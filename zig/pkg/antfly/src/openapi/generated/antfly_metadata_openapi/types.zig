@@ -5321,6 +5321,11 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
             return .{ .value = try std.json.innerParse(T, allocator, source, options) };
         }
 
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
         pub fn jsonStringify(self: @This(), jw: anytype) !void {
             switch (self) {
                 .absent => return error.OptionalNullablePropertyAbsent,

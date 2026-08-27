@@ -618,6 +618,85 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	}
 }
 
+func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
+	decode := func(encoded string) GraphResult {
+		t.Helper()
+		var result GraphResult
+		if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	canonical := decode(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`)
+	legacy := decode(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":0}`)
+
+	canonicalRequest := []QueryRequest{{GraphQueries: map[string]GraphQuery{"walk": {}}}}
+	canonicalResponse := QueryResponses{Responses: []QueryResult{{
+		GraphResults: map[string]GraphResult{"walk": canonical},
+	}}}
+	if err := validateQueryGraphResponses(canonicalRequest, &canonicalResponse); err != nil {
+		t.Fatalf("valid canonical response: %v", err)
+	}
+
+	legacyRequest := []QueryRequest{{GraphSearches: map[string]LegacyGraphQuery{"walk": {}}}}
+	legacyResponse := QueryResponses{Responses: []QueryResult{{
+		GraphResults: map[string]GraphResult{"walk": legacy},
+	}}}
+	if err := validateQueryGraphResponses(legacyRequest, &legacyResponse); err != nil {
+		t.Fatalf("valid legacy response: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		requests  []QueryRequest
+		responses QueryResponses
+		contains  string
+	}{
+		{
+			name:      "canonical rejects legacy",
+			requests:  canonicalRequest,
+			responses: legacyResponse,
+			contains:  "canonical graph result requires a discriminator",
+		},
+		{
+			name:      "legacy rejects canonical",
+			requests:  legacyRequest,
+			responses: canonicalResponse,
+			contains:  "legacy graph result requires discriminator",
+		},
+		{
+			name:     "operation names must match",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"other": canonical},
+			}}},
+			contains: "missing=[walk] unexpected=[other]",
+		},
+		{
+			name:      "graph request response cardinality",
+			requests:  canonicalRequest,
+			responses: QueryResponses{},
+			contains:  "response count 0 does not match request count 1",
+		},
+		{
+			name:     "non graph request rejects graph results",
+			requests: []QueryRequest{{}},
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": canonical},
+			}}},
+			contains: "without graph operations",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateQueryGraphResponses(test.requests, &test.responses)
+			if err == nil || !strings.Contains(err.Error(), test.contains) {
+				t.Fatalf("expected error containing %q, got %v", test.contains, err)
+			}
+		})
+	}
+}
+
 func TestCanonicalGraphResultPreservesOpaqueHydratedJSON(t *testing.T) {
 	var canonical GraphQueryResult
 	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"title":"alpha","nested":{"values":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`), &canonical); err != nil {

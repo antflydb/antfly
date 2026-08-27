@@ -427,8 +427,8 @@ test "channel-aware Gemma generation stays on projected native backends" {
 test "generate API serializes public content and reasoning separately" {
     const rendered = try std.json.Stringify.valueAlloc(std.testing.allocator, api.GenerateMessage{
         .role = .assistant,
-        .content = "Paris",
-        .reasoning_content = "The capital of France is Paris.",
+        .content = .{ .value = "Paris" },
+        .reasoning_content = .{ .value = "The capital of France is Paris." },
     }, .{ .emit_null_optional_fields = false });
     defer std.testing.allocator.free(rendered);
 
@@ -557,20 +557,21 @@ fn generateSpeculationErrorMessage(err: anyerror) []const u8 {
 
 fn generateSpeculationStatus(stats: ?generation.SpeculativeDecodeStats) ?api.GenerateSpeculationStatus {
     const value = stats orelse return null;
+    const disabled_reason = value.mtp_disabled_reason orelse switch (value.speculation_policy_decision) {
+        .disabled_off => "speculation_policy_off",
+        .disabled_unavailable => "draft_backend_unavailable",
+        .disabled_uncalibrated => "speculation_calibration_required",
+        .disabled_low_acceptance => "mtp_auto_low_acceptance",
+        .disabled_zero_match => "mtp_auto_zero_match",
+        .disabled_slow => "mtp_auto_cost_probe_slow",
+        .disabled_insufficient_probe => "mtp_auto_insufficient_cost_probe",
+        .inactive, .active, .forced => null,
+    };
     return .{
         .policy = value.speculation_policy.name(),
         .calibration = value.speculation_calibration.name(),
         .decision = value.speculation_policy_decision.name(),
-        .disabled_reason = value.mtp_disabled_reason orelse switch (value.speculation_policy_decision) {
-            .disabled_off => "speculation_policy_off",
-            .disabled_unavailable => "draft_backend_unavailable",
-            .disabled_uncalibrated => "speculation_calibration_required",
-            .disabled_low_acceptance => "mtp_auto_low_acceptance",
-            .disabled_zero_match => "mtp_auto_zero_match",
-            .disabled_slow => "mtp_auto_cost_probe_slow",
-            .disabled_insufficient_probe => "mtp_auto_insufficient_cost_probe",
-            .inactive, .active, .forced => null,
-        },
+        .disabled_reason = if (disabled_reason) |reason| .{ .value = reason } else .absent,
     };
 }
 
@@ -7736,8 +7737,11 @@ pub const Node = struct {
             .index = 0,
             .message = .{
                 .role = .assistant,
-                .content = content,
-                .reasoning_content = if (reasoning_text) |reasoning| try allocator.dupe(u8, reasoning) else null,
+                .content = .{ .value = content },
+                .reasoning_content = if (reasoning_text) |reasoning|
+                    .{ .value = try allocator.dupe(u8, reasoning) }
+                else
+                    .absent,
             },
             .finish_reason = parseFinishReason(finish_reason),
         };
@@ -7808,7 +7812,7 @@ pub const Node = struct {
                 .code = "MODEL_RESOURCE_BUSY",
                 .message = "insufficient inference capacity is currently available",
                 .retryable = true,
-                .retry_after_ms = transient_capacity_retry_after_ms,
+                .retry_after_ms = .{ .value = transient_capacity_retry_after_ms },
             },
             else => .{
                 .code = "MODEL_LOAD_FAILED",
@@ -7827,7 +7831,10 @@ pub const Node = struct {
             else
                 "request exceeds the configured inference resource budget",
             .retryable = retryable,
-            .retry_after_ms = if (retryable) transient_capacity_retry_after_ms else null,
+            .retry_after_ms = if (retryable)
+                .{ .value = transient_capacity_retry_after_ms }
+            else
+                .absent,
         };
     }
 
@@ -8907,12 +8914,14 @@ pub const Node = struct {
 
         var message: api.GenerateMessage = .{
             .role = .assistant,
-            .reasoning_content = reasoning_text,
+            .content = .{ .value = response_text },
+            .reasoning_content = if (reasoning_text) |reasoning|
+                .{ .value = reasoning }
+            else
+                .absent,
         };
         if (tool_calls) |calls| {
-            if (calls.len == 0) {
-                message.content = response_text;
-            } else {
+            if (calls.len > 0) {
                 const api_calls = try alloc.alloc(generating_api.ToolCall, calls.len);
                 for (calls, 0..) |call, i| {
                     api_calls[i] = .{
@@ -8921,10 +8930,9 @@ pub const Node = struct {
                         .function = .{ .name = call.function.name, .arguments = call.function.arguments },
                     };
                 }
+                message.content = .null_value;
                 message.tool_calls = api_calls;
             }
-        } else {
-            message.content = response_text;
         }
 
         const choices = [_]api.GenerateChoice{.{
@@ -8939,7 +8947,10 @@ pub const Node = struct {
             .model = model_name,
             .choices = &choices,
             .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
-            .speculation = generateSpeculationStatus(speculative),
+            .speculation = if (generateSpeculationStatus(speculative)) |status|
+                .{ .value = status }
+            else
+                .absent,
         });
     }
 
@@ -9336,7 +9347,7 @@ pub const Node = struct {
     ) !void {
         const choices = [_]api.GenerateChunkChoice{.{
             .index = 0,
-            .delta = .{ .content = token_text },
+            .delta = .{ .content = .{ .value = token_text } },
         }};
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
@@ -9357,7 +9368,7 @@ pub const Node = struct {
     ) !void {
         const choices = [_]api.GenerateChunkChoice{.{
             .index = 0,
-            .delta = .{ .reasoning_content = reasoning_text },
+            .delta = .{ .reasoning_content = .{ .value = reasoning_text } },
         }};
         try writeGenerateChunkEvent(writer, allocator, .{
             .id = stream_id,
@@ -9437,7 +9448,10 @@ pub const Node = struct {
             .created = stream_created,
             .model = model_name,
             .choices = &choices,
-            .speculation = generateSpeculationStatus(speculative),
+            .speculation = if (generateSpeculationStatus(speculative)) |status|
+                .{ .value = status }
+            else
+                .absent,
         });
     }
 
@@ -9457,7 +9471,7 @@ pub const Node = struct {
             .created = stream_created,
             .model = model_name,
             .choices = &.{},
-            .usage = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens),
+            .usage = .{ .value = tokenUsageWithCachedPrompt(prompt_tokens, completion_tokens, cached_prompt_tokens) },
         });
         try writer.writeEvent(null, "[DONE]");
     }
@@ -13236,14 +13250,14 @@ test "generation SSE usage chunk serializes authoritative accounting" {
         .created = 42,
         .model = "gemma-4",
         .choices = &.{},
-        .usage = tokenUsageWithCachedPrompt(2003, 300, 512),
+        .usage = .{ .value = tokenUsageWithCachedPrompt(2003, 300, 512) },
     }, .{});
     defer allocator.free(payload);
 
     var parsed = try std.json.parseFromSlice(api.GenerateChunk, allocator, payload, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 0), parsed.value.choices.len);
-    const usage = parsed.value.usage orelse return error.TestExpectedEqual;
+    const usage = parsed.value.usage.valueOrNull() orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(i64, 2003), usage.prompt_tokens);
     try std.testing.expectEqual(@as(i64, 300), usage.completion_tokens);
     try std.testing.expectEqual(@as(i64, 2303), usage.total_tokens);
@@ -13282,12 +13296,12 @@ test "generation SSE orders finish then usage then done" {
     defer finish.deinit();
     try std.testing.expectEqual(@as(usize, 1), finish.value.choices.len);
     try std.testing.expectEqual(api.FinishReason.length, finish.value.choices[0].finish_reason.?);
-    try std.testing.expect(finish.value.usage == null);
+    try std.testing.expect(!finish.value.usage.isPresent());
 
     var usage = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[1], .{});
     defer usage.deinit();
     try std.testing.expectEqual(@as(usize, 0), usage.value.choices.len);
-    try std.testing.expectEqual(@as(i64, 300), usage.value.usage.?.completion_tokens);
+    try std.testing.expectEqual(@as(i64, 300), usage.value.usage.valueOrNull().?.completion_tokens);
     try std.testing.expectEqualStrings("[DONE]", capture.events.items[2]);
 }
 
@@ -13440,10 +13454,10 @@ test "generate speculation status exposes disabled decisions" {
     try std.testing.expectEqualStrings("auto", status.policy);
     try std.testing.expectEqualStrings("none", status.calibration);
     try std.testing.expectEqualStrings("disabled_uncalibrated", status.decision);
-    try std.testing.expectEqualStrings("speculation_calibration_required", status.disabled_reason.?);
+    try std.testing.expectEqualStrings("speculation_calibration_required", status.disabled_reason.valueOrNull().?);
 
     const unavailable = generateSpeculationStatus(.{ .speculation_policy_decision = .disabled_unavailable }).?;
-    try std.testing.expectEqualStrings("draft_backend_unavailable", unavailable.disabled_reason.?);
+    try std.testing.expectEqualStrings("draft_backend_unavailable", unavailable.disabled_reason.valueOrNull().?);
 }
 
 test "generate policy off has no effective draft and reports disabled" {
@@ -13897,7 +13911,7 @@ test "generate batch capacity errors include actionable retry metadata" {
     try std.testing.expectEqual(true, busy_load.retryable);
     try std.testing.expectEqual(
         @as(?i64, transient_capacity_retry_after_ms),
-        busy_load.retry_after_ms,
+        busy_load.retry_after_ms.valueOrNull(),
     );
 
     const busy_admission = Node.batchAdmissionError(error.ResourceTemporarilyUnavailable);
@@ -13905,13 +13919,13 @@ test "generate batch capacity errors include actionable retry metadata" {
     try std.testing.expectEqual(true, busy_admission.retryable);
     try std.testing.expectEqual(
         @as(?i64, transient_capacity_retry_after_ms),
-        busy_admission.retry_after_ms,
+        busy_admission.retry_after_ms.valueOrNull(),
     );
 
     const permanent = Node.batchAdmissionError(error.ResourceLimitExceeded);
     try std.testing.expectEqualStrings("MODEL_RESOURCE_LIMIT", permanent.code);
     try std.testing.expectEqual(false, permanent.retryable);
-    try std.testing.expectEqual(@as(?i64, null), permanent.retry_after_ms);
+    try std.testing.expect(!permanent.retry_after_ms.isPresent());
 }
 
 test "read batch downloaded byte accounting enforces aggregate cap" {

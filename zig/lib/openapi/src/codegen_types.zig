@@ -129,6 +129,13 @@ pub const TypeGenerator = struct {
         self.w.dedent();
         try self.w.line("}}", .{});
         try self.w.blank();
+        try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("if (source == .null) return .null_value;", .{});
+        try self.w.line("return .{{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
         try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
         self.w.indent();
         try self.w.line("switch (self) {{", .{});

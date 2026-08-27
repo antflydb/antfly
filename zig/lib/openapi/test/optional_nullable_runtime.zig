@@ -52,4 +52,24 @@ test "optional nullable properties round-trip all three wire states" {
     try std.testing.expectEqualStrings("cat", concrete.tag.valueOrNull().?);
     const value_json = try std.json.Stringify.valueAlloc(alloc, concrete, .{});
     try std.testing.expect(std.mem.indexOf(u8, value_json, "\"tag\":\"cat\"") != null);
+
+    const value_tree = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        \\{"id":1,"name":"Mochi","tag":"cat"}
+    ,
+        .{},
+    );
+    const concrete_from_value = try std.json.parseFromValueLeaky(types.Pet, alloc, value_tree, .{});
+    try std.testing.expectEqualStrings("cat", concrete_from_value.tag.valueOrNull().?);
+
+    const null_tree = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        \\{"id":1,"name":"Mochi","tag":null}
+    ,
+        .{},
+    );
+    const null_from_value = try std.json.parseFromValueLeaky(types.Pet, alloc, null_tree, .{});
+    try std.testing.expect(null_from_value.tag == .null_value);
 }

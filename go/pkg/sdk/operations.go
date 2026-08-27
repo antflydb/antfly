@@ -169,6 +169,9 @@ func (c *AntflyClient) Query(ctx context.Context, opts ...QueryRequest) (*QueryR
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, fmt.Errorf("parsing result: %w", err)
 	}
+	if err := validateQueryGraphResponses(opts, &result); err != nil {
+		return nil, fmt.Errorf("validating query response: %w", err)
+	}
 
 	return &result, nil
 }

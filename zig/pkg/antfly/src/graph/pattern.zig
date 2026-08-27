@@ -3273,12 +3273,12 @@ fn appendPathEdge(
     }
     out[out.len - 1] = try dupePathEdge(
         alloc,
-        source,
-        target,
+        edge.source,
+        edge.target,
         edge.edge_type,
         edge.weight,
         edge.metadata,
-        traversedEdgeDirection(edge, source, target, requested_direction),
+        try traversedEdgeDirection(edge, source, target, requested_direction),
     );
     initialized += 1;
     return out;
@@ -3289,11 +3289,20 @@ fn traversedEdgeDirection(
     source: []const u8,
     target: []const u8,
     requested_direction: graph_mod.EdgeDirection,
-) graph_mod.EdgeDirection {
+) !?graph_mod.EdgeDirection {
+    const traversed_out = std.mem.eql(u8, edge.source, source) and
+        std.mem.eql(u8, edge.target, target);
+    const traversed_in = std.mem.eql(u8, edge.target, source) and
+        std.mem.eql(u8, edge.source, target);
     return switch (requested_direction) {
-        .out => .out,
-        .in => .in,
-        .both => if (std.mem.eql(u8, edge.source, source) and std.mem.eql(u8, edge.target, target))
+        .out => if (traversed_out) .out else error.InvalidTraversedEdge,
+        .in => if (traversed_in) .in else error.InvalidTraversedEdge,
+        // Equal-key reciprocal edges can satisfy both comparisons. Keep the
+        // direction unknown so the public boundary can resolve it from table
+        // provenance and edge metadata instead of silently claiming `out`.
+        .both => if (traversed_out == traversed_in)
+            if (traversed_out) null else error.InvalidTraversedEdge
+        else if (traversed_out)
             .out
         else
             .in,
@@ -4446,11 +4455,33 @@ test "exact two-edge probe honors incoming final direction" {
     }, .{
         .target_nodes = &.{.{ .table = null, .key = "target" }},
         .target_required = true,
-        .include_paths = false,
+        .include_paths = true,
     });
     defer freeMatches(std.testing.allocator, matches);
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqualStrings("target", matches[0].bindings[2].key);
+    try std.testing.expectEqual(@as(usize, 2), matches[0].path.len);
+    try std.testing.expectEqualStrings("start", matches[0].path[0].source);
+    try std.testing.expectEqualStrings("middle", matches[0].path[0].target);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.out, matches[0].path[0].traversal_direction.?);
+    try std.testing.expectEqualStrings("target", matches[0].path[1].source);
+    try std.testing.expectEqualStrings("middle", matches[0].path[1].target);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.in, matches[0].path[1].traversal_direction.?);
+
+    const equal_key_edge = graph_mod.Edge{
+        .source = "shared",
+        .target = "shared",
+        .edge_type = "CROSS_TABLE",
+        .weight = 1,
+        .created_at = 0,
+        .updated_at = 0,
+        .metadata = "",
+    };
+    const ambiguous = try appendPathEdge(std.testing.allocator, &.{}, equal_key_edge, "shared", "shared", .both);
+    defer freePathEdges(std.testing.allocator, ambiguous);
+    try std.testing.expectEqualStrings("shared", ambiguous[0].source);
+    try std.testing.expectEqualStrings("shared", ambiguous[0].target);
+    try std.testing.expectEqual(@as(?graph_mod.EdgeDirection, null), ambiguous[0].traversal_direction);
 }
 
 test "exact two-edge probe preserves fixed-edge self loops" {

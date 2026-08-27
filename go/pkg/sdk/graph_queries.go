@@ -179,6 +179,113 @@ func DecodeGraphResult(result GraphResult) (any, error) {
 	return decodeLegacyGraphQueryResult(result, envelope)
 }
 
+// DecodeLegacyGraphResult decodes a deprecated graph_searches result. A
+// missing discriminator remains accepted during the stateful API's v0.2
+// compatibility window, but a canonical discriminator is never accepted at
+// this dialect-specific boundary.
+func DecodeLegacyGraphResult(result GraphResult) (LegacyGraphQueryResult, error) {
+	var envelope graphQueryResultEnvelope
+	if err := result.DecodeInto(&envelope); err != nil {
+		return LegacyGraphQueryResult{}, err
+	}
+	if envelope.Kind != nil {
+		var kind *string
+		if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
+			return LegacyGraphQueryResult{}, fmt.Errorf("antfly: graph result has an invalid discriminator")
+		}
+		if *kind != string(LegacyGraphQueryResultKindLegacy) {
+			return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result requires discriminator %q", LegacyGraphQueryResultKindLegacy)
+		}
+	}
+	return decodeLegacyGraphQueryResult(result, envelope)
+}
+
+// validateQueryGraphResponses binds graph result decoding to the request that
+// selected the wire dialect. This prevents a valid union member from being
+// silently interpreted under the wrong operation or compatibility contract.
+func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses) error {
+	hasGraphRequest := false
+	for _, request := range requests {
+		if request.GraphQueries != nil || request.GraphSearches != nil {
+			hasGraphRequest = true
+			break
+		}
+	}
+	if hasGraphRequest && len(result.Responses) != len(requests) {
+		return fmt.Errorf("antfly: query response count %d does not match request count %d", len(result.Responses), len(requests))
+	}
+
+	for responseIndex, response := range result.Responses {
+		if responseIndex >= len(requests) {
+			if len(response.GraphResults) != 0 {
+				return fmt.Errorf("antfly: response %d contains graph_results without a matching request", responseIndex)
+			}
+			continue
+		}
+		request := requests[responseIndex]
+		switch {
+		case request.GraphQueries != nil:
+			if err := validateGraphResultNames(request.GraphQueries, response.GraphResults); err != nil {
+				return fmt.Errorf("antfly: response %d: %w", responseIndex, err)
+			}
+			for name, raw := range response.GraphResults {
+				canonical, err := raw.AsGraphQueryResult()
+				if err != nil {
+					return fmt.Errorf("antfly: response %d graph result %q is not canonical: %w", responseIndex, name, err)
+				}
+				if _, err := DecodeGraphQueryResult(canonical); err != nil {
+					return fmt.Errorf("antfly: response %d graph result %q: %w", responseIndex, name, err)
+				}
+			}
+		case request.GraphSearches != nil:
+			if err := validateGraphResultNames(request.GraphSearches, response.GraphResults); err != nil {
+				return fmt.Errorf("antfly: response %d: %w", responseIndex, err)
+			}
+			for name, raw := range response.GraphResults {
+				if _, err := DecodeLegacyGraphResult(raw); err != nil {
+					return fmt.Errorf("antfly: response %d graph result %q: %w", responseIndex, name, err)
+				}
+			}
+		default:
+			if len(response.GraphResults) != 0 {
+				return fmt.Errorf("antfly: response %d contains graph_results for a request without graph operations", responseIndex)
+			}
+		}
+	}
+	return nil
+}
+
+func validateGraphResultNames[T any](requested map[string]T, received map[string]GraphResult) error {
+	if len(requested) == len(received) {
+		matches := true
+		for name := range requested {
+			if _, ok := received[name]; !ok {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return nil
+		}
+	}
+
+	missing := make([]string, 0)
+	unexpected := make([]string, 0)
+	for name := range requested {
+		if _, ok := received[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	for name := range received {
+		if _, ok := requested[name]; !ok {
+			unexpected = append(unexpected, name)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(unexpected)
+	return fmt.Errorf("graph_results operation names do not match the request (missing=%v unexpected=%v)", missing, unexpected)
+}
+
 // DecodeGraphQueryResult decodes a canonical graph_queries result. Legacy
 // compatibility is intentionally absent from this API.
 func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {

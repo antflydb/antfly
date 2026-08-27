@@ -1165,9 +1165,9 @@ test "public api smoke e2e creates table inserts and queries documents" {
 
     const numeric_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.NumericRangeQuery{
         .field = "score",
-        .min = 9,
-        .max = 10,
-        .inclusive_max = true,
+        .min = .{ .value = 9 },
+        .max = .{ .value = 10 },
+        .inclusive_max = .{ .value = true },
     }, &.{ "title", "score" }, 10);
     defer std.testing.allocator.free(numeric_range_query_body);
     var numeric_range_query = try client.fetchQuery(base_uri, "docs", numeric_range_query_body);
@@ -1219,9 +1219,9 @@ test "public api smoke e2e creates table inserts and queries documents" {
 
     const term_range_query_body = try test_contract_helpers.encodeQueryRequest(std.testing.allocator, query_openapi.TermRangeQuery{
         .field = "title",
-        .min = "alpha",
-        .max = "beta",
-        .inclusive_max = false,
+        .min = .{ .value = "alpha" },
+        .max = .{ .value = "beta" },
+        .inclusive_max = .{ .value = false },
     }, &.{"title"}, 10);
     defer std.testing.allocator.free(term_range_query_body);
     var term_range_query = try client.fetchQuery(base_uri, "docs", term_range_query_body);
@@ -1236,7 +1236,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
         .field = "created_at",
         .start = "2026-03-15T00:00:00Z",
         .end = "2026-03-25T00:00:00Z",
-        .inclusive_end = true,
+        .inclusive_end = .{ .value = true },
     }, &.{ "title", "created_at" }, 10);
     defer std.testing.allocator.free(date_range_query_body);
     var date_range_query = try client.fetchQuery(base_uri, "docs", date_range_query_body);

@@ -5636,6 +5636,8 @@ fn graphPathIdentityEncodedLen(path: db_mod.types.GraphPath) !usize {
             return error.PathIdentityTooLarge;
     }
     for (path.edges) |edge| {
+        total_len = std.math.add(usize, total_len, 1) catch
+            return error.PathIdentityTooLarge;
         for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
             total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
                 return error.PathIdentityTooLarge;
@@ -5667,6 +5669,8 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
         pos += node.len;
     }
     for (path.edges) |edge| {
+        out[pos] = graphPathTraversalDirectionTag(edge.traversal_direction);
+        pos += 1;
         for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
             std.mem.writeInt(u64, out[pos..][0..8], @intCast(part.len), .little);
             pos += 8;
@@ -5675,6 +5679,14 @@ fn graphPathToKey(alloc: std.mem.Allocator, path: db_mod.types.GraphPath) ![]u8 
         }
     }
     return out;
+}
+
+fn graphPathTraversalDirectionTag(direction: ?graph_mod.EdgeDirection) u8 {
+    return if (direction) |value| switch (value) {
+        .out => 1,
+        .in => 2,
+        .both => 3,
+    } else 0;
 }
 
 fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_idx: usize) bool {
@@ -5692,7 +5704,8 @@ fn rootPathMatches(a: db_mod.types.GraphPath, b: db_mod.types.GraphPath, spur_id
     while (i < spur_idx) : (i += 1) {
         if (!std.mem.eql(u8, a.edges[i].source, b.edges[i].source) or
             !std.mem.eql(u8, a.edges[i].target, b.edges[i].target) or
-            !std.mem.eql(u8, a.edges[i].edge_type, b.edges[i].edge_type)) return false;
+            !std.mem.eql(u8, a.edges[i].edge_type, b.edges[i].edge_type) or
+            a.edges[i].traversal_direction != b.edges[i].traversal_direction) return false;
     }
     return true;
 }
@@ -5726,6 +5739,38 @@ test "distributed K path identity preserves parallel typed edges" {
     defer alloc.free(second_key);
     try std.testing.expect(!std.mem.eql(u8, first_key, second_key));
     try std.testing.expect(!rootPathMatches(first, second, 1));
+
+    var outgoing_edge = [_]graph_paths_mod.PathEdge{.{
+        .source = "shared",
+        .target = "shared",
+        .edge_type = "cross_table",
+        .weight = 1,
+        .traversal_direction = .out,
+    }};
+    var incoming_edge = outgoing_edge;
+    incoming_edge[0].traversal_direction = .in;
+    var node_tables = [_]?[]const u8{ "left", "right" };
+    var shared_nodes = [_][]const u8{ "shared", "shared" };
+    const outgoing = db_mod.types.GraphPath{
+        .nodes = &shared_nodes,
+        .node_tables = &node_tables,
+        .edges = &outgoing_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const incoming = db_mod.types.GraphPath{
+        .nodes = outgoing.nodes,
+        .node_tables = outgoing.node_tables,
+        .edges = &incoming_edge,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const outgoing_key = try graphPathToKey(alloc, outgoing);
+    defer alloc.free(outgoing_key);
+    const incoming_key = try graphPathToKey(alloc, incoming);
+    defer alloc.free(incoming_key);
+    try std.testing.expect(!std.mem.eql(u8, outgoing_key, incoming_key));
+    try std.testing.expect(!rootPathMatches(outgoing, incoming, 1));
 }
 
 fn joinDistributedPaths(

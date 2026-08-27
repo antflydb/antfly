@@ -407,7 +407,27 @@ class TestAntflyClient:
     @patch("antfly.client.Client")
     def test_query_preserves_legacy_graph_searches_bridge(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
-        configure_response(mock_httpx, 200, {"responses": []})
+        configure_response(
+            mock_httpx,
+            200,
+            {
+                "responses": [
+                    {
+                        "took": 0,
+                        "status": 200,
+                        "graph_results": {
+                            "related": {
+                                "type": "neighbors",
+                                "nodes": [],
+                                "paths": [],
+                                "total": 0,
+                                "took": 0,
+                            }
+                        },
+                    }
+                ]
+            },
+        )
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
 
         client = AntflyClient(base_url="http://localhost:8080")
@@ -431,7 +451,25 @@ class TestAntflyClient:
     @patch("antfly.client.Client")
     def test_query_serializes_typed_graph_operations(self, mock_client_class: MagicMock) -> None:
         mock_httpx = MagicMock()
-        configure_response(mock_httpx, 200, {"responses": []})
+        configure_response(
+            mock_httpx,
+            200,
+            {
+                "responses": [
+                    {
+                        "took": 0,
+                        "status": 200,
+                        "graph_results": {
+                            "count_rows": {
+                                "kind": "aggregates",
+                                "aggregates": {"rows": {"value": "0", "exact": True}},
+                                "stats": {"returned_items": 1, "truncated": False},
+                            }
+                        },
+                    }
+                ]
+            },
+        )
         mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
         graph_query = GraphMatchQuery.from_dict(
             {
@@ -626,7 +664,26 @@ class TestAntflyClient:
 
         with patch("antfly.client.Client") as mock_client_class:
             mock_httpx = MagicMock()
-            configure_response(mock_httpx, 200, {"responses": []})
+            configure_response(
+                mock_httpx,
+                200,
+                {
+                    "responses": [
+                        {
+                            "took": 0,
+                            "status": 200,
+                            "graph_results": {
+                                "walk": {
+                                    "kind": "nodes",
+                                    "nodes": [],
+                                    "paths": [],
+                                    "stats": {"returned_items": 0, "truncated": False},
+                                }
+                            },
+                        }
+                    ]
+                },
+            )
             mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
             client = AntflyClient(base_url="http://localhost:8080")
             client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", operation: body}})

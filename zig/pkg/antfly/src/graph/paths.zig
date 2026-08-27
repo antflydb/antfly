@@ -94,9 +94,9 @@ pub const PathEdge = struct {
     edge_type: []const u8,
     weight: f64,
     metadata: []const u8 = "",
-    /// Physical stored-edge orientation relative to this path step. Null is
-    /// retained for locally reconstructed paths whose unequal endpoint keys
-    /// make the orientation unambiguous without extra state.
+    /// Traversal orientation relative to the physical stored endpoints above.
+    /// Null is retained when equal endpoint keys make the direction ambiguous;
+    /// the public boundary resolves it from node-table provenance and metadata.
     traversal_direction: ?EdgeDirection = null,
 };
 
