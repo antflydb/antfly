@@ -115,6 +115,21 @@ fn generationStreamShouldContinue(
     return true;
 }
 
+fn generationStreamWriteIsPeerDisconnect(err: anyerror) bool {
+    return switch (err) {
+        error.Canceled,
+        error.Cancelled,
+        error.EndOfStream,
+        error.StreamClosed,
+        error.ConnectionResetByPeer,
+        error.BrokenPipe,
+        error.SendFailed,
+        error.Timeout,
+        => true,
+        else => false,
+    };
+}
+
 test "generation pipeline session lookup is field safe" {
     var pipeline = struct {}{};
     try std.testing.expect(generationPipelineSession(&pipeline) == null);
@@ -126,6 +141,14 @@ test "generation stream continuation observes writes and peer cancellation" {
     cancellation.store(true, .release);
     try std.testing.expect(!generationStreamShouldContinue(false, &cancellation));
     try std.testing.expect(!generationStreamShouldContinue(true, null));
+}
+
+test "generation stream write classification separates peer disconnects from server faults" {
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.SendFailed));
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.StreamClosed));
+    try std.testing.expect(generationStreamWriteIsPeerDisconnect(error.Canceled));
+    try std.testing.expect(!generationStreamWriteIsPeerDisconnect(error.OutOfMemory));
+    try std.testing.expect(!generationStreamWriteIsPeerDisconnect(error.EventTooLarge));
 }
 
 test "channel-aware Gemma generation stays on projected native backends" {
@@ -343,6 +366,16 @@ fn generateAdmissionUnitsForSpeculation(
 ) usize {
     if (!draft_requested or !shouldResolveDraftModel(policy)) return base_units;
     return std.math.add(usize, base_units, base_units) catch std.math.maxInt(usize);
+}
+
+/// Remove only the admission units added for an auto-discovered drafter.
+/// `reserved_units` may have grown independently after media decoding, so
+/// restoring an older base estimate would silently undercharge the request.
+fn takeAutoDraftAdmissionExtra(reserved_units: *usize, auto_draft_extra_units: *usize) usize {
+    const released = @min(reserved_units.*, auto_draft_extra_units.*);
+    reserved_units.* -= released;
+    auto_draft_extra_units.* = 0;
+    return released;
 }
 
 fn generationBackendKind(backend: backends_mod.BackendType) ?runtime.kv.pool.BackendKind {
@@ -6022,6 +6055,7 @@ pub const Node = struct {
         // instead of failing the request.
         var auto_draft_sibling: ?[]const u8 = null;
         defer if (auto_draft_sibling) |path| ctx.allocator.free(path);
+        var auto_draft_extra_units: usize = 0;
         if (requested_draft_model_name == null and
             speculation.policy == .auto and
             gemma4MtpAutoDraftDiscoveryEnabled())
@@ -6046,12 +6080,26 @@ pub const Node = struct {
                 const extra_units = speculative_units - reserved_units;
                 if (self.reserveAdmissionUnits(extra_units)) {
                     reserved_units += extra_units;
+                    auto_draft_extra_units = extra_units;
                 } else |_| {
                     std.log.warn("skipping discovered MTP drafter: insufficient admission capacity", .{});
                     ctx.allocator.free(auto_draft_sibling.?);
                     auto_draft_sibling = null;
                 }
             }
+        }
+        if (auto_draft_sibling != null and
+            effective_draft_model_name == null and
+            self.config.kernel_jit.qualified_profile_path != null)
+        {
+            // Qualified profiles reject a client-requested draft, but automatic
+            // discovery is best-effort and must not turn a plain request into a
+            // 400 response.
+            std.log.warn("skipping discovered MTP drafter: qualified-profile JIT is active", .{});
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            ctx.allocator.free(auto_draft_sibling.?);
+            auto_draft_sibling = null;
         }
         validateQualifiedProfileDraft(
             self.config.kernel_jit.qualified_profile_path != null,
@@ -6128,6 +6176,16 @@ pub const Node = struct {
                 },
             });
         };
+        if (auto_draft_sibling != null and backend_selection.native_choice == .onnx) {
+            // ONNX cannot host the discovered native/Metal drafter. As with all
+            // automatic-discovery incompatibilities, continue without it.
+            std.log.warn("skipping discovered MTP drafter: ONNX backend selected", .{});
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            ctx.allocator.free(auto_draft_sibling.?);
+            auto_draft_sibling = null;
+            config.speculation_requested = false;
+        }
         validatePromptCacheExecutionMode(config.prompt_cache_enabled, backend_selection) catch {
             return ctx.status(400).json(.{
                 .@"error" = "UNSUPPORTED_FEATURE",
@@ -6555,10 +6613,10 @@ pub const Node = struct {
                 // A discovered drafter is an optimization: give back its extra
                 // admission and retry single-model before surfacing capacity
                 // errors the client's own request never earned.
-                if (auto_draft_sibling != null and reserved_units > admission_units) {
+                if (auto_draft_sibling != null) {
                     std.log.warn("skipping discovered MTP drafter: insufficient scheduler capacity", .{});
-                    self.releaseSlotUnits(reserved_units - admission_units);
-                    reserved_units = admission_units;
+                    const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+                    if (released > 0) self.releaseSlotUnits(released);
                     ctx.allocator.free(auto_draft_sibling.?);
                     auto_draft_sibling = null;
                     config.speculation_requested = false;
@@ -6731,7 +6789,30 @@ pub const Node = struct {
             config.speculation_requested = false;
             if (draft_model_handle) |*handle| handle.release();
             draft_model_handle = null;
+            draft_model_for_generation = null;
+            draft_backend_kind = null;
+            draft_kv_dtype = null;
             draft_gpt_config = null;
+        }
+        if (draft_was_discovered and draft_model_for_generation == null and auto_draft_extra_units > 0) {
+            // Setup failures and deliberate AUTO-policy disablement both mean
+            // there is no second backend. Give back its exact slot and
+            // scheduler reservations while preserving any media-driven growth.
+            if (native_generate_lease) |lease| {
+                if (model.native_generate_coordinator) |coordinator| coordinator.release(lease);
+                native_generate_lease = null;
+            }
+            const released = takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units);
+            if (released > 0) self.releaseSlotUnits(released);
+            if (model.native_generate_coordinator) |coordinator| {
+                native_generate_lease = try self.acquireNativeGenerateLease(coordinator, .{
+                    .requested_units = reserved_units,
+                    .prompt_bytes = prompt_bytes,
+                    .prompt_tokens = prompt_tokens,
+                    .prefill_chunk_limit = if (config.prefill_chunk_size == 0) idle_prefill_ceiling else 0,
+                    .max_tokens = configured_max_tokens,
+                });
+            }
         }
 
         const budget_backend_class: runtime.tier.memory.BackendClass =
@@ -8832,45 +8913,48 @@ pub const Node = struct {
             payload: *std.Io.Writer.Allocating,
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
-            errored: bool = false,
+            write_error: ?anyerror = null,
+            parser_failed: bool = false,
 
             fn shouldContinue(raw_ctx: *anyopaque) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
-                return !stream.errored and !stream.request_context.isCancellationRequested();
+                return stream.write_error == null and
+                    !stream.parser_failed and
+                    !stream.request_context.isCancellationRequested();
             }
 
             fn onToken(raw_ctx: *anyopaque, token_text: []const u8) bool {
                 const stream: *@This() = @ptrCast(@alignCast(raw_ctx));
                 if (stream.parser) |parser| {
                     const update = parser.feed(token_text) catch {
-                        stream.errored = true;
+                        stream.parser_failed = true;
                         return false;
                     };
                     if (update.ready_text.len > 0) {
-                        emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch {
-                            stream.errored = true;
+                        emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch |err| {
+                            stream.write_error = err;
                             return false;
                         };
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
-                            emitToolCallDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch {
-                                stream.errored = true;
+                            emitToolCallDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch |err| {
+                                stream.write_error = err;
                                 return false;
                             };
                         }
                     }
                     if (update.active_tool_delta) |delta| {
-                        emitToolCallDeltaUpdate(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, delta) catch {
-                            stream.errored = true;
+                        emitToolCallDeltaUpdate(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, delta) catch |err| {
+                            stream.write_error = err;
                             return false;
                         };
                     }
                     return true;
                 }
                 // Build OpenAI-compatible SSE chunk
-                emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch {
-                    stream.errored = true;
+                emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch |err| {
+                    stream.write_error = err;
                     return false;
                 };
                 return true;
@@ -8949,8 +9033,23 @@ pub const Node = struct {
             }
         }
 
-        if (stream_ctx.errored) {
-            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_WRITE_FAILED", .{});
+        if (stream_ctx.write_error) |err| {
+            // Generation already stopped through shouldContinue. Classify only
+            // transport/cancellation errors as routine peer abandonment; JSON
+            // formatting, allocation, and other server faults remain errors.
+            const peer_disconnect = generationStreamWriteIsPeerDisconnect(err);
+            if (!builtin.is_test) {
+                if (peer_disconnect)
+                    std.log.info("generation stream closed after client disconnect", .{})
+                else
+                    std.log.err("inference request failed code=STREAM_WRITE_FAILED: {s}", .{@errorName(err)});
+            }
+            if (!peer_disconnect) writer.writeEvent("error", internal_error_message) catch {};
+            writer.close() catch {};
+            return ctx.response.build();
+        }
+        if (stream_ctx.parser_failed) {
+            if (!builtin.is_test) std.log.err("inference request failed code=STREAM_PARSE_FAILED", .{});
             writer.writeEvent("error", internal_error_message) catch {};
             writer.close() catch {};
             return ctx.response.build();
@@ -12946,6 +13045,24 @@ test "generate admission units conservatively charge active draft requests" {
     var off = parsed.value;
     off.speculation_policy = "off";
     try std.testing.expectEqual(@as(usize, 3), Node.estimateGenerateRequestAdmissionUnits(off, 256));
+}
+
+test "auto draft admission unwind preserves independent request growth" {
+    var reserved_units: usize = 10;
+    var auto_draft_extra_units: usize = 2;
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units),
+    );
+    try std.testing.expectEqual(@as(usize, 8), reserved_units);
+    try std.testing.expectEqual(@as(usize, 0), auto_draft_extra_units);
+
+    // Repeated degradation is idempotent and cannot consume media admission.
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        takeAutoDraftAdmissionExtra(&reserved_units, &auto_draft_extra_units),
+    );
+    try std.testing.expectEqual(@as(usize, 8), reserved_units);
 }
 
 test "generate numeric options validate narrowing at the HTTP trust boundary" {
@@ -19101,6 +19218,10 @@ fn writeInternalStreamError(
     stage: []const u8,
     err: anyerror,
 ) void {
+    if (std.mem.eql(u8, stage, "STREAM_WRITE_FAILED") and generationStreamWriteIsPeerDisconnect(err)) {
+        if (!builtin.is_test) std.log.info("generation stream closed after client disconnect", .{});
+        return;
+    }
     writer.writeEvent("error", internalErrorMessage(stage, err)) catch {};
 }
 

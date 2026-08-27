@@ -399,6 +399,16 @@ fn resolveProcessMemoryBudgetMib(
     return .{ .value_mib = null, .source = .automatic };
 }
 
+/// `parseMaxLoadedModelsOverride` validates and resolves this option before the
+/// server loop. The loop must still consume the option and its value so they do
+/// not fall through to `InvalidArguments`.
+fn consumeParsedMaxLoadedModelsOption(args: []const []const u8, index: *usize) bool {
+    if (!std.mem.eql(u8, args[index.*], "--max-loaded-models")) return false;
+    if (index.* + 1 >= args.len) return false;
+    index.* += 1;
+    return true;
+}
+
 fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     structlog.init(.{ .formatter = .json, .level = .info });
 
@@ -438,6 +448,9 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             config_path = args[i + 1];
             i += 1;
+        } else if (consumeParsedMaxLoadedModelsOption(args, &i)) {
+            // Parsed once above so duplicate flags retain the documented
+            // last-value-wins behavior without a second conversion path.
         } else if (std.mem.eql(u8, args[i], "--max-concurrent-requests") and i + 1 < args.len) {
             max_concurrent_requests_override = try parseAdmissionLimit(args[i + 1]);
             i += 1;
@@ -586,6 +599,19 @@ fn runServer(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8)
     try node.serve(allocator, io, host, port);
 
     print("server stopped.\n", .{});
+}
+
+test "run server option loop consumes max loaded models override" {
+    var index: usize = 0;
+    try std.testing.expect(consumeParsedMaxLoadedModelsOption(
+        &.{ "--max-loaded-models", "1" },
+        &index,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), index);
+
+    index = 0;
+    try std.testing.expect(!consumeParsedMaxLoadedModelsOption(&.{"--host"}, &index));
+    try std.testing.expectEqual(@as(usize, 0), index);
 }
 
 fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {

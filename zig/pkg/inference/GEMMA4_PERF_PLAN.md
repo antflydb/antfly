@@ -159,4 +159,60 @@ Executed the approved roofline plan's Air-valid slice; M4 Pro items remain queue
 
 **Machine facts recorded:** `MTLCounterSamplingPointAtDispatchBoundary` is UNSUPPORTED on this base-M4 Air (`stage timing supported=0`) — all in-frame attribution (M0.2 census, stage GB/s) requires the M4 Pro. Peak decode after this round: **E2B 56.2–56.5 tok/s** (vs ~44–46 at branch start, +25%), E4B ~30.4.
 
-**Deferred with reasoning:** M0.2 per-dispatch census (unimplementable/untestable on this device); B2 fused-FFN scope (inherits the −12% sumsq component; needs census first); A3 scales-plane/interleave relayout (the big lever — census justified it at 67–73% FFN efficiency; 1–2 week M4-Pro-validated workstream); A2 AUTO-table folding (env overrides ready; fold after M4 Pro sweep).
+**Deferred with reasoning:** M0.2 per-dispatch census (unimplementable/untestable on this device); B2 fused-FFN scope (inherits the −12% sumsq component; needs census first); A3 scales-plane/interleave relayout (the big lever — census justified it at 67‒73% FFN efficiency; 1–2 week M4-Pro-validated workstream); A2 AUTO-table folding (env overrides ready; fold after M4 Pro sweep).
+
+## 13. M4 Pro production-readiness ledger (2026-08-27, final uncommitted source at `e92beae1101b4852ba98f031112eb2bf1a205de7`)
+
+This round inspected the pushed roofline changes, requalified both real Gemma4 models against llama.cpp on the M4 Pro reference machine (Mac mini, 24 GiB), fixed the production defects exposed by the review, and repeated the benchmark with the exact final Metal binary. No commit or push was made.
+
+### 13.1 Final pinned comparison
+
+Protocol: fresh process for every engine run; interleaved Antfly/llama.cpp pairs with a 2-second cooldown; five measured repetitions; greedy generation, F16 KV, whole-model Metal, EOS ignored; 23-token/256-output short case and 2,334-token/128-output long case. Antfly's strict metric is `(generated_tokens - 1) / decode_inner_seconds`; llama.cpp's is its reported eval throughput over the matching 255/127 decode evaluations. CV is across the five strict samples.
+
+| Model / prompt | Antfly median tok/s | CV | llama.cpp median tok/s | CV | Antfly / llama.cpp | Gap |
+|---|---:|---:|---:|---:|---:|---:|
+| E2B short | 71.150 | 0.355% | 109.120 | 0.212% | 65.20% | -34.80% |
+| E4B short | 47.170 | 0.105% | 63.280 | 0.122% | 74.54% | -25.46% |
+| E2B long | 85.349 | 0.137% | 105.050 | 0.093% | 81.25% | -18.75% |
+| E4B long | 53.836 | 0.060% | 61.380 | 0.128% | 87.71% | -12.29% |
+
+All Antfly repetitions emitted identical token IDs within each scenario and remained exact versus the first campaign on the pushed commit. Route evidence showed default PLE Q8 staging, E2B pair activation, long-context split-GQA, and zero prepared-frame fallbacks. The final short-case movement versus the first pushed-commit campaign was -1.31% E2B / -0.74% E4B; long was +0.87% / +0.30%, within the campaign-level thermal/run-order envelope rather than a claimed speedup from the safety fixes.
+
+Pinned identities:
+
+- Antfly Metal ReleaseFast SHA-256 `c3128c25c999c27769928727a3c64857af54fca0c8236010924a88d39494b0d0`.
+- llama.cpp `llama-completion` version 10342 (`38278078c`), SHA-256 `92dcad3c204b0574c99611af7a1f64d69ad0506c3abeba56bef8e4ec57fa0bc8`.
+- E2B GGUF SHA-256 `fa401b55b07ee70a54c6dae3903c783a6e65064312529ea57175cb5f8dec6634`.
+- E4B GGUF SHA-256 `676c35070db6dbe52f93e9c864ee0fba4eddea94b9c875d9cb10daff453fbaee`.
+- Machine-readable diagnostic: `/private/tmp/antfly-gemma4-e92-vs-llama-v1/final-vs-llama-v2/benchmark-summary.json`. This is transient diagnostic evidence, not an immutable release artifact.
+
+### 13.2 Findings addressed in source
+
+1. **Host-encode attribution corrected:** frame telemetry now separates wall, pipelined-wait, and pure CPU encode spans. Steady E2B medians were 12.474 ms wall, 11.840 ms wait, and only 0.640 ms CPU encode. The suspected host-encode bottleneck is refuted; optimization should stay focused on GPU/frame work and command-plan/dispatch efficiency.
+2. **Q8 staging ownership hardened:** the pushed dense-to-Q8 preparation path had an armed `errdefer` across an ownership-transfer call, leaving a latent failure-path double-free. Ownership is now transferred only after all fallible sibling allocations complete; the matching large-mmap test exercises the pattern.
+3. **Auto-MTP admission unwind made exact:** failure fallback previously released `reserved_units - admission_units`, which could discard separately-grown media reservation. The server now tracks and releases only the auto-draft increment and reacquires the correctly-sized scheduler lease when the second backend disappears.
+4. **Capacity-one model publication fixed:** speculative prewarm is skipped when publishing the primary model must first evict the only resident model, avoiding the predictable `ResourceTemporarilyUnavailable` warning; post-eviction lazy preparation remains intact.
+5. **Server CLI contract fixed:** `--max-loaded-models` was preparsed but rejected by the main option loop. It is now consumed and covered by a focused parser test.
+6. **Expected SSE disconnect reclassified:** client cancellation/reset/write-close errors are operational info events, while OOM, oversized-event, and parser failures remain errors. Live cancellation now leaves a clean log and a healthy server.
+7. **Production-route tests brought back in sync:** the aggregate suite exposed a stale split-GQA source census that still expected one scratch allocation after the two-buffer pipeline fix, plus two FFN tests that assumed split gate/up always outranked the new M4 pair+activation default. The tests now assert both scratch buffers and alternation, reject the removed submitted-frame exclusion, and validate the route that actually executed while requiring incompatible counters to remain unchanged.
+
+### 13.3 Verification matrix
+
+- Pinned Zig 0.16.0 ReleaseFast builds passed with Metal (`-Dmetal=true -j1`) and without Metal (`-Dmetal=false`); final non-Metal binary SHA-256 `2b2db1f960c543834d86aaafe33d9cf465ab714e3ba1dd36a29d6d729cc77552`.
+- The final aggregate ReleaseFast Metal unit gate exited zero: 3,167 library tests selected (3,148 passed, 19 intentional skips), 11/11 CLI-root tests passed, and 23/23 generated-kernel checks passed. It completed in 524.92 seconds with 12.45 GB maximum RSS and zero swaps.
+- Focused regressions passed for CLI consumption, Q8 mmap ownership, exact auto-draft unwind, capacity-aware prewarm, and streaming disconnect classification. The incoming pair/Q8/admission/companion suite also passed (23 dependent tests).
+- On-device split-GQA oracle passed every E2B/E4B geometry with maximum absolute error at or below `1.1e-6` and rollback route count zero. The Q4_0 pair-activation oracle passed exact-hash default/portfolio/rollback checks.
+- The reviewed exact-v1 quality campaign ran 48 generations: two models × four 2,051-token cases × default/pair-off/PLE-Q8-off × two repetitions. Generated token IDs were exact across every default and rollback lane, and all required route toggles were observed.
+- Live HTTP qualification with `--max-loaded-models 1` passed E2B→E4B→E2B eviction/reload, two concurrent 128-token completions, intentional streaming cancellation, health, documented retryable immediate recovery, and successful recovery after the lease drain. All final responses were valid and the server log contained no warning/error events.
+
+### 13.4 Release decision and remaining gates
+
+**Code-level result: PASS. Full production/release promotion: BLOCKED.** Pair activation and PLE Q8 are token-exact with working rollback controls, and the exercised CLI/server/resource failure paths are clean. The following gates prevent an industry-grade release claim:
+
+1. **Strict zero-paging failed on this machine state.** The final 40-run comparison had 36 zero-delta engine runs but campaign deltas of 61 pageouts and 8 swapins; the quality campaign added 2 pageouts and 204 swapins. Existing swap use was approximately 1.35 GiB. Re-run from a zero-swap, zero-pageout state before promotion.
+2. **The full exact-v1 semantic suite remains fail-closed.** All structured canaries and E4B free-form output passed, but E2B's deterministic free-form response was 164 words against the fixture's 180-word floor in all six default/rollback samples. Because the outputs are identical across lanes, this does not implicate either new default, but the model-level release gate is still red until the fixture expectation is adjudicated or the model behavior changes.
+3. **Auto-MTP cannot be release-qualified here:** no matching Gemma4 unquantized-assistant GGUF is installed. Discovery remains opt-in and unpromoted.
+4. **LM-head Q4_K repack remains opt-in:** token probes are insufficient for this lossy conversion; it still needs a pinned logit/perplexity quality campaign before any default flip.
+5. **Evidence durability/CI remains open:** current comparison and server artifacts live under `/private/tmp`; promotion requires retained artifacts plus hosted CI/repetition on a clean machine.
+
+The competitive priority is now unambiguous: short-context GPU/frame efficiency, especially E2B, not host encode. Long-context split-GQA already closes E4B to 87.7% of llama.cpp. The next performance round should therefore use the M4 Pro dispatch census to localize the remaining short-frame gap, then qualify command-plan reuse/concurrent dispatch and the A3 Q4_0 scales-plane/interleave relayout behind exact-output and watchdog gates.

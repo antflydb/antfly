@@ -8380,11 +8380,14 @@ fn makeRuntimeQ8StorageFromDense(values: []const f32, in_dim: usize, out_dim: us
     if (values.len % q8_values_per_block != 0) return null;
 
     const q8_bytes = try quant_codec.quantizeQ8_0FromF32(std.heap.c_allocator, values);
-    errdefer std.heap.c_allocator.free(q8_bytes);
-    const shape = try std.heap.c_allocator.alloc(i64, 2);
-    errdefer std.heap.c_allocator.free(shape);
+    const shape = std.heap.c_allocator.alloc(i64, 2) catch |err| {
+        std.heap.c_allocator.free(q8_bytes);
+        return err;
+    };
     shape[0] = @intCast(out_dim);
     shape[1] = @intCast(in_dim);
+    // Ownership transfers on call. The callee frees both allocations if its
+    // own setup fails, so no caller errdefer may remain armed across it.
     return try makeRuntimeQ8StorageFromOwnedBytes(q8_bytes, shape);
 }
 
@@ -8403,9 +8406,11 @@ fn makeRuntimeQ8StorageFromQuantized(storage: *const QuantizedStorage, dense_val
     decodeRuntimeStorageToFloat32(storage, dense_weight) catch return null;
 
     const q8_bytes = try quant_codec.quantizeQ8_0FromF32(std.heap.c_allocator, dense_weight);
-    errdefer std.heap.c_allocator.free(q8_bytes);
-    const shape = try std.heap.c_allocator.dupe(i64, storage.shape);
-    errdefer std.heap.c_allocator.free(shape);
+    const shape = std.heap.c_allocator.dupe(i64, storage.shape) catch |err| {
+        std.heap.c_allocator.free(q8_bytes);
+        return err;
+    };
+    // Ownership transfers on call; see makeRuntimeQ8StorageFromDense.
     return try makeRuntimeQ8StorageFromOwnedBytes(q8_bytes, shape);
 }
 
@@ -8707,11 +8712,12 @@ test "runtime generated Q8_0 staging uses mmap for large buffers" {
     const byte_count = @max(min_bytes, 1);
 
     const q8_bytes = try std.heap.c_allocator.alloc(u8, byte_count);
-    errdefer std.heap.c_allocator.free(q8_bytes);
     @memset(q8_bytes, 0x5a);
 
-    const shape = try std.heap.c_allocator.alloc(i64, 2);
-    errdefer std.heap.c_allocator.free(shape);
+    const shape = std.heap.c_allocator.alloc(i64, 2) catch |err| {
+        std.heap.c_allocator.free(q8_bytes);
+        return err;
+    };
     shape[0] = 1;
     shape[1] = @intCast(byte_count);
 
@@ -31020,7 +31026,14 @@ test "metal native q4_0 gated ffn device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.GatedFfnDirectNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    if (q4_0SplitGateUpReduceEnabled()) {
+    const pair_activation_used =
+        after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or
+        after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output;
+    if (pair_activation_used) {
+        // M4 defaults to the token-qualified pair+activation route even though
+        // the older split-reduce rollback remains enabled in isolation.
+        try std.testing.expectEqual(before_direct.q4_0_pair_reduce, after_direct.q4_0_pair_reduce);
+    } else if (q4_0SplitGateUpReduceEnabled()) {
         try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
         try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 3);
     } else {
@@ -31243,9 +31256,14 @@ test "metal native q4_0 gate up q6_k down device path matches decomposed" {
     }, input, residual, &stats)) orelse return error.UnexpectedNull;
     defer direct.deinit();
     const after_direct = runtimeMemorySnapshot(runtime);
-    if (q4_0SplitGateUpReduceEnabled()) {
+    const pair_activation_used =
+        after_direct.q4_0_pair_activation_reduce > before_direct.q4_0_pair_activation_reduce or
+        after_direct.q4_0_pair_activation_reduce_f16_output > before_direct.q4_0_pair_activation_reduce_f16_output;
+    if (pair_activation_used) {
+        try std.testing.expectEqual(before_direct.q4_0_pair_reduce, after_direct.q4_0_pair_reduce);
+    } else if (q4_0SplitGateUpReduceEnabled()) {
         // Split gate/up is the default: gate and up run as two q4_0 linear
-        // reduces instead of the fused pair kernel.
+        // reduces instead of either fused pair kernel.
         try std.testing.expect(after_direct.q4_0_pair_reduce == before_direct.q4_0_pair_reduce);
         try std.testing.expect(after_direct.q4_0_linear_reduce >= before_direct.q4_0_linear_reduce + 2);
     } else {
@@ -31982,12 +32000,18 @@ test "metal native q4_0 attention ffn block works inside active frame" {
     } else {
         try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     }
-    if (q4_0SplitGateUpReduceEnabled()) {
+    const pair_activation_used =
+        after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce or
+        after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output;
+    if (pair_activation_used) {
+        try std.testing.expectEqual(before_block.q4_0_pair_reduce, after_block.q4_0_pair_reduce);
+    } else if (q4_0SplitGateUpReduceEnabled()) {
         try std.testing.expect(after_block.q4_0_linear_reduce > before_block.q4_0_linear_reduce);
     } else {
         try std.testing.expect(
             after_block.q4_0_pair_reduce > before_block.q4_0_pair_reduce or
-                after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce,
+                after_block.q4_0_pair_activation_reduce > before_block.q4_0_pair_activation_reduce or
+                after_block.q4_0_pair_activation_reduce_f16_output > before_block.q4_0_pair_activation_reduce_f16_output,
         );
     }
 

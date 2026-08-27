@@ -1355,9 +1355,11 @@ typedef struct termite_metal_decode_runtime {
     uint64_t frame_submit_count;
     uint64_t frame_wait_nanos;
     uint64_t frame_gpu_nanos;
-    // Host wall time from frame begin to commit: the encode-CPU cost that
-    // residency sets / unretained command buffers would reduce (M0.3).
+    // Host wall time from frame begin to commit, with waits on the previously
+    // submitted pipelined frame tracked separately so M0.3 reports actual host
+    // encode work instead of attributing GPU wait time to the CPU.
     uint64_t active_frame_encode_started_nanos;
+    uint64_t active_frame_encode_wait_nanos;
     uint64_t last_frame_encode_cpu_nanos;
     CFMutableArrayRef active_frame_retained_resources;
     CFMutableArrayRef submitted_frame_retained_resources;
@@ -48732,6 +48734,7 @@ static int termite_metal_decode_runtime_begin_frame_internal(
         cb.label = @"termite_metal_decode_runtime_frame";
         runtime->active_frame_cb = cb;
         runtime->active_frame_encode_started_nanos = termite_metal_clock_monotonic_nanos();
+        runtime->active_frame_encode_wait_nanos = 0;
         runtime->frame_begin_count = termite_metal_u64_saturating_add(runtime->frame_begin_count, 1);
         if (prepared_request) {
             termite_metal_stage_timing_prepare_active_frame(runtime, TERMITE_METAL_FRAME_REGIME_DECODE);
@@ -48788,26 +48791,33 @@ int termite_metal_decode_runtime_submit_frame(termite_metal_decode_runtime *runt
     if (runtime->active_planned_compute_encoder != nil) {
         termite_metal_decode_runtime_close_planned_compute_encoder_for_transition(runtime);
     }
+    const uint64_t encode_now = termite_metal_clock_monotonic_nanos();
+    const uint64_t encode_wall_nanos = runtime->active_frame_encode_started_nanos != 0 &&
+        encode_now > runtime->active_frame_encode_started_nanos
+        ? encode_now - runtime->active_frame_encode_started_nanos
+        : 0;
+    const uint64_t encode_wait_nanos = runtime->active_frame_encode_wait_nanos < encode_wall_nanos
+        ? runtime->active_frame_encode_wait_nanos
+        : encode_wall_nanos;
+    const uint64_t encode_cpu_nanos = encode_wall_nanos - encode_wait_nanos;
     if (termite_metal_trace_frame_lifecycle_enabled()) {
         fprintf(
             stderr,
-            "metal_frame_lifecycle: submit compute=%llu blit=%llu planned_scopes=%llu planned_barriers=%llu encode_cpu_us=%llu\n",
+            "metal_frame_lifecycle: submit compute=%llu blit=%llu planned_scopes=%llu planned_barriers=%llu encode_wall_us=%llu encode_wait_us=%llu encode_cpu_us=%llu\n",
             (unsigned long long)runtime->active_frame_compute_encoder_count,
             (unsigned long long)runtime->active_frame_blit_encoder_count,
             (unsigned long long)runtime->active_frame_planned_compute_scope_count,
             (unsigned long long)runtime->active_frame_planned_barrier_count,
-            (unsigned long long)((termite_metal_clock_monotonic_nanos() - runtime->active_frame_encode_started_nanos) / 1000u)
+            (unsigned long long)(encode_wall_nanos / 1000u),
+            (unsigned long long)(encode_wait_nanos / 1000u),
+            (unsigned long long)(encode_cpu_nanos / 1000u)
         );
     }
     termite_metal_decode_runtime_print_planned_access_profile(runtime);
     runtime->last_frame_gpu_nanos = 0;
-    if (runtime->active_frame_encode_started_nanos != 0) {
-        const uint64_t encode_now = termite_metal_clock_monotonic_nanos();
-        runtime->last_frame_encode_cpu_nanos = encode_now > runtime->active_frame_encode_started_nanos
-            ? encode_now - runtime->active_frame_encode_started_nanos
-            : 0;
-        runtime->active_frame_encode_started_nanos = 0;
-    }
+    runtime->last_frame_encode_cpu_nanos = encode_cpu_nanos;
+    runtime->active_frame_encode_started_nanos = 0;
+    runtime->active_frame_encode_wait_nanos = 0;
     [cb commit];
     runtime->frame_submit_count = termite_metal_u64_saturating_add(runtime->frame_submit_count, 1);
     runtime->submitted_frame_cb = cb;
@@ -48903,6 +48913,8 @@ int termite_metal_decode_runtime_cancel_frame(termite_metal_decode_runtime *runt
     // Cancelled frame: its commands never execute, so release pooled buffers.
     termite_metal_decode_runtime_drain_reuse_pool(runtime, 0);
     runtime->active_frame_cb = nil;
+    runtime->active_frame_encode_started_nanos = 0;
+    runtime->active_frame_encode_wait_nanos = 0;
     runtime->active_frame_compute_encoder_count = 0;
     runtime->active_frame_blit_encoder_count = 0;
     runtime->active_frame_planned_compute_scope_count = 0;
@@ -48938,9 +48950,15 @@ int termite_metal_decode_runtime_wait_frame(termite_metal_decode_runtime *runtim
     [cb waitUntilCompleted];
     const uint64_t wait_finished = termite_metal_clock_monotonic_nanos();
     if (wait_finished > wait_started) {
+        const uint64_t wait_nanos = wait_finished - wait_started;
         runtime->frame_wait_nanos = termite_metal_u64_saturating_add(
             runtime->frame_wait_nanos,
-            wait_finished - wait_started);
+            wait_nanos);
+        if (runtime->active_frame_cb != nil && runtime->active_frame_encode_started_nanos != 0) {
+            runtime->active_frame_encode_wait_nanos = termite_metal_u64_saturating_add(
+                runtime->active_frame_encode_wait_nanos,
+                wait_nanos);
+        }
     }
     int status_code = (cb.status == MTLCommandBufferStatusCompleted) ? 0 : -3;
     runtime->last_frame_gpu_nanos = status_code == 0 ? termite_metal_command_buffer_gpu_elapsed_nanos(cb) : 0;

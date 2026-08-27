@@ -12447,9 +12447,14 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "decode_gqa_split unavailable; using paged attention fallback"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "(runtime->decode_gqa_split_explicitly_requested &&"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 1052672u"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, host_source, "newBufferWithLength:split_scratch_capacity"));
+    // Pipelined decode alternates a two-buffer scratch pool so the active
+    // frame never aliases the previously submitted split-GQA frame.
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "id<MTLBuffer> attention_decode_gqa_split_scratch_buffers[2]"));
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, host_source, "newBufferWithLength:split_scratch_capacity"));
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "options:MTLResourceStorageModePrivate"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "scratch_runtime->submitted_frame_cb != nil"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "attention_decode_gqa_split_scratch_index & 1u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "attention_decode_gqa_split_scratch_index ^= 1u"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, host_source, 1, "scratch_runtime->submitted_frame_cb != nil"));
 
     // Gemma4 E2B/E4B's measured routes are exact 8Q with 1KV or 2KV f16 KV,
     // q_len 1-2, and HD256 SWA-512 or HD512 global attention.

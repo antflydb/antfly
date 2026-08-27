@@ -5050,6 +5050,12 @@ pub const ModelManager = struct {
         self.load_lock.unlock();
     }
 
+    fn canPrewarmBeforeModelPublication(self: *ModelManager) bool {
+        self.lockLoadedModels();
+        defer self.unlockLoadedModels();
+        return modelCacheHasPublicationCapacity(self.loaded.count(), self.max_loaded_models);
+    }
+
     pub fn acquireLoadedModel(self: *ModelManager, model_dir: []const u8) ?ModelHandle {
         self.lockLoadedModels();
         defer self.unlockLoadedModels();
@@ -6056,7 +6062,15 @@ pub const ModelManager = struct {
         model_storage_owned = false;
         loaded_session.resource_lease = null;
 
-        if (build_options.enable_metal and shouldUseMetalWholeModelExecutor(session)) {
+        // Publication performs max-loaded eviction. When the cache is already
+        // full, prewarming first makes the incoming runtime compete with the
+        // still-resident eviction victim and emits a predictable resource
+        // warning. Skip that speculative work; generation prepares the runtime
+        // lazily after publication has reclaimed the victim.
+        if (build_options.enable_metal and
+            self.canPrewarmBeforeModelPublication() and
+            shouldUseMetalWholeModelExecutor(session))
+        {
             if (session_factory.getGptConfig(session)) |gpt_config| {
                 if (graph_mod.metal_executor.supportsSession(session)) {
                     _ = graph_mod.metal_executor.prewarmSharedDecoderRuntime(self.allocator, session, gpt_config) catch |err| {
@@ -6178,12 +6192,23 @@ pub const ModelManager = struct {
     }
 };
 
+fn modelCacheHasPublicationCapacity(loaded_count: usize, max_loaded_models: usize) bool {
+    return max_loaded_models == 0 or loaded_count < max_loaded_models;
+}
+
 fn backendVariantCacheKey(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     backend: backends.BackendType,
 ) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}\nbackend={s}", .{ model_dir, @tagName(backend) });
+}
+
+test "model prewarm defers while max-loaded eviction is pending" {
+    try std.testing.expect(modelCacheHasPublicationCapacity(10, 0));
+    try std.testing.expect(modelCacheHasPublicationCapacity(0, 1));
+    try std.testing.expect(!modelCacheHasPublicationCapacity(1, 1));
+    try std.testing.expect(!modelCacheHasPublicationCapacity(2, 1));
 }
 
 fn admissionEvictionTestModel(last_used_ns: u64) LoadedModel {
