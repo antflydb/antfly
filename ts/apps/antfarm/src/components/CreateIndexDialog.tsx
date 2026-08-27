@@ -52,7 +52,10 @@ interface CreateIndexDialogProps {
   tableName: string;
   onIndexCreated: () => void;
   schema: TableSchema | null;
+  /** Undefined while capability discovery is loading or unavailable. */
   artifactSourcesSupported?: boolean;
+  artifactSourcesCapabilityError?: boolean;
+  onRetryArtifactSourcesCapability?: () => void;
 }
 
 export function getSchemaFieldNames(schema: TableSchema | null): string[] {
@@ -381,7 +384,7 @@ export function buildGraphSourceConfig(source: GraphSourceFormData) {
 
 const IndexKindForm: React.FC<{
   schemaFields: string[];
-  artifactSourcesSupported: boolean;
+  artifactSourcesSupported: boolean | undefined;
 }> = ({ schemaFields, artifactSourcesSupported }) => {
   const { control, setValue, watch } = useFormContext<IndexFormData>();
   const indexType = watch("indexType");
@@ -393,7 +396,10 @@ const IndexKindForm: React.FC<{
   const graphEdgeTypes = useFieldArray({ control, name: "graphEdgeTypes" });
 
   useEffect(() => {
-    if (artifactSourcesSupported) return;
+    // Only a definitive negative capability response may rewrite user input.
+    // Loading and transient discovery failures are not evidence that the
+    // deployment lacks artifact-backed indexes.
+    if (artifactSourcesSupported !== false) return;
     if (sourceType === "artifacts") setValue("sourceType", "field", { shouldValidate: true });
     if (fullTextSourceType === "artifacts") {
       setValue("fullTextSourceType", "field", { shouldValidate: true });
@@ -450,7 +456,7 @@ const IndexKindForm: React.FC<{
         <IndexForm
           schemaFields={schemaFields}
           showName={false}
-          allowArtifactSources={artifactSourcesSupported}
+          allowArtifactSources={artifactSourcesSupported === true}
         />
       ) : indexType === "full_text" ? (
         <div className="space-y-3 rounded-md border p-3">
@@ -578,7 +584,7 @@ const IndexKindForm: React.FC<{
         </div>
       ) : (
         <div className="space-y-3 rounded-md border p-3">
-          {artifactSourcesSupported ? (
+          {artifactSourcesSupported === true ? (
             <FormField
               control={control}
               name="graphSourceType"
@@ -954,7 +960,9 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
   tableName,
   onIndexCreated,
   schema,
-  artifactSourcesSupported = false,
+  artifactSourcesSupported,
+  artifactSourcesCapabilityError = false,
+  onRetryArtifactSourcesCapability,
 }) => {
   const client = useApi();
   const [error, setError] = useState<string | null>(null);
@@ -1118,7 +1126,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       let indexConfig: IndexConfig;
       if (viewMode === "json") {
         indexConfig = parseAdvancedIndexConfig(jsonSource);
-        if (!artifactSourcesSupported && usesArtifactBackedIndexSource(indexConfig)) {
+        if (artifactSourcesSupported === false && usesArtifactBackedIndexSource(indexConfig)) {
           throw new Error("Artifact-backed index sources are unavailable on this deployment.");
         }
       } else if (data.indexType === "full_text") {
@@ -1287,6 +1295,26 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
         {error && (
           <Alert variant="destructive">
             <AlertDescription>{error}</AlertDescription>
+          </Alert>
+        )}
+
+        {artifactSourcesSupported === undefined && (
+          <Alert variant={artifactSourcesCapabilityError ? "destructive" : undefined}>
+            <AlertDescription>
+              {artifactSourcesCapabilityError
+                ? "Could not verify artifact-source support. Raw JSON requests can still be submitted for server-side validation."
+                : "Checking whether this deployment supports artifact-backed indexes…"}
+              {artifactSourcesCapabilityError && onRetryArtifactSourcesCapability && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="ml-2"
+                  onClick={onRetryArtifactSourcesCapability}
+                >
+                  Retry
+                </Button>
+              )}
+            </AlertDescription>
           </Alert>
         )}
 

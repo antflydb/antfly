@@ -381,4 +381,37 @@ describe("CreateIndexDialog", () => {
     expect(screen.queryByPlaceholderText("relations_v1")).toBeNull();
     expect(screen.queryByRole("radio", { name: "Artifact streams" })).toBeNull();
   });
+
+  it("keeps capability discovery failures distinct from unsupported deployments", async () => {
+    const retry = vi.fn();
+    mocks.createIndex.mockResolvedValue(undefined);
+    render(
+      <CreateIndexDialog
+        open
+        onClose={() => undefined}
+        tableName="docs"
+        onIndexCreated={() => undefined}
+        schema={null}
+        artifactSourcesSupported={undefined}
+        artifactSourcesCapabilityError
+        onRetryArtifactSourcesCapability={retry}
+      />
+    );
+
+    expect(screen.getByText(/could not verify artifact-source support/i)).toBeTruthy();
+    expect(screen.queryByText(/unavailable on this deployment/i)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("switch"));
+    fireEvent.change(screen.getByLabelText("Advanced index JSON"), {
+      target: {
+        value:
+          '{"name":"document_text","type":"full_text","sources":[{"artifact":"document_units_v1"}]}',
+      },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    await waitFor(() => expect(mocks.createIndex).toHaveBeenCalledOnce());
+  });
 });

@@ -261,7 +261,11 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [migration, setMigration] = useState<AntflyTable["migration"]>(undefined);
   const [error, setError] = useState<string | null>(null);
   const [openCreateDialog, setOpenCreateDialog] = useState(false);
-  const [artifactSourcesSupported, setArtifactSourcesSupported] = useState(false);
+  const [artifactSourcesSupported, setArtifactSourcesSupported] = useState<boolean | undefined>(
+    undefined
+  );
+  const [artifactSourcesCapabilityError, setArtifactSourcesCapabilityError] = useState(false);
+  const [artifactSourcesCapabilityRequest, setArtifactSourcesCapabilityRequest] = useState(0);
   const [openDropDialog, setOpenDropDialog] = useState(false);
   const [selectedIndex, setSelectedIndex] = useState<IndexStatus | null>(null);
   const [query, setQuery] = useState("");
@@ -274,21 +278,26 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   useEffect(() => {
     let active = true;
-    setArtifactSourcesSupported(false);
+    setArtifactSourcesSupported(undefined);
+    setArtifactSourcesCapabilityError(false);
     void client
       .getStatus()
       .then((status) => {
         if (active) {
           setArtifactSourcesSupported(status.index_capabilities?.artifact_sources === true);
+          setArtifactSourcesCapabilityError(false);
         }
       })
       .catch(() => {
-        if (active) setArtifactSourcesSupported(false);
+        if (active) {
+          setArtifactSourcesSupported(undefined);
+          setArtifactSourcesCapabilityError(true);
+        }
       });
     return () => {
       active = false;
     };
-  }, [client]);
+  }, [artifactSourcesCapabilityRequest, client]);
 
   // Derive search modes from input content instead of toggles
   const hasSemanticQuery = query.trim().length > 0 && queryIndexes.length > 0;
@@ -1554,6 +1563,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         onIndexCreated={handleIndexCreated}
         schema={tableSchema}
         artifactSourcesSupported={artifactSourcesSupported}
+        artifactSourcesCapabilityError={artifactSourcesCapabilityError}
+        onRetryArtifactSourcesCapability={() =>
+          setArtifactSourcesCapabilityRequest((request) => request + 1)
+        }
       />
       <Dialog open={openDropDialog} onOpenChange={setOpenDropDialog}>
         <DialogContent className="max-w-[450px]">

@@ -19070,7 +19070,7 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
 
-    const source_artifact_names = try parseArtifactSourcesAlloc(alloc, root.object);
+    var source_artifact_names = try parseArtifactSourcesAlloc(alloc, root.object);
     errdefer {
         for (source_artifact_names) |name| alloc.free(name);
         if (source_artifact_names.len > 0) alloc.free(source_artifact_names);
@@ -19081,6 +19081,21 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
         return error.InvalidIndexConfig;
     }
 
+    // `artifact_name` is the public one-source spelling of `sources`, whose
+    // contract accepts either chunk or textual asset streams. Keep only the
+    // internal `chunk_name` spelling in the chunk-only slot; otherwise asset
+    // sources would pass admission and then fail runtime catalog validation.
+    if (source_artifact_names.len == 0) {
+        if (root.object.get("artifact_name")) |value| {
+            if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
+            const owned_name = try alloc.dupe(u8, value.string);
+            errdefer alloc.free(owned_name);
+            const singular_source = try alloc.alloc([]u8, 1);
+            singular_source[0] = owned_name;
+            source_artifact_names = singular_source;
+        }
+    }
+
     const selected_field = if (root.object.get("field")) |value| blk: {
         if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
         break :blk try alloc.dupe(u8, value.string);
@@ -19088,12 +19103,10 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
     errdefer if (selected_field) |field| alloc.free(field);
 
     return .{
-        .source_artifact_name = if (root.object.get("artifact_name")) |value|
-            try alloc.dupe(u8, value.string)
-        else if (root.object.get("chunk_name")) |value|
-            try alloc.dupe(u8, value.string)
-        else
-            null,
+        .source_artifact_name = if (root.object.get("chunk_name")) |value| blk: {
+            if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
+            break :blk try alloc.dupe(u8, value.string);
+        } else null,
         .source_artifact_names = source_artifact_names,
         .selected_field = selected_field,
     };
@@ -23120,16 +23133,50 @@ test "generated enrichment request identity includes source_template" {
     try std.testing.expect(!hasGeneratedDenseEmbeddingRequest(requests[0..], "doc:1", "body", "{{body}}", "body_chunks", "body_embedding"));
 }
 
-test "parseTextConfig prefers source artifact name and accepts legacy chunk name" {
+test "parseTextConfig canonicalizes artifact name and accepts internal chunk name" {
     const alloc = std.testing.allocator;
 
     var cfg = try parseTextConfig(alloc, "{\"artifact_name\":\"body_chunks_v1\"}");
     defer cfg.deinit(alloc);
-    try std.testing.expectEqualStrings("body_chunks_v1", cfg.source_artifact_name.?);
+    try std.testing.expect(cfg.source_artifact_name == null);
+    try std.testing.expectEqual(@as(usize, 1), cfg.source_artifact_names.len);
+    try std.testing.expectEqualStrings("body_chunks_v1", cfg.source_artifact_names[0]);
 
-    var legacy = try parseTextConfig(alloc, "{\"chunk_name\":\"legacy_chunks_v1\"}");
-    defer legacy.deinit(alloc);
-    try std.testing.expectEqualStrings("legacy_chunks_v1", legacy.source_artifact_name.?);
+    var internal = try parseTextConfig(alloc, "{\"chunk_name\":\"internal_chunks_v1\"}");
+    defer internal.deinit(alloc);
+    try std.testing.expectEqualStrings("internal_chunks_v1", internal.source_artifact_name.?);
+}
+
+test "full text single artifact name accepts textual asset source" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+
+    try manager.addEnrichment(&store, .{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "text",
+    });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "document_text",
+        .kind = .full_text,
+        .config_json = "{\"artifact_name\":\"document_units_v1\",\"field\":\"text\"}",
+    }});
+
+    try std.testing.expectEqual(@as(usize, 1), manager.text_indexes.items.len);
+    const entry = manager.text_indexes.items[0];
+    try std.testing.expect(entry.chunk_name == null);
+    try std.testing.expectEqual(@as(usize, 1), entry.source_artifact_names.len);
+    try std.testing.expectEqualStrings("document_units_v1", entry.source_artifact_names[0]);
 }
 
 test "parseTextConfig accepts multiple artifact sources and rejects mixed aliases" {
