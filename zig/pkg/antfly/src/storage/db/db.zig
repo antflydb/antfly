@@ -10868,6 +10868,7 @@ pub const DB = struct {
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
             .operator_generation_rebuild => intent.phase == .activating or intent.phase == .validating,
+            .replay_artifact_unavailable => intent.phase == .activating or intent.phase == .validating,
             .artifact_coverage_mismatch,
             .artifact_counter_missing,
             .root_generation_rebuild,
@@ -11402,7 +11403,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         index_name: []const u8,
-        trigger: index_repair_state.Trigger,
+        blocking_trigger: index_repair_state.Trigger,
         reason: []const u8,
     ) !void {
         const cfg = self.core.index_manager.get(index_name) orelse return error.NotFound;
@@ -11416,7 +11417,10 @@ pub const DB = struct {
             const classifiable_phase = entry.intent.phase == .detected or entry.intent.phase == .preflight;
             if (!classifiable_phase or entry.intent.candidate_relative_path != null) return;
             try self.updateIndexRepairIntent(alloc, repair_id, .{
-                .trigger = trigger,
+                // Preserve the pre-existing intent's fail-closed contract.
+                // Only debt created from this replay observation has proof
+                // that the retained physical generation is serviceable.
+                .trigger = blocking_trigger,
                 .next_retry_at_ms = 0,
                 .last_error = reason,
                 .replace_last_error = true,
@@ -11426,7 +11430,7 @@ pub const DB = struct {
         _ = try self.createGenerationRepairIntent(
             alloc,
             cfg.*,
-            trigger,
+            .replay_artifact_unavailable,
             0,
             0,
             reason,
@@ -11727,7 +11731,7 @@ pub const DB = struct {
     fn automaticDenseGenerationRepairTriggerPriority(trigger: index_repair_state.Trigger) u8 {
         return switch (trigger) {
             .operator_generation_rebuild, .operator_generation_validation => 0,
-            .artifact_coverage_mismatch => 1,
+            .artifact_coverage_mismatch, .replay_artifact_unavailable => 1,
             .artifact_counter_missing => 2,
             .incomplete_bulk_publish, .root_generation_rebuild, .projection_generation_invalid => 3,
         };
@@ -12104,7 +12108,8 @@ pub const DB = struct {
         // after source artifacts are reprocessed. Structural-invalid and
         // externally supplied generations retain fail-closed classification.
         if (trigger != .operator_generation_rebuild and
-            trigger != .artifact_coverage_mismatch)
+            trigger != .artifact_coverage_mismatch and
+            trigger != .replay_artifact_unavailable)
         {
             return null;
         }
@@ -13006,7 +13011,8 @@ pub const DB = struct {
                 entry.intent.kind == .dense_vector and
                 self.enrichment_runtime != null and
                 (current_trigger == .operator_generation_rebuild or
-                    current_trigger == .artifact_coverage_mismatch))
+                    current_trigger == .artifact_coverage_mismatch or
+                    current_trigger == .replay_artifact_unavailable))
             {
                 // A shadow rebuild consumes stored embedding artifacts and
                 // cannot repair one missing below its snapshot floor. Re-arm
@@ -13047,7 +13053,8 @@ pub const DB = struct {
             const retryable_replacement_coverage =
                 err == error.RepairSourceCoverageIncomplete and
                 (current_trigger == .operator_generation_rebuild or
-                    current_trigger == .artifact_coverage_mismatch);
+                    current_trigger == .artifact_coverage_mismatch or
+                    current_trigger == .replay_artifact_unavailable);
             const terminal_failure =
                 !retryable_replacement_coverage and indexRepairFailureIsTerminal(err);
             try self.recordIndexRepairAttemptFailure(
@@ -21412,6 +21419,8 @@ pub const DB = struct {
         const managed_admission = intent.trigger == .projection_generation_invalid and
             intent.last_error != null and
             std.mem.eql(u8, intent.last_error.?, managed_catalog_admission_rebuild_reason);
+        const retained_replay_generation = intent.trigger == .replay_artifact_unavailable and
+            !self.core.index_manager.repairUnavailable(intent.index_name);
         // Query admission is monotonic for one managed incarnation. Once an
         // authoritative status sample proves the progressive generation safe,
         // clear the same resident gate used by search. A following producer
@@ -21423,6 +21432,7 @@ pub const DB = struct {
         }
         item.index_repair_active_generation_serviceable = active_generation_complete or
             active_generation_queryable or
+            retained_replay_generation or
             (managed_admission and !self.core.index_manager.repairUnavailable(intent.index_name));
         switch (intent.trigger) {
             .incomplete_bulk_publish,
@@ -21433,6 +21443,10 @@ pub const DB = struct {
             .artifact_coverage_mismatch, .artifact_counter_missing => {
                 // Source-coverage proof is incomplete or false. Keep the
                 // compact degraded state visible while queries fail closed.
+                item.backfill_active = intent.phase != .terminal;
+                item.repair_degraded = true;
+            },
+            .replay_artifact_unavailable => {
                 item.backfill_active = intent.phase != .terminal;
                 item.repair_degraded = true;
             },
@@ -21455,6 +21469,7 @@ pub const DB = struct {
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_validation)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_coverage_mismatch)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_counter_missing)) or
+            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.replay_artifact_unavailable)) or
             std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.projection_generation_invalid));
         return generation_build and
             !std.mem.eql(u8, item.index_repair_phase, @tagName(index_repair_state.Phase.terminal));
@@ -70604,6 +70619,15 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
     try std.testing.expectEqual(.embedding, issues[0].artifact_kind);
     try std.testing.expectEqualStrings("doc:a", issues[0].doc_key);
     try std.testing.expectEqualStrings("dv_v1", issues[0].artifact_name);
+    const repair_id = (try reopened.indexRepairIdForIndex(alloc, "dv_v1")) orelse
+        return error.TestUnexpectedResult;
+    var replay_repair = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+    defer replay_repair.deinit(alloc);
+    try std.testing.expectEqual(
+        index_repair_state.Trigger.replay_artifact_unavailable,
+        replay_repair.intent.trigger,
+    );
+    try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
 
     var result = try reopened.search(alloc, .{
         .index_name = "dv_v1",

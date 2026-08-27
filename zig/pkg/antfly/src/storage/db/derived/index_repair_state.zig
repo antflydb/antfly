@@ -73,6 +73,11 @@ pub const Trigger = enum(u8) {
     /// This state is fail-closed and may be promoted to the online operator
     /// rebuild trigger only after generation-scoped background validation.
     operator_generation_validation = 7,
+    /// Replay could not consume a missing or unreadable source artifact, but
+    /// the already-published physical generation remains structurally valid.
+    /// Rebuild the missing coverage in a shadow while retaining query access
+    /// until the replacement reaches its fenced activation boundary.
+    replay_artifact_unavailable = 8,
 };
 
 pub const Phase = enum(u8) {

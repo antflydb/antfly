@@ -1764,7 +1764,9 @@ fn aggregateIndexStatusIndexed(
                 aggregate.load_error = load_error;
             }
         }
-        if (statusFreshnessCountsAsFresh(runtime.metadata)) {
+        const index_observation_fresh = statusFreshnessCountsAsFresh(runtime.metadata) and
+            !item.runtime_observation_stale;
+        if (index_observation_fresh) {
             aggregate.fresh_group_count += 1;
             aggregate.runtime_fresh = true;
         } else if (statusFreshnessCountsAsRemoteUnknown(runtime.metadata)) {
@@ -1774,7 +1776,7 @@ fn aggregateIndexStatusIndexed(
         } else {
             aggregate.stale_group_count += 1;
         }
-        const observation_current = statusFreshnessCountsAsFresh(runtime.metadata) and
+        const observation_current = index_observation_fresh and
             coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
         // A serviceability proof is scoped to the dense incarnation itself,
         // not to the table-status publication epoch. Preserve it across a
@@ -1796,7 +1798,7 @@ fn aggregateIndexStatusIndexed(
         // Coverage is projected only from current observations. Stale groups
         // remain visible in diagnostics but cannot contribute cardinality or
         // outcomes to a complete aggregate.
-        if (statusFreshnessCountsAsFresh(runtime.metadata)) {
+        if (index_observation_fresh) {
             aggregate.table_doc_count +|= runtime.stats.source_doc_count;
             if (!observation_current) {
                 aggregate.coverage_config_mismatch_count += 1;
@@ -2741,6 +2743,59 @@ test "stale in-place status preserves an incarnation-scoped serviceability proof
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
         "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\",\"shard_observation_incomplete\",\"backfill\",\"coverage\",\"replay\"]}}",
+        encoded.items,
+    );
+}
+
+test "target-scoped stale full text observation cannot publish old readiness" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search_idx",
+        .kind = .full_text,
+        .runtime_observation_stale = true,
+        .doc_count = 8,
+        .term_count = 24,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .fresh },
+        .stats = .{ .source_doc_count = 8, .index_count = 1, .indexes = &indexes },
+    }};
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "search_idx",
+        &.{7},
+        0,
+        0,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.doc_count);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .full_text,
+        aggregate,
+        aggregate.table_doc_count,
+        .strict,
+        false,
+        0,
+        0,
+        null,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\",\"shard_observation_incomplete\",\"backfill\",\"replay\"]}}",
         encoded.items,
     );
 }
@@ -4017,12 +4072,17 @@ fn appendIndexReadinessStatus(
     active_generation_serviceable: bool,
 ) !void {
     const Item = @TypeOf(item);
-    const observation_fresh = runtime_present and if (metadata) |md|
-        md.freshness == .fresh
-    else if (@hasField(Item, "runtime_fresh"))
-        item.runtime_fresh
+    const item_observation_current = if (@hasField(Item, "runtime_observation_stale"))
+        !item.runtime_observation_stale
     else
         true;
+    const observation_fresh = runtime_present and item_observation_current and
+        if (metadata) |md|
+            md.freshness == .fresh
+        else if (@hasField(Item, "runtime_fresh"))
+            item.runtime_fresh
+        else
+            true;
     const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
         item.expected_group_count == item.fresh_group_count
     else

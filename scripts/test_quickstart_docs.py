@@ -14,6 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 QUICKSTART = REPO / "docs" / "guides" / "quickstart.mdx"
 GO_EXAMPLE = REPO / "go" / "pkg" / "sdk" / "examples" / "quickstart" / "main.go"
+QUICKSTART_TAPE = REPO / "quickstart.tape"
 
 
 def fail(message: str) -> None:
@@ -62,6 +63,7 @@ def check_json_payloads(source: str) -> None:
 def main() -> int:
     source = QUICKSTART.read_text(encoding="utf-8")
     go_example = GO_EXAMPLE.read_text(encoding="utf-8")
+    quickstart_tape = QUICKSTART_TAPE.read_text(encoding="utf-8")
 
     check_component_balance(source)
     blocks = fenced_blocks(source)
@@ -130,6 +132,12 @@ def main() -> int:
         fail("every quickstart index wait must stop at first safe queryability")
     if "rg '" in source:
         fail("quickstart troubleshooting must not require undeclared ripgrep tooling")
+    if "--until queryable" not in quickstart_tape:
+        fail("the quickstart recording must wait for queryability")
+    if "Wait@1200s /reached queryable:/" not in quickstart_tape:
+        fail("the quickstart recording must match the queryable success message")
+    if "Wait@1200s /ready/" in quickstart_tape:
+        fail("the quickstart recording must not wait for the complete-only ready state")
 
     for token in (
         "NewAntflyClient(\"http://localhost:8080\", http.DefaultClient)",

@@ -1363,6 +1363,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         indexes[i] = .{
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
+            .runtime_observation_stale = item.runtime_observation_stale,
             .load_error = load_error,
             .doc_count = item.doc_count,
             .term_count = item.term_count,

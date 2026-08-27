@@ -2845,6 +2845,10 @@ pub const AlgebraicProgressStatus = struct {
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
+    // Status-plane overlay used to fence one catalog target while retaining
+    // authoritative observations for unaffected sibling indexes. This is an
+    // internal observation fact and is not serialized in the public API.
+    runtime_observation_stale: bool = false,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
