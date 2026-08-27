@@ -42,6 +42,7 @@ from antfly.client_generated.types import UNSET
 
 from .exceptions import AntflyException, InferenceAPIError, InferenceCapacityError, StorageResourceExhaustedError
 from .graph_queries import require_graph_identifier as _require_graph_identifier
+from .graph_results import decode_query_responses
 
 DEFAULT_WRITE_MAX_REQUEST_BYTES = 64 << 20
 DEFAULT_MAX_JSON_RESPONSE_BYTES = 64 << 20
@@ -821,7 +822,7 @@ class AntflyClient:
                 body[key] = value
 
         response = self._request("POST", f"/db/v1/tables/{quote(table, safe='')}/query", json=body)
-        return QueryResponses.from_dict(response)
+        return decode_query_responses(response)
 
     def get(self, table: str, key: str) -> dict[str, Any]:
         """

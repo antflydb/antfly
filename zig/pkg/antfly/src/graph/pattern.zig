@@ -381,9 +381,10 @@ pub const DistinctBudget = struct {
 };
 
 pub fn ensureBorrowedDistinctMapCapacity(
+    comptime Value: type,
     alloc: Allocator,
     budget: *DistinctBudget,
-    map: *node_identity.BorrowedMap(void),
+    map: *node_identity.BorrowedMap(Value),
     count: usize,
 ) !void {
     const target_capacity = work_budget_mod.hashMapCapacityForCount(
@@ -393,12 +394,12 @@ pub fn ensureBorrowedDistinctMapCapacity(
     if (target_capacity <= map.capacity()) return;
     const current_bytes = work_budget_mod.hashMapRetainedBytes(
         node_identity.Ref,
-        void,
+        Value,
         map.capacity(),
     ) catch return error.GraphDistinctBudgetExceeded;
     const target_bytes = work_budget_mod.hashMapRetainedBytes(
         node_identity.Ref,
-        void,
+        Value,
         target_capacity,
     ) catch return error.GraphDistinctBudgetExceeded;
     try budget.consumeRetainedBytes(target_bytes - current_bytes);
@@ -2149,6 +2150,7 @@ const StreamingCountAccumulator = struct {
             self.distinct_values.items.len + 1,
         );
         try ensureBorrowedDistinctMapCapacity(
+            void,
             alloc,
             self.distinct_budget,
             &self.seen,

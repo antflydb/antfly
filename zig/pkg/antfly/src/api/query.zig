@@ -874,7 +874,12 @@ const GraphAggregateResultBuilder = struct {
     distinct: bool,
     distinct_budget: *graph_pattern.DistinctBudget,
     distinct_values: std.ArrayListUnmanaged(graph_node_identity.Ref) = .empty,
-    distinct_seen: graph_node_identity.BorrowedMap(void) = .{},
+    // Each retained identity records the last incoming shard payload in which
+    // it appeared. Cross-shard overlap is valid and must be deduplicated, but a
+    // duplicate within one shard payload means the shard's exact value/identity
+    // proof is malformed and must fail closed.
+    distinct_seen: graph_node_identity.BorrowedMap(usize) = .{},
+    distinct_batch: usize = 0,
 
     fn appendDistinctValues(
         self: *GraphAggregateResultBuilder,
@@ -882,9 +887,18 @@ const GraphAggregateResultBuilder = struct {
         incoming: db_mod.types.GraphAggregateResult,
     ) !void {
         if (incoming.value > 0 and incoming.distinct_values.len == 0)
-            return error.InvalidQueryRequest;
+            return error.InvalidRemoteResponse;
+        self.distinct_batch = std.math.add(usize, self.distinct_batch, 1) catch
+            return error.InvalidRemoteResponse;
+        const batch = self.distinct_batch;
         for (incoming.distinct_values) |value| {
-            if (self.distinct_seen.contains(value)) continue;
+            if (value.key.len == 0 or (value.table != null and value.table.?.len == 0))
+                return error.InvalidRemoteResponse;
+            if (self.distinct_seen.getPtr(value)) |last_batch| {
+                if (last_batch.* == batch) return error.InvalidRemoteResponse;
+                last_batch.* = batch;
+                continue;
+            }
             try self.distinct_budget.consume(value);
             try graph_pattern.ensureDistinctValueCapacity(
                 alloc,
@@ -893,6 +907,7 @@ const GraphAggregateResultBuilder = struct {
                 self.distinct_values.items.len + 1,
             );
             try graph_pattern.ensureBorrowedDistinctMapCapacity(
+                usize,
                 alloc,
                 self.distinct_budget,
                 &self.distinct_seen,
@@ -905,7 +920,7 @@ const GraphAggregateResultBuilder = struct {
                 if (removed.table) |table| alloc.free(table);
                 alloc.free(removed.key);
             }
-            self.distinct_seen.putAssumeCapacityNoClobber(owned, {});
+            self.distinct_seen.putAssumeCapacityNoClobber(owned, batch);
         }
         self.value = self.distinct_values.items.len;
     }
@@ -4002,6 +4017,58 @@ test "graph merge rejects missing and inexact aggregate shards" {
     try std.testing.expectError(
         error.InvalidRemoteResponse,
         mergeGraphSearchResults(alloc, &distinct_queries, &incomplete_results),
+    );
+
+    var duplicate_values = [_]graph_node_identity.Ref{
+        .{ .table = "people", .key = "one" },
+        .{ .table = "people", .key = "one" },
+    };
+    var duplicate_distinct = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("unique"),
+        .value = duplicate_values.len,
+        .distinct_values = &duplicate_values,
+    }};
+    var duplicate_distinct_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("counted"),
+        .aggregates = &duplicate_distinct,
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const duplicate_distinct_results = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &duplicate_distinct_graph,
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &distinct_queries, &duplicate_distinct_results),
+    );
+
+    var invalid_identity_values = [_]graph_node_identity.Ref{.{
+        .table = "people",
+        .key = "",
+    }};
+    var invalid_identity_distinct = [_]db_mod.types.GraphAggregateResult{.{
+        .name = @constCast("unique"),
+        .value = invalid_identity_values.len,
+        .distinct_values = &invalid_identity_values,
+    }};
+    var invalid_identity_graph = [_]db_mod.types.GraphSearchResult{.{
+        .name = @constCast("counted"),
+        .aggregates = &invalid_identity_distinct,
+        .hits = &.{},
+        .total_hits = 0,
+    }};
+    const invalid_identity_results = [_]db_mod.types.SearchResult{.{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = &invalid_identity_graph,
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        mergeGraphSearchResults(alloc, &distinct_queries, &invalid_identity_results),
     );
 }
 

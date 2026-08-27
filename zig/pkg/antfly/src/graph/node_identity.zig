@@ -130,6 +130,10 @@ pub fn BorrowedMap(comptime Value: type) type {
             return self.inner.contains(ref);
         }
 
+        pub fn getPtr(self: *Self, ref: Ref) ?*Value {
+            return self.inner.getPtr(ref);
+        }
+
         pub fn capacity(self: *const Self) usize {
             return self.inner.capacity();
         }
