@@ -50,7 +50,7 @@ var _ = Describe("InferencePool Controller", func() {
 					Models: antflyaiv1alpha1.ModelConfig{
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{
-								Name:         "bge-small-en-v1.5",
+								Name:         "BAAI/bge-small-en-v1.5:i8",
 								Tasks:        []string{"embed"},
 								Capabilities: []string{"text"},
 								Priority:     antflyaiv1alpha1.ModelPriorityHigh,
@@ -100,7 +100,7 @@ var _ = Describe("InferencePool Controller", func() {
 				return err == nil
 			}, timeout, interval).Should(BeTrue())
 
-			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_MODELS"]).To(Equal("bge-small-en-v1.5"))
+			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_MODELS"]).To(Equal("BAAI/bge-small-en-v1.5:i8"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_POOL"]).To(Equal(poolName))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_WORKLOAD_TYPE"]).To(Equal("general"))
 			Expect(createdConfigMap.Data["ANTFLY_INFERENCE_LOADING_STRATEGY"]).To(Equal("eager"))
@@ -117,7 +117,7 @@ var _ = Describe("InferencePool Controller", func() {
 			preloadModel, ok := preload[0].(map[string]any)
 			Expect(ok).To(BeTrue())
 			Expect(preloadModel).To(HaveKeyWithValue("kind", "embedder"))
-			Expect(preloadModel).To(HaveKeyWithValue("name", "bge-small-en-v1.5"))
+			Expect(preloadModel).To(HaveKeyWithValue("name", "BAAI/bge-small-en-v1.5:i8"))
 			Expect(preloadModel).NotTo(HaveKey("backend"))
 
 			// Verify the StatefulSet was created
@@ -147,7 +147,7 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.InitContainers[0].Args[0]).To(ContainSubstring(defaultLibTPUURL))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[1].Args).To(Equal([]string{
-				"inference", "pull", "bge-small-en-v1.5", "--models-dir", "/models",
+				"inference", "pull", "BAAI/bge-small-en-v1.5:i8", "--models-dir", "/models",
 				"--tasks", "embed", "--capabilities", "text",
 			}))
 			Expect(createdSts.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
@@ -448,7 +448,7 @@ var _ = Describe("InferencePool Controller", func() {
 						Preload: []antflyaiv1alpha1.ModelSpec{
 							{Name: "model-a:i8"},
 							{Name: "model-b"},
-							{Name: "model-c:i8"},
+							{Name: "model-c:i8", Strategy: antflyaiv1alpha1.LoadingStrategyLazy},
 						},
 						LoadingStrategy: antflyaiv1alpha1.LoadingStrategyEager,
 					},
@@ -480,6 +480,13 @@ var _ = Describe("InferencePool Controller", func() {
 			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Command).To(Equal([]string{"/antfly"}))
 			Expect(createdSts.Spec.Template.Spec.InitContainers[2].Args).To(Equal([]string{
 				"inference", "pull", "model-c:i8", "--models-dir", "/models",
+			}))
+			Expect(createdSts.Spec.Template.Spec.Containers[0].Args).To(Equal([]string{
+				"inference", "run",
+				"--host", "0.0.0.0",
+				"--port", "8080",
+				"--config", "/config/config.json",
+				"--allow-insecure-public-bind",
 			}))
 
 			Expect(k8sClient.Delete(ctx, pool)).Should(Succeed())
