@@ -6911,11 +6911,23 @@ pub const VoprPublicClusterFixture = struct {
         self: *VoprPublicClusterFixture,
         transition_id: u64,
     ) !bool {
+        const phase = (try self.externalDataSplitPhase(transition_id)) orelse return false;
+        return phase == .finalized;
+    }
+
+    /// Return the metadata leader's durable view of an externally executed
+    /// split. Deployment-shaped VOPR histories use this to place public work
+    /// inside a real nonterminal topology transition without importing the
+    /// metadata control loop into the scenario.
+    pub fn externalDataSplitPhase(
+        self: *VoprPublicClusterFixture,
+        transition_id: u64,
+    ) !?data_mod.RangeTransitionPhase {
         const leader_index = currentMetadataLeaderIndex(&self.cluster) orelse
-            return false;
+            return null;
         const observation = try self.cluster.node(leader_index).observeSplitTransition(transition_id) orelse
-            return false;
-        return observation.status.phase == .finalized;
+            return null;
+        return observation.status.phase;
     }
 
     /// Publish the finalized transition marker, then atomically replace the

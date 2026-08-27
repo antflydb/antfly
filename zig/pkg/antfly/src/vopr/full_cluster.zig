@@ -1,9 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Deployment-shaped exact-replay composition. A metadata quorum, two hosted
-//! data replicas, three public API nodes, two client tasks, and a production
-//! serverless worker share one VoprIo scheduler and virtual clock.
+//! Deployment-shaped exact-replay composition. Hosted-data fault campaigns and
+//! production-DataServer campaigns share a metadata quorum, three public API
+//! nodes, concurrent clients, and a production serverless worker on one VoprIo
+//! scheduler and virtual clock.
 
 const std = @import("std");
 const vopr = @import("vopr");
@@ -15,13 +16,14 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 13;
+    pub const version: u32 = 14;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
     const routing_id = vopr.id.stable(name, "non-host-routing-sound");
     const isolation_id = vopr.id.stable(name, "multi-table-isolation");
     const graph_query_id = vopr.id.stable(name, "public-cross-range-graph-query-sound");
+    const graph_split_id = vopr.id.stable(name, "public-graph-survives-active-split");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
     const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
@@ -41,6 +43,7 @@ pub const Scenario = struct {
         .{ .id = routing_id, .name = name ++ ".non-host-routing-sound", .kind = .always },
         .{ .id = isolation_id, .name = name ++ ".multi-table-isolation", .kind = .always },
         .{ .id = graph_query_id, .name = name ++ ".public-cross-range-graph-query-sound", .kind = .always },
+        .{ .id = graph_split_id, .name = name ++ ".public-graph-survives-active-split", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
         .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
@@ -69,16 +72,18 @@ pub const Scenario = struct {
         production_data_plane_baseline,
         production_data_plane_graph,
         production_data_plane,
+        production_data_plane_graph_split,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
                 self == .production_data_plane_graph or
-                self == .production_data_plane;
+                self == .production_data_plane or
+                self == .production_data_plane_graph_split;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -109,6 +114,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "production-data-plane-baseline"),
         vopr.id.stable(name, "production-data-plane-graph"),
         vopr.id.stable(name, "production-data-plane"),
+        vopr.id.stable(name, "production-data-plane-graph-split"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -123,7 +129,13 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-baseline",
         name ++ ".production-data-plane-graph",
         name ++ ".production-data-plane",
+        name ++ ".production-data-plane-graph-split",
     };
+
+    const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
+    const production_graph_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph);
+    const production_split_ordinal: usize = @intFromEnum(Mode.production_data_plane);
+    const production_graph_split_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -199,6 +211,11 @@ pub const Scenario = struct {
         resource_pressure_observed: bool = false,
         resource_denial_error_code: u64 = 0,
         graph_query_ok: bool = false,
+        split_graph_inflight_started: bool = false,
+        split_graph_inflight_complete: bool = false,
+        split_graph_inflight_rejected: bool = false,
+        split_graph_inflight_ok: bool = false,
+        post_split_graph_query_ok: bool = false,
         graph_inflight_restart_observed: bool = false,
         graph_inflight_restart_recovered: bool = false,
         graph_topology_churn_observed: bool = false,
@@ -321,6 +338,11 @@ pub const Scenario = struct {
                     .requests_ok = snapshot.requests_ok,
                     .topology_ok = snapshot.topology_ok,
                     .graph_query_ok = snapshot.graph_query_ok,
+                    .split_graph_inflight_started = snapshot.split_graph_inflight_started,
+                    .split_graph_inflight_complete = snapshot.split_graph_inflight_complete,
+                    .split_graph_inflight_rejected = snapshot.split_graph_inflight_rejected,
+                    .split_graph_inflight_ok = snapshot.split_graph_inflight_ok,
+                    .post_split_graph_query_ok = snapshot.post_split_graph_query_ok,
                     .cleanup_ok = snapshot.cleanup_ok,
                     .raft_wire_requests = snapshot.raft_wire_requests,
                     .node_resource_managers = snapshot.node_resource_managers,
@@ -375,8 +397,12 @@ pub const Scenario = struct {
                     self.complete = true;
                     return;
                 };
-                self.production_cluster.?.setActiveSplitEnabled(mode == .production_data_plane);
-                self.production_cluster.?.setGraphEnabled(mode == .production_data_plane_graph);
+                self.production_cluster.?.setActiveSplitEnabled(
+                    mode == .production_data_plane or mode == .production_data_plane_graph_split,
+                );
+                self.production_cluster.?.setGraphEnabled(
+                    mode == .production_data_plane_graph or mode == .production_data_plane_graph_split,
+                );
                 self.production_cluster.?.bootstrap() catch |err| {
                     const teardown_cancelled = blk: {
                         std.Io.checkCancel(self.sim.io()) catch |cancel_err|
@@ -542,7 +568,7 @@ pub const Scenario = struct {
                     .resource,
                     domain_id,
                 ),
-                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane => {},
+                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split => {},
             }
         }
 
@@ -681,6 +707,11 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".tenant-read-ok", @intFromBool(if (production) |value| value.tenant_sound else if (fixture) |public_cluster| public_cluster.tenant_read_sound else false));
         try builder.addNamed(allocator, name ++ ".table-isolation-ok", @intFromBool(if (production) |value| value.tenant_sound else if (fixture) |public_cluster| public_cluster.table_isolation_sound else false));
         try builder.addNamed(allocator, name ++ ".public-cross-range-graph-query", @intFromBool(if (cluster) |snapshot| snapshot.graph_query_ok else false));
+        try builder.addNamed(allocator, name ++ ".public-split-graph-inflight-started", @intFromBool(if (cluster) |snapshot| snapshot.split_graph_inflight_started else false));
+        try builder.addNamed(allocator, name ++ ".public-split-graph-inflight-complete", @intFromBool(if (cluster) |snapshot| snapshot.split_graph_inflight_complete else false));
+        try builder.addNamed(allocator, name ++ ".public-split-graph-inflight-rejected", @intFromBool(if (cluster) |snapshot| snapshot.split_graph_inflight_rejected else false));
+        try builder.addNamed(allocator, name ++ ".public-split-graph-inflight-ok", @intFromBool(if (cluster) |snapshot| snapshot.split_graph_inflight_ok else false));
+        try builder.addNamed(allocator, name ++ ".public-post-split-graph-query", @intFromBool(if (cluster) |snapshot| snapshot.post_split_graph_query_ok else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-inflight-restart-recovered", @intFromBool(if (cluster) |snapshot| snapshot.graph_inflight_restart_recovered else false));
         try builder.addNamed(allocator, name ++ ".graph-topology-churn-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_topology_churn_observed else false));
@@ -716,7 +747,8 @@ pub const Scenario = struct {
         const production = state.production_cluster;
         const cluster = state.clusterHealth();
         const production_mode = state.mode != null and state.mode.?.isProduction();
-        const production_graph_mode = state.mode == .production_data_plane_graph;
+        const production_graph_mode = state.mode == .production_data_plane_graph or
+            state.mode == .production_data_plane_graph_split;
         const resources = state.sim.resourceSnapshot();
         try sink.check(allocator, acknowledged_id, !state.complete or (cluster != null and cluster.?.requests_ok));
         try sink.check(allocator, quorum_id, !state.complete or (cluster != null and cluster.?.topology_ok));
@@ -728,6 +760,11 @@ pub const Scenario = struct {
                 !production_graph_mode or (cluster != null and cluster.?.graph_query_ok)
             else
                 cluster != null and cluster.?.graph_query_ok));
+        try sink.check(allocator, graph_split_id, !state.complete or state.mode.? != .production_data_plane_graph_split or
+            (cluster != null and cluster.?.graph_query_ok and
+                cluster.?.split_graph_inflight_started and cluster.?.split_graph_inflight_ok and
+                (cluster.?.split_graph_inflight_complete != cluster.?.split_graph_inflight_rejected) and
+                cluster.?.post_split_graph_query_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
                 cluster.?.graph_query_ok));
@@ -795,10 +832,12 @@ fn runExactMode(
     completion_expectation: CompletionExpectation,
 ) !void {
     const backend_ids = vopr.vopr_io.artifactBackendIds();
-    const active_split_mode = mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 1];
-    const production_mode = active_split_mode or
-        mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 2] or
-        mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 3];
+    const production_baseline_mode = mode_id == Scenario.mode_ids[Scenario.production_baseline_ordinal];
+    const production_graph_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_ordinal];
+    const production_split_mode = mode_id == Scenario.mode_ids[Scenario.production_split_ordinal];
+    const production_graph_split_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_ordinal];
+    const production_mode = production_baseline_mode or production_graph_mode or
+        production_split_mode or production_graph_split_mode;
     var fair_choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
     var cooperative_choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
     const choice_source = if (production_mode)
@@ -811,9 +850,11 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 1])
+            (if (production_graph_split_mode)
+                "full-cluster-vopr-v14-graph-split"
+            else if (production_split_mode)
                 "full-cluster-vopr-v12"
-            else if (mode_id == Scenario.mode_ids[Scenario.mode_ids.len - 2])
+            else if (production_graph_mode)
                 "full-cluster-vopr-v13-graph"
             else
                 "full-cluster-vopr-v11")
@@ -888,7 +929,7 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
     // Keep the promoted aggregate on its last green contract. Experimental
     // modes receive a distinct focused gate and join this slice only after
     // their recorded history and exact replay pass within the tier budget.
-    const promoted_mode_count = Scenario.mode_ids.len - 3;
+    const promoted_mode_count = Scenario.production_baseline_ordinal;
     for (Scenario.mode_ids[0..promoted_mode_count], 0..) |mode_id, mode_ordinal| {
         try runExactMode(history_alloc, mode_id, mode_ordinal, 50_000, .complete);
     }
@@ -897,7 +938,7 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
 test "full cluster production data plane VOPR active split exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = Scenario.mode_ids.len - 1;
+    const ordinal = Scenario.production_split_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],
@@ -910,7 +951,7 @@ test "full cluster production data plane VOPR active split exact replay" {
 test "full cluster production data plane graph exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = Scenario.mode_ids.len - 2;
+    const ordinal = Scenario.production_graph_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],
@@ -920,10 +961,23 @@ test "full cluster production data plane graph exact replay" {
     );
 }
 
+test "full cluster production data plane graph active split exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_graph_split_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        400_000,
+        .complete,
+    );
+}
+
 test "full cluster production data plane VOPR bounded cutoff exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = Scenario.mode_ids.len - 1;
+    const ordinal = Scenario.production_split_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],
@@ -936,7 +990,7 @@ test "full cluster production data plane VOPR bounded cutoff exact replay" {
 test "full cluster production data plane baseline exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = Scenario.mode_ids.len - 3;
+    const ordinal = Scenario.production_baseline_ordinal;
     try runExactMode(
         history_allocator.allocator(),
         Scenario.mode_ids[ordinal],

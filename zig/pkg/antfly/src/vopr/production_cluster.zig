@@ -15,6 +15,7 @@ const metadata_sim = @import("../metadata/sim_harness.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const api_http_client = @import("../api/http_client.zig");
+const api_http_server = @import("../api/http_server.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const common_http = @import("../common/http/http_common.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
@@ -75,9 +76,11 @@ pub const Fixture = struct {
         reads_complete,
         graph_query_complete,
         split_requested,
+        split_graph_query_started,
         split_finalized,
         split_published,
         post_split_read_complete,
+        post_split_graph_query_complete,
         cleanup_complete,
         complete,
     };
@@ -167,6 +170,7 @@ pub const Fixture = struct {
     control_requests: std.Io.Semaphore = .{},
     control_completions: std.Io.Semaphore = .{},
     control_round_active: bool = false,
+    public_request_ingress_count: u64 = 0,
     write_statuses: [3]u16 = .{ 0, 0, 0 },
     write_body_digests: [3]u64 = .{ 0, 0, 0 },
     write_attempts: [3]u64 = .{ 0, 0, 0 },
@@ -184,6 +188,11 @@ pub const Fixture = struct {
     read_sound: bool = false,
     tenant_sound: bool = false,
     graph_sound: bool = false,
+    split_graph_inflight_started: bool = false,
+    split_graph_inflight_complete: bool = false,
+    split_graph_inflight_rejected: bool = false,
+    split_graph_inflight_sound: bool = false,
+    post_split_graph_sound: bool = false,
     topology_sound: bool = false,
     split_sound: bool = false,
     split_finalized: bool = false,
@@ -347,6 +356,10 @@ pub const Fixture = struct {
                 .api_server_cfg = .{
                     .internal_service_secret = internal_service_secret,
                     .internal_service_issuer = internal_service_issuer,
+                    .request_lifecycle_hook = .{
+                        .ptr = self,
+                        .reach_fn = observePublicRequestLifecycle,
+                    },
                 },
                 .metadata_request_executors = &request_executors,
                 .data_raft_request_executor = self.raft_executor.executor(),
@@ -446,6 +459,14 @@ pub const Fixture = struct {
         self.last_request_lifecycle_group = event.group_id;
         self.last_request_lifecycle_index = event.log_index;
         self.last_request_lifecycle_phase = event.phase;
+    }
+
+    fn observePublicRequestLifecycle(
+        ptr: *anyopaque,
+        event: api_http_server.RequestLifecycleEvent,
+    ) !void {
+        const self: *Fixture = @ptrCast(@alignCast(ptr));
+        if (event.phase == .ingress) self.public_request_ingress_count +|= 1;
     }
 
     fn ensureMetadataIncarnation(self: *Fixture) !void {
@@ -857,7 +878,23 @@ pub const Fixture = struct {
             split_key,
         );
         self.phase = .split_requested;
-        try self.waitForSplitFinalized();
+        if (self.graph_enabled) {
+            try self.waitForSplitInProgress();
+            const ingress_before = self.public_request_ingress_count;
+            self.split_graph_inflight_sound = probe: {
+                var in_flight_graph = self.sim.io().async(runSplitGraphProbe, .{self});
+                errdefer _ = in_flight_graph.cancel(self.sim.io()) catch {};
+                try self.waitForPublicIngressAfter(ingress_before);
+                self.split_graph_inflight_started = true;
+                self.phase = .split_graph_query_started;
+                try self.waitForSplitFinalized();
+                break :probe try in_flight_graph.await(self.sim.io());
+            };
+            if (!self.split_graph_inflight_sound)
+                return error.ProductionDataInFlightSplitGraphQueryFailed;
+        } else {
+            try self.waitForSplitFinalized();
+        }
         self.split_finalized = true;
         self.phase = .split_finalized;
 
@@ -882,6 +919,22 @@ pub const Fixture = struct {
         self.topology_sound = self.topology_sound and self.split_sound;
         self.phase = .post_split_read_complete;
         if (!self.split_sound) return error.ProductionDataSplitRoundTripFailed;
+
+        if (self.graph_enabled) {
+            // The split key moves doc:k to the newly published destination
+            // while doc:c and doc:x retain their original owners. Re-run both
+            // directions through the public coordinator so this history proves
+            // graph planning, Raft/derived-state visibility, and hydration
+            // against the post-cutover three-range topology rather than merely
+            // observing that the migrated document is individually readable.
+            const right_hop_sound = try self.runGraphQuery("doc:x", 1, &.{"doc:k"});
+            const round_trip_sound = try self.runGraphQuery("doc:c", 2, &.{ "doc:x", "doc:k" });
+            self.post_split_graph_sound = right_hop_sound and round_trip_sound;
+            self.graph_sound = self.graph_sound and self.post_split_graph_sound;
+            self.phase = .post_split_graph_query_complete;
+            if (!self.post_split_graph_sound)
+                return error.ProductionDataPostSplitGraphQueryFailed;
+        }
     }
 
     fn runGraphQuery(
@@ -919,40 +972,91 @@ pub const Fixture = struct {
                 try self.sim.io().sleep(.fromMilliseconds(1), .awake);
                 continue;
             }
+            return try self.graphResponseComplete(response.body, start_key, max_depth, expected_keys);
+        }
+        return false;
+    }
 
-            var parsed = try std.json.parseFromSlice(
-                metadata_openapi.QueryResponses,
-                self.alloc,
-                response.body,
-                .{},
+    fn runSplitGraphProbe(self: *Fixture) !bool {
+        const query_body = try test_contract_helpers.encodeGraphTraverseQueryRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{"doc:c"},
+            &.{"links"},
+            2,
+            10,
+        );
+        defer self.alloc.free(query_body);
+
+        var response = try self.client.fetchQueryRaw(self.data_api_uris[1], "docs", query_body);
+        defer response.deinit(self.alloc);
+        switch (response.status) {
+            200 => {
+                self.split_graph_inflight_complete = try self.graphResponseComplete(
+                    response.body,
+                    "doc:c",
+                    2,
+                    &.{ "doc:x", "doc:k" },
+                );
+                return self.split_graph_inflight_complete;
+            },
+            409, 503 => {
+                // A request crossing topology publication may fail closed,
+                // but it must never return a successful partial traversal.
+                self.split_graph_inflight_rejected = true;
+                return true;
+            },
+            else => return error.UnexpectedHttpStatus,
+        }
+    }
+
+    fn waitForPublicIngressAfter(self: *Fixture, baseline: u64) !void {
+        for (0..1_024) |_| {
+            if (self.public_request_ingress_count > baseline) return;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.ProductionDataGraphIngressTimeout;
+    }
+
+    fn graphResponseComplete(
+        self: *Fixture,
+        body: []const u8,
+        start_key: []const u8,
+        max_depth: u32,
+        expected_keys: []const []const u8,
+    ) !bool {
+        var parsed = try std.json.parseFromSlice(
+            metadata_openapi.QueryResponses,
+            self.alloc,
+            body,
+            .{},
+        );
+        defer parsed.deinit();
+        const responses = parsed.value.responses orelse return false;
+        if (responses.len != 1) return false;
+        const graph_results = responses[0].graph_results orelse return false;
+        const walk = graph_results.map.get("walk") orelse return false;
+        const nodes = walk.nodes orelse return false;
+        if (walk.total != expected_keys.len or nodes.len != expected_keys.len) {
+            std.debug.print(
+                "production graph probe start={s} depth={} returned incomplete result: {s}\n",
+                .{ start_key, max_depth, body },
             );
-            defer parsed.deinit();
-            const responses = parsed.value.responses orelse return false;
-            if (responses.len != 1) return false;
-            const graph_results = responses[0].graph_results orelse return false;
-            const walk = graph_results.map.get("walk") orelse return false;
-            const nodes = walk.nodes orelse return false;
-            if (walk.total != expected_keys.len or nodes.len != expected_keys.len) {
+            return false;
+        }
+        for (expected_keys) |expected| {
+            var found = false;
+            for (nodes) |node| found = found or std.mem.eql(u8, node.key, expected);
+            if (!found) {
                 std.debug.print(
-                    "production graph probe start={s} depth={} returned incomplete result: {s}\n",
-                    .{ start_key, max_depth, response.body },
+                    "production graph probe start={s} missing={s}: {s}\n",
+                    .{ start_key, expected, body },
                 );
                 return false;
             }
-            for (expected_keys) |expected| {
-                var found = false;
-                for (nodes) |node| found = found or std.mem.eql(u8, node.key, expected);
-                if (!found) {
-                    std.debug.print(
-                        "production graph probe start={s} missing={s}: {s}\n",
-                        .{ start_key, expected, response.body },
-                    );
-                    return false;
-                }
-            }
-            return true;
         }
-        return false;
+        return true;
     }
 
     fn waitForDocIdentityReady(self: *Fixture, table_name: []const u8, max_rounds: usize) !bool {
@@ -1014,6 +1118,22 @@ pub const Fixture = struct {
             try self.runOneControlRound();
         }
         return error.ProductionDataSplitTimeout;
+    }
+
+    fn waitForSplitInProgress(self: *Fixture) !void {
+        for (0..30_000) |_| {
+            const phase = (try self.metadata.?.externalDataSplitPhase(split_transition_id)) orelse {
+                try self.runOneControlRound();
+                continue;
+            };
+            switch (phase) {
+                .bootstrap_peer, .replay_deltas, .cutover_ready => return,
+                .finalized => return error.ProductionDataSplitFinalizedBeforeGraphProbe,
+                .rolling_back, .rolled_back => return error.ProductionDataSplitRolledBackBeforeGraphProbe,
+                .prepare => try self.runOneControlRound(),
+            }
+        }
+        return error.ProductionDataSplitProgressTimeout;
     }
 
     const OperationResult = union(enum) {
@@ -1383,6 +1503,11 @@ pub const Fixture = struct {
         requests_ok: bool,
         topology_ok: bool,
         graph_query_ok: bool,
+        split_graph_inflight_started: bool,
+        split_graph_inflight_complete: bool,
+        split_graph_inflight_rejected: bool,
+        split_graph_inflight_ok: bool,
+        post_split_graph_query_ok: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
         hosts: usize,
@@ -1397,6 +1522,11 @@ pub const Fixture = struct {
                 self.failure == null,
             .topology_ok = self.topology_sound,
             .graph_query_ok = self.graph_sound,
+            .split_graph_inflight_started = self.split_graph_inflight_started,
+            .split_graph_inflight_complete = self.split_graph_inflight_complete,
+            .split_graph_inflight_rejected = self.split_graph_inflight_rejected,
+            .split_graph_inflight_ok = self.split_graph_inflight_sound,
+            .post_split_graph_query_ok = self.post_split_graph_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally
             // reaches zero during cleanup. Keep the monotonic construction
