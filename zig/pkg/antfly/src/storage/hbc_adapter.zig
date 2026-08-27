@@ -875,11 +875,16 @@ const CacheRwLock = struct {
         self.vector_read_stripes[stripe].unlock();
     }
 
-    fn lockVectorStripes(self: *@This()) void {
+    fn lockVectorStripes(self: *@This()) bool {
+        var contended = false;
         for (&self.vector_read_stripes) |*stripe| {
             var attempts: usize = 0;
-            while (!stripe.tryLock()) : (attempts += 1) backoff(attempts);
+            while (!stripe.tryLock()) : (attempts += 1) {
+                contended = true;
+                backoff(attempts);
+            }
         }
+        return contended;
     }
 
     fn tryLockVectorStripes(self: *@This()) ?usize {
@@ -922,7 +927,10 @@ const CacheRwLock = struct {
         while (self.state.cmpxchgWeak(0, writer_bit, .acquire, .monotonic) != null) : (attempts += 1) {
             backoff(attempts);
         }
-        if (attempts != 0) {
+        self.vector_fence_pending.store(true, .release);
+        const stripes_contended = self.lockVectorStripes();
+        self.vector_fence_pending.store(false, .release);
+        if (attempts != 0 or stripes_contended) {
             const waited_ns = elapsedSince(started_ns);
             _ = self.exclusive_contended_calls.fetchAdd(1, .monotonic);
             _ = self.exclusive_wait_ns.fetchAdd(waited_ns, .monotonic);
@@ -931,9 +939,6 @@ const CacheRwLock = struct {
                 maximum = self.exclusive_max_wait_ns.cmpxchgWeak(maximum, waited_ns, .monotonic, .monotonic) orelse break;
             }
         }
-        self.vector_fence_pending.store(true, .release);
-        self.lockVectorStripes();
-        self.vector_fence_pending.store(false, .release);
     }
 
     fn unlockExclusive(self: *@This()) void {
@@ -11733,6 +11738,34 @@ test "hbc shared vector lookup stats preserve compulsory and cross-stripe misses
     while (CacheRwLock.vectorReadStripe(direct_namespace, missing_id) == cached_stripe) missing_id += 1;
     try std.testing.expect(cache.borrowVector(direct_namespace, missing_id) == null);
     try std.testing.expectEqual(@as(u64, 1), cache.namespaceStats(direct_namespace).vector.misses);
+}
+
+test "hbc shared cache lock reports striped reader wait" {
+    const Writer = struct {
+        fn run(lock: *CacheRwLock, acquired: *std.atomic.Value(bool)) void {
+            lock.lockExclusive();
+            acquired.store(true, .release);
+            lock.unlockExclusive();
+        }
+    };
+
+    var lock: CacheRwLock = .{};
+    const read_stripe = lock.lockVectorShared(1, 1);
+    var writer_acquired = std.atomic.Value(bool).init(false);
+    var writer = try std.Thread.spawn(.{}, Writer.run, .{ &lock, &writer_acquired });
+    while (!lock.vector_fence_pending.load(.acquire)) std.atomic.spinLoopHint();
+    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    lock.unlockVectorShared(read_stripe);
+    writer.join();
+
+    try std.testing.expect(writer_acquired.load(.acquire));
+    const stats = lock.snapshot();
+    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_lock_calls);
+    try std.testing.expectEqual(@as(u64, 1), stats.exclusive_contended_calls);
+    try std.testing.expect(stats.exclusive_wait_ns > 0);
+    try std.testing.expect(stats.exclusive_max_wait_ns > 0);
 }
 
 test "hbc shared cache contention experiment" {
