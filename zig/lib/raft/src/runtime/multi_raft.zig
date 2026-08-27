@@ -764,6 +764,51 @@ pub const MultiRaft = struct {
         try grp.proposeWithReceipt(data, accepted_index);
     }
 
+    pub fn prepareProposalReceiptTracking(self: *MultiRaft, group_id: core.types.GroupId) !void {
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try grp.prepareProposalReceiptTracking();
+    }
+
+    pub fn trackProposalReceipt(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        term: core.types.Term,
+        index: core.types.Index,
+    ) !void {
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        grp.trackProposalReceipt(term, index);
+    }
+
+    pub fn acquireProposalReceipt(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        term: core.types.Term,
+        index: core.types.Index,
+    ) bool {
+        const grp = self.group(group_id) orelse return false;
+        return grp.acquireProposalReceipt(term, index);
+    }
+
+    pub fn releaseProposalReceipt(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        term: core.types.Term,
+        index: core.types.Index,
+    ) void {
+        const grp = self.group(group_id) orelse return;
+        grp.releaseProposalReceipt(term, index);
+    }
+
+    pub fn termAtTrackedProposalReceipt(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        term: core.types.Term,
+        index: core.types.Index,
+    ) !core.types.Term {
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        return try grp.termAtTrackedProposalReceipt(term, index);
+    }
+
     pub fn readIndex(self: *MultiRaft, group_id: core.types.GroupId, request_ctx: []const u8) !void {
         try self.resumeOnActivity(group_id);
         const grp = self.group(group_id) orelse return error.UnknownGroup;

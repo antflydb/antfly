@@ -733,6 +733,22 @@ pub const Host = struct {
         try self.runtime_host.proposeWithReceipt(group_id, data, accepted_index);
     }
 
+    pub fn prepareProposalReceiptTracking(self: *Host, group_id: u64) !void {
+        try self.runtime_host.prepareProposalReceiptTracking(group_id);
+    }
+
+    pub fn trackProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) !void {
+        try self.runtime_host.trackProposalReceipt(group_id, term, index);
+    }
+
+    pub fn acquireProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) bool {
+        return self.runtime_host.acquireProposalReceipt(group_id, term, index);
+    }
+
+    pub fn releaseProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) void {
+        self.runtime_host.releaseProposalReceipt(group_id, term, index);
+    }
+
     pub fn transferLeader(self: *Host, group_id: u64, transferee: u64) !void {
         try self.runtime_host.transferLeader(group_id, transferee);
     }
@@ -789,6 +805,10 @@ pub const Host = struct {
     pub fn raftTermAt(self: *Host, group_id: u64, index: u64) !u64 {
         const grp = self.runtime_host.group(group_id) orelse return error.UnknownGroup;
         return try grp.termAt(index);
+    }
+
+    pub fn raftTermAtTrackedProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) !u64 {
+        return try self.runtime_host.termAtTrackedProposalReceipt(group_id, term, index);
     }
 
     pub fn leaderId(self: *Host, group_id: u64) ?u64 {

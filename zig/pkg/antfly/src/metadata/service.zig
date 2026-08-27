@@ -3988,12 +3988,20 @@ pub const MetadataHttpService = struct {
         }
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
+        // Reserve proof storage before Raft accepts the entry. This keeps the
+        // accepted-but-untrackable state impossible under allocator pressure.
+        try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
         var accepted_index: ?u64 = null;
         var dispatch_error: ?anyerror = null;
         self.raft.host.http_host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
             dispatch_error = err;
         };
         const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
+        try self.raft.host.http_host.host.trackProposalReceipt(
+            self.metadata_group_id,
+            raft_status.hard.current_term,
+            index,
+        );
         if (dispatch_error) |err| {
             // Once the local leader assigned an index the proposal was
             // accepted. Replication-message construction can still fail after
@@ -4020,6 +4028,20 @@ pub const MetadataHttpService = struct {
         receipt: MetadataProposalReceipt,
         request: api_operation.RequestContext,
     ) !void {
+        self.lockRuntime();
+        const tracked_receipt = self.raft.host.http_host.host.acquireProposalReceipt(
+            self.metadata_group_id,
+            receipt.term,
+            receipt.index,
+        );
+        self.unlockRuntime();
+        defer {
+            if (tracked_receipt) {
+                self.lockRuntime();
+                self.raft.host.http_host.host.releaseProposalReceipt(self.metadata_group_id, receipt.term, receipt.index);
+                self.unlockRuntime();
+            }
+        }
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
         const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
             @min(local_deadline_ns, caller_deadline_ns)
@@ -4031,7 +4053,11 @@ pub const MetadataHttpService = struct {
             const maybe_raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id);
             const applied_entry_term = if (maybe_raft_status) |raft_status|
                 if (raft_status.applied_index >= receipt.index)
-                    self.raft.host.http_host.raftTermAt(self.metadata_group_id, receipt.index) catch null
+                    self.raft.host.http_host.host.raftTermAtTrackedProposalReceipt(
+                        self.metadata_group_id,
+                        receipt.term,
+                        receipt.index,
+                    ) catch null
                 else
                     null
             else
