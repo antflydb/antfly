@@ -112,7 +112,7 @@ pub const Header = struct {
     }
 
     pub fn supportsDecodeU16(self: Header) bool {
-        return (self.components == 1 or self.components == 3) and self.bits_per_component >= 1 and self.bits_per_component <= 38;
+        return (self.components == 1 or self.components == 3) and self.bits_per_component >= 1 and self.bits_per_component <= 16;
     }
 };
 
@@ -230,6 +230,7 @@ pub const DecodedImageU16 = struct {
     components: u8,
     backend: DecodeBackend,
     pixels: []u16,
+    jp2_color: Jp2ColorMetadata = .{},
 
     pub fn deinit(self: *DecodedImageU16) void {
         self.allocator.free(self.pixels);
@@ -545,8 +546,11 @@ fn componentPlanesU8DecodeSupport(state: *const codestream.State) NativeDecodeSu
 }
 
 pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedImageU16 {
+    var jp2_color = Jp2ColorMetadata{};
     const codestream_bytes = if (box.hasSignature(bytes)) blk: {
-        const parsed = try box.parse(bytes);
+        var parsed = try box.parseOwned(allocator, bytes);
+        defer box.freeParsed(allocator, &parsed);
+        jp2_color = Jp2ColorMetadata.fromParsed(parsed);
         const offset = parsed.codestream_offset orelse return error.MissingCodestreamBox;
         break :blk bytes[offset..];
     } else if (codestream.hasSoc(bytes))
@@ -581,6 +585,7 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
             .components = @intCast(state.header.components.len),
             .backend = .pure_zig,
             .pixels = pixels,
+            .jp2_color = jp2_color,
         };
     }
 
@@ -653,6 +658,7 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
         .components = @intCast(state.header.components.len),
         .backend = .pure_zig,
         .pixels = pixels,
+        .jp2_color = jp2_color,
     };
 }
 
