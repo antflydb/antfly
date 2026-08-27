@@ -3590,8 +3590,8 @@ pub const Reader = struct {
         if (!image_mask and has_jbig2 and bits_i != 1) return error.UnsupportedPdfRendering;
         if (image_mask and bits_i != 1) return error.UnsupportedPdfRendering;
 
-        const width: u32 = @intCast(width_i);
-        const height: u32 = @intCast(height_i);
+        const width = std.math.cast(u32, width_i) orelse return error.RenderedPageTooLarge;
+        const height = std.math.cast(u32, height_i) orelse return error.RenderedPageTooLarge;
         const pixel_count = std.math.mul(usize, width, height) catch return error.UnsupportedPdfRendering;
         if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
         const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.UnsupportedPdfRendering;
@@ -4353,15 +4353,20 @@ pub const Reader = struct {
             defer context.leaveMask(active_key);
             var resolved = try self.resolveValue(smask_obj);
             defer resolved.deinit(self.alloc);
-            if (resolved == .stream) {
+            if (resolved == .name) {
+                if (!std.mem.eql(u8, resolved.name, "None")) return error.InvalidPdfImageMask;
+            } else if (resolved == .stream) {
                 // A soft mask is part of the image's pixel definition, not
                 // optional decoration. Propagate unsupported codecs so the
                 // caller can use a capable page renderer instead of silently
                 // sending a corrupted image downstream.
+                try validateImageMaskDimensions(&resolved, width, height);
                 const smask = try self.decodeImageToRgbaGuardedAlloc(&resolved, context, parent_live_bytes, mask_depth + 1);
                 defer self.alloc.free(smask.rgba);
                 if (smask.width != width or smask.height != height) return error.InvalidPdfImageMask;
                 applySoftMaskAlpha(rgba, smask.rgba);
+            } else {
+                return error.InvalidPdfImageMask;
             }
         }
 
@@ -4373,6 +4378,7 @@ pub const Reader = struct {
             if (resolved == .array) {
                 applyColorKeyMask(rgba, resolved.array);
             } else if (resolved == .stream) {
+                try validateImageMaskDimensions(&resolved, width, height);
                 const mask = try self.decodeImageToRgbaGuardedAlloc(&resolved, context, parent_live_bytes, mask_depth + 1);
                 defer self.alloc.free(mask.rgba);
                 if (mask.width != width or mask.height != height) return error.InvalidPdfImageMask;
@@ -4381,8 +4387,19 @@ pub const Reader = struct {
                     else => false,
                 } else false;
                 applyExplicitMaskAlpha(rgba, mask.rgba, mask_is_stencil);
+            } else {
+                return error.InvalidPdfImageMask;
             }
         }
+    }
+
+    fn validateImageMaskDimensions(mask: *const syntax.Object, expected_width: u32, expected_height: u32) !void {
+        const width_i = (mask.get("Width") orelse return error.InvalidPdfImageMask).asInteger() orelse return error.InvalidPdfImageMask;
+        const height_i = (mask.get("Height") orelse return error.InvalidPdfImageMask).asInteger() orelse return error.InvalidPdfImageMask;
+        if (width_i <= 0 or height_i <= 0) return error.InvalidPdfImageMask;
+        const width = std.math.cast(u32, width_i) orelse return error.InvalidPdfImageMask;
+        const height = std.math.cast(u32, height_i) orelse return error.InvalidPdfImageMask;
+        if (width != expected_width or height != expected_height) return error.InvalidPdfImageMask;
     }
 
     fn findInheritedPageValue(self: *const Reader, page: *const syntax.Object, key: []const u8) !?syntax.Object {
@@ -13658,7 +13675,9 @@ test "image decode rejects mismatched soft-mask dimensions" {
         "3 0 obj\nnull\nendobj\n",
         "4 0 obj\nnull\nendobj\n",
         "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
-        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 2 >>\nstream\nab\nendstream\nendobj\n",
+        // The malformed JBIG2 payload would produce TruncatedJbig2Stream if
+        // the decoder ran. Dimension validation must reject the mask first.
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /Length 1 >>\nstream\nx\nendstream\nendobj\n",
     };
     const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
     defer alloc.free(sample);
@@ -13667,6 +13686,70 @@ test "image decode rejects mismatched soft-mask dimensions" {
     var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
     defer image.deinit(alloc);
     try std.testing.expectError(error.InvalidPdfImageMask, reader.decodeImageToRgbaAlloc(&image));
+}
+
+test "image decode rejects dimensions outside the native image domain" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 4294967296 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 1 >>\nstream\nx\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    try std.testing.expectError(error.RenderedPageTooLarge, reader.decodeImageToRgbaAlloc(&image));
+}
+
+test "image decode rejects invalid transparency mask object types" {
+    const alloc = std.testing.allocator;
+    const invalid_images = [_][]const u8{
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 42 /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask /Bogus /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+    };
+    for (invalid_images) |invalid_image| {
+        const objects = [_][]const u8{
+            "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+            "2 0 obj\nnull\nendobj\n",
+            "3 0 obj\nnull\nendobj\n",
+            "4 0 obj\nnull\nendobj\n",
+            invalid_image,
+        };
+        const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+        defer alloc.free(sample);
+        var reader = try Reader.init(alloc, sample);
+        defer reader.deinit();
+        var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+        defer image.deinit(alloc);
+        try std.testing.expectError(error.InvalidPdfImageMask, reader.decodeImageToRgbaAlloc(&image));
+    }
+}
+
+test "image decode accepts the PDF soft-mask None sentinel" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask /None /Length 3 >>\nstream\nabc\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqual(@as(u32, 1), decoded.width);
+    try std.testing.expectEqual(@as(u32, 1), decoded.height);
+    try std.testing.expectEqualSlices(u8, &.{ 'a', 'b', 'c', 0xff }, decoded.rgba);
 }
 
 test "image decode preflights RGBA working set before JBIG2 codec work" {
