@@ -167,15 +167,19 @@ pub const StdHttpExecutor = struct {
         if (req.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
-        if (self.cfg.resolve_before_connect) return try self.executeResolved(alloc, req);
         if (req.timeout_ms != null or req.cancellation != null)
             return try self.executeWithControl(alloc, req);
+        return try self.executeTransport(alloc, req);
+    }
+
+    fn executeTransport(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+        if (self.cfg.resolve_before_connect) return try self.executeResolved(alloc, req);
         return try self.executeDirect(alloc, req);
     }
 
     fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const io = self.io_impl.io();
-        self.resolved_client_mutex.lockUncancelable(io);
+        try self.resolved_client_mutex.lock(io);
         defer self.resolved_client_mutex.unlock(io);
 
         const extra_count = @as(usize, @intFromBool(req.content_type != null)) +
@@ -294,7 +298,7 @@ pub const StdHttpExecutor = struct {
                 request_alloc: std.mem.Allocator,
                 request: common.HttpRequest,
             ) std.Io.Cancelable!void {
-                state.result = http_executor.executeDirect(request_alloc, request);
+                state.result = http_executor.executeTransport(request_alloc, request);
                 state.done.set(task_io);
             }
 
@@ -312,7 +316,7 @@ pub const StdHttpExecutor = struct {
                 task_io: std.Io,
                 response_alloc: std.mem.Allocator,
             ) void {
-                // Group cancellation joins the network task. executeDirect's
+                // Group cancellation joins the network task. Transport-owned
                 // request/client defers retire an interrupted connection before
                 // any request-owned pointers are allowed to leave this scope.
                 group.cancel(task_io);
@@ -675,6 +679,7 @@ test "resolved std http executor preserves delivery provenance across opaque exc
         .uri = uri,
         .content_type = "application/json",
         .body = "{}",
+        .timeout_ms = 1_000,
         .delivery_tracker = &setup_delivery,
     }));
     try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, setup_delivery.load());
@@ -690,10 +695,86 @@ test "resolved std http executor preserves delivery provenance across opaque exc
         .uri = uri,
         .content_type = "application/json",
         .body = "{}",
+        .timeout_ms = 1_000,
         .delivery_tracker = &response_delivery,
     }));
     try std.testing.expectEqual(common.RequestDeliveryTracker.State.may_have_been_sent, response_delivery.load());
     try std.testing.expectEqual(@as(usize, 1), app.calls.load(.acquire));
+}
+
+test "resolved std http executor bounds queued requests before delivery" {
+    const App = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+
+        fn executor(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return .{ .status = 200 };
+        }
+    };
+
+    const CancelTask = struct {
+        cancellation: *common.RequestCancellation,
+
+        fn run(self: *@This()) void {
+            sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 25);
+            self.cancellation.cancel();
+        }
+    };
+
+    var app = App{};
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, app.executor());
+    defer listener.deinit();
+    try listener.start();
+    const uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(uri);
+
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{
+        .resolve_before_connect = true,
+    });
+    defer executor.deinit();
+
+    const io = executor.io_impl.io();
+    executor.resolved_client_mutex.lockUncancelable(io);
+    var client_locked = true;
+    defer if (client_locked) executor.resolved_client_mutex.unlock(io);
+
+    var timeout_delivery: common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.Timeout, executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = uri,
+        .body = "{}",
+        .timeout_ms = 25,
+        .delivery_tracker = &timeout_delivery,
+    }));
+    try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, timeout_delivery.load());
+    try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
+
+    var cancellation: common.RequestCancellation = .{};
+    var cancel_task = CancelTask{ .cancellation = &cancellation };
+    const cancel_thread = try std.Thread.spawn(.{}, CancelTask.run, .{&cancel_task});
+    var cancel_thread_joined = false;
+    defer if (!cancel_thread_joined) cancel_thread.join();
+
+    var cancelled_delivery: common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.Cancelled, executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = uri,
+        .body = "{}",
+        .cancellation = &cancellation,
+        .delivery_tracker = &cancelled_delivery,
+    }));
+    cancel_thread.join();
+    cancel_thread_joined = true;
+    try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, cancelled_delivery.load());
+    try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
+
+    executor.resolved_client_mutex.unlock(io);
+    client_locked = false;
 }
 
 test "std http executor retires pooled connection before configured cap" {
