@@ -8540,6 +8540,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.local_db_mutex.unlock();
             return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null, managed_open_options) catch |err| {
                 if (!isTransientWriterOpenConflict(err)) return err;
+                if (!managed_open_options.retry_transient_writer_open) return err;
                 const now_ns = platform_time.monotonicNs();
                 if (now_ns >= deadline_ns) {
                     std.log.err("local mutation writer wait timed out table={s} group_id={} wait_ms={} err={s}", .{
@@ -9861,7 +9862,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .identity_namespace = identity_namespace,
                 .metadata_source = .local_persisted,
             },
-            .{ .reconcile_for_replicated_apply = true },
+            .{
+                .reconcile_for_replicated_apply = true,
+                .retry_transient_writer_open = false,
+            },
         );
     }
 
@@ -15879,7 +15883,7 @@ pub const ProvisionedTableWriteSource = struct {
         metadata_source: ReplicatedApplyMetadataSource,
         err: anyerror,
     ) anyerror {
-        if (metadata_source == .local_persisted and err == error.LsmRootWriterAlreadyOpen) {
+        if (metadata_source == .local_persisted and isTransientWriterOpenConflict(err)) {
             return error.RaftApplyWriterUnavailable;
         }
         return err;
@@ -15949,26 +15953,31 @@ pub const ProvisionedTableWriteSource = struct {
                     target_generation,
                     table_name,
                     true,
-                    .{ .reconcile_for_replicated_apply = true },
+                    .{
+                        .reconcile_for_replicated_apply = true,
+                        .retry_transient_writer_open = metadata_source != .local_persisted,
+                    },
                 ) catch |err| return mapReplicatedApplyWriterAcquireError(metadata_source, err);
             defer cached.deinit(alloc);
-            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
-            runTestBeforeBatchExecutionHook();
-            try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
-            if (apply_req.transaction != null) {
-                const already_applied = if (raft_entry) |entry|
-                    try cached.db.raftEntryAlreadyApplied(entry)
-                else
-                    false;
-                if (!already_applied) {
-                    try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                    try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
-                    if (raft_entry) |entry| try cached.db.markRaftEntryApplied(entry);
-                }
-            } else if (raft_entry) |entry|
-                try cached.db.batchRaftReplicatedApply(apply_req, entry)
+            const already_applied = if (raft_entry) |entry|
+                try cached.db.raftEntryAlreadyApplied(entry)
             else
-                try cached.db.batchReplicatedApply(apply_req);
+                false;
+            if (!already_applied) {
+                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                runTestBeforeBatchExecutionHook();
+                try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
+                if (apply_req.transaction != null) {
+                    try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    if (raft_entry) |entry|
+                        try applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry)
+                    else
+                        try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
+                } else if (raft_entry) |entry|
+                    try cached.db.batchRaftReplicatedApply(apply_req, entry)
+                else
+                    try cached.db.batchReplicatedApply(apply_req);
+            }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
                 lockAtomic(&self.local_db_mutex);
@@ -15994,23 +16003,25 @@ pub const ProvisionedTableWriteSource = struct {
             );
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
-            runTestBeforeBatchExecutionHook();
-            try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
-            if (apply_req.transaction != null) {
-                const already_applied = if (raft_entry) |entry|
-                    try db.raftEntryAlreadyApplied(entry)
-                else
-                    false;
-                if (!already_applied) {
-                    try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                    try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
-                    if (raft_entry) |entry| try db.markRaftEntryApplied(entry);
-                }
-            } else if (raft_entry) |entry|
-                try db.batchRaftReplicatedApply(apply_req, entry)
+            const already_applied = if (raft_entry) |entry|
+                try db.raftEntryAlreadyApplied(entry)
             else
-                try db.batchReplicatedApply(apply_req);
+                false;
+            if (!already_applied) {
+                try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                runTestBeforeBatchExecutionHook();
+                try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
+                if (apply_req.transaction != null) {
+                    try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    if (raft_entry) |entry|
+                        try applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, table_name, group_id, apply_req, entry)
+                    else
+                        try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
+                } else if (raft_entry) |entry|
+                    try db.batchRaftReplicatedApply(apply_req, entry)
+                else
+                    try db.batchReplicatedApply(apply_req);
+            }
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -19248,11 +19259,13 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 };
 
-test "prepared raft apply reclassifies only a pre-mutation LSM writer conflict" {
+test "prepared raft apply reclassifies every transient pre-mutation writer conflict" {
     const map = ProvisionedTableWriteSource.mapReplicatedApplyWriterAcquireError;
     try std.testing.expect(map(.local_persisted, error.LsmRootWriterAlreadyOpen) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.local_persisted, error.WriterLocked) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.local_persisted, error.PersistentDescriptorAdmissionExhausted) == error.RaftApplyWriterUnavailable);
     try std.testing.expect(map(.catalog, error.LsmRootWriterAlreadyOpen) == error.LsmRootWriterAlreadyOpen);
-    try std.testing.expect(map(.local_persisted, error.WriterLocked) == error.WriterLocked);
+    try std.testing.expect(map(.local_persisted, error.OutOfMemory) == error.OutOfMemory);
 }
 
 const GroupBatch = struct {
@@ -19373,7 +19386,7 @@ fn applyReplicatedTransactionMutation(
     group_id: u64,
     req: db_mod.types.BatchRequest,
 ) !void {
-    try applyReplicatedTransactionMutationWithCancellation(alloc, db, table_name, group_id, req, .none);
+    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, null);
 }
 
 fn applyReplicatedTransactionMutationWithCancellation(
@@ -19383,6 +19396,29 @@ fn applyReplicatedTransactionMutationWithCancellation(
     group_id: u64,
     req: db_mod.types.BatchRequest,
     visibility_cancellation: db_mod.types.CancellationToken,
+) !void {
+    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, visibility_cancellation, null);
+}
+
+fn applyReplicatedTransactionMutationAtRaftEntry(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    raft_entry: db_mod.RaftAppliedEntryIdentity,
+) !void {
+    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
+}
+
+fn applyReplicatedTransactionMutationInternal(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    visibility_cancellation: db_mod.types.CancellationToken,
+    raft_entry: ?db_mod.RaftAppliedEntryIdentity,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
     switch (mutation) {
@@ -19406,57 +19442,104 @@ fn applyReplicatedTransactionMutationWithCancellation(
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
-            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
-                begin.txn_id,
-                begin.begin_timestamp,
-                begin.created_at_ns,
-                durable_participants,
-                coordinator,
-                begin.retain_terminal,
-            );
+            if (raft_entry) |entry|
+                _ = try db.beginReplicatedTransactionAtRaftEntry(
+                    begin.txn_id,
+                    begin.begin_timestamp,
+                    begin.created_at_ns,
+                    durable_participants,
+                    coordinator,
+                    begin.retain_terminal,
+                    entry,
+                )
+            else
+                _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                    begin.txn_id,
+                    begin.begin_timestamp,
+                    begin.created_at_ns,
+                    durable_participants,
+                    coordinator,
+                    begin.retain_terminal,
+                );
         },
-        .prepare => |prepare| try db.writeTransaction(prepare.txn_id, .{
-            .writes = batchWritesAsTransactionWrites(req.writes),
-            .deletes = req.deletes,
-            .transforms = req.transforms,
-            .predicates = req.predicates,
-        }),
+        .prepare => |prepare| {
+            const intents: db_mod.types.TransactionIntentRequest = .{
+                .writes = batchWritesAsTransactionWrites(req.writes),
+                .deletes = req.deletes,
+                .transforms = req.transforms,
+                .predicates = req.predicates,
+            };
+            if (raft_entry) |entry|
+                try db.writeReplicatedTransactionAtRaftEntry(prepare.txn_id, intents, entry)
+            else
+                try db.writeTransaction(prepare.txn_id, intents);
+        },
         .resolve => |resolve| {
-            try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
-                resolve.txn_id,
-                resolve.status,
-                resolve.commit_version,
-                req.sync_level,
-                visibility_cancellation,
-            );
             const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
             defer alloc.free(local_participant);
-            // Retained coordinators keep their own acknowledgement pending
-            // until the API session registry has durably recorded the terminal
-            // response. That acknowledgement is the topology-safe handoff.
-            const defer_coordinator_ack = db.transactionDefersCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
-                transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
-                else => return err,
-            };
-            if (!defer_coordinator_ack) {
-                db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
-                    transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
+            if (raft_entry) |entry| {
+                // Retained coordinators keep their own acknowledgement pending
+                // until the API session registry durably records the response.
+                // Everyone else records resolution, acknowledgement, and the
+                // Raft receipt in one backend batch.
+                const defer_coordinator_ack = db.transactionRetainsCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
+                    transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
+                try db.resolveReplicatedTransactionAtRaftEntry(
+                    resolve.txn_id,
+                    resolve.status,
+                    resolve.commit_version,
+                    req.sync_level,
+                    visibility_cancellation,
+                    entry,
+                    if (defer_coordinator_ack) null else local_participant,
+                );
+            } else {
+                try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
+                    resolve.txn_id,
+                    resolve.status,
+                    resolve.commit_version,
+                    req.sync_level,
+                    visibility_cancellation,
+                );
+                const defer_coordinator_ack = db.transactionDefersCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
+                    transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
+                    else => return err,
+                };
+                if (!defer_coordinator_ack) {
+                    db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
+                        transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
+                        else => return err,
+                    };
+                }
             }
         },
-        .acknowledge => |ack| db.markTransactionParticipantResolved(ack.txn_id, ack.participant) catch |err| switch (err) {
+        .acknowledge => |ack| (if (raft_entry) |entry|
+            db.markReplicatedTransactionParticipantResolvedAtRaftEntry(ack.txn_id, ack.participant, entry)
+        else
+            db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft
             // commands. Once cleanup wins, a late acknowledgement is a safe
             // no-op and must not recreate coordinator sidecar metadata.
             transactions_mod.TxnError.TxnNotFound => {},
             else => return err,
         },
-        .cleanup => |cleanup| _ = try db.cleanupTransactionMetadataIfEligible(
-            cleanup.txn_id,
-            cleanup.cutoff_timestamp,
-            cleanup.retained_cutoff_timestamp,
-        ),
+        .cleanup => |cleanup| {
+            if (raft_entry) |entry|
+                _ = try db.cleanupReplicatedTransactionAtRaftEntry(
+                    cleanup.txn_id,
+                    cleanup.cutoff_timestamp,
+                    cleanup.retained_cutoff_timestamp,
+                    entry,
+                )
+            else
+                _ = try db.cleanupTransactionMetadataIfEligible(
+                    cleanup.txn_id,
+                    cleanup.cutoff_timestamp,
+                    cleanup.retained_cutoff_timestamp,
+                );
+        },
     }
 }
 
@@ -21798,6 +21881,10 @@ const ManagedDbOpenOptions = struct {
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
     schema_json_before_index_load: ?[]const u8 = null,
+    /// Request-owned Raft progress must never sleep inside writer acquisition:
+    /// the single cadence lane retries on its next tick and remains available
+    /// to drive elections, heartbeats, and unrelated groups.
+    retry_transient_writer_open: bool = true,
     /// HA replay must reconcile catalog-driven indexes while the node remains a
     /// read-only standby. Perform that structural reconciliation in an isolated
     /// workerless open, then reopen with the live HA gate before publishing the

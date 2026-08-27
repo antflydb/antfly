@@ -5935,6 +5935,7 @@ pub fn build(b: *std.Build) void {
             "api http client rejects unsupported routed batch protocol without legacy replay",
             "api http client requires explicit not-proposed marker and tracks delivery phase",
             "raft batch aggregation makes failures after an accepted group non-retryable",
+            "prepared raft apply reclassifies every transient pre-mutation writer conflict",
             "stateless batch retries are bounded and exclude explicit OCC",
             "provisioned stateless batch retries definite aborts to the production bound",
             "bound table write source backs up and restores a local table",
