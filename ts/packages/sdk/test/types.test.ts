@@ -200,6 +200,7 @@ describe("Antfly Query Type Integration", () => {
     it("should accept valid MatchQuery in full_text_search", () => {
       const query: QueryRequest = {
         table: "products",
+        full_text_index: "product_text",
         full_text_search: {
           match: "laptop",
           field: "name",
@@ -208,6 +209,7 @@ describe("Antfly Query Type Integration", () => {
       };
 
       expect(query.full_text_search).toBeDefined();
+      expect(query.full_text_index).toBe("product_text");
       expectTypeOf(query.full_text_search).toMatchTypeOf<AntflyQuery | undefined>();
     });
 

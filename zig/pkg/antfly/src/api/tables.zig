@@ -531,7 +531,7 @@ const IndexRuntimeSchemaDebug = struct {
 pub const TableStatusWithRuntimeSchemaDebug = struct {
     name: []const u8,
     description: ?[]const u8 = null,
-    indexes: std.json.ArrayHashMap(indexes_openapi.IndexConfig),
+    indexes: std.json.ArrayHashMap(indexes_openapi.CreatedIndex),
     shards: std.json.ArrayHashMap(metadata_openapi.ShardConfig),
     schema: ?schema_openapi.TableSchema = null,
     migration: ?metadata_openapi.TableMigration = null,
@@ -1221,6 +1221,7 @@ pub fn routeQueryRequestToActiveReadIndex(
     table: *const metadata_table_manager.TableRecord,
     req: *db_mod.types.SearchRequest,
 ) !void {
+    try validateNamedFullTextQueryIndexes(alloc, table.indexes_json, req.full_text_queries);
     if (!queryNeedsPrimaryTextIndex(req.*)) return;
 
     const active_name = (try selectActiveFullTextIndexName(alloc, table)) orelse return;
@@ -1233,6 +1234,26 @@ pub fn routeQueryRequestToActiveReadIndex(
         req.index_name = active_name;
     } else {
         alloc.free(active_name);
+    }
+}
+
+fn validateNamedFullTextQueryIndexes(
+    alloc: std.mem.Allocator,
+    indexes_json: []const u8,
+    queries: []const db_mod.types.NamedFullTextQuery,
+) !void {
+    if (queries.len == 0) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer parsed.deinit();
+    const indexes = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidTableIndexMetadata,
+    };
+    for (queries) |query| {
+        if (query.index_name.len == 0) return error.InvalidQueryRequest;
+        const config = indexes.get(query.index_name) orelse return error.InvalidQueryRequest;
+        const index_type = inferIndexType(query.index_name, config) orelse return error.InvalidQueryRequest;
+        if (index_type != .full_text) return error.InvalidQueryRequest;
     }
 }
 
@@ -1753,10 +1774,10 @@ fn parseTableSchema(alloc: std.mem.Allocator, schema_json: []const u8) !schema_o
 fn parseTableIndexes(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
-) !std.json.ArrayHashMap(indexes_openapi.IndexConfig) {
+) !std.json.ArrayHashMap(indexes_openapi.CreatedIndex) {
     const canonical_json = try encodeTableIndexesObject(alloc, indexes_json);
     defer alloc.free(canonical_json);
-    return try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.IndexConfig), alloc, canonical_json, .{
+    return try std.json.parseFromSliceLeaky(std.json.ArrayHashMap(indexes_openapi.CreatedIndex), alloc, canonical_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     });
@@ -5130,6 +5151,42 @@ test "metadata.query routing selects read schema full text index" {
     try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
     try std.testing.expectEqualStrings("full_text_index_v0", req.index_name.?);
     try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+}
+
+test "metadata.query routing validates named full text retrieval and keeps schema filters separate" {
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":0}",
+        .indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"},\"document_text\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\"}]},\"dense_idx\":{\"type\":\"embeddings\",\"dimension\":3}}",
+        .placement_role = "data",
+    };
+    var queries = [_]db_mod.types.NamedFullTextQuery{.{
+        .name = "$full_text_results",
+        .index_name = "document_text",
+        .query = .{ .match_all = {} },
+    }};
+    var req: db_mod.types.SearchRequest = .{
+        .full_text_queries = &queries,
+        .filter_query_json = "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+    };
+    defer if (req.index_name) |index_name| std.testing.allocator.free(index_name);
+    defer if (req.primary_text_index_name) |index_name| std.testing.allocator.free(index_name);
+
+    try routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req);
+    try std.testing.expectEqualStrings("full_text_index_v0", req.index_name.?);
+    try std.testing.expectEqualStrings("full_text_index_v0", req.primary_text_index_name.?);
+
+    queries[0].index_name = "dense_idx";
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req),
+    );
+    queries[0].index_name = "missing_text";
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        routeQueryRequestToActiveReadIndex(std.testing.allocator, &table, &req),
+    );
 }
 
 test "metadata.query routing leaves hierarchy child traversal index free" {

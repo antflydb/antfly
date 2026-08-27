@@ -563,6 +563,7 @@ class AntflyClient:
         *,
         query: dict[str, Any] | None = None,
         full_text_search: dict[str, Any] | None = None,
+        full_text_index: str | None = None,
         semantic_search: str | None = None,
         embedding_template: str | None = None,
         indexes: list[str] | None = None,
@@ -602,6 +603,7 @@ class AntflyClient:
             table: Table name
             query: Canonical public query AST
             full_text_search: Full-text query object
+            full_text_index: Named full-text index used by the scoring text query
             semantic_search: Natural-language vector search query
             embedding_template: Optional multimodal embedding template
             indexes: Vector index names for semantic search
@@ -654,6 +656,7 @@ class AntflyClient:
         query_fields = {
             "query": query,
             "full_text_search": full_text_search,
+            "full_text_index": full_text_index,
             "semantic_search": semantic_search,
             "embedding_template": embedding_template,
             "indexes": indexes,

@@ -398,6 +398,28 @@ class TestAntflyClient:
         assert hit.field_id == "doc:2"
         assert hit.field_sort == ["2026-01-01T00:00:00Z", "doc:2"]
 
+    @patch("antfly.client.Client")
+    def test_query_forwards_named_full_text_index(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        configure_response(mock_httpx, 200, {"responses": []})
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        client.query(
+            table="docs",
+            full_text_search={"match": "singularity", "field": "text"},
+            full_text_index="document_text",
+        )
+
+        mock_httpx.stream.assert_called_once_with(
+            "POST",
+            "/db/v1/tables/docs/query",
+            json={
+                "full_text_search": {"match": "singularity", "field": "text"},
+                "full_text_index": "document_text",
+            },
+        )
+
     def test_query_rejects_ambiguous_aggregation_aliases(self) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
 

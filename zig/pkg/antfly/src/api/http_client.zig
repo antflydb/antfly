@@ -4158,16 +4158,28 @@ test "api http client round-trips public table management routes" {
     var parsed_indexes = try parseJsonBody([]metadata_openapi.IndexStatus, std.testing.allocator, indexes.body);
     defer parsed_indexes.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed_indexes.value.len);
-    try std.testing.expectEqualStrings("full_text_index_v0", parsed_indexes.value[0].config.name);
-    try std.testing.expectEqual(.full_text, parsed_indexes.value[0].config.type);
-    try std.testing.expectEqualStrings("full_text_index_v1", parsed_indexes.value[1].config.name);
-    try std.testing.expectEqual(.full_text, parsed_indexes.value[1].config.type);
+    const full_text_v0 = switch (parsed_indexes.value[0].config) {
+        .created_full_text_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    const full_text_v1 = switch (parsed_indexes.value[1].config) {
+        .created_full_text_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqualStrings("full_text_index_v0", full_text_v0.name);
+    try std.testing.expectEqualStrings("full_text", full_text_v0.type);
+    try std.testing.expectEqualStrings("full_text_index_v1", full_text_v1.name);
+    try std.testing.expectEqualStrings("full_text", full_text_v1.type);
 
     var index = try client.fetchTableIndex(base_uri, "docs", "full_text_index_v0");
     defer index.deinit(std.heap.page_allocator);
     var parsed_index = try parseJsonBody(metadata_openapi.IndexStatus, std.testing.allocator, index.body);
     defer parsed_index.deinit();
-    try std.testing.expectEqual(.full_text, parsed_index.value.config.type);
+    const full_text_index = switch (parsed_index.value.config) {
+        .created_full_text_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqualStrings("full_text", full_text_index.type);
 
     const index_body = try test_contract_helpers.encodeCreateIndexRequest(std.testing.allocator, "embed_idx");
     defer std.testing.allocator.free(index_body);
@@ -4178,7 +4190,11 @@ test "api http client round-trips public table management routes" {
     defer index_after_create.deinit(std.heap.page_allocator);
     var parsed_index_after_create = try parseJsonBody(metadata_openapi.IndexStatus, std.testing.allocator, index_after_create.body);
     defer parsed_index_after_create.deinit();
-    try std.testing.expectEqual(.embeddings, parsed_index_after_create.value.config.type);
+    const embeddings_index = switch (parsed_index_after_create.value.config) {
+        .created_embeddings_index => |config| config,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expectEqualStrings("embeddings", embeddings_index.type);
 
     var dropped_index = try client.deleteTableIndex(base_uri, "docs", "embed_idx");
     defer dropped_index.deinit(std.heap.page_allocator);

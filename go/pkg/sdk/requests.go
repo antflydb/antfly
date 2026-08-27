@@ -146,6 +146,10 @@ type QueryRequest struct {
 	// FullTextSearch strongly-typed Bleve search query for full-text search
 	FullTextSearch *query.Query `json:"-"`
 
+	// FullTextIndex selects the named full-text index used by FullTextSearch.
+	// When omitted, the server uses the table schema's active full-text index.
+	FullTextIndex string `json:"full_text_index,omitempty"`
+
 	// Indexes to search (required for semantic search)
 	Indexes []string `json:"indexes,omitempty"`
 
@@ -217,6 +221,7 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		Aggregations:     q.Aggregations,
 		Fields:           nil,
 		FilterPrefix:     q.FilterPrefix,
+		FullTextIndex:    q.FullTextIndex,
 		Indexes:          q.Indexes,
 		Limit:            q.Limit,
 		MergeConfig:      q.MergeConfig,
@@ -300,6 +305,7 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 		q.Fields = *oapiReq.Fields
 	}
 	q.FilterPrefix = oapiReq.FilterPrefix
+	q.FullTextIndex = oapiReq.FullTextIndex
 	q.Indexes = oapiReq.Indexes
 	q.Limit = oapiReq.Limit
 	q.MergeConfig = oapiReq.MergeConfig

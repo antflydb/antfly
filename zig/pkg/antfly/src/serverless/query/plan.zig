@@ -95,6 +95,7 @@ fn validateSupportedPublicSearchFields(object: std.json.ObjectMap) !void {
         const supported = std.mem.eql(u8, key, "table") or
             std.mem.eql(u8, key, "query") or
             std.mem.eql(u8, key, "full_text_search") or
+            std.mem.eql(u8, key, "full_text_index") or
             std.mem.eql(u8, key, "semantic_search") or
             std.mem.eql(u8, key, "embedding_template") or
             std.mem.eql(u8, key, "indexes") or
@@ -206,6 +207,7 @@ fn parsePublicSearchPlanAlloc(
         .filter_prefix = if (query_request.filter_prefix) |value| try alloc.dupe(u8, value) else null,
         .filter_text = if (text_clauses.filter_text) |value| try alloc.dupe(u8, value.text) else null,
         .exclusion_text = if (text_clauses.exclusion_text) |value| try alloc.dupe(u8, value.text) else null,
+        .full_text_index = if (query_request.full_text_index) |value| try alloc.dupe(u8, value) else null,
         .vector = public_vector,
         .sparse = public_sparse,
         .semantic_search = if (query_request.semantic_search) |value| try alloc.dupe(u8, value) else null,
@@ -249,6 +251,7 @@ fn parsePublicSearchPlanAlloc(
 
     if (req.embedding_template != null and req.semantic_search == null) return error.InvalidQueryRequest;
     if (req.semantic_search != null and req.vector != null) return error.InvalidQueryRequest;
+    if (req.full_text_index != null and !has_text) return error.InvalidQueryRequest;
 
     try validateSearchRequest(req);
 
@@ -502,7 +505,10 @@ fn resolveSearchSources(
         try resolved.append(.{ .vector = fallback });
     }
     if (needs_text and resolved.findText() == null) {
-        if (published_search_sources.findText()) |fallback| {
+        if (req.full_text_index) |index_name| {
+            const selected = published_search_sources.findTextByName(index_name) orelse return error.InvalidQueryRequest;
+            try resolved.append(.{ .text = selected });
+        } else if (published_search_sources.findText()) |fallback| {
             try resolved.append(.{ .text = fallback });
         }
     }
@@ -772,6 +778,37 @@ test "search plan accepts public full text query strings for supported fields" {
     try std.testing.expectEqual(request.QueryOperator.any_terms, plan.request.operator);
     try std.testing.expectEqualStrings("alpha bravo", plan.request.text);
     try std.testing.expectEqual(@as(usize, 5), plan.request.limit);
+}
+
+test "serverless search plan selects a named full text source" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.PublishedSearchSources{
+        .items = @constCast(&[_]search_sources.SearchSourceDescriptor{
+            .{ .text = .{ .index_name = search_sources.default_full_text_index_name } },
+            .{ .text = .{ .index_name = "title_text" } },
+        }),
+    };
+    var plan = try parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_index\":\"title_text\",\"full_text_search\":{\"query\":\"body:alpha\"}}",
+        sources,
+    );
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqualStrings("title_text", plan.request.full_text_index.?);
+    try std.testing.expectEqualStrings("title_text", plan.sources.findText().?.index_name);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"full_text_index\":\"missing\",\"full_text_search\":{\"query\":\"body:alpha\"}}",
+            sources,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"full_text_index\":\"title_text\",\"limit\":5}", sources),
+    );
 }
 
 test "search plan rejects unsupported public full text fields" {

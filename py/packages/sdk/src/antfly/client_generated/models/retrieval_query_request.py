@@ -81,6 +81,13 @@ class RetrievalQueryRequest:
                 IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
                 MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
                 TermRangeQuery | Unset | WildcardQuery):
+            full_text_index (str | Unset): Full-text index used by `full_text_search` and by scoring text clauses in
+                `query`.
+                Use this to query a named document- or artifact-backed full-text index. The selected
+                index must exist and have type `full_text`. Omit this field to use the table's active
+                schema full-text index, preserving v0.2 behavior. Structured document filters continue
+                to use the active schema index even when retrieval uses a named artifact index.
+                 Example: document_text.
             semantic_search (str | Unset): Natural language query for vector similarity search. Results are ranked by
                 semantic similarity
                 to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
@@ -396,6 +403,7 @@ class RetrievalQueryRequest:
         | Unset
         | WildcardQuery
     ) = UNSET
+    full_text_index: str | Unset = UNSET
     semantic_search: str | Unset = UNSET
     embedding_template: str | Unset = UNSET
     indexes: list[str] | Unset = UNSET
@@ -573,6 +581,8 @@ class RetrievalQueryRequest:
             full_text_search = self.full_text_search.to_dict()
         else:
             full_text_search = self.full_text_search.to_dict()
+
+        full_text_index = self.full_text_index
 
         semantic_search = self.semantic_search
 
@@ -790,6 +800,8 @@ class RetrievalQueryRequest:
             field_dict["query"] = query
         if full_text_search is not UNSET:
             field_dict["full_text_search"] = full_text_search
+        if full_text_index is not UNSET:
+            field_dict["full_text_index"] = full_text_index
         if semantic_search is not UNSET:
             field_dict["semantic_search"] = semantic_search
         if embedding_template is not UNSET:
@@ -1147,6 +1159,8 @@ class RetrievalQueryRequest:
             return componentsschemas_query_type_25
 
         full_text_search = _parse_full_text_search(d.pop("full_text_search", UNSET))
+
+        full_text_index = d.pop("full_text_index", UNSET)
 
         semantic_search = d.pop("semantic_search", UNSET)
 
@@ -1759,6 +1773,7 @@ class RetrievalQueryRequest:
             table=table,
             query=query,
             full_text_search=full_text_search,
+            full_text_index=full_text_index,
             semantic_search=semantic_search,
             embedding_template=embedding_template,
             indexes=indexes,

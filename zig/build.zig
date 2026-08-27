@@ -3865,6 +3865,9 @@ pub fn build(b: *std.Build) void {
         "api http client round-trips public status and internal capability routes",
         "api http retryable embedding failures provide retry guidance",
         "api http server obtains query embedding policy from resource manager",
+        "api query contract targets named full text retrieval without changing primary filters",
+        "metadata.query routing validates named full text retrieval and keeps schema filters separate",
+        "encode query request preserves the singular named full text selector across shard forwarding",
         "api http stale hierarchy cursor response is actionable and machine readable",
         "api http unsupported unsorted query response is machine readable",
         "api http unsupported hierarchy grouping response uses the public contract",
@@ -5172,7 +5175,6 @@ pub fn build(b: *std.Build) void {
         "api http server join planner uses complete fresh local stats before metadata publication",
         "api http server serves provisioned index runtime backfill status across shards",
         "table contract rejects unsupported index kinds before catalog admission",
-        "table contract ignores create-table full text entries and preserves non-full-text indexes",
         "table contract keeps operational create request failures on the internal error path",
         "api http server rejects unsupported table index before metadata publication",
         "api http server serves table create and drop",
@@ -5295,6 +5297,10 @@ pub fn build(b: *std.Build) void {
     const public_api_parity_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
+        // The macOS debug root includes the complete public transport and
+        // generated-contract surface; current measured compilation peaks a
+        // little above the aggregate's generic 7 GiB scheduler claim.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

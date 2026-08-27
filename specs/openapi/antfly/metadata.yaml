@@ -6855,6 +6855,7 @@ components:
               - anyOf:
                   - required: [query]
                   - required: [full_text_search]
+                  - required: [full_text_index]
                   - required: [filter_query]
                   - required: [exclusion_query]
                   - required: [semantic_search]
@@ -6928,6 +6929,18 @@ components:
           example:
             query: "+body:computer +category:technology"
             boost: 1.0
+        full_text_index:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: |
+            Full-text index used by `full_text_search` and by scoring text clauses in `query`.
+            Use this to query a named document- or artifact-backed full-text index. The selected
+            index must exist and have type `full_text`. Omit this field to use the table's active
+            schema full-text index, preserving v0.2 behavior. Structured document filters continue
+            to use the active schema index even when retrieval uses a named artifact index.
+          example: "document_text"
         semantic_search:
           type: string
           x-antfly-max-utf8-bytes: 1048576

@@ -2479,8 +2479,14 @@ pub fn parseQueryRequestWithDeadline(
     }
 
     if (normalized_query.full_text) |query| {
-        req.full_text = query;
+        if (request.full_text_index) |index_name| {
+            req.full_text_queries = try singleNamedFullTextQueryAlloc(alloc, index_name, query);
+        } else {
+            req.full_text = query;
+        }
         normalized_query.full_text = null;
+    } else if (request.full_text_index != null) {
+        return error.InvalidQueryRequest;
     } else if (normalized_query.filter_text != null or
         normalized_query.exclusion_text != null or
         normalized_query.filter_query_json.len > 0 or
@@ -2887,8 +2893,14 @@ fn buildPreflightSearchRequestAlloc(
     errdefer normalized_query.deinit(alloc);
 
     if (normalized_query.full_text) |query| {
-        req.full_text = query;
+        if (request.full_text_index) |index_name| {
+            req.full_text_queries = try singleNamedFullTextQueryAlloc(alloc, index_name, query);
+        } else {
+            req.full_text = query;
+        }
         normalized_query.full_text = null;
+    } else if (request.full_text_index != null) {
+        return error.InvalidQueryRequest;
     } else if (normalized_query.filter_text != null or
         normalized_query.exclusion_text != null or
         normalized_query.filter_query_json.len > 0 or
@@ -3063,6 +3075,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
     const disallowed = [_][]const u8{
         "\"query\"",
         "\"full_text_search\"",
+        "\"full_text_index\"",
         "\"filter_query\"",
         "\"exclusion_query\"",
         "\"merge_config\"",
@@ -8640,6 +8653,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
         else => {},
     }
     if (req.dense) |dense| alloc.free(dense.vector);
+    freeNamedFullTextQueries(alloc, req.full_text_queries);
     freeNamedDenseQueries(alloc, req.dense_queries);
     freeNamedSparseQueries(alloc, req.sparse_queries);
     freeNamedGraphQueries(alloc, req.graph_queries);
@@ -8667,6 +8681,38 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     }
     if (req.distributed_text_stats.len > 0) @import("../search/distributed_stats.zig").deinitTextFieldStats(alloc, req.distributed_text_stats);
     req.* = undefined;
+}
+
+fn singleNamedFullTextQueryAlloc(
+    alloc: std.mem.Allocator,
+    index_name: []const u8,
+    query: db_mod.types.TextQuery,
+) ![]const db_mod.types.NamedFullTextQuery {
+    if (index_name.len == 0) return error.InvalidQueryRequest;
+    const items = try alloc.alloc(db_mod.types.NamedFullTextQuery, 1);
+    errdefer alloc.free(items);
+    const result_name = try alloc.dupe(u8, "$full_text_results");
+    errdefer alloc.free(result_name);
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    items[0] = .{
+        .name = result_name,
+        .index_name = owned_index_name,
+        .query = query,
+    };
+    return items;
+}
+
+fn freeNamedFullTextQueries(
+    alloc: std.mem.Allocator,
+    queries: []const db_mod.types.NamedFullTextQuery,
+) void {
+    for (queries) |item| {
+        alloc.free(@constCast(item.name));
+        alloc.free(@constCast(item.index_name));
+        freeTextQuery(alloc, item.query);
+    }
+    if (queries.len > 0) alloc.free(@constCast(queries));
 }
 
 fn freeNamedDocFilterBindings(alloc: std.mem.Allocator, bindings: []const db_mod.types.NamedDocFilterBinding) void {
@@ -11159,6 +11205,38 @@ test "api query contract keeps ambiguous direct text operators score-bearing" {
     try std.testing.expectEqualStrings("body", parsed.req.full_text.?.match.field);
     try std.testing.expectEqualStrings("raft", parsed.req.full_text.?.match.text);
     try std.testing.expectEqualStrings("", parsed.req.filter_query_json);
+}
+
+test "api query contract targets named full text retrieval without changing primary filters" {
+    const alloc = std.testing.allocator;
+    var parsed = try parsePublicQueryRequest(
+        alloc,
+        null,
+        "docs",
+        \\{
+        \\  "full_text_index": "document_text",
+        \\  "full_text_search": {"match":"needle","field":"text"},
+        \\  "filter_query": {"term":{"path":"/tenant","value":"acme"}}
+        \\}
+        ,
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.req.full_text == null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.full_text_queries.len);
+    try std.testing.expectEqualStrings("$full_text_results", parsed.req.full_text_queries[0].name);
+    try std.testing.expectEqualStrings("document_text", parsed.req.full_text_queries[0].index_name);
+    try std.testing.expect(parsed.req.full_text_queries[0].query == .match);
+    try std.testing.expectEqualStrings("needle", parsed.req.full_text_queries[0].query.match.text);
+    try std.testing.expectEqualStrings(
+        "{\"term\":{\"path\":\"/tenant\",\"value\":\"acme\"}}",
+        parsed.req.filter_query_json,
+    );
+
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parsePublicQueryRequest(alloc, null, "docs", "{\"full_text_index\":\"document_text\",\"limit\":10}"),
+    );
 }
 
 test "api query contract rejects malformed scoring clauses before filter fallback" {

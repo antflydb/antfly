@@ -9028,6 +9028,7 @@ pub const ApiHttpServer = struct {
 
     fn validateSupportedForeignPublicQueryRequest(request: anytype) !void {
         if (request.full_text_search != null) return error.UnsupportedQueryRequest;
+        if (request.full_text_index != null) return error.UnsupportedQueryRequest;
         if (request.semantic_search != null) return error.UnsupportedQueryRequest;
         if (request.embedding_template != null) return error.UnsupportedQueryRequest;
         if (request.indexes != null) return error.UnsupportedQueryRequest;
@@ -25157,9 +25158,11 @@ test "api http server serves fielded full-text search through mcp tools" {
     try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw Antfly QueryRequest body"));
     const query_request_contract_schema = query_request_schema.object.get("anyOf").?.array.items[0];
     try std.testing.expect(query_properties.object.get("fullTextSearchField") != null);
+    try std.testing.expect(query_properties.object.get("fullTextIndex") != null);
     try std.testing.expect(query_properties.object.get("full_text_search") != null);
     const query_request_properties = query_request_contract_schema.object.get("properties") orelse return error.TestExpectedEqual;
     try std.testing.expect(query_request_properties.object.get("full_text_search") != null);
+    try std.testing.expect(query_request_properties.object.get("full_text_index") != null);
     const hierarchy_schema = query_request_properties.object.get("hierarchy") orelse return error.TestExpectedEqual;
     try ant_json.testing.expectEqualJsonValue(alloc, @embedFile("generated/mcp_query_hierarchy_schema.json"), hierarchy_schema);
     const hierarchy_properties = hierarchy_schema.object.get("properties").?.object;

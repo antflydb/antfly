@@ -207,6 +207,7 @@ describe("AntflyClient", () => {
 
       const request: QueryRequest = {
         table: "products",
+        full_text_index: "product_text",
         full_text_search: {
           match: "laptop",
           field: "name",

@@ -3,6 +3,7 @@ import type { IndexStatus, QueryRequest, TableStatus } from "@antfly/sdk";
 export interface TableQueryBuilderState {
   query: string;
   queryIndexes: string[];
+  fullTextIndex?: string;
   selectedFields: string[];
   semanticQuery: string;
   filterQuery: string;
@@ -120,10 +121,16 @@ export function builderArtifactRetrievalDefaults(
   indexes: IndexStatus[],
   query: string,
   selectedVectorIndexes: string[],
-  tableStatus?: TableStatus | null
+  tableStatus?: TableStatus | null,
+  selectedFullTextIndex?: string
 ): ArtifactRetrievalDefaults | null {
   if (!query.trim()) return null;
-  return artifactRetrievalDefaults(indexes, selectedVectorIndexes, tableStatus);
+  return artifactRetrievalDefaults(
+    indexes,
+    selectedVectorIndexes,
+    tableStatus,
+    selectedFullTextIndex
+  );
 }
 
 export function requestArtifactRetrievalDefaults(
@@ -151,7 +158,11 @@ export function requestArtifactRetrievalDefaults(
   }
 
   if (request.full_text_search !== undefined || request.hierarchy !== undefined) {
-    const defaults = artifactRetrievalDefaults(indexes, [], tableStatus);
+    const fullTextIndex =
+      typeof request.full_text_index === "string" && request.full_text_index.trim()
+        ? request.full_text_index
+        : undefined;
+    const defaults = artifactRetrievalDefaults(indexes, [], tableStatus, fullTextIndex);
     if (defaults) activeDefaults.push(defaults);
   }
 
@@ -169,15 +180,37 @@ export function requestArtifactRetrievalDefaults(
 export function artifactRetrievalDefaults(
   indexes: IndexStatus[],
   selectedVectorIndexes: string[],
-  tableStatus?: TableStatus | null
+  tableStatus?: TableStatus | null,
+  selectedFullTextIndex?: string
 ): ArtifactRetrievalDefaults | null {
   // The list endpoint owns membership. Table status supplies richer enrichment
   // metadata, but may briefly lag a create/drop operation.
   const configs = new Map(indexes.map((index) => [index.config.name, index.config]));
-  const candidateNames =
-    selectedVectorIndexes.length > 0
-      ? selectedVectorIndexes.filter((name) => configs.get(name)?.type === "embeddings")
-      : [...configs].filter(([, config]) => config.type === "full_text").map(([name]) => name);
+  const fullTextNames = [...configs]
+    .filter(([, config]) => config.type === "full_text")
+    .map(([name]) => name);
+  const schemaVersion = (tableStatus?.migration?.read_schema ?? tableStatus?.schema)?.version;
+  const activeSchemaIndex =
+    typeof schemaVersion === "number" ? `full_text_index_v${schemaVersion}` : undefined;
+  const schemaFullTextNames = fullTextNames.filter((name) => /^full_text_index_v\d+$/.test(name));
+  const automaticFullTextNames = activeSchemaIndex
+    ? fullTextNames.includes(activeSchemaIndex)
+      ? [activeSchemaIndex]
+      : []
+    : schemaFullTextNames.length === 1
+      ? schemaFullTextNames
+      : [];
+  const candidateNames = selectedVectorIndexes.length
+    ? selectedVectorIndexes.filter((name) => configs.get(name)?.type === "embeddings")
+    : selectedFullTextIndex
+      ? configs.get(selectedFullTextIndex)?.type === "full_text"
+        ? [selectedFullTextIndex]
+        : []
+      : automaticFullTextNames.length > 0
+        ? automaticFullTextNames
+        : fullTextNames.length === 1
+          ? fullTextNames
+          : [];
 
   const tableEnrichments = tableStatus?.artifact_enrichments ?? [];
   const artifactSearchFields = new Set<string>();
@@ -470,6 +503,7 @@ function normalizedProjectionFields(projectionFields?: string[]): string[] {
 export function buildTableQueryRequest({
   query,
   queryIndexes,
+  fullTextIndex,
   selectedFields,
   semanticQuery,
   filterQuery,
@@ -491,6 +525,7 @@ export function buildTableQueryRequest({
     request.indexes = queryIndexes;
     request.semantic_search = trimmedQuery;
   } else if (trimmedQuery.length > 0) {
+    if (fullTextIndex?.trim()) request.full_text_index = fullTextIndex.trim();
     if (normalizedSearchFields.length > 0) {
       request.full_text_search = artifactFullTextQuery(normalizedSearchFields, trimmedQuery);
     } else {

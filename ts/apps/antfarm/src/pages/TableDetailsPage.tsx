@@ -37,6 +37,11 @@ import {
   MultiSelectContent,
   MultiSelectItem,
   MultiSelectTrigger,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Sheet,
   SheetContent,
   SheetHeader,
@@ -271,6 +276,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [query, setQuery] = useState("");
   const [queryResult, setQueryResult] = useState<QueryResult | null>(null);
   const [queryIndexes, setQueryIndexes] = useState<string[]>([]);
+  const [fullTextIndex, setFullTextIndex] = useState("");
   const [filterQuery, setFilterQuery] = useState(JSON.stringify({}, null, 2));
   const [semanticQuery, setSemanticQuery] = useState(JSON.stringify({}, null, 2));
   const [selectedFields, setSelectedFields] = useState<string[]>([]);
@@ -320,8 +326,9 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   const [queryMode, setQueryMode] = useState<"builder" | "json">("builder");
 
   const artifactRetrieval = useMemo(
-    () => builderArtifactRetrievalDefaults(indexes, query, queryIndexes, tableStatus),
-    [indexes, query, queryIndexes, tableStatus]
+    () =>
+      builderArtifactRetrievalDefaults(indexes, query, queryIndexes, tableStatus, fullTextIndex),
+    [indexes, query, queryIndexes, tableStatus, fullTextIndex]
   );
   const artifactSelectionError = hasSemanticQuery ? artifactRetrieval?.selectionError : undefined;
   const queryMetadataBlocker = tableQueryMetadataBlocker(indexesMetadataState, tableMetadataState);
@@ -334,6 +341,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     return buildTableQueryRequest({
       query,
       queryIndexes,
+      fullTextIndex,
       selectedFields,
       semanticQuery,
       filterQuery,
@@ -346,6 +354,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
   }, [
     query,
     queryIndexes,
+    fullTextIndex,
     filterQuery,
     semanticQuery,
     selectedFields,
@@ -381,6 +390,8 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         const nextQueryIndexes = Array.isArray(queryRequest.indexes)
           ? queryRequest.indexes.filter((index): index is string => typeof index === "string")
           : [];
+        const nextFullTextIndex =
+          typeof queryRequest.full_text_index === "string" ? queryRequest.full_text_index : "";
         const nextSelectedFields = Array.isArray(queryRequest.fields)
           ? queryRequest.fields.filter((field): field is string => typeof field === "string")
           : [];
@@ -405,6 +416,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         const rebuilt = buildTableQueryRequest({
           query: nextQuery,
           queryIndexes: nextQueryIndexes,
+          fullTextIndex: nextFullTextIndex,
           selectedFields: nextSelectedFields,
           semanticQuery: nextSemanticQuery,
           filterQuery: nextFilterQuery,
@@ -421,6 +433,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         }
 
         setQueryIndexes(nextQueryIndexes);
+        setFullTextIndex(nextFullTextIndex);
         setSelectedFields(nextSelectedFields);
         setIncludeProfile(queryRequest.profile === true);
         setFieldInput("");
@@ -455,8 +468,14 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
           .filter((index) => index.config.type === "embeddings")
           .map((index) => index.config.name)
       );
+      const liveFullTextIndexes = new Set(
+        nextIndexes
+          .filter((index) => index.config.type === "full_text")
+          .map((index) => index.config.name)
+      );
       setIndexes(nextIndexes);
       setQueryIndexes((current) => current.filter((name) => liveVectorIndexes.has(name)));
+      setFullTextIndex((current) => (current && liveFullTextIndexes.has(current) ? current : ""));
       setIndexesMetadataState("ready");
     } catch (e) {
       if (
@@ -553,6 +572,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
     setQuery("");
     setQueryResult(null);
     setQueryIndexes([]);
+    setFullTextIndex("");
     setFilterQuery(JSON.stringify({}, null, 2));
     setSemanticQuery(JSON.stringify({}, null, 2));
     setSelectedFields([]);
@@ -589,6 +609,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
       const droppedIndexName = selectedIndex.config.name;
       await client.indexes.drop(tableName, droppedIndexName);
       setQueryIndexes((current) => current.filter((name) => name !== droppedIndexName));
+      setFullTextIndex((current) => (current === droppedIndexName ? "" : current));
       await refreshQueryMetadata();
       handleCloseDropDialog();
     } catch (e) {
@@ -603,6 +624,10 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
 
   const handleQueryIndexChange = (value: string[]) => {
     setQueryIndexes(value);
+  };
+
+  const handleFullTextIndexChange = (value: string) => {
+    setFullTextIndex(value === "__active_schema__" ? "" : value);
   };
 
   const handleRunQuery = useCallback(async () => {
@@ -1277,6 +1302,39 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
                               </p>
                             )}
                           </div>
+                          {indexes.some((idx) => idx.config.type === "full_text") && (
+                            <div>
+                              <Label className="text-xs mb-1 block">Full-text Index</Label>
+                              <Select
+                                value={fullTextIndex || "__active_schema__"}
+                                onValueChange={handleFullTextIndexChange}
+                                disabled={queryIndexes.length > 0}
+                              >
+                                <SelectTrigger>
+                                  <SelectValue placeholder="Use active schema index" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="__active_schema__">
+                                    Active schema index (automatic)
+                                  </SelectItem>
+                                  {indexes
+                                    .filter((idx) => idx.config.type === "full_text")
+                                    .map((index) => (
+                                      <SelectItem key={index.config.name} value={index.config.name}>
+                                        {index.config.name}
+                                      </SelectItem>
+                                    ))}
+                                </SelectContent>
+                              </Select>
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                {queryIndexes.length > 0
+                                  ? "Clear vector indexes to run full-text search."
+                                  : fullTextIndex
+                                    ? "Queries the selected named full-text index."
+                                    : "Uses the full-text index for the table's active read schema."}
+                              </p>
+                            </div>
+                          )}
                           {queryIndexes.length > 1 && (
                             <Alert className="py-1.5 px-3">
                               <AlertDescription className="text-xs">

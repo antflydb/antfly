@@ -103,6 +103,19 @@ pub const PublishedSearchSources = struct {
         return self.text;
     }
 
+    pub fn findTextByName(self: PublishedSearchSources, index_name: []const u8) ?TextSourceDescriptor {
+        if (self.items) |items| {
+            for (items) |item| switch (item) {
+                .text => |value| if (std.mem.eql(u8, value.index_name, index_name)) return value,
+                else => {},
+            };
+        }
+        if (self.text) |value| {
+            if (std.mem.eql(u8, value.index_name, index_name)) return value;
+        }
+        return null;
+    }
+
     pub fn findVector(self: PublishedSearchSources) ?VectorSourceDescriptor {
         if (self.items) |items| {
             for (items) |item| switch (item) {

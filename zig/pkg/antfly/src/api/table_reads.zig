@@ -16474,6 +16474,31 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
         // Child traversal is an ordered hierarchy scan rather than a relevance
         // query. Keeping the query clause out of the internal wire request also
         // lets the public parser reject accidental mixed-mode requests.
+    } else if (req.full_text_queries.len > 0) {
+        // The public selector is intentionally singular. Preserve its stable
+        // result name while forwarding coordinator requests to data shards;
+        // arbitrary internal multi-query plans cannot be represented by the
+        // public wire contract without losing result-set identity.
+        if (req.full_text != null or
+            req.full_text_queries.len != 1 or
+            !std.mem.eql(u8, req.full_text_queries[0].name, "$full_text_results"))
+        {
+            return error.UnsupportedQueryRequest;
+        }
+        try appendJsonFieldString(
+            alloc,
+            &out,
+            &first,
+            "full_text_index",
+            req.full_text_queries[0].index_name,
+        );
+        try appendTextQueryField(
+            alloc,
+            &out,
+            &first,
+            "full_text_search",
+            req.full_text_queries[0].query,
+        );
     } else if (req.full_text) |full_text| {
         try appendTextQueryField(alloc, &out, &first, "full_text_search", full_text);
     } else {
@@ -21590,6 +21615,31 @@ test "encode query request round-trips schema valid multi match boosts" {
                 .fields = &.{.{ .field = "body", .boost = -1 }},
             },
         } }),
+    );
+}
+
+test "encode query request preserves the singular named full text selector across shard forwarding" {
+    const alloc = std.testing.allocator;
+    const named = [_]db_mod.types.NamedFullTextQuery{.{
+        .name = "$full_text_results",
+        .index_name = "document_text",
+        .query = .{ .match = .{ .field = "text", .text = "singularity" } },
+    }};
+    const encoded = try encodeQueryRequest(alloc, .{ .full_text_queries = &named });
+    defer alloc.free(encoded);
+
+    var owned = try query_contract.parsePublicQueryRequest(alloc, null, "files", encoded);
+    defer owned.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), owned.req.full_text_queries.len);
+    try std.testing.expectEqualStrings("$full_text_results", owned.req.full_text_queries[0].name);
+    try std.testing.expectEqualStrings("document_text", owned.req.full_text_queries[0].index_name);
+    try std.testing.expectEqualStrings("singularity", owned.req.full_text_queries[0].query.match.text);
+
+    var unsupported = named;
+    unsupported[0].name = "$custom_results";
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        encodeQueryRequest(alloc, .{ .full_text_queries = &unsupported }),
     );
 }
 

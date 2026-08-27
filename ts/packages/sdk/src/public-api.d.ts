@@ -6485,6 +6485,15 @@ export interface components {
              */
             full_text_search?: components["schemas"]["RawQuery"];
             /**
+             * @description Full-text index used by `full_text_search` and by scoring text clauses in `query`.
+             *     Use this to query a named document- or artifact-backed full-text index. The selected
+             *     index must exist and have type `full_text`. Omit this field to use the table's active
+             *     schema full-text index, preserving v0.2 behavior. Structured document filters continue
+             *     to use the active schema index even when retrieval uses a named artifact index.
+             * @example document_text
+             */
+            full_text_index?: string;
+            /**
              * @description Natural language query for vector similarity search. Results are ranked by semantic similarity
              *     to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF).
              *
