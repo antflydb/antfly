@@ -1952,7 +1952,7 @@ pub const AntflyApiHandler = struct {
         var params = (try internalGroupTableParams(ctx)) orelse return textResponse(ctx, 400, "invalid path parameter");
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
-        var input = http_route_helpers.parseScanKeysRequest(ctx.allocator, body) catch |err| return switch (err) {
+        var input = http_route_helpers.parseInternalScanKeysRequest(ctx.allocator, body) catch |err| return switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => textResponse(ctx, 400, "invalid scan request"),
             else => err,
         };

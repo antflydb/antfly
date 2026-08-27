@@ -28,8 +28,10 @@ const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
+const document_content_hash = @import("document_content_hash.zig");
 pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
+pub const DocumentContentHash = document_content_hash.Digest;
 
 pub const GeoPoint = struct {
     lon: f64,
@@ -1119,6 +1121,9 @@ pub const ScanOptions = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     filter_query_json: []const u8 = "",
+    /// Internal-only response mode used by linear merge. Public scans leave
+    /// this false and retain their existing NDJSON shape.
+    include_content_hashes: bool = false,
 };
 
 pub const ScanDocument = struct {
@@ -1135,6 +1140,7 @@ pub const ScanDocument = struct {
 pub const ScanHash = struct {
     id: []u8,
     hash: u64,
+    content_hash: ?DocumentContentHash = null,
 
     pub fn deinit(self: *ScanHash, alloc: Allocator) void {
         alloc.free(self.id);

@@ -36,6 +36,7 @@ const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const doc_identity = @import("doc_identity.zig");
+const document_content_hash = @import("document_content_hash.zig");
 const range_cardinality = @import("range_cardinality.zig");
 pub const DocIdentityNamespace = doc_identity.Namespace;
 const doc_set = @import("doc_set.zig");
@@ -23208,6 +23209,10 @@ pub const DB = struct {
             try hashes.append(alloc, .{
                 .id = try alloc.dupe(u8, raw_key),
                 .hash = hash,
+                .content_hash = if (opts.include_content_hashes)
+                    try document_content_hash.hashJson(alloc, doc.value)
+                else
+                    null,
             });
 
             if (opts.include_documents) {
