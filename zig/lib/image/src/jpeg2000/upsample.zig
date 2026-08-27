@@ -218,12 +218,10 @@ pub fn bilinearU16(
     return out;
 }
 
-/// Bilinear upsampling on the JPEG 2000 reference grid. Unlike a generic
-/// resize, this preserves the phase implied by the image/tile origin and each
-/// component's XRsiz/YRsiz sampling factors.
-pub fn bilinearU16ReferenceGrid(
+fn bilinearIntegerReferenceGrid(
+    comptime Sample: type,
     allocator: std.mem.Allocator,
-    input: []const u16,
+    input: []const Sample,
     in_width: usize,
     in_height: usize,
     out_width: usize,
@@ -234,13 +232,17 @@ pub fn bilinearU16ReferenceGrid(
     component_origin_y: usize,
     xrsiz: usize,
     yrsiz: usize,
-) ![]u16 {
+) ![]Sample {
+    comptime {
+        const info = @typeInfo(Sample);
+        if (info != .int) @compileError("reference-grid bilinear samples must be integers");
+    }
     if (in_width == 0 or in_height == 0 or out_width == 0 or out_height == 0 or xrsiz == 0 or yrsiz == 0)
         return error.InvalidPlaneDimensions;
     const input_len = std.math.mul(usize, in_width, in_height) catch return error.InvalidPlaneDimensions;
     if (input.len != input_len) return error.InvalidPlaneDimensions;
     const output_len = std.math.mul(usize, out_width, out_height) catch return error.InvalidPlaneDimensions;
-    const out = try allocator.alloc(u16, output_len);
+    const out = try allocator.alloc(Sample, output_len);
     errdefer allocator.free(out);
 
     const max_x: isize = @as(isize, @intCast(in_width)) - 1;
@@ -275,6 +277,60 @@ pub fn bilinearU16ReferenceGrid(
     return out;
 }
 
+/// Bilinear upsampling on the JPEG 2000 reference grid. Unlike a generic
+/// resize, this preserves the phase implied by the image/tile origin and each
+/// component's XRsiz/YRsiz sampling factors.
+pub fn bilinearI32ReferenceGrid(
+    allocator: std.mem.Allocator,
+    input: []const i32,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+) ![]i32 {
+    return bilinearIntegerReferenceGrid(i32, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+}
+
+pub fn bilinearU8ReferenceGrid(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+) ![]u8 {
+    return bilinearIntegerReferenceGrid(u8, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+}
+
+pub fn bilinearU16ReferenceGrid(
+    allocator: std.mem.Allocator,
+    input: []const u16,
+    in_width: usize,
+    in_height: usize,
+    out_width: usize,
+    out_height: usize,
+    reference_origin_x: usize,
+    reference_origin_y: usize,
+    component_origin_x: usize,
+    component_origin_y: usize,
+    xrsiz: usize,
+    yrsiz: usize,
+) ![]u16 {
+    return bilinearIntegerReferenceGrid(u16, allocator, input, in_width, in_height, out_width, out_height, reference_origin_x, reference_origin_y, component_origin_x, component_origin_y, xrsiz, yrsiz);
+}
+
 test "reference-grid U16 upsampling preserves a non-aligned image origin" {
     const input = [_]u16{ 10, 20, 30 };
     const result = try bilinearU16ReferenceGrid(
@@ -293,6 +349,17 @@ test "reference-grid U16 upsampling preserves a non-aligned image origin" {
     );
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualSlices(u16, &.{ 10, 10, 13, 18, 23 }, result);
+}
+
+test "reference-grid integer upsampling is consistent across sample depths" {
+    const input_u8 = [_]u8{ 10, 20, 30 };
+    const input_i32 = [_]i32{ 10, 20, 30 };
+    const u8_result = try bilinearU8ReferenceGrid(std.testing.allocator, &input_u8, 3, 1, 5, 1, 3, 0, 2, 0, 2, 1);
+    defer std.testing.allocator.free(u8_result);
+    const i32_result = try bilinearI32ReferenceGrid(std.testing.allocator, &input_i32, 3, 1, 5, 1, 3, 0, 2, 0, 2, 1);
+    defer std.testing.allocator.free(i32_result);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 10, 13, 18, 23 }, u8_result);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 10, 13, 18, 23 }, i32_result);
 }
 
 /// Bilinear upsampling for f32 planes.

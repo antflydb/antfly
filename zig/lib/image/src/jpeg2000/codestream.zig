@@ -295,6 +295,45 @@ pub const State = struct {
         self.* = undefined;
     }
 
+    /// The decoder intentionally supports the compact single-stage custom-MCT
+    /// marker layout emitted by this codec. Reject other Annex-J stage graphs
+    /// at the capability gate instead of guessing and returning corrupted
+    /// pixels.
+    pub fn supportedCustomMctPayload(self: *const State) ?[]const u8 {
+        const mco = self.mco orelse return null;
+        const coding_style = self.coding_style orelse return null;
+        if (!coding_style.multiple_component_transform or coding_style.wavelet_transform != 0 or
+            self.header.components.len != 3 or mco.ids.len != 1) return null;
+
+        var referenced_mcc: ?*const McCCollection = null;
+        for (self.mcc_collections) |*mcc| {
+            if (mcc.index == mco.ids[0]) {
+                if (referenced_mcc != null) return null;
+                referenced_mcc = mcc;
+            }
+        }
+        const mcc = referenced_mcc orelse return null;
+        if (mcc.payload.len != 4 or mcc.payload[2] != 0 or mcc.payload[3] != 0) return null;
+        const mct_index = std.mem.readInt(u16, mcc.payload[0..2], .big);
+
+        var referenced_mct: ?*const McTSegment = null;
+        for (self.mct_segments) |*mct| {
+            if (mct.index == mct_index) {
+                if (referenced_mct != null) return null;
+                referenced_mct = mct;
+            }
+        }
+        const mct = referenced_mct orelse return null;
+        if (mct.element_type != 2 or mct.payload.len != 3 * 3 * @sizeOf(f32)) return null;
+        var offset: usize = 0;
+        while (offset < mct.payload.len) : (offset += @sizeOf(f32)) {
+            const raw = std.mem.readInt(u32, mct.payload[offset..][0..4], .big);
+            const value: f32 = @bitCast(raw);
+            if (!std.math.isFinite(value)) return null;
+        }
+        return mct.payload;
+    }
+
     /// Check support for the full (non-bounded) decode path.
     /// Allows arbitrary decomposition levels, wavelet transform 0 or 1,
     /// quantization styles 0/1/2, MCT, and all code block styles.
@@ -312,7 +351,13 @@ pub const State = struct {
         if (coding_style.progression_order > 4) return .unsupported_progression_order;
         // Allow both 5/3 (reversible, transform=1) and 9/7 (irreversible, transform=0)
         if (coding_style.wavelet_transform > 1) return .unsupported_wavelet_transform;
-        // MCT allowed for 3-component images with both wavelet types
+        if (coding_style.multiple_component_transform and self.header.components.len < 3)
+            return .unsupported_multi_component_transform;
+        if (self.mco != null and self.supportedCustomMctPayload() == null)
+            return .unsupported_multi_component_transform;
+        // Built-in MCT transforms the first three components and preserves any
+        // additional alpha/spot planes. Custom MCT is gated to the exact
+        // three-component marker layout implemented by the decoder.
         // Quantization styles 0, 1, 2 all supported
         const quantization_style = self.quantization_style orelse return .missing_quantization_style;
         if (quantization_style.style > 2) return .unsupported_quantization_mode;

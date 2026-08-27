@@ -216,7 +216,24 @@ fn validateEncodeParams(params: *const EncodeParams, pixel_len: usize) !struct {
     const h: usize = params.height;
     const num_components: usize = params.components;
 
-    if (pixel_len != w * h * num_components) return error.InvalidPixelDataLength;
+    if (num_components == 0) return error.InvalidComponentCount;
+    if (params.multiple_component_transform and num_components < 3)
+        return error.InvalidMctComponentCount;
+    if (params.custom_mct) |matrix| {
+        if (!params.multiple_component_transform or params.wavelet_transform != 0 or num_components != 3)
+            return error.InvalidCustomMctConfiguration;
+        if (matrix.num_components != 3 or matrix.forward.len != 9 or matrix.inverse.len != 9 or matrix.offsets.len != 3)
+            return error.InvalidCustomMct;
+        for (matrix.forward) |value| if (!std.math.isFinite(value)) return error.InvalidCustomMct;
+        for (matrix.inverse) |value| if (!std.math.isFinite(value)) return error.InvalidCustomMct;
+        for (matrix.offsets) |value| {
+            if (!std.math.isFinite(value)) return error.InvalidCustomMct;
+            if (value != 0.0) return error.UnsupportedCustomMctOffsets;
+        }
+    }
+    const pixel_count = std.math.mul(usize, w, h) catch return error.InvalidPixelDataLength;
+    const expected_samples = std.math.mul(usize, pixel_count, num_components) catch return error.InvalidPixelDataLength;
+    if (pixel_len != expected_samples) return error.InvalidPixelDataLength;
     if (params.code_block_width_exponent > 30 or params.code_block_height_exponent > 30) {
         return error.UnsupportedCodeBlockSize;
     }
@@ -1584,6 +1601,56 @@ test "validateEncodeParams accepts BYPASS/TERMALL/PTERM Scod bits" {
         .code_block_style = 0x01 | 0x04 | 0x10,
     };
     _ = try validateEncodeParams(&params, 16);
+}
+
+test "validateEncodeParams rejects MCT without three color components" {
+    const params = EncodeParams{
+        .width = 2,
+        .height = 2,
+        .components = 2,
+        .multiple_component_transform = true,
+    };
+    try std.testing.expectError(error.InvalidMctComponentCount, validateEncodeParams(&params, 8));
+}
+
+test "validateEncodeParams rejects custom MCT configurations that would be ignored" {
+    const identity = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const offsets = [_]f32{ 0, 0, 0 };
+    const matrix = color_transform.CustomMctMatrix{
+        .num_components = 3,
+        .forward = &identity,
+        .inverse = &identity,
+        .offsets = &offsets,
+    };
+    const params = EncodeParams{
+        .width = 2,
+        .height = 2,
+        .components = 3,
+        .wavelet_transform = 0,
+        .multiple_component_transform = false,
+        .custom_mct = matrix,
+    };
+    try std.testing.expectError(error.InvalidCustomMctConfiguration, validateEncodeParams(&params, 12));
+}
+
+test "validateEncodeParams rejects custom MCT offsets that cannot be serialized" {
+    const identity = [_]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+    const offsets = [_]f32{ 1, 0, 0 };
+    const matrix = color_transform.CustomMctMatrix{
+        .num_components = 3,
+        .forward = &identity,
+        .inverse = &identity,
+        .offsets = &offsets,
+    };
+    const params = EncodeParams{
+        .width = 2,
+        .height = 2,
+        .components = 3,
+        .wavelet_transform = 0,
+        .multiple_component_transform = true,
+        .custom_mct = matrix,
+    };
+    try std.testing.expectError(error.UnsupportedCustomMctOffsets, validateEncodeParams(&params, 12));
 }
 
 test "encode 4x4 grayscale produces valid J2K starting with SOC" {
@@ -3007,7 +3074,7 @@ test "custom MCT markers round-trip through codestream" {
     // is exercised in color_transform.zig. Here we only verify marker wiring.
     const forward = [_]f32{ 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 };
     const inverse = [_]f32{ 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0 };
-    const offsets = [_]f32{ 128.0, 128.0, 128.0 };
+    const offsets = [_]f32{ 0.0, 0.0, 0.0 };
     const matrix = color_transform.CustomMctMatrix{
         .num_components = 3,
         .forward = &forward,
@@ -3036,6 +3103,31 @@ test "custom MCT markers round-trip through codestream" {
     try std.testing.expectEqual(@as(usize, 1), state.mcc_collections.len);
     try std.testing.expect(state.mco != null);
     try std.testing.expectEqual(@as(usize, 1), state.mco.?.ids.len);
+    try std.testing.expectEqual(codestream.NativeDecodeSupport.supported, state.fullNativeDecodeSupport());
+
+    // Custom marker payloads have an explicit arity. Never reinterpret a 3x3
+    // matrix as part of a four-component transform.
+    const original_components = state.header.components;
+    var four_components = [_]codestream.Component{
+        original_components[0],
+        original_components[1],
+        original_components[2],
+        original_components[2],
+    };
+    state.header.components = &four_components;
+    try std.testing.expectEqual(
+        codestream.NativeDecodeSupport.unsupported_multi_component_transform,
+        state.fullNativeDecodeSupport(),
+    );
+    state.header.components = original_components;
+
+    const original_payload = state.mct_segments[0].payload;
+    state.mct_segments[0].payload = original_payload[0 .. original_payload.len - 4];
+    try std.testing.expectEqual(
+        codestream.NativeDecodeSupport.unsupported_multi_component_transform,
+        state.fullNativeDecodeSupport(),
+    );
+    state.mct_segments[0].payload = original_payload;
 
     // Payload f32 coefficients must round-trip byte-for-byte with the matrix.
     var i: usize = 0;
@@ -3096,8 +3188,8 @@ test "encode with custom_mct applies user matrix in forward path" {
     defer allocator.free(bytes_custom);
 
     // The custom stream carries extra MCT/MCC/MCO markers, so it must be
-    // longer than the built-in ICT stream. Decode must still work (falls
-    // back to ICT in the reconstruct path for MVP).
+    // longer than the built-in ICT stream. Decode must consume the validated
+    // compact custom-MCT marker chain successfully.
     try std.testing.expect(bytes_custom.len > bytes_ict.len);
     var decoded = try decode.decodeU8Bytes(allocator, bytes_custom);
     defer decoded.deinit();

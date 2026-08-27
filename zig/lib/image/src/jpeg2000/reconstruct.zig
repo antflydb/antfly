@@ -491,6 +491,139 @@ pub fn interleaveComponentPlanesU16(
     return output;
 }
 
+/// Interleave reconstructed U8 component samples, upsampling one component at
+/// a time on the JPEG 2000 reference grid. Processing one plane at a time keeps
+/// peak memory bounded for dense multi-tile PDF images.
+pub fn interleaveComponentSamplesU8(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU8,
+    state: *const codestream.State,
+) ![]u8 {
+    const component_count = component_planes.planes.len;
+    if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
+        component_planes.widths.len != component_count or
+        component_planes.heights.len != component_count) return error.UnsupportedPlaneCount;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch return error.InvalidPlaneLength;
+    const output_len = std.math.mul(usize, pixel_count, component_count) catch return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+
+    for (component_planes.planes, 0..) |source, component_index| {
+        const source_width = component_planes.widths[component_index];
+        const source_height = component_planes.heights[component_index];
+        const source_len = std.math.mul(usize, source_width, source_height) catch return error.InvalidPlaneLength;
+        if (source_width == 0 or source_height == 0 or source.len != source_len)
+            return error.InvalidPlaneLength;
+        var upsampled: ?[]u8 = null;
+        defer if (upsampled) |plane| allocator.free(plane);
+        const plane = if (source_width == image_width and source_height == image_height)
+            source
+        else blk: {
+            const component = state.header.components[component_index];
+            const geometry = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            if (source_width != geometry.width or source_height != geometry.height)
+                return error.InvalidPlaneLength;
+            upsampled = try upsample.bilinearU8ReferenceGrid(
+                allocator,
+                source,
+                source_width,
+                source_height,
+                image_width,
+                image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                geometry.origin_x,
+                geometry.origin_y,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            break :blk upsampled.?;
+        };
+        for (plane, 0..) |sample, pixel_index| {
+            output[pixel_index * component_count + component_index] = sample;
+        }
+    }
+    return output;
+}
+
+/// Interleave native-precision component samples into U8 output. This is used
+/// for non-8-bit multi-tile streams so interpolation happens before the final
+/// precision conversion, matching the single-tile decode path exactly.
+pub fn interleaveNativeComponentSamplesU8(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU16,
+    state: *const codestream.State,
+) ![]u8 {
+    const component_count = component_planes.planes.len;
+    if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
+        component_planes.widths.len != component_count or
+        component_planes.heights.len != component_count) return error.UnsupportedPlaneCount;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch return error.InvalidPlaneLength;
+    const output_len = std.math.mul(usize, pixel_count, component_count) catch return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+
+    for (component_planes.planes, 0..) |source, component_index| {
+        const source_width = component_planes.widths[component_index];
+        const source_height = component_planes.heights[component_index];
+        const source_len = std.math.mul(usize, source_width, source_height) catch return error.InvalidPlaneLength;
+        if (source_width == 0 or source_height == 0 or source.len != source_len)
+            return error.InvalidPlaneLength;
+        var upsampled: ?[]u16 = null;
+        defer if (upsampled) |plane| allocator.free(plane);
+        const component = state.header.components[component_index];
+        const plane = if (source_width == image_width and source_height == image_height)
+            source
+        else blk: {
+            const geometry = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            if (source_width != geometry.width or source_height != geometry.height)
+                return error.InvalidPlaneLength;
+            upsampled = try upsample.bilinearU16ReferenceGrid(
+                allocator,
+                source,
+                source_width,
+                source_height,
+                image_width,
+                image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                geometry.origin_x,
+                geometry.origin_y,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            break :blk upsampled.?;
+        };
+        const center: i32 = @as(i32, 1) << @intCast(component.bits_per_component - 1);
+        for (plane, 0..) |sample, pixel_index| {
+            output[pixel_index * component_count + component_index] = try reconstructU8Sample(
+                @as(i32, sample) - center,
+                component.bits_per_component,
+                component.is_signed,
+            );
+        }
+    }
+    return output;
+}
+
 /// Stitch decoded tile pixels into a single output image buffer.
 /// Each tile's pixels are copied to the correct position in the output.
 pub fn reconstructMultiTile(
@@ -1045,63 +1178,36 @@ pub fn buildCustomMctMatrixFromState(
     state: *const codestream.State,
     num_components: u8,
 ) !?color_transform.CustomMctMatrix {
-    const mco = state.mco orelse return null;
-    if (mco.ids.len == 0) return null;
-    if (num_components == 0) return null;
+    if (state.mco == null) return null;
+    if (num_components != 3) return error.UnsupportedCustomMct;
+    const payload = state.supportedCustomMctPayload() orelse return error.UnsupportedCustomMct;
+    const nn: usize = @as(usize, num_components) * @as(usize, num_components);
+    const expected_bytes = nn * @sizeOf(f32);
+    if (payload.len != expected_bytes) return error.UnsupportedCustomMct;
 
-    // Walk the MCO chain. The encoder only emits a single MCC reference, so
-    // we resolve the first id that successfully yields an f32 MCT. If none
-    // resolve, return null so the caller can fall back to the built-in ICT.
-    for (mco.ids) |mcc_id| {
-        const mcc = findMcc(state, mcc_id) orelse continue;
-        // Placeholder payload layout: [u16 mct_index, u16 reserved].
-        if (mcc.payload.len < 2) continue;
-        const mct_index = std.mem.readInt(u16, mcc.payload[0..2], .big);
-        const mct = findMct(state, mct_index) orelse continue;
-        if (mct.element_type != 2) continue; // only f32 supported
-        const nn: usize = @as(usize, num_components) * @as(usize, num_components);
-        const expected_bytes = nn * @sizeOf(f32);
-        if (mct.payload.len < expected_bytes) continue;
-
-        const forward = try allocator.alloc(f32, nn);
-        errdefer allocator.free(forward);
-        var k: usize = 0;
-        while (k < nn) : (k += 1) {
-            const raw = std.mem.readInt(u32, mct.payload[k * 4 ..][0..4], .big);
-            forward[k] = @bitCast(raw);
-        }
-
-        const inverse = color_transform.invertMctMatrixGaussJordan(forward, num_components, allocator) catch |err| {
-            allocator.free(forward);
-            return err;
-        };
-        errdefer allocator.free(inverse);
-
-        const offsets = try allocator.alloc(f32, num_components);
-        @memset(offsets, 0.0);
-
-        return color_transform.CustomMctMatrix{
-            .num_components = num_components,
-            .forward = forward,
-            .inverse = inverse,
-            .offsets = offsets,
-        };
+    const forward = try allocator.alloc(f32, nn);
+    errdefer allocator.free(forward);
+    var k: usize = 0;
+    while (k < nn) : (k += 1) {
+        const raw = std.mem.readInt(u32, payload[k * 4 ..][0..4], .big);
+        forward[k] = @bitCast(raw);
     }
-    return null;
-}
 
-fn findMcc(state: *const codestream.State, id: u16) ?*const codestream.McCCollection {
-    for (state.mcc_collections) |*m| {
-        if (m.index == id) return m;
-    }
-    return null;
-}
+    const inverse = color_transform.invertMctMatrixGaussJordan(forward, num_components, allocator) catch |err| {
+        allocator.free(forward);
+        return err;
+    };
+    errdefer allocator.free(inverse);
 
-fn findMct(state: *const codestream.State, id: u16) ?*const codestream.McTSegment {
-    for (state.mct_segments) |*m| {
-        if (m.index == id) return m;
-    }
-    return null;
+    const offsets = try allocator.alloc(f32, num_components);
+    @memset(offsets, 0.0);
+
+    return color_transform.CustomMctMatrix{
+        .num_components = num_components,
+        .forward = forward,
+        .inverse = inverse,
+        .offsets = offsets,
+    };
 }
 
 /// Assemble coefficient planes and apply the irreversible (9/7) pipeline:
@@ -1541,7 +1647,9 @@ fn interleaveComponentPlanesU8WithUpsampling(
     }
 
     for (state.header.components, 0..) |component, component_index| {
-        const dims = tile.componentDimensions(
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
             state.header.width,
             state.header.height,
             component.xrsiz,
@@ -1552,14 +1660,19 @@ fn interleaveComponentPlanesU8WithUpsampling(
         if (component_width == image_width and component_height == image_height) {
             planes[component_index] = raw_planes[component_index];
         } else {
-            planes[component_index] = try upsample.upsampleI32(
+            planes[component_index] = try upsample.bilinearI32ReferenceGrid(
                 allocator,
-                .bilinear,
                 raw_planes[component_index],
                 component_width,
                 component_height,
                 image_width,
                 image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                dims.origin_x,
+                dims.origin_y,
+                component.xrsiz,
+                component.yrsiz,
             );
             owned_upsampled[component_index] = true;
         }
@@ -1594,7 +1707,9 @@ pub fn interleaveComponentPlanesU8(
     const pixel_count = std.math.mul(usize, image_width, image_height) catch
         return error.InvalidPlaneLength;
     for (state.header.components, raw_planes) |component, plane| {
-        const dims = tile.componentDimensions(
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
             state.header.width,
             state.header.height,
             component.xrsiz,
@@ -1774,14 +1889,34 @@ pub fn reconstructTier1ExecutionReportWithOptions(
     }
     var any_subsampled = false;
     for (state.header.components, 0..) |comp, i| {
-        const dims = tile.componentDimensions(state.header.width, state.header.height, comp.xrsiz, comp.yrsiz);
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            comp.xrsiz,
+            comp.yrsiz,
+        );
         const cw: usize = @intCast(dims.width);
         const ch: usize = @intCast(dims.height);
         if (cw == image_w and ch == image_h) {
             planes[i] = raw_planes[i];
         } else {
             any_subsampled = true;
-            planes[i] = try upsample.upsampleI32(allocator, .bilinear, raw_planes[i], cw, ch, image_w, image_h);
+            planes[i] = try upsample.bilinearI32ReferenceGrid(
+                allocator,
+                raw_planes[i],
+                cw,
+                ch,
+                image_w,
+                image_h,
+                state.header.x_offset,
+                state.header.y_offset,
+                dims.origin_x,
+                dims.origin_y,
+                comp.xrsiz,
+                comp.yrsiz,
+            );
             owned_upsampled[i] = true;
         }
     }
