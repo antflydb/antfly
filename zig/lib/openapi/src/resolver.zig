@@ -23,6 +23,7 @@ const types = @import("types.zig");
 const naming = @import("naming.zig");
 
 pub const ResolveError = error{
+    CyclicRef,
     UnresolvedRef,
     OutOfMemory,
 };
@@ -36,22 +37,52 @@ pub const Resolver = struct {
     }
 
     /// Resolve a SchemaOrRef to its concrete Schema.
-    /// For inline schemas, returns as-is.
-    /// For $ref, looks up in components/schemas.
+    /// For inline schemas, returns as-is. Local component aliases are followed
+    /// to their concrete schema with cycle detection. External references are
+    /// deliberately unresolved: their schemas belong to another document and
+    /// must not be confused with a same-named component in this document.
     pub fn resolveSchema(self: *Resolver, sor: types.SchemaOrRef) ResolveError!types.Schema {
-        switch (sor) {
-            .schema => |s| return s,
-            .ref => |ref| {
+        // Schema aliases form a singly linked chain, so Floyd's algorithm gives
+        // exact cycle detection without allocating a visited set for every
+        // generator lookup.
+        var slow = sor;
+        var fast = sor;
+        while (true) {
+            slow = (try self.nextSchemaAlias(slow)) orelse break;
+            fast = (try self.nextSchemaAlias(fast)) orelse break;
+            fast = (try self.nextSchemaAlias(fast)) orelse break;
+            if (sameSchemaRef(slow, fast)) return ResolveError.CyclicRef;
+        }
+
+        var current = sor;
+        while (true) {
+            switch (current) {
+                .schema => |schema| return schema,
+                .ref => current = (try self.nextSchemaAlias(current)) orelse unreachable,
+            }
+        }
+    }
+
+    fn nextSchemaAlias(self: *Resolver, sor: types.SchemaOrRef) ResolveError!?types.SchemaOrRef {
+        return switch (sor) {
+            .schema => null,
+            .ref => |ref| blk: {
+                if (naming.isExternalRef(ref.ref_string)) return ResolveError.UnresolvedRef;
                 const ref_name = naming.refToName(ref.ref_string) orelse return ResolveError.UnresolvedRef;
                 const components = self.doc.components orelse return ResolveError.UnresolvedRef;
-                const target = components.schemas.get(ref_name) orelse return ResolveError.UnresolvedRef;
-                // Resolve one level (don't chase ref chains for now)
-                return switch (target) {
-                    .schema => |s| s,
-                    .ref => return ResolveError.UnresolvedRef,
-                };
+                break :blk components.schemas.get(ref_name) orelse return ResolveError.UnresolvedRef;
             },
-        }
+        };
+    }
+
+    fn sameSchemaRef(left: types.SchemaOrRef, right: types.SchemaOrRef) bool {
+        return switch (left) {
+            .schema => false,
+            .ref => |left_ref| switch (right) {
+                .schema => false,
+                .ref => |right_ref| std.mem.eql(u8, left_ref.ref_string, right_ref.ref_string),
+            },
+        };
     }
 
     /// Resolve a ParameterOrRef to its concrete Parameter.
@@ -155,5 +186,66 @@ test "unresolved ref" {
 
     var resolver = Resolver.init(arena, &doc);
     const result = resolver.resolveSchema(types.SchemaOrRef{ .ref = .{ .ref_string = "#/components/schemas/Missing" } });
+    try std.testing.expectError(ResolveError.UnresolvedRef, result);
+}
+
+test "resolve schema ref alias chain" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Alias", .{ .ref = .{ .ref_string = "#/components/schemas/Target" } });
+    try schemas.put(arena, "Target", .{ .schema = .{ .schema_type = .{ .single = "string" }, .nullable = true } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+
+    var resolver = Resolver.init(arena, &doc);
+    const resolved = try resolver.resolveSchema(.{ .ref = .{ .ref_string = "#/components/schemas/Alias" } });
+    try std.testing.expect(resolved.isNullable());
+}
+
+test "reject cyclic schema ref aliases" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Left", .{ .ref = .{ .ref_string = "#/components/schemas/Right" } });
+    try schemas.put(arena, "Right", .{ .ref = .{ .ref_string = "#/components/schemas/Left" } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+
+    var resolver = Resolver.init(arena, &doc);
+    const result = resolver.resolveSchema(.{ .ref = .{ .ref_string = "#/components/schemas/Left" } });
+    try std.testing.expectError(ResolveError.CyclicRef, result);
+}
+
+test "external schema ref cannot resolve to same-named local component" {
+    const alloc = std.testing.allocator;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
+    try schemas.put(arena, "Identifier", .{ .schema = .{ .schema_type = .{ .single = "string" } } });
+    const doc = types.OpenApiDoc{
+        .openapi = "3.0.3",
+        .info = .{ .title = "Test", .version = "1.0" },
+        .components = .{ .schemas = schemas },
+    };
+
+    var resolver = Resolver.init(arena, &doc);
+    const result = resolver.resolveSchema(.{
+        .ref = .{ .ref_string = "generated/identifier.yaml#/components/schemas/Identifier" },
+    });
     try std.testing.expectError(ResolveError.UnresolvedRef, result);
 }

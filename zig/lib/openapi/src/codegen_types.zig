@@ -253,10 +253,11 @@ pub const TypeGenerator = struct {
             try self.emitStructField(type_name, prop_name, prop_sor, required_set.contains(prop_name));
         }
 
-        // Request serialization normally omits null optional fields. A custom
-        // serializer is needed only when the schema also has a required field
-        // that permits null, because presence remains part of its contract.
-        if (self.schemaHasRequiredNullableFields(schema, &required_set, true)) {
+        // Request serialization normally omits null optional fields. Generate a
+        // required-aware serializer when a required field permits null or its
+        // nullability belongs to an external schema we cannot inspect. Presence
+        // remains part of the containing object's wire contract either way.
+        if (self.schemaNeedsRequiredFieldSerializer(schema, &required_set, true)) {
             try self.w.blank();
             try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
             self.w.indent();
@@ -399,7 +400,7 @@ pub const TypeGenerator = struct {
         // Also include any direct properties on the schema itself
         try self.emitFlattenedSchemaProperties(type_name, schema, &emitted_props, &all_required, true);
 
-        if (self.schemaHasRequiredNullableFields(schema, &all_required, true)) {
+        if (self.schemaNeedsRequiredFieldSerializer(schema, &all_required, true)) {
             try self.w.blank();
             try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
             self.w.indent();
@@ -529,7 +530,7 @@ pub const TypeGenerator = struct {
         }
     }
 
-    fn schemaHasRequiredNullableFields(
+    fn schemaNeedsRequiredFieldSerializer(
         self: *TypeGenerator,
         schema: types.Schema,
         required_fields: *const std.StringArrayHashMapUnmanaged(void),
@@ -538,25 +539,30 @@ pub const TypeGenerator = struct {
         if (allow_required) {
             for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
                 if (!required_fields.contains(prop_name)) continue;
-                if (self.schemaOrRefAllowsNull(prop_sor)) return true;
+                if (self.schemaOrRefNullability(prop_sor) != .non_nullable) return true;
             }
         }
 
         for (schema.all_of) |member| {
             const resolved = self.resolver.resolveSchema(member) catch continue;
-            if (self.schemaHasRequiredNullableFields(resolved, required_fields, allow_required)) return true;
+            if (self.schemaNeedsRequiredFieldSerializer(resolved, required_fields, allow_required)) return true;
         }
         return false;
     }
 
+    const SchemaNullability = enum { non_nullable, nullable, unknown };
+
     /// Whether a property schema permits JSON null. OpenAPI represents this
     /// through 3.0 `nullable`, a 3.1 type array, or a nullable composition.
-    /// Resolve component references here because request presence semantics
-    /// belong to the referenced wire schema, not to the spelling used by the
-    /// containing property.
-    fn schemaOrRefAllowsNull(self: *TypeGenerator, schema_or_ref: types.SchemaOrRef) bool {
-        const schema = self.resolver.resolveSchema(schema_or_ref) catch return false;
-        return schema.isNullable() or nullableOneOfInner(schema.one_of) != null;
+    /// Local component aliases are resolved recursively. External schemas are
+    /// unknown by construction; callers must preserve required-field presence
+    /// conservatively instead of assuming that an unresolved type rejects null.
+    fn schemaOrRefNullability(self: *TypeGenerator, schema_or_ref: types.SchemaOrRef) SchemaNullability {
+        const schema = self.resolver.resolveSchema(schema_or_ref) catch return .unknown;
+        return if (schema.isNullable() or nullableOneOfInner(schema.one_of) != null)
+            .nullable
+        else
+            .non_nullable;
     }
 
     /// Generate a union(enum) from oneOf with discriminator.
@@ -1220,6 +1226,12 @@ pub const TypeGenerator = struct {
         try mapped.generateAll(&doc);
         try std.testing.expect(std.mem.indexOf(u8, mapped_writer.toSlice(), "alias: identifier_openapi.Identifier,") != null);
         try std.testing.expect(mapped.used_imports.contains("identifier_openapi"));
+        // The imported schema's nullability is not available in this document.
+        // Conservatively emit the required field so an imported optional alias
+        // cannot turn an explicit required null into an absent property.
+        try std.testing.expect(std.mem.indexOf(u8, mapped_writer.toSlice(), "pub fn jsonStringify(self: @This(), jw: anytype) !void {") != null);
+        try std.testing.expect(std.mem.indexOf(u8, mapped_writer.toSlice(), "try jw.objectField(\"alias\");") != null);
+        try std.testing.expect(std.mem.indexOf(u8, mapped_writer.toSlice(), "try jw.write(self.alias);") != null);
     }
 
     /// Get the Zig type string for an inline schema.
@@ -1529,16 +1541,22 @@ test "required + nullable field codegen" {
     try props.put(arena, "referenced_tag", .{
         .ref = .{ .ref_string = "#/components/schemas/NullableString" },
     });
+    try props.put(arena, "aliased_referenced_tag", .{
+        .ref = .{ .ref_string = "#/components/schemas/NullableStringAlias" },
+    });
 
     var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
     try schemas.put(arena, "NullableString", .{
         .schema = .{ .one_of = nullable_string_members },
     });
+    try schemas.put(arena, "NullableStringAlias", .{
+        .ref = .{ .ref_string = "#/components/schemas/NullableString" },
+    });
     try schemas.put(arena, "Item", types.SchemaOrRef{
         .schema = types.Schema{
             .schema_type = .{ .single = "object" },
             .properties = props,
-            .required = &.{ "name", "tag", "old_tag", "one_of_tag", "referenced_tag" },
+            .required = &.{ "name", "tag", "old_tag", "one_of_tag", "referenced_tag", "aliased_referenced_tag" },
         },
     });
 
@@ -1568,6 +1586,7 @@ test "required + nullable field codegen" {
     // type, including through a named component reference.
     try std.testing.expect(std.mem.indexOf(u8, output, "one_of_tag: ?[]const u8,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "referenced_tag: NullableString,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "aliased_referenced_tag: NullableStringAlias,") != null);
     // Doc comment from nullable field description
     try std.testing.expect(std.mem.indexOf(u8, output, "/// A nullable required tag") != null);
     // Request serialization must preserve required nulls while omitting absent
@@ -1578,6 +1597,8 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.one_of_tag);") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"referenced_tag\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.referenced_tag);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"aliased_referenced_tag\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.aliased_referenced_tag);") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (self.note) |value|") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "else if (jw.options.emit_null_optional_fields)") != null);
 }

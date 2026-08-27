@@ -1486,6 +1486,93 @@ pub const FieldCapability = struct {
     index_sort_position: ?i64 = null,
     /// Sort direction in the table index_sort tuple when this field participates.
     index_sort_order: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.name) |value| {
+            try jw.objectField("name");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("name");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.path_pattern) |value| {
+            try jw.objectField("path_pattern");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("path_pattern");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.field_pattern) |value| {
+            try jw.objectField("field_pattern");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field_pattern");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.match_mapping_type) |value| {
+            try jw.objectField("match_mapping_type");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("match_mapping_type");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.emitted_name) |value| {
+            try jw.objectField("emitted_name");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("emitted_name");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.document_schema) |value| {
+            try jw.objectField("document_schema");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("document_schema");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("query_modes");
+        try jw.write(self.query_modes);
+        try jw.objectField("sortable");
+        try jw.write(self.sortable);
+        try jw.objectField("provenance");
+        try jw.write(self.provenance);
+        try jw.objectField("missing_null_policy");
+        try jw.write(self.missing_null_policy);
+        try jw.objectField("sort_lifecycle_state");
+        try jw.write(self.sort_lifecycle_state);
+        if (self.analyzer) |value| {
+            try jw.objectField("analyzer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("analyzer");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.index_sort_position) |value| {
+            try jw.objectField("index_sort_position");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("index_sort_position");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.index_sort_order) |value| {
+            try jw.objectField("index_sort_order");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("index_sort_order");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Statistics about a specific field.
@@ -1716,6 +1803,17 @@ pub const IndexStatus = struct {
     shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
     config: antfly_indexes_openapi.IndexConfig,
     status: antfly_indexes_openapi.IndexStats,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("shard_status");
+        try jw.write(self.shard_status);
+        try jw.objectField("config");
+        try jw.write(self.config);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
 };
 
 /// Actionable retry contract for temporary inference-capacity failures.
@@ -3574,6 +3672,15 @@ pub const TableCatalogChangedConflict = struct {
 pub const TableMigration = struct {
     state: []const u8,
     read_schema: antfly_schema_openapi.TableSchema,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("read_schema");
+        try jw.write(self.read_schema);
+        try jw.endObject();
+    }
 };
 
 /// Durable table repair debt. Artifact targets include exact source and artifact identifiers; index targets include the affected index and repair status.

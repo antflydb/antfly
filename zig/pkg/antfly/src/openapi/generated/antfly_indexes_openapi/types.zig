@@ -1320,10 +1320,31 @@ pub const GraphAliasCountAggregate = struct {
     count: antfly_graph_identifier_openapi.GraphIdentifier,
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("count");
+        try jw.write(self.count);
+        if (self.distinct) |value| {
+            try jw.objectField("distinct");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("distinct");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphAliasOperand = struct {
     alias: antfly_graph_identifier_openapi.GraphIdentifier,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("alias");
+        try jw.write(self.alias);
+        try jw.endObject();
+    }
 };
 
 /// Document fields made available to graph mapping templates through `_doc.value`.
@@ -1659,6 +1680,24 @@ pub const GraphDocumentFuzzyFilter = struct {
     /// Required so fuzzy and exact term predicates remain structurally distinct.
     fuzziness: antfly_query_openapi.Fuzziness,
     prefix_length: ?i32 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("term");
+        try jw.write(self.term);
+        try jw.objectField("path");
+        try jw.write(self.path);
+        try jw.objectField("fuzziness");
+        try jw.write(self.fuzziness);
+        if (self.prefix_length) |value| {
+            try jw.objectField("prefix_length");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("prefix_length");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphDocumentIdsFilter = struct {
@@ -1885,6 +1924,31 @@ pub const GraphMatch = struct {
     where: ?GraphWhereExpression = null,
     /// Ordered correlated left-outer patterns. Aliases introduced by an earlier item are visible to later items, including as null.
     optional: ?[]const GraphOptionalMatch = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("anchor");
+        try jw.write(self.anchor);
+        try jw.objectField("nodes");
+        try jw.write(self.nodes);
+        try jw.objectField("edges");
+        try jw.write(self.edges);
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("where");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.optional) |value| {
+            try jw.objectField("optional");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("optional");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Outgoing structural edge expansion from the `from` alias to the `to` alias. Reverse a relationship by swapping those aliases; model an undirected relationship by indexing both directed edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
@@ -1897,6 +1961,50 @@ pub const GraphMatchEdge = struct {
     max_hops: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("from");
+        try jw.write(self.from);
+        try jw.objectField("to");
+        try jw.write(self.to);
+        if (self.types) |value| {
+            try jw.objectField("types");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("types");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.min_hops) |value| {
+            try jw.objectField("min_hops");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("min_hops");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.max_hops) |value| {
+            try jw.objectField("max_hops");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("max_hops");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("min_weight");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.max_weight) |value| {
+            try jw.objectField("max_weight");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("max_weight");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Declared under an alias of at most 128 Unicode code points. Omit table for the queried table. Declare it for a cross-table alias that may be used as the source of a relationship, including planner-selected reverse expansion of a branched pattern.

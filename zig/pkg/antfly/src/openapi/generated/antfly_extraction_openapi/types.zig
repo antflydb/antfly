@@ -45,6 +45,34 @@ pub const ExtractionInput = struct {
     content: antfly_generating_openapi.ChatMessageContent,
     tokens: ?[]const ExtractionToken = null,
     metadata: ?std.json.Value = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("id");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        if (self.tokens) |value| {
+            try jw.objectField("tokens");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tokens");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("metadata");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ExtractionObject = struct {

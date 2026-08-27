@@ -124,8 +124,8 @@ assert_contains "$GEN_DIR/api/server.zig" "@import(\"schema\")" "api server impo
 assert_contains "$GEN_DIR/api/server.zig" "@import(\"embeddings\")" "api server imports embeddings module"
 assert_contains "$GEN_DIR/api/server.zig" "schema.TableSchema" "server uses schema.TableSchema for body parsing"
 assert_contains "$GEN_DIR/api/server.zig" "embeddings.EmbedderConfig" "server uses embeddings.EmbedderConfig for body parsing"
-assert_contains "$GEN_DIR/api/server.zig" "body: schema.TableSchema" "handler interface shows schema.TableSchema"
-assert_contains "$GEN_DIR/api/server.zig" "body: embeddings.EmbedderConfig" "handler interface shows embeddings.EmbedderConfig"
+assert_contains "$GEN_DIR/api/server.zig" "!std.json.Parsed(schema.TableSchema)" "schema body parser returns schema.TableSchema"
+assert_contains "$GEN_DIR/api/server.zig" "!std.json.Parsed(embeddings.EmbedderConfig)" "embeddings body parser returns embeddings.EmbedderConfig"
 
 # Step 4: Test config file path
 echo ""

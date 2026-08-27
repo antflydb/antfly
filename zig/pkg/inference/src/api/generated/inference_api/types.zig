@@ -52,6 +52,34 @@ pub const ChatMessage = struct {
     tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
     /// ID of the tool call this message is responding to (only for role=tool)
     tool_call_id: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("content");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tool_calls");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.tool_call_id) |value| {
+            try jw.objectField("tool_call_id");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tool_call_id");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Message content. Supports two formats: - Simple string: "Hello, how are you?" - Array of content parts (OpenAI multimodal format): [{"type": "text", "text": "Hello"}]
@@ -599,6 +627,27 @@ pub const GenerateMessage = struct {
     content: ?[]const u8 = null,
     /// Tool calls made by the model (only present when finish_reason is tool_calls)
     tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.content) |value| {
+            try jw.objectField("content");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("content");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tool_calls");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateRequest = struct {
@@ -1074,6 +1123,20 @@ pub const RerankMultimodalDocument = struct {
     /// Optional caller-provided document identifier
     id: ?[]const u8 = null,
     content: antfly_generating_openapi.ChatMessageContent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("id");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("content");
+        try jw.write(self.content);
+        try jw.endObject();
+    }
 };
 
 pub const RerankMultimodalRequest = struct {
