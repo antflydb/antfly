@@ -390,7 +390,29 @@ pub const GenerateChoice = struct {
     message: GenerateMessage,
     finish_reason: FinishReason,
     /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
+    logprobs: OpenApiOptionalNullable(std.json.Value) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("finish_reason");
+        try jw.write(self.finish_reason);
+        switch (self.logprobs) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("logprobs");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("logprobs");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Streaming generation chunk (SSE event data)
@@ -412,17 +434,72 @@ pub const GenerateChunkChoice = struct {
 pub const GenerateDelta = struct {
     role: ?Role = null,
     /// Token content delta
-    content: ?[]const u8 = null,
+    content: OpenApiOptionalNullable([]const u8) = .absent,
     /// Tool call deltas for streaming tool calls
     tool_calls: ?[]const ToolCallDelta = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.role) |value| {
+            try jw.objectField("role");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("role");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.content) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("content");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("content");
+                try jw.write(value);
+            },
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tool_calls");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateMessage = struct {
     role: Role,
     /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
+    content: OpenApiOptionalNullable([]const u8) = .absent,
     /// Tool calls made by the model (only present when finish_reason is tool_calls)
     tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        switch (self.content) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("content");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("content");
+                try jw.write(value);
+            },
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tool_calls");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateRequest = struct {
@@ -968,3 +1045,43 @@ pub const TranscribeResponse = struct {
 };
 
 pub const VADOptions = antfly_chunking_api_openapi.VADOptions;
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}

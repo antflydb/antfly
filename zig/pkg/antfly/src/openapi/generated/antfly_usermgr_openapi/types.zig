@@ -12,13 +12,59 @@ pub const ApiKey = struct {
     /// Owner of the API key.
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
+    permissions: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
     created_at: []const u8,
     /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
+    expires_at: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key_id");
+        try jw.write(self.key_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("username");
+        try jw.write(self.username);
+        switch (self.permissions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("permissions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("permissions");
+                try jw.write(value);
+            },
+        }
+        switch (self.row_filter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("row_filter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("row_filter");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        switch (self.expires_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("expires_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("expires_at");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// API key creation response including the cleartext secret (shown once).
@@ -30,17 +76,67 @@ pub const ApiKeyWithSecret = struct {
     /// Owner of the API key.
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
+    permissions: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
     created_at: []const u8,
     /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
+    expires_at: OpenApiOptionalNullable([]const u8) = .absent,
     /// Cleartext secret for the API key. Store securely — it cannot be retrieved again.
     key_secret: []const u8,
     /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
     encoded: []const u8,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key_id");
+        try jw.write(self.key_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("username");
+        try jw.write(self.username);
+        switch (self.permissions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("permissions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("permissions");
+                try jw.write(value);
+            },
+        }
+        switch (self.row_filter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("row_filter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("row_filter");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        switch (self.expires_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("expires_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("expires_at");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("key_secret");
+        try jw.write(self.key_secret);
+        try jw.objectField("encoded");
+        try jw.write(self.encoded);
+        try jw.endObject();
+    }
 };
 
 pub const AuthSubject = struct {
@@ -57,9 +153,45 @@ pub const CreateApiKeyRequest = struct {
     /// Duration until expiration (e.g., '720h' for 30 days). Empty means never.
     expires_in: ?[]const u8 = null,
     /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
-    permissions: ?[]const Permission = null,
+    permissions: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.expires_in) |value| {
+            try jw.objectField("expires_in");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("expires_in");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.permissions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("permissions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("permissions");
+                try jw.write(value);
+            },
+        }
+        switch (self.row_filter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("row_filter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("row_filter");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateUserRequest = struct {
@@ -67,9 +199,45 @@ pub const CreateUserRequest = struct {
     username: ?[]const u8 = null,
     password: []const u8,
     /// Optional list of initial permissions for the user.
-    initial_policies: ?[]const Permission = null,
+    initial_policies: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Auth metadata available to stored row-filter policies.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.username) |value| {
+            try jw.objectField("username");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("username");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("password");
+        try jw.write(self.password);
+        switch (self.initial_policies) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("initial_policies");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("initial_policies");
+                try jw.write(value);
+            },
+        }
+        switch (self.metadata) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Error = struct {
@@ -179,5 +347,65 @@ pub const User = struct {
     /// Base64 encoded password hash. Exposing this is a security risk.
     password_hash: []const u8,
     /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("username");
+        try jw.write(self.username);
+        try jw.objectField("password_hash");
+        try jw.write(self.password_hash);
+        switch (self.metadata) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}

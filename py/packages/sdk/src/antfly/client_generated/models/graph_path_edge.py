@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from attrs import define as _attrs_define
 
+from ..models.graph_path_edge_direction import GraphPathEdgeDirection
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -23,6 +24,10 @@ class GraphPathEdge:
         Attributes:
             from_ (GraphPathEndpoint):
             to (GraphPathEndpoint):
+            direction (GraphPathEdgeDirection): Physical stored-edge orientation relative to this path edge's `from`
+                endpoint. `out` means the stored relationship points from `from` to `to`; `in` means the path traversed a
+                relationship stored from `to` to `from`. This keeps paths lossless when a `both` query encounters reciprocal
+                relationships.
             type_ (str): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is
                 the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
             weight (float): Finite durable edge weight. max_weight paths further require values in [0,1].
@@ -31,6 +36,7 @@ class GraphPathEdge:
 
     from_: GraphPathEndpoint
     to: GraphPathEndpoint
+    direction: GraphPathEdgeDirection
     type_: str
     weight: float
     metadata: GraphPathEdgeMetadata | Unset = UNSET
@@ -39,6 +45,8 @@ class GraphPathEdge:
         from_ = self.from_.to_dict()
 
         to = self.to.to_dict()
+
+        direction = self.direction.value
 
         type_ = self.type_
 
@@ -54,6 +62,7 @@ class GraphPathEdge:
             {
                 "from": from_,
                 "to": to,
+                "direction": direction,
                 "type": type_,
                 "weight": weight,
             }
@@ -73,6 +82,8 @@ class GraphPathEdge:
 
         to = GraphPathEndpoint.from_dict(d.pop("to"))
 
+        direction = GraphPathEdgeDirection(d.pop("direction"))
+
         type_ = d.pop("type")
 
         weight = d.pop("weight")
@@ -87,6 +98,7 @@ class GraphPathEdge:
         graph_path_edge = cls(
             from_=from_,
             to=to,
+            direction=direction,
             type_=type_,
             weight=weight,
             metadata=metadata,

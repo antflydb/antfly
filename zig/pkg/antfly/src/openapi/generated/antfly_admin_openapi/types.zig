@@ -260,15 +260,78 @@ pub const HAReadCheckResponse = struct {
 pub const HAReadDecision = struct {
     action: []const u8,
     consistency: []const u8,
-    required_lsn: ?i64 = null,
-    required_metadata_lsn: ?i64 = null,
+    required_lsn: OpenApiOptionalNullable(i64) = .absent,
+    required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
     received_lsn: i64,
     applied_lsn: i64,
     safe_read_lsn: i64,
-    metadata_applied_lsn: ?i64 = null,
-    serve_lsn: ?i64 = null,
+    metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
+    serve_lsn: OpenApiOptionalNullable(i64) = .absent,
     missing_lsn_count: i64,
     metadata_missing_lsn_count: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("consistency");
+        try jw.write(self.consistency);
+        switch (self.required_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("required_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("required_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.required_metadata_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("required_metadata_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("required_metadata_lsn");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        switch (self.metadata_applied_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata_applied_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata_applied_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.serve_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("serve_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("serve_lsn");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("missing_lsn_count");
+        try jw.write(self.missing_lsn_count);
+        try jw.objectField("metadata_missing_lsn_count");
+        try jw.write(self.metadata_missing_lsn_count);
+        try jw.endObject();
+    }
 };
 
 pub const HARejoinAssessResponse = struct {
@@ -337,9 +400,54 @@ pub const HAReplicationSlot = struct {
     safe_read_lsn: i64,
     active: bool,
     reseed_required: bool,
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     current_lsn: i64,
-    dropped: ?bool = null,
+    dropped: OpenApiOptionalNullable(bool) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("timeline_id");
+        try jw.write(self.timeline_id);
+        try jw.objectField("restart_lsn");
+        try jw.write(self.restart_lsn);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        try jw.objectField("active");
+        try jw.write(self.active);
+        try jw.objectField("reseed_required");
+        try jw.write(self.reseed_required);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("current_lsn");
+        try jw.write(self.current_lsn);
+        switch (self.dropped) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("dropped");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("dropped");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAReplicationSlotActionResponse = struct {
@@ -365,11 +473,44 @@ pub const HARetentionSnapshot = struct {
 };
 
 pub const HARuntimeLifecycleObservation = struct {
-    node_id: ?[]const u8 = null,
+    node_id: OpenApiOptionalNullable([]const u8) = .absent,
     role: []const u8,
-    pod_uid: ?[]const u8 = null,
+    pod_uid: OpenApiOptionalNullable([]const u8) = .absent,
     fenced: bool,
     observed_at_unix_ns: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self.node_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("node_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("node_id");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("role");
+        try jw.write(self.role);
+        switch (self.pod_uid) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("pod_uid");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("pod_uid");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("fenced");
+        try jw.write(self.fenced);
+        try jw.objectField("observed_at_unix_ns");
+        try jw.write(self.observed_at_unix_ns);
+        try jw.endObject();
+    }
 };
 
 pub const HASeedArtifactCaptureResponse = struct {
@@ -416,8 +557,50 @@ pub const HASeedLifecycleReceiptEvent = struct {
     receipt_sha256: []const u8,
     receipt_json: []const u8,
     recorded_at_unix_ns: i64,
-    pod_uid: ?[]const u8 = null,
+    pod_uid: OpenApiOptionalNullable([]const u8) = .absent,
     authoritative_state: []const u8,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("cursor");
+        try jw.write(self.cursor);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("topology_id");
+        try jw.write(self.topology_id);
+        try jw.objectField("topology_generation");
+        try jw.write(self.topology_generation);
+        try jw.objectField("node_id");
+        try jw.write(self.node_id);
+        try jw.objectField("target_pvc_name");
+        try jw.write(self.target_pvc_name);
+        try jw.objectField("target_pvc_uid");
+        try jw.write(self.target_pvc_uid);
+        try jw.objectField("receipt_sha256");
+        try jw.write(self.receipt_sha256);
+        try jw.objectField("receipt_json");
+        try jw.write(self.receipt_json);
+        try jw.objectField("recorded_at_unix_ns");
+        try jw.write(self.recorded_at_unix_ns);
+        switch (self.pod_uid) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("pod_uid");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("pod_uid");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("authoritative_state");
+        try jw.write(self.authoritative_state);
+        try jw.endObject();
+    }
 };
 
 pub const HASeedLifecycleReceiptInventoryResponse = struct {
@@ -464,7 +647,49 @@ pub const HASlotSnapshot = struct {
     safe_read_lag_lsn: i64,
     retention_lag_lsn: i64,
     status: []const u8,
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("timeline_id");
+        try jw.write(self.timeline_id);
+        try jw.objectField("active");
+        try jw.write(self.active);
+        try jw.objectField("reseed_required");
+        try jw.write(self.reseed_required);
+        try jw.objectField("restart_lsn");
+        try jw.write(self.restart_lsn);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        try jw.objectField("write_lag_lsn");
+        try jw.write(self.write_lag_lsn);
+        try jw.objectField("apply_lag_lsn");
+        try jw.write(self.apply_lag_lsn);
+        try jw.objectField("safe_read_lag_lsn");
+        try jw.write(self.safe_read_lag_lsn);
+        try jw.objectField("retention_lag_lsn");
+        try jw.write(self.retention_lag_lsn);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAStandbyBootstrapResponse = struct {
@@ -484,22 +709,140 @@ pub const HAStandbySnapshot = struct {
     received_lsn: i64,
     applied_lsn: i64,
     safe_read_lsn: i64,
-    upstream_lsn: ?i64 = null,
-    write_lag_lsn: ?i64 = null,
-    receive_lag_lsn: ?i64 = null,
-    apply_lag_lsn: ?i64 = null,
+    upstream_lsn: OpenApiOptionalNullable(i64) = .absent,
+    write_lag_lsn: OpenApiOptionalNullable(i64) = .absent,
+    receive_lag_lsn: OpenApiOptionalNullable(i64) = .absent,
+    apply_lag_lsn: OpenApiOptionalNullable(i64) = .absent,
     /// Last local standby replication pull or apply error observed by the node-local runtime.
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     /// Monotonic nanosecond timestamp for the most recent local standby replication attempt.
-    last_attempt_ns: ?i64 = null,
+    last_attempt_ns: OpenApiOptionalNullable(i64) = .absent,
     /// Monotonic nanosecond timestamp for the most recent successful local standby replication round.
-    last_success_ns: ?i64 = null,
+    last_success_ns: OpenApiOptionalNullable(i64) = .absent,
     /// Local standby replication rounds that exited early with an error.
-    replication_failures_total: ?i64 = null,
+    replication_failures_total: OpenApiOptionalNullable(i64) = .absent,
     unapplied_lsn_count: i64,
     caught_up_to_received: bool,
     can_serve_safe_reads: bool,
     lease_watchdog: ?HALeaseWatchdogProof = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("node_id");
+        try jw.write(self.node_id);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        switch (self.upstream_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("upstream_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("upstream_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.write_lag_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("write_lag_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("write_lag_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.receive_lag_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("receive_lag_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("receive_lag_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.apply_lag_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("apply_lag_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("apply_lag_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        switch (self.last_attempt_ns) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_attempt_ns");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_attempt_ns");
+                try jw.write(value);
+            },
+        }
+        switch (self.last_success_ns) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_success_ns");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_success_ns");
+                try jw.write(value);
+            },
+        }
+        switch (self.replication_failures_total) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("replication_failures_total");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("replication_failures_total");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("unapplied_lsn_count");
+        try jw.write(self.unapplied_lsn_count);
+        try jw.objectField("caught_up_to_received");
+        try jw.write(self.caught_up_to_received);
+        try jw.objectField("can_serve_safe_reads");
+        try jw.write(self.can_serve_safe_reads);
+        if (self.lease_watchdog) |value| {
+            try jw.objectField("lease_watchdog");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("lease_watchdog");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAStandbyStatusResponse = struct {
@@ -567,9 +910,54 @@ pub const PromotionAssessRequest = struct {
 
 pub const ReadCheckRequest = struct {
     consistency: ?[]const u8 = null,
-    required_lsn: ?i64 = null,
-    required_metadata_lsn: ?i64 = null,
-    metadata_applied_lsn: ?i64 = null,
+    required_lsn: OpenApiOptionalNullable(i64) = .absent,
+    required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
+    metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.consistency) |value| {
+            try jw.objectField("consistency");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("consistency");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.required_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("required_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("required_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.required_metadata_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("required_metadata_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("required_metadata_lsn");
+                try jw.write(value);
+            },
+        }
+        switch (self.metadata_applied_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata_applied_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata_applied_lsn");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RejoinAssessRequest = struct {
@@ -588,7 +976,25 @@ pub const RejoinAssessRequest = struct {
 pub const ReplicationSlotCreateRequest = struct {
     slot_name: HASlotName,
     /// Optional LSN to initialize the slot at. Defaults to the current primary LSN.
-    initial_lsn: ?i64 = null,
+    initial_lsn: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        switch (self.initial_lsn) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("initial_lsn");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("initial_lsn");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SeedArtifactCaptureRequest = struct {
@@ -618,7 +1024,25 @@ pub const StandbyBootstrapRequest = struct {
     /// Absolute normalized pod-local path to the HA base-backup manifest.
     manifest_path: []const u8,
     /// Optional absolute normalized pod-local directory containing files referenced by the manifest.
-    content_root: ?[]const u8 = null,
+    content_root: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("manifest_path");
+        try jw.write(self.manifest_path);
+        switch (self.content_root) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("content_root");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("content_root");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const StorageMaintenanceJob = struct {
@@ -712,3 +1136,43 @@ pub const WriteCheckRequest = struct {
     role: []const u8,
     expected_identity: ?HAIdentity = null,
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}

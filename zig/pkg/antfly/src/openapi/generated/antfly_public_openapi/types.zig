@@ -452,13 +452,59 @@ pub const ApiKey = struct {
     /// Owner of the API key.
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
+    permissions: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
     created_at: []const u8,
     /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
+    expires_at: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key_id");
+        try jw.write(self.key_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("username");
+        try jw.write(self.username);
+        switch (self.permissions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("permissions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("permissions");
+                try jw.write(value);
+            },
+        }
+        switch (self.row_filter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("row_filter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("row_filter");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        switch (self.expires_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("expires_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("expires_at");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// API key creation response including the cleartext secret (shown once).
@@ -470,17 +516,67 @@ pub const ApiKeyWithSecret = struct {
     /// Owner of the API key.
     username: []const u8,
     /// Optional permission scoping. If empty, inherits owner's full permissions.
-    permissions: ?[]const Permission = null,
+    permissions: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
     /// When the API key was created.
     created_at: []const u8,
     /// When the API key expires. Null means never.
-    expires_at: ?[]const u8 = null,
+    expires_at: OpenApiOptionalNullable([]const u8) = .absent,
     /// Cleartext secret for the API key. Store securely — it cannot be retrieved again.
     key_secret: []const u8,
     /// Pre-encoded credential ready for the Authorization header: base64(key_id:key_secret).
     encoded: []const u8,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key_id");
+        try jw.write(self.key_id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("username");
+        try jw.write(self.username);
+        switch (self.permissions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("permissions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("permissions");
+                try jw.write(value);
+            },
+        }
+        switch (self.row_filter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("row_filter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("row_filter");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("created_at");
+        try jw.write(self.created_at);
+        switch (self.expires_at) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("expires_at");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("expires_at");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("key_secret");
+        try jw.write(self.key_secret);
+        try jw.objectField("encoded");
+        try jw.write(self.encoded);
+        try jw.endObject();
+    }
 };
 
 /// Kind of stored artifact tracked by the repair queue.
@@ -822,7 +918,7 @@ pub const ClusterBackupResponse = struct {
 pub const ClusterDataGroupStatus = struct {
     group_id: i64,
     leader_known: ?bool = null,
-    leader_data_id: ?i64 = null,
+    leader_data_id: OpenApiOptionalNullable(i64) = .absent,
     voter_count_known: ?bool = null,
     voter_count: ?i64 = null,
     healthy_voter_reports: ?i64 = null,
@@ -836,6 +932,122 @@ pub const ClusterDataGroupStatus = struct {
     doc_count: ?i64 = null,
     disk_bytes: ?i64 = null,
     empty: ?bool = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        if (self.leader_known) |value| {
+            try jw.objectField("leader_known");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("leader_known");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.leader_data_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("leader_data_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("leader_data_id");
+                try jw.write(value);
+            },
+        }
+        if (self.voter_count_known) |value| {
+            try jw.objectField("voter_count_known");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("voter_count_known");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.voter_count) |value| {
+            try jw.objectField("voter_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("voter_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.healthy_voter_reports) |value| {
+            try jw.objectField("healthy_voter_reports");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("healthy_voter_reports");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.joint_consensus) |value| {
+            try jw.objectField("joint_consensus");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("joint_consensus");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.transition_pending) |value| {
+            try jw.objectField("transition_pending");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("transition_pending");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.replay_required) |value| {
+            try jw.objectField("replay_required");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("replay_required");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.replay_caught_up) |value| {
+            try jw.objectField("replay_caught_up");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("replay_caught_up");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.cutover_ready) |value| {
+            try jw.objectField("cutover_ready");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("cutover_ready");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.reads_ready_after_cutover) |value| {
+            try jw.objectField("reads_ready_after_cutover");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("reads_ready_after_cutover");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.doc_identity_lifecycle) |value| {
+            try jw.objectField("doc_identity_lifecycle");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("doc_identity_lifecycle");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.doc_count) |value| {
+            try jw.objectField("doc_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("doc_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.disk_bytes) |value| {
+            try jw.objectField("disk_bytes");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("disk_bytes");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.empty) |value| {
+            try jw.objectField("empty");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("empty");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ClusterDataNodeStatus = struct {
@@ -863,15 +1075,111 @@ pub const ClusterDataRangeStatus = struct {
     table_id: i64,
     table_name: ?[]const u8 = null,
     start_key: ?[]const u8 = null,
-    end_key: ?[]const u8 = null,
+    end_key: OpenApiOptionalNullable([]const u8) = .absent,
     doc_identity_shard_id: ?i64 = null,
     doc_identity_range_id: ?i64 = null,
     state: ?[]const u8 = null,
-    leader_data_id: ?i64 = null,
+    leader_data_id: OpenApiOptionalNullable(i64) = .absent,
     voter_count: ?i64 = null,
     doc_count: ?i64 = null,
     disk_bytes: ?i64 = null,
     empty: ?bool = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        try jw.objectField("range_id");
+        try jw.write(self.range_id);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        if (self.table_name) |value| {
+            try jw.objectField("table_name");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("table_name");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.start_key) |value| {
+            try jw.objectField("start_key");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("start_key");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.end_key) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("end_key");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("end_key");
+                try jw.write(value);
+            },
+        }
+        if (self.doc_identity_shard_id) |value| {
+            try jw.objectField("doc_identity_shard_id");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("doc_identity_shard_id");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.doc_identity_range_id) |value| {
+            try jw.objectField("doc_identity_range_id");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("doc_identity_range_id");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.state) |value| {
+            try jw.objectField("state");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("state");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.leader_data_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("leader_data_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("leader_data_id");
+                try jw.write(value);
+            },
+        }
+        if (self.voter_count) |value| {
+            try jw.objectField("voter_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("voter_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.doc_count) |value| {
+            try jw.objectField("doc_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("doc_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.disk_bytes) |value| {
+            try jw.objectField("disk_bytes");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("disk_bytes");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.empty) |value| {
+            try jw.objectField("empty");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("empty");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ClusterDataReplicaStatus = struct {
@@ -1131,9 +1439,45 @@ pub const CreateApiKeyRequest = struct {
     /// Duration until expiration (e.g., '720h' for 30 days). Empty means never.
     expires_in: ?[]const u8 = null,
     /// Optional permission scoping. Each permission must be a subset of the creator's permissions.
-    permissions: ?[]const Permission = null,
+    permissions: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
-    row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+    row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.expires_in) |value| {
+            try jw.objectField("expires_in");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("expires_in");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.permissions) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("permissions");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("permissions");
+                try jw.write(value);
+            },
+        }
+        switch (self.row_filter) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("row_filter");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("row_filter");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateTableRequest = struct {
@@ -1154,9 +1498,45 @@ pub const CreateUserRequest = struct {
     username: ?[]const u8 = null,
     password: []const u8,
     /// Optional list of initial permissions for the user.
-    initial_policies: ?[]const Permission = null,
+    initial_policies: OpenApiOptionalNullable([]const Permission) = .absent,
     /// Auth metadata available to stored row-filter policies.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.username) |value| {
+            try jw.objectField("username");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("username");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("password");
+        try jw.write(self.password);
+        switch (self.initial_policies) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("initial_policies");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("initial_policies");
+                try jw.write(value);
+            },
+        }
+        switch (self.metadata) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// A dense-index rebuild is retaining replay history and the node has reached its hard safety budget.
@@ -1225,13 +1605,13 @@ pub const DocumentArtifactChildRange = struct {
     /// Current placement summary for the range.
     placement: []const u8,
     /// Owner group for this child artifact range, when assigned.
-    owner_group_id: ?i64 = null,
+    owner_group_id: OpenApiOptionalNullable(i64) = .absent,
     /// Placement generation for range ownership metadata.
-    placement_generation: ?i64 = null,
+    placement_generation: OpenApiOptionalNullable(i64) = .absent,
     /// Current routing status for child writes in this range.
-    route_status: ?[]const u8 = null,
+    route_status: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether this range may split at its configured split boundary.
-    split_eligible: ?bool = null,
+    split_eligible: OpenApiOptionalNullable(bool) = .absent,
     /// Inclusive first internal child key covered by this range.
     start_key: []const u8,
     /// Exclusive end internal child key, or empty for the final range.
@@ -1241,7 +1621,85 @@ pub const DocumentArtifactChildRange = struct {
     /// Number of child records covered by this range.
     child_count: i64,
     /// Approximate extracted text bytes covered by this range when available.
-    text_bytes: ?i64 = null,
+    text_bytes: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("range_id");
+        try jw.write(self.range_id);
+        try jw.objectField("range_kind");
+        try jw.write(self.range_kind);
+        try jw.objectField("artifact_name");
+        try jw.write(self.artifact_name);
+        try jw.objectField("split_boundary");
+        try jw.write(self.split_boundary);
+        try jw.objectField("placement");
+        try jw.write(self.placement);
+        switch (self.owner_group_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("owner_group_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("owner_group_id");
+                try jw.write(value);
+            },
+        }
+        switch (self.placement_generation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("placement_generation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("placement_generation");
+                try jw.write(value);
+            },
+        }
+        switch (self.route_status) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("route_status");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("route_status");
+                try jw.write(value);
+            },
+        }
+        switch (self.split_eligible) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("split_eligible");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("split_eligible");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("start_key");
+        try jw.write(self.start_key);
+        try jw.objectField("end_key_exclusive");
+        try jw.write(self.end_key_exclusive);
+        try jw.objectField("last_key");
+        try jw.write(self.last_key);
+        try jw.objectField("child_count");
+        try jw.write(self.child_count);
+        switch (self.text_bytes) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("text_bytes");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("text_bytes");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Inspection view for a derived document artifact produced from a source table row. The typed fields form the stable summary contract. The embedded manifest/state JSON fields are optional raw detail intended for admin/debug inspection so producers can evolve their internal unit schema without changing this route contract.
@@ -1265,7 +1723,7 @@ pub const DocumentArtifactManifest = struct {
     /// Producer route selected for the source content.
     route_type: []const u8,
     /// Reason extraction was skipped, when the source type is unsupported.
-    unsupported_reason: ?[]const u8 = null,
+    unsupported_reason: OpenApiOptionalNullable([]const u8) = .absent,
     /// Number of extracted document units.
     unit_count: i64,
     /// Number of indexable chunks derived from the units.
@@ -1297,13 +1755,147 @@ pub const DocumentArtifactManifest = struct {
     /// Number of merge operations recorded for this artifact.
     merge_operation_count: i64,
     /// Last extraction or materialization error code, when the current artifact generation failed.
-    last_error_code: ?[]const u8 = null,
+    last_error_code: OpenApiOptionalNullable([]const u8) = .absent,
     /// Human-readable last extraction or materialization error summary, when available.
-    last_error_message: ?[]const u8 = null,
+    last_error_message: OpenApiOptionalNullable([]const u8) = .absent,
     /// Opaque JSON manifest for the artifact units and provenance. Present only for raw detail responses.
     manifest_json: ?[]const u8 = null,
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
-    state_json: ?[]const u8 = null,
+    state_json: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("document_id");
+        try jw.write(self.document_id);
+        try jw.objectField("artifact_name");
+        try jw.write(self.artifact_name);
+        try jw.objectField("artifact_id");
+        try jw.write(self.artifact_id);
+        try jw.objectField("manifest_version");
+        try jw.write(self.manifest_version);
+        try jw.objectField("generation");
+        try jw.write(self.generation);
+        try jw.objectField("source_url");
+        try jw.write(self.source_url);
+        try jw.objectField("source_fingerprint");
+        try jw.write(self.source_fingerprint);
+        try jw.objectField("content_type");
+        try jw.write(self.content_type);
+        try jw.objectField("route_type");
+        try jw.write(self.route_type);
+        switch (self.unsupported_reason) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("unsupported_reason");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("unsupported_reason");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("unit_count");
+        try jw.write(self.unit_count);
+        try jw.objectField("chunk_count");
+        try jw.write(self.chunk_count);
+        if (self.ocr_attempted_count) |value| {
+            try jw.objectField("ocr_attempted_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("ocr_attempted_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.ocr_selected_count) |value| {
+            try jw.objectField("ocr_selected_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("ocr_selected_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.ocr_retained_embedded_count) |value| {
+            try jw.objectField("ocr_retained_embedded_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("ocr_retained_embedded_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.ocr_failed_count) |value| {
+            try jw.objectField("ocr_failed_count");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("ocr_failed_count");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.ocr_failed_page_numbers) |value| {
+            try jw.objectField("ocr_failed_page_numbers");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("ocr_failed_page_numbers");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.ocr_failed_pages_truncated) |value| {
+            try jw.objectField("ocr_failed_pages_truncated");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("ocr_failed_pages_truncated");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("child_ranges");
+        try jw.write(self.child_ranges);
+        try jw.objectField("child_range_count");
+        try jw.write(self.child_range_count);
+        try jw.objectField("merge_status");
+        try jw.write(self.merge_status);
+        try jw.objectField("merge_from_generation");
+        try jw.write(self.merge_from_generation);
+        try jw.objectField("merge_to_generation");
+        try jw.write(self.merge_to_generation);
+        try jw.objectField("merge_operation_granularity");
+        try jw.write(self.merge_operation_granularity);
+        try jw.objectField("merge_operation_count");
+        try jw.write(self.merge_operation_count);
+        switch (self.last_error_code) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error_code");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error_code");
+                try jw.write(value);
+            },
+        }
+        switch (self.last_error_message) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error_message");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error_message");
+                try jw.write(value);
+            },
+        }
+        if (self.manifest_json) |value| {
+            try jw.objectField("manifest_json");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("manifest_json");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.state_json) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("state_json");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("state_json");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Available derived document artifact manifests for a source document.
@@ -1340,7 +1932,7 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Current per-shard bounded pass limit.
     limit: i64,
     /// Single-shard continuation key when no shard cursors are present.
-    next_key: ?[]const u8 = null,
+    next_key: OpenApiOptionalNullable([]const u8) = .absent,
     /// Cumulative source rows scanned by completed passes.
     scanned: i64,
     /// Cumulative source rows whose artifact was reprocessed.
@@ -1356,7 +1948,7 @@ pub const DocumentArtifactReprocessJob = struct {
     /// Per-shard continuation cursors to resume on the next advance operation.
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
     /// Last terminal or transient job error, when available.
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether cancellation has been requested for a running pass. Running passes finish at a bounded reprocess boundary before the job transitions to cancelled.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
@@ -1365,6 +1957,73 @@ pub const DocumentArtifactReprocessJob = struct {
     last_updated_at_millis: i64,
     /// Unix epoch milliseconds after which the retained job status may be removed.
     expires_at_millis: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("job_id");
+        try jw.write(self.job_id);
+        try jw.objectField("attempt_id");
+        try jw.write(self.attempt_id);
+        try jw.objectField("table_name");
+        try jw.write(self.table_name);
+        try jw.objectField("artifact_name");
+        try jw.write(self.artifact_name);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("reprocess_status");
+        try jw.write(self.reprocess_status);
+        try jw.objectField("from_key");
+        try jw.write(self.from_key);
+        try jw.objectField("to_key");
+        try jw.write(self.to_key);
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        switch (self.next_key) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_key");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_key");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("scanned");
+        try jw.write(self.scanned);
+        try jw.objectField("reprocessed");
+        try jw.write(self.reprocessed);
+        try jw.objectField("skipped");
+        try jw.write(self.skipped);
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.objectField("pending_shards");
+        try jw.write(self.pending_shards);
+        try jw.objectField("failures");
+        try jw.write(self.failures);
+        try jw.objectField("shard_cursors");
+        try jw.write(self.shard_cursors);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("cancel_requested");
+        try jw.write(self.cancel_requested);
+        try jw.objectField("created_at_millis");
+        try jw.write(self.created_at_millis);
+        try jw.objectField("last_updated_at_millis");
+        try jw.write(self.last_updated_at_millis);
+        try jw.objectField("expires_at_millis");
+        try jw.write(self.expires_at_millis);
+        try jw.endObject();
+    }
 };
 
 /// Request to create a durable table artifact reprocess job.
@@ -1386,7 +2045,7 @@ pub const DocumentArtifactReprocessResponse = struct {
 
 pub const DocumentArtifactReprocessShardCursor = struct {
     /// Physical table group that produced this cursor, when known.
-    group_id: ?i64 = null,
+    group_id: OpenApiOptionalNullable(i64) = .absent,
     /// Source key cursor for resuming this shard-local repair pass.
     next_key: []const u8,
     /// Number of source rows scanned by this shard-local pass.
@@ -1399,6 +2058,34 @@ pub const DocumentArtifactReprocessShardCursor = struct {
     failed: i64,
     /// Effective scan limit used by this shard-local pass.
     limit: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self.group_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("group_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("group_id");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("next_key");
+        try jw.write(self.next_key);
+        try jw.objectField("scanned");
+        try jw.write(self.scanned);
+        try jw.objectField("reprocessed");
+        try jw.write(self.reprocessed);
+        try jw.objectField("skipped");
+        try jw.write(self.skipped);
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        try jw.endObject();
+    }
 };
 
 /// Bounded request for reprocessing a derived artifact across source rows in key order.
@@ -1431,12 +2118,50 @@ pub const DocumentArtifactTableReprocessResponse = struct {
     /// Effective scan limit used by the bounded pass.
     limit: i64,
     /// Source key cursor for the next bounded pass, when more rows may remain.
-    next_key: ?[]const u8 = null,
+    next_key: OpenApiOptionalNullable([]const u8) = .absent,
     /// Number of shard-local continuations still pending after this pass. For single-shard callers this is 1 when only `next_key` remains and 0 when complete.
     pending_shards: i64,
     failures: []const DocumentArtifactReprocessFailure,
     /// Per-shard continuation cursors for distributed repairs. Durable background repair jobs should persist and resume these independently instead of collapsing progress into a single global cursor.
     shard_cursors: []const DocumentArtifactReprocessShardCursor,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("reprocess");
+        try jw.write(self.reprocess);
+        try jw.objectField("reprocess_status");
+        try jw.write(self.reprocess_status);
+        try jw.objectField("artifact_name");
+        try jw.write(self.artifact_name);
+        try jw.objectField("scanned");
+        try jw.write(self.scanned);
+        try jw.objectField("reprocessed");
+        try jw.write(self.reprocessed);
+        try jw.objectField("skipped");
+        try jw.write(self.skipped);
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        switch (self.next_key) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_key");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_key");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("pending_shards");
+        try jw.write(self.pending_shards);
+        try jw.objectField("failures");
+        try jw.write(self.failures);
+        try jw.objectField("shard_cursors");
+        try jw.write(self.shard_cursors);
+        try jw.endObject();
+    }
 };
 
 pub const Edge = antfly_indexes_openapi.Edge;
@@ -1992,7 +2717,55 @@ pub const JoinClause = struct {
     /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
     strategy_hint: ?JoinStrategy = null,
     /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
-    nested_join: ?std.json.Value = null,
+    nested_join: OpenApiOptionalNullable(std.json.Value) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("right_table");
+        try jw.write(self.right_table);
+        if (self.join_type) |value| {
+            try jw.objectField("join_type");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("join_type");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("on");
+        try jw.write(self.on);
+        if (self.right_filters) |value| {
+            try jw.objectField("right_filters");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("right_filters");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.right_fields) |value| {
+            try jw.objectField("right_fields");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("right_fields");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.strategy_hint) |value| {
+            try jw.objectField("strategy_hint");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("strategy_hint");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.nested_join) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("nested_join");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("nested_join");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Condition for matching rows between tables.
@@ -3531,13 +4304,71 @@ pub const SecretStoreStatus = struct {
     /// Whether this store can expose one exact opaque source-generation acknowledgement. This remains true when a single loaded file predates the generation field, and is false for layered stores whose served snapshot has multiple publication sources.
     supports_source_generation: ?bool = null,
     /// Opaque, non-secret generation embedded by the control plane in the currently applied secrets file. It is null for files without an acknowledgement generation and never derives from secret values.
-    source_generation: ?[]const u8 = null,
+    source_generation: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether the latest observed replacement failed to load.
     last_reload_failed: ?bool = null,
     /// Whether Antfly is serving a last-known-good secrets snapshot after a failed refresh.
     stale: ?bool = null,
     reload_successes: ?i64 = null,
     reload_failures: ?i64 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generation");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.supports_source_generation) |value| {
+            try jw.objectField("supports_source_generation");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("supports_source_generation");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.source_generation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("source_generation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("source_generation");
+                try jw.write(value);
+            },
+        }
+        if (self.last_reload_failed) |value| {
+            try jw.objectField("last_reload_failed");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("last_reload_failed");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.stale) |value| {
+            try jw.objectField("stale");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("stale");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.reload_successes) |value| {
+            try jw.objectField("reload_successes");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("reload_successes");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.reload_failures) |value| {
+            try jw.objectField("reload_failures");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("reload_failures");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SecretWriteRequest = struct {
@@ -3865,7 +4696,7 @@ pub const TableRepairIssue = struct {
     /// Hex-encoded internal artifact storage key, when known.
     artifact_key: ?[]const u8 = null,
     /// Chunk ordinal for chunk-derived artifacts.
-    chunk_id: ?i64 = null,
+    chunk_id: OpenApiOptionalNullable(i64) = .absent,
     /// Whether this artifact kind currently has an automated repair reprocessor.
     repairable: bool,
     /// Stable reason code when repairable is false.
@@ -3885,6 +4716,93 @@ pub const TableRepairIssue = struct {
     last_seen_ns: i64,
     /// Last stable repair error code, when a repair attempt failed.
     last_error: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("artifact_kind");
+        try jw.write(self.artifact_kind);
+        try jw.objectField("index_name");
+        try jw.write(self.index_name);
+        try jw.objectField("doc_key");
+        try jw.write(self.doc_key);
+        if (self.parent_doc_key) |value| {
+            try jw.objectField("parent_doc_key");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("parent_doc_key");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.unit_id) |value| {
+            try jw.objectField("unit_id");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("unit_id");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("source_artifact_name");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("artifact_name");
+        try jw.write(self.artifact_name);
+        if (self.artifact_key) |value| {
+            try jw.objectField("artifact_key");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("artifact_key");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.chunk_id) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("chunk_id");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("chunk_id");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("repairable");
+        try jw.write(self.repairable);
+        if (self.unsupported_reason) |value| {
+            try jw.objectField("unsupported_reason");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("unsupported_reason");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("sequence");
+        try jw.write(self.sequence);
+        try jw.objectField("reason");
+        try jw.write(self.reason);
+        try jw.objectField("generation_attempts");
+        try jw.write(self.generation_attempts);
+        if (self.generation_error) |value| {
+            try jw.objectField("generation_error");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generation_error");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.objectField("attempts");
+        try jw.write(self.attempts);
+        try jw.objectField("first_seen_ns");
+        try jw.write(self.first_seen_ns);
+        try jw.objectField("last_seen_ns");
+        try jw.write(self.last_seen_ns);
+        if (self.last_error) |value| {
+            try jw.objectField("last_error");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("last_error");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Bounded page of table repair issues.
@@ -3901,8 +4819,38 @@ pub const TableRepairIssueList = struct {
     /// Whether another page is available.
     has_more: bool,
     /// Opaque cursor for the next page when has_more is true.
-    next_cursor: ?[]const u8 = null,
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     issues: []const TableRepairIssue,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("target");
+        try jw.write(self.target);
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        try jw.objectField("scanned");
+        try jw.write(self.scanned);
+        try jw.objectField("groups_scanned");
+        try jw.write(self.groups_scanned);
+        try jw.objectField("has_more");
+        try jw.write(self.has_more);
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("issues");
+        try jw.write(self.issues);
+        try jw.endObject();
+    }
 };
 
 /// Durable table repair job state.
@@ -3922,14 +4870,14 @@ pub const TableRepairJob = struct {
     /// Index name when the job is restricted to one index.
     index: ?[]const u8 = null,
     /// Opaque continuation cursor for the next bounded repair pass.
-    cursor: ?[]const u8 = null,
+    cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Effective per-pass repair limit.
     limit: i64,
     /// Whether the next bounded pass still needs to dispatch the job's one forced named-index generation.
     force: bool,
     result: TableRepairRunResult,
     /// Last stable job-level error code.
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether cancellation is pending. For a named-index job, cancellation durably pauses the matching repair in every group and becomes terminal only after that bounded traversal completes.
     cancel_requested: bool,
     /// Unix epoch milliseconds when the job was created.
@@ -3938,6 +4886,73 @@ pub const TableRepairJob = struct {
     last_updated_at_millis: i64,
     /// Unix epoch milliseconds when the job is eligible for cleanup.
     expires_at_millis: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("job_id");
+        try jw.write(self.job_id);
+        try jw.objectField("attempt_id");
+        try jw.write(self.attempt_id);
+        try jw.objectField("table_name");
+        try jw.write(self.table_name);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("repair_status");
+        try jw.write(self.repair_status);
+        try jw.objectField("target");
+        try jw.write(self.target);
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("kind");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.index) |value| {
+            try jw.objectField("index");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("index");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("cursor");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        try jw.objectField("force");
+        try jw.write(self.force);
+        try jw.objectField("result");
+        try jw.write(self.result);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("cancel_requested");
+        try jw.write(self.cancel_requested);
+        try jw.objectField("created_at_millis");
+        try jw.write(self.created_at_millis);
+        try jw.objectField("last_updated_at_millis");
+        try jw.write(self.last_updated_at_millis);
+        try jw.objectField("expires_at_millis");
+        try jw.write(self.expires_at_millis);
+        try jw.endObject();
+    }
 };
 
 /// Starts a durable table repair job. The job advances in bounded passes using the same repair request shape as runTableRepair.
@@ -3997,11 +5012,59 @@ pub const TableRepairRunResult = struct {
     /// Effective repair limit.
     limit: i64,
     /// Opaque cursor for the next artifact repair pass when has_more is true. Index repair currently repairs one named index per request and does not return a continuation cursor.
-    next_cursor: ?[]const u8 = null,
+    next_cursor: OpenApiOptionalNullable([]const u8) = .absent,
     /// Whether another repair scan page is available via next_cursor.
     has_more: bool,
     /// Whether repair debt remains after this bounded pass. If true and next_cursor is absent, rerun repair from the beginning after addressing failed or unsupported records.
     debt_remaining: bool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("scanned");
+        try jw.write(self.scanned);
+        try jw.objectField("groups_scanned");
+        try jw.write(self.groups_scanned);
+        try jw.objectField("reprocessed");
+        try jw.write(self.reprocessed);
+        try jw.objectField("repaired");
+        try jw.write(self.repaired);
+        try jw.objectField("missing_source_docs");
+        try jw.write(self.missing_source_docs);
+        try jw.objectField("failed");
+        try jw.write(self.failed);
+        try jw.objectField("unsupported");
+        try jw.write(self.unsupported);
+        try jw.objectField("unresolved");
+        try jw.write(self.unresolved);
+        try jw.objectField("in_progress");
+        try jw.write(self.in_progress);
+        try jw.objectField("indexes_rebuilt");
+        try jw.write(self.indexes_rebuilt);
+        try jw.objectField("indexes_degraded_before");
+        try jw.write(self.indexes_degraded_before);
+        try jw.objectField("indexes_degraded_after");
+        try jw.write(self.indexes_degraded_after);
+        try jw.objectField("controls_applied");
+        try jw.write(self.controls_applied);
+        try jw.objectField("limit");
+        try jw.write(self.limit);
+        switch (self.next_cursor) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("next_cursor");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("next_cursor");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("has_more");
+        try jw.write(self.has_more);
+        try jw.objectField("debt_remaining");
+        try jw.write(self.debt_remaining);
+        try jw.endObject();
+    }
 };
 
 pub const TableRestoreStatus = struct {
@@ -4173,12 +5236,88 @@ pub const TransactionSessionDetailsResponse = struct {
     staged_delete_count: i64,
     read_snapshot_count: i64,
     savepoint_count: i64,
-    savepoint_limit: ?i64 = null,
-    remaining_savepoints: ?i64 = null,
+    savepoint_limit: OpenApiOptionalNullable(i64) = .absent,
+    remaining_savepoints: OpenApiOptionalNullable(i64) = .absent,
     durable: bool,
     tables: ?[]const TransactionSessionTableDetail = null,
     read_snapshots: ?[]const TransactionSessionReadSnapshot = null,
     savepoint_ids: ?[]const i64 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("transaction_id");
+        try jw.write(self.transaction_id);
+        try jw.objectField("owner_node_id");
+        try jw.write(self.owner_node_id);
+        try jw.objectField("begin_timestamp");
+        try jw.write(self.begin_timestamp);
+        try jw.objectField("last_touched_timestamp");
+        try jw.write(self.last_touched_timestamp);
+        try jw.objectField("lease_expires_at");
+        try jw.write(self.lease_expires_at);
+        try jw.objectField("lease_state");
+        try jw.write(self.lease_state);
+        try jw.objectField("sync_level");
+        try jw.write(self.sync_level);
+        try jw.objectField("staged_table_count");
+        try jw.write(self.staged_table_count);
+        try jw.objectField("staged_read_count");
+        try jw.write(self.staged_read_count);
+        try jw.objectField("staged_write_count");
+        try jw.write(self.staged_write_count);
+        try jw.objectField("staged_delete_count");
+        try jw.write(self.staged_delete_count);
+        try jw.objectField("read_snapshot_count");
+        try jw.write(self.read_snapshot_count);
+        try jw.objectField("savepoint_count");
+        try jw.write(self.savepoint_count);
+        switch (self.savepoint_limit) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("savepoint_limit");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("savepoint_limit");
+                try jw.write(value);
+            },
+        }
+        switch (self.remaining_savepoints) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("remaining_savepoints");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("remaining_savepoints");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("durable");
+        try jw.write(self.durable);
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tables");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.read_snapshots) |value| {
+            try jw.objectField("read_snapshots");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("read_snapshots");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.savepoint_ids) |value| {
+            try jw.objectField("savepoint_ids");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("savepoint_ids");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSessionListResponse = struct {
@@ -4192,7 +5331,44 @@ pub const TransactionSessionReadSnapshot = struct {
     table: ?[]const u8 = null,
     key: ?[]const u8 = null,
     version: ?i64 = null,
-    document: ?std.json.Value = null,
+    document: OpenApiOptionalNullable(std.json.Value) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("table");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.key) |value| {
+            try jw.objectField("key");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("key");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("version");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.document) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("document");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("document");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSessionStatus = struct {
@@ -4209,9 +5385,64 @@ pub const TransactionSessionStatus = struct {
     staged_delete_count: i64,
     read_snapshot_count: i64,
     savepoint_count: i64,
-    savepoint_limit: ?i64 = null,
-    remaining_savepoints: ?i64 = null,
+    savepoint_limit: OpenApiOptionalNullable(i64) = .absent,
+    remaining_savepoints: OpenApiOptionalNullable(i64) = .absent,
     durable: bool,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("transaction_id");
+        try jw.write(self.transaction_id);
+        try jw.objectField("owner_node_id");
+        try jw.write(self.owner_node_id);
+        try jw.objectField("begin_timestamp");
+        try jw.write(self.begin_timestamp);
+        try jw.objectField("last_touched_timestamp");
+        try jw.write(self.last_touched_timestamp);
+        try jw.objectField("lease_expires_at");
+        try jw.write(self.lease_expires_at);
+        try jw.objectField("lease_state");
+        try jw.write(self.lease_state);
+        try jw.objectField("sync_level");
+        try jw.write(self.sync_level);
+        try jw.objectField("staged_table_count");
+        try jw.write(self.staged_table_count);
+        try jw.objectField("staged_read_count");
+        try jw.write(self.staged_read_count);
+        try jw.objectField("staged_write_count");
+        try jw.write(self.staged_write_count);
+        try jw.objectField("staged_delete_count");
+        try jw.write(self.staged_delete_count);
+        try jw.objectField("read_snapshot_count");
+        try jw.write(self.read_snapshot_count);
+        try jw.objectField("savepoint_count");
+        try jw.write(self.savepoint_count);
+        switch (self.savepoint_limit) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("savepoint_limit");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("savepoint_limit");
+                try jw.write(value);
+            },
+        }
+        switch (self.remaining_savepoints) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("remaining_savepoints");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("remaining_savepoints");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("durable");
+        try jw.write(self.durable);
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSessionTableDetail = struct {
@@ -4366,7 +5597,27 @@ pub const User = struct {
     /// Base64 encoded password hash. Exposing this is a security risk.
     password_hash: []const u8,
     /// Server-side auth metadata available to stored row-filter policies through $auth metadata paths.
-    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
+    metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("username");
+        try jw.write(self.username);
+        try jw.objectField("password_hash");
+        try jw.write(self.password_hash);
+        switch (self.metadata) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("metadata");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("metadata");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const WebSearchConnection = struct {
@@ -4403,3 +5654,43 @@ pub const WebSearchConnection = struct {
     /// True when required credentials/config are present. Secret values are never returned.
     configured: ?bool = null,
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}

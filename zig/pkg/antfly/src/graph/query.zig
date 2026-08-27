@@ -264,6 +264,7 @@ pub const PathEdgeInfo = struct {
     edge_type: []const u8,
     weight: f64,
     metadata: []const u8 = "",
+    traversal_direction: ?graph_mod.EdgeDirection = null,
 };
 
 pub const GraphResultNode = struct {
@@ -1176,6 +1177,7 @@ fn clonePatternPathEdgesFromInfoAlloc(alloc: Allocator, edges: []const PathEdgeI
             .edge_type = try alloc.dupe(u8, edge.edge_type),
             .weight = edge.weight,
             .metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "",
+            .traversal_direction = edge.traversal_direction,
         };
         initialized += 1;
     }
@@ -1337,6 +1339,7 @@ fn pathEdgeInfoFromPathEdge(alloc: Allocator, edge: paths_mod.PathEdge) !PathEdg
         .edge_type = edge_type,
         .weight = edge.weight,
         .metadata = metadata,
+        .traversal_direction = edge.traversal_direction,
     };
 }
 

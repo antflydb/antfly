@@ -37,6 +37,8 @@ pub const TypeGenerator = struct {
     reserved_type_names: std.StringHashMapUnmanaged(void) = .empty,
     /// Stable semantic helper key -> allocated public Zig type identifier.
     auxiliary_type_names: std.StringHashMapUnmanaged([]const u8) = .empty,
+    optional_nullable_type_name: ?[]const u8 = null,
+    uses_optional_nullable: bool = false,
     type_names_initialized: bool = false,
 
     pub fn init(arena: Allocator, w: *SourceWriter, resolver: *Resolver) TypeGenerator {
@@ -49,6 +51,11 @@ pub const TypeGenerator = struct {
         const schemas = components.schemas;
 
         try self.initializeTypeNames(schemas.keys());
+        const optional_nullable_type_name = try self.allocateAuxiliaryTypeName(
+            "openapi-optional-nullable",
+            "OpenApiOptionalNullable",
+        );
+        self.optional_nullable_type_name = optional_nullable_type_name;
 
         // Zig named declarations can reference later declarations, so schema
         // emission does not need dependency ordering. Keeping this lexical makes
@@ -71,6 +78,72 @@ pub const TypeGenerator = struct {
                 },
             }
         }
+        if (self.uses_optional_nullable) {
+            try self.emitOptionalNullableType(optional_nullable_type_name);
+            try self.w.blank();
+        }
+    }
+
+    fn emitOptionalNullableType(self: *TypeGenerator, type_name: []const u8) !void {
+        try self.w.line("/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.", .{});
+        try self.w.line("pub fn {s}(comptime T: type) type {{", .{type_name});
+        self.w.indent();
+        try self.w.line("return union(enum) {{", .{});
+        self.w.indent();
+        try self.w.line("absent,", .{});
+        try self.w.line("null_value,", .{});
+        try self.w.line("value: T,", .{});
+        try self.w.blank();
+        try self.w.line("pub fn fromNullable(value: ?T) @This() {{", .{});
+        self.w.indent();
+        try self.w.line("return if (value) |item| .{{ .value = item }} else .null_value;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("pub fn isPresent(self: @This()) bool {{", .{});
+        self.w.indent();
+        try self.w.line("return self != .absent;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("pub fn valueOrNull(self: @This()) ?T {{", .{});
+        self.w.indent();
+        try self.w.line("return switch (self) {{", .{});
+        self.w.indent();
+        try self.w.line(".absent, .null_value => null,", .{});
+        try self.w.line(".value => |item| item,", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("if (try source.peekNextTokenType() == .null) {{", .{});
+        self.w.indent();
+        try self.w.line("_ = try source.next();", .{});
+        try self.w.line("return .null_value;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.line("return .{{ .value = try std.json.innerParse(T, allocator, source, options) }};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
+        self.w.indent();
+        try self.w.line("switch (self) {{", .{});
+        self.w.indent();
+        try self.w.line(".absent => return error.OptionalNullablePropertyAbsent,", .{});
+        try self.w.line(".null_value => try jw.write(@as(?u8, null)),", .{});
+        try self.w.line(".value => |value| try jw.write(value),", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
     }
 
     fn sortedStringKeys(arena: Allocator, keys: []const []const u8) ![]const []const u8 {
@@ -479,6 +552,14 @@ pub const TypeGenerator = struct {
             } else {
                 try self.w.line("{s}: {s},", .{ field, zig_type });
             }
+        } else if (representation.nullability == .nullable) {
+            const wrapper = self.optional_nullable_type_name orelse return error.InvalidOpenApiSchema;
+            self.uses_optional_nullable = true;
+            const value_type = if (representation.null_representation == .zig_optional)
+                try std.fmt.allocPrint(self.arena, "std.meta.Child({s})", .{zig_type})
+            else
+                zig_type;
+            try self.w.line("{s}: {s}({s}) = .absent,", .{ field, wrapper, value_type });
         } else if (representation.null_representation == .zig_optional) {
             try self.w.line("{s}: {s} = null,", .{ field, zig_type });
         } else {
@@ -606,16 +687,35 @@ pub const TypeGenerator = struct {
         allow_required: bool,
         optional_nulls_follow_writer: bool,
     ) !void {
-        for (schema.properties.keys(), schema.properties.values()) |prop_name, _| {
+        for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
             if (emitted_props.contains(prop_name)) continue;
             try emitted_props.put(self.arena, prop_name, {});
 
             const field = try naming.zigFieldName(self.arena, prop_name);
             const is_required = allow_required and required_fields.contains(prop_name);
+            const representation = self.schemaOrRefRepresentation(prop_sor);
 
             if (is_required) {
                 try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
                 try self.w.line("try jw.write(self.{s});", .{field});
+            } else if (representation.nullability == .nullable) {
+                try self.w.line("switch (self.{s}) {{", .{field});
+                self.w.indent();
+                try self.w.line(".absent => {{}},", .{});
+                try self.w.line(".null_value => {{", .{});
+                self.w.indent();
+                try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
+                try self.w.line("try jw.write(@as(?u8, null));", .{});
+                self.w.dedent();
+                try self.w.line("}},", .{});
+                try self.w.line(".value => |value| {{", .{});
+                self.w.indent();
+                try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
+                try self.w.line("try jw.write(value);", .{});
+                self.w.dedent();
+                try self.w.line("}},", .{});
+                self.w.dedent();
+                try self.w.line("}}", .{});
             } else {
                 try self.w.line("if (self.{s}) |value| {{", .{field});
                 self.w.indent();
@@ -657,8 +757,12 @@ pub const TypeGenerator = struct {
     ) bool {
         if (allow_required) {
             for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
-                if (!required_fields.contains(prop_name)) continue;
-                if (self.schemaOrRefRepresentation(prop_sor).nullability != .non_nullable) return true;
+                const representation = self.schemaOrRefRepresentation(prop_sor);
+                if (required_fields.contains(prop_name)) {
+                    if (representation.nullability != .non_nullable) return true;
+                } else if (representation.nullability == .nullable) {
+                    return true;
+                }
             }
         }
 
@@ -1654,9 +1758,9 @@ test "nullable raw JSON override distinguishes required null from optional absen
     const output = w.toSlice();
     try std.testing.expect(std.mem.indexOf(u8, output, "pub const NullableRaw = std.json.Value;") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "required_raw: NullableRaw,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "optional_raw: ?NullableRaw = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "optional_raw: OpenApiOptionalNullable(NullableRaw) = .absent,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "required_inline_raw: std.json.Value,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "optional_inline_raw: ?std.json.Value = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "optional_inline_raw: OpenApiOptionalNullable(std.json.Value) = .absent,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.required_raw);") != null);
 }
 
@@ -1861,7 +1965,11 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "pub const ModernNullableString = ?ModernNullableStringValue;") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "legacy_referenced_tag: LegacyNullableString,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "modern_referenced_tag: ModernNullableString,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "optional_legacy_referenced_tag: LegacyNullableString = null,") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        output,
+        "optional_legacy_referenced_tag: OpenApiOptionalNullable(std.meta.Child(LegacyNullableString)) = .absent,",
+    ) != null);
     // Doc comment from nullable field description
     try std.testing.expect(std.mem.indexOf(u8, output, "/// A nullable required tag") != null);
     // Request serialization must preserve required nulls while omitting absent
@@ -1879,6 +1987,8 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"modern_referenced_tag\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.modern_referenced_tag);") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (self.note) |value|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "switch (self.optional_legacy_referenced_tag)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, ".null_value => {") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "else if (jw.options.emit_null_optional_fields)") != null);
 }
 

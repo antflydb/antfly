@@ -2144,10 +2144,37 @@ pub const GraphPath = struct {
 pub const GraphPathEdge = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
+    direction: GraphPathEdgeDirection,
     type: GraphEdgeType,
     /// Finite durable edge weight. max_weight paths further require values in [0,1].
     weight: f64,
     metadata: ?std.json.Value = null,
+};
+
+/// Physical stored-edge orientation relative to this path edge's `from` endpoint. `out` means the stored relationship points from `from` to `to`; `in` means the path traversed a relationship stored from `to` to `from`. This keeps paths lossless when a `both` query encounters reciprocal relationships.
+pub const GraphPathEdgeDirection = enum {
+    out,
+    in,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .out => "out",
+            .in => "in",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "out", .out },
+            .{ "in", .in },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GraphPathEndpoint = struct {

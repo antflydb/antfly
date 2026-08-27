@@ -280,6 +280,7 @@ pub const GraphNotExistsPattern = types.GraphNotExistsPattern;
 pub const GraphOptionalMatch = types.GraphOptionalMatch;
 pub const GraphPath = types.GraphPath;
 pub const GraphPathEdge = types.GraphPathEdge;
+pub const GraphPathEdgeDirection = types.GraphPathEdgeDirection;
 pub const GraphPathEndpoint = types.GraphPathEndpoint;
 pub const GraphPathWeightDomainError = types.GraphPathWeightDomainError;
 pub const GraphQuery = types.GraphQuery;

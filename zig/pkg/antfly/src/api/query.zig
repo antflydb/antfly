@@ -1855,6 +1855,7 @@ fn clonePathEdge(
         .edge_type = edge_type,
         .weight = source.weight,
         .metadata = metadata,
+        .traversal_direction = source.traversal_direction,
     };
 }
 

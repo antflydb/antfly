@@ -94,6 +94,10 @@ pub const PathEdge = struct {
     edge_type: []const u8,
     weight: f64,
     metadata: []const u8 = "",
+    /// Physical stored-edge orientation relative to this path step. Null is
+    /// retained for locally reconstructed paths whose unequal endpoint keys
+    /// make the orientation unambiguous without extra state.
+    traversal_direction: ?EdgeDirection = null,
 };
 
 pub const Path = struct {
@@ -1030,6 +1034,10 @@ fn clonePathEdge(alloc: Allocator, edge: anytype) !PathEdge {
         .edge_type = edge_type,
         .weight = edge.weight,
         .metadata = metadata,
+        .traversal_direction = if (@hasField(@TypeOf(edge), "traversal_direction"))
+            edge.traversal_direction
+        else
+            null,
     };
 }
 
@@ -1244,6 +1252,8 @@ fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
             return error.PathIdentityTooLarge;
     }
     for (path.edges) |edge| {
+        total_len = std.math.add(usize, total_len, 1) catch
+            return error.PathIdentityTooLarge;
         for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
             total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
                 return error.PathIdentityTooLarge;
@@ -1271,6 +1281,12 @@ fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
         pos += node.len;
     }
     for (path.edges) |edge| {
+        buf[pos] = if (edge.traversal_direction) |direction| switch (direction) {
+            .out => 1,
+            .in => 2,
+            .both => 3,
+        } else 0;
+        pos += 1;
         for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
             std.mem.writeInt(u64, buf[pos..][0..8], @intCast(part.len), .little);
             pos += 8;
@@ -1313,7 +1329,8 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
 fn pathEdgeIdentityEql(a: PathEdge, b: PathEdge) bool {
     return std.mem.eql(u8, a.source, b.source) and
         std.mem.eql(u8, a.target, b.target) and
-        std.mem.eql(u8, a.edge_type, b.edge_type);
+        std.mem.eql(u8, a.edge_type, b.edge_type) and
+        a.traversal_direction == b.traversal_direction;
 }
 
 fn joinPathsRetained(
@@ -1705,6 +1722,42 @@ test "k shortest paths preserve parallel typed edge identities" {
         found_paths[0].edges[0].edge_type,
         found_paths[1].edges[0].edge_type,
     ));
+
+    // Equal public keys can still identify reciprocal cross-table edges. The
+    // internal K-path key and Yen root comparison must not collapse them.
+    var nodes = [_][]const u8{ "shared", "shared" };
+    var tables = [_]?[]const u8{ "authors", "entities" };
+    var forward_edges = [_]PathEdge{.{
+        .source = "shared",
+        .target = "shared",
+        .edge_type = "knows",
+        .weight = 1,
+        .traversal_direction = .out,
+    }};
+    var reverse_edges = forward_edges;
+    reverse_edges[0].traversal_direction = .in;
+    const forward = Path{
+        .nodes = &nodes,
+        .node_tables = &tables,
+        .edges = &forward_edges,
+        .total_weight = 1,
+        .length = 1,
+    };
+    const reverse = Path{
+        .nodes = &nodes,
+        .node_tables = &tables,
+        .edges = &reverse_edges,
+        .total_weight = 1,
+        .length = 1,
+    };
+
+    const forward_key = try pathToKey(alloc, &forward);
+    defer alloc.free(forward_key);
+    const reverse_key = try pathToKey(alloc, &reverse);
+    defer alloc.free(reverse_key);
+
+    try std.testing.expect(!std.mem.eql(u8, forward_key, reverse_key));
+    try std.testing.expect(!rootPathMatches(&forward, &reverse, 1));
 }
 
 test "k shortest paths share one cumulative work budget across spur searches" {

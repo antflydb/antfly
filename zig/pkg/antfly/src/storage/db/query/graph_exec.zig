@@ -1152,6 +1152,10 @@ fn cloneGraphPathEdgeInfo(
         .edge_type = edge_type,
         .weight = edge.weight,
         .metadata = metadata,
+        .traversal_direction = if (@hasField(@TypeOf(edge), "traversal_direction"))
+            edge.traversal_direction
+        else
+            null,
     };
 }
 

@@ -390,6 +390,7 @@ from .graph_optional_match import GraphOptionalMatch
 from .graph_optional_match_nodes import GraphOptionalMatchNodes
 from .graph_path import GraphPath
 from .graph_path_edge import GraphPathEdge
+from .graph_path_edge_direction import GraphPathEdgeDirection
 from .graph_path_edge_metadata import GraphPathEdgeMetadata
 from .graph_path_endpoint import GraphPathEndpoint
 from .graph_path_weight_domain_error import GraphPathWeightDomainError
@@ -1322,6 +1323,7 @@ __all__ = (
     "GraphOptionalMatchNodes",
     "GraphPath",
     "GraphPathEdge",
+    "GraphPathEdgeDirection",
     "GraphPathEdgeMetadata",
     "GraphPathEndpoint",
     "GraphPathWeightDomainError",

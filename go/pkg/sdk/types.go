@@ -322,6 +322,7 @@ type (
 	GraphResultRefNodeSelector     = oapi.GraphResultRefNodeSelector
 	GraphPath                      = oapi.GraphPath
 	GraphPathEdge                  = oapi.GraphPathEdge
+	GraphPathEdgeDirection         = oapi.GraphPathEdgeDirection
 	GraphPathEndpoint              = oapi.GraphPathEndpoint
 	GraphResultNode                = oapi.GraphResultNode
 	GraphBindingNode               = oapi.GraphBindingNode
@@ -502,6 +503,8 @@ const (
 	GraphAggregatesResultKindAggregates = oapi.GraphAggregatesResultKindAggregates
 	GraphNodesResultKindNodes           = oapi.GraphNodesResultKindNodes
 	LegacyGraphQueryResultKindLegacy    = oapi.LegacyGraphQueryResultKindLegacy
+	GraphPathEdgeDirectionIn            = oapi.GraphPathEdgeDirectionIn
+	GraphPathEdgeDirectionOut           = oapi.GraphPathEdgeDirectionOut
 
 	HierarchyArtifactKindAsset           = oapi.HierarchyArtifactKindAsset
 	HierarchyArtifactKindChunk           = oapi.HierarchyArtifactKindChunk

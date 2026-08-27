@@ -71,6 +71,7 @@ const traversalResult: GraphQueryResult = {
         {
           from: { key: "paper:graph-rag" },
           to: { key: "paper:vector-db" },
+          direction: "out",
           type: "cites",
           weight: 0.92,
         },
@@ -85,12 +86,14 @@ const traversalResult: GraphQueryResult = {
         {
           from: { key: "paper:graph-rag" },
           to: { key: "paper:vector-db" },
+          direction: "out",
           type: "cites",
           weight: 0.92,
         },
         {
           from: { key: "paper:vector-db" },
           to: { key: "paper:path-ranking" },
+          direction: "out",
           type: "extends",
           weight: 0.78,
         },
@@ -105,6 +108,7 @@ const traversalResult: GraphQueryResult = {
         {
           from: { key: "paper:graph-rag" },
           to: { key: "paper:agent-memory" },
+          direction: "out",
           type: "extends",
           weight: 0.88,
         },
@@ -123,12 +127,14 @@ const traversalResult: GraphQueryResult = {
         {
           from: { key: "paper:graph-rag" },
           to: { key: "paper:agent-memory" },
+          direction: "out",
           type: "extends",
           weight: 0.88,
         },
         {
           from: { key: "paper:agent-memory" },
           to: { key: "paper:entity-links" },
+          direction: "out",
           type: "mentions",
           weight: 0.72,
         },
@@ -153,12 +159,14 @@ const shortestPathResult: GraphQueryResult = {
         {
           from: { key: "paper:graph-rag" },
           to: { key: "paper:agent-memory" },
+          direction: "out",
           type: "extends",
           weight: 0.88,
         },
         {
           from: { key: "paper:agent-memory" },
           to: { key: "paper:entity-links" },
+          direction: "out",
           type: "mentions",
           weight: 0.72,
         },

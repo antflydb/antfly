@@ -314,8 +314,38 @@ pub const DocumentClassificationObject = struct {
     prefix: []const u8,
     input: std.json.Value,
     features: DocumentClassificationFeatures,
-    best: ?DocumentClassificationResult = null,
+    best: OpenApiOptionalNullable(DocumentClassificationResult) = .absent,
     scores: []const DocumentClassificationResult,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("checkpoint_path");
+        try jw.write(self.checkpoint_path);
+        try jw.objectField("prefix");
+        try jw.write(self.prefix);
+        try jw.objectField("input");
+        try jw.write(self.input);
+        try jw.objectField("features");
+        try jw.write(self.features);
+        switch (self.best) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("best");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("best");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("scores");
+        try jw.write(self.scores);
+        try jw.endObject();
+    }
 };
 
 pub const DocumentClassificationRequest = struct {
@@ -374,8 +404,34 @@ pub const DocumentTokenClassificationPrediction = struct {
     text: []const u8,
     bbox: []const i64,
     features: DocumentTokenClassificationFeatures,
-    best: ?DocumentTokenClassificationResult = null,
+    best: OpenApiOptionalNullable(DocumentTokenClassificationResult) = .absent,
     scores: []const DocumentTokenClassificationResult,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("token_index");
+        try jw.write(self.token_index);
+        try jw.objectField("text");
+        try jw.write(self.text);
+        try jw.objectField("bbox");
+        try jw.write(self.bbox);
+        try jw.objectField("features");
+        try jw.write(self.features);
+        switch (self.best) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("best");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("best");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("scores");
+        try jw.write(self.scores);
+        try jw.endObject();
+    }
 };
 
 pub const DocumentTokenClassificationRequest = struct {
@@ -455,7 +511,35 @@ pub const EmbeddingItemError = struct {
     /// HTTP-style status classification for this item
     status: i64,
     /// Minimum retry delay in milliseconds for a retryable transient failure
-    retry_after_ms: ?i64 = null,
+    retry_after_ms: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("stage");
+        try jw.write(self.stage);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        switch (self.retry_after_ms) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("retry_after_ms");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("retry_after_ms");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// A single embedding result
@@ -542,7 +626,29 @@ pub const GenerateBatchError = struct {
     message: []const u8,
     retryable: bool,
     /// Minimum retry delay in milliseconds for a retryable capacity failure.
-    retry_after_ms: ?i64 = null,
+    retry_after_ms: OpenApiOptionalNullable(i64) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        switch (self.retry_after_ms) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("retry_after_ms");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("retry_after_ms");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Batch execution mode. Only synchronous batches are implemented.
@@ -611,7 +717,29 @@ pub const GenerateChoice = struct {
     message: GenerateMessage,
     finish_reason: FinishReason,
     /// Log probability information (not supported, always null)
-    logprobs: ?std.json.Value = null,
+    logprobs: OpenApiOptionalNullable(std.json.Value) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("finish_reason");
+        try jw.write(self.finish_reason);
+        switch (self.logprobs) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("logprobs");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("logprobs");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Streaming generation chunk (SSE event data)
@@ -622,8 +750,45 @@ pub const GenerateChunk = struct {
     model: []const u8,
     choices: []const GenerateChunkChoice,
     /// Authoritative token accounting. When `stream_options.include_usage` is true, streaming responses emit this only on the final chunk, after the finish chunk and before the `[DONE]` sentinel; that chunk has an empty `choices` array.
-    usage: ?GenerateUsage = null,
-    speculation: ?GenerateSpeculationStatus = null,
+    usage: OpenApiOptionalNullable(GenerateUsage) = .absent,
+    speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("choices");
+        try jw.write(self.choices);
+        switch (self.usage) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("usage");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("usage");
+                try jw.write(value);
+            },
+        }
+        switch (self.speculation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speculation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speculation");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateChunkChoice = struct {
@@ -636,11 +801,52 @@ pub const GenerateChunkChoice = struct {
 pub const GenerateDelta = struct {
     role: ?Role = null,
     /// Token content delta
-    content: ?[]const u8 = null,
+    content: OpenApiOptionalNullable([]const u8) = .absent,
     /// Reasoning content delta, separate from public content
-    reasoning_content: ?[]const u8 = null,
+    reasoning_content: OpenApiOptionalNullable([]const u8) = .absent,
     /// Tool call deltas for streaming tool calls
     tool_calls: ?[]const ToolCallDelta = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.role) |value| {
+            try jw.objectField("role");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("role");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.content) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("content");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("content");
+                try jw.write(value);
+            },
+        }
+        switch (self.reasoning_content) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("reasoning_content");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("reasoning_content");
+                try jw.write(value);
+            },
+        }
+        if (self.tool_calls) |value| {
+            try jw.objectField("tool_calls");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tool_calls");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateJsonSchemaConfig = struct {
@@ -655,9 +861,9 @@ pub const GenerateJsonSchemaConfig = struct {
 pub const GenerateMessage = struct {
     role: Role,
     /// The generated message content (null when tool_calls is present)
-    content: ?[]const u8 = null,
+    content: OpenApiOptionalNullable([]const u8) = .absent,
     /// Model reasoning emitted on a private reasoning channel, separate from public content
-    reasoning_content: ?[]const u8 = null,
+    reasoning_content: OpenApiOptionalNullable([]const u8) = .absent,
     /// Tool calls made by the model (only present when finish_reason is tool_calls)
     tool_calls: ?[]const antfly_generating_openapi.ToolCall = null,
 
@@ -665,19 +871,27 @@ pub const GenerateMessage = struct {
         try jw.beginObject();
         try jw.objectField("role");
         try jw.write(self.role);
-        if (self.content) |value| {
-            try jw.objectField("content");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("content");
-            try jw.write(@as(?u8, null));
+        switch (self.content) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("content");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("content");
+                try jw.write(value);
+            },
         }
-        if (self.reasoning_content) |value| {
-            try jw.objectField("reasoning_content");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("reasoning_content");
-            try jw.write(@as(?u8, null));
+        switch (self.reasoning_content) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("reasoning_content");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("reasoning_content");
+                try jw.write(value);
+            },
         }
         if (self.tool_calls) |value| {
             try jw.objectField("tool_calls");
@@ -761,7 +975,35 @@ pub const GenerateResponse = struct {
     /// List of completion choices (currently always 1)
     choices: []const GenerateChoice,
     usage: GenerateUsage,
-    speculation: ?GenerateSpeculationStatus = null,
+    speculation: OpenApiOptionalNullable(GenerateSpeculationStatus) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("object");
+        try jw.write(self.object);
+        try jw.objectField("created");
+        try jw.write(self.created);
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("choices");
+        try jw.write(self.choices);
+        try jw.objectField("usage");
+        try jw.write(self.usage);
+        switch (self.speculation) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("speculation");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("speculation");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GenerateResponseFormat = struct {
@@ -776,7 +1018,29 @@ pub const GenerateSpeculationStatus = struct {
     policy: []const u8,
     calibration: []const u8,
     decision: []const u8,
-    disabled_reason: ?[]const u8 = null,
+    disabled_reason: OpenApiOptionalNullable([]const u8) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("policy");
+        try jw.write(self.policy);
+        try jw.objectField("calibration");
+        try jw.write(self.calibration);
+        try jw.objectField("decision");
+        try jw.write(self.decision);
+        switch (self.disabled_reason) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("disabled_reason");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("disabled_reason");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Options that apply only to streamed generation responses.
@@ -1443,3 +1707,43 @@ pub const SchemasConfig = struct {
     level: ?Level = null,
     style: ?Style = null,
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}

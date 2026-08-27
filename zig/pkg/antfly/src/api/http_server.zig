@@ -16792,9 +16792,9 @@ pub fn parseCreateUserRequest(alloc: std.mem.Allocator, body: []const u8, path_u
     const password = try alloc.dupe(u8, parsed.value.password);
     errdefer alloc.free(password);
 
-    const initial_policies = try clonePermissionsFromOpenApi(alloc, parsed.value.initial_policies);
+    const initial_policies = try clonePermissionsFromOpenApi(alloc, parsed.value.initial_policies.valueOrNull());
     errdefer freePermissions(alloc, initial_policies);
-    const metadata_json = try normalizeMetadataFromOpenApi(alloc, parsed.value.metadata);
+    const metadata_json = try normalizeMetadataFromOpenApi(alloc, parsed.value.metadata.valueOrNull());
     errdefer alloc.free(metadata_json);
 
     return .{
@@ -16819,10 +16819,10 @@ pub fn parseCreateApiKeyRequest(alloc: std.mem.Allocator, body: []const u8) !Own
     const name = try alloc.dupe(u8, parsed.value.name);
     errdefer alloc.free(name);
 
-    const permissions = try clonePermissionsFromOpenApi(alloc, parsed.value.permissions);
+    const permissions = try clonePermissionsFromOpenApi(alloc, parsed.value.permissions.valueOrNull());
     errdefer freePermissions(alloc, permissions);
 
-    const row_filter = try cloneRowFiltersFromOpenApi(alloc, parsed.value.row_filter);
+    const row_filter = try cloneRowFiltersFromOpenApi(alloc, parsed.value.row_filter.valueOrNull());
     errdefer freeRowFilters(alloc, row_filter);
 
     const expires_at_ns = if (parsed.value.expires_in) |expires_in_value| blk: {
@@ -17039,10 +17039,19 @@ pub fn apiKeyToOpenApi(
         .key_id = api_key.key_id,
         .name = api_key.name,
         .username = api_key.username,
-        .permissions = if (api_key.permissions.len > 0) try clonePermissionsToOpenApi(alloc, api_key.permissions) else null,
-        .row_filter = if (api_key.row_filter.len > 0) try rowFilterMapToOpenApi(alloc, api_key.row_filter) else null,
+        .permissions = if (api_key.permissions.len > 0)
+            .{ .value = try clonePermissionsToOpenApi(alloc, api_key.permissions) }
+        else
+            .null_value,
+        .row_filter = if (api_key.row_filter.len > 0)
+            .{ .value = try rowFilterMapToOpenApi(alloc, api_key.row_filter) }
+        else
+            .null_value,
         .created_at = try formatTimestampOwned(alloc, api_key.created_at_ns),
-        .expires_at = if (api_key.expires_at_ns) |value| try formatTimestampOwned(alloc, value) else null,
+        .expires_at = if (api_key.expires_at_ns) |value|
+            .{ .value = try formatTimestampOwned(alloc, value) }
+        else
+            .null_value,
     };
 }
 
@@ -18579,7 +18588,10 @@ pub fn userToOpenApi(alloc: std.mem.Allocator, user: usermgr.User) !usermgr_open
     return .{
         .username = user.username,
         .password_hash = user.password_hash,
-        .metadata = if (user.metadata_json.len > 0) try parseOwnedJsonObjectMapAlloc(alloc, user.metadata_json) else null,
+        .metadata = if (user.metadata_json.len > 0)
+            .{ .value = try parseOwnedJsonObjectMapAlloc(alloc, user.metadata_json) }
+        else
+            .null_value,
     };
 }
 

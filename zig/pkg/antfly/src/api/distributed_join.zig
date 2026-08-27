@@ -4239,7 +4239,7 @@ pub fn supportedJoinRequestFromOpenApi(
         nested.deinit(alloc);
         alloc.destroy(nested);
     };
-    if (join.nested_join) |value| {
+    if (join.nested_join.valueOrNull()) |value| {
         const initialized_nested = blk: {
             const nested = try alloc.create(SupportedJoinRequest);
             errdefer alloc.destroy(nested);

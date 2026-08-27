@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from math import isfinite
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn
 
 from .client_generated.models.query_responses import QueryResponses
 from .exceptions import AntflyException
@@ -19,6 +19,7 @@ _MAX_GRAPH_ALIASES = 64
 _MAX_GRAPH_EDGES = 64
 _MAX_GRAPH_ITEMS = 10_000
 _MISSING = object()
+GraphResultDialect = Literal["auto", "canonical", "legacy", "none"]
 
 
 def _invalid(path: str, message: str) -> NoReturn:
@@ -109,13 +110,15 @@ def _validate_path_edge(
     _exact_keys(
         edge,
         path,
-        required=frozenset({"from", "to", "type", "weight"}),
+        required=frozenset({"from", "to", "direction", "type", "weight"}),
         optional=frozenset({"metadata"}),
     )
     from_endpoint = _validate_endpoint(edge["from"], f"{path}.from")
     to_endpoint = _validate_endpoint(edge["to"], f"{path}.to")
     if not _same_endpoint(from_endpoint, expected_from) or not _same_endpoint(to_endpoint, expected_to):
         _invalid(path, "endpoints do not match adjacent path nodes")
+    if edge["direction"] not in {"out", "in"}:
+        _invalid(f"{path}.direction", "must be out or in")
     _nonempty_string(edge["type"], f"{path}.type", max_utf8_bytes=65_536)
     weight = _finite_nonnegative(edge["weight"], f"{path}.weight", at_most_one=max_weight_mode)
     if "metadata" in edge:
@@ -301,11 +304,17 @@ def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
     _validate_stats(value["stats"], f"{path}.stats", len(paths) if paths else len(nodes), allow_truncated=True)
 
 
-def _validate_canonical_graph_result(value: object, path: str) -> None:
+def _validate_graph_result(value: object, path: str, dialect: GraphResultDialect) -> None:
     result = _object(value, path)
     kind = result.get("kind", _MISSING)
+    if dialect == "none":
+        _invalid(path, "was returned for a request without graph operations")
     if kind is _MISSING or kind == "legacy":
+        if dialect == "canonical":
+            _invalid(f"{path}.kind", "canonical graph results require a discriminator")
         return
+    if dialect == "legacy":
+        _invalid(f"{path}.kind", "legacy graph results must use the legacy result shape")
     if not isinstance(kind, str):
         _invalid(f"{path}.kind", "must be a string")
     if kind == "bindings":
@@ -318,28 +327,46 @@ def _validate_canonical_graph_result(value: object, path: str) -> None:
         _invalid(f"{path}.kind", f"has unknown canonical discriminator {kind!r}")
 
 
-def decode_query_responses(value: object) -> QueryResponses:
-    """Validate canonical graph results and decode the generated response model."""
+def decode_query_responses(
+    value: object,
+    *,
+    graph_dialect: GraphResultDialect = "auto",
+    expected_graph_operations: frozenset[str] | None = None,
+) -> QueryResponses:
+    """Validate graph results against the request dialect, then decode them."""
     response = _object(value, "response")
     raw_responses = response.get("responses", _MISSING)
-    if raw_responses is not _MISSING:
+    if raw_responses is _MISSING:
+        if expected_graph_operations is not None:
+            _invalid("response", "is missing responses")
+    else:
         responses = _array(raw_responses, "response.responses")
+        if expected_graph_operations is not None and len(responses) != 1:
+            _invalid("response.responses", "must contain exactly one response")
         for response_index, raw_result in enumerate(responses):
             result_path = f"response.responses[{response_index}]"
             result = _object(raw_result, result_path)
             graph_results = result.get("graph_results", _MISSING)
             if graph_results is _MISSING:
+                if expected_graph_operations:
+                    _invalid(result_path, "is missing graph_results")
                 continue
             operations = _object(graph_results, f"{result_path}.graph_results")
+            if expected_graph_operations is not None and frozenset(operations) != expected_graph_operations:
+                _invalid(
+                    f"{result_path}.graph_results",
+                    "operation names do not match the request",
+                )
             for name, graph_result in operations.items():
-                kind = graph_result.get("kind") if isinstance(graph_result, Mapping) else None
-                if (
-                    isinstance(kind, str)
-                    and kind in {"bindings", "aggregates", "nodes"}
-                    and not is_valid_graph_identifier(name)
-                ):
+                result_kind = graph_result.get("kind", _MISSING) if isinstance(graph_result, Mapping) else _MISSING
+                is_canonical = graph_dialect == "canonical" or result_kind in {"bindings", "aggregates", "nodes"}
+                if is_canonical and not is_valid_graph_identifier(name):
                     _invalid(f"{result_path}.graph_results", f"contains invalid operation name {name!r}")
-                _validate_canonical_graph_result(graph_result, f"{result_path}.graph_results[{name!r}]")
+                _validate_graph_result(
+                    graph_result,
+                    f"{result_path}.graph_results[{name!r}]",
+                    graph_dialect,
+                )
     try:
         return QueryResponses.from_dict(response)
     except (AttributeError, KeyError, TypeError, ValueError) as exc:

@@ -421,6 +421,9 @@ func validateDecodedGraphPath(path GraphPath) error {
 }
 
 func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint, maxWeightMode bool) error {
+	if !edge.Direction.Valid() {
+		return fmt.Errorf("graph path edge direction must be out or in")
+	}
 	if edge.Type == "" || len(edge.Type) > maxGraphEdgeTypeBytes || !utf8.ValidString(edge.Type) {
 		return fmt.Errorf("graph path edge type must encode to between 1 and %d UTF-8 bytes", maxGraphEdgeTypeBytes)
 	}

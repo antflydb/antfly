@@ -1096,9 +1096,9 @@ fn matchExactTwoEdgePattern(
             }
 
             const path = if (opts.include_paths) blk: {
-                const first = try appendPathEdge(alloc, &.{}, forward_edge, start_key, middle_key);
+                const first = try appendPathEdge(alloc, &.{}, forward_edge, start_key, middle_key, pattern[1].edge.direction);
                 defer freePathEdges(alloc, first);
-                break :blk try appendPathEdge(alloc, first, backward_edge, middle_key, target_key);
+                break :blk try appendPathEdge(alloc, first, backward_edge, middle_key, target_key, pattern[2].edge.direction);
             } else @constCast((&[_]paths_mod.PathEdge{})[0..]);
             errdefer freePathEdges(alloc, path);
             try matches.append(alloc, .{ .bindings = filtered_bindings, .path = path });
@@ -1357,7 +1357,7 @@ fn streamReachableNodes(
                 }
                 const new_hops = frontier.hops + 1;
                 const new_path = if (include_paths)
-                    try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key)
+                    try appendPathEdge(alloc, frontier.path, graph_edge, frontier.key, target_key, edge.direction)
                 else
                     @constCast((&[_]paths_mod.PathEdge{})[0..]);
                 var new_path_owned = true;
@@ -3229,7 +3229,7 @@ fn clonePathEdges(alloc: Allocator, edges: []const paths_mod.PathEdge) ![]paths_
         if (out.len > 0) alloc.free(out);
     }
     for (edges, 0..) |edge, i| {
-        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata);
+        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction);
         initialized += 1;
     }
     return out;
@@ -3243,11 +3243,11 @@ fn concatPathEdges(alloc: Allocator, left: []const paths_mod.PathEdge, right: []
         if (out.len > 0) alloc.free(out);
     }
     for (left, 0..) |edge, i| {
-        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata);
+        out[i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction);
         initialized += 1;
     }
     for (right, 0..) |edge, i| {
-        out[left.len + i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata);
+        out[left.len + i] = try dupePathEdge(alloc, edge.source, edge.target, edge.edge_type, edge.weight, edge.metadata, edge.traversal_direction);
         initialized += 1;
     }
     return out;
@@ -3259,6 +3259,7 @@ fn appendPathEdge(
     edge: graph_mod.Edge,
     source: []const u8,
     target: []const u8,
+    requested_direction: graph_mod.EdgeDirection,
 ) ![]paths_mod.PathEdge {
     var out = try alloc.alloc(paths_mod.PathEdge, existing.len + 1);
     var initialized: usize = 0;
@@ -3267,7 +3268,7 @@ fn appendPathEdge(
         if (out.len > 0) alloc.free(out);
     }
     for (existing, 0..) |item, i| {
-        out[i] = try dupePathEdge(alloc, item.source, item.target, item.edge_type, item.weight, item.metadata);
+        out[i] = try dupePathEdge(alloc, item.source, item.target, item.edge_type, item.weight, item.metadata, item.traversal_direction);
         initialized += 1;
     }
     out[out.len - 1] = try dupePathEdge(
@@ -3277,9 +3278,26 @@ fn appendPathEdge(
         edge.edge_type,
         edge.weight,
         edge.metadata,
+        traversedEdgeDirection(edge, source, target, requested_direction),
     );
     initialized += 1;
     return out;
+}
+
+fn traversedEdgeDirection(
+    edge: graph_mod.Edge,
+    source: []const u8,
+    target: []const u8,
+    requested_direction: graph_mod.EdgeDirection,
+) graph_mod.EdgeDirection {
+    return switch (requested_direction) {
+        .out => .out,
+        .in => .in,
+        .both => if (std.mem.eql(u8, edge.source, source) and std.mem.eql(u8, edge.target, target))
+            .out
+        else
+            .in,
+    };
 }
 
 fn dupePathEdge(
@@ -3289,6 +3307,7 @@ fn dupePathEdge(
     edge_type: []const u8,
     weight: f64,
     metadata: []const u8,
+    traversal_direction: ?graph_mod.EdgeDirection,
 ) !paths_mod.PathEdge {
     const owned_source = try alloc.dupe(u8, source);
     errdefer alloc.free(owned_source);
@@ -3304,6 +3323,7 @@ fn dupePathEdge(
         .edge_type = owned_edge_type,
         .weight = weight,
         .metadata = owned_metadata,
+        .traversal_direction = traversal_direction,
     };
 }
 

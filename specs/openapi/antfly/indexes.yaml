@@ -2235,6 +2235,15 @@ components:
         - out: Outgoing edges from the node
         - in: Incoming edges to the node
         - both: Both outgoing and incoming edges
+    GraphPathEdgeDirection:
+      type: string
+      enum: [out, in]
+      description: >-
+        Physical stored-edge orientation relative to this path edge's `from`
+        endpoint. `out` means the stored relationship points from `from` to
+        `to`; `in` means the path traversed a relationship stored from `to` to
+        `from`. This keeps paths lossless when a `both` query encounters
+        reciprocal relationships.
     PathWeightMode:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -2461,7 +2470,7 @@ components:
     GraphPathEdge:
       type: object
       additionalProperties: false
-      required: [from, to, type, weight]
+      required: [from, to, direction, type, weight]
       description: >-
         One edge in a canonical path. `from` and `to` are the exact ordered
         traversal endpoints, not unqualified physical edge keys, so identity
@@ -2470,6 +2479,7 @@ components:
       properties:
         from: { $ref: '#/components/schemas/GraphPathEndpoint' }
         to: { $ref: '#/components/schemas/GraphPathEndpoint' }
+        direction: { $ref: '#/components/schemas/GraphPathEdgeDirection' }
         type:
           $ref: '#/components/schemas/GraphEdgeType'
         weight:

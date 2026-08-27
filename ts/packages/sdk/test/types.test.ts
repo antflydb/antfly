@@ -253,6 +253,7 @@ describe("Antfly Query Type Integration", () => {
       const edge: GraphPathEdge = {
         from: { key: "shared" },
         to: { key: "shared", table: "entities" },
+        direction: "out",
         type: "references",
         weight: 1,
       };

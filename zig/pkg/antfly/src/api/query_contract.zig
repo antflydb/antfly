@@ -22,6 +22,7 @@ const graph_edge_type = @import("../graph/edge_type.zig");
 const graph_edge_weight = @import("../graph/edge_weight.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
+const graph_traversal_mod = @import("../graph/traversal.zig");
 const graph_path_weight_diagnostic = @import("../graph/path_weight_diagnostic.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const graph_mod = @import("../graph/graph.zig");
@@ -6468,6 +6469,14 @@ fn toOpenApiGraphPathEdges(
             std.mem.eql(u8, edge.target, left_key);
         if (!connects_in_order and !connects_in_reverse)
             return error.InvalidRemoteResponse;
+        const direction: indexes_openapi.GraphPathEdgeDirection = if (edge.traversal_direction) |stored| switch (stored) {
+            .out => if (connects_in_order) .out else return error.InvalidRemoteResponse,
+            .in => if (connects_in_reverse) .in else return error.InvalidRemoteResponse,
+            .both => return error.InvalidRemoteResponse,
+        } else if (connects_in_order != connects_in_reverse)
+            (if (connects_in_order) .out else .in)
+        else
+            try graphPathEdgeDirectionForEqualKeys(node_tables, i, edge.metadata);
         out[i] = .{
             .from = .{
                 .key = left_key,
@@ -6477,12 +6486,54 @@ fn toOpenApiGraphPathEdges(
                 .key = right_key,
                 .table = if (node_tables.len == 0) null else node_tables[i + 1],
             },
+            .direction = direction,
             .type = edge.edge_type,
             .weight = edge.weight,
             .metadata = try pathEdgeMetadataObjectJsonValue(alloc, edge.metadata),
         };
     }
     return out;
+}
+
+fn graphPathEdgeDirectionForEqualKeys(
+    node_tables: []const ?[]const u8,
+    edge_index: usize,
+    metadata: []const u8,
+) !indexes_openapi.GraphPathEdgeDirection {
+    // Equal keys are still distinct cross-table identities. The durable edge
+    // metadata names its physical target table, which lets the public path
+    // retain orientation even when comparing source/target keys cannot.
+    if (node_tables.len != 0) {
+        const left_table = node_tables[edge_index];
+        const right_table = node_tables[edge_index + 1];
+        if (!optionalStringEqual(left_table, right_table)) {
+            const target_table = graph_traversal_mod.metadataTargetTable(metadata) orelse
+                return error.InvalidRemoteResponse;
+            var left_is_target = optionalStringEqualsValue(left_table, target_table);
+            var right_is_target = optionalStringEqualsValue(right_table, target_table);
+            // The queried table is encoded as null in public path identities.
+            // If a cross-table edge names neither explicit side, its durable
+            // target can only be that elided base-table identity.
+            if (!left_is_target and !right_is_target and (left_table == null) != (right_table == null)) {
+                left_is_target = left_table == null;
+                right_is_target = right_table == null;
+            }
+            if (left_is_target == right_is_target) return error.InvalidRemoteResponse;
+            return if (right_is_target) .out else .in;
+        }
+    }
+    // A physical self-loop has no distinguishable reverse orientation and is
+    // emitted once under `both`, so `out` is its stable canonical spelling.
+    return .out;
+}
+
+fn optionalStringEqual(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left == null or right == null) return left == null and right == null;
+    return std.mem.eql(u8, left.?, right.?);
+}
+
+fn optionalStringEqualsValue(optional: ?[]const u8, value: []const u8) bool {
+    return optional != null and std.mem.eql(u8, optional.?, value);
 }
 
 test "canonical graph path edges enforce durable type policy" {
@@ -6496,6 +6547,31 @@ test "canonical graph path edges enforce durable type policy" {
         error.InvalidRemoteResponse,
         toOpenApiGraphPathEdges(std.testing.allocator, &.{ "a", "b" }, &.{}, edges),
     );
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    const nodes = [_][]const u8{ "shared", "shared" };
+    const tables = [_]?[]const u8{ "authors", "entities" };
+    const forward = [_]graph_paths_mod.PathEdge{.{
+        .source = "shared",
+        .target = "shared",
+        .edge_type = "knows",
+        .weight = 1,
+        .traversal_direction = .out,
+    }};
+    const reverse = [_]graph_paths_mod.PathEdge{.{
+        .source = "shared",
+        .target = "shared",
+        .edge_type = "knows",
+        .weight = 1,
+        .traversal_direction = .in,
+    }};
+
+    const encoded_forward = try toOpenApiGraphPathEdges(alloc, &nodes, &tables, &forward);
+    const encoded_reverse = try toOpenApiGraphPathEdges(alloc, &nodes, &tables, &reverse);
+    try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.out, encoded_forward[0].direction);
+    try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.in, encoded_reverse[0].direction);
 }
 
 fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
@@ -8862,32 +8938,32 @@ fn parseGeneratedBleveQuerySlice(
 
 fn parseGeneratedBleveQueryBoost(query: query_openapi.Query) !f32 {
     return switch (query) {
-        .match_all_query => |value| parseGeneratedBoost(value.boost),
-        .match_none_query => |value| parseGeneratedBoost(value.boost),
-        .query_string_query => |value| parseGeneratedBoost(value.boost),
-        .term_query => |value| parseGeneratedBoost(value.boost),
-        .match_query => |value| parseGeneratedBoost(value.boost),
-        .multi_match_query => |value| parseGeneratedBoost(value.multi_match.boost),
-        .match_phrase_query => |value| parseGeneratedBoost(value.boost),
-        .phrase_query => |value| parseGeneratedBoost(value.boost),
-        .multi_phrase_query => |value| parseGeneratedBoost(value.boost),
-        .fuzzy_query => |value| parseGeneratedBoost(value.boost),
-        .prefix_query => |value| parseGeneratedBoost(value.boost),
-        .wildcard_query => |value| parseGeneratedBoost(value.boost),
-        .regexp_query => |value| parseGeneratedBoost(value.boost),
-        .numeric_range_query => |value| parseGeneratedBoost(value.boost),
-        .term_range_query => |value| parseGeneratedBoost(value.boost),
-        .date_range_string_query => |value| parseGeneratedBoost(value.boost),
-        .doc_id_query => |value| parseGeneratedBoost(value.boost),
-        .bool_field_query => |value| parseGeneratedBoost(value.boost),
-        .boolean_query => |value| parseGeneratedBoost(value.boost),
-        .conjunction_query => |value| parseGeneratedBoost(value.boost),
-        .disjunction_query => |value| parseGeneratedBoost(value.boost),
-        .ip_range_query => |value| parseGeneratedBoost(value.boost),
-        .geo_bounding_box_query => |value| parseGeneratedBoost(value.boost),
-        .geo_distance_query => |value| parseGeneratedBoost(value.boost),
-        .geo_bounding_polygon_query => |value| parseGeneratedBoost(value.boost),
-        .geo_shape_query => |value| parseGeneratedBoost(value.boost),
+        .match_all_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .match_none_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .query_string_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .term_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .match_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .multi_match_query => |value| parseGeneratedBoost(value.multi_match.boost.valueOrNull()),
+        .match_phrase_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .phrase_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .multi_phrase_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .fuzzy_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .prefix_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .wildcard_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .regexp_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .numeric_range_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .term_range_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .date_range_string_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .doc_id_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .bool_field_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .boolean_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .conjunction_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .disjunction_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .ip_range_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .geo_bounding_box_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .geo_distance_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .geo_bounding_polygon_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
+        .geo_shape_query => |value| parseGeneratedBoost(value.boost.valueOrNull()),
     };
 }
 
@@ -9008,18 +9084,18 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
         } },
         .numeric_range_query => |range_query| .{ .numeric_range = .{
             .field = try alloc.dupe(u8, range_query.field orelse return error.UnsupportedQueryRequest),
-            .min = range_query.min,
-            .max = range_query.max,
-            .inclusive_min = range_query.inclusive_min orelse true,
-            .inclusive_max = range_query.inclusive_max orelse false,
+            .min = range_query.min.valueOrNull(),
+            .max = range_query.max.valueOrNull(),
+            .inclusive_min = range_query.inclusive_min.valueOrNull() orelse true,
+            .inclusive_max = range_query.inclusive_max.valueOrNull() orelse false,
             .boost = query_boost,
         } },
         .term_range_query => |range_query| .{ .term_range = .{
             .field = try alloc.dupe(u8, range_query.field orelse return error.UnsupportedQueryRequest),
-            .min = if (range_query.min) |min| try alloc.dupe(u8, min) else null,
-            .max = if (range_query.max) |max| try alloc.dupe(u8, max) else null,
-            .inclusive_min = range_query.inclusive_min orelse true,
-            .inclusive_max = range_query.inclusive_max orelse false,
+            .min = if (range_query.min.valueOrNull()) |min| try alloc.dupe(u8, min) else null,
+            .max = if (range_query.max.valueOrNull()) |max| try alloc.dupe(u8, max) else null,
+            .inclusive_min = range_query.inclusive_min.valueOrNull() orelse true,
+            .inclusive_max = range_query.inclusive_max.valueOrNull() orelse false,
             .boost = query_boost,
         } },
         .date_range_string_query => |range_query| blk: {
@@ -9036,8 +9112,8 @@ fn parseGeneratedBleveQueryValue(alloc: std.mem.Allocator, query: query_openapi.
                     (try parseDateTimeOptionalToNs(end)) orelse return error.UnsupportedQueryRequest
                 else
                     null,
-                .inclusive_start = range_query.inclusive_start orelse true,
-                .inclusive_end = range_query.inclusive_end orelse false,
+                .inclusive_start = range_query.inclusive_start.valueOrNull() orelse true,
+                .inclusive_end = range_query.inclusive_end.valueOrNull() orelse false,
                 .boost = query_boost,
             } };
         },

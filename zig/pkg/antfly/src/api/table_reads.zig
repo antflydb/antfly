@@ -18223,7 +18223,7 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","depth":1,"path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"type":"external","weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","depth":1,"path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -18234,9 +18234,11 @@ test "parseRemoteSearchResult preserves canonical graph path table identities" {
     try std.testing.expectEqualStrings("entities", result.graph_results[0].nodes[0].path_tables.?[1].?);
     try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path_edges.?[0].source);
     try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path_edges.?[0].target);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.in, result.graph_results[0].nodes[0].path_edges.?[0].traversal_direction.?);
     try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
     try std.testing.expectEqualStrings("shared", result.graph_results[0].paths[0].nodes[1]);
     try std.testing.expectEqualStrings("entities", result.graph_results[0].paths[0].node_tables[1].?);
+    try std.testing.expectEqual(graph_mod.EdgeDirection.in, result.graph_results[0].paths[0].edges[0].traversal_direction.?);
 }
 
 fn parseRemoteGraphResults(
@@ -18809,9 +18811,11 @@ fn cloneRemoteCanonicalGraphNodePathEdges(
     var initialized: usize = 0;
     errdefer freeRemoteGraphNodePathEdgeItems(alloc, edges, initialized);
     for (value, 0..) |item, i| {
-        const source = try alloc.dupe(u8, item.from.key);
+        const source_key = if (item.direction == .out) item.from.key else item.to.key;
+        const target_key = if (item.direction == .out) item.to.key else item.from.key;
+        const source = try alloc.dupe(u8, source_key);
         errdefer alloc.free(source);
-        const target = try alloc.dupe(u8, item.to.key);
+        const target = try alloc.dupe(u8, target_key);
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
@@ -18823,6 +18827,10 @@ fn cloneRemoteCanonicalGraphNodePathEdges(
             .edge_type = edge_type,
             .weight = item.weight,
             .metadata = metadata,
+            .traversal_direction = switch (item.direction) {
+                .out => .out,
+                .in => .in,
+            },
         };
         initialized += 1;
     }
@@ -19075,9 +19083,11 @@ fn parseRemoteCanonicalPathEdges(
         if (edges.len > 0) alloc.free(edges);
     }
     for (value, 0..) |item, i| {
-        const source = try alloc.dupe(u8, item.from.key);
+        const source_key = if (item.direction == .out) item.from.key else item.to.key;
+        const target_key = if (item.direction == .out) item.to.key else item.from.key;
+        const source = try alloc.dupe(u8, source_key);
         errdefer alloc.free(source);
-        const target = try alloc.dupe(u8, item.to.key);
+        const target = try alloc.dupe(u8, target_key);
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
@@ -19089,6 +19099,10 @@ fn parseRemoteCanonicalPathEdges(
             .edge_type = edge_type,
             .weight = item.weight,
             .metadata = metadata,
+            .traversal_direction = switch (item.direction) {
+                .out => .out,
+                .in => .in,
+            },
         };
         initialized += 1;
     }
@@ -19233,6 +19247,7 @@ test "remote legacy graph paths require contiguous identities and exact weight s
 }
 
 test "remote canonical graph paths reject impossible shapes and weight domains" {
+    const alloc = std.testing.allocator;
     const nodes = [_]indexes_openapi.GraphPathEndpoint{
         .{ .key = "a" },
         .{ .key = "b", .table = "entities" },
@@ -19240,6 +19255,7 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     var edges = [_]indexes_openapi.GraphPathEdge{.{
         .from = nodes[0],
         .to = nodes[1],
+        .direction = .out,
         .type = "related",
         .weight = 0.5,
     }};
@@ -19253,6 +19269,21 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     };
     try validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges);
     try validateRemoteCanonicalGraphPathScores(path);
+
+    edges[0].direction = .in;
+    const decoded_edges = try parseRemoteCanonicalPathEdges(alloc, &edges);
+    defer {
+        for (decoded_edges) |edge| {
+            alloc.free(edge.source);
+            alloc.free(edge.target);
+            alloc.free(edge.edge_type);
+            if (edge.metadata.len > 0) alloc.free(edge.metadata);
+        }
+        alloc.free(decoded_edges);
+    }
+    try std.testing.expectEqualStrings("b", decoded_edges[0].source);
+    try std.testing.expectEqualStrings("a", decoded_edges[0].target);
+    edges[0].direction = .out;
 
     try std.testing.expectError(
         error.InvalidRemoteResponse,
@@ -19284,8 +19315,8 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(path));
 
     const overflow_edges = [_]indexes_openapi.GraphPathEdge{
-        .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .type = "e", .weight = std.math.floatMax(f64) },
-        .{ .from = .{ .key = "b" }, .to = .{ .key = "c" }, .type = "e", .weight = std.math.floatMax(f64) },
+        .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .direction = .out, .type = "e", .weight = std.math.floatMax(f64) },
+        .{ .from = .{ .key = "b" }, .to = .{ .key = "c" }, .direction = .out, .type = "e", .weight = std.math.floatMax(f64) },
     };
     try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(.{
         .nodes = &.{ .{ .key = "a" }, .{ .key = "b" }, .{ .key = "c" } },

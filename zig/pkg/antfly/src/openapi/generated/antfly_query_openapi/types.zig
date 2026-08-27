@@ -6,7 +6,32 @@ const std = @import("std");
 pub const BoolFieldQuery = struct {
     bool: bool,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("bool");
+        try jw.write(self.bool);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const BooleanQuery = struct {
@@ -14,7 +39,51 @@ pub const BooleanQuery = struct {
     should: ?DisjunctionQuery = null,
     must_not: ?DisjunctionQuery = null,
     filter: ?Query = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.must) |value| {
+            try jw.objectField("must");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("must");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.should) |value| {
+            try jw.objectField("should");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("should");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.must_not) |value| {
+            try jw.objectField("must_not");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("must_not");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("filter");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const BoostValue = f64;
@@ -24,29 +93,156 @@ pub const Boost = ?BoostValue;
 
 pub const ConjunctionQuery = struct {
     conjuncts: []const Query,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("conjuncts");
+        try jw.write(self.conjuncts);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DateRangeStringQuery = struct {
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
-    inclusive_start: ?bool = null,
-    inclusive_end: ?bool = null,
+    inclusive_start: OpenApiOptionalNullable(bool) = .absent,
+    inclusive_end: OpenApiOptionalNullable(bool) = .absent,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     datetime_parser: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("start");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.end) |value| {
+            try jw.objectField("end");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("end");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.inclusive_start) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("inclusive_start");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("inclusive_start");
+                try jw.write(value);
+            },
+        }
+        switch (self.inclusive_end) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("inclusive_end");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("inclusive_end");
+                try jw.write(value);
+            },
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        if (self.datetime_parser) |value| {
+            try jw.objectField("datetime_parser");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("datetime_parser");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
     min: ?i64 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("disjuncts");
+        try jw.write(self.disjuncts);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        if (self.min) |value| {
+            try jw.objectField("min");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("min");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DocIdQuery = struct {
     ids: []const []const u8,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("ids");
+        try jw.write(self.ids);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// The fuzziness of the query. Can be an integer or "auto".
@@ -57,7 +253,46 @@ pub const FuzzyQuery = struct {
     prefix_length: ?i32 = null,
     fuzziness: ?Fuzziness = null,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("term");
+        try jw.write(self.term);
+        if (self.prefix_length) |value| {
+            try jw.objectField("prefix_length");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("prefix_length");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.fuzziness) |value| {
+            try jw.objectField("fuzziness");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("fuzziness");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 /// Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat.
@@ -72,13 +307,64 @@ pub const GeoBoundingBoxQuery = struct {
     max_lat: f64,
     /// Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
     max_lon: f64,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("min_lat");
+        try jw.write(self.min_lat);
+        try jw.objectField("min_lon");
+        try jw.write(self.min_lon);
+        try jw.objectField("max_lat");
+        try jw.write(self.max_lat);
+        try jw.objectField("max_lon");
+        try jw.write(self.max_lon);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GeoBoundingPolygonQuery = struct {
     polygon_points: []const GeoPoint,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("polygon_points");
+        try jw.write(self.polygon_points);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GeoDistanceQuery = struct {
@@ -86,7 +372,34 @@ pub const GeoDistanceQuery = struct {
     location: []const f64,
     distance: []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("location");
+        try jw.write(self.location);
+        try jw.objectField("distance");
+        try jw.write(self.distance);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GeoPoint = struct {
@@ -108,45 +421,224 @@ pub const GeoShapeGeometry = struct {
 pub const GeoShapeQuery = struct {
     geometry: GeoShapeGeometry,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("geometry");
+        try jw.write(self.geometry);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const IPRangeQuery = struct {
     cidr: []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("cidr");
+        try jw.write(self.cidr);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const MatchAllQuery = struct {
     match_all: std.json.Value,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("match_all");
+        try jw.write(self.match_all);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const MatchNoneQuery = struct {
     match_none: std.json.Value,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("match_none");
+        try jw.write(self.match_none);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const MatchPhraseQuery = struct {
     match_phrase: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     fuzziness: ?Fuzziness = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("match_phrase");
+        try jw.write(self.match_phrase);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.analyzer) |value| {
+            try jw.objectField("analyzer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("analyzer");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        if (self.fuzziness) |value| {
+            try jw.objectField("fuzziness");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("fuzziness");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("match");
+        try jw.write(self.match);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.analyzer) |value| {
+            try jw.objectField("analyzer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("analyzer");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const MultiMatchBody = struct {
     query: []const u8,
     fields: []const []const u8,
     type: []const u8,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(self.query);
+        try jw.objectField("fields");
+        try jw.write(self.fields);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const MultiMatchQuery = struct {
@@ -156,30 +648,186 @@ pub const MultiMatchQuery = struct {
 pub const MultiPhraseQuery = struct {
     terms: []const []const []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     fuzziness: ?Fuzziness = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("terms");
+        try jw.write(self.terms);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        if (self.fuzziness) |value| {
+            try jw.objectField("fuzziness");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("fuzziness");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const NumericRangeQuery = struct {
-    min: ?f64 = null,
-    max: ?f64 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
+    min: OpenApiOptionalNullable(f64) = .absent,
+    max: OpenApiOptionalNullable(f64) = .absent,
+    inclusive_min: OpenApiOptionalNullable(bool) = .absent,
+    inclusive_max: OpenApiOptionalNullable(bool) = .absent,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self.min) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("min");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("min");
+                try jw.write(value);
+            },
+        }
+        switch (self.max) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max");
+                try jw.write(value);
+            },
+        }
+        switch (self.inclusive_min) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("inclusive_min");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("inclusive_min");
+                try jw.write(value);
+            },
+        }
+        switch (self.inclusive_max) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("inclusive_max");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("inclusive_max");
+                try jw.write(value);
+            },
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const PhraseQuery = struct {
     terms: []const []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     fuzziness: ?Fuzziness = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("terms");
+        try jw.write(self.terms);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        if (self.fuzziness) |value| {
+            try jw.objectField("fuzziness");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("fuzziness");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const PrefixQuery = struct {
     prefix: []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("prefix");
+        try jw.write(self.prefix);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Query = union(enum) {
@@ -426,32 +1074,232 @@ pub const Query = union(enum) {
 
 pub const QueryStringQuery = struct {
     query: []const u8,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(self.query);
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RegexpQuery = struct {
     regexp: []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("regexp");
+        try jw.write(self.regexp);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TermQuery = struct {
     term: []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("term");
+        try jw.write(self.term);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TermRangeQuery = struct {
-    min: ?[]const u8 = null,
-    max: ?[]const u8 = null,
-    inclusive_min: ?bool = null,
-    inclusive_max: ?bool = null,
+    min: OpenApiOptionalNullable([]const u8) = .absent,
+    max: OpenApiOptionalNullable([]const u8) = .absent,
+    inclusive_min: OpenApiOptionalNullable(bool) = .absent,
+    inclusive_max: OpenApiOptionalNullable(bool) = .absent,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        switch (self.min) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("min");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("min");
+                try jw.write(value);
+            },
+        }
+        switch (self.max) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("max");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("max");
+                try jw.write(value);
+            },
+        }
+        switch (self.inclusive_min) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("inclusive_min");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("inclusive_min");
+                try jw.write(value);
+            },
+        }
+        switch (self.inclusive_max) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("inclusive_max");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("inclusive_max");
+                try jw.write(value);
+            },
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const WildcardQuery = struct {
     wildcard: []const u8,
     field: ?[]const u8 = null,
-    boost: Boost = null,
+    boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("wildcard");
+        try jw.write(self.wildcard);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("field");
+            try jw.write(@as(?u8, null));
+        }
+        switch (self.boost) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("boost");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("boost");
+                try jw.write(value);
+            },
+        }
+        try jw.endObject();
+    }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}

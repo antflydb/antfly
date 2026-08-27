@@ -5,6 +5,7 @@
 
 import createClient, { type Client } from "openapi-fetch";
 import { validateGraphQueryIdentifiers } from "./graph-identifiers.js";
+import { validateGraphQueryResponses } from "./graph-results.js";
 import type { paths } from "./public-api.js";
 import type {
   AntflyAuth,
@@ -540,6 +541,7 @@ export class AntflyClient {
         ...(options?.signal ? { signal: options.signal } : {}),
       });
       if (error) throw queryError("Table query failed", error, response);
+      validateGraphQueryResponses(data, [request]);
       return data;
     } else {
       const { data, error, response } = await this.client.POST("/db/v1/query", {
@@ -547,6 +549,7 @@ export class AntflyClient {
         ...(options?.signal ? { signal: options.signal } : {}),
       });
       if (error) throw queryError("Query failed", error, response);
+      validateGraphQueryResponses(data, [request]);
       return data;
     }
   }
@@ -571,6 +574,7 @@ export class AntflyClient {
         },
       });
       if (error) throw queryError("Table multi-query failed", error, response);
+      validateGraphQueryResponses(data, requests);
       return data;
     } else {
       const { data, error, response } = await this.client.POST("/db/v1/query", {
@@ -580,6 +584,7 @@ export class AntflyClient {
         },
       });
       if (error) throw queryError("Multi-query failed", error, response);
+      validateGraphQueryResponses(data, requests);
       return data;
     }
   }

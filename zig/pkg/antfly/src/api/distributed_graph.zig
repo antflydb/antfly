@@ -2876,6 +2876,7 @@ fn clonePatternPathEdge(
         .edge_type = edge.edge_type,
         .weight = edge.weight,
         .metadata = edge.metadata,
+        .traversal_direction = edge.traversal_direction,
     });
 }
 
@@ -5588,6 +5589,7 @@ fn dupeGraphPathEdge(
         .edge_type = edge_type,
         .weight = edge.weight,
         .metadata = metadata,
+        .traversal_direction = edge.traversal_direction,
     };
 }
 
@@ -9601,6 +9603,7 @@ fn clonePathEdge(
         .edge_type = edge_type,
         .weight = edge.weight,
         .metadata = metadata,
+        .traversal_direction = edge.traversal_direction,
     };
 }
 

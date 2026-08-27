@@ -83,6 +83,7 @@ describe("GraphIndexExplorer", () => {
                     {
                       from: { key: "alice" },
                       to: { key: "bob" },
+                      direction: "out",
                       type: "cites",
                       weight: 0.8,
                     },
@@ -183,6 +184,7 @@ describe("GraphIndexExplorer", () => {
                 {
                   from: { key: "shared" },
                   to: { key: "shared", table: "entities" },
+                  direction: "out",
                   type: "mentions",
                   weight: 1,
                 },
@@ -224,6 +226,7 @@ describe("GraphIndexExplorer", () => {
                 {
                   from: { key: "alice" },
                   to: { key: "bob", table: "entities" },
+                  direction: "out",
                   type: "mentions",
                   weight: 1,
                   metadata: { target_table: "entities" },
@@ -231,6 +234,7 @@ describe("GraphIndexExplorer", () => {
                 {
                   from: { key: "bob", table: "entities" },
                   to: { key: "carol", table: "entities" },
+                  direction: "out",
                   type: "related",
                   weight: 1,
                 },

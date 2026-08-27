@@ -45,6 +45,41 @@ def test_pre_discriminator_graph_result_decodes_as_legacy() -> None:
     assert result.total == 12
 
 
+def test_canonical_query_decoder_rejects_legacy_or_missing_discriminator() -> None:
+    legacy_response = _query_response(
+        {"type": "neighbors", "total": 1},
+        operation="walk",
+    )
+    with pytest.raises(AntflyException, match="canonical graph results require a discriminator"):
+        decode_query_responses(
+            legacy_response,
+            graph_dialect="canonical",
+            expected_graph_operations=frozenset({"walk"}),
+        )
+
+    with pytest.raises(AntflyException, match="must contain exactly one response"):
+        decode_query_responses(
+            {"responses": []},
+            graph_dialect="canonical",
+            expected_graph_operations=frozenset({"walk"}),
+        )
+
+    with pytest.raises(AntflyException, match="operation names do not match the request"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "nodes",
+                    "nodes": [],
+                    "paths": [],
+                    "stats": {"returned_items": 0, "truncated": False},
+                },
+                operation="unexpected",
+            ),
+            graph_dialect="canonical",
+            expected_graph_operations=frozenset({"walk"}),
+        )
+
+
 def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> None:
     canonical = decode_query_responses(
         _query_response(
@@ -84,6 +119,7 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
                             {
                                 "from": {"key": "a"},
                                 "to": {"key": "b"},
+                                "direction": "out",
                                 "type": "edge",
                                 "weight": 0.5,
                             }
@@ -180,6 +216,7 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
                         {
                             "from": {"key": "a"},
                             "to": {"key": "wrong"},
+                            "direction": "out",
                             "type": "edge",
                             "weight": 0.5,
                         }
@@ -202,6 +239,7 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
                         {
                             "from": {"key": "a"},
                             "to": {"key": "b"},
+                            "direction": "out",
                             "type": "edge",
                             "weight": 0.5,
                         }
@@ -236,6 +274,7 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
                         {
                             "from": {"key": "a"},
                             "to": {"key": "b"},
+                            "direction": "out",
                             "type": "é" * 32_769,
                             "weight": 1,
                         }

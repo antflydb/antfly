@@ -118,8 +118,42 @@ pub const HAReplicationSlotResponse = struct {
     safe_read_lsn: i64,
     active: bool,
     reseed_required: bool,
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     current_lsn: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("timeline_id");
+        try jw.write(self.timeline_id);
+        try jw.objectField("restart_lsn");
+        try jw.write(self.restart_lsn);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        try jw.objectField("active");
+        try jw.write(self.active);
+        try jw.objectField("reseed_required");
+        try jw.write(self.reseed_required);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("current_lsn");
+        try jw.write(self.current_lsn);
+        try jw.endObject();
+    }
 };
 
 /// Stable standby replication slot name.
@@ -143,8 +177,42 @@ pub const HAStandbyStatusUpdateResponse = struct {
     safe_read_lsn: i64,
     active: bool,
     reseed_required: bool,
-    last_error: ?[]const u8 = null,
+    last_error: OpenApiOptionalNullable([]const u8) = .absent,
     current_lsn: i64,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("slot_name");
+        try jw.write(self.slot_name);
+        try jw.objectField("timeline_id");
+        try jw.write(self.timeline_id);
+        try jw.objectField("restart_lsn");
+        try jw.write(self.restart_lsn);
+        try jw.objectField("received_lsn");
+        try jw.write(self.received_lsn);
+        try jw.objectField("applied_lsn");
+        try jw.write(self.applied_lsn);
+        try jw.objectField("safe_read_lsn");
+        try jw.write(self.safe_read_lsn);
+        try jw.objectField("active");
+        try jw.write(self.active);
+        try jw.objectField("reseed_required");
+        try jw.write(self.reseed_required);
+        switch (self.last_error) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("last_error");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("last_error");
+                try jw.write(value);
+            },
+        }
+        try jw.objectField("current_lsn");
+        try jw.write(self.current_lsn);
+        try jw.endObject();
+    }
 };
 
 pub const HAStartReplicationRequest = struct {
@@ -169,3 +237,43 @@ pub const HAStartReplicationResponse = struct {
     encoded_bytes: i64,
     records: []const HAReplicationFrame,
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}

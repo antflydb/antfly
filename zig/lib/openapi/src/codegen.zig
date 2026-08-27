@@ -341,8 +341,12 @@ test "generate 3.1 types with nullable and ref siblings" {
     try std.testing.expect(std.mem.indexOf(u8, out, "@\"error\": []const u8,") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "message: []const u8,") != null);
 
-    // Optional (not required) + nullable type array: `?T = null`
-    try std.testing.expect(std.mem.indexOf(u8, out, "tag: ?[]const u8 = null,") != null);
+    // Optional + nullable preserves absent, explicit null, and a concrete value.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "tag: OpenApiOptionalNullable([]const u8) = .absent,",
+    ) != null);
 
     // Required + nullable (3.1 type array): `?T` with no default
     try std.testing.expect(std.mem.indexOf(u8, out, "details: ?std.json.Value,") != null);

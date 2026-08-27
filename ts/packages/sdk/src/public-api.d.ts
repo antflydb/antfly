@@ -12488,10 +12488,16 @@ export interface components {
             };
             stats: components["schemas"]["GraphQueryStats"];
         };
+        /**
+         * @description Physical stored-edge orientation relative to this path edge's `from` endpoint. `out` means the stored relationship points from `from` to `to`; `in` means the path traversed a relationship stored from `to` to `from`. This keeps paths lossless when a `both` query encounters reciprocal relationships.
+         * @enum {string}
+         */
+        GraphPathEdgeDirection: "out" | "in";
         /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
         GraphPathEdge: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
+            direction: components["schemas"]["GraphPathEdgeDirection"];
             type: components["schemas"]["GraphEdgeType"];
             /**
              * Format: double
