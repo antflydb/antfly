@@ -88,6 +88,15 @@ pub const RepairCancelStateResponse = struct {
     cancel_requested: bool = false,
 };
 
+/// Semantic result of a pre-decision transaction request. Keeping routing
+/// misses in the success channel prevents arbitrary RequestExecutor errors
+/// from masquerading as server proof that a mutation was not proposed.
+pub const TxnPreDecisionOutcome = enum {
+    applied,
+    route_miss,
+    not_proposed,
+};
+
 pub const QueryResponse = struct {
     content_type: ?[]u8 = null,
     identity_read_generation: ?u64 = null,
@@ -2357,6 +2366,29 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         delivery_tracker: ?*http_common.RequestDeliveryTracker,
     ) !EmptyResponse {
+        return switch (try self.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            delivery_tracker,
+            null,
+        )) {
+            .applied => .{},
+            .route_miss => error.UnknownGroup,
+            .not_proposed => error.GroupLeaderUnavailable,
+        };
+    }
+
+    pub fn fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+        timeout_ms: ?u32,
+    ) !TxnPreDecisionOutcome {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2374,14 +2406,15 @@ pub const ApiHttpClient = struct {
             .content_type = "application/json",
             .body = body,
             .delivery_tracker = delivery_tracker,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => return .{},
-            404 => return error.UnknownGroup,
+            200 => return .applied,
+            404 => return .route_miss,
             409 => return remoteGroupConflictError(resp.body),
             503 => if (isTxnPreDecisionNotProposedResponse(resp))
-                return error.GroupLeaderUnavailable
+                return .not_proposed
             else
                 return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
@@ -2412,6 +2445,29 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         delivery_tracker: ?*http_common.RequestDeliveryTracker,
     ) !EmptyResponse {
+        return switch (try self.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            delivery_tracker,
+            null,
+        )) {
+            .applied => .{},
+            .route_miss => error.UnknownGroup,
+            .not_proposed => error.GroupLeaderUnavailable,
+        };
+    }
+
+    pub fn fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+        timeout_ms: ?u32,
+    ) !TxnPreDecisionOutcome {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2429,14 +2485,15 @@ pub const ApiHttpClient = struct {
             .content_type = "application/json",
             .body = body,
             .delivery_tracker = delivery_tracker,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
         switch (resp.status) {
-            200 => return .{},
-            404 => return error.UnknownGroup,
+            200 => return .applied,
+            404 => return .route_miss,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
             503 => if (isTxnPreDecisionNotProposedResponse(resp))
-                return error.GroupLeaderUnavailable
+                return .not_proposed
             else
                 return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
