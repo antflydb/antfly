@@ -639,6 +639,20 @@ pub const Host = struct {
         return round;
     }
 
+    pub fn runProgressRoundBounded(
+        self: *Host,
+        max_inbound_messages: usize,
+        max_ready_steps: usize,
+    ) !raft_engine.runtime.multi_raft.HostRound {
+        const inbound_start_ns = platform_time.monotonicNs();
+        _ = try self.drainInboundMessages(max_inbound_messages);
+        const inbound_elapsed_ns = platform_time.monotonicNs() -| inbound_start_ns;
+        var round = try self.runtime_host.runProgressRound(max_ready_steps);
+        round.inbound_drain_elapsed_ns = inbound_elapsed_ns;
+        round.elapsed_ns += inbound_elapsed_ns;
+        return round;
+    }
+
     pub fn step(self: *Host, group_id: u64, msg: raft_engine.core.Message) !void {
         try self.runtime_host.step(group_id, msg);
     }
@@ -739,6 +753,22 @@ pub const Host = struct {
         try self.runtime_host.proposeWithReceipt(group_id, data, accepted_index);
     }
 
+    pub fn prepareProposalReceiptTracking(self: *Host, group_id: u64) !void {
+        try self.runtime_host.prepareProposalReceiptTracking(group_id);
+    }
+
+    pub fn trackProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) !void {
+        try self.runtime_host.trackProposalReceipt(group_id, term, index);
+    }
+
+    pub fn acquireProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) bool {
+        return self.runtime_host.acquireProposalReceipt(group_id, term, index);
+    }
+
+    pub fn releaseProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) void {
+        self.runtime_host.releaseProposalReceipt(group_id, term, index);
+    }
+
     pub fn transferLeader(self: *Host, group_id: u64, transferee: u64) !void {
         try self.runtime_host.transferLeader(group_id, transferee);
     }
@@ -787,6 +817,18 @@ pub const Host = struct {
     pub fn raftStatus(self: *Host, group_id: u64) ?raft_engine.core.Status {
         const grp = self.runtime_host.group(group_id) orelse return null;
         return grp.status();
+    }
+
+    /// Returns the Raft term stored at an exact log position. Callers use this
+    /// together with the applied watermark to distinguish their accepted entry
+    /// from a higher-term replacement at the same index.
+    pub fn raftTermAt(self: *Host, group_id: u64, index: u64) !u64 {
+        const grp = self.runtime_host.group(group_id) orelse return error.UnknownGroup;
+        return try grp.termAt(index);
+    }
+
+    pub fn raftTermAtTrackedProposalReceipt(self: *Host, group_id: u64, term: u64, index: u64) !u64 {
+        return try self.runtime_host.termAtTrackedProposalReceipt(group_id, term, index);
     }
 
     pub fn leaderId(self: *Host, group_id: u64) ?u64 {
@@ -1108,6 +1150,14 @@ pub const HttpHost = struct {
         return try self.host.runRoundBounded(max_inbound_messages, max_tick_groups, max_ready_steps);
     }
 
+    pub fn runProgressRoundBounded(
+        self: *HttpHost,
+        max_inbound_messages: usize,
+        max_ready_steps: usize,
+    ) !raft_engine.runtime.multi_raft.HostRound {
+        return try self.host.runProgressRoundBounded(max_inbound_messages, max_ready_steps);
+    }
+
     pub fn campaignGroup(self: *HttpHost, group_id: u64) !void {
         try self.host.campaignGroup(group_id);
     }
@@ -1142,6 +1192,10 @@ pub const HttpHost = struct {
 
     pub fn raftStatus(self: *HttpHost, group_id: u64) ?raft_engine.core.Status {
         return self.host.raftStatus(group_id);
+    }
+
+    pub fn raftTermAt(self: *HttpHost, group_id: u64, index: u64) !u64 {
+        return try self.host.raftTermAt(group_id, index);
     }
 
     pub fn leaderId(self: *HttpHost, group_id: u64) ?u64 {
