@@ -274,6 +274,7 @@ pub const IndexRuntimeCapabilities = types.IndexRuntimeCapabilities;
 pub const IndexStats = types.IndexStats;
 pub const IndexStatus = types.IndexStatus;
 pub const IndexType = types.IndexType;
+pub const InferenceA4bResidencyMode = types.InferenceA4bResidencyMode;
 pub const InferenceAdmissionConfig = types.InferenceAdmissionConfig;
 pub const InferenceAudioChunkConfig = types.InferenceAudioChunkConfig;
 pub const InferenceBackendPriorityEntry = types.InferenceBackendPriorityEntry;

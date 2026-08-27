@@ -5183,6 +5183,35 @@ pub const IndexType = enum {
     }
 };
 
+/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+pub const InferenceA4bResidencyMode = enum {
+    auto,
+    streamed,
+    resident,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .streamed => "streamed",
+            .resident => "resident",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "streamed", .streamed },
+            .{ "resident", .resident },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// Process-local foreground request admission settings.
 pub const InferenceAdmissionConfig = struct {
     inference: ?InferenceRequestAdmissionConfig = null,
@@ -5710,6 +5739,8 @@ pub const InferenceGenerateDelta = struct {
     role: ?InferenceRole = null,
     /// Token content delta
     content: ?[]const u8 = null,
+    /// Reasoning content delta, separate from public content
+    reasoning_content: ?[]const u8 = null,
     /// Tool call deltas for streaming tool calls
     tool_calls: ?[]const InferenceToolCallDelta = null,
 };
@@ -5727,6 +5758,8 @@ pub const InferenceGenerateMessage = struct {
     role: InferenceRole,
     /// The generated message content (null when tool_calls is present)
     content: ?[]const u8 = null,
+    /// Model reasoning emitted on a private reasoning channel, separate from public content
+    reasoning_content: ?[]const u8 = null,
     /// Tool calls made by the model (only present when finish_reason is tool_calls)
     tool_calls: ?[]const ToolCall = null,
 };
@@ -6043,6 +6076,10 @@ pub const InferenceModelRef = struct {
     backend: ?InferenceModelBackend = null,
     format: ?InferenceModelFormat = null,
     quantization: ?InferenceModelQuantization = null,
+    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+    residency_mode: ?InferenceA4bResidencyMode = null,
+    /// Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
+    memory_budget_mb: ?i64 = null,
 };
 
 pub const InferenceModelsResponse = struct {

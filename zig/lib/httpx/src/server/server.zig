@@ -2027,7 +2027,11 @@ pub const Server = struct {
             };
             const application = request_future.await(self.requestIo()) catch |err| {
                 const status = self.routeErrorResponseStatus(err) orelse return;
-                std.debug.print("HTTP/1 application handler error: {}\n", .{err});
+                // The Zig test runner reserves the test artifact's stderr for
+                // its listen protocol. An expected handler failure exercised
+                // by a transport test must not corrupt that protocol and turn
+                // a passing test into a failed build step.
+                if (!builtin.is_test) std.debug.print("HTTP/1 application handler error: {}\n", .{err});
                 // Once streaming headers are committed, another HTTP
                 // response would corrupt the connection. Closing the
                 // connection is the only valid terminal action.
