@@ -8158,6 +8158,28 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
             } else |_| {}
         }
 
+        if (request.out_dim >= lm_head_q4_repack_min_out_dim) repack: {
+            const target = lmHeadQ4RepackFormat() orelse break :repack;
+            if (try makeRuntimeQ4StorageFromQ6K(storage, request.in_dim, request.out_dim, target)) |q4k_storage| {
+                errdefer {
+                    q4k_storage.deinit();
+                    std.heap.c_allocator.destroy(q4k_storage);
+                }
+                std.log.info(
+                    "lm_head {s} repack: slot={d} rows={d} cols={d} bytes {d} -> {d}",
+                    .{ @tagName(target), request.slot, request.out_dim, request.in_dim, storage.raw_bytes.len, q4k_storage.raw_bytes.len },
+                );
+                stats.decoder_runtime_prepare_linear_calls += 1;
+                self.raw_linear_slot_quantized_storage[request.slot] = q4k_storage;
+                setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
+                self.raw_linear_slot_kinds[request.slot] = .quantized;
+                self.raw_linear_slots_prepared[request.slot] = true;
+                self.raw_linear_slot_in_dims[request.slot] = request.in_dim;
+                self.raw_linear_slot_out_dims[request.slot] = request.out_dim;
+                return true;
+            }
+        }
+
         stats.decoder_runtime_prepare_linear_calls += 1;
         self.raw_linear_slot_quantized_storage[request.slot] = try dupQuantizedStorage(storage);
         setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
@@ -8325,20 +8347,29 @@ fn makeRuntimeQ8StorageFromQuantized(storage: *const QuantizedStorage, dense_val
 }
 
 fn makeRuntimeQ8StorageFromOwnedBytes(q8_bytes: []u8, shape: []i64) !*QuantizedStorage {
-    var q8_owned: ?[]u8 = q8_bytes;
-    errdefer if (q8_owned) |bytes| std.heap.c_allocator.free(bytes);
+    return makeRuntimeRepackedStorageFromOwnedBytes(q8_bytes, shape, .Q8_0, "termite-q8-runtime");
+}
+
+fn makeRuntimeRepackedStorageFromOwnedBytes(
+    repacked_bytes: []u8,
+    shape: []i64,
+    tensor_type: gguf_tensor_types.KnownTensorType,
+    mmap_tag: [:0]const u8,
+) !*QuantizedStorage {
+    var bytes_owned: ?[]u8 = repacked_bytes;
+    errdefer if (bytes_owned) |bytes| std.heap.c_allocator.free(bytes);
     var shape_owned: ?[]i64 = shape;
     errdefer if (shape_owned) |owned_shape| std.heap.c_allocator.free(owned_shape);
 
     const owned = try std.heap.c_allocator.create(QuantizedStorage);
     errdefer std.heap.c_allocator.destroy(owned);
 
-    if (q8_bytes.len >= runtimeQ8StagingMmapMinBytes()) {
-        if (c_file.mmapTempCopy(std.heap.c_allocator, "termite-q8-runtime", q8_bytes)) |region| {
-            std.heap.c_allocator.free(q8_bytes);
-            q8_owned = null;
+    if (repacked_bytes.len >= runtimeQ8StagingMmapMinBytes()) {
+        if (c_file.mmapTempCopy(std.heap.c_allocator, mmap_tag, repacked_bytes)) |region| {
+            std.heap.c_allocator.free(repacked_bytes);
+            bytes_owned = null;
             owned.* = .{
-                .tensor_type = .{ .known = .Q8_0 },
+                .tensor_type = .{ .known = tensor_type },
                 .raw_bytes = region.data,
                 .shape = shape,
                 .raw_owned = false,
@@ -8352,16 +8383,90 @@ fn makeRuntimeQ8StorageFromOwnedBytes(q8_bytes: []u8, shape: []i64) !*QuantizedS
     }
 
     owned.* = .{
-        .tensor_type = .{ .known = .Q8_0 },
-        .raw_bytes = q8_bytes,
+        .tensor_type = .{ .known = tensor_type },
+        .raw_bytes = repacked_bytes,
         .shape = shape,
         .raw_owned = true,
         .raw_mmap_backed = false,
         .allocator = std.heap.c_allocator,
     };
-    q8_owned = null;
+    bytes_owned = null;
     shape_owned = null;
     return owned;
+}
+
+/// Opt-in vocab-tail byte reduction: requantize a Q6_K lm_head slot to Q4_K
+/// at prepare time (6.5625 -> 4.5 bits/weight, ~-172 MB per decoded token on
+/// the Gemma4 E4B head). Head-only precision change; stays opt-in until the
+/// quality eval suite qualifies a default.
+fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {
+    if (comptime @import("builtin").os.tag == .freestanding) return null;
+    const c_std = @cImport(@cInclude("stdlib.h"));
+    const value = c_std.getenv("TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK") orelse return null;
+    const raw = std.mem.span(value);
+    if (raw.len == 0 or std.mem.eql(u8, raw, "0") or
+        std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off")) return null;
+    if (std.ascii.eqlIgnoreCase(raw, "q4_0")) return .Q4_0;
+    // "1"/"true"/"q4_k" and anything else default to Q4_K.
+    return .Q4_K;
+}
+
+/// Only vocab-sized tails qualify; ordinary projections keep their checkpoint
+/// format.
+const lm_head_q4_repack_min_out_dim: usize = 32768;
+
+/// Streaming Q6_K -> Q4-class repack: per-row dequant + requant keeps the
+/// transient footprint at one f32 row (a whole-tensor image of the E4B head
+/// would be ~2.7 GB). target must be Q4_K or Q4_0.
+fn makeRuntimeQ4StorageFromQ6K(
+    storage: *const QuantizedStorage,
+    in_dim: usize,
+    out_dim: usize,
+    target: gguf_tensor_types.KnownTensorType,
+) !?*QuantizedStorage {
+    if (storage.packed_expert != null) return null;
+    if (target != .Q4_K and target != .Q4_0) return null;
+    switch (storage.tensor_type) {
+        .known => |known| if (known != .Q6_K) return null,
+        else => return null,
+    }
+    const target_values_per_block = gguf_tensor_types.valuesPerBlock(.{ .known = target }) orelse return null;
+    const target_block_bytes = gguf_tensor_types.bytesPerBlock(.{ .known = target }) orelse return null;
+    const q6k_values_per_block = gguf_tensor_types.valuesPerBlock(.{ .known = .Q6_K }) orelse return null;
+    const q6k_block_bytes = gguf_tensor_types.bytesPerBlock(.{ .known = .Q6_K }) orelse return null;
+    if (in_dim == 0 or out_dim == 0 or
+        in_dim % target_values_per_block != 0 or in_dim % q6k_values_per_block != 0) return null;
+    const source_row_bytes = (in_dim / q6k_values_per_block) * q6k_block_bytes;
+    const source_bytes = std.math.mul(usize, out_dim, source_row_bytes) catch return null;
+    if (storage.raw_bytes.len < source_bytes) return null;
+
+    const blocks_per_row = in_dim / target_values_per_block;
+    const repacked_row_bytes = blocks_per_row * target_block_bytes;
+    const repacked = try std.heap.c_allocator.alloc(u8, out_dim * repacked_row_bytes);
+    errdefer std.heap.c_allocator.free(repacked);
+    const row_values = try std.heap.c_allocator.alloc(f32, in_dim);
+    defer std.heap.c_allocator.free(row_values);
+
+    for (0..out_dim) |row| {
+        quant_codec.dequantizeRow(storage.tensor_type, storage.raw_bytes, in_dim, row, row_values) catch {
+            std.heap.c_allocator.free(repacked);
+            return null;
+        };
+        const row_out = repacked[row * repacked_row_bytes ..][0..repacked_row_bytes];
+        for (0..blocks_per_row) |block_idx| {
+            const block_in = row_values[block_idx * target_values_per_block ..][0..target_values_per_block];
+            const block_out = row_out[block_idx * target_block_bytes ..][0..target_block_bytes];
+            switch (target) {
+                .Q4_K => quant_codec.quantizeQ4_KBlock(block_in, block_out),
+                .Q4_0 => quant_codec.quantizeQ4_0Block(block_in, block_out),
+                else => unreachable,
+            }
+        }
+    }
+
+    const shape = try std.heap.c_allocator.dupe(i64, storage.shape);
+    errdefer std.heap.c_allocator.free(shape);
+    return try makeRuntimeRepackedStorageFromOwnedBytes(repacked, shape, target, "termite-q4-lm-head");
 }
 
 fn decodeRuntimeStorageToFloat32(storage: *const QuantizedStorage, output: []f32) !void {
@@ -10614,6 +10719,15 @@ pub extern fn termite_metal_device_available() c_int;
 pub extern fn termite_metal_copy_device_name(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_copy_compiler_identity(buffer: [*c]u8, capacity: usize) usize;
 pub extern fn termite_metal_device_info_get(info: *MetalDeviceInfo) c_int;
+pub extern fn termite_metal_pipelined_decode_frame_device_default() c_int;
+
+/// Device-qualified default for pipelined decode frames: true only where the
+/// fast prepared frame qualified (M4-family). Explicit enable/disable env
+/// flags still take precedence at the call sites.
+pub fn pipelinedDecodeFrameDeviceDefault() bool {
+    if (comptime @import("builtin").os.tag != .macos) return false;
+    return termite_metal_pipelined_decode_frame_device_default() != 0;
+}
 pub extern fn termite_metal_generated_pipeline_create(
     source: [*]const u8,
     source_len: usize,

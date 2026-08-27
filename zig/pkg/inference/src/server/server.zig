@@ -283,6 +283,35 @@ fn effectiveDraftModelName(requested: ?[]const u8, policy: generation.Speculatio
     return if (shouldResolveDraftModel(policy)) requested else null;
 }
 
+/// Opt-in: when a request carries no draft_model and the speculation policy is
+/// auto, discover the Gemma4 MTP assistant artifact sitting next to the target
+/// model dir. Kept fail-closed until Metal auto-MTP qualifies as a default.
+fn gemma4MtpAutoDraftDiscoveryEnabled() bool {
+    return platform.env.getenvBoolDefault("ANTFLY_GEMMA4_MTP_AUTO_DRAFT_DISCOVERY", false);
+}
+
+/// Sibling MTP assistant dir for a Gemma4 QAT gguf artifact
+/// (`...-q4_0-gguf` -> `...-q4_0-unquantized-assistant`), or null when the
+/// model dir has no such sibling on disk. Caller owns the returned path.
+fn gemma4MtpAssistantSiblingPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_path: []const u8,
+) ?[]const u8 {
+    const suffix = "-gguf";
+    if (!std.mem.endsWith(u8, model_path, suffix)) return null;
+    const sibling = std.fmt.allocPrint(
+        allocator,
+        "{s}-unquantized-assistant",
+        .{model_path[0 .. model_path.len - suffix.len]},
+    ) catch return null;
+    _ = std.Io.Dir.cwd().statFile(io, sibling, .{}) catch {
+        allocator.free(sibling);
+        return null;
+    };
+    return sibling;
+}
+
 fn validateQualifiedProfileDraft(
     qualified_profile_requested: bool,
     effective_draft_model: ?[]const u8,
@@ -5126,6 +5155,21 @@ pub const Node = struct {
         return coordinator.acquire(admission);
     }
 
+    /// Rendered prompt and tokenization retained from an admission estimate so
+    /// the generation pipeline can skip re-rendering and re-encoding. Owns its
+    /// memory; must stay alive until generation for the request completes.
+    const NativePromptEstimate = struct {
+        allocator: std.mem.Allocator,
+        prompt: []const u8,
+        encoded: @import("inference_tokenizer").EncodeResult,
+        prompt_token_limit: usize,
+
+        fn deinit(self: *NativePromptEstimate) void {
+            self.allocator.free(self.prompt);
+            self.encoded.deinit();
+        }
+    };
+
     fn estimateNativePromptTokens(
         self: *Node,
         allocator: std.mem.Allocator,
@@ -5136,13 +5180,15 @@ pub const Node = struct {
         max_tokens: i32,
         speculative_bonus_tokens: usize,
         enable_thinking: ?bool,
+        out_estimate: ?*?NativePromptEstimate,
     ) !usize {
         _ = self;
         const prompt = if (model.chat_tmpl) |ct|
             try ct.applyWithOptions(allocator, messages, .{ .enable_thinking = enable_thinking })
         else
             try generation.formatMessages(allocator, messages);
-        defer allocator.free(prompt);
+        var prompt_owned = true;
+        defer if (prompt_owned) allocator.free(prompt);
         const media_allowance = try generation.nativeGenerationAdmissionMediaTokenAllowance(
             allocator,
             model_dir,
@@ -5165,10 +5211,22 @@ pub const Node = struct {
             model.manifest.add_bos_token,
             model.manifest.bos_token,
         );
-        defer encoded.deinit();
+        var encoded_owned = true;
+        defer if (encoded_owned) encoded.deinit();
         var count: usize = 0;
         while (count < encoded.attention_mask.len and encoded.attention_mask[count] != 0) : (count += 1) {}
-        return std.math.add(usize, count, media_allowance) catch error.PromptTooLong;
+        const total = std.math.add(usize, count, media_allowance) catch return error.PromptTooLong;
+        if (out_estimate) |out| {
+            out.* = .{
+                .allocator = allocator,
+                .prompt = prompt,
+                .encoded = encoded,
+                .prompt_token_limit = prompt_token_limit,
+            };
+            prompt_owned = false;
+            encoded_owned = false;
+        }
+        return total;
     }
 
     pub fn generateEmbeddings(self: *Node, ctx: *httpx.Context) !httpx.Response {
@@ -5735,14 +5793,29 @@ pub const Node = struct {
     pub fn generateContent(self: *Node, ctx: *httpx.Context) !httpx.Response {
         const raw_body = (try ctx.body()) orelse
             return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
-        if (!rawGenerateChatTemplateKwargsAreValid(ctx.allocator, raw_body, false)) {
-            return ctx.status(400).json(.{
-                .@"error" = "INVALID_REQUEST",
-                .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
-            });
+        // Single JSON parse per request: only bodies that can carry
+        // chat_template_kwargs (substring pre-gate, false positives harmless)
+        // are parsed as an untyped Value, which then doubles as the kwargs
+        // validator input and the typed-parse source. Malformed bodies fall
+        // back to the raw typed parse so their errors stay identical.
+        var parsed_body_value: ?std.json.Parsed(std.json.Value) = null;
+        defer if (parsed_body_value) |*owned| owned.deinit();
+        if (std.mem.indexOf(u8, raw_body, "chat_template_kwargs") != null) {
+            parsed_body_value = std.json.parseFromSlice(std.json.Value, ctx.allocator, raw_body, .{}) catch null;
         }
-        var parsed = (try ctx.parseJson(api.GenerateRequest)) orelse
-            return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
+        if (parsed_body_value) |owned| {
+            if (!generateRequestChatTemplateKwargsAreValid(owned.value)) {
+                return ctx.status(400).json(.{
+                    .@"error" = "INVALID_REQUEST",
+                    .message = "chat_template_kwargs accepts only a boolean enable_thinking field",
+                });
+            }
+        }
+        var parsed = if (parsed_body_value) |owned|
+            try std.json.parseFromValue(api.GenerateRequest, ctx.allocator, owned.value, .{ .ignore_unknown_fields = true })
+        else
+            (try ctx.parseJson(api.GenerateRequest)) orelse
+                return ctx.status(400).json(.{ .@"error" = "missing_body", .message = "Request body required" });
         defer parsed.deinit();
         const body = parsed.value;
         if (body.prompt_cache_key) |key| {
@@ -6386,6 +6459,10 @@ pub const Node = struct {
             kv_dtype,
         );
         const prompt_bytes = self.estimateGeneratePromptBytes(messages.items);
+        // Kept alive for the whole request so the pipeline can reuse the
+        // estimate's rendered prompt and token ids instead of redoing both.
+        var prompt_estimate: ?NativePromptEstimate = null;
+        defer if (prompt_estimate) |*estimate| estimate.deinit();
         const prompt_tokens = self.estimateNativePromptTokens(
             ctx.allocator,
             model_path,
@@ -6395,6 +6472,7 @@ pub const Node = struct {
             configured_max_tokens,
             if (config.speculation_requested and config.speculation_policy != .off and config.speculative_k > 0) 1 else 0,
             config.enable_thinking,
+            &prompt_estimate,
         ) catch |err| {
             if (err == error.PromptTooLong) {
                 return ctx.status(400).json(.{
@@ -6448,6 +6526,7 @@ pub const Node = struct {
                 return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
         }
 
+        var resolved_draft_model_path: ?[]const u8 = null;
         if (effective_draft_model_name) |draft_model_name| {
             if (shouldResolveDraftModel(config.speculation_policy)) {
                 const draft_model_path = self.resolveRequestModelPath(ctx.allocator, ctx.io, draft_model_name, "generators") catch |err|
@@ -6459,6 +6538,19 @@ pub const Node = struct {
                         .message = "draft_model must resolve to a model different from model",
                     });
                 }
+                resolved_draft_model_path = draft_model_path;
+            }
+        } else if (config.speculation_policy == .auto and gemma4MtpAutoDraftDiscoveryEnabled()) {
+            if (gemma4MtpAssistantSiblingPath(ctx.allocator, ctx.io, model_path)) |sibling| {
+                draft_model_path_storage = sibling;
+                resolved_draft_model_path = sibling;
+                // Scheduler batching and route exclusions must treat the
+                // discovered drafter exactly like a client-requested one.
+                config.speculation_requested = true;
+            }
+        }
+        if (resolved_draft_model_path) |draft_model_path| {
+            {
                 config.draft_model = draft_model_path;
                 var load_draft_backend = true;
                 if (config.speculation_policy == .auto) {
@@ -6899,6 +6991,16 @@ pub const Node = struct {
             .add_bos_token = model.manifest.add_bos_token,
             .bos_token = model.manifest.bos_token,
             .chat_template = model.chat_tmpl,
+            // The admission estimate rendered and encoded with the same
+            // template, messages, and enable_thinking (after the final
+            // tool-prompt prepend), so the pipeline may reuse both. The
+            // pipeline revalidates the encode's token limit itself.
+            .preformatted_prompt = if (prompt_estimate) |estimate| estimate.prompt else null,
+            .pre_encoded_prompt = if (prompt_estimate) |estimate| .{
+                .ids = estimate.encoded.ids,
+                .attention_mask = estimate.encoded.attention_mask,
+                .prompt_token_limit = estimate.prompt_token_limit,
+            } else null,
             .print_timing = request_generate_timing,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
@@ -7772,6 +7874,7 @@ pub const Node = struct {
                         configs[pos].max_tokens,
                         if (configs[pos].speculation_requested and configs[pos].speculation_policy != .off and configs[pos].speculative_k > 0) 1 else 0,
                         configs[pos].enable_thinking,
+                        null,
                     ) catch |err| {
                         results[idx].@"error" = if (err == error.PromptTooLong)
                             .{
@@ -8315,15 +8418,17 @@ pub const Node = struct {
         const stream_id = try allocCompletionId(ctx.allocator);
         defer ctx.allocator.free(stream_id);
         const stream_created = completionCreatedTimestamp();
+        var chunk_payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer chunk_payload.deinit();
 
-        emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
+        emitRoleDelta(&writer, &chunk_payload, stream_id, stream_created, model_name) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
         };
 
         writeStreamCompletion(
-            ctx.allocator,
+            &chunk_payload,
             &writer,
             stream_id,
             stream_created,
@@ -8339,7 +8444,7 @@ pub const Node = struct {
         };
         emitTerminalUsageOrDone(
             &writer,
-            ctx.allocator,
+            &chunk_payload,
             stream_id,
             stream_created,
             model_name,
@@ -8605,7 +8710,7 @@ pub const Node = struct {
             stream_id: []const u8,
             stream_created: i64,
             model_name: []const u8,
-            allocator: std.mem.Allocator,
+            payload: *std.Io.Writer.Allocating,
             parser: ?*tool_parser_mod.Parser,
             request_context: *const httpx.Context,
             errored: bool = false,
@@ -8623,21 +8728,21 @@ pub const Node = struct {
                         return false;
                     };
                     if (update.ready_text.len > 0) {
-                        emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch {
+                        emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.ready_text) catch {
                             stream.errored = true;
                             return false;
                         };
                     }
                     if (!parser.streamsIncrementalToolDeltas() and update.new_calls.len > 0) {
                         for (update.new_calls, 0..) |call, idx| {
-                            emitToolCallDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch {
+                            emitToolCallDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, update.call_start_index + idx, call) catch {
                                 stream.errored = true;
                                 return false;
                             };
                         }
                     }
                     if (update.active_tool_delta) |delta| {
-                        emitToolCallDeltaUpdate(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, delta) catch {
+                        emitToolCallDeltaUpdate(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, delta) catch {
                             stream.errored = true;
                             return false;
                         };
@@ -8645,7 +8750,7 @@ pub const Node = struct {
                     return true;
                 }
                 // Build OpenAI-compatible SSE chunk
-                emitContentDelta(stream.writer, stream.allocator, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch {
+                emitContentDelta(stream.writer, stream.payload, stream.stream_id, stream.stream_created, stream.model_name, token_text) catch {
                     stream.errored = true;
                     return false;
                 };
@@ -8653,12 +8758,14 @@ pub const Node = struct {
             }
         };
 
+        var chunk_payload: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer chunk_payload.deinit();
         var stream_ctx = StreamCtx{
             .writer = &writer,
             .stream_id = stream_id,
             .stream_created = stream_created,
             .model_name = model_name,
-            .allocator = ctx.allocator,
+            .payload = &chunk_payload,
             .parser = tool_parser,
             .request_context = ctx,
         };
@@ -8670,7 +8777,7 @@ pub const Node = struct {
             pipeline.continue_fn = StreamCtx.shouldContinue;
         }
 
-        emitRoleDelta(&writer, ctx.allocator, stream_id, stream_created, model_name) catch |err| {
+        emitRoleDelta(&writer, &chunk_payload, stream_id, stream_created, model_name) catch |err| {
             writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
             writer.close() catch {};
             return ctx.response.build();
@@ -8739,13 +8846,13 @@ pub const Node = struct {
         recordSpeculationOutcome(&self.metrics, speculative);
 
         if (tool_parser != null) {
-            flushStreamParserState(ctx.allocator, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
+            flushStreamParserState(&chunk_payload, &writer, stream_id, stream_created, model_name, result.finish_reason, tool_parser.?, speculative) catch |err| {
                 writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
             };
         } else {
-            emitFinishDelta(&writer, ctx.allocator, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
+            emitFinishDelta(&writer, &chunk_payload, stream_id, stream_created, model_name, result.finish_reason, speculative) catch |err| {
                 writeInternalStreamError(&writer, "STREAM_WRITE_FAILED", err);
                 writer.close() catch {};
                 return ctx.response.build();
@@ -8754,7 +8861,7 @@ pub const Node = struct {
 
         emitTerminalUsageOrDone(
             &writer,
-            ctx.allocator,
+            &chunk_payload,
             stream_id,
             stream_created,
             model_name,
@@ -8773,7 +8880,7 @@ pub const Node = struct {
     }
 
     fn writeStreamCompletion(
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         writer: *httpx.Context.StreamWriter,
         stream_id: []const u8,
         stream_created: i64,
@@ -8786,32 +8893,32 @@ pub const Node = struct {
         if (tool_parser) |parser| {
             parser.reset();
             _ = try parser.feed(full_text);
-            const remaining = try parser.finishText(allocator);
-            defer allocator.free(remaining);
+            const remaining = try parser.finishText(payload.allocator);
+            defer payload.allocator.free(remaining);
             const calls = parser.toolCalls();
-            if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
+            if (remaining.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, remaining);
             if (calls.len > 0) {
-                for (calls, 0..) |call, idx| try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
+                for (calls, 0..) |call, idx| try emitToolCallDeltaUpdate(writer, payload, stream_id, stream_created, model_name, .{
                     .index = idx,
                     .id = call.id,
                     .type = call.type,
                     .name = call.function.name,
                     .arguments = call.function.arguments,
                 });
-                try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, "tool_calls", speculative);
+                try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, "tool_calls", speculative);
                 return;
             }
-            if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-            try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+            if (remaining.len == 0 and full_text.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, full_text);
+            try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, default_finish_reason, speculative);
             return;
         }
 
-        if (full_text.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, full_text);
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, default_finish_reason, speculative);
+        if (full_text.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, full_text);
+        try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, default_finish_reason, speculative);
     }
 
     fn flushStreamParserState(
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         writer: *httpx.Context.StreamWriter,
         stream_id: []const u8,
         stream_created: i64,
@@ -8820,11 +8927,11 @@ pub const Node = struct {
         parser: *tool_parser_mod.Parser,
         speculative: ?generation.SpeculativeDecodeStats,
     ) !void {
-        const remaining = try parser.finishRemainingText(allocator);
-        defer allocator.free(remaining);
-        if (remaining.len > 0) try emitContentDelta(writer, allocator, stream_id, stream_created, model_name, remaining);
+        const remaining = try parser.finishRemainingText(payload.allocator);
+        defer payload.allocator.free(remaining);
+        if (remaining.len > 0) try emitContentDelta(writer, payload, stream_id, stream_created, model_name, remaining);
         const finish_reason = if (parser.toolCalls().len > 0) "tool_calls" else default_finish_reason;
-        try emitFinishDelta(writer, allocator, stream_id, stream_created, model_name, finish_reason, speculative);
+        try emitFinishDelta(writer, payload, stream_id, stream_created, model_name, finish_reason, speculative);
     }
 
     fn parseFinishReason(s: []const u8) api.FinishReason {
@@ -8840,17 +8947,19 @@ pub const Node = struct {
 
     fn writeGenerateChunkEvent(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         chunk: api.GenerateChunk,
     ) !void {
-        const payload = try std.json.Stringify.valueAlloc(allocator, chunk, .{});
-        defer allocator.free(payload);
-        try writer.writeEvent(null, payload);
+        // Stream-owned buffer, reset per event: streaming emits one chunk per
+        // token and per-token alloc/free churn is measurable overhead.
+        payload.clearRetainingCapacity();
+        std.json.Stringify.value(chunk, .{}, &payload.writer) catch return error.OutOfMemory;
+        try writer.writeEvent(null, payload.written());
     }
 
     fn emitRoleDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8859,7 +8968,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .role = .assistant },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8870,7 +8979,7 @@ pub const Node = struct {
 
     fn emitContentDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8880,7 +8989,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .content = token_text },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8891,7 +9000,7 @@ pub const Node = struct {
 
     fn emitToolCallDeltaUpdate(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8911,7 +9020,7 @@ pub const Node = struct {
             .index = 0,
             .delta = .{ .tool_calls = &tool_calls },
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8922,14 +9031,14 @@ pub const Node = struct {
 
     fn emitToolCallDelta(
         writer: *httpx.Context.StreamWriter,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
         index: usize,
         call: tool_parser_mod.ToolCall,
     ) !void {
-        try emitToolCallDeltaUpdate(writer, allocator, stream_id, stream_created, model_name, .{
+        try emitToolCallDeltaUpdate(writer, payload, stream_id, stream_created, model_name, .{
             .index = index,
             .id = call.id,
             .type = call.type,
@@ -8940,7 +9049,7 @@ pub const Node = struct {
 
     fn emitFinishDelta(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8952,7 +9061,7 @@ pub const Node = struct {
             .delta = .{},
             .finish_reason = parseFinishReason(finish_reason),
         }};
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8964,7 +9073,7 @@ pub const Node = struct {
 
     fn emitTerminalUsageAndDone(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8972,7 +9081,7 @@ pub const Node = struct {
         completion_tokens: usize,
         cached_prompt_tokens: usize,
     ) !void {
-        try writeGenerateChunkEvent(writer, allocator, .{
+        try writeGenerateChunkEvent(writer, payload, .{
             .id = stream_id,
             .object = "chat.completion.chunk",
             .created = stream_created,
@@ -8985,7 +9094,7 @@ pub const Node = struct {
 
     fn emitTerminalUsageOrDone(
         writer: anytype,
-        allocator: std.mem.Allocator,
+        payload: *std.Io.Writer.Allocating,
         stream_id: []const u8,
         stream_created: i64,
         model_name: []const u8,
@@ -8997,7 +9106,7 @@ pub const Node = struct {
         if (include_usage) {
             return emitTerminalUsageAndDone(
                 writer,
-                allocator,
+                payload,
                 stream_id,
                 stream_created,
                 model_name,
@@ -12795,8 +12904,10 @@ test "generation SSE orders finish then usage then done" {
 
     var capture = Capture{ .allocator = allocator };
     defer capture.deinit();
-    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
-    try Node.emitTerminalUsageAndDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try Node.emitFinishDelta(&capture, &payload, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageAndDone(&capture, &payload, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0);
 
     try std.testing.expectEqual(@as(usize, 3), capture.events.items.len);
     var finish = try std.json.parseFromSlice(api.GenerateChunk, allocator, capture.events.items[0], .{});
@@ -12833,8 +12944,10 @@ test "generation SSE omits usage unless requested" {
 
     var capture = Capture{ .allocator = allocator };
     defer capture.deinit();
-    try Node.emitFinishDelta(&capture, allocator, "chatcmpl-test", 42, "gemma-4", "length", null);
-    try Node.emitTerminalUsageOrDone(&capture, allocator, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
+    var payload: std.Io.Writer.Allocating = .init(allocator);
+    defer payload.deinit();
+    try Node.emitFinishDelta(&capture, &payload, "chatcmpl-test", 42, "gemma-4", "length", null);
+    try Node.emitTerminalUsageOrDone(&capture, &payload, "chatcmpl-test", 42, "gemma-4", 2003, 300, 0, false);
 
     try std.testing.expectEqual(@as(usize, 2), capture.events.items.len);
     try std.testing.expectEqualStrings("[DONE]", capture.events.items[1]);
@@ -12949,6 +13062,18 @@ test "generate chat template kwargs preserve default and parse explicit thinking
     ,
         false,
     ));
+
+    // The single-parse request path validates the untyped Value and then
+    // builds the typed request from that same Value instead of re-parsing
+    // the raw body.
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, allocator, disabled_json, .{});
+    defer parsed_value.deinit();
+    try std.testing.expect(generateRequestChatTemplateKwargsAreValid(parsed_value.value));
+    var from_value = try std.json.parseFromValue(api.GenerateRequest, allocator, parsed_value.value, .{ .ignore_unknown_fields = true });
+    defer from_value.deinit();
+    try std.testing.expectEqual(@as(?bool, false), from_value.value.chat_template_kwargs.?.enable_thinking);
+    try std.testing.expectEqualStrings("m", from_value.value.model);
+    try std.testing.expectEqual(@as(usize, 1), from_value.value.messages.len);
 }
 
 test "generate speculation status exposes disabled decisions" {

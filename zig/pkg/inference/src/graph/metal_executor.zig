@@ -1983,14 +1983,20 @@ fn envFlag(name: [:0]const u8) bool {
     return slice.len > 0 and !std.mem.eql(u8, slice, "0");
 }
 
-fn pipelinedDecodeFrameEnabledForFlags(enable_requested: bool, disable_requested: bool) bool {
-    return enable_requested and !disable_requested;
+fn pipelinedDecodeFrameEnabledForFlags(
+    enable_requested: bool,
+    disable_requested: bool,
+    device_default: bool,
+) bool {
+    if (disable_requested) return false;
+    return enable_requested or device_default;
 }
 
 fn pipelinedDecodeFrameEnabled() bool {
     return pipelinedDecodeFrameEnabledForFlags(
         platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
         platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
+        metal_runtime.pipelinedDecodeFrameDeviceDefault(),
     );
 }
 
@@ -2581,9 +2587,10 @@ test "metal executor only enables split KV policy for mixed local and global Gem
     try std.testing.expect(!config.supportsSplitSwaGlobalKvRing());
 }
 
-test "metal executor keeps speculative decode frames opt in" {
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false));
-    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false));
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true));
-    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true));
+test "metal executor pipelined decode frames follow flags with device default" {
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, false));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(false, false, true));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true, true));
 }
