@@ -954,6 +954,11 @@ components:
         - [sources, chunker]
         - [sources, embedding_name]
         - [sources, source_artifact_name]
+      # OpenAPI 3.0 has no dependentRequired keyword. Keep this machine-readable
+      # for Antfly validators without forcing generators to model the whole
+      # configuration as an opaque anyOf union.
+      x-antfly-dependent-required:
+        source_artifact_name: [embedding_name]
       properties:
         publication_policy:
           $ref: "#/components/schemas/IndexPublicationPolicy"
@@ -1001,11 +1006,13 @@ components:
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
+          minLength: 1
+          description: "Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: "Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source."
+          minLength: 1
+          description: "Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source."
         template:
           x-go-type-skip-optional-pointer: true
           type: string

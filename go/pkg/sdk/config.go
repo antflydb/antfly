@@ -180,13 +180,26 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	}
 	switch typed := config.(type) {
 	case IndexConfig:
+		if typed.Type == IndexTypeEmbeddings {
+			if err := validateSingleSourceEmbeddingRequest(data); err != nil {
+				return nil, err
+			}
+		}
 		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
 	case *IndexConfig:
 		if typed == nil {
 			return nil, fmt.Errorf("index config must not be nil")
 		}
+		if typed.Type == IndexTypeEmbeddings {
+			if err := validateSingleSourceEmbeddingRequest(data); err != nil {
+				return nil, err
+			}
+		}
 		return newCreateIndexRequestFromIndexConfig(data, typed.Type)
 	case EmbeddingsIndexConfig, CreateEmbeddingsIndexRequest:
+		if err := validateSingleSourceEmbeddingRequest(data); err != nil {
+			return nil, err
+		}
 		var variant oapi.CreateEmbeddingsIndexRequest
 		if err := json.Unmarshal(data, &variant); err != nil {
 			return nil, fmt.Errorf("build embeddings create index request: %w", err)
@@ -198,6 +211,9 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 	case *CreateEmbeddingsIndexRequest:
 		if typed == nil {
 			return nil, fmt.Errorf("embeddings create index request must not be nil")
+		}
+		if err := validateSingleSourceEmbeddingRequest(data); err != nil {
+			return nil, err
 		}
 		variant := *typed
 		variant.Type = oapi.CreateEmbeddingsIndexRequestTypeEmbeddings
@@ -262,6 +278,20 @@ func NewCreateIndexRequest(config any) (*CreateIndexRequest, error) {
 		return nil, fmt.Errorf("unsupported index config type: %T", config)
 	}
 	return request, nil
+}
+
+func validateSingleSourceEmbeddingRequest(data []byte) error {
+	var fields struct {
+		EmbeddingName      string `json:"embedding_name"`
+		SourceArtifactName string `json:"source_artifact_name"`
+	}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return fmt.Errorf("decode embeddings index config: %w", err)
+	}
+	if fields.SourceArtifactName != "" && strings.TrimSpace(fields.EmbeddingName) == "" {
+		return fmt.Errorf("source_artifact_name requires a non-empty embedding_name")
+	}
+	return nil
 }
 
 func newCreateIndexRequestFromIndexConfig(data []byte, indexType IndexType) (*CreateIndexRequest, error) {

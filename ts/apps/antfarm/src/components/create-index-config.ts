@@ -59,6 +59,19 @@ export function parseAdvancedIndexConfig(source: string): IndexConfig {
       throw new Error(`Index sources cannot be combined with ${conflict}.`);
     }
   }
+  if (config.type === "embeddings") {
+    for (const field of ["embedding_name", "source_artifact_name"] as const) {
+      if (
+        config[field] !== undefined &&
+        (typeof config[field] !== "string" || !config[field].trim())
+      ) {
+        throw new Error(`Embedding ${field} must be a non-empty string.`);
+      }
+    }
+    if (config.source_artifact_name !== undefined && config.embedding_name === undefined) {
+      throw new Error("Embedding source_artifact_name requires a non-empty embedding_name.");
+    }
+  }
   return value as IndexConfig;
 }
 

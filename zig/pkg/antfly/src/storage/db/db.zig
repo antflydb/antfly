@@ -6306,6 +6306,14 @@ pub const DB = struct {
         defer sync_targets.deinit(self.alloc);
         var materialized_derived_batch: ?derived_types.DerivedBatch = null;
         defer if (materialized_derived_batch) |*materialized_batch| derived_types.deinitDerivedBatch(self.alloc, materialized_batch);
+        var materialized_deleted_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer materialized_deleted_artifact_keys.deinit(self.alloc);
+        if (!use_thin_replay_fast_path) {
+            var seen_deleted_artifact_keys = std.StringHashMapUnmanaged(void).empty;
+            defer seen_deleted_artifact_keys.deinit(self.alloc);
+            for (deleted_artifact_keys) |key| try appendUniqueBorrowedKeyWithSet(self.alloc, &materialized_deleted_artifact_keys, &seen_deleted_artifact_keys, key);
+            for (precomputed_generated.artifact_delete_keys) |key| try appendUniqueBorrowedKeyWithSet(self.alloc, &materialized_deleted_artifact_keys, &seen_deleted_artifact_keys, key);
+        }
         // An exact source retry that only refreshes timestamp metadata has no
         // derived visibility transition. Reuse the current committed fence
         // instead of reserving a sequence that would either be lost (and make
@@ -6401,7 +6409,13 @@ pub const DB = struct {
                 include_generated_enrichment_hint,
             )
         else blk: {
-            materialized_derived_batch = try buildDerivedBatch(self.alloc, effective_req, extracted[0..extracted_initialized], deleted_artifact_keys, changed_graph_artifact_keys.items);
+            materialized_derived_batch = try buildDerivedBatch(
+                self.alloc,
+                effective_req,
+                extracted[0..extracted_initialized],
+                materialized_deleted_artifact_keys.items,
+                changed_graph_artifact_keys.items,
+            );
             for (materialized_derived_batch.?.overwritten_doc_keys) |key| self.alloc.free(@constCast(key));
             if (materialized_derived_batch.?.overwritten_doc_keys.len > 0) self.alloc.free(materialized_derived_batch.?.overwritten_doc_keys);
             materialized_derived_batch.?.overwritten_doc_keys = try buildOverwrittenDocKeys(self.alloc, effective_req.writes, overwritten_flags);
@@ -34600,7 +34614,7 @@ fn buildDerivedBatch(
     alloc: Allocator,
     req: types.BatchRequest,
     extracted: []const mapper.ExtractedWrite,
-    deleted_artifact_keys: []const []u8,
+    deleted_artifact_keys: []const []const u8,
     changed_artifact_keys: []const []u8,
 ) !derived_types.DerivedBatch {
     var documents = try alloc.alloc(derived_types.DerivedDocument, req.writes.len);
@@ -39442,13 +39456,19 @@ fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: deri
             .compact_text_segment_threshold = null,
             .defer_text_compaction = true,
         };
-        const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, batch);
-        defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
         var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
         defer publication_context.deinit();
+        const delete_keys = try collectTextReplayDeleteKeys(
+            ctx.alloc,
+            batch,
+            index_ref.name,
+            publication_context.chunk_backed,
+        );
+        defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
         var collected = try collectTextDocumentWritesForIndex(
             ctx.alloc,
             ctx.store,
+            ctx.index_manager,
             batch.documents,
             index_ref.name,
             publication_context.chunk_backed,
@@ -40492,27 +40512,34 @@ fn collectDocumentWritesProfiled(
     };
 }
 
-fn appendUniqueBorrowedKey(
+fn appendUniqueBorrowedKeyWithSet(
     alloc: Allocator,
     out: *std.ArrayListUnmanaged([]const u8),
+    seen: *std.StringHashMapUnmanaged(void),
     key: []const u8,
 ) !void {
     if (key.len == 0) return;
-    for (out.items) |existing| {
-        if (std.mem.eql(u8, existing, key)) return;
-    }
+    const entry = try seen.getOrPut(alloc, key);
+    if (entry.found_existing) return;
     try out.append(alloc, key);
 }
 
-fn collectTextReplayDeleteKeys(alloc: Allocator, batch: derived_types.DerivedBatch) ![]const []const u8 {
+fn collectTextReplayDeleteKeys(
+    alloc: Allocator,
+    batch: derived_types.DerivedBatch,
+    index_name: []const u8,
+    chunk_backed: bool,
+) ![]const []const u8 {
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
 
-    for (batch.deleted_keys) |key| try appendUniqueBorrowedKey(alloc, &keys, key);
-    for (batch.overwritten_doc_keys) |key| try appendUniqueBorrowedKey(alloc, &keys, key);
+    for (batch.deleted_keys) |key| try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    for (batch.overwritten_doc_keys) |key| try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
     for (batch.documents) |doc| {
-        if (doc.action != .upsert) continue;
-        try appendUniqueBorrowedKey(alloc, &keys, doc.key);
+        if (doc.action == .delete and !documentTargetsTextIndex(doc, index_name, chunk_backed)) continue;
+        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, doc.key);
     }
 
     return try keys.toOwnedSlice(alloc);
@@ -40581,6 +40608,7 @@ const CollectedTextDocumentWrites = struct {
 fn collectTextDocumentWritesForIndex(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
     documents: []const derived_types.DerivedDocument,
     index_name: []const u8,
     chunk_backed: bool,
@@ -40612,9 +40640,16 @@ fn collectTextDocumentWritesForIndex(
         if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
         if (!documentTargetsTextIndex(doc, index_name, chunk_backed)) continue;
         if (trust_inline and doc.cleaned_value != null) {
+            const projected = try textualAssetFullTextProjectionAlloc(
+                alloc,
+                index_manager,
+                doc.key,
+                doc.cleaned_value.?,
+            );
+            if (projected) |value| try result.owned_values.append(alloc, value);
             try result.writes.append(alloc, .{
                 .key = doc.key,
-                .value = doc.cleaned_value.?,
+                .value = projected orelse doc.cleaned_value.?,
             });
             continue;
         }
@@ -40653,7 +40688,19 @@ fn collectTextDocumentWritesForIndex(
             result.missing_required += 1;
             continue;
         };
-        const stable_value = if (read_values[i] != null) blk: {
+        const projected = try textualAssetFullTextProjectionAlloc(
+            alloc,
+            index_manager,
+            item.doc_key,
+            value,
+        );
+        const stable_value = if (projected) |owned| blk: {
+            result.owned_values.append(alloc, owned) catch |err| {
+                alloc.free(owned);
+                return err;
+            };
+            break :blk owned;
+        } else if (read_values[i] != null) blk: {
             const owned = try alloc.dupe(u8, value);
             result.owned_values.append(alloc, owned) catch |err| {
                 alloc.free(owned);
@@ -40674,6 +40721,36 @@ fn collectTextDocumentWritesForIndex(
     }
 
     return result;
+}
+
+/// Full-text segments consume JSON objects, while textual asset artifacts are
+/// intentionally stored as their original bytes. Project a non-JSON asset to
+/// a stable one-field JSON document at the indexing boundary so live apply,
+/// journal catch-up, and rebuild all have identical behavior without changing
+/// the artifact returned to callers.
+fn textualAssetFullTextProjectionAlloc(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    key: []const u8,
+    raw: []const u8,
+) !?[]u8 {
+    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, key)) orelse return null;
+    defer {
+        alloc.free(parsed.doc_key);
+        alloc.free(parsed.artifact_name);
+    }
+    const enrichment = index_manager.getEnrichment(.asset, parsed.artifact_name) orelse return null;
+    if (assetContentTypeIsJson(enrichment.content_type)) return null;
+
+    const field = if (enrichment.source_field.len > 0) enrichment.source_field else "text";
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, &out, field);
+    try out.append(alloc, ':');
+    try appendJsonString(alloc, &out, raw);
+    try out.append(alloc, '}');
+    return try out.toOwnedSlice(alloc);
 }
 
 fn documentTargetsTextIndex(doc: derived_types.DerivedDocument, index_name: []const u8, is_chunk_index: bool) bool {
@@ -53228,6 +53305,154 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     const after_delete = try db.getEdges(alloc, "selected_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, after_delete);
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "db multi-source full text unions chunk and textual asset streams across deletion and reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .enable_without_producers = true,
+            },
+        });
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "body_chunks_v1",
+            .kind = .chunk,
+            .field = "body",
+            .chunker_json =
+            \\{"provider":"antfly","store_chunks":false,"text":{"target_tokens":32,"overlap_tokens":0}}
+            ,
+        });
+        try db.addEnrichment(.{
+            .name = "summary_text_v1",
+            .kind = .asset,
+            .field = "summary",
+            .content_type = "text/plain",
+            .producer_json = "{\"type\":\"copy\"}",
+        });
+        try db.addIndex(.{
+            .name = "document_text",
+            .kind = .full_text,
+            .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"},{\"artifact\":\"summary_text_v1\"}]}",
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"body\":\"chunkonlytoken searchable body\",\"summary\":\"assetonlytoken concise summary\"}",
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        var chunk_match = try waitForSearchResult(alloc, &db, .{
+            .index_name = "document_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
+            .return_mode = .member,
+        }, 1);
+        defer chunk_match.deinit();
+        try std.testing.expectEqual(@as(usize, 1), chunk_match.hits.len);
+        const chunk_match_ref = chunk_match.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("body_chunks_v1", chunk_match_ref.name);
+
+        var asset_match = try waitForSearchResult(alloc, &db, .{
+            .index_name = "document_text",
+            .full_text = .{ .match = .{ .field = "summary", .text = "assetonlytoken" } },
+            .return_mode = .member,
+        }, 1);
+        defer asset_match.deinit();
+        try std.testing.expectEqual(@as(usize, 1), asset_match.hits.len);
+        const asset_match_ref = asset_match.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("summary_text_v1", asset_match_ref.name);
+
+        var members = try waitForSearchResult(alloc, &db, .{
+            .index_name = "document_text",
+            .full_text = .{ .match_all = {} },
+            .return_mode = .member,
+            .limit = 10,
+        }, 2);
+        defer members.deinit();
+        try std.testing.expectEqual(@as(usize, 2), members.hits.len);
+        var saw_chunk = false;
+        var saw_asset = false;
+        for (members.hits) |hit| {
+            const artifact_ref = hit.artifact_ref orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("doc:a", artifact_ref.document_id);
+            if (std.mem.eql(u8, artifact_ref.name, "body_chunks_v1")) {
+                try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
+                saw_chunk = true;
+            } else if (std.mem.eql(u8, artifact_ref.name, "summary_text_v1")) {
+                try std.testing.expectEqual(types.ArtifactKind.asset, artifact_ref.kind);
+                saw_asset = true;
+            }
+        }
+        try std.testing.expect(saw_chunk and saw_asset);
+
+        var parents = try waitForSearchResult(alloc, &db, .{
+            .index_name = "document_text",
+            .full_text = .{ .match_all = {} },
+            .limit = 10,
+        }, 1);
+        defer parents.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parents.hits.len);
+        try std.testing.expectEqualStrings("doc:a", parents.hits[0].id);
+
+        // Removing one producer input must delete only that source member;
+        // the other source remains searchable and retains its provenance.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value = "{\"body\":\"chunkonlytoken searchable body\"}",
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        const removed_asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_text_v1");
+        defer alloc.free(removed_asset_key);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, removed_asset_key));
+
+        var removed_match = try db.search(alloc, .{
+            .index_name = "document_text",
+            .full_text = .{ .match = .{ .field = "summary", .text = "assetonlytoken" } },
+            .return_mode = .member,
+        });
+        defer removed_match.deinit();
+        try std.testing.expectEqual(@as(u32, 0), removed_match.total_hits);
+
+        var after_delete = try waitForSearchResult(alloc, &db, .{
+            .index_name = "document_text",
+            .full_text = .{ .match_all = {} },
+            .return_mode = .member,
+            .limit = 10,
+        }, 1);
+        defer after_delete.deinit();
+        try std.testing.expectEqual(@as(usize, 1), after_delete.hits.len);
+        const remaining_ref = after_delete.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings("body_chunks_v1", remaining_ref.name);
+        try db.sync(true);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    var recovered = try waitForSearchResult(alloc, &reopened, .{
+        .index_name = "document_text",
+        .full_text = .{ .match_all = {} },
+        .return_mode = .member,
+        .limit = 10,
+    }, 1);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovered.hits.len);
+    const recovered_ref = recovered.hits[0].artifact_ref orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("body_chunks_v1", recovered_ref.name);
 }
 
 test "db graph replay blocks resolution artifact without resolver contract" {
@@ -71150,9 +71375,12 @@ test "collectDocumentWrites skips missing out-of-range replay docs" {
 test "text replay delete keys include upserted derived document keys" {
     const alloc = std.testing.allocator;
 
+    const selected_target = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "selected_text" }};
+    const other_target = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "other_text" }};
     const docs = [_]derived_types.DerivedDocument{
         .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"new\"}" },
-        .{ .key = "ignored", .action = .delete },
+        .{ .key = "deleted:2", .action = .delete, .targets = &selected_target },
+        .{ .key = "ignored", .action = .delete, .targets = &other_target },
         .{ .key = "chunk:1", .action = .upsert, .cleaned_value = "{\"text\":\"newer\"}" },
     };
     const deleted = [_][]const u8{"deleted:1"};
@@ -71163,13 +71391,14 @@ test "text replay delete keys include upserted derived document keys" {
         .overwritten_doc_keys = &overwritten,
     };
 
-    const keys = try collectTextReplayDeleteKeys(alloc, batch);
+    const keys = try collectTextReplayDeleteKeys(alloc, batch, "selected_text", true);
     defer alloc.free(keys);
 
-    try std.testing.expectEqual(@as(usize, 3), keys.len);
+    try std.testing.expectEqual(@as(usize, 4), keys.len);
     try std.testing.expectEqualStrings("deleted:1", keys[0]);
     try std.testing.expectEqualStrings("chunk:1", keys[1]);
     try std.testing.expectEqualStrings("overwritten:1", keys[2]);
+    try std.testing.expectEqualStrings("deleted:2", keys[3]);
 }
 
 test "db replay respects per-index applied watermarks" {

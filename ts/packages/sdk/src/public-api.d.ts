@@ -9342,9 +9342,9 @@ export interface components {
             field?: string;
             /** @description Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             sources?: components["schemas"]["ArtifactIndexSource"][];
-            /** @description Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            /** @description Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
             embedding_name?: string;
-            /** @description Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source. */
+            /** @description Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source. */
             source_artifact_name?: string;
             /**
              * @description Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.

@@ -50,11 +50,12 @@ class CreateEmbeddingsIndexRequest:
             vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or
             source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless
             deployments.
-        embedding_name (str | Unset): Single-source alternative request form. Mutually exclusive with sources. Responses
-            also expose canonical sources while preserving this released v0.2 field. Requires
-            index_capabilities.artifact_sources=true and is rejected by serverless deployments.
-        source_artifact_name (str | Unset): Artifact stream consumed by the embedding enrichment backing this vector
-            index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+        embedding_name (str | Unset): Released v0.2 single-source alternative request form. Mutually exclusive with
+            sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving
+            these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+        source_artifact_name (str | Unset): Optional source artifact consumed by the embedding enrichment named by
+            embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized
+            source.
         template (str | Unset): Handlebars template for generating prompts (managed indexes only; not allowed when
             external=true). See https://handlebarsjs.com/guide/ for more information. Example: Hello, {{#if (eq Name
             "John")}}Johnathan{{else}}{{Name}}{{/if}}! You are {{Age}} years old..

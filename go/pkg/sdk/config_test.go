@@ -2,6 +2,7 @@ package sdk
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +44,15 @@ func TestNewCreateIndexRequestOmitsPathIdentity(t *testing.T) {
 	}
 	if body["type"] != "embeddings" || body["dimension"] != float64(512) {
 		t.Fatalf("unexpected request: %s", data)
+	}
+}
+
+func TestNewCreateIndexRequestRejectsOrphanedEmbeddingSourceArtifact(t *testing.T) {
+	_, err := NewCreateIndexRequest(EmbeddingsIndexConfig{
+		SourceArtifactName: "document_chunks_v1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "source_artifact_name requires a non-empty embedding_name") {
+		t.Fatalf("NewCreateIndexRequest error = %v, want embedding_name dependency", err)
 	}
 }
 

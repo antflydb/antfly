@@ -221,6 +221,24 @@ describe("CreateIndexDialog", () => {
     expect(() =>
       parseAdvancedIndexConfig(
         JSON.stringify({
+          name: "orphaned_embedding_source",
+          type: "embeddings",
+          source_artifact_name: "document_chunks_v1",
+        })
+      )
+    ).toThrow("requires a non-empty embedding_name");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({
+          name: "empty_embedding_artifact",
+          type: "embeddings",
+          embedding_name: " ",
+        })
+      )
+    ).toThrow("embedding_name must be a non-empty string");
+    expect(() =>
+      parseAdvancedIndexConfig(
+        JSON.stringify({
           name: "invalid_graph_source",
           type: "graph",
           sources: [{ artifact: "relations_v1", path: "relations[*]" }],

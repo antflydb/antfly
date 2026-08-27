@@ -228,9 +228,9 @@ pub const CreateEmbeddingsIndexRequest = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -858,9 +858,9 @@ pub const EmbeddingsIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Embedding artifact streams indexed together. Each artifact record is an independent vector member identified by (artifact name, source key). All sources must use the same dense vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name, or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     sources: ?[]const ArtifactIndexSource = null,
-    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
@@ -1597,9 +1597,9 @@ pub const IndexConfig = struct {
     sparse: ?bool = null,
     /// Vector dimension for dense indexes. Required for external dense indexes. Can be omitted for managed dense indexes when an embedder is configured (auto-detected via probe). Ignored for sparse indexes.
     dimension: ?i64 = null,
-    /// Single-source alternative request form. Mutually exclusive with sources. Responses also expose canonical sources while preserving this released v0.2 field. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    /// Released v0.2 single-source alternative request form. Mutually exclusive with sources. Required when source_artifact_name is set. Responses also expose canonical sources while preserving these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
     embedding_name: ?[]const u8 = null,
-    /// Artifact stream consumed by the embedding enrichment backing this vector index. This is descriptive public configuration; the matching enrichment defines the materialized source.
+    /// Optional source artifact consumed by the embedding enrichment named by embedding_name. Only valid when embedding_name is also set; the matching enrichment defines the materialized source.
     source_artifact_name: ?[]const u8 = null,
     /// Handlebars template for generating prompts (managed indexes only; not allowed when external=true). See https://handlebarsjs.com/guide/ for more information.
     template: ?[]const u8 = null,
