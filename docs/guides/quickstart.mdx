@@ -336,14 +336,14 @@ To wait only for that first queryable generation, run:
 ```bash
 antfly index wait --table wikipedia \
   --index title_body \
-  --queryable \
+  --until queryable \
   --timeout 20m
 ```
 
 Continue as soon as this command succeeds. The examples below search the safely
 published portion of the index while the remaining documents continue indexing,
 so result counts and rankings can improve as coverage grows. When an application
-requires a fixed, fully covered corpus, omit `--queryable` to wait for the
+requires a fixed, fully covered corpus, use `--until complete` to wait for the
 stronger `ready` state instead.
 
 Use `antfly index list --table wikipedia` for a compact progress summary, or
@@ -891,7 +891,7 @@ Adding an index to a table with existing data triggers background embedding gene
 ```bash
 antfly index wait --table wikipedia \
   --index thumbnail \
-  --queryable \
+  --until queryable \
   --timeout 20m
 ```
 
@@ -1366,7 +1366,7 @@ Pull the missing model again, or pass the intended directory explicitly with
 
 Do not continue to semantic, image, or RAG steps until the relevant index is
 queryable. `queryable_partial` is safe to use while coverage grows; `pending` is
-not. If `index wait --queryable` times out, capture the full status and recent
+not. If `index wait --until queryable` times out, capture the full status and recent
 watchdog messages:
 
 ```bash
