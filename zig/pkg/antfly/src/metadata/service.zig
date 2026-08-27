@@ -4037,6 +4037,27 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+    }
+
+    /// Admits a transition only while this node is still leader in the
+    /// caller's captured term. The comparison and Raft admission share the
+    /// runtime lock, closing the check-then-propose window for background work
+    /// that can outlive a leadership change.
+    pub fn proposeTransitionCommandWithReceiptInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        if (expected_term == 0) return error.NotLeader;
+        return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, expected_term);
+    }
+
+    fn proposeTransitionCommandWithReceiptInExpectedTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: ?u64,
+    ) !MetadataProposalReceipt {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
         const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
@@ -4047,6 +4068,9 @@ pub const MetadataHttpService = struct {
             return error.NotLeader;
         if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or raft_status.soft.leader_id.? != raft_status.id) {
             return error.NotLeader;
+        }
+        if (expected_term) |term| {
+            if (raft_status.hard.current_term != term) return error.NotLeader;
         }
         const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
         defer self.alloc.free(encoded);
@@ -4169,6 +4193,16 @@ pub const MetadataHttpService = struct {
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
         const receipt = try self.proposeTransitionCommandWithReceipt(command);
+        try self.waitForTransitionApplied(receipt);
+        return receipt;
+    }
+
+    pub fn proposeTransitionCommandAndWaitAppliedInTerm(
+        self: *MetadataHttpService,
+        command: metadata_storage.TransitionCommand,
+        expected_term: u64,
+    ) !MetadataProposalReceipt {
+        const receipt = try self.proposeTransitionCommandWithReceiptInTerm(command, expected_term);
         try self.waitForTransitionApplied(receipt);
         return receipt;
     }
@@ -13828,10 +13862,12 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
     try std.testing.expectEqual(true, svc.lifecycle_listener_registered);
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{
+    const leader_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
+    try std.testing.expect(leader_status.hard.current_term > 0);
+    const receipt = try svc.proposeTransitionCommandWithReceiptInTerm(.{
         .upsert_node = .{ .node_id = 77 },
-    });
-    try std.testing.expect(receipt.term > 0);
+    }, leader_status.hard.current_term);
+    try std.testing.expectEqual(leader_status.hard.current_term, receipt.term);
     try std.testing.expect(receipt.index > 0);
     try svc.waitForTransitionApplied(receipt);
     const receipt_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
@@ -13843,6 +13879,19 @@ test "metadata http service catalog cache is independent from volatile projectio
         if (node.node_id == 77) found_receipt_node = true;
     }
     try std.testing.expect(found_receipt_node);
+
+    const last_index_before_wrong_term = try store.storage().lastIndex();
+    try std.testing.expectError(error.NotLeader, svc.proposeTransitionCommandWithReceiptInTerm(.{
+        .upsert_node = .{ .node_id = 78 },
+    }, receipt.term + 1));
+    try std.testing.expectEqual(last_index_before_wrong_term, try store.storage().lastIndex());
+    const nodes_after_wrong_term = try svc.listProjectedNodes(std.testing.allocator);
+    defer svc.freeProjectedNodes(std.testing.allocator, nodes_after_wrong_term);
+    try std.testing.expectEqual(receipt_nodes.len, nodes_after_wrong_term.len);
+    for (nodes_after_wrong_term) |node| {
+        try std.testing.expect(node.node_id != 78);
+    }
+
     const catalog_epoch_before = svc.catalog_epoch.load(.acquire);
     try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
     try std.testing.expect(svc.projected_core_snapshot_cache.snapshot == null);
