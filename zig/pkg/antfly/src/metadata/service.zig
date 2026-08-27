@@ -13862,10 +13862,12 @@ test "metadata http service catalog cache is independent from volatile projectio
     defer svc.freeProjectedTables(std.testing.allocator, before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
     try std.testing.expectEqual(true, svc.lifecycle_listener_registered);
-    const receipt = try svc.proposeTransitionCommandWithReceipt(.{
+    const leader_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
+    try std.testing.expect(leader_status.hard.current_term > 0);
+    const receipt = try svc.proposeTransitionCommandWithReceiptInTerm(.{
         .upsert_node = .{ .node_id = 77 },
-    });
-    try std.testing.expect(receipt.term > 0);
+    }, leader_status.hard.current_term);
+    try std.testing.expectEqual(leader_status.hard.current_term, receipt.term);
     try std.testing.expect(receipt.index > 0);
     try svc.waitForTransitionApplied(receipt);
     const receipt_status = svc.raft.host.http_host.host.raftStatus(2900) orelse return error.MissingRaftStatus;
@@ -13877,6 +13879,19 @@ test "metadata http service catalog cache is independent from volatile projectio
         if (node.node_id == 77) found_receipt_node = true;
     }
     try std.testing.expect(found_receipt_node);
+
+    const last_index_before_wrong_term = try store.storage().lastIndex();
+    try std.testing.expectError(error.NotLeader, svc.proposeTransitionCommandWithReceiptInTerm(.{
+        .upsert_node = .{ .node_id = 78 },
+    }, receipt.term + 1));
+    try std.testing.expectEqual(last_index_before_wrong_term, try store.storage().lastIndex());
+    const nodes_after_wrong_term = try svc.listProjectedNodes(std.testing.allocator);
+    defer svc.freeProjectedNodes(std.testing.allocator, nodes_after_wrong_term);
+    try std.testing.expectEqual(receipt_nodes.len, nodes_after_wrong_term.len);
+    for (nodes_after_wrong_term) |node| {
+        try std.testing.expect(node.node_id != 78);
+    }
+
     const catalog_epoch_before = svc.catalog_epoch.load(.acquire);
     try std.testing.expectEqual(catalog_epoch_before, svc.catalog_validation_cache.catalog_epoch);
     try std.testing.expect(svc.projected_core_snapshot_cache.snapshot == null);
