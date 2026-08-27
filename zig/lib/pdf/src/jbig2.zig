@@ -778,7 +778,16 @@ const Decoder = struct {
             }
         }
         const imported_count = symbols.items.len;
-        const code_len = if (refine) try ceilLog2(imported_count + new_count) else 0;
+        const total_count = std.math.add(usize, imported_count, new_count) catch return error.InvalidJbig2SymbolCount;
+        // Empty dictionaries are valid no-ops and appear in production scans.
+        // They have no symbol identifiers or export runs to arithmetic-decode,
+        // so avoid both ceilLog2(0) and the otherwise unnecessary 65 KiB
+        // arithmetic context. A nonzero export count is still inconsistent.
+        if (total_count == 0) {
+            if (export_count != 0) return error.InvalidJbig2SymbolCount;
+            return .{ .symbols = try self.alloc.alloc(Bitmap, 0) };
+        }
+        const code_len = if (refine) try ceilLog2(total_count) else 0;
         var arith = try ArithmeticDecoder.init(payload[cursor.pos..]);
         const generic_ctx = try allocZeroedBytes(self.alloc, self.work, 65536);
         defer self.alloc.free(generic_ctx);
@@ -885,7 +894,7 @@ const Decoder = struct {
             index += @intCast(run);
             flag = 1 - flag;
         }
-        if (exported.items.len != export_count or symbols.items.len != imported_count + new_count) return error.InvalidJbig2SymbolCount;
+        if (exported.items.len != export_count or symbols.items.len != total_count) return error.InvalidJbig2SymbolCount;
         try self.work.chargeItems(exported.items.len, 16);
         return .{ .symbols = try exported.toOwnedSlice(self.alloc) };
     }
@@ -1111,4 +1120,30 @@ test "Treasury mask decodes refinement aggregation and text region" {
     var black_pixels: usize = 0;
     for (decoded.pixels) |byte| black_pixels += @popCount(byte);
     try std.testing.expectEqual(@as(usize, 230_542), black_pixels);
+}
+
+test "Treasury empty refinement dictionary is a valid no-op" {
+    // Extracted from page 2 of the March 1985 Treasury Bulletin. The segment
+    // declares refinement aggregation but imports, defines, and exports zero
+    // symbols. Its trailing bytes are the original arithmetic terminator.
+    const encoded = @embedFile("testdata/treasury-1985-page2-empty-refinement-dictionary.hex");
+    const payload_len = std.mem.trim(u8, encoded, "\r\n").len / 2;
+    const payload = try std.testing.allocator.alloc(u8, payload_len);
+    defer std.testing.allocator.free(payload);
+    _ = try std.fmt.hexToBytes(payload, std.mem.trim(u8, encoded, "\r\n"));
+
+    var work = DecodeWorkBudget{ .remaining = 1_000_000 };
+    var decoder = Decoder{
+        .alloc = std.testing.allocator,
+        .work = &work,
+        .max_bytes = 1024,
+    };
+    defer decoder.deinit();
+    var dictionary = try decoder.decodeDictionary(payload, &.{});
+    defer dictionary.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), dictionary.symbols.len);
+
+    // The same empty dictionary cannot claim an exported symbol.
+    payload[17] = 1;
+    try std.testing.expectError(error.InvalidJbig2SymbolCount, decoder.decodeDictionary(payload, &.{}));
 }
