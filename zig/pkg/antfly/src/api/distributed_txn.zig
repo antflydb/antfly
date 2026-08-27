@@ -69,6 +69,8 @@ pub const TableCommitRequest = contract.TableCommitRequest;
 pub const CommitConflict = contract.CommitConflict;
 pub const ParticipantPhase = contract.ParticipantPhase;
 pub const CommitOutcome = contract.CommitOutcome;
+pub const PreDecisionContext = contract.PreDecisionContext;
+pub const pre_decision_server_response_reserve_ms = contract.pre_decision_server_response_reserve_ms;
 
 pub const ParticipantWorker = struct {
     ptr: *anyopaque,
@@ -192,7 +194,12 @@ pub const HostedParticipantWorker = struct {
     /// post-send failure.
     const pre_decision_response_reserve_ms: u32 = 1_000;
     const default_pre_decision_attempt_timeout_ms: u32 =
-        internal_batch_forwarding.max_remaining_ms + pre_decision_response_reserve_ms;
+        contract.max_pre_decision_server_budget_ms + pre_decision_response_reserve_ms;
+
+    const PreDecisionAttemptBudget = struct {
+        client_timeout_ms: u32,
+        server_budget_ms: u32,
+    };
 
     catalog: table_catalog.CatalogSource,
     router: table_router.HostedGroupRouter,
@@ -259,7 +266,7 @@ pub const HostedParticipantWorker = struct {
         };
         switch (route) {
             .local => {
-                const result = self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants) catch |err| {
+                const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, try self.localPreDecisionContext(deadline_ns)) catch |err| {
                     if (!isPreDecisionCandidateMiss(err)) return err;
                     return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
                 };
@@ -271,13 +278,15 @@ pub const HostedParticipantWorker = struct {
                 const body = try encodeTxnBeginRequest(alloc, req);
                 defer alloc.free(body);
                 var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+                const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
                 const outcome = client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
                     remote.base_uri,
                     group_id,
                     table_name,
                     body,
                     &delivery_tracker,
-                    try self.remainingPreDecisionAttemptTimeoutMs(deadline_ns),
+                    budget.client_timeout_ms,
+                    budget.server_budget_ms,
                 ) catch |err| {
                     if (!shouldTryAnotherPreDecisionTransport(err, &delivery_tracker)) return err;
                     return try self.beginGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
@@ -300,7 +309,7 @@ pub const HostedParticipantWorker = struct {
         };
         switch (route) {
             .local => {
-                const result = self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req) catch |err| {
+                const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
                     if (!isPreDecisionCandidateMiss(err)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, null, deadline_ns);
                 };
@@ -312,13 +321,15 @@ pub const HostedParticipantWorker = struct {
                 const body = try encodeTxnPrepareRequest(alloc, req);
                 defer alloc.free(body);
                 var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+                const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
                 const outcome = client.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
                     remote.base_uri,
                     group_id,
                     table_name,
                     body,
                     &delivery_tracker,
-                    try self.remainingPreDecisionAttemptTimeoutMs(deadline_ns),
+                    budget.client_timeout_ms,
+                    budget.server_budget_ms,
                 ) catch |err| {
                     if (!shouldTryAnotherPreDecisionTransport(err, &delivery_tracker)) return err;
                     return try self.prepareGroupFromCandidates(alloc, group_id, table_name, req, attempted_node_id, body, deadline_ns);
@@ -377,7 +388,7 @@ pub const HostedParticipantWorker = struct {
         try ensurePreDecisionDeadline(deadline_ns);
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
-            const result = self.writes.txnBeginGroupLocal(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants) catch |err| {
+            const result = self.writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.begin_timestamp, req.topology_epoch, req.retain_terminal, req.participants, try self.localPreDecisionContext(deadline_ns)) catch |err| {
                 if (isPreDecisionCandidateMiss(err)) return false;
                 return err;
             };
@@ -390,13 +401,15 @@ pub const HostedParticipantWorker = struct {
         defer alloc.free(base_uri);
         var client = self.httpClient(alloc);
         var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
         const outcome = client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
             base_uri,
             group_id,
             table_name,
             body,
             &delivery_tracker,
-            try self.remainingPreDecisionAttemptTimeoutMs(deadline_ns),
+            budget.client_timeout_ms,
+            budget.server_budget_ms,
         ) catch |err| {
             if (shouldTryAnotherPreDecisionTransport(err, &delivery_tracker)) return false;
             return err;
@@ -452,7 +465,7 @@ pub const HostedParticipantWorker = struct {
         try ensurePreDecisionDeadline(deadline_ns);
         if (node_id == self.router.localNodeId()) {
             if (self.router.localStatus(group_id) != .active) return false;
-            const result = self.writes.txnPrepareGroupLocal(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req) catch |err| {
+            const result = self.writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, req.txn_id, req.topology_epoch, req.req, try self.localPreDecisionContext(deadline_ns)) catch |err| {
                 if (isPreDecisionCandidateMiss(err)) return false;
                 return err;
             };
@@ -465,13 +478,15 @@ pub const HostedParticipantWorker = struct {
         defer alloc.free(base_uri);
         var client = self.httpClient(alloc);
         var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
         const outcome = client.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
             base_uri,
             group_id,
             table_name,
             body,
             &delivery_tracker,
-            try self.remainingPreDecisionAttemptTimeoutMs(deadline_ns),
+            budget.client_timeout_ms,
+            budget.server_budget_ms,
         ) catch |err| {
             if (shouldTryAnotherPreDecisionTransport(err, &delivery_tracker)) return false;
             return err;
@@ -486,9 +501,24 @@ pub const HostedParticipantWorker = struct {
         return platform_time.monotonicNs() +| duration_ns;
     }
 
-    fn remainingPreDecisionAttemptTimeoutMs(self: *const HostedParticipantWorker, deadline_ns: u64) !u32 {
+    fn remainingPreDecisionAttemptBudget(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionAttemptBudget {
         const remaining_ms = try remainingPreDecisionTimeoutMs(deadline_ns);
-        return @min(remaining_ms, self.pre_decision_attempt_timeout_ms);
+        const client_timeout_ms = @min(remaining_ms, self.pre_decision_attempt_timeout_ms);
+        if (client_timeout_ms <= pre_decision_response_reserve_ms + contract.pre_decision_server_response_reserve_ms)
+            return error.Timeout;
+        return .{
+            .client_timeout_ms = client_timeout_ms,
+            .server_budget_ms = @min(
+                contract.max_pre_decision_server_budget_ms,
+                client_timeout_ms - pre_decision_response_reserve_ms,
+            ),
+        };
+    }
+
+    fn localPreDecisionContext(self: *const HostedParticipantWorker, deadline_ns: u64) !PreDecisionContext {
+        const budget = try self.remainingPreDecisionAttemptBudget(deadline_ns);
+        const duration_ns = @as(u64, budget.server_budget_ms) *| std.time.ns_per_ms;
+        return .{ .deadline_ns = platform_time.monotonicNs() +| duration_ns };
     }
 
     fn resolveGroup(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
@@ -739,14 +769,18 @@ test "distributed txn classifies local and transported visibility outcomes ident
 }
 
 test "hosted participant attempt deadline preserves the server outcome window" {
+    try std.testing.expectEqual(
+        contract.max_pre_decision_server_budget_ms,
+        internal_batch_forwarding.max_remaining_ms,
+    );
     try std.testing.expect(
         HostedParticipantWorker.default_pre_decision_attempt_timeout_ms >
-            internal_batch_forwarding.max_remaining_ms,
+            contract.max_pre_decision_server_budget_ms,
     );
     try std.testing.expectEqual(
         HostedParticipantWorker.pre_decision_response_reserve_ms,
         HostedParticipantWorker.default_pre_decision_attempt_timeout_ms -
-            internal_batch_forwarding.max_remaining_ms,
+            contract.max_pre_decision_server_budget_ms,
     );
 }
 
@@ -800,6 +834,7 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
             not_sent_timeout,
             post_send_timeout,
             unknown_group,
+            unmarked_unknown_group,
             forged_leader_unavailable,
             forged_unknown_group,
         };
@@ -823,6 +858,12 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
             self.calls += 1;
             const timeout_ms = req.timeout_ms orelse return error.TestExpectedBoundedTimeout;
             try std.testing.expect(timeout_ms > 0 and timeout_ms <= HostedParticipantWorker.default_pre_decision_attempt_timeout_ms);
+            const server_budget_raw = req.header(contract.pre_decision_remaining_ms_header) orelse
+                return error.TestExpectedServerBudget;
+            const server_budget_ms = try std.fmt.parseUnsigned(u32, server_budget_raw, 10);
+            try std.testing.expect(server_budget_ms > contract.pre_decision_server_response_reserve_ms);
+            try std.testing.expect(server_budget_ms <= contract.max_pre_decision_server_budget_ms);
+            try std.testing.expect(server_budget_ms + HostedParticipantWorker.pre_decision_response_reserve_ms <= timeout_ms);
             var service_auth_headers: usize = 0;
             for (req.headers) |header| {
                 if (!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) continue;
@@ -871,7 +912,16 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
                         tracker.markMayHaveBeenSent();
                         return error.Timeout;
                     },
-                    .unknown_group => try http_route_helpers.textResponse(alloc, 404, "not found"),
+                    .unknown_group => try http_route_helpers.textResponseWithHeaders(
+                        alloc,
+                        404,
+                        "not found",
+                        &.{.{
+                            .name = contract.pre_decision_outcome_header,
+                            .value = contract.pre_decision_not_proposed_v1,
+                        }},
+                    ),
+                    .unmarked_unknown_group => try http_route_helpers.textResponse(alloc, 404, "not found"),
                     .forged_leader_unavailable => {
                         const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
                         tracker.markMayHaveBeenSent();
@@ -994,6 +1044,15 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
         .participants = &.{"table2:docs:group:7"},
     });
     try std.testing.expectEqual(@as(usize, 2), missing_executor.calls);
+
+    var unmarked_missing_executor = FakeExecutor{ .first_outcome = .unmarked_unknown_group };
+    var unmarked_missing_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, unmarked_missing_executor.iface());
+    try std.testing.expectError(error.UnexpectedHttpStatus, unmarked_missing_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), unmarked_missing_executor.calls);
 
     const LocalMissRouter = struct {
         fn iface() table_router.HostedGroupRouter {

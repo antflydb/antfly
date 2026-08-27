@@ -275,8 +275,13 @@ pub const Operations = struct {
     pub fn txnBegin(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnBeginRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
-        _ = (writes.txnBeginGroupLocal(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants) catch |err| switch (err) {
+        _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
+            .deadline_ns = request.deadline_ns,
+            .cancellation = request.cancellation,
+        }) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -298,7 +303,12 @@ pub const Operations = struct {
             error.InvalidBatchRequest => return error.InvalidArgument,
             else => return error.Internal,
         };
-        _ = (writes.txnPrepareGroupLocal(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req) catch |err| switch (err) {
+        _ = (writes.txnPrepareGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.topology_epoch, input.req, .{
+            .deadline_ns = request.deadline_ns,
+            .cancellation = request.cancellation,
+        }) catch |err| switch (err) {
+            error.Canceled, error.Cancelled => return error.Canceled,
+            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
             error.TopologyChanged => return error.TopologyChanged,
             error.VersionConflict, error.IntentConflict => return error.TransactionConflict,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,

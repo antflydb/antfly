@@ -88,12 +88,11 @@ pub const RepairCancelStateResponse = struct {
     cancel_requested: bool = false,
 };
 
-/// Semantic result of a pre-decision transaction request. Keeping routing
-/// misses in the success channel prevents arbitrary RequestExecutor errors
-/// from masquerading as server proof that a mutation was not proposed.
+/// Semantic result of a pre-decision transaction request. Only an explicit
+/// server marker enters the retryable channel; transport errors and unmarked
+/// HTTP statuses cannot masquerade as proof that no mutation was proposed.
 pub const TxnPreDecisionOutcome = enum {
     applied,
-    route_miss,
     not_proposed,
 };
 
@@ -2373,9 +2372,9 @@ pub const ApiHttpClient = struct {
             body,
             delivery_tracker,
             null,
+            null,
         )) {
             .applied => .{},
-            .route_miss => error.UnknownGroup,
             .not_proposed => error.GroupLeaderUnavailable,
         };
     }
@@ -2388,6 +2387,7 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         delivery_tracker: ?*http_common.RequestDeliveryTracker,
         timeout_ms: ?u32,
+        server_budget_ms: ?u32,
     ) !TxnPreDecisionOutcome {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -2400,23 +2400,30 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
+        var budget_buf: [10]u8 = undefined;
+        const headers: []const http_common.RequestHeader = if (server_budget_ms) |budget| blk: {
+            if (budget == 0 or budget > txn_contract.max_pre_decision_server_budget_ms)
+                return error.InvalidArgument;
+            const value = try std.fmt.bufPrint(&budget_buf, "{d}", .{budget});
+            break :blk &.{.{
+                .name = txn_contract.pre_decision_remaining_ms_header,
+                .value = value,
+            }};
+        } else &.{};
         var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .headers = headers,
             .delivery_tracker = delivery_tracker,
             .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
+        if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         switch (resp.status) {
             200 => return .applied,
-            404 => return .route_miss,
             409 => return remoteGroupConflictError(resp.body),
-            503 => if (isTxnPreDecisionNotProposedResponse(resp))
-                return .not_proposed
-            else
-                return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2452,9 +2459,9 @@ pub const ApiHttpClient = struct {
             body,
             delivery_tracker,
             null,
+            null,
         )) {
             .applied => .{},
-            .route_miss => error.UnknownGroup,
             .not_proposed => error.GroupLeaderUnavailable,
         };
     }
@@ -2467,6 +2474,7 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         delivery_tracker: ?*http_common.RequestDeliveryTracker,
         timeout_ms: ?u32,
+        server_budget_ms: ?u32,
     ) !TxnPreDecisionOutcome {
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
@@ -2479,23 +2487,30 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
+        var budget_buf: [10]u8 = undefined;
+        const headers: []const http_common.RequestHeader = if (server_budget_ms) |budget| blk: {
+            if (budget == 0 or budget > txn_contract.max_pre_decision_server_budget_ms)
+                return error.InvalidArgument;
+            const value = try std.fmt.bufPrint(&budget_buf, "{d}", .{budget});
+            break :blk &.{.{
+                .name = txn_contract.pre_decision_remaining_ms_header,
+                .value = value,
+            }};
+        } else &.{};
         var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .headers = headers,
             .delivery_tracker = delivery_tracker,
             .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
+        if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         switch (resp.status) {
             200 => return .applied,
-            404 => return .route_miss,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
-            503 => if (isTxnPreDecisionNotProposedResponse(resp))
-                return .not_proposed
-            else
-                return error.UnexpectedHttpStatus,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -3402,7 +3417,7 @@ fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
 }
 
 fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
-    if (resp.status != 503) return false;
+    if (resp.status != 404 and resp.status != 503 and resp.status != 504) return false;
     const outcome = resp.header(txn_contract.pre_decision_outcome_header) orelse return false;
     return std.mem.eql(u8, outcome, txn_contract.pre_decision_not_proposed_v1);
 }

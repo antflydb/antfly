@@ -6979,6 +6979,7 @@ pub const DataServer = struct {
                 .batch_group_with_cancellation = localRaftBatchGroupWithCancellation,
                 .batch_group_local = localRaftBatchGroupLocal,
                 .batch_group_local_with_cancellation = localRaftBatchGroupLocalWithCancellation,
+                .batch_group_local_with_pre_decision_context = localRaftBatchGroupLocalWithPreDecisionContext,
             },
         };
     }
@@ -7107,6 +7108,36 @@ pub const DataServer = struct {
             .refresh_metadata = false,
             .visibility_cancellation = cancellation,
         });
+    }
+
+    fn localRaftBatchGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+        context: antfly.public_api.distributed_txn.PreDecisionContext,
+    ) !void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        const deadline_ns = context.deadline_ns orelse
+            return try localRaftBatchGroupLocalWithCancellation(ptr, alloc, group_id, table_name, req, context.cancellation);
+        const leader_wait_ns = preDecisionLeaderWaitNsAt(
+            platform_time.monotonicNs(),
+            deadline_ns,
+        ) orelse return error.DeadlineExceeded;
+        var cancellation = antfly.raft.transport.http_common.RequestCancellation.fromToken(context.cancellation);
+        try self.proposeRaftBatchGroupWithLeaderWait(
+            alloc,
+            group_id,
+            table_name,
+            req,
+            .{
+                .refresh_metadata = false,
+                .cancellation = if (context.cancellation.ptr != null) &cancellation else null,
+                .visibility_cancellation = context.cancellation,
+            },
+            leader_wait_ns,
+        );
     }
 
     fn localRaftBatchGroupForwarded(
@@ -8130,6 +8161,15 @@ pub const DataServer = struct {
         // routing and remote consensus while retaining the established 500 ms
         // cap for ordinary five-second writes.
         return @min(data_raft_local_campaign_max_grace_ns, leader_wait_ns / 4);
+    }
+
+    fn preDecisionLeaderWaitNsAt(now_ns: u64, deadline_ns: u64) ?u64 {
+        const response_reserve_ns = @as(
+            u64,
+            antfly.public_api.distributed_txn.pre_decision_server_response_reserve_ms,
+        ) * std.time.ns_per_ms;
+        if (now_ns >= deadline_ns or deadline_ns - now_ns <= response_reserve_ns) return null;
+        return @min(deadline_ns - now_ns - response_reserve_ns, data_raft_batch_leader_wait_ns);
     }
 
     fn nextDataRaftBatchForwarding(
@@ -30060,6 +30100,32 @@ test "expired data raft deadline snapshots never wait and release before returni
     // perform synchronous logging.
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
+}
+
+test "transaction pre-decision Raft wait consumes admission delay and preserves response time" {
+    const response_reserve_ns = @as(
+        u64,
+        antfly.public_api.distributed_txn.pre_decision_server_response_reserve_ms,
+    ) * std.time.ns_per_ms;
+    const start_ns = 10 * std.time.ns_per_s;
+    const deadline_ns = start_ns + 5 * std.time.ns_per_s;
+
+    try std.testing.expectEqual(
+        @as(?u64, data_raft_batch_leader_wait_ns - response_reserve_ns),
+        DataServer.preDecisionLeaderWaitNsAt(start_ns, deadline_ns),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, 3_750 * std.time.ns_per_ms),
+        DataServer.preDecisionLeaderWaitNsAt(start_ns + 1_200 * std.time.ns_per_ms, deadline_ns),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        DataServer.preDecisionLeaderWaitNsAt(deadline_ns - response_reserve_ns, deadline_ns),
+    );
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        DataServer.preDecisionLeaderWaitNsAt(deadline_ns, deadline_ns),
+    );
 }
 
 test "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback" {
