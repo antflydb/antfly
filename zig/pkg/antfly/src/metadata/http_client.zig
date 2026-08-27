@@ -16,6 +16,7 @@ const std = @import("std");
 const ant_json = @import("antfly-json");
 const platform_time = @import("antfly_platform").time;
 const tables_api = @import("../api/tables.zig");
+const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const metadata_api = @import("api.zig");
@@ -44,9 +45,6 @@ const RetryPolicy = enum {
     replay_safe,
     /// Retry only failures that prove the server did not admit the mutation.
     at_most_once,
-    /// Require the table-mutation protocol marker in addition to
-    /// non-admission proof before replaying a table mutation.
-    marked_table_mutation,
 };
 
 /// One monotonic budget shared by every transport and not-leader retry in a
@@ -457,37 +455,13 @@ pub const MetadataHttpClient = struct {
         table_name: []const u8,
         definition_json: []const u8,
     ) !void {
-        try tables_api.validateTableMutationName(table_name);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedCreateTableMutation{
-            .table_name = table_name,
-            .definition_json = definition_json,
-        }, .{});
-        defer self.alloc.free(body);
-        const uri = try join(self.alloc, base_uri, routes.Routes.internal_forwarded_table_create);
-        defer self.alloc.free(uri);
-        var resp = self.executeWithRetryPolicy(.{
-            .method = .POST,
-            .uri = uri,
-            .body = body,
-            .content_type = "application/json",
-            .timeout_ms = default_request_timeout_ms,
-        }, null, .marked_table_mutation) catch |err| switch (err) {
-            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
-            else => return err,
-        };
-        defer resp.deinit(self.alloc);
-        if (!responseHasHeaderValueAnyStatus(
-            resp,
-            routes.Routes.table_mutation_protocol_header,
-            routes.Routes.table_mutation_protocol_value,
-        )) return error.MetadataMutationOutcomeUnknown;
-        if (resp.status == 201) return;
-        return switch (resp.status) {
-            400 => error.InvalidCreateTableRequest,
-            405 => error.UnsupportedOperation,
-            409 => error.TableAlreadyExists,
-            else => error.MetadataMutationOutcomeUnknown,
-        };
+        return self.forwardTableMutation(
+            base_uri,
+            .create_table,
+            table_name,
+            definition_json,
+            .{ .remaining_ms = 5_000, .forwards_remaining = 2, .campaign_allowed = true },
+        );
     }
 
     pub fn dropTableForwarded(
@@ -495,34 +469,89 @@ pub const MetadataHttpClient = struct {
         base_uri: []const u8,
         table_name: []const u8,
     ) !void {
+        return self.forwardTableMutation(
+            base_uri,
+            .drop_table,
+            table_name,
+            null,
+            .{ .remaining_ms = 5_000, .forwards_remaining = 2, .campaign_allowed = true },
+        );
+    }
+
+    pub fn forwardTableMutation(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        kind: routes.TableMutationKind,
+        table_name: []const u8,
+        definition_json: ?[]const u8,
+        forwarding: raft_mutation_forwarding.Context,
+    ) !void {
         try tables_api.validateTableMutationName(table_name);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedDropTableMutation{
+        const operation_id = routes.tableMutationOperationId(kind, table_name, definition_json);
+        var operation_id_buf: [32]u8 = undefined;
+        const operation_id_hex = routes.formatTableMutationOperationId(operation_id, &operation_id_buf);
+        const body = try std.json.Stringify.valueAlloc(self.alloc, routes.ForwardedTableMutation{
+            .operation_id = operation_id_hex,
+            .kind = kind,
             .table_name = table_name,
-        }, .{});
+            .definition_json = definition_json,
+        }, .{ .emit_null_optional_fields = false });
         defer self.alloc.free(body);
-        const uri = try join(self.alloc, base_uri, routes.Routes.internal_forwarded_table_drop);
+        const uri = try join(self.alloc, base_uri, routes.Routes.internal_forwarded_table_mutation);
         defer self.alloc.free(uri);
-        var resp = self.executeWithRetryPolicy(.{
+
+        var remaining_buf: [10]u8 = undefined;
+        var forwards_buf: [3]u8 = undefined;
+        const request_headers = [_]http_common.RequestHeader{
+            .{
+                .name = routes.Routes.raft_mutation_remaining_ms_header,
+                .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}),
+            },
+            .{
+                .name = routes.Routes.raft_mutation_forwards_remaining_header,
+                .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{forwarding.forwards_remaining}),
+            },
+            .{
+                .name = routes.Routes.raft_mutation_campaign_allowed_header,
+                .value = if (forwarding.campaign_allowed) "true" else "false",
+            },
+        };
+        var delivery_tracker: http_common.RequestDeliveryTracker = .{};
+        var resp = internal_service_auth.executeRequest(self.alloc, self.executor, .{
             .method = .POST,
             .uri = uri,
+            .headers = &request_headers,
             .body = body,
             .content_type = "application/json",
-            .timeout_ms = default_request_timeout_ms,
-        }, null, .marked_table_mutation) catch |err| switch (err) {
-            error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
-            else => return err,
+            .timeout_ms = @min(default_request_timeout_ms, forwarding.remaining_ms),
+            .delivery_tracker = &delivery_tracker,
+        }, self.internal_service) catch |err| {
+            const delivery = delivery_tracker.load();
+            if (delivery == .not_sent or
+                (delivery == .unknown and err == error.ConnectionRefused))
+            {
+                return error.NotLeader;
+            }
+            return error.MetadataMutationOutcomeUnknown;
         };
         defer resp.deinit(self.alloc);
-        if (!responseHasHeaderValueAnyStatus(
-            resp,
-            routes.Routes.table_mutation_protocol_header,
-            routes.Routes.table_mutation_protocol_value,
-        )) return error.MetadataMutationOutcomeUnknown;
-        if (resp.status == 204) return;
+        const outcome = raft_mutation_forwarding.parseOutcome(
+            responseHeader(resp, routes.Routes.raft_mutation_outcome_header),
+            routes.Routes.raft_mutation_outcome_not_proposed,
+            routes.Routes.raft_mutation_outcome_unknown,
+            routes.Routes.raft_mutation_outcome_committed,
+            "committed-visibility-pending-v1",
+            "committed-repair-required-v1",
+        ) orelse return error.MetadataMutationOutcomeUnknown;
+        if (outcome == .not_proposed and resp.status == 503) return error.NotLeader;
+        if (outcome == .committed and
+            ((kind == .create_table and resp.status == 201) or
+                (kind == .drop_table and resp.status == 204))) return;
         return switch (resp.status) {
+            400 => if (kind == .create_table) error.InvalidCreateTableRequest else error.InvalidTableName,
             404 => error.TableNotFound,
             405 => error.UnsupportedOperation,
-            409 => error.TableTransitionActive,
+            409 => if (kind == .create_table) error.TableAlreadyExists else error.TableTransitionActive,
             else => error.MetadataMutationOutcomeUnknown,
         };
     }
@@ -858,7 +887,6 @@ pub const MetadataHttpClient = struct {
             const retryable_authority_response = switch (retry_policy) {
                 .replay_safe => isMetadataNotLeaderResponse(resp),
                 .at_most_once => isMetadataMutationNotAdmittedResponse(resp),
-                .marked_table_mutation => isMarkedTableMutationNotAdmittedResponse(resp),
             };
             if (!retryable_authority_response) return resp;
             if (not_leader_attempt >= max_metadata_not_leader_retries) {
@@ -895,17 +923,17 @@ pub const MetadataHttpClient = struct {
         );
     }
 
-    fn isMarkedTableMutationNotAdmittedResponse(resp: http_common.HttpResponse) bool {
-        return isMetadataMutationNotAdmittedResponse(resp) and responseHasHeaderValueAnyStatus(
-            resp,
-            routes.Routes.table_mutation_protocol_header,
-            routes.Routes.table_mutation_protocol_value,
-        );
-    }
-
     fn responseHasHeaderValue(resp: http_common.HttpResponse, name: []const u8, value: []const u8) bool {
         if (resp.status != 503) return false;
         return responseHasHeaderValueAnyStatus(resp, name, value);
+    }
+
+    fn responseHeader(resp: http_common.HttpResponse, name: []const u8) ?[]const u8 {
+        for (resp.headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, name))
+                return std.mem.trim(u8, header.value, " \t\r\n");
+        }
+        return null;
     }
 
     fn responseHasHeaderValueAnyStatus(resp: http_common.HttpResponse, name: []const u8, value: []const u8) bool {
@@ -1357,32 +1385,39 @@ test "metadata http client forwards table create and drop to the internal route"
             try std.testing.expect(std.mem.endsWith(u8, req.uri, self.expected_uri_suffix));
             if (self.expected_body) |body| {
                 try std.testing.expectEqualStrings(body, req.body);
-            } else {
-                try std.testing.expectEqual(@as(usize, 0), req.body.len);
             }
             var service_auth_headers: usize = 0;
+            var routing_headers: usize = 0;
             for (req.headers) |header| {
-                if (!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) continue;
-                service_auth_headers += 1;
-                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                if (std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) {
+                    service_auth_headers += 1;
+                    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                }
+                if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_remaining_ms_header) or
+                    std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_forwards_remaining_header) or
+                    std.ascii.eqlIgnoreCase(header.name, routes.Routes.raft_mutation_campaign_allowed_header))
+                {
+                    routing_headers += 1;
+                }
             }
             try std.testing.expectEqual(@as(usize, if (self.expect_service_auth) 1 else 0), service_auth_headers);
+            try std.testing.expectEqual(@as(usize, 3), routing_headers);
             const headers = try alloc.alloc(http_common.Header, 1);
             errdefer alloc.free(headers);
             headers[0] = .{
-                .name = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_header),
+                .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
                 .value = &.{},
             };
             errdefer headers[0].deinit(alloc);
-            headers[0].value = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_value);
+            headers[0].value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed);
             return .{ .status = self.success_status, .headers = headers };
         }
     };
 
     var create_exec = RecordingExecutor{
         .expected_method = .POST,
-        .expected_uri_suffix = routes.Routes.internal_forwarded_table_create,
-        .expected_body = "{\"table_name\":\"sales/archive\",\"definition_json\":\"{\\\"num_shards\\\":1}\"}",
+        .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
+        .expected_body = "{\"protocol_version\":3,\"operation_id\":\"54aa403a0a168d74ed396383e0942204\",\"kind\":\"create_table\",\"table_name\":\"sales/archive\",\"definition_json\":\"{\\\"num_shards\\\":1}\"}",
         .success_status = 201,
         .expect_service_auth = true,
     };
@@ -1393,8 +1428,8 @@ test "metadata http client forwards table create and drop to the internal route"
 
     var drop_exec = RecordingExecutor{
         .expected_method = .POST,
-        .expected_uri_suffix = routes.Routes.internal_forwarded_table_drop,
-        .expected_body = "{\"table_name\":\"sales%2Farchive\"}",
+        .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
+        .expected_body = null,
         .success_status = 204,
     };
     var drop_client = MetadataHttpClient.init(std.testing.allocator, drop_exec.executor());
@@ -1431,6 +1466,7 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
     const RejectingExecutor = struct {
         header_name: []const u8,
         header_value: []const u8,
+        outcome_value: []const u8,
         attempts: usize = 0,
 
         fn ownedHeader(
@@ -1463,8 +1499,8 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
             initialized += 1;
             headers[initialized] = try ownedHeader(
                 alloc,
-                routes.Routes.table_mutation_protocol_header,
-                routes.Routes.table_mutation_protocol_value,
+                routes.Routes.raft_mutation_outcome_header,
+                self.outcome_value,
             );
             initialized += 1;
             const body = try alloc.dupe(u8, "metadata authority unavailable");
@@ -1475,17 +1511,19 @@ test "metadata http client surfaces typed rejection for forwarded table mutation
     var not_admitted = RejectingExecutor{
         .header_name = http_common.metadata_mutation_not_admitted_header,
         .header_value = http_common.metadata_mutation_not_admitted_value,
+        .outcome_value = routes.Routes.raft_mutation_outcome_not_proposed,
     };
     var not_admitted_client = MetadataHttpClient.init(std.testing.allocator, not_admitted.executor());
     try std.testing.expectError(
         error.NotLeader,
         not_admitted_client.createTableForwarded("http://127.0.0.1:9000", "docs", "{}"),
     );
-    try std.testing.expectEqual(@as(usize, 1 + max_metadata_not_leader_retries), not_admitted.attempts);
+    try std.testing.expectEqual(@as(usize, 1), not_admitted.attempts);
 
     var broad_hint = RejectingExecutor{
         .header_name = http_common.metadata_not_leader_header,
         .header_value = http_common.metadata_not_leader_value,
+        .outcome_value = routes.Routes.raft_mutation_outcome_unknown,
     };
     var broad_hint_client = MetadataHttpClient.init(std.testing.allocator, broad_hint.executor());
     try std.testing.expectError(
@@ -1536,11 +1574,11 @@ test "metadata http client preserves unrecognized server outcomes for forwarded 
                 const headers = try alloc.alloc(http_common.Header, 1);
                 errdefer alloc.free(headers);
                 headers[0] = .{
-                    .name = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_header),
+                    .name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header),
                     .value = &.{},
                 };
                 errdefer headers[0].deinit(alloc);
-                headers[0].value = try alloc.dupe(u8, routes.Routes.table_mutation_protocol_value);
+                headers[0].value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_committed);
                 return .{ .status = self.status, .headers = headers };
             }
             return .{ .status = self.status };

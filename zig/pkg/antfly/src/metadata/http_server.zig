@@ -25,6 +25,7 @@ const extension_operations = @import("extension_operations.zig");
 const node_operations = @import("node_operations.zig");
 const table_operations = @import("table_operations.zig");
 const operation = @import("../api/operation.zig");
+const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
 const metadata_table_manager = @import("table_manager.zig");
@@ -1238,8 +1239,11 @@ pub const MetadataHttpServer = struct {
         try server.post(extension_path ++ routes.Routes.internal_extension_disable_suffix, httpx.Handler.bind(self, metadataDisableExtension));
         try server.put(extension_path ++ routes.Routes.internal_extension_config_suffix, httpx.Handler.bind(self, metadataConfigureExtension));
 
-        try server.postWithBodyLimit(routes.Routes.internal_forwarded_table_create, max_forwarded_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTableForwarded));
-        try server.post(routes.Routes.internal_forwarded_table_drop, httpx.Handler.bind(self, metadataDropTableForwarded));
+        try server.postWithBodyLimit(
+            routes.Routes.internal_forwarded_table_mutation,
+            max_forwarded_table_create_body_bytes,
+            httpx.Handler.bind(self, metadataTableMutationForwarded),
+        );
         const table_path = routes.Routes.internal_tables_prefix ++ ":table_name";
         try server.postWithBodyLimit(table_path, tables_api.max_table_create_body_bytes, httpx.Handler.bind(self, metadataCreateTable));
         try server.delete(table_path, httpx.Handler.bind(self, metadataDropTable));
@@ -1939,34 +1943,74 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataCreateTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        try ctx.setHeader(
-            routes.Routes.table_mutation_protocol_header,
-            routes.Routes.table_mutation_protocol_value,
-        );
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
         return self.executeMetadataCreateTable(ctx, table_name, (try ctx.body()) orelse "");
     }
 
-    fn metadataCreateTableForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+    fn metadataTableMutationForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const forwarding = raft_mutation_forwarding.parseValues(
+            ctx.header(routes.Routes.raft_mutation_remaining_ms_header),
+            ctx.header(routes.Routes.raft_mutation_forwards_remaining_header),
+            ctx.header(routes.Routes.raft_mutation_campaign_allowed_header),
+            .{ .max_remaining_ms = 5_000, .max_forwards = 2 },
+        ) catch return ctx.status(400).text("invalid raft mutation forwarding context");
+        // Forwarded mutation endpoints require the complete routing context;
+        // accepting a headerless request would bypass hop/deadline ownership.
+        if (forwarding == null)
+            return ctx.status(400).text("missing raft mutation forwarding context");
         try ctx.setHeader(
-            routes.Routes.table_mutation_protocol_header,
-            routes.Routes.table_mutation_protocol_value,
+            routes.Routes.raft_mutation_outcome_header,
+            routes.Routes.raft_mutation_outcome_not_proposed,
         );
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const body = (try ctx.body()) orelse "";
         validateForwardedCreateTableBodySize(body.len) catch
-            return ctx.status(413).text("create table request too large");
+            return ctx.status(413).text("table mutation request too large");
         var forwarded = std.json.parseFromSlice(
-            routes.ForwardedCreateTableMutation,
+            routes.ForwardedTableMutation,
             ctx.allocator,
             body,
             .{ .allocate = .alloc_always },
-        ) catch return ctx.status(400).text("invalid forwarded create table request");
+        ) catch return ctx.status(400).text("invalid forwarded table mutation");
         defer forwarded.deinit();
+        if (forwarded.value.protocol_version != routes.Routes.table_mutation_protocol_version)
+            return ctx.status(426).text("unsupported table mutation protocol");
         tables_api.validateTableMutationName(forwarded.value.table_name) catch
             return ctx.status(400).text("invalid table name");
-        return self.executeMetadataCreateTable(ctx, forwarded.value.table_name, forwarded.value.definition_json);
+        const operation_id = routes.parseTableMutationOperationId(forwarded.value.operation_id) catch
+            return ctx.status(400).text("invalid table mutation operation id");
+        const expected_operation_id = routes.tableMutationOperationId(
+            forwarded.value.kind,
+            forwarded.value.table_name,
+            forwarded.value.definition_json,
+        );
+        if (!std.mem.eql(u8, &operation_id, &expected_operation_id))
+            return ctx.status(400).text("table mutation operation id mismatch");
+        try ctx.setHeader(
+            routes.Routes.raft_mutation_outcome_header,
+            routes.Routes.raft_mutation_outcome_unknown,
+        );
+        const response = switch (forwarded.value.kind) {
+            .create_table => try self.executeMetadataCreateTable(
+                ctx,
+                forwarded.value.table_name,
+                forwarded.value.definition_json orelse
+                    return ctx.status(400).text("missing create table definition"),
+            ),
+            .drop_table => blk: {
+                if (forwarded.value.definition_json != null)
+                    return ctx.status(400).text("drop table definition must be absent");
+                break :blk try self.executeMetadataDropTable(ctx, forwarded.value.table_name);
+            },
+        };
+        if (response.status.code >= 200 and response.status.code < 300) {
+            try ctx.setHeader(
+                routes.Routes.raft_mutation_outcome_header,
+                routes.Routes.raft_mutation_outcome_committed,
+            );
+        }
+        return response;
     }
 
     fn executeMetadataCreateTable(
@@ -2007,31 +2051,9 @@ pub const MetadataHttpServer = struct {
     }
 
     fn metadataDropTable(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        try ctx.setHeader(
-            routes.Routes.table_mutation_protocol_header,
-            routes.Routes.table_mutation_protocol_value,
-        );
         self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
         const table_name = requiredParam(ctx, "table_name") catch return ctx.status(400).text("invalid table name");
         return self.executeMetadataDropTable(ctx, table_name);
-    }
-
-    fn metadataDropTableForwarded(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
-        try ctx.setHeader(
-            routes.Routes.table_mutation_protocol_header,
-            routes.Routes.table_mutation_protocol_value,
-        );
-        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
-        var forwarded = std.json.parseFromSlice(
-            routes.ForwardedDropTableMutation,
-            ctx.allocator,
-            (try ctx.body()) orelse "",
-            .{ .allocate = .alloc_always },
-        ) catch return ctx.status(400).text("invalid forwarded drop table request");
-        defer forwarded.deinit();
-        tables_api.validateTableMutationName(forwarded.value.table_name) catch
-            return ctx.status(400).text("invalid table name");
-        return self.executeMetadataDropTable(ctx, forwarded.value.table_name);
     }
 
     fn executeMetadataDropTable(

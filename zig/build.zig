@@ -6518,6 +6518,8 @@ pub fn build(b: *std.Build) void {
             "started table mutations preserve authority-loss ambiguity",
             "table mutation names preserve the public contract",
             "stored create table encoding",
+            "raft mutation ",
+            "table topology mutation ",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

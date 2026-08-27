@@ -68,6 +68,26 @@ pub const TableTransitionFence = struct {
     }
 };
 
+pub const TableMutationOperationId = [16]u8;
+
+/// One durable, atomic table-topology intent. Placement changes remain the
+/// responsibility of the normal reconciler, but the catalog definition and
+/// its ranges can no longer be partially published or removed by a sequence
+/// of independently forwarded proposals.
+pub const TableTopologyMutation = union(enum) {
+    create: struct {
+        operation_id: TableMutationOperationId,
+        table: metadata.TableRecord,
+        ranges: []const metadata.RangeRecord,
+    },
+    drop: struct {
+        operation_id: TableMutationOperationId,
+        table_id: u64,
+        expected_name: []const u8,
+        expected_transition_generation: u64,
+    },
+};
+
 pub const TransitionCommand = union(enum) {
     initialize_metadata_incarnation: metadata_incarnation.MetadataClusterIncarnation,
     upsert_node: metadata.NodeRecord,
@@ -109,6 +129,7 @@ pub const TransitionCommand = union(enum) {
         table_id: u64,
         expected_transition_generation: u64,
     },
+    apply_table_topology: TableTopologyMutation,
     upsert_schema_progress: metadata.SchemaProgressRecord,
     remove_schema_progress: struct {
         table_id: u64,
@@ -207,6 +228,14 @@ pub const TransitionCommand = union(enum) {
                 metadata_table_manager.freeTable(alloc, replacement.expected);
                 metadata_table_manager.freeTable(alloc, replacement.replacement);
             },
+            .apply_table_topology => |*mutation| switch (mutation.*) {
+                .create => |*create| {
+                    metadata_table_manager.freeTable(alloc, create.table);
+                    for (create.ranges) |record| metadata_table_manager.freeRange(alloc, record);
+                    alloc.free(create.ranges);
+                },
+                .drop => |drop| alloc.free(drop.expected_name),
+            },
             .upsert_restore_progress => |*record| {
                 metadata_table_manager.freeRestoreProgress(alloc, record.*);
             },
@@ -298,6 +327,21 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
         },
         .remove_table => |record| {
             if (record.table_id == 0) return error.InvalidTableId;
+        },
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |create| {
+                if (create.table.table_id == 0 or create.table.name.len == 0 or create.ranges.len == 0)
+                    return error.InvalidTableTopologyMutation;
+                for (create.ranges) |record| {
+                    try group_ids.requireDataGroupId(record.group_id);
+                    if (record.table_id != create.table.table_id)
+                        return error.InvalidTableTopologyMutation;
+                }
+            },
+            .drop => |drop| {
+                if (drop.table_id == 0 or drop.expected_name.len == 0)
+                    return error.InvalidTableTopologyMutation;
+            },
         },
         .claim_replication_source_cutover => |claim| {
             if (claim.expected_replication_sources_json.len == 0 or
@@ -512,6 +556,11 @@ test "transition command validation rejects metadata group ids in data group fie
         .{ .remove_restore_progress = .{ .table_id = 1, .node_id = 1, .group_id = metadata_group_id } },
         .{ .upsert_range = .{ .group_id = metadata_group_id, .table_id = 1, .start_key = "" } },
         .{ .remove_range = .{ .group_id = metadata_group_id } },
+        .{ .apply_table_topology = .{ .create = .{
+            .operation_id = @splat(1),
+            .table = .{ .table_id = 1, .name = "docs" },
+            .ranges = &.{.{ .group_id = metadata_group_id, .table_id = 1, .start_key = "" }},
+        } } },
         .{ .upsert_split_transition = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = metadata_group_id, .destination_group_id = 2 } },
         .{ .upsert_split_transition = .{ .transition_id = 1, .attempt_epoch = 1, .source_group_id = 2, .destination_group_id = metadata_group_id } },
         .{ .upsert_merge_transition = .{ .transition_id = 1, .donor_group_id = metadata_group_id, .receiver_group_id = 2 } },
@@ -521,6 +570,82 @@ test "transition command validation rejects metadata group ids in data group fie
     for (commands) |command| {
         try std.testing.expectError(error.ReservedGroupId, validateTransitionCommandDataGroupIds(command));
     }
+}
+
+test "table topology mutation atomically creates and drops catalog ranges" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-table-topology-mutation",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const metadata_group_id: u64 = 21;
+    const table = metadata.TableRecord{ .table_id = 7, .name = "docs", .min_ranges = 2 };
+    const ranges = [_]metadata.RangeRecord{
+        .{ .group_id = 301, .range_id = 301, .table_id = 7, .start_key = "", .end_key = "doc:m" },
+        .{ .group_id = 302, .range_id = 302, .table_id = 7, .start_key = "doc:m", .end_key = null },
+    };
+    const operation_id: TableMutationOperationId = @splat(0x41);
+    const create = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .create = .{
+            .operation_id = operation_id,
+            .table = table,
+            .ranges = &ranges,
+        } },
+    });
+    defer std.testing.allocator.free(create);
+    var decoded_create = (try decodeTransitionCommand(std.testing.allocator, create)).?;
+    defer decoded_create.deinit(std.testing.allocator);
+    try std.testing.expectEqual(operation_id, decoded_create.apply_table_topology.create.operation_id);
+    try std.testing.expectEqual(@as(usize, 2), decoded_create.apply_table_topology.create.ranges.len);
+
+    const create_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = create },
+    });
+    defer std.testing.allocator.free(create_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 1,
+        .entries_bytes = create_entries,
+    });
+    {
+        const projected_tables = try store.listTables(std.testing.allocator, metadata_group_id);
+        defer store.freeTables(std.testing.allocator, projected_tables);
+        const projected_ranges = try store.listRanges(std.testing.allocator, metadata_group_id);
+        defer store.freeRanges(std.testing.allocator, projected_ranges);
+        try std.testing.expectEqual(@as(usize, 1), projected_tables.len);
+        try std.testing.expectEqual(@as(usize, 2), projected_ranges.len);
+    }
+
+    const drop = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .drop = .{
+            .operation_id = @splat(0x42),
+            .table_id = table.table_id,
+            .expected_name = table.name,
+            .expected_transition_generation = 0,
+        } },
+    });
+    defer std.testing.allocator.free(drop);
+    const drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = drop },
+    });
+    defer std.testing.allocator.free(drop_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 2,
+        .entries_bytes = drop_entries,
+    });
+    const projected_tables = try store.listTables(std.testing.allocator, metadata_group_id);
+    defer store.freeTables(std.testing.allocator, projected_tables);
+    const projected_ranges = try store.listRanges(std.testing.allocator, metadata_group_id);
+    defer store.freeRanges(std.testing.allocator, projected_ranges);
+    try std.testing.expectEqual(@as(usize, 0), projected_tables.len);
+    try std.testing.expectEqual(@as(usize, 0), projected_ranges.len);
 }
 
 test "metadata raft apply store restore job transition encoding is append-only compatible" {
@@ -2070,6 +2195,8 @@ pub const RaftApplyStore = struct {
             .upsert_replica_intent, .remove_replica_intent => metadataSnapshotProjectionBit(.placement) |
                 metadataSnapshotProjectionBit(.placement_version),
             .upsert_table, .compare_and_replace_table, .remove_table => metadataSnapshotProjectionBit(.table),
+            .apply_table_topology => metadataSnapshotProjectionBit(.table) |
+                metadataSnapshotProjectionBit(.range),
             .upsert_schema_progress, .remove_schema_progress => metadataSnapshotProjectionBit(.schema_progress),
             .upsert_restore_progress, .remove_restore_progress => metadataSnapshotProjectionBit(.restore_progress),
             .upsert_replication_source_status, .claim_replication_source_cutover, .complete_replication_source_retirement => metadataSnapshotProjectionBit(.replication_source_status),
@@ -2575,6 +2702,9 @@ pub const RaftApplyStore = struct {
                     .table_id = record.table_id,
                 });
             },
+            .apply_table_topology => |mutation| {
+                try self.applyTableTopologyMutationTxn(txn, group_id, mutation);
+            },
             .upsert_schema_progress => |record| {
                 const table_name = try self.lookupTableNameTxn(txn, group_id, record.table_id);
                 defer if (table_name) |name| self.alloc.free(name);
@@ -3012,6 +3142,133 @@ pub const RaftApplyStore = struct {
         }
         if ((try self.loadTableTransitionFenceTxn(txn, group_id, record.table_id)).active()) return;
         try self.putTableRecordTxn(txn, group_id, key, record);
+    }
+
+    fn applyTableTopologyMutationTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        mutation: TableTopologyMutation,
+    ) !void {
+        switch (mutation) {
+            .create => |create| {
+                _ = create.operation_id;
+                if ((try self.loadTableTransitionFenceTxn(
+                    txn,
+                    group_id,
+                    create.table.table_id,
+                )).active()) return;
+
+                var table_key_buf: [160]u8 = undefined;
+                const table_key = try tableKeyForGroup(
+                    &table_key_buf,
+                    group_id,
+                    create.table.table_id,
+                );
+                const encoded_table = txn.get(table_key) catch |err| switch (err) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                if (encoded_table) |encoded| {
+                    const existing = try decodeTableRecord(self.alloc, encoded);
+                    defer metadata_table_manager.freeTable(self.alloc, existing);
+                    if (!metadata_table_manager.tableDefinitionsEqual(existing, create.table)) return;
+                }
+
+                var unique_groups = std.AutoHashMapUnmanaged(u64, void).empty;
+                defer unique_groups.deinit(self.alloc);
+                try unique_groups.ensureTotalCapacity(self.alloc, @intCast(create.ranges.len));
+                for (create.ranges) |record| {
+                    if (unique_groups.contains(record.group_id)) return;
+                    unique_groups.putAssumeCapacity(record.group_id, {});
+                    var range_key_buf: [160]u8 = undefined;
+                    const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
+                    const encoded_range = txn.get(range_key) catch |err| switch (err) {
+                        error.NotFound => continue,
+                        else => return err,
+                    };
+                    const existing = try decodeRangeRecord(self.alloc, encoded_range);
+                    defer metadata_table_manager.freeRange(self.alloc, existing);
+                    if (!metadata_table_manager.rangeRecordsEqual(existing, record)) return;
+                }
+
+                if (encoded_table == null)
+                    try self.putTableRecordTxn(txn, group_id, table_key, create.table);
+                for (create.ranges) |record| {
+                    var range_key_buf: [160]u8 = undefined;
+                    const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
+                    const existing_range = txn.get(range_key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (existing_range != null) continue;
+                    const encoded_range = try encodeRangeRecord(self.alloc, record);
+                    defer self.alloc.free(encoded_range);
+                    try txn.put(range_key, encoded_range);
+                    self.notifyCommittedKeyListeners(.{
+                        .metadata_group_id = group_id,
+                        .key = range_key,
+                    });
+                    self.notifyProjectionListeners(.{
+                        .kind = .range,
+                        .metadata_group_id = group_id,
+                        .table_name = create.table.name,
+                        .table_id = create.table.table_id,
+                        .group_id = record.group_id,
+                    });
+                }
+            },
+            .drop => |drop| {
+                _ = drop.operation_id;
+                const fence = try self.loadTableTransitionFenceTxn(txn, group_id, drop.table_id);
+                if (fence.active() or fence.generation != drop.expected_transition_generation) return;
+
+                var table_key_buf: [160]u8 = undefined;
+                const table_key = try tableKeyForGroup(&table_key_buf, group_id, drop.table_id);
+                const encoded_table = txn.get(table_key) catch |err| switch (err) {
+                    // Replaying an already-applied drop is an idempotent
+                    // success. The caller verifies absence after its receipt.
+                    error.NotFound => return,
+                    else => return err,
+                };
+                const existing = try decodeTableRecord(self.alloc, encoded_table);
+                defer metadata_table_manager.freeTable(self.alloc, existing);
+                if (!std.mem.eql(u8, existing.name, drop.expected_name)) return;
+
+                var range_prefix_buf: [160]u8 = undefined;
+                const range_prefix = try rangePrefixForGroup(&range_prefix_buf, group_id);
+                const rows = try docstore.DocStore.scanPrefixTxn(self.alloc, txn, range_prefix);
+                defer docstore.DocStore.freeResults(self.alloc, rows);
+                for (rows) |row| {
+                    const record = try decodeRangeRecord(self.alloc, row.value);
+                    defer metadata_table_manager.freeRange(self.alloc, record);
+                    if (record.table_id != drop.table_id) continue;
+                    try txn.delete(row.key);
+                    self.notifyCommittedKeyListeners(.{
+                        .metadata_group_id = group_id,
+                        .key = row.key,
+                    });
+                    self.notifyProjectionListeners(.{
+                        .kind = .range,
+                        .metadata_group_id = group_id,
+                        .table_name = existing.name,
+                        .table_id = drop.table_id,
+                        .group_id = record.group_id,
+                    });
+                }
+                try txn.delete(table_key);
+                self.notifyCommittedKeyListeners(.{
+                    .metadata_group_id = group_id,
+                    .key = table_key,
+                });
+                self.notifyProjectionListeners(.{
+                    .kind = .table,
+                    .metadata_group_id = group_id,
+                    .table_name = existing.name,
+                    .table_id = drop.table_id,
+                });
+            },
+        }
     }
 
     fn applyReplicationSourceStatusUpsertTxn(
@@ -4417,6 +4674,7 @@ const TransitionTag = enum(u8) {
     compare_and_replace_table = 47,
     claim_replication_source_cutover = 48,
     complete_replication_source_retirement = 49,
+    apply_table_topology = 50,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -4497,6 +4755,37 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
                 u64,
                 record.expected_transition_generation,
             );
+        },
+        .apply_table_topology => |mutation| {
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_table_topology));
+            switch (mutation) {
+                .create => |create| {
+                    try out.append(alloc, 1);
+                    try out.appendSlice(alloc, &create.operation_id);
+                    try appendFramedTableRecord(alloc, &out, create.table);
+                    try appendInt(
+                        alloc,
+                        &out,
+                        u32,
+                        std.math.cast(u32, create.ranges.len) orelse
+                            return error.InvalidMetadataTransitionEncoding,
+                    );
+                    for (create.ranges) |record| {
+                        const encoded_range = try encodeRangeRecord(alloc, record);
+                        defer alloc.free(encoded_range);
+                        try appendInt(alloc, &out, u32, std.math.cast(u32, encoded_range.len) orelse
+                            return error.InvalidMetadataTransitionEncoding);
+                        try out.appendSlice(alloc, encoded_range);
+                    }
+                },
+                .drop => |drop| {
+                    try out.append(alloc, 2);
+                    try out.appendSlice(alloc, &drop.operation_id);
+                    try appendInt(alloc, &out, u64, drop.table_id);
+                    try appendRequiredString(alloc, &out, drop.expected_name);
+                    try appendInt(alloc, &out, u64, drop.expected_transition_generation);
+                },
+            }
         },
         .upsert_schema_progress => |record| {
             try out.append(alloc, @intFromEnum(TransitionTag.upsert_schema_progress));
@@ -4741,6 +5030,53 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
                     u64,
                 ),
             },
+        },
+        .apply_table_topology => blk: {
+            const kind = try readInt(encoded, &pos, u8);
+            if (pos + @sizeOf(TableMutationOperationId) > encoded.len)
+                return error.InvalidMetadataTransitionEncoding;
+            var operation_id: TableMutationOperationId = undefined;
+            @memcpy(&operation_id, encoded[pos..][0..operation_id.len]);
+            pos += operation_id.len;
+            if (kind == 1) {
+                const table = try readFramedTableRecord(alloc, encoded, &pos);
+                errdefer metadata_table_manager.freeTable(alloc, table);
+                const range_count = try readInt(encoded, &pos, u32);
+                if (range_count == 0 or range_count > 65_536)
+                    return error.InvalidMetadataTransitionEncoding;
+                const ranges = try alloc.alloc(metadata.RangeRecord, range_count);
+                var decoded_count: usize = 0;
+                errdefer {
+                    for (ranges[0..decoded_count]) |record| metadata_table_manager.freeRange(alloc, record);
+                    alloc.free(ranges);
+                }
+                for (ranges) |*record| {
+                    const frame_len = try readInt(encoded, &pos, u32);
+                    if (frame_len == 0 or pos + frame_len > encoded.len)
+                        return error.InvalidMetadataTransitionEncoding;
+                    record.* = try decodeRangeRecord(alloc, encoded[pos .. pos + frame_len]);
+                    pos += frame_len;
+                    decoded_count += 1;
+                }
+                break :blk .{ .apply_table_topology = .{ .create = .{
+                    .operation_id = operation_id,
+                    .table = table,
+                    .ranges = ranges,
+                } } };
+            }
+            if (kind == 2) {
+                const table_id = try readInt(encoded, &pos, u64);
+                const expected_name = try readRequiredString(alloc, encoded, &pos);
+                errdefer alloc.free(expected_name);
+                const expected_transition_generation = try readInt(encoded, &pos, u64);
+                break :blk .{ .apply_table_topology = .{ .drop = .{
+                    .operation_id = operation_id,
+                    .table_id = table_id,
+                    .expected_name = expected_name,
+                    .expected_transition_generation = expected_transition_generation,
+                } } };
+            }
+            return error.InvalidMetadataTransitionEncoding;
         },
         .upsert_schema_progress => .{
             .upsert_schema_progress = try readSchemaProgressRecord(encoded, &pos),

@@ -47,6 +47,7 @@ const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const api_operation = @import("../api/operation.zig");
+const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
@@ -639,23 +640,18 @@ fn tableMutationRouteFromObservation(
     observation: ServiceGroupRaftObservation,
     peers: []const ReallocationProtocolPeer,
 ) !MetadataHttpService.TableMutationRoute {
-    const leader_id = observation.leader_id orelse return error.NotLeader;
-    // The caller already failed the authoritative local-leader check; a stale
-    // observation naming this node must not forward to itself.
-    if (leader_id == observation.local_node_id) return error.NotLeader;
-    const peer = findReallocationProtocolPeer(peers, leader_id) orelse {
-        std.log.warn("table mutation routing blocked: metadata leader {d} is not in the configured peer set", .{leader_id});
+    const index = raft_mutation_forwarding.selectRemoteLeaderPeerIndex(
+        observation.local_node_id,
+        observation.leader_id,
+        peers,
+    ) catch |err| {
+        std.log.warn(
+            "table mutation routing blocked: local={d} leader={?d} class={s}",
+            .{ observation.local_node_id, observation.leader_id, @errorName(err) },
+        );
         return error.NotLeader;
     };
-    const orchestration_url = peer.orchestration_url orelse {
-        std.log.warn("table mutation routing blocked: metadata leader {d} has no orchestration URL", .{leader_id});
-        return error.NotLeader;
-    };
-    if (orchestration_url.len == 0) {
-        std.log.warn("table mutation routing blocked: metadata leader {d} has an empty orchestration URL", .{leader_id});
-        return error.NotLeader;
-    }
-    return .{ .forward = peer };
+    return .{ .forward = peers[index] };
 }
 
 test "metadata.table mutation routing forwards only to a routable remote leader" {

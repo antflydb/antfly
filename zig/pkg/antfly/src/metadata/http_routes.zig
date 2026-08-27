@@ -14,14 +14,57 @@
 
 const std = @import("std");
 
-pub const ForwardedCreateTableMutation = struct {
-    table_name: []const u8,
-    definition_json: []const u8,
+pub const TableMutationKind = enum {
+    create_table,
+    drop_table,
 };
 
-pub const ForwardedDropTableMutation = struct {
+pub const ForwardedTableMutation = struct {
+    protocol_version: u16 = Routes.table_mutation_protocol_version,
+    operation_id: []const u8,
+    kind: TableMutationKind,
     table_name: []const u8,
+    definition_json: ?[]const u8 = null,
 };
+
+pub const TableMutationOperationId = [16]u8;
+
+fn hashMutationPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var len: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &len, @intCast(value.len), .little);
+    hasher.update(&len);
+    hasher.update(value);
+}
+
+pub fn tableMutationOperationId(
+    kind: TableMutationKind,
+    table_name: []const u8,
+    definition_json: ?[]const u8,
+) TableMutationOperationId {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-metadata-table-mutation-v1");
+    hashMutationPart(&hasher, @tagName(kind));
+    hashMutationPart(&hasher, table_name);
+    hashMutationPart(&hasher, definition_json orelse "");
+    var digest: [32]u8 = undefined;
+    hasher.final(&digest);
+    return digest[0..@sizeOf(TableMutationOperationId)].*;
+}
+
+pub fn formatTableMutationOperationId(
+    operation_id: TableMutationOperationId,
+    out: *[32]u8,
+) []const u8 {
+    return std.fmt.bufPrint(out, "{x}", .{operation_id}) catch unreachable;
+}
+
+pub fn parseTableMutationOperationId(raw: []const u8) !TableMutationOperationId {
+    if (raw.len != 32) return error.InvalidTableMutationOperationId;
+    var operation_id: TableMutationOperationId = undefined;
+    _ = std.fmt.hexToBytes(&operation_id, raw) catch
+        return error.InvalidTableMutationOperationId;
+    return operation_id;
+}
 
 pub const Routes = struct {
     pub const health = "/metadata/v1/health";
@@ -52,10 +95,15 @@ pub const Routes = struct {
     pub const internal_extension_enable_suffix = "/enable";
     pub const internal_extension_disable_suffix = "/disable";
     pub const internal_extension_config_suffix = "/config";
-    pub const table_mutation_protocol_header = "X-Antfly-Metadata-Table-Mutation-Protocol";
-    pub const table_mutation_protocol_value = "2";
-    pub const internal_forwarded_table_create = "/internal/v1/table-mutations/create";
-    pub const internal_forwarded_table_drop = "/internal/v1/table-mutations/drop";
+    pub const table_mutation_protocol_version: u16 = 3;
+    pub const raft_mutation_remaining_ms_header = "X-Antfly-Raft-Mutation-Remaining-Ms";
+    pub const raft_mutation_forwards_remaining_header = "X-Antfly-Raft-Mutation-Forwards-Remaining";
+    pub const raft_mutation_campaign_allowed_header = "X-Antfly-Raft-Mutation-Campaign-Allowed";
+    pub const raft_mutation_outcome_header = "X-Antfly-Raft-Mutation-Outcome";
+    pub const raft_mutation_outcome_not_proposed = "not-proposed-v1";
+    pub const raft_mutation_outcome_unknown = "unknown-v1";
+    pub const raft_mutation_outcome_committed = "committed-v1";
+    pub const internal_forwarded_table_mutation = "/internal/v1/raft-mutations/table-topology";
     pub const internal_tables_prefix = "/internal/v1/tables/";
     pub const internal_table_restore_suffix = "/restore";
     pub const internal_table_definition_suffix = "/definition";

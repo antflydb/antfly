@@ -8525,20 +8525,16 @@ pub const DataServer = struct {
         request_campaign_consumed: bool,
     ) ?antfly.public_api.internal_batch_forwarding.Context {
         if (!route.allow_remote_forward or route.forwards_remaining == 0) return null;
-        if (now_ns >= deadline_ns) return null;
-        const remaining_ns = deadline_ns - now_ns;
-        if (remaining_ns <= data_raft_forward_response_reserve_ns + std.time.ns_per_ms) return null;
-        const target_budget_ns = remaining_ns - data_raft_forward_response_reserve_ns;
-        const target_budget_ms = target_budget_ns / std.time.ns_per_ms;
-        if (target_budget_ms == 0) return null;
-        return .{
-            .remaining_ms = @intCast(@min(target_budget_ms, std.math.maxInt(u32))),
-            .forwards_remaining = route.forwards_remaining - 1,
+        return antfly.public_api.raft_mutation_forwarding.contextForDeadline(
+            now_ns,
+            deadline_ns,
+            data_raft_forward_response_reserve_ns,
+            route.forwards_remaining,
             // Once a voter has owned the request-driven election attempt, a
             // forwarded target may route or follow its normal randomized Raft
             // ticker but must not start a second synchronized campaign.
-            .campaign_allowed = route.campaign_allowed and !request_campaign_consumed,
-        };
+            route.campaign_allowed and !request_campaign_consumed,
+        );
     }
 
     fn dataRaftForwardedLeaderWaitNs(forwarding: antfly.public_api.internal_batch_forwarding.Context) u64 {
