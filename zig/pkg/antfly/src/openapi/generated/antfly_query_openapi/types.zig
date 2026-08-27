@@ -6,7 +6,7 @@ const std = @import("std");
 pub const BoolFieldQuery = struct {
     bool: bool,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const BooleanQuery = struct {
@@ -14,15 +14,17 @@ pub const BooleanQuery = struct {
     should: ?DisjunctionQuery = null,
     must_not: ?DisjunctionQuery = null,
     filter: ?Query = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
+pub const BoostValue = f64;
+
 /// A floating-point number used to decrease or increase the relevance scores of a query.
-pub const Boost = f64;
+pub const Boost = ?BoostValue;
 
 pub const ConjunctionQuery = struct {
     conjuncts: []const Query,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const DateRangeStringQuery = struct {
@@ -31,20 +33,20 @@ pub const DateRangeStringQuery = struct {
     inclusive_start: ?bool = null,
     inclusive_end: ?bool = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     datetime_parser: ?[]const u8 = null,
 };
 
 pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
-    boost: ?Boost = null,
+    boost: Boost = null,
     /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
     min: ?i64 = null,
 };
 
 pub const DocIdQuery = struct {
     ids: []const []const u8,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// The fuzziness of the query. Can be an integer or "auto".
@@ -55,7 +57,7 @@ pub const FuzzyQuery = struct {
     prefix_length: ?i32 = null,
     fuzziness: ?Fuzziness = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Geographic bounding box filter. The public query shape uses scalar latitude and longitude bounds to match structured filter_query.geo_bbox. Longitude ranges may cross the antimeridian by specifying a western/min longitude that is greater than the eastern/max longitude; for example, min_lon 179.5 and max_lon -179.5 matches points near +/-180 degrees longitude. Latitude bounds must be ordered with min_lat <= max_lat.
@@ -70,13 +72,13 @@ pub const GeoBoundingBoxQuery = struct {
     max_lat: f64,
     /// Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
     max_lon: f64,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const GeoBoundingPolygonQuery = struct {
     polygon_points: []const GeoPoint,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const GeoDistanceQuery = struct {
@@ -84,7 +86,7 @@ pub const GeoDistanceQuery = struct {
     location: []const f64,
     distance: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const GeoPoint = struct {
@@ -106,30 +108,30 @@ pub const GeoShapeGeometry = struct {
 pub const GeoShapeQuery = struct {
     geometry: GeoShapeGeometry,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const IPRangeQuery = struct {
     cidr: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MatchAllQuery = struct {
     match_all: std.json.Value,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MatchNoneQuery = struct {
     match_none: std.json.Value,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MatchPhraseQuery = struct {
     match_phrase: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     fuzziness: ?Fuzziness = null,
 };
 
@@ -137,14 +139,14 @@ pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MultiMatchBody = struct {
     query: []const u8,
     fields: []const []const u8,
     type: []const u8,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MultiMatchQuery = struct {
@@ -154,7 +156,7 @@ pub const MultiMatchQuery = struct {
 pub const MultiPhraseQuery = struct {
     terms: []const []const []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     fuzziness: ?Fuzziness = null,
 };
 
@@ -164,20 +166,20 @@ pub const NumericRangeQuery = struct {
     inclusive_min: ?bool = null,
     inclusive_max: ?bool = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const PhraseQuery = struct {
     terms: []const []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     fuzziness: ?Fuzziness = null,
 };
 
 pub const PrefixQuery = struct {
     prefix: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const Query = union(enum) {
@@ -424,19 +426,19 @@ pub const Query = union(enum) {
 
 pub const QueryStringQuery = struct {
     query: []const u8,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const RegexpQuery = struct {
     regexp: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const TermQuery = struct {
     term: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const TermRangeQuery = struct {
@@ -445,11 +447,11 @@ pub const TermRangeQuery = struct {
     inclusive_min: ?bool = null,
     inclusive_max: ?bool = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const WildcardQuery = struct {
     wildcard: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };

@@ -91,19 +91,35 @@ pub const TypeGenerator = struct {
             return;
         }
 
-        // String enum
-        if (schema.enum_values.len > 0) {
-            try self.generateEnum(type_name, schema);
-            return;
-        }
-
-        // A oneOf containing exactly one concrete type and the JSON null
-        // literal is a nullable value, not an opaque union. Keeping the
-        // concrete type is especially important when it is used as a typed
-        // additionalProperties value.
+        // A nullable oneOf already names its concrete payload, so keep the
+        // compact alias instead of introducing a redundant FooValue wrapper.
         if (try self.nullableOneOfType(schema.one_of)) |inner_type| {
             if (schema.description) |desc| try self.w.docComment(desc);
             try self.w.line("pub const {s} = ?{s};", .{ type_name, inner_type });
+            return;
+        }
+
+        // Component nullability is part of the named schema, not a property of
+        // whichever document happens to reference it. Preserve that fact in
+        // the generated Zig type so local aliases, array/map values, and mapped
+        // external modules all agree. A separately named payload keeps enum and
+        // object namespaces usable while the public component remains optional.
+        if (schema.isNullable()) {
+            const payload_type_name = try std.fmt.allocPrint(self.arena, "{s}Value", .{type_name});
+            try self.ensureAuxiliaryTypeNameAvailable(payload_type_name);
+            var payload_schema = try self.nonNullableSchema(schema);
+            payload_schema.description = null;
+            try self.generateNamedType(payload_type_name, payload_schema);
+            try self.extra_type_reexports.append(self.arena, payload_type_name);
+            try self.w.blank();
+            if (schema.description) |desc| try self.w.docComment(desc);
+            try self.w.line("pub const {s} = ?{s};", .{ type_name, payload_type_name });
+            return;
+        }
+
+        // String enum
+        if (schema.enum_values.len > 0) {
+            try self.generateEnum(type_name, schema);
             return;
         }
 
@@ -175,6 +191,46 @@ pub const TypeGenerator = struct {
         const zig_type = try self.zigTypeForSchema(schema);
         if (schema.description) |desc| try self.w.docComment(desc);
         try self.w.line("pub const {s} = {s};", .{ type_name, zig_type });
+    }
+
+    fn nonNullableSchema(self: *TypeGenerator, schema: types.Schema) !types.Schema {
+        var payload = schema;
+        payload.nullable = false;
+        payload.enum_has_null = false;
+        if (schema.schema_type) |schema_type| switch (schema_type) {
+            .single => {},
+            .array => |members| {
+                var non_null_count: usize = 0;
+                for (members) |member| {
+                    if (!std.mem.eql(u8, member, "null")) non_null_count += 1;
+                }
+                if (non_null_count == 0) return error.InvalidOpenApiSchema;
+                const non_null_members = try self.arena.alloc([]const u8, non_null_count);
+                var next: usize = 0;
+                for (members) |member| {
+                    if (std.mem.eql(u8, member, "null")) continue;
+                    non_null_members[next] = member;
+                    next += 1;
+                }
+                payload.schema_type = if (non_null_members.len == 1)
+                    .{ .single = non_null_members[0] }
+                else
+                    .{ .array = non_null_members };
+            },
+        };
+        return payload;
+    }
+
+    fn ensureAuxiliaryTypeNameAvailable(self: *TypeGenerator, candidate: []const u8) !void {
+        if (self.resolver.doc.components) |components| {
+            for (components.schemas.keys()) |schema_name| {
+                const existing = try naming.toTypeName(self.arena, schema_name);
+                if (std.mem.eql(u8, existing, candidate)) return error.InvalidOpenApiSchema;
+            }
+        }
+        for (self.extra_type_reexports.items) |existing| {
+            if (std.mem.eql(u8, existing, candidate)) return error.InvalidOpenApiSchema;
+        }
     }
 
     /// Generate a Zig enum from a string enum schema.
@@ -351,17 +407,24 @@ pub const TypeGenerator = struct {
             },
         }
 
-        // Check if the schema itself declares nullability (3.0 nullable or 3.1 type array)
-        const schema_nullable = switch (prop_sor) {
-            .schema => |s| s.isNullable(),
-            .ref => false,
+        const nullability = self.schemaOrRefNullability(prop_sor);
+        // Named nullable components and inline nullable oneOf aliases already
+        // carry `?` in zig_type. Other inline nullable schemas still need the
+        // field occurrence to supply it. An external mapped type owns its own
+        // nullability, while its required presence is handled by serialization.
+        const type_carries_null = switch (prop_sor) {
+            .schema => |s| nullableOneOfInner(s.one_of) != null,
+            .ref => nullability == .nullable,
         };
 
-        if (is_required and !schema_nullable) {
-            try self.w.line("{s}: {s},", .{ field, zig_type });
-        } else if (is_required and schema_nullable) {
-            // Required but nullable: field is present but can be null
-            try self.w.line("{s}: ?{s},", .{ field, zig_type });
+        if (is_required) {
+            if (nullability == .nullable and !type_carries_null) {
+                try self.w.line("{s}: ?{s},", .{ field, zig_type });
+            } else {
+                try self.w.line("{s}: {s},", .{ field, zig_type });
+            }
+        } else if (type_carries_null) {
+            try self.w.line("{s}: {s} = null,", .{ field, zig_type });
         } else {
             try self.w.line("{s}: ?{s} = null,", .{ field, zig_type });
         }
@@ -1544,6 +1607,15 @@ test "required + nullable field codegen" {
     try props.put(arena, "aliased_referenced_tag", .{
         .ref = .{ .ref_string = "#/components/schemas/NullableStringAlias" },
     });
+    try props.put(arena, "legacy_referenced_tag", .{
+        .ref = .{ .ref_string = "#/components/schemas/LegacyNullableString" },
+    });
+    try props.put(arena, "modern_referenced_tag", .{
+        .ref = .{ .ref_string = "#/components/schemas/ModernNullableString" },
+    });
+    try props.put(arena, "optional_legacy_referenced_tag", .{
+        .ref = .{ .ref_string = "#/components/schemas/LegacyNullableString" },
+    });
 
     var schemas = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
     try schemas.put(arena, "NullableString", .{
@@ -1552,11 +1624,17 @@ test "required + nullable field codegen" {
     try schemas.put(arena, "NullableStringAlias", .{
         .ref = .{ .ref_string = "#/components/schemas/NullableString" },
     });
+    try schemas.put(arena, "LegacyNullableString", .{
+        .schema = .{ .schema_type = .{ .single = "string" }, .nullable = true },
+    });
+    try schemas.put(arena, "ModernNullableString", .{
+        .schema = .{ .schema_type = .{ .array = &.{ "string", "null" } } },
+    });
     try schemas.put(arena, "Item", types.SchemaOrRef{
         .schema = types.Schema{
             .schema_type = .{ .single = "object" },
             .properties = props,
-            .required = &.{ "name", "tag", "old_tag", "one_of_tag", "referenced_tag", "aliased_referenced_tag" },
+            .required = &.{ "name", "tag", "old_tag", "one_of_tag", "referenced_tag", "aliased_referenced_tag", "legacy_referenced_tag", "modern_referenced_tag" },
         },
     });
 
@@ -1587,6 +1665,15 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "one_of_tag: ?[]const u8,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "referenced_tag: NullableString,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "aliased_referenced_tag: NullableStringAlias,") != null);
+    // Named 3.0 and 3.1 nullable components retain nullability in their public
+    // type, so required refs can represent null and optional refs avoid ??T.
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const LegacyNullableStringValue = []const u8;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const LegacyNullableString = ?LegacyNullableStringValue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const ModernNullableStringValue = []const u8;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "pub const ModernNullableString = ?ModernNullableStringValue;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "legacy_referenced_tag: LegacyNullableString,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "modern_referenced_tag: ModernNullableString,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "optional_legacy_referenced_tag: LegacyNullableString = null,") != null);
     // Doc comment from nullable field description
     try std.testing.expect(std.mem.indexOf(u8, output, "/// A nullable required tag") != null);
     // Request serialization must preserve required nulls while omitting absent
@@ -1599,6 +1686,10 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.referenced_tag);") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"aliased_referenced_tag\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.aliased_referenced_tag);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"legacy_referenced_tag\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.legacy_referenced_tag);") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.objectField(\"modern_referenced_tag\");") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.modern_referenced_tag);") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (self.note) |value|") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "else if (jw.options.emit_null_optional_fields)") != null);
 }

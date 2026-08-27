@@ -985,7 +985,7 @@ pub const BedrockGeneratorConfig = struct {
 pub const BoolFieldQuery = struct {
     bool: bool,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const BooleanQuery = struct {
@@ -993,11 +993,13 @@ pub const BooleanQuery = struct {
     should: ?DisjunctionQuery = null,
     must_not: ?DisjunctionQuery = null,
     filter: ?Query = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
+pub const BoostValue = f64;
+
 /// A floating-point number used to decrease or increase the relevance scores of a query.
-pub const Boost = f64;
+pub const Boost = ?BoostValue;
 
 /// Configuration for Brave Search API. Brave Search provides privacy-focused search with its own independent index. **Setup:** 1. Sign up at https://brave.com/search/api/ 2. Get API key from dashboard **Docs:** https://api.search.brave.com/app/documentation
 pub const BraveSearchConfig = struct {
@@ -1625,7 +1627,7 @@ pub const ConfigureExtensionRequest = struct {
 
 pub const ConjunctionQuery = struct {
     conjuncts: []const Query,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const ConnectedModel = struct {
@@ -2431,7 +2433,7 @@ pub const DateRangeStringQuery = struct {
     inclusive_start: ?bool = null,
     inclusive_end: ?bool = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     datetime_parser: ?[]const u8 = null,
 };
 
@@ -2625,7 +2627,7 @@ pub const DerivedCoverageStatusPolicy = enum {
 
 pub const DisjunctionQuery = struct {
     disjuncts: []const Query,
-    boost: ?Boost = null,
+    boost: Boost = null,
     /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
     min: ?i64 = null,
 };
@@ -2705,7 +2707,7 @@ pub const DistanceUnit = enum {
 
 pub const DocIdQuery = struct {
     ids: []const []const u8,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Parsed child-range descriptor from a derived document artifact manifest.
@@ -4258,7 +4260,7 @@ pub const FuzzyQuery = struct {
     prefix_length: ?i32 = null,
     fuzziness: ?Fuzziness = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Configuration for the generation step. This step generates the final response from retrieved documents using the reasoning as context.
@@ -4374,13 +4376,13 @@ pub const GeoBoundingBoxQuery = struct {
     max_lat: f64,
     /// Eastern longitude bound. May be less than min_lon for antimeridian-wrapped boxes.
     max_lon: f64,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const GeoBoundingPolygonQuery = struct {
     polygon_points: []const GeoPoint,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const GeoDistanceQuery = struct {
@@ -4388,7 +4390,7 @@ pub const GeoDistanceQuery = struct {
     location: []const f64,
     distance: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const GeoPoint = struct {
@@ -4410,7 +4412,7 @@ pub const GeoShapeGeometry = struct {
 pub const GeoShapeQuery = struct {
     geometry: GeoShapeGeometry,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Configuration for the Google AI (Gemini) embedding provider. API key via `api_key` field or `GEMINI_API_KEY` environment variable. **Example Models:** gemini-embedding-001 (default, 3072 dims) **Docs:** https://ai.google.dev/gemini-api/docs/embeddings
@@ -5966,7 +5968,7 @@ pub const HierarchyProjection = struct {
 pub const IPRangeQuery = struct {
     cidr: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Image URL or data URI.
@@ -8217,19 +8219,19 @@ pub const LsmStorageStatus = struct {
 
 pub const MatchAllQuery = struct {
     match_all: std.json.Value,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MatchNoneQuery = struct {
     match_none: std.json.Value,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MatchPhraseQuery = struct {
     match_phrase: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     fuzziness: ?Fuzziness = null,
 };
 
@@ -8237,7 +8239,7 @@ pub const MatchQuery = struct {
     match: []const u8,
     field: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Inline binary media content (audio, image, etc.).
@@ -8341,7 +8343,7 @@ pub const MultiMatchBody = struct {
     query: []const u8,
     fields: []const []const u8,
     type: []const u8,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const MultiMatchQuery = struct {
@@ -8351,7 +8353,7 @@ pub const MultiMatchQuery = struct {
 pub const MultiPhraseQuery = struct {
     terms: []const []const []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     fuzziness: ?Fuzziness = null,
 };
 
@@ -8369,7 +8371,7 @@ pub const NumericRangeQuery = struct {
     inclusive_min: ?bool = null,
     inclusive_max: ?bool = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Configuration for the Ollama embedding provider. Local embeddings for privacy and offline use. URL via `url` field or `OLLAMA_HOST` env var. **Example Models:** nomic-embed-text (768 dims), mxbai-embed-large (1024 dims), all-minilm (384 dims) **Docs:** https://ollama.com/search?c=embedding
@@ -8682,14 +8684,14 @@ pub const PermissionType = enum {
 pub const PhraseQuery = struct {
     terms: []const []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
     fuzziness: ?Fuzziness = null,
 };
 
 pub const PrefixQuery = struct {
     prefix: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Statistics from token-based document pruning
@@ -9344,7 +9346,7 @@ pub const QueryStrategy = enum {
 
 pub const QueryStringQuery = struct {
     query: []const u8,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// A transient query dependency or read-availability failure that is safe to retry.
@@ -9473,7 +9475,7 @@ pub const RawQuery = std.json.Value;
 pub const RegexpQuery = struct {
     regexp: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Bounded request to list table repair issues.
@@ -10892,7 +10894,7 @@ pub const TemplateFieldMapping = struct {
 pub const TermQuery = struct {
     term: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 pub const TermRangeQuery = struct {
@@ -10901,7 +10903,7 @@ pub const TermRangeQuery = struct {
     inclusive_min: ?bool = null,
     inclusive_max: ?bool = null,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Options specific to text chunking.
@@ -11499,7 +11501,7 @@ pub const WebSearchProvider = enum {
 pub const WildcardQuery = struct {
     wildcard: []const u8,
     field: ?[]const u8 = null,
-    boost: ?Boost = null,
+    boost: Boost = null,
 };
 
 /// Configuration for You.com Search API. You.com is useful for agentic search and research-oriented result retrieval. **Setup:** 1. Sign up for You.com API access 2. Get API key from dashboard **Docs:** https://api.you.com

@@ -638,6 +638,7 @@ pub const WebSearchProvider = types.WebSearchProvider;
 pub const WildcardQuery = types.WildcardQuery;
 pub const YouSearchConfig = types.YouSearchConfig;
 pub const AlgebraicIndexStatsIndexType = types.AlgebraicIndexStatsIndexType;
+pub const BoostValue = types.BoostValue;
 pub const EmbeddingsIndexStatsIndexType = types.EmbeddingsIndexStatsIndexType;
 pub const FullTextIndexStatsIndexType = types.FullTextIndexStatsIndexType;
 pub const GraphIndexStatsIndexType = types.GraphIndexStatsIndexType;
