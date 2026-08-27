@@ -9,6 +9,14 @@ const utf8 = new TextEncoder();
 
 type JsonObject = Record<string, unknown>;
 type GraphDialect = "canonical" | "legacy" | "none";
+type CanonicalResultContract = {
+  kind: "bindings" | "aggregates" | "nodes";
+  names?: Set<string>;
+};
+type RequestGraphContract = {
+  dialect: GraphDialect;
+  operations: Map<string, CanonicalResultContract | undefined>;
+};
 
 function invalid(path: string, message: string): never {
   throw new TypeError(`query returned invalid graph response at ${path}: ${message}`);
@@ -224,8 +232,15 @@ function stats(value: unknown, path: string, expectedItems: number, allowTruncat
     invalid(`${path}.truncated`, "must be false for exact aggregates");
 }
 
-function canonicalResult(value: unknown, path: string): void {
+function sameNameSet(actual: readonly string[], expected: Set<string>): boolean {
+  return actual.length === expected.size && actual.every((name) => expected.has(name));
+}
+
+function canonicalResult(value: unknown, path: string, contract: CanonicalResultContract): void {
   const result = object(value, path);
+  if (result.kind !== contract.kind) {
+    invalid(`${path}.kind`, `must be ${JSON.stringify(contract.kind)} for the requested operation`);
+  }
   if (result.kind === "bindings") {
     exactKeys(result, path, ["kind", "rows", "stats"]);
     const rows = array(result.rows, `${path}.rows`);
@@ -246,6 +261,9 @@ function canonicalResult(value: unknown, path: string): void {
         if (binding.table !== undefined) nonemptyString(binding.table, `${rowPath}.${alias}.table`);
         if (binding.document !== undefined)
           object(binding.document, `${rowPath}.${alias}.document`);
+      }
+      if (contract.names && !sameNameSet(Object.keys(row), contract.names)) {
+        invalid(rowPath, "binding aliases do not match the requested projection");
       }
     });
     stats(result.stats, `${path}.stats`, rows.length, true);
@@ -269,6 +287,9 @@ function canonicalResult(value: unknown, path: string): void {
       ) {
         invalid(`${path}.aggregates.${name}`, "must contain an exact unsigned decimal value");
       }
+    }
+    if (contract.names && !sameNameSet(Object.keys(aggregates), contract.names)) {
+      invalid(`${path}.aggregates`, "names do not match the requested aggregates");
     }
     stats(result.stats, `${path}.stats`, entries.length, false);
     return;
@@ -301,21 +322,58 @@ function canonicalResult(value: unknown, path: string): void {
   invalid(`${path}.kind`, "canonical graph results require bindings, aggregates, or nodes");
 }
 
-function requestDialect(request: QueryRequest): { dialect: GraphDialect; operations: Set<string> } {
+function canonicalOperationContract(value: unknown, path: string): CanonicalResultContract {
+  const operation = object(value, path);
+  if (operation.match !== undefined) {
+    const returned = object(operation.return, `${path}.return`);
+    if (returned.bindings !== undefined) {
+      const bindings = array(returned.bindings, `${path}.return.bindings`);
+      const names = new Set<string>();
+      bindings.forEach((name, index) => {
+        if (typeof name !== "string")
+          invalid(`${path}.return.bindings[${index}]`, "must be a string");
+        names.add(name);
+      });
+      return { kind: "bindings", names };
+    }
+    if (returned.aggregates !== undefined) {
+      return {
+        kind: "aggregates",
+        names: new Set(Object.keys(object(returned.aggregates, `${path}.return.aggregates`))),
+      };
+    }
+    return invalid(`${path}.return`, "must select bindings or aggregates");
+  }
+  if (
+    operation.traverse !== undefined ||
+    operation.shortest_path !== undefined ||
+    operation.k_shortest_paths !== undefined
+  ) {
+    return { kind: "nodes" };
+  }
+  return invalid(path, "does not contain a supported graph operation");
+}
+
+function requestDialect(request: QueryRequest): RequestGraphContract {
   const canonical = request.graph_queries;
   const legacy = request.graph_searches;
   if (canonical !== undefined && canonical !== null && legacy !== undefined && legacy !== null) {
     throw new TypeError("query accepts either graph_queries or graph_searches, not both");
   }
-  if (canonical !== undefined && canonical !== null)
-    return { dialect: "canonical", operations: new Set(Object.keys(canonical)) };
-  if (legacy !== undefined && legacy !== null)
-    return { dialect: "legacy", operations: new Set(Object.keys(legacy)) };
-  return { dialect: "none", operations: new Set() };
-}
-
-function sameNames(actual: string[], expected: Set<string>): boolean {
-  return actual.length === expected.size && actual.every((name) => expected.has(name));
+  if (canonical !== undefined && canonical !== null) {
+    const operations = new Map<string, CanonicalResultContract>();
+    for (const [name, operation] of Object.entries(canonical)) {
+      operations.set(name, canonicalOperationContract(operation, `request.graph_queries.${name}`));
+    }
+    return { dialect: "canonical", operations };
+  }
+  if (legacy !== undefined && legacy !== null) {
+    return {
+      dialect: "legacy",
+      operations: new Map(Object.keys(legacy).map((name) => [name, undefined])),
+    };
+  }
+  return { dialect: "none", operations: new Map() };
 }
 
 export function validateGraphQueryResponses(
@@ -356,7 +414,7 @@ export function validateGraphQueryResponses(
         );
       return;
     }
-    if (!sameNames(names, operations))
+    if (!sameNameSet(names, new Set(operations.keys())))
       invalid(
         `response.responses[${index}].graph_results`,
         "operation names do not match the request"
@@ -366,7 +424,9 @@ export function validateGraphQueryResponses(
       const result = object(results[name], path);
       if (dialect === "canonical") {
         if (!isValidGraphIdentifier(name)) invalid(path, "has an invalid canonical operation name");
-        canonicalResult(result, path);
+        const contract = operations.get(name);
+        if (!contract) invalid(path, "has no canonical request contract");
+        canonicalResult(result, path, contract);
       } else if (result.kind !== undefined && result.kind !== "legacy") {
         invalid(`${path}.kind`, "legacy graph results must use the legacy result shape");
       }

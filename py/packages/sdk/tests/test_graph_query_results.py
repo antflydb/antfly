@@ -80,6 +80,74 @@ def test_canonical_query_decoder_rejects_legacy_or_missing_discriminator() -> No
         )
 
 
+def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
+    path_query = {
+        "path": {
+            "index": "graph",
+            "shortest_path": {"from": {"key": "a"}, "to": {"key": "b"}},
+        }
+    }
+    with pytest.raises(AntflyException, match="must be 'nodes' for the requested operation"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "aggregates",
+                    "aggregates": {"count": {"value": "1", "exact": True}},
+                    "stats": {"returned_items": 1, "truncated": False},
+                },
+                operation="path",
+            ),
+            graph_dialect="canonical",
+            expected_graph_queries=path_query,
+        )
+
+    bindings_query = {
+        "matched": {
+            "index": "graph",
+            "match": {
+                "anchor": "a",
+                "nodes": {"a": {}, "b": {}},
+                "edges": [{"from": "a", "to": "b"}],
+            },
+            "return": {"bindings": ["a", "b"]},
+        }
+    }
+    with pytest.raises(AntflyException, match="binding aliases do not match the requested projection"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "bindings",
+                    "rows": [{"a": {"key": "a"}, "c": None}],
+                    "stats": {"returned_items": 1, "truncated": False},
+                },
+                operation="matched",
+            ),
+            graph_dialect="canonical",
+            expected_graph_queries=bindings_query,
+        )
+
+    aggregates_query = {
+        "counted": {
+            "index": "graph",
+            "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+            "return": {"aggregates": {"rows": {"count": "*"}}},
+        }
+    }
+    with pytest.raises(AntflyException, match="names do not match the requested aggregates"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "aggregates",
+                    "aggregates": {"other": {"value": "1", "exact": True}},
+                    "stats": {"returned_items": 1, "truncated": False},
+                },
+                operation="counted",
+            ),
+            graph_dialect="canonical",
+            expected_graph_queries=aggregates_query,
+        )
+
+
 def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> None:
     canonical = decode_query_responses(
         _query_response(

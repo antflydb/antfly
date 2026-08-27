@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -200,9 +201,11 @@ func DecodeLegacyGraphResult(result GraphResult) (LegacyGraphQueryResult, error)
 	return decodeLegacyGraphQueryResult(result, envelope)
 }
 
-// validateQueryGraphResponses binds graph result decoding to the request that
-// selected the wire dialect. This prevents a valid union member from being
-// silently interpreted under the wrong operation or compatibility contract.
+// validateQueryGraphResponses binds each graph result envelope to the request
+// that selected its wire dialect and result shape. Keep this automatic check
+// allocation-light: callers that consume a result use DecodeGraphResultForQuery
+// for the one full payload decode. In particular, do not eagerly materialize up
+// to 10,000 hydrated documents here only to discard them before returning.
 func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses) error {
 	hasGraphRequest := false
 	for _, request := range requests {
@@ -229,11 +232,7 @@ func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses
 				return fmt.Errorf("antfly: response %d: %w", responseIndex, err)
 			}
 			for name, raw := range response.GraphResults {
-				canonical, err := raw.AsGraphQueryResult()
-				if err != nil {
-					return fmt.Errorf("antfly: response %d graph result %q is not canonical: %w", responseIndex, name, err)
-				}
-				if _, err := DecodeGraphQueryResult(canonical); err != nil {
+				if err := validateCanonicalGraphResultEnvelope(request.GraphQueries[name], raw); err != nil {
 					return fmt.Errorf("antfly: response %d graph result %q: %w", responseIndex, name, err)
 				}
 			}
@@ -251,6 +250,104 @@ func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses
 				return fmt.Errorf("antfly: response %d contains graph_results for a request without graph operations", responseIndex)
 			}
 		}
+	}
+	return nil
+}
+
+type canonicalGraphResultContract struct {
+	kind  string
+	names []string
+}
+
+func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResultContract, error) {
+	encoded, err := json.Marshal(query)
+	if err != nil {
+		return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph query: %w", err)
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &members); err != nil {
+		return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph query: %w", err)
+	}
+
+	if raw, ok := members["match"]; ok && !isNullGraphJSON(raw) {
+		var match GraphMatchQuery
+		if err := query.DecodeStrictInto(&match); err != nil {
+			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph match query: %w", err)
+		}
+		encodedReturn, err := json.Marshal(match.Return)
+		if err != nil {
+			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph return: %w", err)
+		}
+		var returnMembers map[string]json.RawMessage
+		if err := json.Unmarshal(encodedReturn, &returnMembers); err != nil {
+			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph return: %w", err)
+		}
+		if _, ok := returnMembers["bindings"]; ok {
+			var value GraphBindingsReturn
+			if err := match.Return.DecodeStrictInto(&value); err != nil {
+				return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph bindings return: %w", err)
+			}
+			return canonicalGraphResultContract{kind: string(GraphBindingsResultKindBindings), names: append([]string(nil), value.Bindings...)}, nil
+		}
+		if _, ok := returnMembers["aggregates"]; ok {
+			var value GraphAggregatesReturn
+			if err := match.Return.DecodeStrictInto(&value); err != nil {
+				return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph aggregates return: %w", err)
+			}
+			names := make([]string, 0, len(value.Aggregates))
+			for name := range value.Aggregates {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+			return canonicalGraphResultContract{kind: string(GraphAggregatesResultKindAggregates), names: names}, nil
+		}
+		return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph match return must select bindings or aggregates")
+	}
+
+	for _, operation := range []string{"traverse", "shortest_path", "k_shortest_paths"} {
+		if raw, ok := members[operation]; ok && !isNullGraphJSON(raw) {
+			return canonicalGraphResultContract{kind: string(GraphNodesResultKindNodes)}, nil
+		}
+	}
+	return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph query has no supported operation")
+}
+
+type graphResultEnvelopeDecoder interface {
+	DecodeInto(any) error
+}
+
+func canonicalGraphResultEnvelope(result graphResultEnvelopeDecoder) (graphQueryResultEnvelope, string, error) {
+	var envelope graphQueryResultEnvelope
+	if err := result.DecodeInto(&envelope); err != nil {
+		return graphQueryResultEnvelope{}, "", err
+	}
+	if envelope.Kind == nil {
+		return graphQueryResultEnvelope{}, "", fmt.Errorf("antfly: canonical graph result requires a discriminator")
+	}
+	var kind *string
+	if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
+		return graphQueryResultEnvelope{}, "", fmt.Errorf("antfly: graph result has an invalid discriminator")
+	}
+	if envelope.Stats == nil || envelope.Stats.ReturnedItems == nil || envelope.Stats.Truncated == nil {
+		return graphQueryResultEnvelope{}, "", fmt.Errorf("antfly: canonical graph result requires complete stats")
+	}
+	return envelope, *kind, nil
+}
+
+func validateCanonicalGraphResultEnvelope(query GraphQuery, result GraphResult) error {
+	contract, err := canonicalGraphResultContractForQuery(query)
+	if err != nil {
+		return err
+	}
+	envelope, kind, err := canonicalGraphResultEnvelope(result)
+	if err != nil {
+		return err
+	}
+	if kind != contract.kind {
+		return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, kind)
+	}
+	if kind == string(GraphAggregatesResultKindAggregates) && *envelope.Stats.Truncated {
+		return fmt.Errorf("antfly: exact aggregate graph results cannot be truncated")
 	}
 	return nil
 }
@@ -289,18 +386,86 @@ func validateGraphResultNames[T any](requested map[string]T, received map[string
 // DecodeGraphQueryResult decodes a canonical graph_queries result. Legacy
 // compatibility is intentionally absent from this API.
 func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
-	var envelope graphQueryResultEnvelope
-	if err := result.DecodeInto(&envelope); err != nil {
+	envelope, kind, err := canonicalGraphResultEnvelope(result)
+	if err != nil {
 		return nil, err
 	}
-	if envelope.Kind == nil {
-		return nil, fmt.Errorf("antfly: canonical graph result requires a discriminator")
+	return decodeCanonicalGraphResult(result, kind, envelope)
+}
+
+// DecodeCanonicalGraphResult decodes the GraphResult stored in
+// QueryResult.graph_results as a canonical graph_queries result. Unlike
+// DecodeGraphResult, this API never accepts the deprecated graph_searches
+// response shape.
+func DecodeCanonicalGraphResult(result GraphResult) (any, error) {
+	envelope, kind, err := canonicalGraphResultEnvelope(result)
+	if err != nil {
+		return nil, err
 	}
-	var kind *string
-	if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
-		return nil, fmt.Errorf("antfly: graph result has an invalid discriminator")
+	return decodeCanonicalGraphResult(result, kind, envelope)
+}
+
+// DecodeGraphResultForQuery performs the full canonical payload decode and
+// verifies that its variant and projected names match the operation that
+// requested it. This is the preferred decoder for values returned by a known
+// graph_queries entry.
+func DecodeGraphResultForQuery(query GraphQuery, result GraphResult) (any, error) {
+	contract, err := canonicalGraphResultContractForQuery(query)
+	if err != nil {
+		return nil, err
 	}
-	return decodeCanonicalGraphResult(result, *kind, envelope)
+	decoded, err := DecodeCanonicalGraphResult(result)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateDecodedGraphResultContract(contract, decoded); err != nil {
+		return nil, err
+	}
+	return decoded, nil
+}
+
+func validateDecodedGraphResultContract(contract canonicalGraphResultContract, decoded any) error {
+	switch value := decoded.(type) {
+	case GraphBindingsResult:
+		if contract.kind != string(GraphBindingsResultKindBindings) {
+			return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, GraphBindingsResultKindBindings)
+		}
+		expected := make(map[string]struct{}, len(contract.names))
+		for _, name := range contract.names {
+			expected[name] = struct{}{}
+		}
+		for rowIndex, row := range value.Rows {
+			if len(row) != len(expected) {
+				return fmt.Errorf("antfly: bindings graph result row %d does not match the requested projection", rowIndex)
+			}
+			for name := range row {
+				if _, ok := expected[name]; !ok {
+					return fmt.Errorf("antfly: bindings graph result row %d contains unrequested alias %q", rowIndex, name)
+				}
+			}
+		}
+		return nil
+	case GraphAggregatesResult:
+		if contract.kind != string(GraphAggregatesResultKindAggregates) {
+			return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, GraphAggregatesResultKindAggregates)
+		}
+		actual := make([]string, 0, len(value.Aggregates))
+		for name := range value.Aggregates {
+			actual = append(actual, name)
+		}
+		sort.Strings(actual)
+		if !slices.Equal(actual, contract.names) {
+			return fmt.Errorf("antfly: aggregate graph result names %v do not match requested names %v", actual, contract.names)
+		}
+		return nil
+	case GraphNodesResult:
+		if contract.kind != string(GraphNodesResultKindNodes) {
+			return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, GraphNodesResultKindNodes)
+		}
+		return nil
+	default:
+		return fmt.Errorf("antfly: unsupported decoded graph result type %T", decoded)
+	}
 }
 
 type graphQueryResultEnvelope struct {

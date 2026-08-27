@@ -58,7 +58,7 @@ describe("graph result admission", () => {
   it("rejects a legacy downgrade for a canonical request", () => {
     expect(() =>
       validateGraphQueryResponses(responses({ type: "neighbors", total: 1 }), [canonicalRequest])
-    ).toThrow("canonical graph results require bindings, aggregates, or nodes");
+    ).toThrow('must be "nodes" for the requested operation');
   });
 
   it("rejects mismatched operation names and missing edge orientation", () => {
@@ -99,6 +99,69 @@ describe("graph result admission", () => {
     expect(() => validateGraphQueryResponses(malformed, [canonicalRequest])).toThrow(
       'is missing required member "direction"'
     );
+  });
+
+  it("binds canonical result kinds and projections to the requested operation", () => {
+    expect(() =>
+      validateGraphQueryResponses(
+        responses({
+          kind: "aggregates",
+          aggregates: { count: { value: "1", exact: true } },
+          stats: { returned_items: 1, truncated: false },
+        }),
+        [canonicalRequest]
+      )
+    ).toThrow('must be "nodes" for the requested operation');
+
+    const bindingsRequest = {
+      graph_queries: {
+        matched: {
+          index: "graph_idx",
+          match: {
+            anchor: "a",
+            nodes: { a: {}, b: {} },
+            edges: [{ from: "a", to: "b" }],
+          },
+          return: { bindings: ["a", "b"] },
+        },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          {
+            kind: "bindings",
+            rows: [{ a: { key: "a" }, c: null }],
+            stats: { returned_items: 1, truncated: false },
+          },
+          "matched"
+        ),
+        [bindingsRequest]
+      )
+    ).toThrow("binding aliases do not match the requested projection");
+
+    const aggregateRequest = {
+      graph_queries: {
+        counted: {
+          index: "graph_idx",
+          match: { anchor: "a", nodes: { a: {} }, edges: [] },
+          return: { aggregates: { rows: { count: "*" } } },
+        },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          {
+            kind: "aggregates",
+            aggregates: { other: { value: "1", exact: true } },
+            stats: { returned_items: 1, truncated: false },
+          },
+          "counted"
+        ),
+        [aggregateRequest]
+      )
+    ).toThrow("names do not match the requested aggregates");
   });
 
   it("retains stateful legacy compatibility only for legacy requests", () => {

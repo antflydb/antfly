@@ -2051,6 +2051,7 @@ func graphVisualizationQuery(searchText string) map[string]any {
 				"index": DefaultAutographIndex,
 				"traverse": map[string]any{
 					"start":             map[string]any{"result_ref": "$query_results", "limit": 8},
+					"direction":         "both",
 					"max_depth":         1,
 					"limit":             80,
 					"include_paths":     true,
@@ -2073,6 +2074,7 @@ func graphVisualizationSampleQuery() map[string]any {
 				"index": DefaultAutographIndex,
 				"traverse": map[string]any{
 					"start":             map[string]any{"result_ref": "$query_results", "limit": 8},
+					"direction":         "both",
 					"max_depth":         1,
 					"limit":             80,
 					"include_paths":     true,
@@ -2093,7 +2095,7 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	if !ok {
 		return viz
 	}
-	graphValue, err := antfly.DecodeGraphQueryResult(graph)
+	graphValue, err := antfly.DecodeCanonicalGraphResult(graph)
 	if err != nil {
 		return viz
 	}
@@ -2184,17 +2186,17 @@ func graphEdgesFromPath(node antfly.GraphResultNode) []GraphEdge {
 			Source: graphEndpointID(node.Path[i-1]),
 			Target: graphEndpointID(node.Path[i]),
 			Type:   "related",
-			Weight: node.Distance,
+			Weight: 1,
 		})
 	}
 	return edges
 }
 
 func graphEndpointID(endpoint antfly.GraphPathEndpoint) string {
-	if endpoint.Table == "" {
+	if endpoint.Table == nil {
 		return endpoint.Key
 	}
-	return endpoint.Table + "/" + endpoint.Key
+	return *endpoint.Table + "/" + endpoint.Key
 }
 
 func graphNodeFromResult(node antfly.GraphResultNode) GraphNode {

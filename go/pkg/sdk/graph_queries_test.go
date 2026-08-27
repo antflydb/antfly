@@ -629,8 +629,16 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 	}
 	canonical := decode(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`)
 	legacy := decode(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":0}`)
+	var traversal GraphQuery
+	if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}}}`), &traversal); err != nil {
+		t.Fatal(err)
+	}
+	var aggregation GraphQuery
+	if err := json.Unmarshal([]byte(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"rows":{"count":"*"}}}}`), &aggregation); err != nil {
+		t.Fatal(err)
+	}
 
-	canonicalRequest := []QueryRequest{{GraphQueries: map[string]GraphQuery{"walk": {}}}}
+	canonicalRequest := []QueryRequest{{GraphQueries: map[string]GraphQuery{"walk": traversal}}}
 	canonicalResponse := QueryResponses{Responses: []QueryResult{{
 		GraphResults: map[string]GraphResult{"walk": canonical},
 	}}}
@@ -679,6 +687,22 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 			contains:  "response count 0 does not match request count 1",
 		},
 		{
+			name:     "operation result kind must match",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":false}}`)},
+			}}},
+			contains: `requires result kind "nodes", got "aggregates"`,
+		},
+		{
+			name:     "exact aggregate result cannot be truncated",
+			requests: []QueryRequest{{GraphQueries: map[string]GraphQuery{"count": aggregation}}},
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"count": decode(`{"kind":"aggregates","aggregates":{"rows":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}`)},
+			}}},
+			contains: "exact aggregate graph results cannot be truncated",
+		},
+		{
 			name:     "non graph request rejects graph results",
 			requests: []QueryRequest{{}},
 			responses: QueryResponses{Responses: []QueryResult{{
@@ -694,6 +718,41 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 				t.Fatalf("expected error containing %q, got %v", test.contains, err)
 			}
 		})
+	}
+}
+
+func TestDecodeGraphResultForQueryValidatesRequestedProjection(t *testing.T) {
+	decodeQuery := func(encoded string) GraphQuery {
+		t.Helper()
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(encoded), &query); err != nil {
+			t.Fatal(err)
+		}
+		return query
+	}
+	decodeResult := func(encoded string) GraphResult {
+		t.Helper()
+		var result GraphResult
+		if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	bindingsQuery := decodeQuery(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b"}]},"return":{"bindings":["a","b"]}}`)
+	validBindings := decodeResult(`{"kind":"bindings","rows":[{"a":{"key":"1"},"b":null}],"stats":{"returned_items":1,"truncated":false}}`)
+	if _, err := DecodeGraphResultForQuery(bindingsQuery, validBindings); err != nil {
+		t.Fatalf("valid request-bound bindings result: %v", err)
+	}
+	wrongBindings := decodeResult(`{"kind":"bindings","rows":[{"a":{"key":"1"},"c":null}],"stats":{"returned_items":1,"truncated":false}}`)
+	if _, err := DecodeGraphResultForQuery(bindingsQuery, wrongBindings); err == nil || !strings.Contains(err.Error(), "unrequested alias") {
+		t.Fatalf("expected projected alias mismatch, got %v", err)
+	}
+
+	aggregatesQuery := decodeQuery(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"rows":{"count":"*"}}}}`)
+	wrongAggregates := decodeResult(`{"kind":"aggregates","aggregates":{"other":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":false}}`)
+	if _, err := DecodeGraphResultForQuery(aggregatesQuery, wrongAggregates); err == nil || !strings.Contains(err.Error(), "do not match requested names") {
+		t.Fatalf("expected aggregate name mismatch, got %v", err)
 	}
 }
 

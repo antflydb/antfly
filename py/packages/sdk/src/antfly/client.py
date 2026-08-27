@@ -868,9 +868,11 @@ class AntflyClient:
                 body[key] = value
 
         response = self._request("POST", f"/db/v1/tables/{quote(table, safe='')}/query", json=body)
+        expected_graph_queries = None
         if encoded_graph_queries is not None:
             graph_dialect = "canonical"
-            expected_graph_operations = frozenset(encoded_graph_queries)
+            expected_graph_operations = None
+            expected_graph_queries = encoded_graph_queries
         elif graph_searches is not None:
             graph_dialect = "legacy"
             expected_graph_operations = frozenset(graph_searches)
@@ -881,6 +883,7 @@ class AntflyClient:
             response,
             graph_dialect=graph_dialect,
             expected_graph_operations=expected_graph_operations,
+            expected_graph_queries=expected_graph_queries,
         )
 
     def get(self, table: str, key: str) -> dict[str, Any]:

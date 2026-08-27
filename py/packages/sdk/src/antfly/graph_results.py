@@ -20,6 +20,7 @@ _MAX_GRAPH_EDGES = 64
 _MAX_GRAPH_ITEMS = 10_000
 _MISSING = object()
 GraphResultDialect = Literal["auto", "canonical", "legacy", "none"]
+GraphResultKind = Literal["bindings", "aggregates", "nodes"]
 
 
 def _invalid(path: str, message: str) -> NoReturn:
@@ -304,7 +305,33 @@ def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
     _validate_stats(value["stats"], f"{path}.stats", len(paths) if paths else len(nodes), allow_truncated=True)
 
 
-def _validate_graph_result(value: object, path: str, dialect: GraphResultDialect) -> None:
+def _canonical_result_contract(value: object, path: str) -> tuple[GraphResultKind, frozenset[str] | None]:
+    operation = _object(value, path)
+    if "match" in operation:
+        returned = _object(operation.get("return", _MISSING), f"{path}.return")
+        if "bindings" in returned:
+            bindings = _array(returned["bindings"], f"{path}.return.bindings")
+            names: list[str] = []
+            for index, name in enumerate(bindings):
+                if not isinstance(name, str):
+                    _invalid(f"{path}.return.bindings[{index}]", "must be a string")
+                names.append(name)
+            return "bindings", frozenset(names)
+        if "aggregates" in returned:
+            aggregates = _object(returned["aggregates"], f"{path}.return.aggregates")
+            return "aggregates", frozenset(aggregates)
+        _invalid(f"{path}.return", "must select bindings or aggregates")
+    if any(name in operation for name in ("traverse", "shortest_path", "k_shortest_paths")):
+        return "nodes", None
+    _invalid(path, "does not contain a supported graph operation")
+
+
+def _validate_graph_result(
+    value: object,
+    path: str,
+    dialect: GraphResultDialect,
+    contract: tuple[GraphResultKind, frozenset[str] | None] | None = None,
+) -> None:
     result = _object(value, path)
     kind = result.get("kind", _MISSING)
     if dialect == "none":
@@ -317,10 +344,22 @@ def _validate_graph_result(value: object, path: str, dialect: GraphResultDialect
         _invalid(f"{path}.kind", "legacy graph results must use the legacy result shape")
     if not isinstance(kind, str):
         _invalid(f"{path}.kind", "must be a string")
+    if contract is not None and kind != contract[0]:
+        _invalid(f"{path}.kind", f"must be {contract[0]!r} for the requested operation")
     if kind == "bindings":
         _validate_bindings_result(result, path)
+        if contract is not None and contract[1] is not None:
+            expected = contract[1]
+            for row_index, raw_row in enumerate(_array(result["rows"], f"{path}.rows")):
+                row = _object(raw_row, f"{path}.rows[{row_index}]")
+                if frozenset(row) != expected:
+                    _invalid(f"{path}.rows[{row_index}]", "binding aliases do not match the requested projection")
     elif kind == "aggregates":
         _validate_aggregates_result(result, path)
+        if contract is not None and contract[1] is not None:
+            aggregates = _object(result["aggregates"], f"{path}.aggregates")
+            if frozenset(aggregates) != contract[1]:
+                _invalid(f"{path}.aggregates", "names do not match the requested aggregates")
     elif kind == "nodes":
         _validate_nodes_result(result, path)
     else:
@@ -332,27 +371,34 @@ def decode_query_responses(
     *,
     graph_dialect: GraphResultDialect = "auto",
     expected_graph_operations: frozenset[str] | None = None,
+    expected_graph_queries: Mapping[str, object] | None = None,
 ) -> QueryResponses:
     """Validate graph results against the request dialect, then decode them."""
+    if expected_graph_operations is not None and expected_graph_queries is not None:
+        raise ValueError("expected_graph_operations and expected_graph_queries are mutually exclusive")
+    expected_names = expected_graph_operations
+    if expected_graph_queries is not None:
+        expected_names = frozenset(expected_graph_queries)
+
     response = _object(value, "response")
     raw_responses = response.get("responses", _MISSING)
     if raw_responses is _MISSING:
-        if expected_graph_operations is not None:
+        if expected_names is not None:
             _invalid("response", "is missing responses")
     else:
         responses = _array(raw_responses, "response.responses")
-        if expected_graph_operations is not None and len(responses) != 1:
+        if expected_names is not None and len(responses) != 1:
             _invalid("response.responses", "must contain exactly one response")
         for response_index, raw_result in enumerate(responses):
             result_path = f"response.responses[{response_index}]"
             result = _object(raw_result, result_path)
             graph_results = result.get("graph_results", _MISSING)
             if graph_results is _MISSING:
-                if expected_graph_operations:
+                if expected_names:
                     _invalid(result_path, "is missing graph_results")
                 continue
             operations = _object(graph_results, f"{result_path}.graph_results")
-            if expected_graph_operations is not None and frozenset(operations) != expected_graph_operations:
+            if expected_names is not None and frozenset(operations) != expected_names:
                 _invalid(
                     f"{result_path}.graph_results",
                     "operation names do not match the request",
@@ -362,10 +408,17 @@ def decode_query_responses(
                 is_canonical = graph_dialect == "canonical" or result_kind in {"bindings", "aggregates", "nodes"}
                 if is_canonical and not is_valid_graph_identifier(name):
                     _invalid(f"{result_path}.graph_results", f"contains invalid operation name {name!r}")
+                contract = None
+                if expected_graph_queries is not None:
+                    contract = _canonical_result_contract(
+                        expected_graph_queries[name],
+                        f"request.graph_queries[{name!r}]",
+                    )
                 _validate_graph_result(
                     graph_result,
                     f"{result_path}.graph_results[{name!r}]",
                     graph_dialect,
+                    contract,
                 )
     try:
         return QueryResponses.from_dict(response)
