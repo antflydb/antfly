@@ -63,7 +63,8 @@ const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
-const metadata_proposal_apply_poll_ms: u64 = 1;
+const metadata_proposal_driver_wait_ns: u64 = std.time.ns_per_ms;
+const metadata_proposal_passive_wait_ns: u64 = 25 * std.time.ns_per_ms;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
@@ -388,6 +389,61 @@ const MetadataRunRoundTrace = struct {
         return if (idx) |value| self.phases[value] else .{ .name = "-", .elapsed_ns = 0 };
     }
 };
+
+const MetadataProposalProgressDriver = struct {
+    lane: std.atomic.Mutex = .unlocked,
+    wake_epoch: std.atomic.Value(u32) = .init(0),
+
+    const Lease = struct {
+        driver: *MetadataProposalProgressDriver,
+
+        fn deinit(self: *Lease) void {
+            self.driver.lane.unlock();
+            self.driver.notifyWaiters();
+            self.* = undefined;
+        }
+    };
+
+    fn tryAcquire(self: *MetadataProposalProgressDriver) ?Lease {
+        if (!self.lane.tryLock()) return null;
+        return .{ .driver = self };
+    }
+
+    fn currentEpoch(self: *const MetadataProposalProgressDriver) u32 {
+        return self.wake_epoch.load(.acquire);
+    }
+
+    fn waitForHandoff(self: *MetadataProposalProgressDriver, observed_epoch: u32, timeout_ns: u64) void {
+        if (self.wake_epoch.load(.acquire) != observed_epoch) return;
+        std.Io.futexWaitTimeout(
+            std.Options.debug_io,
+            u32,
+            &self.wake_epoch.raw,
+            observed_epoch,
+            .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromNanoseconds(@intCast(timeout_ns)),
+            } },
+        ) catch return;
+    }
+
+    fn notifyWaiters(self: *MetadataProposalProgressDriver) void {
+        _ = self.wake_epoch.fetchAdd(1, .release);
+        std.Io.futexWake(std.Options.debug_io, u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+    }
+};
+
+test "metadata proposal receipt progress uses a single transferable driver" {
+    var driver = MetadataProposalProgressDriver{};
+    var first = driver.tryAcquire() orelse return error.TestExpectedEqual;
+    try std.testing.expect(driver.tryAcquire() == null);
+    const observed_epoch = driver.currentEpoch();
+    first.deinit();
+    try std.testing.expect(driver.currentEpoch() != observed_epoch);
+
+    var next = driver.tryAcquire() orelse return error.TestExpectedEqual;
+    next.deinit();
+}
 
 const LifecycleSignal = struct {
     alloc: std.mem.Allocator,
@@ -3656,6 +3712,10 @@ pub const MetadataHttpService = struct {
     transition_mutex: std.Io.Mutex = .init,
     transition_metrics_mutex: std.Io.Mutex = .init,
     transition_metrics_snapshot: raft_transition_service.TransitionServiceMetrics = .{},
+    // One request drives low-latency Ready processing for every outstanding
+    // metadata proposal. Other requests sleep on the driver's handoff signal,
+    // avoiding a per-waiter Raft round and false lifecycle epoch changes.
+    proposal_progress_driver: MetadataProposalProgressDriver = .{},
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
@@ -3894,6 +3954,7 @@ pub const MetadataHttpService = struct {
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
         }
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(signal.table_name);
     }
 
@@ -3905,6 +3966,7 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceCommittedKeySignal(ptr: *anyopaque, _: metadata_storage.raft_apply_store.CommittedKeySignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         self.lifecycle_reconcile_requested.store(true, .release);
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(null);
     }
 
@@ -4042,6 +4104,8 @@ pub const MetadataHttpService = struct {
                 self.unlockRuntime();
             }
         }
+        var progress_driver_lease: ?MetadataProposalProgressDriver.Lease = null;
+        defer if (progress_driver_lease) |*lease| lease.deinit();
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
         const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
             @min(local_deadline_ns, caller_deadline_ns)
@@ -4049,6 +4113,10 @@ pub const MetadataHttpService = struct {
             local_deadline_ns;
         while (platform_time.monotonicNs() < deadline_ns) {
             try request.ensureActive();
+            // Capture before observing Raft so an apply notification between
+            // the observation and wait cannot be lost.
+            const lifecycle_observation = self.lifecycle_signal.snapshot(null);
+            const progress_driver_epoch = self.proposal_progress_driver.currentEpoch();
             self.lockRuntime();
             const maybe_raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id);
             const applied_entry_term = if (maybe_raft_status) |raft_status|
@@ -4069,8 +4137,28 @@ pub const MetadataHttpService = struct {
                 .superseded => return error.NotLeader,
                 .pending => {},
             }
-            try self.runRaftProgressOnly();
-            platform_clock.Clock.real().sleepMs(metadata_proposal_apply_poll_ms);
+            if (progress_driver_lease == null) {
+                progress_driver_lease = self.proposal_progress_driver.tryAcquire();
+            }
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) break;
+            const remaining_ns = deadline_ns - now_ns;
+            if (progress_driver_lease != null) {
+                try self.runRaftProgressOnly();
+                self.lifecycle_signal.wait(
+                    lifecycle_observation,
+                    @min(remaining_ns, metadata_proposal_driver_wait_ns),
+                );
+            } else {
+                // Bound the passive sleep so request cancellation remains
+                // responsive even if the driver stalls without producing a
+                // lifecycle event. Apply and driver handoff wake passive
+                // waiters immediately.
+                self.proposal_progress_driver.waitForHandoff(
+                    progress_driver_epoch,
+                    @min(remaining_ns, metadata_proposal_passive_wait_ns),
+                );
+            }
         }
         try request.ensureActive();
         return error.MetadataProposalApplyTimeout;
