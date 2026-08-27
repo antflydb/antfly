@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 MAX_ARTIFACT_SOURCES = 64
 _GRAPH_ARTIFACT_PATH = re.compile(r"^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$")
-_GRAPH_MATERIALIZED_SOURCE = re.compile(r"^\{\{\s*(_doc\.key|_artifact\.value(?:\..+)?)\s*\}\}$")
+_GRAPH_MATERIALIZED_SOURCE = re.compile(r"^\{\{\s*(?:_doc\.key|_artifact\.value(?:\.[A-Za-z0-9_]+)*)\s*\}\}$")
 
 
 def _relationship_field_active(value: Any) -> bool:

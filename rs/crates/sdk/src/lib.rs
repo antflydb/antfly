@@ -254,10 +254,19 @@ fn valid_graph_materialized_source_template(value: &str) -> bool {
     else {
         return false;
     };
-    expression == "_doc.key"
-        || expression == "_artifact.value"
-        || (expression.starts_with("_artifact.value.")
-            && expression.len() > "_artifact.value.".len())
+    if expression == "_doc.key" || expression == "_artifact.value" {
+        return true;
+    }
+    let Some(path) = expression.strip_prefix("_artifact.value.") else {
+        return false;
+    };
+    !path.is_empty()
+        && path.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
 }
 
 fn valid_graph_artifact_path(path: &str) -> bool {
@@ -825,6 +834,45 @@ mod tests {
             target: None,
         });
         assert!(graph_index_sources(vec![invalid_source]).is_err());
+
+        for source in [
+            "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
+            "{{ _artifact.value.owner-id }}",
+            "{{ _artifact.value. }}",
+        ] {
+            assert!(
+                graph_index_sources(vec![GraphIndexSourceSpec {
+                    artifact: "relations".into(),
+                    path: None,
+                    format: None,
+                    mention_edge_type: None,
+                    nodes: Some(GraphNodeMappingSpec {
+                        model: None,
+                        source: Some(source.into()),
+                        target: None,
+                    }),
+                    edge: None,
+                    context: None,
+                }])
+                .is_err()
+            );
+        }
+        assert!(
+            graph_index_sources(vec![GraphIndexSourceSpec {
+                artifact: "relations".into(),
+                path: None,
+                format: None,
+                mention_edge_type: None,
+                nodes: Some(GraphNodeMappingSpec {
+                    model: None,
+                    source: Some("{{ _artifact.value.owner.id }}".into()),
+                    target: None,
+                }),
+                edge: None,
+                context: None,
+            }])
+            .is_ok()
+        );
     }
 
     #[test]

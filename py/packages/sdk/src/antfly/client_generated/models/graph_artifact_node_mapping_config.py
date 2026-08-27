@@ -18,8 +18,9 @@ class GraphArtifactNodeMappingConfig:
     Attributes:
         model (GraphArtifactNodeMappingConfigModel | Unset):  Default: GraphArtifactNodeMappingConfigModel.DOCUMENT.
         source (str | Unset): Stable owner identity for edges materialized from one artifact item. It must resolve from
-            the source document key or the durable artifact payload so replay and deletion can deterministically replace
-            prior edges. Omit it to use the source document key.
+            the source document key or the durable artifact payload through a dot-separated ASCII field path so replay and
+            deletion can deterministically replace prior edges. Helpers, literals, multiple expressions, and document-value
+            fields are rejected. Omit it to use the source document key.
         target (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
             each materialized graph item.
     """

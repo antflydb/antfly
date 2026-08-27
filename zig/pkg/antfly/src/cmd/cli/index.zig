@@ -585,10 +585,12 @@ fn waitDisposition(summary: IndexSummary, target: WaitTarget) WaitDisposition {
 
 fn writeIndexSummary(allocator: std.mem.Allocator, io: std.Io, index: antfly_client.types.IndexStatus) !void {
     const summary = summarizeIndex(index);
+    const index_name = index_readiness.createdIndexName(index.config);
+    const index_type = index_readiness.createdIndexType(index.config);
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const writer = &out.writer;
-    try writer.print("{s}\t{s}\t{s}\t", .{ index.config.name, @tagName(index.config.type), summary.state });
+    try writer.print("{s}\t{s}\t{s}\t", .{ index_name, @tagName(index_type), summary.state });
     if (summary.progress) |progress| {
         try writer.print("{d:.1}%", .{@max(0.0, @min(1.0, progress)) * 100.0});
     } else {

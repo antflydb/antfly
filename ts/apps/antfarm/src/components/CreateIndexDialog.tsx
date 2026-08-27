@@ -32,6 +32,7 @@ import {
   type GeneratorConfig,
   graphIndexSources,
   type IndexConfig,
+  isValidGraphMaterializedSourceTemplate,
 } from "@antfly/sdk";
 import { zodResolver } from "@hookform/resolvers/zod";
 import type React from "react";
@@ -174,6 +175,17 @@ const indexFormSchema = z
       } else {
         validateNamedSources(data.graphSources, "graphSources", context);
         data.graphSources.forEach((source, index) => {
+          if (
+            source.sourceNode?.trim() &&
+            !isValidGraphMaterializedSourceTemplate(source.sourceNode)
+          ) {
+            context.addIssue({
+              code: "custom",
+              path: ["graphSources", index, "sourceNode"],
+              message:
+                "Use {{ _doc.key }} or one {{ _artifact.value... }} path for the source node.",
+            });
+          }
           const fields = splitContextFields(source.contextFields);
           if (new Set(fields).size !== fields.length) {
             context.addIssue({
@@ -822,6 +834,7 @@ const IndexKindForm: React.FC<{
                           <FormControl>
                             <Input placeholder="{{ _doc.key }}" {...field} />
                           </FormControl>
+                          <FormMessage />
                         </FormItem>
                       )}
                     />

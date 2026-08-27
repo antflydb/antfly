@@ -86,7 +86,8 @@ class RetrievalQueryRequest:
                 Use this to query a named document- or artifact-backed full-text index. The selected
                 index must exist and have type `full_text`. Omit this field to use the table's active
                 schema full-text index, preserving v0.2 behavior. Structured document filters continue
-                to use the active schema index even when retrieval uses a named artifact index.
+                to use the active schema index even when retrieval uses a named artifact index. This
+                selector is invalid without `full_text_search` or a scoring text clause in `query`.
                  Example: document_text.
             semantic_search (str | Unset): Natural language query for vector similarity search. Results are ranked by
                 semantic similarity

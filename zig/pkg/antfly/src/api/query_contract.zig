@@ -3005,7 +3005,13 @@ pub fn preflightQueryRequestAlloc(
     errdefer freeOwnedStringItems(alloc, graph_query_order.items);
     errdefer graph_query_order.deinit(alloc);
 
-    if (preflightRequestHasFullTextResults(preflight_req.req)) {
+    for (preflight_req.req.full_text_queries) |query| {
+        try appendUniqueOwnedString(alloc, &full_text_indexes, query.index_name);
+    }
+    if (preflight_req.req.full_text != null or
+        preflight_req.req.filter_text != null or
+        preflight_req.req.exclusion_text != null)
+    {
         try appendUniqueOwnedString(alloc, &full_text_indexes, "full_text");
     }
     for (preflight_req.req.dense_queries) |dense_query| {
@@ -12782,6 +12788,21 @@ test "api query contract preflight summarizes query lanes and result refs" {
     try std.testing.expect(summary.profile_requested);
     try std.testing.expect(summary.include_stored);
     try std.testing.expectEqual(@as(u32, 2), summary.aggregation_count);
+}
+
+test "api query contract preflight preserves a named full text index" {
+    var parsed = try std.json.parseFromSlice(metadata_openapi.QueryRequest, std.testing.allocator,
+        \\{
+        \\  "full_text_index": "document_text",
+        \\  "full_text_search": {"match":"raft","field":"body"}
+        \\}
+    , .{});
+    defer parsed.deinit();
+
+    var summary = try preflightQueryRequestAlloc(std.testing.allocator, parsed.value);
+    defer summary.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), summary.full_text_indexes.len);
+    try std.testing.expectEqualStrings("document_text", summary.full_text_indexes[0]);
 }
 
 test "api query contract preflight rejects count with reranker" {

@@ -3670,6 +3670,8 @@ pub fn build(b: *std.Build) void {
         "metadata.table debug encoder emits runtime schemas and index bindings",
         "api query builder preflight describes missing physical sort coverage with public sortable wording",
         "api query builder prompt exposes native sort capabilities",
+        "api query contract preflight preserves a named full text index",
+        "query builder preflight plan preserves exact named full text selection",
         "distributed query shard request preserves sorted cursor contract",
         "distributed sorted hit merge uses typed sort tuple ordering and cursors",
         "distributed shard validation rejects mixed scalar sort domains",

@@ -20313,8 +20313,16 @@ fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
     const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
     if (std.mem.eql(u8, expr, "_doc.key")) return;
     if (std.mem.eql(u8, expr, "_artifact.value")) return;
-    if (std.mem.startsWith(u8, expr, "_artifact.value.") and expr.len > "_artifact.value.".len) return;
-    return error.InvalidIndexConfig;
+    const prefix = "_artifact.value.";
+    if (!std.mem.startsWith(u8, expr, prefix)) return error.InvalidIndexConfig;
+    var parts = std.mem.splitScalar(u8, expr[prefix.len..], '.');
+    while (parts.next()) |part| {
+        if (part.len == 0) return error.InvalidIndexConfig;
+        for (part) |ch| {
+            if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return error.InvalidIndexConfig;
+        }
+    }
+    return;
 }
 
 fn validateGraphTemplateDocFields(template_source: []const u8, declared_fields: []const []u8) !void {
@@ -20596,6 +20604,18 @@ test "graph config rejects undeclared doc value template fields and unsupported 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1"},"nodes":{"source":"{{ _item.source.document_id }}"}}
     ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.id }}{{ _doc.value.tenant_id }}"},"context":{"doc_fields":["tenant_id"]}}}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{"source":{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.owner-id }}"}}}
+    ));
+
+    var stable = try parseGraphConfig(alloc,
+        \\{"source":{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.owner.id }}"}}}
+    );
+    defer stable.deinit(alloc);
+    try std.testing.expectEqualStrings("{{ _artifact.value.owner.id }}", stable.artifact_sources[0].mapping.source_template);
 }
 
 test "graph config rejects artifact source combined with document field edge types" {

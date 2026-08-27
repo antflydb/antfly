@@ -23,6 +23,24 @@ const semantic_readiness_timeout_ms: u64 = 1_500;
 // and only run it when the caller explicitly selected indexes.
 const retrieval_advisory_timeout_ms: u64 = 250;
 
+/// `CreatedIndex` is a discriminated response union. Keep common CLI fields
+/// behind total accessors so adding or reshaping one variant cannot silently
+/// reintroduce flat-struct assumptions in release-only code paths.
+pub fn createdIndexName(config: antfly_client.types.CreatedIndex) []const u8 {
+    return switch (config) {
+        inline else => |value| value.name,
+    };
+}
+
+pub fn createdIndexType(config: antfly_client.types.CreatedIndex) antfly_client.types.IndexType {
+    return switch (config) {
+        .created_full_text_index => .full_text,
+        .created_embeddings_index => .embeddings,
+        .created_graph_index => .graph,
+        .created_algebraic_index => .algebraic,
+    };
+}
+
 /// Coverage is an integrity signal, but its completion semantics are policy
 /// specific. External indexes are query-ready once replay is current even when
 /// callers intentionally supplied vectors for only part of the source table.
@@ -47,12 +65,13 @@ fn printEmbeddingReadinessWarning(
     table_name: []const u8,
     index: antfly_client.types.IndexStatus,
 ) void {
+    const index_name = createdIndexName(index.config);
     const stats = switch (index.status) {
         .embeddings_index_stats => |value| value,
         else => {
             std.debug.print(
                 "warning: semantic index {s} has no embeddings readiness status; results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
-                .{ index.config.name, table_name, index.config.name },
+                .{ index_name, table_name, index_name },
             );
             return;
         },
@@ -70,17 +89,17 @@ fn printEmbeddingReadinessWarning(
     if (stats.coverage) |coverage| {
         std.debug.print(
             "warning: semantic index {s} is {s} (coverage {d}/{d}, complete={any}); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
-            .{ index.config.name, state, coverage.produced, coverage.source_total, coverage.complete, table_name, index.config.name },
+            .{ index_name, state, coverage.produced, coverage.source_total, coverage.complete, table_name, index_name },
         );
     } else if (stats.backfill_progress) |progress| {
         std.debug.print(
             "warning: semantic index {s} is {s} ({d:.1}%); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
-            .{ index.config.name, state, @max(0.0, @min(1.0, progress)) * 100.0, table_name, index.config.name },
+            .{ index_name, state, @max(0.0, @min(1.0, progress)) * 100.0, table_name, index_name },
         );
     } else {
         std.debug.print(
             "warning: semantic index {s} is {s}; results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
-            .{ index.config.name, state, table_name, index.config.name },
+            .{ index_name, state, table_name, index_name },
         );
     }
 }
@@ -138,7 +157,7 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
             if (selectedEarlier(selected, selected_index)) continue;
             var found: ?antfly_client.types.IndexStatus = null;
             for (parsed.value) |index| {
-                if (std.mem.eql(u8, name, index.config.name)) {
+                if (std.mem.eql(u8, name, createdIndexName(index.config))) {
                     found = index;
                     break;
                 }
@@ -150,10 +169,11 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
                 );
                 continue;
             };
-            if (index.config.type != .embeddings) {
+            const index_type = createdIndexType(index.config);
+            if (index_type != .embeddings) {
                 std.debug.print(
                     "warning: selected semantic index {s} is type {s}, not embeddings; the query may fail.\n",
-                    .{ name, @tagName(index.config.type) },
+                    .{ name, @tagName(index_type) },
                 );
                 continue;
             }
@@ -164,7 +184,7 @@ fn warnIfSemanticIndexesAreNotReadyWithTimeout(
 
     var embedding_count: usize = 0;
     for (parsed.value) |index| {
-        if (index.config.type != .embeddings) continue;
+        if (createdIndexType(index.config) != .embeddings) continue;
         embedding_count += 1;
         printEmbeddingReadinessWarning(table_name, index);
     }
@@ -226,4 +246,21 @@ test "semantic readiness selection deduplicates without allocation" {
     try std.testing.expect(!selectedEarlier(&selected, 0));
     try std.testing.expect(!selectedEarlier(&selected, 1));
     try std.testing.expect(selectedEarlier(&selected, 2));
+}
+
+test "created index accessors cover every response variant" {
+    const cases = [_]struct {
+        config: antfly_client.types.CreatedIndex,
+        name: []const u8,
+        index_type: antfly_client.types.IndexType,
+    }{
+        .{ .config = .{ .created_full_text_index = .{ .name = "text", .type = "full_text" } }, .name = "text", .index_type = .full_text },
+        .{ .config = .{ .created_embeddings_index = .{ .name = "dense", .type = "embeddings" } }, .name = "dense", .index_type = .embeddings },
+        .{ .config = .{ .created_graph_index = .{ .name = "links", .type = "graph" } }, .name = "links", .index_type = .graph },
+        .{ .config = .{ .created_algebraic_index = .{ .name = "rows", .type = "algebraic" } }, .name = "rows", .index_type = .algebraic },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqualStrings(case.name, createdIndexName(case.config));
+        try std.testing.expectEqual(case.index_type, createdIndexType(case.config));
+    }
 }

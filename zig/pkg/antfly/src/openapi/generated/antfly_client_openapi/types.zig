@@ -4495,7 +4495,7 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
-/// Stable owner identity for edges materialized from one artifact item. It must resolve from the source document key or the durable artifact payload so replay and deletion can deterministically replace prior edges. Omit it to use the source document key.
+/// Stable owner identity for edges materialized from one artifact item. It must resolve from the source document key or the durable artifact payload through a dot-separated ASCII field path so replay and deletion can deterministically replace prior edges. Helpers, literals, multiple expressions, and document-value fields are rejected. Omit it to use the source document key.
 pub const GraphMaterializedSourceTemplate = []const u8;
 
 /// Defines how to select start/target nodes for graph queries
@@ -7872,7 +7872,7 @@ pub const QueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
-    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index.
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query`.
     full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,
@@ -8429,7 +8429,7 @@ pub const RetrievalQueryRequest = struct {
     query: ?std.json.Value = null,
     /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
     full_text_search: ?RawQuery = null,
-    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index.
+    /// Full-text index used by `full_text_search` and by scoring text clauses in `query`. Use this to query a named document- or artifact-backed full-text index. The selected index must exist and have type `full_text`. Omit this field to use the table's active schema full-text index, preserving v0.2 behavior. Structured document filters continue to use the active schema index even when retrieval uses a named artifact index. This selector is invalid without `full_text_search` or a scoring text clause in `query`.
     full_text_index: ?[]const u8 = null,
     /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. UTF-8 input is limited to 1 MiB. Use `embedding_template` for multimodal queries.
     semantic_search: ?[]const u8 = null,

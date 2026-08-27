@@ -56,6 +56,7 @@ export {
   artifactFullTextIndexConfig,
   artifactIndexSources,
   graphIndexSources,
+  isValidGraphMaterializedSourceTemplate,
   validateCreateIndexRequestRelationships,
 } from "./index-config.js";
 export {

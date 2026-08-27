@@ -163,6 +163,21 @@ describe("artifact embedding index configuration", () => {
     expect(() =>
       graphIndexSources({ artifact: "relations", nodes: { source: "{{ source }}" } })
     ).toThrow(/nodes.source/);
+    for (const source of [
+      "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
+      "{{ _artifact.value.owner-id }}",
+      "{{ _artifact.value. }}",
+    ]) {
+      expect(() => graphIndexSources({ artifact: "relations", nodes: { source } })).toThrow(
+        /nodes.source/
+      );
+    }
+    expect(() =>
+      graphIndexSources({
+        artifact: "relations",
+        nodes: { source: "{{ _artifact.value.owner.id }}" },
+      })
+    ).not.toThrow();
     expect(() =>
       graphIndexSources({ artifact: "relations", nodes: { target: Number.POSITIVE_INFINITY } })
     ).toThrow(/nodes.target/);

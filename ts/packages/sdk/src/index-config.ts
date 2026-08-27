@@ -88,17 +88,9 @@ function validateOptionalString(value: unknown, path: string): asserts value is 
   }
 }
 
-function isGraphMaterializedSourceTemplate(value: string): boolean {
-  const expression = value
-    .trim()
-    .match(/^\{\{\s*(.*?)\s*\}\}$/)?.[1]
-    ?.trim();
-  return (
-    expression === "_doc.key" ||
-    expression === "_artifact.value" ||
-    (expression?.startsWith("_artifact.value.") === true &&
-      expression.length > "_artifact.value.".length)
-  );
+/** Returns whether a graph source-owner template is stable across replay and deletion. */
+export function isValidGraphMaterializedSourceTemplate(value: string): boolean {
+  return /^\{\{\s*(?:_doc\.key|_artifact\.value(?:\.[A-Za-z0-9_]+)*)\s*\}\}$/.test(value.trim());
 }
 
 function validateOnlyKeys(
@@ -244,7 +236,7 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     if (
       source.nodes?.source !== undefined &&
       (typeof source.nodes.source !== "string" ||
-        !isGraphMaterializedSourceTemplate(source.nodes.source))
+        !isValidGraphMaterializedSourceTemplate(source.nodes.source))
     ) {
       throw new TypeError(`sources[${index}].nodes.source must use _doc.key or _artifact.value`);
     }

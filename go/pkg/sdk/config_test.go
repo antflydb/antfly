@@ -503,6 +503,24 @@ func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
 	}); err == nil {
 		t.Fatal("unstable graph source identities must be rejected")
 	}
+	for _, source := range []string{
+		"{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
+		"{{ _artifact.value.owner-id }}",
+		"{{ _artifact.value. }}",
+	} {
+		if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
+			Artifact: "relations",
+			Nodes:    GraphArtifactNodeMappingConfig{Source: source},
+		}); err == nil {
+			t.Fatalf("unsafe graph source identity %q must be rejected", source)
+		}
+	}
+	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
+		Artifact: "relations",
+		Nodes:    GraphArtifactNodeMappingConfig{Source: "{{ _artifact.value.owner.id }}"},
+	}); err != nil {
+		t.Fatalf("stable nested artifact source identity rejected: %v", err)
+	}
 }
 
 func TestNewArtifactFullTextIndexConfig(t *testing.T) {

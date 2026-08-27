@@ -1394,7 +1394,7 @@ pub const GraphIndexStats = struct {
     algebraic_graph: ?std.json.Value = null,
 };
 
-/// Stable owner identity for edges materialized from one artifact item. It must resolve from the source document key or the durable artifact payload so replay and deletion can deterministically replace prior edges. Omit it to use the source document key.
+/// Stable owner identity for edges materialized from one artifact item. It must resolve from the source document key or the durable artifact payload through a dot-separated ASCII field path so replay and deletion can deterministically replace prior edges. Helpers, literals, multiple expressions, and document-value fields are rejected. Omit it to use the source document key.
 pub const GraphMaterializedSourceTemplate = []const u8;
 
 /// Defines how to select start/target nodes for graph queries

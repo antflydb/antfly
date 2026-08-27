@@ -515,8 +515,25 @@ func validGraphMaterializedSourceTemplate(value string) bool {
 		return false
 	}
 	expression := strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(trimmed, "{{"), "}}"))
-	return expression == "_doc.key" || expression == "_artifact.value" ||
-		(strings.HasPrefix(expression, "_artifact.value.") && len(expression) > len("_artifact.value."))
+	if expression == "_doc.key" || expression == "_artifact.value" {
+		return true
+	}
+	const prefix = "_artifact.value."
+	if !strings.HasPrefix(expression, prefix) {
+		return false
+	}
+	for _, part := range strings.Split(strings.TrimPrefix(expression, prefix), ".") {
+		if part == "" {
+			return false
+		}
+		for _, char := range part {
+			if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') || char == '_') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func validGraphArtifactPath(path string) bool {
