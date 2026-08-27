@@ -1038,6 +1038,7 @@ test "compiled table write boundary transports cancellation and committed failur
             self.pre_decision_calls += 1;
             try std.testing.expectEqual(@as(?u64, 123), context.deadline_ns);
             try context.cancellation.check();
+            if (self.failure) |err| return err;
             return {};
         }
 
@@ -1102,6 +1103,7 @@ test "compiled table write boundary transports cancellation and committed failur
     );
     try std.testing.expectEqual(@as(usize, 1), fake.stateless_transaction_calls);
     canceled.store(false, .release);
+    fake.failure = null;
     try std.testing.expect((try source.txnBeginGroupLocalWithPreDecisionContext(
         std.testing.allocator,
         7,
@@ -1117,4 +1119,17 @@ test "compiled table write boundary transports cancellation and committed failur
         },
     )) != null);
     try std.testing.expectEqual(@as(usize, 1), fake.pre_decision_calls);
+    fake.failure = error.DeadlineExceeded;
+    try std.testing.expectError(error.DeadlineExceeded, source.txnBeginGroupLocalWithPreDecisionContext(
+        std.testing.allocator,
+        7,
+        "docs",
+        std.mem.zeroes(db_mod.types.TxnId),
+        1,
+        2,
+        false,
+        &.{},
+        .{ .deadline_ns = 123 },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), fake.pre_decision_calls);
 }

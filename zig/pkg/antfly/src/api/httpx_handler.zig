@@ -2144,6 +2144,7 @@ pub const AntflyApiHandler = struct {
             error.NotFound => textResponse(ctx, 404, "not found"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
+            error.TransactionPreDecisionOutcomeUnknown => textResponse(ctx, 504, "transaction outcome unknown"),
             error.EnrichmentWaitCanceled,
             error.EnrichmentWaitTimeout,
             error.EnrichmentRetryInProgress,
@@ -6115,6 +6116,19 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
     defer unavailable_response.deinit();
     try std.testing.expectEqual(@as(u16, 503), unavailable_response.status.code);
     try std.testing.expect(unavailable_response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
+
+    var ambiguous_deadline_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
+    defer ambiguous_deadline_request.deinit();
+    var ambiguous_deadline_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &ambiguous_deadline_request);
+    defer ambiguous_deadline_ctx.deinit();
+    var ambiguous_deadline_response = try AntflyApiHandler.internalTxnErrorResponse(
+        &ambiguous_deadline_ctx,
+        error.TransactionPreDecisionOutcomeUnknown,
+        .begin,
+    );
+    defer ambiguous_deadline_response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), ambiguous_deadline_response.status.code);
+    try std.testing.expect(ambiguous_deadline_response.headers.get(distributed_txn_contract.pre_decision_outcome_header) == null);
 
     inline for (.{
         .{ error.DeadlineExceeded, @as(u16, 504) },

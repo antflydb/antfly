@@ -29,6 +29,7 @@ pub const Error = operation.ApiError || error{
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     GroupLeaderUnavailable,
+    TransactionPreDecisionOutcomeUnknown,
     RaftBatchWriteOutcomeUnknown,
     DecisionConflict,
     TransactionConflict,
@@ -275,13 +276,19 @@ pub const Operations = struct {
     pub fn txnBegin(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnBeginRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
+        const supports_pre_decision_context =
+            writes.vtable.txn_begin_group_local_with_pre_decision_context != null;
         _ = (writes.txnBeginGroupLocalWithPreDecisionContext(alloc, group_id, table_name, input.txn_id, input.begin_timestamp, input.topology_epoch, input.retain_terminal, input.participants, .{
             .deadline_ns = request.deadline_ns,
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.Timeout, error.DeadlineExceeded => {
+                if (!supports_pre_decision_context)
+                    return error.TransactionPreDecisionOutcomeUnknown;
+                return error.DeadlineExceeded;
+            },
             error.DecisionConflict => return error.DecisionConflict,
             error.TopologyChanged => return error.TopologyChanged,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -298,6 +305,8 @@ pub const Operations = struct {
     pub fn txnPrepare(self: Operations, alloc: std.mem.Allocator, request: operation.RequestContext, group_id: u64, table_name: []const u8, input: distributed_txn.TxnPrepareRequest) Error!void {
         try request.ensureActive();
         const writes = self.writes orelse return error.NotFound;
+        const supports_pre_decision_context =
+            writes.vtable.txn_prepare_group_local_with_pre_decision_context != null;
         const validator = self.txn_validator orelse return error.Unavailable;
         validator.validate(table_name, input.req.writes) catch |err| switch (err) {
             error.InvalidBatchRequest => return error.InvalidArgument,
@@ -308,7 +317,11 @@ pub const Operations = struct {
             .cancellation = request.cancellation,
         }) catch |err| switch (err) {
             error.Canceled, error.Cancelled => return error.Canceled,
-            error.Timeout, error.DeadlineExceeded => return error.DeadlineExceeded,
+            error.Timeout, error.DeadlineExceeded => {
+                if (!supports_pre_decision_context)
+                    return error.TransactionPreDecisionOutcomeUnknown;
+                return error.DeadlineExceeded;
+            },
             error.TopologyChanged => return error.TopologyChanged,
             error.VersionConflict, error.IntentConflict => return error.TransactionConflict,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
@@ -829,6 +842,54 @@ test "internal transaction operations preserve pre-decision leader unavailabilit
         }
     };
 
+    const LegacyDeadlineSource = struct {
+        fn iface() table_writes.TableWriteSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .batch = batch,
+                    .txn_begin_group_local = txnBegin,
+                    .txn_prepare_group_local = txnPrepare,
+                },
+            };
+        }
+
+        fn batch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) anyerror!?void {
+            return null;
+        }
+
+        fn txnBegin(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: u64,
+            _: bool,
+            _: []const []const u8,
+        ) anyerror!?void {
+            return error.DeadlineExceeded;
+        }
+
+        fn txnPrepare(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: db_mod.types.TxnId,
+            _: u64,
+            _: db_mod.types.TransactionIntentRequest,
+        ) anyerror!?void {
+            return error.Timeout;
+        }
+    };
+
     const Validator = struct {
         fn validate(_: *anyopaque, _: []const u8, _: []const db_mod.types.TransactionWrite) anyerror!void {}
     };
@@ -848,6 +909,27 @@ test "internal transaction operations preserve pre-decision leader unavailabilit
         .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
     ));
     try std.testing.expectError(error.GroupLeaderUnavailable, operations.txnPrepare(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .req = .{} },
+    ));
+
+    const legacy_deadline_operations = Operations{
+        .reads = null,
+        .shard_db_adapter = null,
+        .writes = LegacyDeadlineSource.iface(),
+        .txn_validator = .{ .ptr = undefined, .validate_fn = Validator.validate },
+    };
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnBegin(
+        std.testing.allocator,
+        .{},
+        7,
+        "docs",
+        .{ .txn_id = txn_id, .begin_timestamp = 1, .participants = &.{"table2:docs:group:7"} },
+    ));
+    try std.testing.expectError(error.TransactionPreDecisionOutcomeUnknown, legacy_deadline_operations.txnPrepare(
         std.testing.allocator,
         .{},
         7,
