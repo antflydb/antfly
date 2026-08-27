@@ -26,6 +26,7 @@ const backend_erased = @import("../../backend_erased.zig");
 const backend_scan = @import("../../backend_scan.zig");
 const types = @import("../types.zig");
 const doc_identity = @import("../doc_identity.zig");
+const artifact_ids = @import("../artifact_ids.zig");
 const graph_asset_state = @import("../graph_asset_state.zig");
 const dynamic_field_capability = @import("../dynamic_field_capability.zig");
 const apply_state = @import("../derived/apply_state.zig");
@@ -14638,9 +14639,18 @@ pub const IndexManager = struct {
 
         for (docs, 0..) |doc, i| {
             if (doc.doc_ordinal != null) continue;
+            var identity_doc_key = doc.key;
+            if (internal_keys.isInternalUserKey(doc.key)) {
+                if (try artifact_ids.decodeArtifactRefAlloc(arena, doc.key)) |artifact_ref| {
+                    // Artifact members share their source document's ordinal.
+                    // This lets one resolved document filter project to every
+                    // matching member in a multi-source text index.
+                    identity_doc_key = artifact_ref.document_id;
+                }
+            }
             try pending.append(arena, .{
                 .source_index = i,
-                .store_key = try internal_keys.identityDocToOrdinalKeyAlloc(arena, doc.key),
+                .store_key = try internal_keys.identityDocToOrdinalKeyAlloc(arena, identity_doc_key),
             });
         }
         if (pending.items.len == 0) return docs;

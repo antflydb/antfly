@@ -23148,7 +23148,9 @@ pub const DB = struct {
         // primary selection query. This protects direct storage callers and
         // internal worker envelopes in addition to the public API boundary.
         if (!types.canonicalHierarchyExecutionWithinBudget(req)) return error.InvalidQueryRequest;
-        return try self.searchLockedWithExecutionContextImpl(alloc, req, exec_ctx, true, null);
+        var identity_prefix_filter = try self.searchRequestWithIdentityPrefixFilterAlloc(req);
+        defer identity_prefix_filter.deinit();
+        return try self.searchLockedWithExecutionContextImpl(alloc, identity_prefix_filter.req, exec_ctx, true, null);
     }
 
     fn searchLockedWithExecutionContextImpl(
@@ -24614,7 +24616,9 @@ pub const DB = struct {
     }
 
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
+        var identity_prefix_filter = try self.searchRequestWithIdentityPrefixFilterAlloc(req);
+        defer identity_prefix_filter.deinit();
+        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(identity_prefix_filter.req);
         defer algebraic_filter.deinit();
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, .{
@@ -24736,6 +24740,84 @@ pub const DB = struct {
             req.exclude_doc_ids.len > 0 or
             req.resolved_doc_filter != null or
             req.doc_filter_bindings.len > 0;
+    }
+
+    const IdentityPrefixFilterRequest = struct {
+        req: types.SearchRequest,
+        resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
+        alloc: ?Allocator = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.resolved_doc_filter) |filter| {
+                const alloc = self.alloc.?;
+                filter.deinit(alloc);
+                alloc.destroy(filter);
+            }
+            self.* = undefined;
+        }
+    };
+
+    /// Resolve document-key prefixes once, before composed search fans out to
+    /// dense, sparse, and full-text lanes. Artifact-backed indexes use encoded
+    /// member identities internally, so forwarding the raw prefix to a physical
+    /// backend is both incorrect and inconsistent across index kinds.
+    fn searchRequestWithIdentityPrefixFilterAlloc(self: *DB, req: types.SearchRequest) !IdentityPrefixFilterRequest {
+        if (req.filter_prefix.len == 0) return .{ .req = req };
+
+        var filter = if (req.resolved_doc_filter) |ptr|
+            try self.normalizeResolvedDocFilterDocKeysNoLockAtGenerationAlloc(
+                self.alloc,
+                @ptrCast(@alignCast(ptr)),
+                req.identity_read_generation,
+            )
+        else
+            doc_set.ResolvedDocFilter{};
+        errdefer filter.deinit(self.alloc);
+
+        switch (filter.include) {
+            // A partial-coverage identity set cannot be intersected with
+            // ordinals. Filtering its canonical document keys directly
+            // preserves prefix semantics while allowing downstream projection
+            // to use its normal fallback behavior.
+            .doc_keys => |keys| {
+                var matching = std.ArrayListUnmanaged([]const u8).empty;
+                defer matching.deinit(self.alloc);
+                for (keys) |key| {
+                    if (std.mem.startsWith(u8, key, req.filter_prefix)) try matching.append(self.alloc, key);
+                }
+                const include = try doc_set.cloneDocKeysAlloc(self.alloc, matching.items);
+                filter.include.deinit(self.alloc);
+                filter.include = include;
+            },
+            else => {
+                var prefix_set = try doc_identity.visibleDocSetForPrefixFromStoreAlloc(
+                    self.alloc,
+                    self.core.store,
+                    req.filter_prefix,
+                    req.identity_read_generation,
+                );
+                defer prefix_set.deinit(self.alloc);
+                const include = (try doc_set.intersectAlloc(self.alloc, &filter.include, &prefix_set)) orelse
+                    return error.InvalidDocIdentity;
+                filter.include.deinit(self.alloc);
+                filter.include = include;
+            },
+        }
+
+        const resolved_filter = try self.alloc.create(doc_set.ResolvedDocFilter);
+        errdefer self.alloc.destroy(resolved_filter);
+        resolved_filter.* = filter;
+        filter = .{};
+
+        var next = req;
+        next.filter_prefix = "";
+        next.resolved_doc_filter = resolved_filter;
+        next.resolved_doc_filter_owned = false;
+        return .{
+            .req = next,
+            .resolved_doc_filter = resolved_filter,
+            .alloc = self.alloc,
+        };
     }
 
     const AlgebraicDocFilterRequest = struct {
@@ -46017,13 +46099,18 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .kind = .sparse_vector,
         .config_json = "{\"field\":\"embedding\",\"sources\":[{\"artifact\":\"title_sparse_v1\"},{\"artifact\":\"body_sparse_v1\"}]}",
     });
+    try db.addIndex(.{
+        .name = "primary_text",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
 
     try db.batch(.{
         .writes = &.{
             .{ .key = "doc:direct", .value = "{\"title\":\"direct\",\"body\":\"unused\"}" },
             .{ .key = "doc:chunk", .value = "{\"title\":\"unused\",\"body\":\"chunk\"}" },
         },
-        .sync_level = .write,
+        .sync_level = .full_index,
     });
 
     const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:chunk", "body_chunks_v1", 0);
@@ -46067,6 +46154,19 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     }
     try std.testing.expect(dense_has_direct and dense_has_chunk);
     for (dense.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
+
+    var dense_prefix = try db.searchDenseProfiled(alloc, .{
+        .index_name = "mixed_dense",
+        .filter_prefix = "doc:chunk",
+        .limit = 2,
+        .include_stored = false,
+    }, .{ .vector = &.{ 0.0, 0.0 }, .k = 2 });
+    defer dense_prefix.result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), dense_prefix.result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), dense_prefix.result.hits.len);
+    try std.testing.expectEqualStrings("doc:chunk", dense_prefix.result.hits[0].id);
+    try std.testing.expectEqual(@as(u64, 1), dense_prefix.profile.native_filter_candidate_count);
+    try std.testing.expectEqual(@as(u64, 1), dense_prefix.profile.hbc_exact_vectors_scored);
 
     var dense_members = try db.search(alloc, .{
         .index_name = "mixed_dense",
@@ -46129,6 +46229,50 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         sparse_has_chunk = sparse_has_chunk or std.mem.eql(u8, hit.id, "doc:chunk");
     }
     try std.testing.expect(sparse_has_direct and sparse_has_chunk);
+
+    var sparse_prefix = try db.search(alloc, .{
+        .index_name = "mixed_sparse",
+        .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
+        .filter_prefix = "doc:chunk",
+        .limit = 2,
+        .search_effort = 1.0,
+    });
+    defer sparse_prefix.deinit();
+    try std.testing.expectEqual(@as(u32, 1), sparse_prefix.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), sparse_prefix.hits.len);
+    try std.testing.expectEqualStrings("doc:chunk", sparse_prefix.hits[0].id);
+
+    var hybrid_prefix = try db.search(alloc, .{
+        .full_text_queries = &.{.{
+            .name = "text",
+            .index_name = "primary_text",
+            .query = .{ .match_all = {} },
+        }},
+        .dense_queries = &.{.{
+            .name = "dense",
+            .index_name = "mixed_dense",
+            .query = .{ .vector = &.{ 0.0, 0.0 }, .k = 2 },
+        }},
+        .sparse_queries = &.{.{
+            .name = "sparse",
+            .index_name = "mixed_sparse",
+            .query = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 },
+        }},
+        .merge_config = .{
+            .strategy = .rrf,
+            .weights = &.{
+                .{ .name = "text", .weight = 1.0 },
+                .{ .name = "dense", .weight = 1.0 },
+                .{ .name = "sparse", .weight = 1.0 },
+            },
+        },
+        .filter_prefix = "doc:chunk",
+        .limit = 10,
+    });
+    defer hybrid_prefix.deinit();
+    try std.testing.expectEqual(@as(u32, 1), hybrid_prefix.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), hybrid_prefix.hits.len);
+    try std.testing.expectEqualStrings("doc:chunk", hybrid_prefix.hits[0].id);
     try std.testing.expectError(error.UnsupportedHierarchyGrouping, db.search(alloc, .{
         .index_name = "mixed_sparse",
         .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
@@ -50181,6 +50325,7 @@ test "db dense default dynamic 0.2 percent numeric filter exact scores bounded c
         .{
             .filter_query_json = "{\"numeric_range\":{\"field\":\"id\",\"min\":9980,\"inclusive_min\":true}}",
             .filter_prefix = "doc:0999",
+            .expected_candidates = 10,
             .expected_scored = 10,
         },
         // Exercise a highly selective positive filter together with a large,
@@ -53531,6 +53676,47 @@ test "db multi-source full text unions chunk and textual asset streams across de
         defer parents.deinit();
         try std.testing.expectEqual(@as(usize, 1), parents.hits.len);
         try std.testing.expectEqualStrings("doc:a", parents.hits[0].id);
+
+        // Prefix filtering is defined over the source document identity, not
+        // the encoded artifact member key. Exercise both the direct text lane
+        // and the named/composed lane while an out-of-prefix artifact has the
+        // same searchable content.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:b",
+                .value = "{\"body\":\"chunkonlytoken searchable body\",\"summary\":\"assetonlytoken concise summary\"}",
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        var prefixed_text = try waitForSearchResult(alloc, &db, .{
+            .index_name = "document_text",
+            .full_text = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
+            .filter_prefix = "doc:a",
+            .return_mode = .member,
+            .limit = 10,
+        }, 1);
+        defer prefixed_text.deinit();
+        try std.testing.expectEqual(@as(u32, 1), prefixed_text.total_hits);
+        try std.testing.expectEqualStrings("doc:a", prefixed_text.hits[0].artifact_ref.?.document_id);
+
+        var prefixed_composed_text = try waitForSearchResult(alloc, &db, .{
+            .full_text_queries = &.{.{
+                .name = "artifact_body",
+                .index_name = "document_text",
+                .query = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
+            }},
+            .filter_prefix = "doc:a",
+            .return_mode = .member,
+            .limit = 10,
+        }, 1);
+        defer prefixed_composed_text.deinit();
+        try std.testing.expectEqual(@as(u32, 1), prefixed_composed_text.total_hits);
+        try std.testing.expectEqualStrings("doc:a", prefixed_composed_text.hits[0].artifact_ref.?.document_id);
+
+        try db.batch(.{ .deletes = &.{"doc:b"}, .sync_level = .enrichments });
+        try db.runUntilIdle();
 
         // Removing one producer input must delete only that source member;
         // the other source remains searchable and retains its provenance.
