@@ -15,6 +15,7 @@
 const std = @import("std");
 const api_operation = @import("operation.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const document_content_hash = @import("../storage/db/document_content_hash.zig");
 const raft_mod = @import("../raft/mod.zig");
 const table_reads = @import("table_read_source.zig");
 const table_writes = @import("table_write_source.zig");
@@ -141,35 +142,12 @@ pub fn executeResponse(
     request: api_operation.RequestContext,
 ) !Response {
     try request.ensureActive();
-    var request_keys = std.StringHashMapUnmanaged(void){};
-    defer request_keys.deinit(alloc);
-    for (req.writes, 0..) |write, index| {
-        if (index % 64 == 0) try request.ensureActive();
-        try request_keys.put(alloc, write.key, {});
-    }
-
     var changed_writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
     defer changed_writes.deinit(alloc);
 
-    var skipped: usize = 0;
-    for (req.writes, 0..) |write, index| {
-        if (index % 64 == 0) try request.ensureActive();
-        var existing = try reads.lookup(alloc, table_name, write.key, .{}, .read_index);
-        if (existing) |*lookup| {
-            defer lookup.deinit(alloc);
-            if (try jsonDocumentsEqualIgnoringTimestamp(alloc, write.value, lookup.json)) {
-                skipped += 1;
-            } else {
-                try changed_writes.append(alloc, write);
-            }
-        } else {
-            try changed_writes.append(alloc, write);
-        }
-    }
-
     try request.ensureActive();
     const next_cursor = if (req.writes.len > 0) req.writes[req.writes.len - 1].key else req.last_merged_id;
-    var scanned = (try reads.scan(
+    var scanned = (try reads.scanContentHashes(
         alloc,
         table_name,
         req.last_merged_id,
@@ -188,16 +166,43 @@ pub fn executeResponse(
         deleted_ids.deinit(alloc);
     }
 
-    var keys_scanned: usize = 0;
-    var lines = std.mem.splitScalar(u8, scanned.ndjson, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (keys_scanned % 64 == 0) try request.ensureActive();
-        keys_scanned += 1;
-        const key = try parseScanLineKey(alloc, line);
-        defer alloc.free(key);
-        if (request_keys.contains(key)) continue;
-        try deleted_ids.append(alloc, try alloc.dupe(u8, key));
+    var skipped: usize = 0;
+    var incoming_index: usize = 0;
+    var stored_index: usize = 0;
+    var compared: usize = 0;
+    while (incoming_index < req.writes.len or stored_index < scanned.entries.len) : (compared += 1) {
+        if (compared % 64 == 0) try request.ensureActive();
+        if (incoming_index == req.writes.len) {
+            try deleted_ids.append(alloc, try alloc.dupe(u8, scanned.entries[stored_index].id));
+            stored_index += 1;
+            continue;
+        }
+        if (stored_index == scanned.entries.len) {
+            try changed_writes.append(alloc, req.writes[incoming_index]);
+            incoming_index += 1;
+            continue;
+        }
+
+        const incoming = req.writes[incoming_index];
+        const stored = scanned.entries[stored_index];
+        switch (std.mem.order(u8, incoming.key, stored.id)) {
+            .lt => try changed_writes.append(alloc, incoming),
+            .eq => {
+                const incoming_hash = try document_content_hash.hashJson(alloc, incoming.value);
+                if (std.mem.eql(u8, &incoming_hash, &stored.hash)) {
+                    skipped += 1;
+                } else {
+                    try changed_writes.append(alloc, incoming);
+                }
+                stored_index += 1;
+            },
+            .gt => {
+                try deleted_ids.append(alloc, try alloc.dupe(u8, stored.id));
+                stored_index += 1;
+                continue;
+            },
+        }
+        incoming_index += 1;
     }
 
     if (!req.dry_run and (changed_writes.items.len > 0 or deleted_ids.items.len > 0)) {
@@ -221,7 +226,7 @@ pub fn executeResponse(
             .from = req.last_merged_id,
             .to = next_cursor,
         },
-        .keys_scanned = keys_scanned,
+        .keys_scanned = scanned.entries.len,
         .deleted_ids = if (req.dry_run) deleted_ids.items else null,
         .message = if (req.dry_run) "dry run - no changes made" else null,
     };
@@ -275,73 +280,8 @@ fn parseSyncLevel(value: std.json.Value) !db_mod.types.SyncLevel {
     return db_mod.types.parsePublicSyncLevelText(text) orelse error.InvalidLinearMergeRequest;
 }
 
-fn parseScanLineKey(alloc: std.mem.Allocator, line: []const u8) ![]const u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidLinearMergeRequest;
-    const key_value = parsed.value.object.get("_id") orelse return error.InvalidLinearMergeRequest;
-    if (key_value != .string) return error.InvalidLinearMergeRequest;
-    return try alloc.dupe(u8, key_value.string);
-}
-
 fn batchWriteLessThan(_: void, lhs: db_mod.types.BatchWrite, rhs: db_mod.types.BatchWrite) bool {
     return std.mem.lessThan(u8, lhs.key, rhs.key);
-}
-
-fn jsonDocumentsEqualIgnoringTimestamp(alloc: std.mem.Allocator, left_raw: []const u8, right_raw: []const u8) !bool {
-    var left = try std.json.parseFromSlice(std.json.Value, alloc, left_raw, .{});
-    defer left.deinit();
-    var right = try std.json.parseFromSlice(std.json.Value, alloc, right_raw, .{});
-    defer right.deinit();
-    return jsonValuesEqualIgnoringTimestamp(left.value, right.value);
-}
-
-fn jsonValuesEqualIgnoringTimestamp(left: std.json.Value, right: std.json.Value) bool {
-    return switch (left) {
-        .null => right == .null,
-        .bool => |v| right == .bool and right.bool == v,
-        .integer => |v| right == .integer and right.integer == v,
-        .float => |v| right == .float and right.float == v,
-        .number_string => |v| right == .number_string and std.mem.eql(u8, right.number_string, v),
-        .string => |v| right == .string and std.mem.eql(u8, right.string, v),
-        .array => |arr| blk: {
-            if (right != .array or arr.items.len != right.array.items.len) break :blk false;
-            for (arr.items, right.array.items) |lhs, rhs| {
-                if (!jsonValuesEqualIgnoringTimestamp(lhs, rhs)) break :blk false;
-            }
-            break :blk true;
-        },
-        .object => |obj| blk: {
-            if (right != .object) break :blk false;
-            if (comparableObjectFieldCount(obj) != comparableObjectFieldCount(right.object)) break :blk false;
-            var it = obj.iterator();
-            while (it.next()) |entry| {
-                if (isIgnoredSystemField(entry.key_ptr.*)) continue;
-                const other = right.object.get(entry.key_ptr.*) orelse break :blk false;
-                if (!jsonValuesEqualIgnoringTimestamp(entry.value_ptr.*, other)) break :blk false;
-            }
-            var right_it = right.object.iterator();
-            while (right_it.next()) |entry| {
-                if (isIgnoredSystemField(entry.key_ptr.*)) continue;
-                if (obj.get(entry.key_ptr.*) == null) break :blk false;
-            }
-            break :blk true;
-        },
-    };
-}
-
-fn comparableObjectFieldCount(obj: std.json.ObjectMap) usize {
-    var count: usize = 0;
-    var it = obj.iterator();
-    while (it.next()) |entry| {
-        if (isIgnoredSystemField(entry.key_ptr.*)) continue;
-        count += 1;
-    }
-    return count;
-}
-
-fn isIgnoredSystemField(field: []const u8) bool {
-    return std.mem.eql(u8, field, "_timestamp") or std.mem.eql(u8, field, "_id");
 }
 
 test "linear merge request parser sorts keys and accepts sync level aliases" {
@@ -392,30 +332,13 @@ test "linear merge request parser rejects unbounded empty cleanup" {
     ));
 }
 
-test "linear merge equality ignores system timestamp" {
-    try std.testing.expect(try jsonDocumentsEqualIgnoringTimestamp(std.testing.allocator,
-        \\{"title":"alpha","content":"same"}
-    ,
-        \\{"_id":"doc:a","title":"alpha","content":"same","_timestamp":1234}
-    ));
-    try std.testing.expect(!(try jsonDocumentsEqualIgnoringTimestamp(std.testing.allocator,
-        \\{"title":"alpha","content":"same"}
-    ,
-        \\{"title":"alpha","content":"different","_timestamp":1234}
-    )));
-}
-
-test "linear merge scan line key uses reserved document identity" {
-    const key = try parseScanLineKey(std.testing.allocator, "{\"_id\":\"doc:a\",\"title\":\"alpha\"}");
-    defer std.testing.allocator.free(key);
-    try std.testing.expectEqualStrings("doc:a", key);
-
-    try std.testing.expectError(error.InvalidLinearMergeRequest, parseScanLineKey(std.testing.allocator, "{\"key\":\"doc:legacy\"}"));
-}
-
-test "storage.ha linear merge delegates every mutation to the HA-mirrored batch source" {
+test "linear merge uses one ordered hash scan and delegates mutations to the HA batch source" {
     const FakeReads = struct {
-        cancel_after_lookup: ?*std.atomic.Value(bool) = null,
+        ndjson: []const u8,
+        cancel_after_scan: ?*std.atomic.Value(bool) = null,
+        lookups: usize = 0,
+        scans: usize = 0,
+        requested_content_hashes: bool = false,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{ .ptr = self, .vtable = &.{ .lookup = lookup, .scan = scan, .query = query } };
@@ -423,12 +346,16 @@ test "storage.ha linear merge delegates every mutation to the HA-mirrored batch 
 
         fn lookup(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.cancel_after_lookup) |signal| signal.store(true, .release);
+            self.lookups += 1;
             return null;
         }
 
-        fn scan(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
-            return .{ .ndjson = try alloc.dupe(u8, "") };
+        fn scan(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, opts: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scans += 1;
+            self.requested_content_hashes = opts.include_content_hashes;
+            if (self.cancel_after_scan) |signal| signal.store(true, .release);
+            return .{ .ndjson = try alloc.dupe(u8, self.ndjson) };
         }
 
         fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
@@ -455,22 +382,39 @@ test "storage.ha linear merge delegates every mutation to the HA-mirrored batch 
         }
     };
 
+    const alpha_hash = try document_content_hash.hashJson(std.testing.allocator, "{\"title\":\"alpha\",\"_timestamp\":9}");
+    const charlie_hash = try document_content_hash.hashJson(std.testing.allocator, "{\"title\":\"charlie\"}");
+    const alpha_hex = std.fmt.bytesToHex(alpha_hash, .lower);
+    const charlie_hex = std.fmt.bytesToHex(charlie_hash, .lower);
+    const scan_ndjson = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"_id\":\"doc:a\",\"_content_hash\":\"{s}\"}}\n{{\"_id\":\"doc:c\",\"_content_hash\":\"{s}\"}}\n",
+        .{ &alpha_hex, &charlie_hex },
+    );
+    defer std.testing.allocator.free(scan_ndjson);
+
     var request = try parseRequest(std.testing.allocator,
-        \\{"records":{"doc:a":{"title":"alpha"}},"sync_level":"full_text"}
+        \\{"records":{"doc:a":{"title":"alpha"},"doc:b":{"title":"bravo"}},"sync_level":"full_text"}
     );
     defer request.deinit(std.testing.allocator);
-    var reads = FakeReads{};
+    var reads = FakeReads{ .ndjson = scan_ndjson };
     var writes = RecordingWrites{};
     const response = try executeResponse(std.testing.allocator, reads.source(), writes.source(), "docs", request, .{});
 
     try std.testing.expectEqual(@as(usize, 1), writes.calls);
     try std.testing.expectEqual(@as(usize, 1), writes.writes);
-    try std.testing.expectEqual(@as(usize, 0), writes.deletes);
+    try std.testing.expectEqual(@as(usize, 1), writes.deletes);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_text, writes.sync_level.?);
     try std.testing.expectEqual(@as(usize, 1), response.upserted);
+    try std.testing.expectEqual(@as(usize, 1), response.deleted);
+    try std.testing.expectEqual(@as(usize, 1), response.skipped);
+    try std.testing.expectEqual(@as(usize, 2), response.keys_scanned);
+    try std.testing.expectEqual(@as(usize, 0), reads.lookups);
+    try std.testing.expectEqual(@as(usize, 1), reads.scans);
+    try std.testing.expect(reads.requested_content_hashes);
 
     var cancellation = std.atomic.Value(bool).init(false);
-    reads.cancel_after_lookup = &cancellation;
+    reads.cancel_after_scan = &cancellation;
     try std.testing.expectError(error.Canceled, executeResponse(
         std.testing.allocator,
         reads.source(),
@@ -480,4 +424,6 @@ test "storage.ha linear merge delegates every mutation to the HA-mirrored batch 
         .{ .cancellation = api_operation.CancellationToken.fromAtomic(&cancellation) },
     ));
     try std.testing.expectEqual(@as(usize, 1), writes.calls);
+    try std.testing.expectEqual(@as(usize, 0), reads.lookups);
+    try std.testing.expectEqual(@as(usize, 2), reads.scans);
 }

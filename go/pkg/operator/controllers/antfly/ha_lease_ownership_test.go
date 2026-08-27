@@ -14,11 +14,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func TestLeaseRenewalClockIgnoresStatusOnlyEvents(t *testing.T) {
@@ -35,52 +33,6 @@ func TestLeaseRenewalClockIgnoresStatusOnlyEvents(t *testing.T) {
 	updatedSpec.Generation++
 	if !predicate.Update(event.UpdateEvent{ObjectOld: updatedStatus, ObjectNew: updatedSpec}) {
 		t.Fatal("HA spec generation change did not wake Lease renewal immediately")
-	}
-}
-
-func TestLeaseRenewalClockKeepsRecurringAfterQueueConsumption(t *testing.T) {
-	reconciler := &haLeaseRenewalReconciler{interval: 5 * time.Millisecond}
-	request := reconcile.Request{NamespacedName: types.NamespacedName{Name: "antfly", Namespace: "default"}}
-	reconciler.tracked.Store(request, struct{}{})
-	queue := workqueue.NewTypedRateLimitingQueue(
-		workqueue.DefaultTypedControllerRateLimiter[reconcile.Request](),
-	)
-	defer queue.ShutDown()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	if err := reconciler.periodicSource().Start(ctx, queue); err != nil {
-		t.Fatalf("start periodic Lease source: %v", err)
-	}
-
-	dequeue := func() reconcile.Request {
-		t.Helper()
-		items := make(chan reconcile.Request, 1)
-		go func() {
-			item, shutdown := queue.Get()
-			if shutdown {
-				return
-			}
-			queue.Done(item)
-			queue.Forget(item)
-			items <- item
-		}()
-		select {
-		case item := <-items:
-			return item
-		case <-time.After(250 * time.Millisecond):
-			t.Fatal("periodic Lease clock did not enqueue the tracked cluster")
-			return reconcile.Request{}
-		}
-	}
-
-	if first := dequeue(); first != request {
-		t.Fatalf("first request = %#v, want %#v", first, request)
-	}
-	// Consuming and forgetting the only queued item models the informer-event
-	// collision that can consume a controller-runtime RequeueAfter chain. The
-	// manager-owned ticker must produce another independent enqueue.
-	if second := dequeue(); second != request {
-		t.Fatalf("second request = %#v, want %#v", second, request)
 	}
 }
 
@@ -563,8 +515,8 @@ func TestLeaseRenewalControllerKeepsCommittedHandoffWhenProofEndpointIsUnavailab
 	if err != nil {
 		t.Fatalf("periodic committed-handoff renewal: %v", err)
 	}
-	if result != (ctrl.Result{}) {
-		t.Fatalf("result = %#v, want the independent periodic source to own scheduling", result)
+	if result.RequeueAfter != haLeaseRenewalInterval {
+		t.Fatalf("requeueAfter = %s, want %s", result.RequeueAfter, haLeaseRenewalInterval)
 	}
 	observed := getOwnershipTestLease(t, parent)
 	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {

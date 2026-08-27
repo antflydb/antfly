@@ -13006,6 +13006,8 @@ export interface components {
             role: components["schemas"]["InferenceRole"];
             /** @description The generated message content (null when tool_calls is present) */
             content?: string | null;
+            /** @description Model reasoning emitted on a private reasoning channel, separate from public content */
+            reasoning_content?: string | null;
             /** @description Tool calls made by the model (only present when finish_reason is tool_calls) */
             tool_calls?: components["schemas"]["ToolCall"][];
         };
@@ -13045,6 +13047,8 @@ export interface components {
             role?: components["schemas"]["InferenceRole"];
             /** @description Token content delta */
             content?: string | null;
+            /** @description Reasoning content delta, separate from public content */
+            reasoning_content?: string | null;
             /** @description Tool call deltas for streaming tool calls */
             tool_calls?: components["schemas"]["InferenceToolCallDelta"][];
         };
@@ -13095,6 +13099,11 @@ export interface components {
          */
         InferenceModelQuantization: "q4_k" | "q8" | "fp16";
         /**
+         * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+         * @enum {string}
+         */
+        InferenceA4bResidencyMode: "auto" | "streamed" | "resident";
+        /**
          * @description Backend priority entry for model loading. Use `backend` or `backend:device`,
          *     where device defaults to `auto`.
          *
@@ -13124,6 +13133,17 @@ export interface components {
             backend?: components["schemas"]["InferenceModelBackend"];
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
+            /**
+             * @description Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+             * @default auto
+             */
+            residency_mode?: components["schemas"]["InferenceA4bResidencyMode"];
+            /**
+             * Format: uint32
+             * @description Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
+             * @default 0
+             */
+            memory_budget_mb?: number;
         };
         /** @description Native generator prompt KV cache configuration. */
         InferencePromptCacheConfig: {

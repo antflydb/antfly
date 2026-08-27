@@ -10,17 +10,13 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const (
@@ -32,46 +28,7 @@ const (
 // observation plus renewal of the unchanged current holder. Expensive seed
 // capture and every topology transition stay on the main reconciler.
 type haLeaseRenewalReconciler struct {
-	parent   *AntflyClusterReconciler
-	interval time.Duration
-	tracked  sync.Map
-}
-
-func (r *haLeaseRenewalReconciler) renewalInterval() time.Duration {
-	if r != nil && r.interval > 0 {
-		return r.interval
-	}
-	return haLeaseRenewalInterval
-}
-
-// periodicSource is an independent, recurring clock for every HA cluster the
-// controller has observed. RequeueAfter is intentionally not used here: an
-// informer event for the same key can coalesce with a delayed workqueue item
-// and consume the only future renewal. A fresh tick always re-enqueues every
-// tracked key, so status/spec churn and unrelated reconcile failures cannot
-// permanently stop Lease progress.
-func (r *haLeaseRenewalReconciler) periodicSource() source.Source {
-	return source.Func(func(ctx context.Context, queue workqueue.TypedRateLimitingInterface[reconcile.Request]) error {
-		go func() {
-			ticker := time.NewTicker(r.renewalInterval())
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					r.tracked.Range(func(key, _ any) bool {
-						request, ok := key.(reconcile.Request)
-						if ok {
-							queue.Add(request)
-						}
-						return true
-					})
-				}
-			}
-		}()
-		return nil
-	})
+	parent *AntflyClusterReconciler
 }
 
 func haLeaseRenewalEventPredicate() predicate.Predicate {
@@ -113,16 +70,13 @@ func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	cluster := &antflyv1.AntflyCluster{}
 	if err := r.parent.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
-			r.tracked.Delete(req)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if cluster.Spec.HighAvailability == nil {
-		r.tracked.Delete(req)
 		return ctrl.Result{}, nil
 	}
-	r.tracked.Store(req, struct{}{})
 
 	proofCtx, cancel := context.WithTimeout(ctx, haLeaseProofTimeout)
 	defer cancel()
@@ -132,9 +86,9 @@ func (r *haLeaseRenewalReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// intentionally transient during receipt binding.
 	_ = r.parent.observeHACurrentPrimaryWatchdogProof(proofCtx, cluster)
 	if err := r.parent.renewCurrentHAFencingLease(ctx, cluster); err != nil && !apierrors.IsConflict(err) {
-		return ctrl.Result{}, err
+		return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, err
 	}
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: haLeaseRenewalInterval}, nil
 }
 
 // observeHACurrentPrimaryWatchdogProof fetches only the authenticated runtime

@@ -14165,13 +14165,11 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := normalizeClusterDomainField(&r.ClusterDomain); err != nil {
 		return fmt.Errorf("configure AntflyCluster controller: %w", err)
 	}
-	leaseRenewal := &haLeaseRenewalReconciler{parent: r}
 	if err := ctrl.NewControllerManagedBy(mgr).
 		Named("antflycluster-ha-lease-renewal").
 		WithOptions(controller.Options{MaxConcurrentReconciles: 16}).
 		For(&antflyv1.AntflyCluster{}, ctrlbuilder.WithPredicates(haLeaseRenewalEventPredicate())).
-		WatchesRawSource(leaseRenewal.periodicSource()).
-		Complete(leaseRenewal); err != nil {
+		Complete(&haLeaseRenewalReconciler{parent: r}); err != nil {
 		return err
 	}
 	builder := ctrl.NewControllerManagedBy(mgr).

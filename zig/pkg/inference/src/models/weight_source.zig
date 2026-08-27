@@ -145,6 +145,11 @@ pub const QuantizedStorage = struct {
     /// stronger than `raw_owned == false`: stack, heap, and synthetic borrowed
     /// buffers must not be treated as safe Metal no-copy sources.
     raw_mmap_backed: bool = false,
+    /// Full mmap that owns `raw_bytes`, when available. This lets high-memory
+    /// runtimes publish one model-wide GPU allocation instead of creating a
+    /// separate Metal allocation for every tensor view. The slice is borrowed
+    /// and has the same lifetime as the tensor store.
+    raw_mmap_source_bytes: ?[]const u8 = null,
     raw_mmap_region: ?c_file.MmapRegion = null,
     prepared: PreparedQuantCache = .{},
     prepared_group_cache: ?PreparedGroupCache = null,

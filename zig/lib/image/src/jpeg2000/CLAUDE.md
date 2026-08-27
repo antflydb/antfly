@@ -73,7 +73,7 @@ Validation: `encode.zig:validateEncodeParams` accepts any combination of the abo
 - Forward RCT `color_transform.forwardRct` (5/3 path, integer, in `encode.zig:encodeFromShiftedPlanes`).
 - Forward ICT `color_transform.forwardIct` (9/7 path, f32, in `encode.zig:forward97Pipeline`).
 - Custom MCT matrices (Annex J): `color_transform.CustomMctMatrix{,I32}`, `applyCustomMctForward/Inverse`, `invertMctMatrixGaussJordan`. Markers emitted via `encode.zig:writeCustomMctMarkers` when `EncodeParams.custom_mct != null`.
-- Decoder reconstructs a custom 3-component f32 MCT from the MCT/MCC/MCO chain via `reconstruct.buildCustomMctMatrixFromState`; when the marker chain doesn't yield a usable matrix, the built-in ICT is used as the fallback. The MCC parsing matches the minimal placeholder layout emitted by the encoder (first u16 of the MCC payload is the referenced MCT id); full ISO MCC stage/tuple language is not yet implemented. Offsets are not yet serialized on the wire and are treated as zero on decode.
+- Decoder reconstructs a custom 3-component f32 MCT from the MCT/MCC/MCO chain via `reconstruct.buildCustomMctMatrixFromState`. The MCC parsing matches the compact single-stage layout emitted by the encoder (first u16 of the MCC payload is the referenced MCT id); unsupported, malformed, non-finite, or differently-sized stage graphs fail closed at `fullNativeDecodeSupport` instead of falling back to ICT. Per-tile decode states retain the marker chain. Full ISO MCC stage/tuple language is not yet implemented. Offsets are not serialized, so the encoder rejects non-zero offsets and the decoder uses zero; singular matrices are rejected before component-plane allocation.
 
 ## Rate control
 
@@ -85,7 +85,7 @@ PCRD bisection lives in `rate_control.zig` (`optimizeTruncation`). Wired into en
 
 ## Subsampling
 
-Decoder handles `XRsiz/YRsiz != 1` for U8 via per-component plane sizing (`tile.componentDimensions`) and bilinear upsampling to the image grid (`upsample.upsampleI32(.bilinear, …)` invoked by `reconstruct.zig`). U16 path rejects subsampled input with `error.UnsupportedSubsampling`. Encoder remains 1:1 only.
+Decoder handles `XRsiz/YRsiz != 1` for U8 and U16 via origin-aware per-component geometry (`tile.componentDimensionsAt`) and reference-grid bilinear upsampling. Reconstructed samples are clipped to their declared native precision before resampling on both output paths. Streaming-compatible single-tile streams release each Tier-1 codeblock immediately after inverse-plane assembly; multi-tile decodes stitch component-grid samples before upsampling, preventing tile-edge clamping seams. U8 processes one compact sample plane at a time during final interleave to bound peak memory; non-8-bit streams retain native precision until after interpolation. Encoder remains 1:1 only.
 
 ## Current interop parity (vs OpenJPEG 2.5.4)
 
