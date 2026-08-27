@@ -15349,6 +15349,16 @@ pub const ProvisionedTableWriteSource = struct {
 
     const ReplicatedApplyMetadataSource = enum { catalog, local_persisted };
 
+    fn mapReplicatedApplyWriterAcquireError(
+        metadata_source: ReplicatedApplyMetadataSource,
+        err: anyerror,
+    ) anyerror {
+        if (metadata_source == .local_persisted and err == error.LsmRootWriterAlreadyOpen) {
+            return error.RaftApplyWriterUnavailable;
+        }
+        return err;
+    }
+
     fn applyReplicatedBatchGroupLocalWithMetadata(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
@@ -15396,14 +15406,15 @@ pub const ProvisionedTableWriteSource = struct {
             const target_generation = self.visibleRootGeneration(group_id);
             var cached = if (split_identity_namespace) |namespace|
                 (if (metadata_source == .local_persisted)
-                    try self.leasePreparedTransitionGroupWriter(alloc, group_id, table_name, namespace)
+                    self.leasePreparedTransitionGroupWriter(alloc, group_id, table_name, namespace) catch |err|
+                        return mapReplicatedApplyWriterAcquireError(metadata_source, err)
                 else
-                    try self.leaseCachedTransitionGroupWriterWithOptions(alloc, group_id, table_name, namespace, .{
+                    self.leaseCachedTransitionGroupWriterWithOptions(alloc, group_id, table_name, namespace, .{
                         .reconcile_for_replicated_apply = true,
-                    })) orelse
+                    }) catch |err| return mapReplicatedApplyWriterAcquireError(metadata_source, err)) orelse
                     return error.TransitionDestinationNotProvisioned
             else
-                try self.getOrOpenCachedDbForLocalMutationWithOptions(
+                self.getOrOpenCachedDbForLocalMutationWithOptions(
                     alloc,
                     cache,
                     path,
@@ -15412,7 +15423,7 @@ pub const ProvisionedTableWriteSource = struct {
                     table_name,
                     true,
                     .{ .reconcile_for_replicated_apply = true },
-                );
+                ) catch |err| return mapReplicatedApplyWriterAcquireError(metadata_source, err);
             defer cached.deinit(alloc);
             try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
             runTestBeforeBatchExecutionHook();
@@ -18625,6 +18636,13 @@ pub const HostedProvisionedTableWriteSource = struct {
         return result;
     }
 };
+
+test "prepared raft apply reclassifies only a pre-mutation LSM writer conflict" {
+    const map = ProvisionedTableWriteSource.mapReplicatedApplyWriterAcquireError;
+    try std.testing.expect(map(.local_persisted, error.LsmRootWriterAlreadyOpen) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.catalog, error.LsmRootWriterAlreadyOpen) == error.LsmRootWriterAlreadyOpen);
+    try std.testing.expect(map(.local_persisted, error.WriterLocked) == error.WriterLocked);
+}
 
 const GroupBatch = struct {
     group_id: u64,

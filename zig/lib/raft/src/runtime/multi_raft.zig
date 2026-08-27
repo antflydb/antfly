@@ -513,6 +513,7 @@ pub const MultiRaft = struct {
         // visible to the next reconciliation pass.
         if (self.hooks.replica_catalog) |catalog| _ = try catalog.removeReplica(group_id);
         std.debug.assert(self.removeGroup(group_id));
+        if (self.hooks.state_machine) |state_machine| state_machine.retireGroup(group_id);
         if (self.hooks.group_storage) |group_storage| group_storage.retireGroup(group_id);
     }
 

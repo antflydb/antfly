@@ -675,10 +675,12 @@ const CliConfig = struct {
     experimental: bool = false,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
+    api_advertise_url: ?[]const u8 = null,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
     raft_bind_host: ?[]const u8 = null,
     raft_bind_port: ?u16 = null,
+    raft_advertise_url: ?[]const u8 = null,
     auth_enabled: ?bool = null,
     ard_base_url: ?[]const u8 = null,
     ard_publisher_domain: ?[]const u8 = null,
@@ -1087,6 +1089,49 @@ test "data descriptor factory separates bootstrap voters from transport peers" {
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, desc.initial_voters.?);
 }
 
+test "data descriptor factory restores persisted voters before metadata peer discovery" {
+    var fallback_store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer fallback_store.deinit();
+    var factory = DataDescriptorFactory.init(std.testing.allocator, &fallback_store);
+    defer factory.deinit();
+
+    const store = try factory.storageForGroup(703);
+    var voters = [_]u64{ 1, 2, 3 };
+    try store.applySnapshot(.{
+        .metadata = .{
+            .index = 8,
+            .term = 1,
+            .conf_state = .{ .voters = voters[0..] },
+        },
+        .data = &.{},
+    });
+    store.setHardState(.{
+        .current_term = 1,
+        .commit_index = 8,
+    });
+
+    var desc = try factory.iface().buildDescriptor(.{
+        .group_id = 703,
+        .replica_id = 1,
+        .local_node_id = 1,
+    });
+    defer factory.iface().freeDescriptor(std.testing.allocator, &desc);
+    try std.testing.expectEqualSlices(u64, &.{1}, desc.group.raft_config.peers);
+
+    var raw = try raft_engine.core.RawNode.init(
+        std.testing.allocator,
+        desc.group.raft_config,
+        desc.group.storage,
+    );
+    defer raw.deinit();
+    try raw.campaign();
+
+    const status = raw.status();
+    try std.testing.expectEqual(@as(usize, 2), status.votes_unknown);
+    const ready = raw.ready();
+    try std.testing.expectEqual(@as(usize, 2), ready.messages.len);
+}
+
 test "placement topology promotes cutover-ready learners to voters" {
     const intents = [_]antfly.raft.PlacementIntent{
         .{ .record = .{ .group_id = 705, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .serving },
@@ -1125,6 +1170,18 @@ test "data descriptor factory bootstraps pristine group from complete intent pee
 }
 
 const RaftTableApplyStateMachine = struct {
+    const RetryApplyCheckpoint = struct {
+        completed_index: u64 = 0,
+        completed_term: u64 = 0,
+    };
+
+    const TestFaults = if (@import("builtin").is_test) struct {
+        writer_unavailable_once_at_index: ?u64 = null,
+        applied_index_publication_failure_once: bool = false,
+        document_apply_attempts: usize = 0,
+        document_apply_successes: usize = 0,
+    } else struct {};
+
     const ApplyFailureKey = struct {
         group_id: u64,
         index: u64,
@@ -1172,11 +1229,13 @@ const RaftTableApplyStateMachine = struct {
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     applied_mutex: std.atomic.Mutex = .unlocked,
     applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    retry_apply_checkpoints: std.AutoHashMapUnmanaged(u64, RetryApplyCheckpoint) = .empty,
     // Only the proposing leader registers an outcome waiter. Followers retain
     // no request-scoped state, and timed-out callers remove their own waiter.
     // The map is therefore bounded by live synchronous proposals rather than
     // by Raft history or an eviction policy that could lose an outcome.
     apply_outcomes: std.AutoHashMapUnmanaged(ApplyFailureKey, ApplyOutcomeWaiter) = .empty,
+    test_faults: TestFaults = .{},
 
     fn init(
         alloc: std.mem.Allocator,
@@ -1195,6 +1254,7 @@ const RaftTableApplyStateMachine = struct {
     fn deinit(self: *RaftTableApplyStateMachine) void {
         self.write_source.deinit();
         self.applied_indexes.deinit(self.alloc);
+        self.retry_apply_checkpoints.deinit(self.alloc);
         self.apply_outcomes.deinit(self.alloc);
         self.* = undefined;
     }
@@ -1232,6 +1292,101 @@ const RaftTableApplyStateMachine = struct {
         return self.applied_indexes.get(group_id) orelse 0;
     }
 
+    fn prepareRetryApplyCheckpoint(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        snapshot: ?raft_engine.core.types.Snapshot,
+        committed_entries: []const raft_engine.core.Entry,
+    ) !u64 {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const result = try self.retry_apply_checkpoints.getOrPut(self.alloc, group_id);
+        if (!result.found_existing) result.value_ptr.* = .{};
+        const checkpoint = result.value_ptr.*;
+        if (checkpoint.completed_index == 0) return 0;
+
+        if (snapshot) |value| {
+            if (value.metadata.index == checkpoint.completed_index and
+                value.metadata.term != checkpoint.completed_term)
+            {
+                return error.RaftApplyRetryCheckpointMismatch;
+            }
+            if (value.metadata.index > checkpoint.completed_index) return checkpoint.completed_index;
+        }
+
+        for (committed_entries) |entry| {
+            if (entry.index != checkpoint.completed_index) continue;
+            if (entry.term != checkpoint.completed_term) return error.RaftApplyRetryCheckpointMismatch;
+            return checkpoint.completed_index;
+        }
+        if (committed_entries.len > 0 and
+            committed_entries[0].index < checkpoint.completed_index and
+            committed_entries[committed_entries.len - 1].index > checkpoint.completed_index)
+        {
+            return error.RaftApplyRetryCheckpointMismatch;
+        }
+        return checkpoint.completed_index;
+    }
+
+    fn advanceRetryApplyCheckpoint(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        completed_index: u64,
+        completed_term: u64,
+        exact_entry_completed: bool,
+    ) void {
+        if (completed_index == 0) return;
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        const checkpoint = self.retry_apply_checkpoints.getPtr(group_id) orelse unreachable;
+        if (completed_index > checkpoint.completed_index) {
+            checkpoint.* = .{
+                .completed_index = completed_index,
+                .completed_term = completed_term,
+            };
+        } else if (completed_index == checkpoint.completed_index) {
+            std.debug.assert(completed_term == checkpoint.completed_term);
+        }
+        if (exact_entry_completed) {
+            const outcome = self.apply_outcomes.getPtr(.{
+                .group_id = group_id,
+                .index = completed_index,
+            }) orelse return;
+            if (outcome.outcome == .pending) {
+                outcome.outcome = if (outcome.expected_term == completed_term) .succeeded else .unknown;
+            }
+        }
+    }
+
+    fn clearRetryApplyCheckpoint(self: *RaftTableApplyStateMachine, group_id: u64) void {
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+        _ = self.retry_apply_checkpoints.remove(group_id);
+    }
+
+    fn applyDocumentBatchForEntry(
+        self: *RaftTableApplyStateMachine,
+        group_id: u64,
+        entry_index: u64,
+        table_name: []const u8,
+        req: antfly.db.types.BatchRequest,
+    ) !void {
+        if (@import("builtin").is_test) {
+            self.test_faults.document_apply_attempts += 1;
+            if (self.test_faults.writer_unavailable_once_at_index == entry_index) {
+                self.test_faults.writer_unavailable_once_at_index = null;
+                return error.RaftApplyWriterUnavailable;
+            }
+        }
+        _ = try self.write_source.applyPreparedReplicatedBatchGroupLocal(
+            self.alloc,
+            group_id,
+            table_name,
+            req,
+        );
+        if (@import("builtin").is_test) self.test_faults.document_apply_successes += 1;
+    }
+
     fn publishAppliedReady(
         self: *RaftTableApplyStateMachine,
         group_id: u64,
@@ -1267,7 +1422,13 @@ const RaftTableApplyStateMachine = struct {
         }
 
         const existing = self.applied_indexes.get(group_id) orelse 0;
-        if (applied_index > existing) try self.applied_indexes.put(self.alloc, group_id, applied_index);
+        if (applied_index > existing) {
+            if (@import("builtin").is_test and self.test_faults.applied_index_publication_failure_once) {
+                self.test_faults.applied_index_publication_failure_once = false;
+                return error.TestAppliedIndexPublicationFailure;
+            }
+            try self.applied_indexes.put(self.alloc, group_id, applied_index);
+        }
     }
 
     fn registerApplyOutcomeWaiter(
@@ -1316,11 +1477,25 @@ const RaftTableApplyStateMachine = struct {
         _ = self.apply_outcomes.remove(.{ .group_id = group_id, .index = index });
     }
 
+    fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {
+        const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.applied_mutex);
+        defer self.applied_mutex.unlock();
+
+        _ = self.applied_indexes.remove(group_id);
+        _ = self.retry_apply_checkpoints.remove(group_id);
+        var outcomes = self.apply_outcomes.iterator();
+        while (outcomes.next()) |entry| {
+            if (entry.key_ptr.group_id == group_id) self.apply_outcomes.removeByPtr(entry.key_ptr);
+        }
+    }
+
     fn stateMachine(self: *RaftTableApplyStateMachine) raft_engine.runtime.storage_iface.StateMachine {
         return .{
             .ptr = self,
             .vtable = &.{
                 .apply_ready = applyReady,
+                .retire_group = retireGroup,
             },
         };
     }
@@ -1333,58 +1508,76 @@ const RaftTableApplyStateMachine = struct {
         _: []const raft_engine.core.ReadState,
     ) !void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
+        if (snapshot == null and committed_entries.len == 0) return;
         const snapshot_index: u64 = if (snapshot) |value| value.metadata.index else 0;
         var last_index: u64 = snapshot_index;
-        if (snapshot) |value| {
+        var completed_index = try self.prepareRetryApplyCheckpoint(group_id, snapshot, committed_entries);
+        if (snapshot) |value| if (value.metadata.index > completed_index) {
             try self.write_source.installRaftSnapshotGroupLocal(self.alloc, group_id, value.data);
-        }
+            completed_index = value.metadata.index;
+            self.advanceRetryApplyCheckpoint(group_id, value.metadata.index, value.metadata.term, false);
+        };
         for (committed_entries) |entry| {
             if (entry.index > last_index) last_index = entry.index;
-            if (entry.entry_type != .normal) continue;
-            if (!data_raft_batch.looksLikeEnvelope(entry.data)) continue;
-            var decoded = try data_raft_batch.decode(self.alloc, entry.data);
-            defer decoded.deinit(self.alloc);
-            // The durable apply store consumes protocol barriers. They carry
-            // no document mutation, and their null batch payload is
-            // intentionally poison to binaries that predate the barrier.
-            if (decoded.protocol_barrier_version != null) continue;
-            // Split lifecycle commands belong exclusively to the durable Raft
-            // apply store. Sending an otherwise empty command through the
-            // document DB can fail on unrelated index/runtime state after the
-            // lifecycle mutation is already durable, leaving Raft replaying a
-            // partially applied command.
-            if (!batchRequiresDocumentDbApply(decoded.batch.req)) continue;
-            _ = self.write_source.applyPreparedReplicatedBatchGroupLocal(
-                self.alloc,
-                group_id,
-                decoded.table_name,
-                decoded.batch.req,
-            ) catch |err| {
-                if (ExpectedApplyFailure.fromError(err)) |failure| {
-                    // Transaction conflicts are deterministic command results,
-                    // not state-machine failures. Every replica rejects the
-                    // prepare at this log index and must continue applying;
-                    // the proposing leader returns the result to the 2PC
-                    // coordinator after observing the applied index.
-                    self.recordApplyFailure(group_id, entry.index, entry.term, failure);
-                    std.log.debug("data raft document apply rejected group_id={} index={} table={s} err={s}", .{
+            if (entry.index <= completed_index) continue;
+            if (entry.entry_type == .normal and data_raft_batch.looksLikeEnvelope(entry.data)) {
+                var decoded = try data_raft_batch.decode(self.alloc, entry.data);
+                defer decoded.deinit(self.alloc);
+                // The durable apply store consumes protocol barriers. They carry
+                // no document mutation, and their null batch payload is
+                // intentionally poison to binaries that predate the barrier.
+                if (decoded.protocol_barrier_version == null and
+                    // Split lifecycle commands belong exclusively to the durable
+                    // Raft apply store. Sending an otherwise empty command through
+                    // the document DB can fail on unrelated index/runtime state
+                    // after the lifecycle mutation is already durable, leaving
+                    // Raft replaying a partially applied command.
+                    batchRequiresDocumentDbApply(decoded.batch.req))
+                {
+                    self.applyDocumentBatchForEntry(
                         group_id,
                         entry.index,
                         decoded.table_name,
-                        @errorName(err),
-                    });
-                    continue;
+                        decoded.batch.req,
+                    ) catch |err| {
+                        if (ExpectedApplyFailure.fromError(err)) |failure| {
+                            // Transaction conflicts are deterministic command
+                            // results, not state-machine failures. Every replica
+                            // rejects the prepare at this log index and continues.
+                            self.recordApplyFailure(group_id, entry.index, entry.term, failure);
+                            std.log.debug("data raft document apply rejected group_id={} index={} table={s} err={s}", .{
+                                group_id,
+                                entry.index,
+                                decoded.table_name,
+                                @errorName(err),
+                            });
+                        } else if (err == error.RaftApplyWriterUnavailable) {
+                            std.log.warn("data raft document apply deferred group_id={} index={} table={s} err={s}", .{
+                                group_id,
+                                entry.index,
+                                decoded.table_name,
+                                @errorName(err),
+                            });
+                            return err;
+                        } else {
+                            std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
+                                group_id,
+                                entry.index,
+                                decoded.table_name,
+                                err,
+                            });
+                            return err;
+                        }
+                    };
                 }
-                std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
-                    group_id,
-                    entry.index,
-                    decoded.table_name,
-                    err,
-                });
-                return err;
-            };
+            }
+            completed_index = entry.index;
+            self.advanceRetryApplyCheckpoint(group_id, entry.index, entry.term, true);
         }
-        if (last_index > 0) try self.publishAppliedReady(group_id, snapshot_index, committed_entries, last_index);
+        if (last_index > 0) {
+            try self.publishAppliedReady(group_id, snapshot_index, committed_entries, last_index);
+            if (last_index >= completed_index) self.clearRetryApplyCheckpoint(group_id);
+        }
     }
 };
 
@@ -6320,7 +6513,14 @@ pub const DataServer = struct {
 
     fn runRaftProgressOnce(ptr: *anyopaque) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        return try self.runRaftRoundOnly();
+        self.runRaftRoundOnly() catch |err| return handleRaftProgressError(err);
+    }
+
+    fn handleRaftProgressError(err: anyerror) !void {
+        switch (err) {
+            error.RaftApplyWriterUnavailable => return,
+            else => return err,
+        }
     }
 
     /// Runs data-node control and maintenance work without advancing Raft.
@@ -18136,6 +18336,8 @@ pub fn runFromIterator(
         .store_registration = if (cli.node_id != null and cli.store_id != null) .{
             .node_id = cli.node_id.?,
             .store_id = cli.store_id.?,
+            .api_url = cli.api_advertise_url orelse "",
+            .raft_url = cli.raft_advertise_url orelse "",
             .role = cli.store_role orelse "data",
             .failure_domain = cli.failure_domain orelse "",
         } else null,
@@ -18272,12 +18474,20 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
             cfg.bind_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--api-advertise-url")) {
+            cfg.api_advertise_url = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--raft-host")) {
             cfg.raft_bind_host = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--raft-port")) {
             cfg.raft_bind_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--raft-advertise-url")) {
+            cfg.raft_advertise_url = args.next() orelse return error.InvalidArguments;
             continue;
         }
         if (std.mem.eql(u8, arg, "--health-port")) {
@@ -18648,8 +18858,10 @@ fn printUsage(argv0: []const u8) void {
         \\  --config <path>                  JSON common config file
         \\  --api-host <host>              Data API bind host (default: 127.0.0.1)
         \\  --api-port <port>              Data API bind port (default: 0)
+        \\  --api-advertise-url <url>      Data API URL registered with metadata (default: listener URL)
         \\  --raft-host <host>             Data raft bind host (default: 127.0.0.1)
         \\  --raft-port <port>             Data raft bind port (default: 0 when registered)
+        \\  --raft-advertise-url <url>     Data raft URL registered with metadata (default: listener URL)
         \\  --health <true|false>          Enable health/metrics server (default: true)
         \\  --health-port <port>           Dedicated health/metrics bind port (default: 4200)
         \\  --experimental                 Enable experimental A2A protocol surfaces
@@ -18886,6 +19098,250 @@ test "data raft source split lifecycle commands bypass document db apply" {
             .delta_sequence = 1,
         },
     }));
+}
+
+test "data raft retry checkpoints survive changed ready windows and publication failure" {
+    const alloc = std.testing.allocator;
+    const group_id: u64 = 78;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-raft-writer-retry", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+
+    const Catalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{.{
+                    .table_id = 8,
+                    .name = "docs",
+                    .placement_role = "data",
+                }})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{.{
+                    .group_id = group_id,
+                    .table_id = 8,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var storage = antfly.public_api.ProvisionedGroupStorage.init(alloc);
+    defer storage.deinit();
+    var apply_sm = RaftTableApplyStateMachine.init(alloc, replica_root, Catalog.iface(), null);
+    defer apply_sm.deinit();
+    apply_sm.attachProvisionedStorage(&storage);
+
+    _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
+        .writes = &.{.{ .key = "doc:counter", .value = "{\"count\":0}" }},
+    });
+    const increment = try data_raft_batch.encode(alloc, "docs", .{
+        .transforms = &.{.{
+            .key = "doc:counter",
+            .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
+        }},
+    });
+    defer alloc.free(increment);
+    const trailing_write = try data_raft_batch.encode(alloc, "docs", .{
+        .writes = &.{.{ .key = "doc:after", .value = "{\"ok\":true}" }},
+    });
+    defer alloc.free(trailing_write);
+    const entries = [_]raft_engine.core.Entry{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = increment },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = trailing_write },
+    };
+    const extended_entries = [_]raft_engine.core.Entry{
+        entries[0],
+        entries[1],
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = trailing_write },
+    };
+
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 1, 1);
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 2, 1);
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 3, 1);
+    apply_sm.test_faults.writer_unavailable_once_at_index = 2;
+    try std.testing.expectError(
+        error.RaftApplyWriterUnavailable,
+        RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{}),
+    );
+    try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(@as(usize, 1), apply_sm.retry_apply_checkpoints.count());
+    try DataServer.handleRaftProgressError(error.RaftApplyWriterUnavailable);
+    try std.testing.expectError(error.OutOfMemory, DataServer.handleRaftProgressError(error.OutOfMemory));
+
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &extended_entries, &.{});
+    try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
+    try std.testing.expectEqual(@as(usize, 4), apply_sm.test_faults.document_apply_attempts);
+    try std.testing.expectEqual(@as(usize, 3), apply_sm.test_faults.document_apply_successes);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 2).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 3).?);
+
+    {
+        var cached = (try apply_sm.write_source.leaseCachedGroupWriter(alloc, group_id, "docs")) orelse
+            return error.TestUnexpectedResult;
+        defer cached.deinit(alloc);
+        const raw = (try cached.db.get(alloc, "doc:counter")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("count").?.integer);
+    }
+
+    const publication_entries = [_]raft_engine.core.Entry{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = increment },
+    };
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 4, 1);
+    apply_sm.test_faults.applied_index_publication_failure_once = true;
+    try std.testing.expectError(
+        error.TestAppliedIndexPublicationFailure,
+        RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &publication_entries, &.{}),
+    );
+    try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(@as(usize, 1), apply_sm.retry_apply_checkpoints.count());
+
+    const shifted_entries = [_]raft_engine.core.Entry{
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = trailing_write },
+    };
+    try apply_sm.registerApplyOutcomeWaiter(group_id, 5, 1);
+    try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &shifted_entries, &.{});
+    try std.testing.expectEqual(@as(u64, 5), apply_sm.appliedIndex(group_id));
+    try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
+    try std.testing.expectEqual(@as(usize, 6), apply_sm.test_faults.document_apply_attempts);
+    try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_successes);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 4).?);
+    try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 5).?);
+
+    {
+        var cached = (try apply_sm.write_source.leaseCachedGroupWriter(alloc, group_id, "docs")) orelse
+            return error.TestUnexpectedResult;
+        defer cached.deinit(alloc);
+        const raw = (try cached.db.get(alloc, "doc:counter")) orelse return error.TestUnexpectedResult;
+        defer alloc.free(raw);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("count").?.integer);
+    }
+}
+
+test "data raft replica retirement removes only retired group apply state" {
+    const alloc = std.testing.allocator;
+    const retired_group_id: u64 = 781;
+    const active_group_id: u64 = 782;
+
+    const Catalog = struct {
+        fn iface() antfly.public_api.table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metadata_epoch = 1, .metrics = .{} },
+                .tables = @constCast((&[_]antfly.metadata.table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]antfly.metadata.table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]antfly.metadata.table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]antfly.raft.reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]antfly.metadata.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]antfly.metadata.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
+    };
+
+    var apply_sm = RaftTableApplyStateMachine.init(alloc, "/tmp/unused-antfly-retire-group", Catalog.iface(), null);
+    defer apply_sm.deinit();
+    var data_sm = antfly.raft.state_machine.DataStateMachine{
+        .alloc = alloc,
+        .applied_sink = antfly.raft.state_machine.noopAppliedIndexSink(),
+        .delegate = apply_sm.stateMachine(),
+    };
+    var routed_sm = antfly.raft.state_machine.RoutedStateMachine{
+        .metadata_state_machine = data_sm.stateMachine(),
+        .data_state_machine = data_sm.stateMachine(),
+    };
+    var host = raft_engine.runtime.MultiRaft.init(alloc, .{}, .{
+        .state_machine = routed_sm.stateMachine(),
+    });
+    defer host.deinit();
+
+    var retired_storage = raft_engine.core.MemoryStorage.init(alloc);
+    defer retired_storage.deinit();
+    var active_storage = raft_engine.core.MemoryStorage.init(alloc);
+    defer active_storage.deinit();
+    var peers = [_]u64{1};
+    try host.addGroup(.{
+        .group_id = retired_group_id,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = retired_group_id,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = retired_storage.storage(),
+    });
+    try host.addGroup(.{
+        .group_id = active_group_id,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = active_group_id,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = active_storage.storage(),
+    });
+
+    try apply_sm.applied_indexes.put(alloc, retired_group_id, 7);
+    try apply_sm.applied_indexes.put(alloc, active_group_id, 11);
+    try apply_sm.retry_apply_checkpoints.put(alloc, retired_group_id, .{ .completed_index = 6, .completed_term = 2 });
+    try apply_sm.retry_apply_checkpoints.put(alloc, active_group_id, .{ .completed_index = 10, .completed_term = 3 });
+    try apply_sm.registerApplyOutcomeWaiter(retired_group_id, 8, 2);
+    try apply_sm.registerApplyOutcomeWaiter(retired_group_id, 9, 2);
+    try apply_sm.registerApplyOutcomeWaiter(active_group_id, 12, 3);
+
+    try host.removeReplica(retired_group_id);
+
+    try std.testing.expect(host.group(retired_group_id) == null);
+    try std.testing.expect(host.group(active_group_id) != null);
+    try std.testing.expect(!apply_sm.applied_indexes.contains(retired_group_id));
+    try std.testing.expectEqual(@as(?u64, 11), apply_sm.applied_indexes.get(active_group_id));
+    try std.testing.expect(!apply_sm.retry_apply_checkpoints.contains(retired_group_id));
+    try std.testing.expectEqual(@as(u64, 10), apply_sm.retry_apply_checkpoints.get(active_group_id).?.completed_index);
+    try std.testing.expect(!apply_sm.apply_outcomes.contains(.{ .group_id = retired_group_id, .index = 8 }));
+    try std.testing.expect(!apply_sm.apply_outcomes.contains(.{ .group_id = retired_group_id, .index = 9 }));
+    try std.testing.expectEqual(@as(usize, 1), apply_sm.apply_outcomes.count());
+    try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = active_group_id, .index = 12 }).?.outcome);
 }
 
 test "data raft apply records transaction conflicts without stopping replica progress" {
@@ -19366,6 +19822,10 @@ test "data runtime parses optional split store registration flags" {
         "data",
         "--failure-domain",
         "rack-a",
+        "--api-advertise-url",
+        "http://data-0.data.default.svc.cluster.local:12380",
+        "--raft-advertise-url",
+        "http://data-0.data.default.svc.cluster.local:9021",
         "--process-memory-budget-mb",
         "0",
     };
@@ -19378,6 +19838,14 @@ test "data runtime parses optional split store registration flags" {
     try std.testing.expectEqual(@as(u64, 21), parsed.store_id.?);
     try std.testing.expectEqualStrings("data", parsed.store_role.?);
     try std.testing.expectEqualStrings("rack-a", parsed.failure_domain.?);
+    try std.testing.expectEqualStrings(
+        "http://data-0.data.default.svc.cluster.local:12380",
+        parsed.api_advertise_url.?,
+    );
+    try std.testing.expectEqualStrings(
+        "http://data-0.data.default.svc.cluster.local:9021",
+        parsed.raft_advertise_url.?,
+    );
     try std.testing.expectEqual(@as(?usize, 0), parsed.process_memory_budget_mb);
     try std.testing.expectEqual(
         @as(usize, 0),

@@ -67,7 +67,13 @@ pub const ReplicaDescriptorFactory = struct {
     pub const VTable = struct {
         build_descriptor: *const fn (ptr: *anyopaque, record: catalog.ReplicaRecord) anyerror!raft_engine.runtime.ReplicaDescriptor,
         free_descriptor: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void = null,
+        accepts_record: ?*const fn (ptr: *anyopaque, record: catalog.ReplicaRecord) bool = null,
     };
+
+    pub fn acceptsRecord(self: ReplicaDescriptorFactory, record: catalog.ReplicaRecord) bool {
+        const accepts_record = self.vtable.accepts_record orelse return true;
+        return accepts_record(self.ptr, record);
+    }
 
     pub fn buildDescriptor(self: ReplicaDescriptorFactory, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
         return try self.vtable.build_descriptor(self.ptr, record);
@@ -308,6 +314,7 @@ pub const Host = struct {
     }
 
     pub fn ensureReplica(self: *Host, record: catalog.ReplicaRecord) !raft_engine.runtime.EnsureReplicaResult {
+        if (!self.acceptsReplicaRecord(record)) return error.ReplicaAdmissionRejected;
         const prepare_bootstrap = !self.hasReplica(record.group_id) and record.backup_restore_bootstrap != null;
         if (prepare_bootstrap) self.noteReplicaBootstrapPreparing(record);
         var prepared = self.prepareReplica(record, prepare_bootstrap) catch |err| {
@@ -350,6 +357,7 @@ pub const Host = struct {
         prepare_bootstrap: bool,
         persist_catalog: bool,
     ) !PreparedReplica {
+        if (!self.acceptsReplicaRecord(record)) return error.ReplicaAdmissionRejected;
         const should_prepare_bootstrap = prepare_bootstrap and record.backup_restore_bootstrap != null;
         if (should_prepare_bootstrap) {
             try record.backup_restore_bootstrap.?.validate();
@@ -453,10 +461,22 @@ pub const Host = struct {
         var restored: usize = 0;
         for (records) |record| {
             if (self.runtime_host.group(record.group_id) != null) continue;
+            if (!self.acceptsReplicaRecord(record)) {
+                std.log.warn(
+                    "raft host skipped catalog replica rejected by descriptor factory group_id={} replica_id={} local_node_id={}",
+                    .{ record.group_id, record.replica_id, record.local_node_id },
+                );
+                continue;
+            }
             const result = try self.ensureReplica(record);
             if (result.created or result.resumed or result.fetched_snapshot) restored += 1;
         }
         return restored;
+    }
+
+    fn acceptsReplicaRecord(self: *const Host, record: catalog.ReplicaRecord) bool {
+        const factory = self.deps.descriptor_factory orelse return true;
+        return factory.acceptsRecord(record);
     }
 
     pub fn removeReplica(self: *Host, group_id: u64) !void {
