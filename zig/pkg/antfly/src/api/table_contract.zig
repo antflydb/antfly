@@ -497,10 +497,11 @@ fn validatePublicNestedIndexFields(object: anytype, index_type: public_index_con
     const Object = @TypeOf(object);
     const sources = if (@hasField(Object, "map")) object.map.get("sources") else object.get("sources");
     if (sources) |value| {
-        if (value != .null) try validatePublicArtifactSources(
-            value,
-            if (index_type == .graph) .graph_sources else .artifact_sources,
-        );
+        if (value != .null) try validatePublicArtifactSources(value, switch (index_type) {
+            .graph => .graph_sources,
+            .full_text => .full_text_sources,
+            else => .artifact_sources,
+        });
     }
     const source = if (@hasField(Object, "map")) object.map.get("source") else object.get("source");
     if (index_type == .embeddings) {
@@ -1052,8 +1053,8 @@ test "table contract admits and preserves multi-source index requests" {
     }{
         .{
             .name = "document_text",
-            .body = "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"document_units_v1\"},{\"artifact\":\"document_chunks_v1\"}]}",
-            .expected_sources = "\"sources\":[{\"artifact\":\"document_units_v1\"},{\"artifact\":\"document_chunks_v1\"}]",
+            .body = "{\"type\":\"full_text\",\"field\":\"text\",\"sources\":[{\"artifact\":\"document_units_v1\",\"field\":\"summary\"},{\"artifact\":\"document_chunks_v1\"}]}",
+            .expected_sources = "\"sources\":[{\"artifact\":\"document_units_v1\",\"field\":\"summary\"},{\"artifact\":\"document_chunks_v1\"}]",
         },
         .{
             .name = "document_vectors",
@@ -1122,6 +1123,7 @@ test "table contract rejects malformed multi-source members" {
         "{\"type\":\"full_text\",\"sources\":[]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"},{\"artifact\":\"dense_v1\"}]}",
         "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"path\":\"$.relations[*]\"},{\"artifact\":\"relations_v1\",\"path\":\"$.links[*]\"}]}",
+        "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\",\"field\":\"\"}]}",
         "{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"chunks_v1\",\"path\":\"$.text\"}]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{}]}",
         "{\"type\":\"embeddings\",\"dimension\":3,\"sources\":[{\"artifact\":\"dense_v1\"}],\"enrichments\":[{\"name\":\"dense_v1\",\"kind\":\"embedding\",\"field\":\"body\",\"vector_space\":\"\"}]}",

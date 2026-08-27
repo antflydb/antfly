@@ -146,9 +146,41 @@ export function artifactIndexSources(...artifacts: string[]): ArtifactIndexSourc
   return artifacts.map((artifact) => ({ artifact }));
 }
 
+export interface FullTextArtifactSourceConfig {
+  artifact: string;
+  /** Source-local projection; overrides the index-level field for this stream. */
+  field?: string;
+}
+
+/** Validates and copies full-text sources with optional source-local fields. */
+export function fullTextArtifactIndexSources(
+  ...sources: FullTextArtifactSourceConfig[]
+): FullTextArtifactSourceConfig[] {
+  sources.forEach((source, index) => {
+    if (!isRecord(source)) throw new TypeError(`sources[${index}] must be an object`);
+  });
+  validateArtifactNames(sources.map((source) => source.artifact));
+  return sources.map((source, index) => {
+    validateOnlyKeys(
+      source as unknown as Record<string, unknown>,
+      ["artifact", "field"],
+      `sources[${index}]`
+    );
+    validateOptionalString(source.field, `sources[${index}].field`);
+    const field = source.field?.trim();
+    if (source.field !== undefined && !field) {
+      throw new TypeError(`sources[${index}].field must not be empty`);
+    }
+    return { artifact: source.artifact, ...(field ? { field } : {}) };
+  });
+}
+
 export interface ArtifactFullTextIndexOptions {
-  artifacts: readonly string[];
-  /** Optional content field shared by every selected artifact record. */
+  /** Artifact-only convenience form. Mutually exclusive with sources. */
+  artifacts?: readonly string[];
+  /** Artifact streams with optional source-local field projections. */
+  sources?: readonly FullTextArtifactSourceConfig[];
+  /** Optional content field inherited by sources that do not select one. */
   field?: string;
   memOnly?: boolean;
 }
@@ -169,8 +201,24 @@ export function artifactFullTextIndexConfig(
     args.length === 1 && isRecord(args[0])
       ? (args[0] as unknown as ArtifactFullTextIndexOptions)
       : { artifacts: args as string[] };
-  if (isRecord(options)) validateOnlyKeys(options, ["artifacts", "field", "memOnly"], "options");
-  if (!Array.isArray(options.artifacts)) throw new TypeError("artifacts must be an array");
+  validateOnlyKeys(
+    options as unknown as Record<string, unknown>,
+    ["artifacts", "sources", "field", "memOnly"],
+    "options"
+  );
+  if (options.artifacts !== undefined && options.sources !== undefined) {
+    throw new TypeError("artifacts and sources are mutually exclusive");
+  }
+  if (options.sources !== undefined && !Array.isArray(options.sources)) {
+    throw new TypeError("sources must be an array");
+  }
+  const sources = Array.isArray(options.sources)
+    ? fullTextArtifactIndexSources(...options.sources)
+    : Array.isArray(options.artifacts)
+      ? artifactIndexSources(...options.artifacts)
+      : (() => {
+          throw new TypeError("artifacts or sources must be an array");
+        })();
   validateOptionalString(options.field, "field");
   if (options.memOnly !== undefined && typeof options.memOnly !== "boolean") {
     throw new TypeError("memOnly must be a boolean");
@@ -180,7 +228,7 @@ export function artifactFullTextIndexConfig(
   return {
     name,
     type: "full_text",
-    sources: artifactIndexSources(...options.artifacts),
+    sources,
     ...(field ? { field } : {}),
     ...(options.memOnly ? { mem_only: true } : {}),
   };

@@ -1417,6 +1417,7 @@ pub const IndexManager = struct {
         config: types.IndexConfig,
         chunk_name: ?[]u8,
         source_artifact_names: [][]u8 = &.{},
+        source_selected_fields: []?[]u8 = &.{},
         selected_field: ?[]u8 = null,
         text_analysis: introducer_mod.TextAnalysisConfig,
         observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
@@ -2583,6 +2584,7 @@ pub const IndexManager = struct {
         if (entry.chunk_name) |chunk_name| self.alloc.free(chunk_name);
         for (entry.source_artifact_names) |name| self.alloc.free(name);
         if (entry.source_artifact_names.len > 0) self.alloc.free(entry.source_artifact_names);
+        freeOptionalOwnedStrings(self.alloc, entry.source_selected_fields);
         if (entry.selected_field) |field| self.alloc.free(field);
         introducer_mod.freeTextAnalysisConfig(self.alloc, entry.text_analysis);
         for (entry.observed_field_analyzers) |item| {
@@ -9152,7 +9154,7 @@ pub const IndexManager = struct {
 
     fn allTextIndexesAllowSchemaLessFastProjection(self: *const IndexManager) bool {
         for (self.text_indexes.items) |entry| {
-            if (entry.runtime_schema != null or entry.selected_field != null) return false;
+            if (entry.runtime_schema != null or textIndexSelectsAnyField(&entry)) return false;
         }
         return true;
     }
@@ -11420,6 +11422,7 @@ pub const IndexManager = struct {
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
                     .chunk_name = if (text_cfg.source_artifact_name) |name| try self.alloc.dupe(u8, name) else null,
                     .source_artifact_names = try cloneOwnedStrings(self.alloc, text_cfg.source_artifact_names),
+                    .source_selected_fields = try cloneOptionalOwnedStrings(self.alloc, text_cfg.source_selected_fields),
                     .selected_field = if (text_cfg.selected_field) |field| try self.alloc.dupe(u8, field) else null,
                     .text_analysis = text_analysis,
                     .observed_field_analyzers = observed_field_analyzers,
@@ -14048,7 +14051,7 @@ pub const IndexManager = struct {
         const source_batch = try mapper.buildTextProjectionSourceBatchWithOptions(
             arena,
             docs,
-            try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null and entry.selected_field == null),
+            try self.textProjectionOptionsForSchema(arena, entry.runtime_schema == null and !textIndexSelectsAnyField(entry)),
         );
         return try self.indexPreparedTextProjectionSourceDocsWithArena(arena, store, entry, source_batch.docs);
     }
@@ -14289,7 +14292,10 @@ pub const IndexManager = struct {
                 while (source_end < source_docs_with_ordinals.len) {
                     const projection_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
                     const previous_projection_docs = builder.text_docs.items.len;
-                    try builder.appendSourceDoc(source_docs_with_ordinals[source_end]);
+                    try builder.appendSourceDocWithSelectedField(
+                        source_docs_with_ordinals[source_end],
+                        textIndexSelectedFieldForKey(entry, source_docs_with_ordinals[source_end].key),
+                    );
                     if (metrics_enabled) projection_ns +|= platform_time.monotonicNs() - projection_start_ns;
                     source_end += 1;
 
@@ -18403,6 +18409,40 @@ fn textArtifactSourceMatches(self: *const IndexManager, key: []const u8, artifac
     return !self.assetSourceSupportsUnitGrouping(artifact_name);
 }
 
+fn textIndexSelectsAnyField(entry: *const IndexManager.TextIndex) bool {
+    if (entry.selected_field != null) return true;
+    for (entry.source_selected_fields) |field| {
+        if (field != null) return true;
+    }
+    return false;
+}
+
+fn textIndexSelectedFieldForKey(entry: *const IndexManager.TextIndex, key: []const u8) ?[]const u8 {
+    return selectedTextFieldForArtifactKey(
+        entry.source_artifact_names,
+        entry.source_selected_fields,
+        entry.selected_field,
+        key,
+    );
+}
+
+fn selectedTextFieldForArtifactKey(
+    source_artifact_names: []const []const u8,
+    source_selected_fields: []const ?[]const u8,
+    default_field: ?[]const u8,
+    key: []const u8,
+) ?[]const u8 {
+    for (source_artifact_names, 0..) |artifact_name, i| {
+        if (!internal_keys.matchesChunkArtifactName(key, artifact_name) and
+            !internal_keys.matchesAssetArtifactName(key, artifact_name)) continue;
+        if (i < source_selected_fields.len) {
+            if (source_selected_fields[i]) |field| return field;
+        }
+        return default_field;
+    }
+    return default_field;
+}
+
 fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
     if (entry.chunk_name) |artifact_name| {
         return textArtifactSourceMatches(self, key, artifact_name);
@@ -18841,12 +18881,14 @@ pub fn denseConfigArtifactNamesAlloc(alloc: Allocator, cfg: types.IndexConfig) !
 const TextConfig = struct {
     source_artifact_name: ?[]u8 = null,
     source_artifact_names: [][]u8 = &.{},
+    source_selected_fields: []?[]u8 = &.{},
     selected_field: ?[]u8 = null,
 
     fn deinit(self: *const TextConfig, alloc: Allocator) void {
         if (self.source_artifact_name) |source_artifact_name| alloc.free(source_artifact_name);
         for (self.source_artifact_names) |name| alloc.free(name);
         if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
+        freeOptionalOwnedStrings(alloc, self.source_selected_fields);
         if (self.selected_field) |field| alloc.free(field);
     }
 };
@@ -19137,6 +19179,49 @@ fn parseArtifactSourcesAlloc(alloc: Allocator, root: std.json.ObjectMap) ![][]u8
     return sources;
 }
 
+const ParsedTextArtifactSources = struct {
+    names: [][]u8 = &.{},
+    selected_fields: []?[]u8 = &.{},
+
+    fn deinit(self: *const ParsedTextArtifactSources, alloc: Allocator) void {
+        for (self.names) |name| alloc.free(name);
+        if (self.names.len > 0) alloc.free(self.names);
+        freeOptionalOwnedStrings(alloc, self.selected_fields);
+    }
+};
+
+fn parseTextArtifactSourcesAlloc(alloc: Allocator, root: std.json.ObjectMap) !ParsedTextArtifactSources {
+    const sources_value = root.get("sources") orelse return .{};
+    if (sources_value != .array or sources_value.array.items.len == 0 or sources_value.array.items.len > max_artifact_sources)
+        return error.InvalidIndexConfig;
+    const names = try alloc.alloc([]u8, sources_value.array.items.len);
+    var initialized_names: usize = 0;
+    errdefer {
+        for (names[0..initialized_names]) |name| alloc.free(name);
+        alloc.free(names);
+    }
+    const selected_fields = try alloc.alloc(?[]u8, sources_value.array.items.len);
+    @memset(selected_fields, null);
+    errdefer freeOptionalOwnedStrings(alloc, selected_fields);
+
+    for (sources_value.array.items, 0..) |source_value, i| {
+        if (source_value != .object or !objectHasOnlyFields(source_value.object, &.{ "artifact", "field" }))
+            return error.InvalidIndexConfig;
+        const artifact = source_value.object.get("artifact") orelse return error.InvalidIndexConfig;
+        if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
+        for (names[0..i]) |previous| {
+            if (std.mem.eql(u8, previous, artifact.string)) return error.InvalidIndexConfig;
+        }
+        names[i] = try alloc.dupe(u8, artifact.string);
+        initialized_names += 1;
+        if (source_value.object.get("field")) |field| {
+            if (field != .string or field.string.len == 0) return error.InvalidIndexConfig;
+            selected_fields[i] = try alloc.dupe(u8, field.string);
+        }
+    }
+    return .{ .names = names, .selected_fields = selected_fields };
+}
+
 fn objectHasOnlyFields(object: std.json.ObjectMap, allowed: []const []const u8) bool {
     var iter = object.iterator();
     while (iter.next()) |entry| {
@@ -19165,6 +19250,24 @@ fn cloneOwnedStrings(alloc: Allocator, values: []const []const u8) ![][]u8 {
         initialized += 1;
     }
     return cloned;
+}
+
+fn cloneOptionalOwnedStrings(alloc: Allocator, values: []const ?[]u8) ![]?[]u8 {
+    if (values.len == 0) return &.{};
+    const cloned = try alloc.alloc(?[]u8, values.len);
+    @memset(cloned, null);
+    errdefer freeOptionalOwnedStrings(alloc, cloned);
+    for (values, 0..) |value, i| {
+        if (value) |bytes| cloned[i] = try alloc.dupe(u8, bytes);
+    }
+    return cloned;
+}
+
+fn freeOptionalOwnedStrings(alloc: Allocator, values: []?[]u8) void {
+    for (values) |value| {
+        if (value) |bytes| alloc.free(bytes);
+    }
+    if (values.len > 0) alloc.free(values);
 }
 
 fn parseEmbeddingSemanticProducerAlloc(alloc: Allocator, raw: []const u8) !?[]u8 {
@@ -19290,11 +19393,10 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
 
-    var source_artifact_names = try parseArtifactSourcesAlloc(alloc, root.object);
-    errdefer {
-        for (source_artifact_names) |name| alloc.free(name);
-        if (source_artifact_names.len > 0) alloc.free(source_artifact_names);
-    }
+    var parsed_sources = try parseTextArtifactSourcesAlloc(alloc, root.object);
+    errdefer parsed_sources.deinit(alloc);
+    var source_artifact_names = parsed_sources.names;
+    var source_selected_fields = parsed_sources.selected_fields;
     if (source_artifact_names.len > 0 and
         (root.object.get("artifact_name") != null or root.object.get("chunk_name") != null))
     {
@@ -19309,10 +19411,17 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
         if (root.object.get("artifact_name")) |value| {
             if (value != .string or value.string.len == 0) return error.InvalidIndexConfig;
             const owned_name = try alloc.dupe(u8, value.string);
-            errdefer alloc.free(owned_name);
-            const singular_source = try alloc.alloc([]u8, 1);
+            const singular_source = alloc.alloc([]u8, 1) catch |err| {
+                alloc.free(owned_name);
+                return err;
+            };
             singular_source[0] = owned_name;
             source_artifact_names = singular_source;
+            parsed_sources.names = singular_source;
+            const singular_fields = try alloc.alloc(?[]u8, 1);
+            singular_fields[0] = null;
+            source_selected_fields = singular_fields;
+            parsed_sources.selected_fields = singular_fields;
         }
     }
 
@@ -19328,6 +19437,7 @@ fn parseTextConfig(alloc: Allocator, raw: []const u8) !TextConfig {
             break :blk try alloc.dupe(u8, value.string);
         } else null,
         .source_artifact_names = source_artifact_names,
+        .source_selected_fields = source_selected_fields,
         .selected_field = selected_field,
     };
 }
@@ -21192,7 +21302,14 @@ fn textConfigSelectsField(alloc: Allocator, raw: []const u8) !bool {
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidIndexConfig;
-    return parsed.value.object.get("field") != null;
+    if (parsed.value.object.get("field") != null) return true;
+    const sources = parsed.value.object.get("sources") orelse return false;
+    if (sources != .array) return error.InvalidIndexConfig;
+    for (sources.array.items) |source| {
+        if (source != .object) return error.InvalidIndexConfig;
+        if (source.object.get("field") != null) return true;
+    }
+    return false;
 }
 
 fn saveTextProjectionProvenance(
@@ -23422,12 +23539,15 @@ test "full text single artifact name accepts textual asset source" {
 test "parseTextConfig accepts multiple artifact sources and rejects mixed aliases" {
     const alloc = std.testing.allocator;
     var cfg = try parseTextConfig(alloc,
-        \\{"field":"text","sources":[{"artifact":"title_chunks_v1"},{"artifact":"body_assets_v1"}]}
+        \\{"field":"text","sources":[{"artifact":"title_chunks_v1","field":"title"},{"artifact":"body_assets_v1"}]}
     );
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 2), cfg.source_artifact_names.len);
     try std.testing.expectEqualStrings("title_chunks_v1", cfg.source_artifact_names[0]);
     try std.testing.expectEqualStrings("body_assets_v1", cfg.source_artifact_names[1]);
+    try std.testing.expectEqual(@as(usize, 2), cfg.source_selected_fields.len);
+    try std.testing.expectEqualStrings("title", cfg.source_selected_fields[0].?);
+    try std.testing.expect(cfg.source_selected_fields[1] == null);
     try std.testing.expectEqualStrings("text", cfg.selected_field.?);
 
     try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
@@ -23437,11 +23557,36 @@ test "parseTextConfig accepts multiple artifact sources and rejects mixed aliase
         \\{"sources":[{"artifact":"body_assets_v1","path":"$.body"}]}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
+        \\{"sources":[{"artifact":"body_assets_v1","field":""}]}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
+        \\{"sources":[{"artifact":"body_assets_v1"},{"artifact":"body_assets_v1","field":"body"}]}
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
         \\{"field":"","sources":[{"artifact":"body_assets_v1"}]}
     ));
     try std.testing.expectError(error.InvalidIndexConfig, parseTextConfig(alloc,
         \\{"field":7,"sources":[{"artifact":"body_assets_v1"}]}
     ));
+}
+
+test "multi-source text field projection selects by artifact identity and inherits default" {
+    const alloc = std.testing.allocator;
+    const title_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:1", "title_chunks_v1", 0);
+    defer alloc.free(title_key);
+    const body_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:1", "body_chunks_v1", 0);
+    defer alloc.free(body_key);
+    const source_names = [_][]const u8{ "title_chunks_v1", "body_chunks_v1" };
+    const source_fields = [_]?[]const u8{ "title", null };
+
+    try std.testing.expectEqualStrings(
+        "title",
+        selectedTextFieldForArtifactKey(&source_names, &source_fields, "text", title_key).?,
+    );
+    try std.testing.expectEqualStrings(
+        "text",
+        selectedTextFieldForArtifactKey(&source_names, &source_fields, "text", body_key).?,
+    );
 }
 
 test "dense embedding writes own vectors and metadata past caller lifetime" {

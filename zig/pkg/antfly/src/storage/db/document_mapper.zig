@@ -215,9 +215,20 @@ pub const TextProjectionBatchBuilder = struct {
     }
 
     pub fn appendSourceDoc(self: *TextProjectionBatchBuilder, doc: TextProjectionSourceDoc) !void {
-        const has_selected_field = self.selected_field != null;
+        return try self.appendSourceDocWithSelectedField(doc, self.selected_field);
+    }
+
+    /// Append one source document with a source-local field projection. This
+    /// keeps one analyzer/schema-aware batch builder while allowing a union
+    /// index to consume artifact streams with different record shapes.
+    pub fn appendSourceDocWithSelectedField(
+        self: *TextProjectionBatchBuilder,
+        doc: TextProjectionSourceDoc,
+        selected_field: ?[]const u8,
+    ) !void {
+        const has_selected_field = selected_field != null;
         const extraction_root = doc.typed_source orelse doc.root;
-        const extracted = if (self.selected_field) |field|
+        const extracted = if (selected_field) |field|
             try extractSelectedTextField(self.arena, extraction_root, field)
         else if (self.schema == null and doc.schema_less_fast_projection)
             ExtractedTextFields{ .fields = doc.schema_less_text_fields }

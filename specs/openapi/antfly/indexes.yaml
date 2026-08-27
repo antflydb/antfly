@@ -92,6 +92,20 @@ components:
           type: string
           minLength: 1
           description: "Stable name of a generated artifact stream."
+    FullTextArtifactIndexSource:
+      type: object
+      additionalProperties: false
+      required: [artifact]
+      description: "Textual artifact stream consumed by a full-text index, with an optional source-local projection."
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: "Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index."
+        field:
+          type: string
+          minLength: 1
+          description: "Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection."
     CreateFullTextIndexRequest:
       description: "Create a full-text index."
       allOf:
@@ -449,7 +463,7 @@ components:
           minItems: 1
           maxItems: 64
           uniqueItems: true
-          items: { $ref: "#/components/schemas/ArtifactIndexSource" }
+          items: { $ref: "#/components/schemas/FullTextArtifactIndexSource" }
         mem_only: { type: boolean }
         field: { type: string }
     CreatedGraphIndexConfig:
@@ -645,9 +659,9 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            $ref: "#/components/schemas/ArtifactIndexSource"
+            $ref: "#/components/schemas/FullTextArtifactIndexSource"
           x-go-type-skip-optional-pointer: true
-          description: "Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
+          description: "Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments."
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean

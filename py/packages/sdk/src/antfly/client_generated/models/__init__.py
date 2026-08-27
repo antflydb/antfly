@@ -280,6 +280,7 @@ from .followup_step_config import FollowupStepConfig
 from .foreign_column import ForeignColumn
 from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
+from .full_text_artifact_index_source import FullTextArtifactIndexSource
 from .full_text_index_config import FullTextIndexConfig
 from .full_text_index_stats import FullTextIndexStats
 from .full_text_index_stats_async_indexing import FullTextIndexStatsAsyncIndexing
@@ -1132,6 +1133,7 @@ __all__ = (
     "ForeignColumn",
     "ForeignSource",
     "ForeignSourceType",
+    "FullTextArtifactIndexSource",
     "FullTextIndexConfig",
     "FullTextIndexStats",
     "FullTextIndexStatsAsyncIndexing",

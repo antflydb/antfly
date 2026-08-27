@@ -68,16 +68,17 @@ type (
 	TableArtifactEnrichmentList              = oapi.TableArtifactEnrichmentList
 
 	// Index config types
-	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
-	ArtifactIndexSource   = oapi.ArtifactIndexSource
-	DistanceMetric        = oapi.DistanceMetric
-	EmbeddingsIndexStats  = oapi.EmbeddingsIndexStats
-	EnrichmentConfig      = oapi.EnrichmentConfig
-	EnrichmentKind        = oapi.EnrichmentKind
-	ExecutionPolicy       = oapi.ExecutionPolicy
-	FullTextIndexConfig   = oapi.FullTextIndexConfig
-	AlgebraicIndexConfig  = oapi.AlgebraicIndexConfig
-	FullTextIndexStats    = oapi.FullTextIndexStats
+	EmbeddingsIndexConfig       = oapi.EmbeddingsIndexConfig
+	ArtifactIndexSource         = oapi.ArtifactIndexSource
+	FullTextArtifactIndexSource = oapi.FullTextArtifactIndexSource
+	DistanceMetric              = oapi.DistanceMetric
+	EmbeddingsIndexStats        = oapi.EmbeddingsIndexStats
+	EnrichmentConfig            = oapi.EnrichmentConfig
+	EnrichmentKind              = oapi.EnrichmentKind
+	ExecutionPolicy             = oapi.ExecutionPolicy
+	FullTextIndexConfig         = oapi.FullTextIndexConfig
+	AlgebraicIndexConfig        = oapi.AlgebraicIndexConfig
+	FullTextIndexStats          = oapi.FullTextIndexStats
 
 	EmbedderProvider         = oapi.EmbedderProvider
 	GeneratorProvider        = oapi.GeneratorProvider

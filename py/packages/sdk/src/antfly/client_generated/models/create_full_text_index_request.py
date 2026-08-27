@@ -10,8 +10,8 @@ from ..models.create_full_text_index_request_type import CreateFullTextIndexRequ
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.artifact_index_source import ArtifactIndexSource
     from ..models.enrichment_config import EnrichmentConfig
+    from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
 
 T = TypeVar("T", bound="CreateFullTextIndexRequest")
@@ -26,9 +26,10 @@ class CreateFullTextIndexRequest:
         description (str | Unset): Optional description of the index and its purpose
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[EnrichmentConfig] | Unset): Inline managed enrichment definitions required by this index.
-        sources (list[ArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every artifact
-            record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by
-            serverless deployments.
+        sources (list[FullTextArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every
+            artifact record is an independent full-text member. A source-local field overrides the shared index-level field
+            for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is
+            rejected by serverless deployments.
         mem_only (bool | Unset): Whether to use memory-only storage
         field (str | Unset): Content field indexed as text. With an artifact source, this selects the field within each
             artifact record; without one, it selects a document field. String values and arrays of strings are indexed;
@@ -42,7 +43,7 @@ class CreateFullTextIndexRequest:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[EnrichmentConfig] | Unset = UNSET
-    sources: list[ArtifactIndexSource] | Unset = UNSET
+    sources: list[FullTextArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
     artifact_name: str | Unset = UNSET
@@ -101,8 +102,8 @@ class CreateFullTextIndexRequest:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.artifact_index_source import ArtifactIndexSource
         from ..models.enrichment_config import EnrichmentConfig
+        from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
         d = dict(src_dict)
         type_ = CreateFullTextIndexRequestType(d.pop("type"))
@@ -121,11 +122,11 @@ class CreateFullTextIndexRequest:
                 enrichments.append(enrichments_item)
 
         _sources = d.pop("sources", UNSET)
-        sources: list[ArtifactIndexSource] | Unset = UNSET
+        sources: list[FullTextArtifactIndexSource] | Unset = UNSET
         if _sources is not UNSET:
             sources = []
             for sources_item_data in _sources:
-                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
+                sources_item = FullTextArtifactIndexSource.from_dict(sources_item_data)
 
                 sources.append(sources_item)
 

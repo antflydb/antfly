@@ -37,6 +37,8 @@ pub const CreatedObjectShape = enum {
     enrichment,
     artifact_sources,
     artifact_source,
+    full_text_sources,
+    full_text_source,
     graph_sources,
     graph_source,
     graph_artifact,
@@ -138,7 +140,11 @@ pub fn isAllowedCreatedProviderField(field: []const u8) bool {
 
 pub fn createdObjectShapeForRootField(kind: Kind, field: []const u8) CreatedObjectShape {
     if (std.mem.eql(u8, field, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, field, "sources")) return if (kind == .graph) .graph_sources else .artifact_sources;
+    if (std.mem.eql(u8, field, "sources")) return switch (kind) {
+        .graph => .graph_sources,
+        .full_text => .full_text_sources,
+        else => .artifact_sources,
+    };
     if (std.mem.eql(u8, field, "summarizer")) return .provider;
     return switch (kind) {
         .embeddings => if (std.mem.eql(u8, field, "embedder"))
@@ -169,6 +175,7 @@ pub fn createdObjectShapeForArrayItem(parent: CreatedObjectShape) CreatedObjectS
     return switch (parent) {
         .enrichments => .enrichment,
         .artifact_sources => .artifact_source,
+        .full_text_sources => .full_text_source,
         .graph_sources => .graph_source,
         .edge_types => .edge_type,
         .graph_resolvers => .graph_resolver,
@@ -179,7 +186,7 @@ pub fn createdObjectShapeForArrayItem(parent: CreatedObjectShape) CreatedObjectS
 pub fn createdValueMatchesShape(shape: CreatedObjectShape, value: std.json.Value) bool {
     return switch (shape) {
         .unrestricted => true,
-        .enrichments, .artifact_sources, .graph_sources, .edge_types, .graph_resolvers => value == .array,
+        .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers => value == .array,
         else => value == .object and createdObjectHasRequiredFields(shape, value.object),
     };
 }
@@ -189,13 +196,14 @@ fn createdObjectHasRequiredFields(shape: CreatedObjectShape, object: std.json.Ob
         .provider, .chunker => &.{"provider"},
         .enrichment => &.{ "name", "kind" },
         .artifact_source => &.{"artifact"},
+        .full_text_source => &.{"artifact"},
         .graph_artifact => &.{ "name", "kind", "source" },
         .graph_artifact_producer_source => &.{ "type", "value" },
         .graph_source => &.{"artifact"},
         .edge_type => &.{"name"},
         .graph_resolver => &.{ "name", "table", "source_artifact", "resolution_artifact", "key_template" },
         .graph_bounded_traversal => &.{"law"},
-        .unrestricted, .enrichments, .artifact_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
+        .unrestricted, .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers, .graph_nodes, .graph_edge, .graph_context, .graph_algebraic_planning, .chunker_text, .chunker_audio, .index_execution, .execution_policy => &.{},
     };
     for (required_fields) |field| {
         const value = object.get(field) orelse return false;
@@ -236,10 +244,11 @@ pub fn createdObjectShapeForChild(parent: CreatedObjectShape, field: []const u8)
 pub fn isAllowedCreatedObjectField(shape: CreatedObjectShape, field: []const u8) bool {
     return switch (shape) {
         .unrestricted => true,
-        .enrichments, .artifact_sources, .graph_sources, .edge_types, .graph_resolvers => false,
+        .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers => false,
         .provider => isAllowedCreatedProviderField(field),
         .enrichment => isAllowedCreatedEnrichmentField(field),
         .artifact_source => std.mem.eql(u8, field, "artifact"),
+        .full_text_source => std.mem.eql(u8, field, "artifact") or std.mem.eql(u8, field, "field"),
         .graph_source => isAllowedGraphArtifactSourceField(field),
         .graph_artifact => isAllowedCreatedGraphArtifactField(field),
         .graph_artifact_producer_source => std.mem.eql(u8, field, "type") or std.mem.eql(u8, field, "value"),
@@ -313,10 +322,11 @@ pub fn rootFieldValueMatches(kind: Kind, field: []const u8, value: std.json.Valu
 pub fn createdFieldValueMatches(shape: CreatedObjectShape, field: []const u8, value: std.json.Value) bool {
     return switch (shape) {
         .unrestricted => true,
-        .enrichments, .artifact_sources, .graph_sources, .edge_types, .graph_resolvers => false,
+        .enrichments, .artifact_sources, .full_text_sources, .graph_sources, .edge_types, .graph_resolvers => false,
         .provider => providerFieldValueMatches(field, value),
         .enrichment => enrichmentFieldValueMatches(field, value),
         .artifact_source => isNonEmptyString(value),
+        .full_text_source => isNonEmptyString(value),
         .graph_source => graphArtifactSourceFieldValueMatches(field, value),
         .graph_artifact => graphArtifactFieldValueMatches(field, value),
         .graph_artifact_producer_source => graphArtifactProducerSourceFieldValueMatches(field, value),

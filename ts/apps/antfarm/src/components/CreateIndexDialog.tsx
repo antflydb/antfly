@@ -94,7 +94,9 @@ const indexFormSchema = z
       .max(64, "At most 64 artifact sources are allowed."),
     fullTextSourceType: z.enum(["document", "field", "artifacts"]),
     fullTextField: z.string().optional(),
-    fullTextArtifacts: z.array(z.object({ artifact: z.string() })).max(64),
+    fullTextArtifacts: z
+      .array(z.object({ artifact: z.string(), field: z.string().optional() }))
+      .max(64),
     graphSourceType: z.enum(["artifacts", "document_fields"]),
     graphEdgeTypes: z
       .array(
@@ -166,6 +168,15 @@ const indexFormSchema = z
       }
       if (data.fullTextSourceType === "artifacts") {
         validateNamedSources(data.fullTextArtifacts, "fullTextArtifacts", context);
+        data.fullTextArtifacts.forEach((source, index) => {
+          if (source.field !== undefined && source.field.length > 0 && !source.field.trim()) {
+            context.addIssue({
+              code: "custom",
+              path: ["fullTextArtifacts", index, "field"],
+              message: "Artifact field must not be blank.",
+            });
+          }
+        });
       }
       return;
     }
@@ -544,8 +555,7 @@ const IndexKindForm: React.FC<{
                       <Input placeholder="text" {...field} />
                     </FormControl>
                     <p className="text-xs text-muted-foreground">
-                      Use this when every artifact record exposes the searchable content under the
-                      same field.
+                      Sources without their own field inherit this value.
                     </p>
                     <FormMessage />
                   </FormItem>
@@ -561,6 +571,19 @@ const IndexKindForm: React.FC<{
                         <FormLabel>Artifact</FormLabel>
                         <FormControl>
                           <Input placeholder="document_chunks_v1" {...field} />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={control}
+                    name={`fullTextArtifacts.${index}.field`}
+                    render={({ field }) => (
+                      <FormItem className="flex-1">
+                        <FormLabel>Content field (optional)</FormLabel>
+                        <FormControl>
+                          <Input placeholder="Inherit shared field" {...field} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -582,7 +605,7 @@ const IndexKindForm: React.FC<{
                 type="button"
                 variant="outline"
                 disabled={fullTextArtifacts.fields.length >= 64}
-                onClick={() => fullTextArtifacts.append({ artifact: "" })}
+                onClick={() => fullTextArtifacts.append({ artifact: "", field: "" })}
               >
                 Add artifact source
               </Button>
@@ -1000,7 +1023,7 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
       artifactSources: [{ artifact: "", sourceArtifact: "", field: "text" }],
       fullTextSourceType: "field",
       fullTextField: "",
-      fullTextArtifacts: [{ artifact: "" }],
+      fullTextArtifacts: [{ artifact: "", field: "" }],
       graphSourceType: artifactSourcesSupported ? "artifacts" : "document_fields",
       graphEdgeTypes: [
         {
@@ -1047,7 +1070,10 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
               ? {
                   sources: (data.fullTextArtifacts ?? [])
                     .filter((source) => source?.artifact)
-                    .map((source) => ({ artifact: source?.artifact || "" })),
+                    .map((source) => ({
+                      artifact: source?.artifact || "",
+                      ...(source?.field?.trim() ? { field: source.field.trim() } : {}),
+                    })),
                   ...(data.fullTextField?.trim() ? { field: data.fullTextField.trim() } : {}),
                 }
               : data.fullTextSourceType === "field"
@@ -1146,11 +1172,13 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
         indexConfig =
           data.fullTextSourceType === "artifacts"
             ? ({
-                ...artifactFullTextIndexConfig(
-                  data.name,
-                  ...data.fullTextArtifacts.map((source) => source.artifact.trim())
-                ),
-                ...(data.fullTextField?.trim() ? { field: data.fullTextField.trim() } : {}),
+                ...artifactFullTextIndexConfig(data.name, {
+                  sources: data.fullTextArtifacts.map((source) => ({
+                    artifact: source.artifact.trim(),
+                    ...(source.field?.trim() ? { field: source.field.trim() } : {}),
+                  })),
+                  ...(data.fullTextField?.trim() ? { field: data.fullTextField.trim() } : {}),
+                }),
               } as IndexConfig)
             : ({
                 name: data.name,

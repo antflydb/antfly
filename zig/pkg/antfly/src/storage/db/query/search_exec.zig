@@ -13044,7 +13044,8 @@ fn searchDenseInternal(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
-    const full_candidate_window = group_chunk_parents or unresolved_stored_filters or multi_source_members;
+    const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
+    const full_candidate_window = expansive_postprocessing or multi_source_members;
     const page_candidate_window = pagingCandidateWindow(paging);
     const score_order_k = scoreOrderCandidateWindowK(dense.k, paging);
     const effort = resolvedSearchEffort(req.search_effort);
@@ -13102,8 +13103,10 @@ fn searchDenseInternal(
         @min(bounded_full_candidate_count, groupedCandidateBudget())
     else
         bounded_full_candidate_count;
-    var candidate_window: u32 = if (full_candidate_window)
+    var candidate_window: u32 = if (expansive_postprocessing)
         initialAdaptiveCandidateWindow(candidate_ceiling, paging)
+    else if (multi_source_members)
+        initialMultiSourceCandidateWindow(candidate_ceiling, paging, score_order_k)
     else
         score_order_k;
 
@@ -13802,6 +13805,22 @@ fn initialAdaptiveCandidateWindow(candidate_ceiling: u32, paging: ComponentPagin
     return @min(candidate_ceiling, @max(overfetch_window, pagingCandidateWindow(paging)));
 }
 
+/// Multi-source indexes need post-processing to translate internal member IDs
+/// to public `(artifact, key)` identities. Start with page-proportional
+/// overfetch and let the existing adaptive loop grow only when discarded or
+/// duplicate members leave the requested page short. Unlike hierarchy and
+/// unresolved-filter collection, this common path must not impose a fixed
+/// 1,024-vector floor on small queries.
+fn initialMultiSourceCandidateWindow(
+    candidate_ceiling: u32,
+    paging: ComponentPaging,
+    score_order_k: u32,
+) u32 {
+    if (candidate_ceiling == 0) return 0;
+    const overfetch_window = paging.limit *| 32;
+    return @min(candidate_ceiling, @max(score_order_k, @max(overfetch_window, pagingCandidateWindow(paging))));
+}
+
 fn growAdaptiveCandidateWindow(current: u32, candidate_ceiling: u32, requested_visible_end: u32) u32 {
     if (current >= candidate_ceiling) return current;
     const grown = @max(current +| 1, @max(current *| 2, requested_visible_end));
@@ -13890,6 +13909,29 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     const grown_width = resolveSearchWidth(grown_k, 0.0, stats);
     try std.testing.expect(page_width < initial_width);
     try std.testing.expect(initial_width < grown_width);
+}
+
+test "multi-source candidate window is page proportional and bounded" {
+    try std.testing.expectEqual(
+        @as(u32, 32),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 0, .limit = 1 }, 1),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 320),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 0, .limit = 10 }, 10),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1_025),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 1_024, .limit = 1 }, 10),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 4_096),
+        initialMultiSourceCandidateWindow(10_000, .{ .offset = 0, .limit = 10 }, 4_096),
+    );
+    try std.testing.expectEqual(
+        @as(u32, 7),
+        initialMultiSourceCandidateWindow(7, .{ .offset = 0, .limit = 10 }, 10),
+    );
 }
 
 test "grouped result page satisfaction treats nested match count as a maximum" {
@@ -14784,7 +14826,8 @@ pub fn searchSparse(
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
     );
-    const full_candidate_window = group_chunk_parents or unresolved_stored_filters or multi_source_members;
+    const expansive_postprocessing = group_chunk_parents or unresolved_stored_filters;
+    const full_candidate_window = expansive_postprocessing or multi_source_members;
     const bounded_sparse_candidate_count: u64 = if (native_constraints.positive_filter)
         @as(u64, native_constraints.filter_doc_ids.len) +| @as(u64, native_constraints.filter_doc_nums.len)
     else
@@ -14794,10 +14837,13 @@ pub fn searchSparse(
         @min(bounded_candidate_count, groupedCandidateBudget())
     else
         bounded_candidate_count;
-    var candidate_window: u32 = if (full_candidate_window)
+    const score_order_k = scoreOrderCandidateWindowK(sparse.k, paging);
+    var candidate_window: u32 = if (expansive_postprocessing)
         initialAdaptiveCandidateWindow(candidate_ceiling, paging)
+    else if (multi_source_members)
+        initialMultiSourceCandidateWindow(candidate_ceiling, paging, score_order_k)
     else
-        scoreOrderCandidateWindowK(sparse.k, paging);
+        score_order_k;
     const query = sparse_mod.SparseVector{
         .indices = sparse.indices,
         .values = sparse.values,

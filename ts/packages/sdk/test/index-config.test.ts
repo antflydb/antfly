@@ -28,6 +28,22 @@ describe("artifact embedding index configuration", () => {
       field: "text",
       sources: [{ artifact: "document_text_v1" }, { artifact: "document_chunks_v1" }],
     });
+
+    expect(
+      artifactFullTextIndexConfig("document_text", {
+        sources: [
+          { artifact: "document_text_v1", field: " summary " },
+          { artifact: "document_chunks_v1", field: "text" },
+        ],
+      })
+    ).toEqual({
+      name: "document_text",
+      type: "full_text",
+      sources: [
+        { artifact: "document_text_v1", field: "summary" },
+        { artifact: "document_chunks_v1", field: "text" },
+      ],
+    });
   });
 
   it("combines document- and chunk-backed embedding streams", () => {

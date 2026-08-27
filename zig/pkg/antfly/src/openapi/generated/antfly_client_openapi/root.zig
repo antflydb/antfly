@@ -208,6 +208,7 @@ pub const FilterSpec = types.FilterSpec;
 pub const FollowupStepConfig = types.FollowupStepConfig;
 pub const ForeignColumn = types.ForeignColumn;
 pub const ForeignSource = types.ForeignSource;
+pub const FullTextArtifactIndexSource = types.FullTextArtifactIndexSource;
 pub const FullTextIndexConfig = types.FullTextIndexConfig;
 pub const FullTextIndexStats = types.FullTextIndexStats;
 pub const Fuzziness = types.Fuzziness;

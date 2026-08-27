@@ -13921,16 +13921,6 @@ components:
       type: object
       not:
         anyOf:
-          - description: A named full-text index selector requires a scoring text query.
-            allOf:
-              - required:
-                  - full_text_index
-              - not:
-                  anyOf:
-                    - required:
-                        - query
-                    - required:
-                        - full_text_search
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required:
@@ -14155,6 +14145,8 @@ components:
           type: string
           minLength: 1
           maxLength: 256
+          x-antfly-runtime-validation: Requires full_text_search or at least one scoring text clause after
+            normalizing the query AST; filter-only and exclusion-only query trees receive HTTP 422.
           description: >
             Full-text index used by `full_text_search` and by scoring text clauses in `query`.
 
@@ -14166,7 +14158,13 @@ components:
 
             to use the active schema index even when retrieval uses a named artifact index. This
 
-            selector is invalid without `full_text_search` or a scoring text clause in `query`.
+            selector is invalid without `full_text_search` or a scoring text clause in `query` and
+
+            receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+
+            is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+
+            from filter-only or exclusion-only trees.
           example: document_text
         semantic_search:
           type: string
@@ -16952,18 +16950,24 @@ components:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
             in generated artifact identity.
-    ArtifactIndexSource:
+    FullTextArtifactIndexSource:
       type: object
       additionalProperties: false
       required:
         - artifact
-      description: Named generated artifact stream consumed by an index. Producer inputs belong on the
-        matching enrichment.
+      description: Textual artifact stream consumed by a full-text index, with an optional source-local
+        projection.
       properties:
         artifact:
           type: string
           minLength: 1
-          description: Stable name of a generated artifact stream.
+          description: Stable name of a chunk or textual asset artifact stream. Artifact names must be
+            unique within the index.
+        field:
+          type: string
+          minLength: 1
+          description: Optional field selected from this artifact's records. When omitted, the index-level
+            field is inherited; when both are omitted, Antfly indexes the default text projection.
     FullTextIndexConfig:
       type: object
       x-antfly-mutually-exclusive:
@@ -16976,11 +16980,12 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            $ref: '#/components/schemas/ArtifactIndexSource'
+            $ref: '#/components/schemas/FullTextArtifactIndexSource'
           x-go-type-skip-optional-pointer: true
           description: Chunk or textual asset streams indexed together; every artifact record is an independent
-            full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless
-            deployments.
+            full-text member. A source-local field overrides the shared index-level field for that stream.
+            Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected
+            by serverless deployments.
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -17017,6 +17022,18 @@ components:
         - best_effort
       default: strict
       description: How generation-scoped source outcomes determine derived-index completeness.
+    ArtifactIndexSource:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      description: Named generated artifact stream consumed by an index. Producer inputs belong on the
+        matching enrichment.
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: Stable name of a generated artifact stream.
     DistanceMetric:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -19243,7 +19260,7 @@ components:
           maxItems: 64
           uniqueItems: true
           items:
-            $ref: '#/components/schemas/ArtifactIndexSource'
+            $ref: '#/components/schemas/FullTextArtifactIndexSource'
         mem_only:
           type: boolean
         field:

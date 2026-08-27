@@ -33,6 +33,7 @@ from .exceptions import (
 )
 from .index_config import (
     ArtifactEmbeddingSource,
+    FullTextArtifactSource,
     GraphArtifactSource,
     GraphContextMapping,
     GraphEdgeMapping,
@@ -77,6 +78,7 @@ __all__ = [
     "SparseEmbedding",
     "PackedSparseEmbedding",
     "ArtifactEmbeddingSource",
+    "FullTextArtifactSource",
     "GraphArtifactSource",
     "GraphContextMapping",
     "GraphEdgeMapping",

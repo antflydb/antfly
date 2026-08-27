@@ -297,7 +297,7 @@ func TestCreateIndexRejectsInvalidDirectUnionBeforeNetwork(t *testing.T) {
 	var request CreateIndexRequest
 	if err := request.FromCreateFullTextIndexRequest(CreateFullTextIndexRequest{
 		ArtifactName: "chunks_v1",
-		Sources:      []ArtifactIndexSource{{Artifact: "chunks_v2"}},
+		Sources:      []FullTextArtifactIndexSource{{Artifact: "chunks_v2"}},
 	}); err != nil {
 		t.Fatalf("FromCreateFullTextIndexRequest: %v", err)
 	}

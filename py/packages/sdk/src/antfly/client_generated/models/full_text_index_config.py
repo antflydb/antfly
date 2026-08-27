@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.artifact_index_source import ArtifactIndexSource
+    from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
 
 T = TypeVar("T", bound="FullTextIndexConfig")
@@ -19,9 +19,10 @@ T = TypeVar("T", bound="FullTextIndexConfig")
 class FullTextIndexConfig:
     """
     Attributes:
-        sources (list[ArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every artifact
-            record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by
-            serverless deployments.
+        sources (list[FullTextArtifactIndexSource] | Unset): Chunk or textual asset streams indexed together; every
+            artifact record is an independent full-text member. A source-local field overrides the shared index-level field
+            for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is
+            rejected by serverless deployments.
         mem_only (bool | Unset): Whether to use memory-only storage
         field (str | Unset): Content field indexed as text. With an artifact source, this selects the field within each
             artifact record; without one, it selects a document field. String values and arrays of strings are indexed;
@@ -31,7 +32,7 @@ class FullTextIndexConfig:
             deployments.
     """
 
-    sources: list[ArtifactIndexSource] | Unset = UNSET
+    sources: list[FullTextArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
     artifact_name: str | Unset = UNSET
@@ -67,15 +68,15 @@ class FullTextIndexConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.artifact_index_source import ArtifactIndexSource
+        from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
         d = dict(src_dict)
         _sources = d.pop("sources", UNSET)
-        sources: list[ArtifactIndexSource] | Unset = UNSET
+        sources: list[FullTextArtifactIndexSource] | Unset = UNSET
         if _sources is not UNSET:
             sources = []
             for sources_item_data in _sources:
-                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
+                sources_item = FullTextArtifactIndexSource.from_dict(sources_item_data)
 
                 sources.append(sources_item)
 

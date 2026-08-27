@@ -40,6 +40,7 @@ pub const EnrichmentConfig = types.EnrichmentConfig;
 pub const EnrichmentKind = types.EnrichmentKind;
 pub const EnrichmentRuntimeStatus = types.EnrichmentRuntimeStatus;
 pub const ExecutionPolicy = types.ExecutionPolicy;
+pub const FullTextArtifactIndexSource = types.FullTextArtifactIndexSource;
 pub const FullTextIndexConfig = types.FullTextIndexConfig;
 pub const FullTextIndexStats = types.FullTextIndexStats;
 pub const GraphAlgebraicPlanningConfig = types.GraphAlgebraicPlanningConfig;

@@ -86,20 +86,48 @@ def artifact_index_sources(*artifacts: str) -> list[dict[str, str]]:
     return [{"artifact": artifact} for artifact in artifacts]
 
 
+@dataclass(frozen=True, slots=True)
+class FullTextArtifactSource:
+    """One textual artifact stream and its optional source-local projection."""
+
+    artifact: str
+    field: str | None = None
+
+
+def _full_text_sources(sources: Sequence[FullTextArtifactSource]) -> list[dict[str, str]]:
+    for index, source in enumerate(sources):
+        if not isinstance(source, FullTextArtifactSource):
+            raise TypeError(f"sources[{index}] must be a FullTextArtifactSource")
+    _validate_artifacts([source.artifact for source in sources])
+    result: list[dict[str, str]] = []
+    for index, source in enumerate(sources):
+        item = {"artifact": source.artifact}
+        if source.field is not None:
+            field = source.field.strip()
+            if not field:
+                raise ValueError(f"sources[{index}].field must not be empty")
+            item["field"] = field
+        result.append(item)
+    return result
+
+
 def artifact_full_text_index_config(
     name: str,
     *artifacts: str,
+    sources: Sequence[FullTextArtifactSource] | None = None,
     field: str | None = None,
     mem_only: bool = False,
 ) -> dict[str, Any]:
-    """Build a full-text index over artifact streams with an optional shared content field."""
+    """Build a full-text index with shared or source-local content fields."""
 
     if not name:
         raise ValueError("index name is required")
+    if artifacts and sources is not None:
+        raise ValueError("artifacts and sources are mutually exclusive")
     result: dict[str, Any] = {
         "name": name,
         "type": "full_text",
-        "sources": artifact_index_sources(*artifacts),
+        "sources": _full_text_sources(sources) if sources is not None else artifact_index_sources(*artifacts),
     }
     if field is not None:
         field = field.strip()

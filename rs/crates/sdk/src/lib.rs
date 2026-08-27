@@ -49,6 +49,13 @@ pub struct ArtifactIndexSourceSpec {
     pub artifact: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FullTextArtifactSourceSpec {
+    pub artifact: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
 pub fn artifact_index_sources<'a>(
     artifacts: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<ArtifactIndexSourceSpec>, IndexConfigError> {
@@ -65,7 +72,7 @@ pub struct ArtifactFullTextIndexConfigSpec {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: ArtifactFullTextIndexKind,
-    pub sources: Vec<ArtifactIndexSourceSpec>,
+    pub sources: Vec<FullTextArtifactSourceSpec>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -111,10 +118,56 @@ pub fn artifact_full_text_index_config_with_options<'a>(
     if field_was_set && field.is_none() {
         return Err(IndexConfigError("field must not be empty".into()));
     }
+    let sources = artifact_index_sources(artifacts)?
+        .into_iter()
+        .map(|source| FullTextArtifactSourceSpec {
+            artifact: source.artifact,
+            field: None,
+        })
+        .collect();
     Ok(ArtifactFullTextIndexConfigSpec {
         name: name.to_owned(),
         kind: ArtifactFullTextIndexKind::FullText,
-        sources: artifact_index_sources(artifacts)?,
+        sources,
+        field,
+        mem_only: options.mem_only,
+    })
+}
+
+/// Builds a full-text union whose artifact streams use different record
+/// shapes. A source-local field overrides the optional shared field.
+pub fn artifact_full_text_index_config_for_sources(
+    name: &str,
+    mut sources: Vec<FullTextArtifactSourceSpec>,
+    options: ArtifactFullTextIndexOptions,
+) -> Result<ArtifactFullTextIndexConfigSpec, IndexConfigError> {
+    if name.is_empty() {
+        return Err(IndexConfigError("index name is required".into()));
+    }
+    validate_artifact_names(sources.iter().map(|source| source.artifact.as_str()))?;
+    for (index, source) in sources.iter_mut().enumerate() {
+        if let Some(field) = source.field.take() {
+            let field = field.trim().to_owned();
+            if field.is_empty() {
+                return Err(IndexConfigError(format!(
+                    "sources[{index}].field must not be empty"
+                )));
+            }
+            source.field = Some(field);
+        }
+    }
+    let field_was_set = options.field.is_some();
+    let field = options
+        .field
+        .map(|field| field.trim().to_owned())
+        .filter(|field| !field.is_empty());
+    if field_was_set && field.is_none() {
+        return Err(IndexConfigError("field must not be empty".into()));
+    }
+    Ok(ArtifactFullTextIndexConfigSpec {
+        name: name.to_owned(),
+        kind: ArtifactFullTextIndexKind::FullText,
+        sources,
         field,
         mem_only: options.mem_only,
     })
@@ -684,9 +737,10 @@ impl types::CreateIndexError {
 mod tests {
     use super::{
         ArtifactEmbeddingIndexOptions, ArtifactEmbeddingSourceSpec, ArtifactFullTextIndexOptions,
-        GraphArtifactFormat, GraphContextMappingSpec, GraphEdgeMappingSpec, GraphIndexSourceSpec,
-        GraphNodeMappingSpec, GraphNodeModel, GraphTemplateOrNumber, antfly_embedder,
-        artifact_embedding_index_config, artifact_full_text_index_config,
+        FullTextArtifactSourceSpec, GraphArtifactFormat, GraphContextMappingSpec,
+        GraphEdgeMappingSpec, GraphIndexSourceSpec, GraphNodeMappingSpec, GraphNodeModel,
+        GraphTemplateOrNumber, antfly_embedder, artifact_embedding_index_config,
+        artifact_full_text_index_config, artifact_full_text_index_config_for_sources,
         artifact_full_text_index_config_with_options, graph_index_sources, normalize_base_url,
         types, validate_create_index_request_relationships,
         validate_create_table_request_relationships,
@@ -771,6 +825,23 @@ mod tests {
         .expect("valid full-text options");
         assert_eq!(configured.field.as_deref(), Some("text"));
         assert!(configured.mem_only);
+
+        let per_source = artifact_full_text_index_config_for_sources(
+            "document_text",
+            vec![
+                FullTextArtifactSourceSpec {
+                    artifact: "document_text_v1".into(),
+                    field: Some(" summary ".into()),
+                },
+                FullTextArtifactSourceSpec {
+                    artifact: "document_chunks_v1".into(),
+                    field: Some("text".into()),
+                },
+            ],
+            ArtifactFullTextIndexOptions::default(),
+        )
+        .expect("valid per-source projections");
+        assert_eq!(per_source.sources[0].field.as_deref(), Some("summary"));
     }
 
     #[test]

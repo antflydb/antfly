@@ -10,8 +10,8 @@ from ..models.created_full_text_index_type import CreatedFullTextIndexType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.artifact_index_source import ArtifactIndexSource
     from ..models.created_enrichment_config import CreatedEnrichmentConfig
+    from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
 
 T = TypeVar("T", bound="CreatedFullTextIndex")
@@ -28,7 +28,7 @@ class CreatedFullTextIndex:
         version (int | Unset): Version of the index implementation. Defaults to 0. Default: 0.
         enrichments (list[CreatedEnrichmentConfig] | Unset): Normalized inline managed enrichment definitions required
             by this index.
-        sources (list[ArtifactIndexSource] | Unset):
+        sources (list[FullTextArtifactIndexSource] | Unset):
         mem_only (bool | Unset):
         field (str | Unset):
     """
@@ -38,7 +38,7 @@ class CreatedFullTextIndex:
     description: str | Unset = UNSET
     version: int | Unset = 0
     enrichments: list[CreatedEnrichmentConfig] | Unset = UNSET
-    sources: list[ArtifactIndexSource] | Unset = UNSET
+    sources: list[FullTextArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -95,8 +95,8 @@ class CreatedFullTextIndex:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.artifact_index_source import ArtifactIndexSource
         from ..models.created_enrichment_config import CreatedEnrichmentConfig
+        from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -117,11 +117,11 @@ class CreatedFullTextIndex:
                 enrichments.append(enrichments_item)
 
         _sources = d.pop("sources", UNSET)
-        sources: list[ArtifactIndexSource] | Unset = UNSET
+        sources: list[FullTextArtifactIndexSource] | Unset = UNSET
         if _sources is not UNSET:
             sources = []
             for sources_item_data in _sources:
-                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
+                sources_item = FullTextArtifactIndexSource.from_dict(sources_item_data)
 
                 sources.append(sources_item)
 

@@ -55,6 +55,8 @@ export {
   artifactEmbeddingIndexConfig,
   artifactFullTextIndexConfig,
   artifactIndexSources,
+  type FullTextArtifactSourceConfig,
+  fullTextArtifactIndexSources,
   graphIndexSources,
   isValidGraphMaterializedSourceTemplate,
   validateCreateIndexRequestRelationships,

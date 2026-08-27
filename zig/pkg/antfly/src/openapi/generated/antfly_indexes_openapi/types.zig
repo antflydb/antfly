@@ -262,8 +262,8 @@ pub const CreateFullTextIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
-    sources: ?[]const ArtifactIndexSource = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
@@ -458,7 +458,7 @@ pub const CreatedFullTextIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
-    sources: ?[]const ArtifactIndexSource = null,
+    sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
     type: []const u8,
@@ -466,7 +466,7 @@ pub const CreatedFullTextIndex = struct {
 
 /// Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources.
 pub const CreatedFullTextIndexConfig = struct {
-    sources: ?[]const ArtifactIndexSource = null,
+    sources: ?[]const FullTextArtifactIndexSource = null,
     mem_only: ?bool = null,
     field: ?[]const u8 = null,
 };
@@ -1110,9 +1110,17 @@ pub const ExecutionPolicy = struct {
     batch_bytes: ?i64 = null,
 };
 
+/// Textual artifact stream consumed by a full-text index, with an optional source-local projection.
+pub const FullTextArtifactIndexSource = struct {
+    /// Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index.
+    artifact: []const u8,
+    /// Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection.
+    field: ?[]const u8 = null,
+};
+
 pub const FullTextIndexConfig = struct {
-    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
-    sources: ?[]const ArtifactIndexSource = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.
@@ -1570,8 +1578,8 @@ pub const IndexConfig = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index. Enrichments are table-level generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact stream.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
-    sources: ?[]const ArtifactIndexSource = null,
+    /// Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
+    sources: ?[]const FullTextArtifactIndexSource = null,
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
     /// Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection.

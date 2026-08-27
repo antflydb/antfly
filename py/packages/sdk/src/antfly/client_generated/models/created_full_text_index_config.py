@@ -9,7 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.artifact_index_source import ArtifactIndexSource
+    from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
 
 T = TypeVar("T", bound="CreatedFullTextIndexConfig")
@@ -21,12 +21,12 @@ class CreatedFullTextIndexConfig:
     through sources.
 
         Attributes:
-            sources (list[ArtifactIndexSource] | Unset):
+            sources (list[FullTextArtifactIndexSource] | Unset):
             mem_only (bool | Unset):
             field (str | Unset):
     """
 
-    sources: list[ArtifactIndexSource] | Unset = UNSET
+    sources: list[FullTextArtifactIndexSource] | Unset = UNSET
     mem_only: bool | Unset = UNSET
     field: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -57,15 +57,15 @@ class CreatedFullTextIndexConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.artifact_index_source import ArtifactIndexSource
+        from ..models.full_text_artifact_index_source import FullTextArtifactIndexSource
 
         d = dict(src_dict)
         _sources = d.pop("sources", UNSET)
-        sources: list[ArtifactIndexSource] | Unset = UNSET
+        sources: list[FullTextArtifactIndexSource] | Unset = UNSET
         if _sources is not UNSET:
             sources = []
             for sources_item_data in _sources:
-                sources_item = ArtifactIndexSource.from_dict(sources_item_data)
+                sources_item = FullTextArtifactIndexSource.from_dict(sources_item_data)
 
                 sources.append(sources_item)
 

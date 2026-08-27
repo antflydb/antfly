@@ -559,4 +559,24 @@ func TestNewArtifactFullTextIndexConfig(t *testing.T) {
 	if body["field"] != "text" || body["mem_only"] != true {
 		t.Fatalf("artifact full-text options were not preserved: %s", data)
 	}
+
+	perSource, err := NewArtifactFullTextIndexConfigForSources(
+		"document_text",
+		FullTextArtifactIndexSource{Artifact: "document_text_v1", Field: " summary "},
+		FullTextArtifactIndexSource{Artifact: "document_chunks_v1", Field: "text"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(perSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &body); err != nil {
+		t.Fatal(err)
+	}
+	sources := body["sources"].([]any)
+	if sources[0].(map[string]any)["field"] != "summary" {
+		t.Fatalf("source-local full-text field was not normalized: %s", data)
+	}
 }

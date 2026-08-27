@@ -6490,7 +6490,10 @@ export interface components {
              *     index must exist and have type `full_text`. Omit this field to use the table's active
              *     schema full-text index, preserving v0.2 behavior. Structured document filters continue
              *     to use the active schema index even when retrieval uses a named artifact index. This
-             *     selector is invalid without `full_text_search` or a scoring text clause in `query`.
+             *     selector is invalid without `full_text_search` or a scoring text clause in `query` and
+             *     receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+             *     is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+             *     from filter-only or exclusion-only trees.
              * @example document_text
              */
             full_text_index?: string;
@@ -8356,14 +8359,16 @@ export interface components {
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
         };
-        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
-        ArtifactIndexSource: {
-            /** @description Stable name of a generated artifact stream. */
+        /** @description Textual artifact stream consumed by a full-text index, with an optional source-local projection. */
+        FullTextArtifactIndexSource: {
+            /** @description Stable name of a chunk or textual asset artifact stream. Artifact names must be unique within the index. */
             artifact: string;
+            /** @description Optional field selected from this artifact's records. When omitted, the index-level field is inherited; when both are omitted, Antfly indexes the default text projection. */
+            field?: string;
         };
         FullTextIndexConfig: {
-            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
-            sources?: components["schemas"]["ArtifactIndexSource"][];
+            /** @description Chunk or textual asset streams indexed together; every artifact record is an independent full-text member. A source-local field overrides the shared index-level field for that stream. Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments. */
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
             /** @description Content field indexed as text. With an artifact source, this selects the field within each artifact record; without one, it selects a document field. String values and arrays of strings are indexed; missing, null, and non-text values produce no posting. Omit to index the default text projection. */
@@ -8383,6 +8388,11 @@ export interface components {
          * @enum {string}
          */
         DerivedCoveragePolicy: "strict" | "partial" | "best_effort";
+        /** @description Named generated artifact stream consumed by an index. Producer inputs belong on the matching enrichment. */
+        ArtifactIndexSource: {
+            /** @description Stable name of a generated artifact stream. */
+            artifact: string;
+        };
         /**
          * @description Distance metric for the vector index (dense only). Use "cosine" for models trained with cosine similarity (e.g. CLIP, OpenAI). Use "inner_product" for models trained with dot product similarity. Use "l2_squared" (default) for models trained with Euclidean distance.
          * @default l2_squared
@@ -9874,7 +9884,7 @@ export interface components {
         };
         /** @description Canonical full-text configuration returned after creation. Single-source alternative request forms are represented through sources. */
         CreatedFullTextIndexConfig: {
-            sources?: components["schemas"]["ArtifactIndexSource"][];
+            sources?: components["schemas"]["FullTextArtifactIndexSource"][];
             mem_only?: boolean;
             field?: string;
         };

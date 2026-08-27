@@ -1,0 +1,149 @@
+---
+title: Artifact-Backed Indexes
+description: Build full-text, vector, and graph indexes over one or more generated artifact streams
+---
+
+<Questions>
+- How do I search document-level and chunk-level embeddings in one index?
+- How do full-text sources select different content fields?
+- What identity does an artifact-backed result use?
+- Which request forms are canonical, alternative, legacy, or deprecated?
+</Questions>
+
+## Overview
+
+An artifact-backed index consumes records produced by named enrichments. The
+canonical `sources` array can union up to 64 streams in one full-text, embeddings,
+or graph index. Each source member has the stable identity `(artifact, key)`, so
+records from different streams cannot collide even when their keys match.
+
+Check deployment support before offering this workflow:
+
+```bash
+curl http://localhost:8080/db/v1/status
+```
+
+`index_capabilities.artifact_sources` must be `true`. Embedded, standalone, and
+distributed deployments support artifact sources. Serverless rejects them and
+does not emulate older artifact-index behavior.
+
+## Document And Chunk Vectors In One Index
+
+This pattern closes the gap between one document-level semantic field and the
+more precise chunks produced by document extraction. Both embedding enrichments
+must have compatible dimensions and semantic vector spaces.
+
+```json
+{
+  "type": "embeddings",
+  "dimension": 768,
+  "sources": [
+    { "artifact": "document_dense_v1" },
+    { "artifact": "document_chunk_dense_v1" }
+  ],
+  "enrichments": [
+    {
+      "name": "document_chunks_v1",
+      "kind": "chunk",
+      "field": "semantic_content",
+      "chunk_size": 512
+    },
+    {
+      "name": "document_dense_v1",
+      "kind": "embedding",
+      "field": "semantic_content",
+      "expected_dims": 768,
+      "vector_space": "searchaf:v1"
+    },
+    {
+      "name": "document_chunk_dense_v1",
+      "kind": "embedding",
+      "field": "text",
+      "source_artifact_name": "document_chunks_v1",
+      "expected_dims": 768,
+      "vector_space": "searchaf:v1"
+    }
+  ]
+}
+```
+
+Create it at `POST /db/v1/tables/{table}/indexes/document_vectors`. The
+`vector_space` value is an application-owned compatibility identifier. Every
+source in a multi-source index must either use the same explicit identifier or
+use semantically identical producer configurations; explicit and implicit modes
+cannot be mixed.
+
+Query `document_vectors` through the normal semantic search API. Raw member
+results retain artifact identity. Use hierarchy grouping when the UI needs one
+source document with matching chunks nested beneath it; request the documented
+top-level field projection when grouping.
+
+## Full-Text Sources With Different Shapes
+
+A shared top-level `field` is inherited by every source that does not override
+it. A source-local field supports unions whose artifact records use different
+JSON shapes:
+
+```json
+{
+  "type": "full_text",
+  "field": "text",
+  "sources": [
+    { "artifact": "document_units_v1", "field": "summary" },
+    { "artifact": "document_chunks_v1" }
+  ]
+}
+```
+
+Here `document_units_v1` indexes `summary`, while `document_chunks_v1` inherits
+`text`. If neither level specifies a field, Antfly uses the default text
+projection. Missing, null, and non-text values add no postings.
+
+To query a named full-text index, set `full_text_index` together with
+`full_text_search` or a scoring text clause in the recursive `query` AST:
+
+```json
+{
+  "full_text_index": "document_text",
+  "full_text_search": { "query": "retrieval augmented generation" },
+  "limit": 10
+}
+```
+
+Filter-only and exclusion-only query trees are not scoring text queries and
+receive HTTP 422 when combined with `full_text_index`.
+
+## Graph Sources
+
+Graph `sources` are ordered. When two sources materialize the same edge identity,
+the earlier source wins. Mapping (`path`, `format`, `nodes`, `edge`, and
+`context`) belongs on each source because streams can use different record
+shapes. The optional `source` object is the one-source convenience form and is
+mutually exclusive with `sources`.
+
+## Readiness And Operations
+
+Creation starts materialization and replay; it does not imply complete coverage.
+Poll `GET /db/v1/tables/{table}/indexes/{index}` and use
+`readiness.queryable` for serving eligibility and `readiness.complete` for full
+coverage. `pending_reasons`, captured/applied revisions, and per-source status
+are diagnostics. Do not infer readiness from replay counters alone.
+
+Changing source membership, projection fields, analyzer semantics, embedding
+space, or graph mapping changes index semantics and requires a new materialized
+generation. Execution batching fields tune work but do not change artifact
+identity.
+
+## API Names And Compatibility
+
+`sources` is the canonical multi-source API. The following are supported
+one-source alternatives, not deprecated aliases: full-text `artifact_name`,
+embeddings `embedding_name`, and graph `source`. Normalized responses expose
+canonical `sources` where the released contract requires it.
+
+The released v0.2 embeddings fields remain supported for their documented
+compatibility window. `source_artifact_name` is descriptive when paired with
+`embedding_name`; the matching enrichment is authoritative. Internal graph
+manifest and edge materialization fields are engine-owned, not alternate public
+APIs. No graph status aliases were released, and the unreleased Go v0.2 SDK
+surface does not create an additional compatibility obligation.

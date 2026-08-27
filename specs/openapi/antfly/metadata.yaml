@@ -6779,13 +6779,6 @@ components:
       type: object
       not:
         anyOf:
-          - description: A named full-text index selector requires a scoring text query.
-            allOf:
-              - required: [full_text_index]
-              - not:
-                  anyOf:
-                    - required: [query]
-                    - required: [full_text_search]
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
@@ -6941,13 +6934,17 @@ components:
           type: string
           minLength: 1
           maxLength: 256
+          x-antfly-runtime-validation: "Requires full_text_search or at least one scoring text clause after normalizing the query AST; filter-only and exclusion-only query trees receive HTTP 422."
           description: |
             Full-text index used by `full_text_search` and by scoring text clauses in `query`.
             Use this to query a named document- or artifact-backed full-text index. The selected
             index must exist and have type `full_text`. Omit this field to use the table's active
             schema full-text index, preserving v0.2 behavior. Structured document filters continue
             to use the active schema index even when retrieval uses a named artifact index. This
-            selector is invalid without `full_text_search` or a scoring text clause in `query`.
+            selector is invalid without `full_text_search` or a scoring text clause in `query` and
+            receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+            is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+            from filter-only or exclusion-only trees.
           example: "document_text"
         semantic_search:
           type: string

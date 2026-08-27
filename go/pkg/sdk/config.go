@@ -402,6 +402,9 @@ func NewArtifactIndexSources(artifacts ...string) ([]ArtifactIndexSource, error)
 type ArtifactFullTextIndexOptions struct {
 	Field   string
 	MemOnly bool
+	// Sources enables source-local field projections and is mutually exclusive
+	// with the positional artifact names.
+	Sources []FullTextArtifactIndexSource
 }
 
 // NewArtifactFullTextIndexConfig builds a full-text index over one or more
@@ -410,15 +413,55 @@ func NewArtifactFullTextIndexConfig(name string, artifacts ...string) (*IndexCon
 	return NewArtifactFullTextIndexConfigWithOptions(name, ArtifactFullTextIndexOptions{}, artifacts...)
 }
 
+// NewArtifactFullTextIndexConfigForSources builds a full-text union over
+// artifact streams whose records may expose searchable text under different
+// fields.
+func NewArtifactFullTextIndexConfigForSources(name string, sources ...FullTextArtifactIndexSource) (*IndexConfig, error) {
+	return NewArtifactFullTextIndexConfigWithOptions(name, ArtifactFullTextIndexOptions{Sources: sources})
+}
+
 // NewArtifactFullTextIndexConfigWithOptions builds an artifact-backed
 // full-text index with an optional content field shared by every source.
 func NewArtifactFullTextIndexConfigWithOptions(name string, options ArtifactFullTextIndexOptions, artifacts ...string) (*IndexConfig, error) {
 	if name == "" {
 		return nil, fmt.Errorf("index name is required")
 	}
-	sources, err := NewArtifactIndexSources(artifacts...)
-	if err != nil {
-		return nil, err
+	if len(artifacts) > 0 && options.Sources != nil {
+		return nil, fmt.Errorf("artifacts and sources are mutually exclusive")
+	}
+	var sources []FullTextArtifactIndexSource
+	if options.Sources != nil {
+		if len(options.Sources) == 0 {
+			return nil, fmt.Errorf("at least one artifact source is required")
+		}
+		if len(options.Sources) > maxArtifactSources {
+			return nil, fmt.Errorf("at most %d artifact sources are allowed", maxArtifactSources)
+		}
+		sources = make([]FullTextArtifactIndexSource, len(options.Sources))
+		seen := make(map[string]struct{}, len(options.Sources))
+		for i, source := range options.Sources {
+			if source.Artifact == "" {
+				return nil, fmt.Errorf("sources[%d].artifact is required", i)
+			}
+			if _, ok := seen[source.Artifact]; ok {
+				return nil, fmt.Errorf("duplicate artifact source %q", source.Artifact)
+			}
+			seen[source.Artifact] = struct{}{}
+			sourceField := strings.TrimSpace(source.Field)
+			if source.Field != "" && sourceField == "" {
+				return nil, fmt.Errorf("sources[%d].field must not be empty", i)
+			}
+			sources[i] = FullTextArtifactIndexSource{Artifact: source.Artifact, Field: sourceField}
+		}
+	} else {
+		artifactSources, err := NewArtifactIndexSources(artifacts...)
+		if err != nil {
+			return nil, err
+		}
+		sources = make([]FullTextArtifactIndexSource, len(artifactSources))
+		for i, source := range artifactSources {
+			sources[i] = FullTextArtifactIndexSource{Artifact: source.Artifact}
+		}
 	}
 	field := strings.TrimSpace(options.Field)
 	if options.Field != "" && field == "" {
