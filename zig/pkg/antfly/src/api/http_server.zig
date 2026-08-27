@@ -12135,6 +12135,8 @@ pub const ApiHttpServer = struct {
         body: []const u8,
         authenticated_identity: ?AuthenticatedIdentity,
     ) !contextual_operations.OwnedResponse {
+        if (body.len > tables_api.max_table_create_transport_bytes)
+            return try contextual_operations.textAlloc(self.alloc, 413, "create table request too large");
         var request = table_contract.parseCreateTableRequest(self.alloc, body) catch |err|
             return try contextual_operations.textAlloc(self.alloc, 400, table_contract.createTableRequestErrorMessage(err, body));
         defer request.deinit(self.alloc);
@@ -12211,6 +12213,8 @@ pub const ApiHttpServer = struct {
             error.CreateTableShardCountOutOfRange => try contextual_operations.textAlloc(self.alloc, 400, tables_api.table_initial_ranges_error_message),
             error.CreateTableRequestTooLarge => try contextual_operations.textAlloc(self.alloc, 413, "create table request too large"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
+            error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
+            error.MetadataMutationOutcomeUnknown => try contextualRetryableTextResponse(self.alloc, 503, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => return err,
         };
@@ -12270,7 +12274,9 @@ pub const ApiHttpServer = struct {
             error.TableNotFound => try contextual_operations.textAlloc(self.alloc, 404, "not found"),
             error.TableTransitionActive => try contextual_operations.textAlloc(self.alloc, 409, "table transition active"),
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
-            error.ExtensionOwnedObject, error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
+            error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table is owned by an extension"),
+            error.MetadataMutationOutcomeUnknown => try contextualRetryableTextResponse(self.alloc, 503, "table mutation outcome is unknown; observe table state before retrying"),
+            error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => return err,
         };
         if (self.table_writes) |writes| {

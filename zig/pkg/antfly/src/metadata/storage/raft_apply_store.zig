@@ -82,9 +82,9 @@ pub const TableTopologyMutation = union(enum) {
         table_id: u64,
         expected_name: []const u8,
         expected_transition_generation: u64,
-        /// Sorted data-group IDs observed with the table. Apply verifies the
-        /// exact owned set before deleting anything; carrying the IDs keeps
-        /// mutation writes proportional to this table's ranges.
+        /// Sorted data-group IDs observed with the table at the transition
+        /// generation above. The generation CAS rejects any intervening range
+        /// mutation, keeping validation and writes proportional to this table.
         range_group_ids: []const u64,
     },
 };
@@ -635,6 +635,26 @@ test "table topology mutation atomically creates and drops catalog ranges" {
 
     const create_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
     try std.testing.expectEqual(@as(u64, 1), create_fence.generation);
+    // A range admitted after the caller's snapshot advances the table fence.
+    // The stale drop must therefore no-op without scanning unrelated ranges.
+    const concurrent_range = metadata.RangeRecord{
+        .group_id = 303,
+        .range_id = 303,
+        .table_id = table.table_id,
+        .start_key = "doc:z",
+        .end_key = null,
+    };
+    const concurrent_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_range = concurrent_range });
+    defer std.testing.allocator.free(concurrent_upsert);
+    const concurrent_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = concurrent_upsert },
+    });
+    defer std.testing.allocator.free(concurrent_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 2,
+        .entries_bytes = concurrent_entries,
+    });
     const incomplete_drop = try encodeTransitionCommand(std.testing.allocator, .{
         .apply_table_topology = .{ .drop = .{
             .table_id = table.table_id,
@@ -645,12 +665,12 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     });
     defer std.testing.allocator.free(incomplete_drop);
     const incomplete_drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 2, .entry_type = .normal, .data = incomplete_drop },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = incomplete_drop },
     });
     defer std.testing.allocator.free(incomplete_drop_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 2,
+        .commit_index = 3,
         .entries_bytes = incomplete_drop_entries,
     });
     {
@@ -659,15 +679,38 @@ test "table topology mutation atomically creates and drops catalog ranges" {
         const retained_ranges = try store.listRanges(std.testing.allocator, metadata_group_id);
         defer store.freeRanges(std.testing.allocator, retained_ranges);
         try std.testing.expectEqual(@as(usize, 1), retained_tables.len);
-        try std.testing.expectEqual(@as(usize, 2), retained_ranges.len);
+        try std.testing.expectEqual(@as(usize, 3), retained_ranges.len);
     }
+
+    const current_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
+    try std.testing.expectEqual(@as(u64, 2), current_fence.generation);
+
+    const owned_member = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_extension_member = .{
+            .extension_name = "memoryaf",
+            .scope = .{ .kind = .table, .table_name = table.name },
+            .object_kind = .index,
+            .object_name = "memory_text",
+            .table_name = table.name,
+        },
+    });
+    defer std.testing.allocator.free(owned_member);
+    const owned_member_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = owned_member },
+    });
+    defer std.testing.allocator.free(owned_member_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 4,
+        .entries_bytes = owned_member_entries,
+    });
 
     const drop = try encodeTransitionCommand(std.testing.allocator, .{
         .apply_table_topology = .{ .drop = .{
             .table_id = table.table_id,
             .expected_name = table.name,
-            .expected_transition_generation = create_fence.generation,
-            .range_group_ids = &.{ 301, 302 },
+            .expected_transition_generation = current_fence.generation,
+            .range_group_ids = &.{ 301, 302, 303 },
         } },
     });
     defer std.testing.allocator.free(drop);
@@ -675,17 +718,49 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     defer decoded_drop.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(
         u64,
-        &.{ 301, 302 },
+        &.{ 301, 302, 303 },
         decoded_drop.apply_table_topology.drop.range_group_ids,
     );
     const drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 3, .entry_type = .normal, .data = drop },
+        .{ .term = 1, .index = 5, .entry_type = .normal, .data = drop },
     });
     defer std.testing.allocator.free(drop_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 3,
+        .commit_index = 5,
         .entries_bytes = drop_entries,
+    });
+    {
+        const retained_tables = try store.listTables(std.testing.allocator, metadata_group_id);
+        defer store.freeTables(std.testing.allocator, retained_tables);
+        try std.testing.expectEqual(@as(usize, 1), retained_tables.len);
+    }
+
+    const remove_owned_member = try encodeTransitionCommand(std.testing.allocator, .{
+        .remove_extension_member = .{
+            .extension_name = "memoryaf",
+            .object_kind = .index,
+            .object_name = "memory_text",
+        },
+    });
+    defer std.testing.allocator.free(remove_owned_member);
+    const remove_owned_member_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 6, .entry_type = .normal, .data = remove_owned_member },
+    });
+    defer std.testing.allocator.free(remove_owned_member_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 6,
+        .entries_bytes = remove_owned_member_entries,
+    });
+    const final_drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 7, .entry_type = .normal, .data = drop },
+    });
+    defer std.testing.allocator.free(final_drop_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 7,
+        .entries_bytes = final_drop_entries,
     });
     const projected_tables = try store.listTables(std.testing.allocator, metadata_group_id);
     defer store.freeTables(std.testing.allocator, projected_tables);
@@ -699,12 +774,12 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     });
     defer std.testing.allocator.free(delayed_upsert);
     const delayed_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
-        .{ .term = 1, .index = 4, .entry_type = .normal, .data = delayed_upsert },
+        .{ .term = 1, .index = 8, .entry_type = .normal, .data = delayed_upsert },
     });
     defer std.testing.allocator.free(delayed_entries);
     try store.snapshotBuilder().applyBatch(.{
         .group_id = metadata_group_id,
-        .commit_index = 4,
+        .commit_index = 8,
         .entries_bytes = delayed_entries,
     });
     const ranges_after_delayed_upsert = try store.listRanges(std.testing.allocator, metadata_group_id);
@@ -3316,15 +3391,13 @@ pub const RaftApplyStore = struct {
                 const existing = try decodeTableRecord(self.alloc, encoded_table);
                 defer metadata_table_manager.freeTable(self.alloc, existing);
                 if (!std.mem.eql(u8, existing.name, drop.expected_name)) return;
+                if (try self.extensionOwnsTableTxn(txn, group_id, existing.name)) return;
 
-                // Verify the complete expected set before making any writes.
-                // Checking both directions prevents a stale or incomplete
-                // caller snapshot from leaving orphaned table-owned ranges.
-                var expected_groups = std.AutoHashMapUnmanaged(u64, void).empty;
-                defer expected_groups.deinit(self.alloc);
-                try expected_groups.ensureTotalCapacity(self.alloc, @intCast(drop.range_group_ids.len));
+                // The generation CAS proves that no range mutation occurred
+                // after the caller's linearizable snapshot. Validate only the
+                // exact keys carried by the command; scanning every range in
+                // the metadata group would make a one-table drop O(cluster).
                 for (drop.range_group_ids) |range_group_id| {
-                    expected_groups.putAssumeCapacity(range_group_id, {});
                     var range_key_buf: [160]u8 = undefined;
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
                     const encoded_range = txn.get(range_key) catch |err| switch (err) {
@@ -3335,24 +3408,6 @@ pub const RaftApplyStore = struct {
                     defer metadata_table_manager.freeRange(self.alloc, record);
                     if (record.table_id != drop.table_id) return;
                 }
-                var range_prefix_buf: [128]u8 = undefined;
-                const range_prefix = try rangePrefixForGroup(&range_prefix_buf, group_id);
-                var owned_range_count: usize = 0;
-                // Stream the exact-set proof. A metadata group may own many
-                // tables; materializing every range here would turn a bounded
-                // drop request into an unbounded temporary allocation.
-                var cursor = try txn.openCursor();
-                defer cursor.close();
-                var entry = try cursor.seekAtOrAfter(range_prefix);
-                while (entry) |row| : (entry = try cursor.next()) {
-                    if (!std.mem.startsWith(u8, row.key, range_prefix)) break;
-                    const record = try decodeRangeRecord(self.alloc, row.value);
-                    defer metadata_table_manager.freeRange(self.alloc, record);
-                    if (record.table_id != drop.table_id) continue;
-                    if (!expected_groups.contains(record.group_id)) return;
-                    owned_range_count += 1;
-                }
-                if (owned_range_count != drop.range_group_ids.len) return;
                 for (drop.range_group_ids) |range_group_id| {
                     var range_key_buf: [160]u8 = undefined;
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
@@ -3383,6 +3438,32 @@ pub const RaftApplyStore = struct {
                 });
             },
         }
+    }
+
+    fn extensionOwnsTableTxn(
+        self: *RaftApplyStore,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+        table_name: []const u8,
+    ) !bool {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try extensionMemberPrefixForGroup(&prefix_buf, group_id);
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.seekAtOrAfter(prefix);
+        while (entry) |row| : (entry = try cursor.next()) {
+            if (!std.mem.startsWith(u8, row.key, prefix)) break;
+            var member = try decodeExtensionMemberRecord(self.alloc, row.value);
+            defer member.deinitOwned(self.alloc);
+            const member_table = if (member.table_name.len != 0)
+                member.table_name
+            else if (member.scope.kind == .table)
+                member.scope.table_name
+            else
+                continue;
+            if (std.mem.eql(u8, member_table, table_name)) return true;
+        }
+        return false;
     }
 
     fn applyReplicationSourceStatusUpsertTxn(

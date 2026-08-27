@@ -61,6 +61,9 @@ pub fn create(
     table_name: []const u8,
     req: tables_api.CreateTableRequest,
 ) !void {
+    svc.lockCatalogMutation();
+    var catalog_locked = true;
+    defer if (catalog_locked) svc.unlockCatalogMutation();
     try request.ensureActive();
     try svc.ensureTableTopologyProtocolReadyWithContext(request);
     const table = tables_api.deriveTableRecord(table_name, req);
@@ -98,6 +101,8 @@ pub fn create(
         if (!metadata_table_manager.rangeRecordsEqual(projected_range.*, expected))
             return error.TableAlreadyExists;
     }
+    svc.unlockCatalogMutation();
+    catalog_locked = false;
     svc.runControlRoundOnly() catch |err| return afterAdmission(err);
 }
 
@@ -107,6 +112,9 @@ pub fn drop(
     request: operation.RequestContext,
     table_name: []const u8,
 ) !void {
+    svc.lockCatalogMutation();
+    var catalog_locked = true;
+    defer if (catalog_locked) svc.unlockCatalogMutation();
     try request.ensureActive();
     try svc.ensureTableTopologyProtocolReadyWithContext(request);
     try svc.ensureLinearizableReadWithContext(request);
@@ -151,5 +159,7 @@ pub fn drop(
     defer svc.freeAdminSnapshot(&projected);
     if (tables_api.findTableByName(&projected, table_name) != null)
         return error.TableTransitionActive;
+    svc.unlockCatalogMutation();
+    catalog_locked = false;
     svc.runControlRoundOnly() catch |err| return afterAdmission(err);
 }

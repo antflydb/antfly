@@ -1503,6 +1503,14 @@ pub const MetadataHttpServer = struct {
                 http_common.metadata_mutation_not_admitted_header,
                 http_common.metadata_mutation_not_admitted_value,
             );
+            // The handler changes this header to `unknown` immediately before
+            // execution. Restore the stronger outcome when Raft proves that
+            // it never assigned a log index so the forwarding client may
+            // safely rediscover the leader and retry.
+            try ctx.setHeader(
+                routes.Routes.raft_mutation_outcome_header,
+                routes.Routes.raft_mutation_outcome_not_proposed,
+            );
         }
         if (err == error.MetadataMutationOutcomeUnknown) {
             // Authority moved after the mutation may have been admitted. Emit

@@ -21,12 +21,35 @@ const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const platform_time = @import("antfly_platform").time;
 
+fn lockCatalogMutation(service: anytype) bool {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (!@hasDecl(ServiceDeclType, "lockCatalogMutation")) return false;
+    service.lockCatalogMutation();
+    return true;
+}
+
+fn unlockCatalogMutation(service: anytype, locked: bool) void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "unlockCatalogMutation") and locked)
+        service.unlockCatalogMutation();
+}
+
 pub fn installOnService(
     service: anytype,
     alloc: std.mem.Allocator,
     extension_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
+    const catalog_locked = lockCatalogMutation(service);
+    defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
 
@@ -65,6 +88,8 @@ pub fn updateOnService(
     extension_name: []const u8,
     request: extension_domain.UpdateExtensionRequest,
 ) !extension_domain.InstalledExtension {
+    const catalog_locked = lockCatalogMutation(service);
+    defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
 
@@ -112,6 +137,8 @@ pub fn dropOnService(
     extension_name: []const u8,
     request: extension_domain.DropExtensionRequest,
 ) !void {
+    const catalog_locked = lockCatalogMutation(service);
+    defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
 
@@ -148,6 +175,8 @@ pub fn dropOnService(
 }
 
 pub fn enableOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
+    const catalog_locked = lockCatalogMutation(service);
+    defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
@@ -163,6 +192,8 @@ pub fn enableOnService(service: anytype, alloc: std.mem.Allocator, extension_nam
 }
 
 pub fn disableOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
+    const catalog_locked = lockCatalogMutation(service);
+    defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
@@ -183,6 +214,8 @@ pub fn configureOnService(
     extension_name: []const u8,
     request: extension_domain.ConfigureExtensionRequest,
 ) !extension_domain.InstalledExtension {
+    const catalog_locked = lockCatalogMutation(service);
+    defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
@@ -204,6 +237,8 @@ pub fn restoreOnService(
     dependencies: []const extension_domain.ExtensionDependency,
 ) !void {
     if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
+    const catalog_locked = lockCatalogMutation(service);
+    defer unlockCatalogMutation(service, catalog_locked);
     try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
         .upsert_installed_extensions = installed,
         .upsert_extension_dependencies = dependencies,

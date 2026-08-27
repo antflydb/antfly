@@ -71,8 +71,10 @@ pub const MetadataControlLoop = struct {
     /// callers should go through metadata service `runRound()` or a
     /// service/simulation helper that first checks reconcile lease ownership.
     pub fn reconcileOnce(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
         try self.state.syncProjected(service);
-        return try self.reconcilePrepared(service);
+        return try self.reconcilePreparedLocked(service);
     }
 
     /// Reconcile using the caller's prepared projected/desired state.
@@ -81,6 +83,12 @@ pub const MetadataControlLoop = struct {
     /// avoid racing a second projected refresh between seeding and plan
     /// computation.
     pub fn reconcilePrepared(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
+        return try self.reconcilePreparedLocked(service);
+    }
+
+    fn reconcilePreparedLocked(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
         self.installMedianKeyLookup(service);
         var current = try self.state.captureCurrent(service);
         defer current.deinit(self.alloc);
@@ -145,6 +153,25 @@ pub const MetadataControlLoop = struct {
         }
     }
 };
+
+fn lockCatalogMutation(service: anytype) bool {
+    const Service = switch (@typeInfo(@TypeOf(service))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(service),
+    };
+    if (!@hasDecl(Service, "lockCatalogMutation")) return false;
+    service.lockCatalogMutation();
+    return true;
+}
+
+fn unlockCatalogMutation(service: anytype, locked: bool) void {
+    const Service = switch (@typeInfo(@TypeOf(service))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(service),
+    };
+    if (@hasDecl(Service, "unlockCatalogMutation") and locked)
+        service.unlockCatalogMutation();
+}
 
 test "metadata control loop proposes desired transitions through the service seam" {
     const FakeService = struct {

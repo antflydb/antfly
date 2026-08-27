@@ -3790,6 +3790,7 @@ pub const MetadataHttpService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     runtime_mutex: std.Io.Mutex = .init,
+    catalog_mutation_mutex: std.Io.Mutex = .init,
     placement_reconcile_mutex: std.Io.Mutex = .init,
     transition_mutex: std.Io.Mutex = .init,
     transition_metrics_mutex: std.Io.Mutex = .init,
@@ -5011,12 +5012,25 @@ pub const MetadataHttpService = struct {
         request: api_operation.RequestContext,
     ) !void {
         try request.ensureActive();
-        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
-            return error.TableTopologyProtocolUpgradeRequired;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
-            raft_status.soft.leader_id.? != local_node_id)
-            return error.NotLeader;
+        // Status.conf_state borrows the Raft group's membership arrays. Copy
+        // the required IDs while the runtime lock protects those arrays, then
+        // release it before any network I/O.
+        const required_node_ids = locked: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+                return error.TableTopologyProtocolUpgradeRequired;
+            if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
+                raft_status.soft.leader_id.? != local_node_id)
+                return error.NotLeader;
+            break :locked try collectReallocationBarrierNodeIds(
+                self.alloc,
+                raft_status.conf_state,
+                self.reallocation_protocol_peers,
+            );
+        };
+        defer self.alloc.free(required_node_ids);
         const incarnation = (try self.metadataIncarnation()) orelse
             return error.TableTopologyProtocolUpgradeRequired;
 
@@ -5029,12 +5043,6 @@ pub const MetadataHttpService = struct {
         const probe_budget = metadata_http_client.RequestBudget{
             .deadline_ns = @min(now_ns +| reallocation_protocol_probe_timeout_ns, request_deadline),
         };
-        const required_node_ids = try collectReallocationBarrierNodeIds(
-            self.alloc,
-            raft_status.conf_state,
-            self.reallocation_protocol_peers,
-        );
-        defer self.alloc.free(required_node_ids);
         for (required_node_ids) |node_id| {
             try request.ensureActive();
             if (node_id == local_node_id) continue;
@@ -6372,6 +6380,19 @@ pub const MetadataHttpService = struct {
 
     fn unlockRuntime(self: *MetadataHttpService) void {
         self.runtime_mutex.unlock(std.Options.debug_io);
+    }
+
+    /// Serializes snapshot-derived catalog commands through Raft admission.
+    /// Table topology waits for its accepted entry while holding this lock;
+    /// extension lifecycle commands are admitted before releasing it. This
+    /// makes their snapshots and log order agree without holding the Raft
+    /// runtime lock across disk or network waits.
+    pub fn lockCatalogMutation(self: *MetadataHttpService) void {
+        self.catalog_mutation_mutex.lockUncancelable(std.Options.debug_io);
+    }
+
+    pub fn unlockCatalogMutation(self: *MetadataHttpService) void {
+        self.catalog_mutation_mutex.unlock(std.Options.debug_io);
     }
 
     fn raftDiagnosticsSnapshotLocked(self: *MetadataHttpService) MetadataRaftDiagnosticsSnapshot {

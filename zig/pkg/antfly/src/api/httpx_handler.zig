@@ -4066,6 +4066,13 @@ pub const AntflyApiHandler = struct {
             _ = ctx.status(400);
             return ctx.text("invalid create table request");
         };
+        // Reject oversized requests before JSON allocation, credential
+        // sealing, or remote embedding-model probes. The same transport cap
+        // is enforced by metadata forwarding and Raft admission.
+        if (body_data.len > tables_api.max_table_create_transport_bytes) {
+            _ = ctx.status(413);
+            return ctx.text("create table request too large");
+        }
         var create_req = table_contract.parseCreateTableRequest(alloc, body_data) catch |err| {
             if (table_contract.classifyCreateTableRequestError(err) == .internal_failure) {
                 std.log.err("create table request parsing failed: {} body_len={d}", .{ err, body_data.len });
@@ -4162,6 +4169,28 @@ pub const AntflyApiHandler = struct {
                 error.InvalidCreateTableRequest => {
                     _ = ctx.status(400);
                     return ctx.text("invalid table configuration");
+                },
+                error.InvalidTableName, error.CreateTableShardCountOutOfRange => {
+                    _ = ctx.status(400);
+                    return ctx.text("invalid table configuration");
+                },
+                error.CreateTableRequestTooLarge => {
+                    _ = ctx.status(413);
+                    return ctx.text("create table request too large");
+                },
+                error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
+                    _ = ctx.status(409);
+                    return ctx.text("table topology changed; retry with the current table state");
+                },
+                error.TableTopologyProtocolUpgradeRequired => {
+                    try ctx.setHeader("Retry-After", "1");
+                    _ = ctx.status(503);
+                    return ctx.text("metadata cluster upgrade in progress; retry later");
+                },
+                error.MetadataMutationOutcomeUnknown => {
+                    try ctx.setHeader("Retry-After", "1");
+                    _ = ctx.status(503);
+                    return ctx.text("table mutation outcome is unknown; observe table state before retrying");
                 },
                 error.UnsupportedOperation => {
                     _ = ctx.status(405);
@@ -4282,6 +4311,24 @@ pub const AntflyApiHandler = struct {
             error.UnsupportedOperation => {
                 _ = ctx.status(405);
                 return ctx.text("method not allowed");
+            },
+            error.InvalidTableName => {
+                _ = ctx.status(400);
+                return ctx.text("invalid table name");
+            },
+            error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => {
+                _ = ctx.status(409);
+                return ctx.text("table topology changed or is extension-owned");
+            },
+            error.TableTopologyProtocolUpgradeRequired => {
+                try ctx.setHeader("Retry-After", "1");
+                _ = ctx.status(503);
+                return ctx.text("metadata cluster upgrade in progress; retry later");
+            },
+            error.MetadataMutationOutcomeUnknown => {
+                try ctx.setHeader("Retry-After", "1");
+                _ = ctx.status(503);
+                return ctx.text("table mutation outcome is unknown; observe table state before retrying");
             },
             else => {
                 std.log.err("public drop table metadata remove failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
