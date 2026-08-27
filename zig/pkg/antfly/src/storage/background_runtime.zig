@@ -382,37 +382,40 @@ const LsmOwnerCloneRegistry = struct {
 
     fn snapshotAlloc(self: *LsmOwnerCloneRegistry, alloc: Allocator) ![]LsmOwnerCloneMetricSnapshot {
         // Registry labels are immutable and entries are never removed. Capture
-        // their stable slices and counter values under the mutex, then perform
-        // every allocator call after releasing it so scraping cannot stall DB
-        // retirement or another observation on allocator latency.
+        // a prefix boundary under the mutex, then allocate outside it. Labels
+        // admitted after that boundary belong to the next scrape; retrying for
+        // them could turn sustained label admission into quadratic allocation
+        // churn or prevent a scrape from completing.
         lockAtomic(&self.mutex);
-        var entry_count = self.entries.items.len;
+        const entry_count = self.entries.items.len;
         self.mutex.unlock();
-        var result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, entry_count);
-        while (true) {
-            lockAtomic(&self.mutex);
-            if (self.entries.items.len != result.len) {
-                entry_count = self.entries.items.len;
-                self.mutex.unlock();
-                alloc.free(result);
-                result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, entry_count);
-                continue;
-            }
-            for (self.entries.items, result) |entry, *snapshot| {
-                snapshot.* = .{
-                    // Temporarily borrowed. The loop below replaces both
-                    // slices with owned copies before returning.
-                    .table_name = entry.table_name,
-                    .group_id = entry.group_id,
-                    .owner_kind = entry.owner_kind,
-                    .owner_name = entry.owner_name,
-                    .owner_overflow = entry.owner_overflow,
-                    .stats = entry.stats,
-                };
-            }
-            self.mutex.unlock();
-            break;
+        return try self.snapshotPrefixAlloc(alloc, entry_count);
+    }
+
+    fn snapshotPrefixAlloc(
+        self: *LsmOwnerCloneRegistry,
+        alloc: Allocator,
+        entry_count: usize,
+    ) ![]LsmOwnerCloneMetricSnapshot {
+        const result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, entry_count);
+        lockAtomic(&self.mutex);
+        // Entries are append-only for the registry lifetime, so the prefix
+        // selected by snapshotAlloc remains present and its labels remain
+        // stable even if observations append entries during allocation.
+        std.debug.assert(self.entries.items.len >= result.len);
+        for (self.entries.items[0..result.len], result) |entry, *snapshot| {
+            snapshot.* = .{
+                // Temporarily borrowed. The loop below replaces both slices
+                // with owned copies after releasing the registry mutex.
+                .table_name = entry.table_name,
+                .group_id = entry.group_id,
+                .owner_kind = entry.owner_kind,
+                .owner_name = entry.owner_name,
+                .owner_overflow = entry.owner_overflow,
+                .stats = entry.stats,
+            };
         }
+        self.mutex.unlock();
 
         var initialized: usize = 0;
         errdefer {
@@ -1871,6 +1874,106 @@ test "LSM owner snapshot is allocation-failure safe after capture" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{&registry});
+}
+
+test "LSM owner snapshot keeps its prefix boundary during concurrent label growth" {
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+
+    const GrowingAllocator = struct {
+        backing: Allocator,
+        registry: *LsmOwnerCloneRegistry,
+        growth_injected: bool = false,
+        injection_error: ?anyerror = null,
+        snapshot_array_allocations: usize = 0,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = allocate,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            } };
+        }
+
+        fn allocate(
+            context: *anyopaque,
+            len: usize,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (len == @sizeOf(LsmOwnerCloneMetricSnapshot) or
+                len == 2 * @sizeOf(LsmOwnerCloneMetricSnapshot))
+            {
+                self.snapshot_array_allocations += 1;
+            }
+            if (!self.growth_injected) {
+                self.growth_injected = true;
+                self.registry.observe(2, "docs", 17, .primary, "primary", false, .{ .calls = 2 }) catch |err| {
+                    self.injection_error = err;
+                    return null;
+                };
+            }
+            return self.backing.rawAlloc(len, alignment, return_address);
+        }
+
+        fn resize(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawResize(memory, alignment, new_len, return_address);
+        }
+
+        fn remap(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawRemap(memory, alignment, new_len, return_address);
+        }
+
+        fn free(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.backing.rawFree(memory, alignment, return_address);
+        }
+    };
+
+    // The allocator injects a new label after snapshotAlloc releases the
+    // sizing mutex and before it reacquires the mutex to capture counters.
+    var growing = GrowingAllocator{ .backing = std.testing.allocator, .registry = &registry };
+    const alloc = growing.allocator();
+    const prefix = try registry.snapshotAlloc(alloc);
+    defer {
+        for (prefix) |*entry| entry.deinit(alloc);
+        alloc.free(prefix);
+    }
+    try std.testing.expect(growing.growth_injected);
+    try std.testing.expectEqual(@as(?anyerror, null), growing.injection_error);
+    try std.testing.expectEqual(@as(usize, 1), growing.snapshot_array_allocations);
+    try std.testing.expectEqual(@as(usize, 1), prefix.len);
+    try std.testing.expectEqual(LsmOwnerKind.dense_vector, prefix[0].owner_kind);
+    try std.testing.expectEqual(@as(u64, 1), prefix[0].stats.calls);
+
+    const next_snapshot = try registry.snapshotAlloc(std.testing.allocator);
+    defer {
+        for (next_snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(next_snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 2), next_snapshot.len);
 }
 
 test "backend runtime API lane leases expose and release the interface" {
