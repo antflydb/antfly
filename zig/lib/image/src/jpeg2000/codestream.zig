@@ -334,6 +334,36 @@ pub const State = struct {
         return mct.payload;
     }
 
+    /// Part-1 RCT/ICT and the compact pixel-wise custom MCT supported here
+    /// operate on corresponding samples from components 0, 1, and 2. Those
+    /// components therefore need identical precision and signedness, must be
+    /// present on the unsubsampled reference grid, and must use the transform
+    /// kernel selected by COD. Reject incompatible COC overrides at the
+    /// capability boundary instead of allowing reconstruction to omit MCT and
+    /// return plausible but color-corrupted pixels.
+    pub fn hasSupportedMctInputs(self: *const State) bool {
+        const default_style = self.coding_style orelse return false;
+        if (!default_style.multiple_component_transform) return true;
+        if (self.header.components.len < 3) return false;
+
+        const first = self.header.components[0];
+        if (first.xrsiz != 1 or first.yrsiz != 1) return false;
+        for (self.header.components[0..3], 0..) |component, component_index| {
+            if (component.xrsiz != 1 or component.yrsiz != 1 or
+                component.bits_per_component != first.bits_per_component or
+                component.is_signed != first.is_signed)
+            {
+                return false;
+            }
+            const effective_style = if (component_index < self.component_coding_styles.len)
+                self.component_coding_styles[component_index] orelse default_style
+            else
+                default_style;
+            if (effective_style.wavelet_transform != default_style.wavelet_transform) return false;
+        }
+        return true;
+    }
+
     /// Check support for the full (non-bounded) decode path.
     /// Allows arbitrary decomposition levels, wavelet transform 0 or 1,
     /// quantization styles 0/1/2, MCT, and all code block styles.
@@ -351,7 +381,7 @@ pub const State = struct {
         if (coding_style.progression_order > 4) return .unsupported_progression_order;
         // Allow both 5/3 (reversible, transform=1) and 9/7 (irreversible, transform=0)
         if (coding_style.wavelet_transform > 1) return .unsupported_wavelet_transform;
-        if (coding_style.multiple_component_transform and self.header.components.len < 3)
+        if (!self.hasSupportedMctInputs())
             return .unsupported_multi_component_transform;
         if (self.mco != null and self.supportedCustomMctPayload() == null)
             return .unsupported_multi_component_transform;

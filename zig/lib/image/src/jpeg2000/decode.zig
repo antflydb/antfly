@@ -539,6 +539,7 @@ fn componentPlanesU8DecodeSupport(state: *const codestream.State) NativeDecodeSu
     const coding_style = state.coding_style orelse return .missing_coding_style;
     if (coding_style.progression_order > 4) return .unsupported_progression_order;
     if (coding_style.wavelet_transform > 1) return .unsupported_wavelet_transform;
+    if (!state.hasSupportedMctInputs()) return .unsupported_multi_component_transform;
     if (!packet.nativeDecodeSupportsCodeBlockStyle(coding_style.code_block_style)) return .unsupported_code_block_style;
     for (state.component_coding_styles) |component_style| {
         if (component_style) |style| {
@@ -2041,6 +2042,52 @@ test "fullNativeDecodeSupport accepts XRsiz/YRsiz > 1" {
 
     const support = try nativeDecodeSupportBytes(allocator, encoded);
     try std.testing.expectEqual(NativeDecodeSupport.supported, support);
+}
+
+test "fullNativeDecodeSupport rejects subsampled MCT inputs" {
+    const allocator = std.testing.allocator;
+    var pixels: [4 * 4 * 3]u8 = undefined;
+    for (&pixels, 0..) |*sample, index| sample.* = @intCast(index * 5);
+    const params = encode.EncodeParams{
+        .width = 4,
+        .height = 4,
+        .components = 3,
+        .bits_per_component = 8,
+        .decomposition_levels = 0,
+        .num_layers = 1,
+        .progression_order = 0,
+        .wavelet_transform = 1,
+        .multiple_component_transform = true,
+        .code_block_width_exponent = 2,
+        .code_block_height_exponent = 2,
+        .format = .j2k,
+    };
+    const encoded_const = try encode.encodeU8Bytes(allocator, &pixels, &params);
+    defer allocator.free(encoded_const);
+
+    var incompatible_coc = try codestream.parseState(allocator, encoded_const);
+    const original_component_style = incompatible_coc.component_coding_styles[1];
+    defer {
+        incompatible_coc.component_coding_styles[1] = original_component_style;
+        incompatible_coc.deinit(allocator);
+    }
+    var mismatched_style = incompatible_coc.coding_style.?;
+    mismatched_style.wavelet_transform = 0;
+    incompatible_coc.component_coding_styles[1] = mismatched_style;
+    try std.testing.expect(!incompatible_coc.hasSupportedMctInputs());
+
+    const encoded = try allocator.dupe(u8, encoded_const);
+    defer allocator.free(encoded);
+
+    // RCT/ICT is defined over corresponding, unsubsampled samples. Declaring
+    // even identical 2:2 factors for all participating components must fail at
+    // the support gate; reconstruction must never silently skip inverse MCT.
+    try rewriteSizForSubsampling(encoded, 8, 8, 8, 8, 2, 2);
+    try std.testing.expectEqual(
+        NativeDecodeSupport.unsupported_multi_component_transform,
+        try nativeDecodeSupportBytes(allocator, encoded),
+    );
+    try std.testing.expectError(error.UnsupportedNativeDecode, decodeU8Bytes(allocator, encoded));
 }
 
 test "fullNativeDecodeSupport accepts signed samples" {

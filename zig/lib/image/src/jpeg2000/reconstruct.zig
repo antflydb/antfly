@@ -296,9 +296,10 @@ test "small-scale custom MCT cannot overflow irreversible reconstruction" {
     );
 }
 
-fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes: [][]i32) void {
+fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes: [][]i32) !void {
     const coding_style = state.coding_style orelse return;
     if (!coding_style.multiple_component_transform or planes.len < 3) return;
+    if (!state.hasSupportedMctInputs()) return error.UnsupportedMultiComponentTransform;
     const first_dims = tile.componentDimensions(
         state.header.width,
         state.header.height,
@@ -307,7 +308,8 @@ fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes
     );
     for (state.header.components[1..3]) |comp| {
         const dims = tile.componentDimensions(state.header.width, state.header.height, comp.xrsiz, comp.yrsiz);
-        if (dims.width != first_dims.width or dims.height != first_dims.height) return;
+        if (dims.width != first_dims.width or dims.height != first_dims.height)
+            return error.UnsupportedMultiComponentTransform;
     }
     color_transform.inverseRct(planes[0], planes[1], planes[2]);
 }
@@ -340,7 +342,7 @@ pub fn reconstructTier1ComponentPlanesU8AtResolution(
         allocator.free(raw_planes);
     }
 
-    if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
 
     return componentPlanesU8FromRawAtResolution(allocator, state, raw_planes, discard_levels);
 }
@@ -426,7 +428,7 @@ pub fn reconstructTier1ComponentPlanesU16AtResolution(
         allocator.free(raw_planes);
     }
 
-    if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
 
     return componentPlanesU16FromRawAtResolution(allocator, state, raw_planes, discard_levels);
 }
@@ -952,21 +954,23 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
     }
 
     if (default_coding_style.multiple_component_transform and component_count >= 3) {
+        if (!state.hasSupportedMctInputs()) return error.UnsupportedMultiComponentTransform;
         if (irreversible[0] and irreversible[1] and irreversible[2]) {
             const all_same = comp_widths[0] == comp_widths[1] and comp_widths[1] == comp_widths[2] and
                 comp_heights[0] == comp_heights[1] and comp_heights[1] == comp_heights[2];
-            if (all_same) {
-                if (try buildCustomMctMatrixFromState(allocator, state, 3)) |matrix| {
-                    defer allocator.free(matrix.forward);
-                    defer allocator.free(matrix.inverse);
-                    defer allocator.free(matrix.offsets);
-                    try color_transform.applyCustomMctInverse(matrix, f32_planes[0..3]);
-                } else {
-                    color_transform.inverseIct(f32_planes[0], f32_planes[1], f32_planes[2]);
-                }
+            if (!all_same) return error.UnsupportedMultiComponentTransform;
+            if (try buildCustomMctMatrixFromState(allocator, state, 3)) |matrix| {
+                defer allocator.free(matrix.forward);
+                defer allocator.free(matrix.inverse);
+                defer allocator.free(matrix.offsets);
+                try color_transform.applyCustomMctInverse(matrix, f32_planes[0..3]);
+            } else {
+                color_transform.inverseIct(f32_planes[0], f32_planes[1], f32_planes[2]);
             }
         } else if (!irreversible[0] and !irreversible[1] and !irreversible[2]) {
-            applyReversibleMctOnEqualComponentGrid(state, planes);
+            try applyReversibleMctOnEqualComponentGrid(state, planes);
+        } else {
+            return error.UnsupportedMultiComponentTransform;
         }
     }
 
@@ -1539,27 +1543,27 @@ pub const StreamingPlaneAssembler = struct {
         }
 
         if (default_coding_style.multiple_component_transform and self.plane_storage.len >= 3) {
+            if (!self.state.hasSupportedMctInputs()) return error.UnsupportedMultiComponentTransform;
             const all_same = self.comp_widths[0] == self.comp_widths[1] and
                 self.comp_widths[1] == self.comp_widths[2] and
                 self.comp_heights[0] == self.comp_heights[1] and
                 self.comp_heights[1] == self.comp_heights[2];
-            if (all_same) {
-                if (try buildCustomMctMatrixFromState(
-                    self.allocator,
-                    self.state,
-                    3,
-                )) |matrix| {
-                    defer self.allocator.free(matrix.forward);
-                    defer self.allocator.free(matrix.inverse);
-                    defer self.allocator.free(matrix.offsets);
-                    try color_transform.applyCustomMctInverse(matrix, self.plane_storage[0..3]);
-                } else {
-                    color_transform.inverseIct(
-                        self.plane_storage[0],
-                        self.plane_storage[1],
-                        self.plane_storage[2],
-                    );
-                }
+            if (!all_same) return error.UnsupportedMultiComponentTransform;
+            if (try buildCustomMctMatrixFromState(
+                self.allocator,
+                self.state,
+                3,
+            )) |matrix| {
+                defer self.allocator.free(matrix.forward);
+                defer self.allocator.free(matrix.inverse);
+                defer self.allocator.free(matrix.offsets);
+                try color_transform.applyCustomMctInverse(matrix, self.plane_storage[0..3]);
+            } else {
+                color_transform.inverseIct(
+                    self.plane_storage[0],
+                    self.plane_storage[1],
+                    self.plane_storage[2],
+                );
             }
         }
 
@@ -1977,10 +1981,10 @@ pub fn reconstructTier1ExecutionReportWithOptions(
         allocator.free(raw_planes);
     }
 
-    // RCT inverse operates on component-grid samples. When all components have
-    // matching subsampled dimensions, run it before upsampling to the reference
-    // grid instead of skipping color transform for subsampled streams.
-    if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    // RCT inverse operates on corresponding unsubsampled component samples.
+    // The capability gate rejects incompatible grids; retain the same check in
+    // reconstruction so internal callers cannot accidentally skip the transform.
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
 
     // Upsample any subsampled components to the full image grid using bilinear
     // filtering. The common 1:1 case leaves planes untouched (pointers reused).
