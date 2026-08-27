@@ -8313,6 +8313,11 @@ fn optionalBoolOrDefault(value: ?std.json.Value, default_value: bool) !bool {
     };
 }
 
+fn nonNullObjectMember(object: std.json.ObjectMap, key: []const u8) ?std.json.Value {
+    const value = object.get(key) orelse return null;
+    return if (value == .null) null else value;
+}
+
 fn parseDirectDslBoolTextQuery(alloc: std.mem.Allocator, query: std.json.Value) anyerror!db_mod.types.TextQuery {
     if (query != .object) return error.UnsupportedQueryRequest;
 
@@ -8323,10 +8328,10 @@ fn parseDirectDslBoolTextQuery(alloc: std.mem.Allocator, query: std.json.Value) 
     var must_not = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
     errdefer deinitTextQueryArrayList(alloc, &must_not);
 
-    if (query.object.get("filter")) |filter| {
+    if (nonNullObjectMember(query.object, "filter")) |filter| {
         try appendDirectDslTextQueryList(alloc, &must, filter);
     }
-    if (query.object.get("must")) |must_value| {
+    if (nonNullObjectMember(query.object, "must")) |must_value| {
         if (must_value == .object and must_value.object.get("conjuncts") != null) {
             try appendDirectDslTextQueryList(
                 alloc,
@@ -8339,11 +8344,11 @@ fn parseDirectDslBoolTextQuery(alloc: std.mem.Allocator, query: std.json.Value) 
     }
     var min_should: u32 = 0;
     var min_should_explicit = false;
-    if (query.object.get("should")) |should_value| {
+    if (nonNullObjectMember(query.object, "should")) |should_value| {
         if (should_value == .object and should_value.object.get("disjuncts") != null) {
             const disjuncts = should_value.object.get("disjuncts").?;
             try appendDirectDslTextQueryList(alloc, &should, disjuncts);
-            min_should_explicit = should_value.object.get("min") != null;
+            min_should_explicit = nonNullObjectMember(should_value.object, "min") != null;
             min_should = try parsePublicMinimumShouldMatchJson(
                 should_value.object.get("min"),
                 should.items.len,
@@ -8352,7 +8357,7 @@ fn parseDirectDslBoolTextQuery(alloc: std.mem.Allocator, query: std.json.Value) 
             try appendDirectDslTextQueryList(alloc, &should, should_value);
         }
     }
-    if (query.object.get("must_not")) |must_not_value| {
+    if (nonNullObjectMember(query.object, "must_not")) |must_not_value| {
         if (must_not_value == .object and
             must_not_value.object.get("disjuncts") != null)
         {
@@ -8375,8 +8380,8 @@ fn parseDirectDslBoolTextQuery(alloc: std.mem.Allocator, query: std.json.Value) 
     errdefer freeTextQueryList(alloc, owned_should);
     const owned_must_not = try must_not.toOwnedSlice(alloc);
     errdefer freeTextQueryList(alloc, owned_must_not);
-    if (query.object.get("minimum_should_match") orelse
-        query.object.get("min_should")) |minimum|
+    if (nonNullObjectMember(query.object, "minimum_should_match") orelse
+        nonNullObjectMember(query.object, "min_should")) |minimum|
     {
         min_should_explicit = true;
         min_should = try parsePublicMinimumShouldMatchJson(
@@ -8466,6 +8471,25 @@ fn parseGeneratedBleveTextQuery(alloc: std.mem.Allocator, query: std.json.Value)
 
 fn normalizeGeneratedBleveQuery(alloc: std.mem.Allocator, query: std.json.Value) !std.json.Value {
     if (query != .object) return query;
+
+    // Stored-document filters address values with RFC 6901 `path`, while the
+    // shared generated text-query schema calls the same selector `field`.
+    // Normalize that alias once at the generated-parser boundary. In
+    // particular, flat fuzzy queries intentionally bypass the direct parser
+    // so fuzziness cannot be mistaken for an exact term.
+    if (query.object.get("path")) |path| {
+        if (query.object.get("field") != null) return error.InvalidQueryRequest;
+        var obj = std.json.ObjectMap.empty;
+        var it = query.object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "path")) {
+                try obj.put(alloc, entry.key_ptr.*, entry.value_ptr.*);
+            }
+        }
+        try obj.put(alloc, "field", path);
+        return .{ .object = obj };
+    }
+
     if (query.object.count() != 1) return query;
 
     if (query.object.get("match")) |wrapped| {
@@ -10117,6 +10141,62 @@ test "canonical graph date filters are operation keyed and require a bound" {
     ));
 }
 
+test "canonical graph document filter variants cross the public storage boundary" {
+    const alloc = std.testing.allocator;
+    const filters = [_][]const u8{
+        "{\"term\":\"active\",\"path\":\"/status\"}",
+        "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":1}",
+        "{\"prefix\":\"doc:\",\"path\":\"/id\"}",
+        "{\"regexp\":\"go.*\",\"path\":\"/tier\"}",
+        "{\"wildcard\":\"go*\",\"path\":\"/tier\"}",
+        "{\"numeric_range\":{\"path\":\"/score\",\"min\":0}}",
+        "{\"term_range\":{\"path\":\"/status\",\"max\":\"z\"}}",
+        "{\"date_range\":{\"path\":\"/created_at\",\"start\":\"2026-01-01T00:00:00Z\"}}",
+        "{\"match_all\":{}}",
+        "{\"match_none\":{}}",
+        "{\"ids\":[\"doc:a\"]}",
+        "{\"bool_field\":{\"path\":\"/published\",\"value\":true}}",
+        "{\"must\":{\"conjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}]}}",
+        "{\"should\":{\"disjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}],\"min\":1}}",
+        "{\"must_not\":{\"disjuncts\":[{\"term\":\"deleted\",\"path\":\"/status\"}]}}",
+        "{\"filter\":{\"term\":\"active\",\"path\":\"/status\"}}",
+        "{\"conjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}]}",
+        "{\"disjuncts\":[{\"term\":\"active\",\"path\":\"/status\"}],\"min\":1}",
+    };
+
+    for (filters, 0..) |filter, filter_index| {
+        const request = try std.mem.concat(alloc, u8, &.{
+            "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"filter\":",
+            filter,
+            "}}}}",
+        });
+        defer alloc.free(request);
+        var owned = parseQueryRequest(alloc, null, "docs", request) catch |err| {
+            std.debug.print("graph document filter {d} failed admission: {s}\n", .{ filter_index, filter });
+            return err;
+        };
+        defer owned.deinit(alloc);
+        const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json orelse
+            return error.TestUnexpectedResult;
+        try std.testing.expect(normalized.len > 0);
+    }
+}
+
+test "canonical graph boolean field filter has one unambiguous root" {
+    const alloc = std.testing.allocator;
+    var owned = try parseQueryRequest(alloc, null, "docs",
+        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"bool_field":{"path":"/published","value":true}}}}}}
+    );
+    defer owned.deinit(alloc);
+
+    const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json.?;
+    var parsed = try ant_json.parseFromSlice(ant_json.Value, alloc, normalized, .{});
+    defer parsed.deinit();
+    const bool_field = parsed.value.object.get("bool_field") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/published", bool_field.object.get("path").?.string);
+    try std.testing.expect(bool_field.object.get("value").?.bool);
+}
+
 test "canonical graph path endpoints reject empty identities before allocation" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
@@ -10307,8 +10387,13 @@ fn validGraphDocumentJsonPointer(path: []const u8) bool {
 
 fn validateCanonicalGraphDateRange(value: std.json.Value) !void {
     if (value != .object) return error.InvalidQueryRequest;
-    const start = value.object.get("start");
-    const end = value.object.get("end");
+    const raw_start = value.object.get("start");
+    const raw_end = value.object.get("end");
+    // Generated optional properties are serialized as JSON null. Treat null
+    // exactly like omission so a one-sided range remains valid across the
+    // generated-model boundary while a genuinely boundless range fails.
+    const start = if (raw_start != null and raw_start.? != .null) raw_start else null;
+    const end = if (raw_end != null and raw_end.? != .null) raw_end else null;
     if (start == null and end == null) return error.InvalidQueryRequest;
     if (start) |bound| {
         if (bound != .string or (try parseRfc3339ToNs(bound.string)) == null)

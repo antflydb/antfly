@@ -4641,10 +4641,14 @@ pub const GraphDistinctBudgetExceededError = struct {
     max_distinct_state_bytes: i64,
 };
 
-pub const GraphDocumentBoolFieldFilter = struct {
-    bool: bool,
+pub const GraphDocumentBoolFieldBody = struct {
     /// RFC 6901 JSON Pointer to the stored-document value.
     path: []const u8,
+    value: bool,
+};
+
+pub const GraphDocumentBoolFieldFilter = struct {
+    bool_field: GraphDocumentBoolFieldBody,
 };
 
 /// At least one of start or end is required and enforced by every Antfly execution boundary. Bounds are RFC 3339 instants in Antfly's unsigned Unix-nanosecond domain, from 1970-01-01T00:00:00Z through 2554-07-21T23:34:33.709551615Z inclusive.
@@ -4665,12 +4669,12 @@ pub const GraphDocumentDateRangeFilter = struct {
 pub const GraphDocumentFilter = union(enum) {
     graph_document_filter_boolean: *GraphDocumentFilterBoolean,
     graph_document_fuzzy_filter: *GraphDocumentFuzzyFilter,
-    graph_document_bool_field_filter: *GraphDocumentBoolFieldFilter,
     graph_document_filter_disjunction: *GraphDocumentFilterDisjunction,
     graph_document_prefix_filter: *GraphDocumentPrefixFilter,
     graph_document_regexp_filter: *GraphDocumentRegexpFilter,
     graph_document_term_filter: *GraphDocumentTermFilter,
     graph_document_wildcard_filter: *GraphDocumentWildcardFilter,
+    graph_document_bool_field_filter: *GraphDocumentBoolFieldFilter,
     graph_document_date_range_filter: *GraphDocumentDateRangeFilter,
     graph_document_filter_conjunction: *GraphDocumentFilterConjunction,
     graph_document_ids_filter: *GraphDocumentIdsFilter,
@@ -4720,12 +4724,6 @@ pub const GraphDocumentFilter = union(enum) {
             if (try parseStructuralVariant(GraphDocumentFuzzyFilter, allocator, source, options)) |parsed| return .{ .graph_document_fuzzy_filter = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "bool",
-            "path",
-        })) {
-            if (try parseStructuralVariant(GraphDocumentBoolFieldFilter, allocator, source, options)) |parsed| return .{ .graph_document_bool_field_filter = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
             "disjuncts",
             "min",
         })) {
@@ -4754,6 +4752,11 @@ pub const GraphDocumentFilter = union(enum) {
             "path",
         })) {
             if (try parseStructuralVariant(GraphDocumentWildcardFilter, allocator, source, options)) |parsed| return .{ .graph_document_wildcard_filter = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "bool_field",
+        })) {
+            if (try parseStructuralVariant(GraphDocumentBoolFieldFilter, allocator, source, options)) |parsed| return .{ .graph_document_bool_field_filter = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "date_range",
@@ -4797,12 +4800,12 @@ pub const GraphDocumentFilter = union(enum) {
         switch (self) {
             .graph_document_filter_boolean => |v| try jw.write(v.*),
             .graph_document_fuzzy_filter => |v| try jw.write(v.*),
-            .graph_document_bool_field_filter => |v| try jw.write(v.*),
             .graph_document_filter_disjunction => |v| try jw.write(v.*),
             .graph_document_prefix_filter => |v| try jw.write(v.*),
             .graph_document_regexp_filter => |v| try jw.write(v.*),
             .graph_document_term_filter => |v| try jw.write(v.*),
             .graph_document_wildcard_filter => |v| try jw.write(v.*),
+            .graph_document_bool_field_filter => |v| try jw.write(v.*),
             .graph_document_date_range_filter => |v| try jw.write(v.*),
             .graph_document_filter_conjunction => |v| try jw.write(v.*),
             .graph_document_ids_filter => |v| try jw.write(v.*),

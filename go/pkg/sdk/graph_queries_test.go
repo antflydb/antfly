@@ -343,6 +343,31 @@ func TestGraphDocumentFilterUsesDiscriminatedRangeWireShape(t *testing.T) {
 	}
 }
 
+func TestGraphDocumentFilterUsesUnambiguousBoolFieldWireShape(t *testing.T) {
+	filter, err := NewGraphDocumentFilter(querydsl.BoolFieldQuery{
+		Field: "published",
+		Bool:  true,
+	}.ToQuery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(filter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value map[string]any
+	if err := json.Unmarshal(encoded, &value); err != nil {
+		t.Fatal(err)
+	}
+	body, ok := value["bool_field"].(map[string]any)
+	if !ok || body["path"] != "/published" || body["value"] != true {
+		t.Fatalf("unexpected graph bool field filter: %#v", value)
+	}
+	if _, found := value["bool"]; found {
+		t.Fatalf("graph bool field filter collides with the compound bool root: %#v", value)
+	}
+}
+
 func TestGraphDocumentFilterUsesDiscriminatedDateRangeWireShape(t *testing.T) {
 	start := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	filter, err := NewGraphDocumentFilter(querydsl.DateRangeStringQuery{

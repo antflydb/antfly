@@ -474,22 +474,6 @@ fields still use typed field values and top-N collection. Changing `index_sort`
 is a layout change; existing generations need backfill, compaction, or reindex
 before the accelerated path can be considered fully covered.
 
-## Graph Search
-
-Graph indexes materialize relationships between document ids. Graph queries can
-run traversals, pathfinding, or pattern-style queries, and node filters use the
-same query primitives as document filters.
-
-Graph search composes with document retrieval in two directions:
-
-- A document query can choose start or target nodes, then a graph traversal
-  expands through relationships.
-- A graph traversal can produce related document ids, then the response can
-  fetch documents or merge graph results with search results.
-
-This keeps relationship search in the same document engine instead of requiring
-a separate graph database for common retrieval workflows.
-
 ## Rejections And Diagnostics
 
 Exact public query behavior should fail closed. A sorted request can return 422

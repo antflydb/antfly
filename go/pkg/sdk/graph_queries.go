@@ -643,7 +643,9 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 			return GraphDocumentFilter{}, err
 		}
 		var out GraphDocumentFilter
-		err = out.FromGraphDocumentBoolFieldFilter(oapi.GraphDocumentBoolFieldFilter{Bool: value.Bool, Path: path})
+		err = out.FromGraphDocumentBoolFieldFilter(oapi.GraphDocumentBoolFieldFilter{
+			BoolField: oapi.GraphDocumentBoolFieldBody{Path: path, Value: value.Bool},
+		})
 		return out, err
 	case graphQueryMemberPresent(members, "match_all"):
 		if err := requireGraphQueryMembers(members, "match_all"); err != nil {
@@ -1082,12 +1084,12 @@ func validateGraphDocumentFilter(filter GraphDocumentFilter, depth int, visited 
 			return fmt.Errorf("antfly: graph ids must contain between 1 and 10000 values")
 		}
 		return validateNonEmptyUnique("graph id", value.Ids)
-	case present("bool"):
+	case present("bool_field"):
 		var value oapi.GraphDocumentBoolFieldFilter
 		if err := filter.DecodeStrictInto(&value); err != nil {
 			return err
 		}
-		return validatePath(value.Path)
+		return validatePath(value.BoolField.Path)
 	case present("conjuncts"):
 		var value GraphDocumentFilterConjunction
 		if err := filter.DecodeStrictInto(&value); err != nil {

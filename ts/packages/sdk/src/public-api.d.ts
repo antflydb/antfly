@@ -12019,10 +12019,13 @@ export interface components {
         GraphDocumentIdsFilter: {
             ids: string[];
         };
-        GraphDocumentBoolFieldFilter: {
-            bool: boolean;
+        GraphDocumentBoolFieldBody: {
             /** @description RFC 6901 JSON Pointer to the stored-document value. */
             path: string;
+            value: boolean;
+        };
+        GraphDocumentBoolFieldFilter: {
+            bool_field: components["schemas"]["GraphDocumentBoolFieldBody"];
         };
         GraphDocumentFilterConjunction: {
             conjuncts: components["schemas"]["GraphDocumentFilter"][];

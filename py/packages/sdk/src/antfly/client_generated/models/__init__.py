@@ -338,6 +338,7 @@ from .graph_bounded_traversal_config_law import GraphBoundedTraversalConfigLaw
 from .graph_distinct_budget_exceeded_error import GraphDistinctBudgetExceededError
 from .graph_distinct_budget_exceeded_error_error import GraphDistinctBudgetExceededErrorError
 from .graph_distinct_budget_exceeded_error_status import GraphDistinctBudgetExceededErrorStatus
+from .graph_document_bool_field_body import GraphDocumentBoolFieldBody
 from .graph_document_bool_field_filter import GraphDocumentBoolFieldFilter
 from .graph_document_date_range_body import GraphDocumentDateRangeBody
 from .graph_document_date_range_filter import GraphDocumentDateRangeFilter
@@ -1269,6 +1270,7 @@ __all__ = (
     "GraphDistinctBudgetExceededError",
     "GraphDistinctBudgetExceededErrorError",
     "GraphDistinctBudgetExceededErrorStatus",
+    "GraphDocumentBoolFieldBody",
     "GraphDocumentBoolFieldFilter",
     "GraphDocumentDateRangeBody",
     "GraphDocumentDateRangeFilter",

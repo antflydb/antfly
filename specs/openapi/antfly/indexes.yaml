@@ -2924,17 +2924,23 @@ components:
           maxItems: 10000
           uniqueItems: true
           items: { type: string }
-    GraphDocumentBoolFieldFilter:
+    GraphDocumentBoolFieldBody:
       type: object
       additionalProperties: false
-      required: [bool, path]
+      required: [path, value]
       properties:
-        bool: { type: boolean }
         path:
           type: string
           minLength: 1
           pattern: '^/'
           description: RFC 6901 JSON Pointer to the stored-document value.
+        value: { type: boolean }
+    GraphDocumentBoolFieldFilter:
+      type: object
+      additionalProperties: false
+      required: [bool_field]
+      properties:
+        bool_field: { $ref: '#/components/schemas/GraphDocumentBoolFieldBody' }
     GraphDocumentFilterBoolean:
       type: object
       additionalProperties: false

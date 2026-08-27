@@ -3901,6 +3901,8 @@ pub fn build(b: *std.Build) void {
         "api query contract preflight summarizes query lanes and result refs",
         "parse supported graph queries accepts pattern requests",
         "graph node filters reject analyzer-backed text clauses",
+        "canonical graph document filter variants cross the public storage boundary",
+        "canonical graph boolean field filter has one unambiguous root",
         "raw graph admission rejects recursive edge shapes above the contract budget",
         "legacy graph result refs preserve their retrieval lane",
         "parse supported graph queries accepts branches predicates optional groups and counts",
