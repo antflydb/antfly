@@ -5178,6 +5178,35 @@ const PublicDocumentArtifactBody = struct {
     len: u32,
 };
 
+const PublicDocumentBodyPrefetch = struct {
+    document_index: usize,
+    locator: PublicDocumentArtifactBody,
+
+    fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+        if (lhs.locator.artifact_index != rhs.locator.artifact_index)
+            return lhs.locator.artifact_index < rhs.locator.artifact_index;
+        if (lhs.locator.offset != rhs.locator.offset)
+            return lhs.locator.offset < rhs.locator.offset;
+        return lhs.document_index < rhs.document_index;
+    }
+};
+
+const PublicDocumentRefsAllocation = struct {
+    items: []PublicDocumentRef,
+    retained_bytes: usize,
+};
+
+const BudgetedMutationOverlay = struct {
+    items: []query_materializer.Mutation,
+    lease: graph_work_budget_mod.RetainedLease,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        freeMaterializerMutations(alloc, self.items);
+        self.lease.deinit();
+        self.* = undefined;
+    }
+};
+
 const PublicDocumentBody = union(enum) {
     artifact: PublicDocumentArtifactBody,
     owned: []u8,
@@ -5321,32 +5350,40 @@ const PublicGraphRequestCache = struct {
         }
     }
 
-    fn prefetchDocumentBodies(self: *PublicGraphRequestCache, docs: []const PublicDocumentRef) !void {
+    fn prefetchDocumentBodies(
+        self: *PublicGraphRequestCache,
+        docs: []const PublicDocumentRef,
+        filter_prefix: []const u8,
+    ) !void {
         const max_coalesced_bytes: usize = 4 * 1024 * 1024;
         const max_gap_bytes: u64 = 64 * 1024;
+        const locator_bytes = std.math.mul(usize, docs.len, @sizeOf(PublicDocumentBodyPrefetch)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var locator_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, locator_bytes);
+        defer locator_lease.deinit();
+        const locators = try self.handler.alloc.alloc(PublicDocumentBodyPrefetch, docs.len);
+        defer self.handler.alloc.free(locators);
+        var locator_count: usize = 0;
+        for (docs) |candidate| {
+            if (filter_prefix.len > 0 and !std.mem.startsWith(u8, candidate.doc_id, filter_prefix)) continue;
+            const document_index = self.published_document_index.get(candidate.doc_id) orelse continue;
+            const locator = switch (self.published_documents.?[document_index].body) {
+                .artifact => |value| value,
+                .owned, .cached, .deleted, .moved => continue,
+            };
+            locators[locator_count] = .{ .document_index = document_index, .locator = locator };
+            locator_count += 1;
+        }
+        std.mem.sort(PublicDocumentBodyPrefetch, locators[0..locator_count], {}, PublicDocumentBodyPrefetch.lessThan);
+
         var cursor: usize = 0;
-        while (cursor < docs.len) {
-            const first_idx = self.published_document_index.get(docs[cursor].doc_id) orelse {
-                cursor += 1;
-                continue;
-            };
-            const first = &self.published_documents.?[first_idx];
-            const first_locator = switch (first.body) {
-                .artifact => |locator| locator,
-                .owned, .cached, .deleted, .moved => {
-                    cursor += 1;
-                    continue;
-                },
-            };
+        while (cursor < locator_count) {
+            const first_locator = locators[cursor].locator;
             var end_cursor = cursor + 1;
             var range_end = std.math.add(u64, first_locator.offset, first_locator.len) catch
                 return error.InvalidDocumentSegment;
-            while (end_cursor < docs.len) : (end_cursor += 1) {
-                const next_idx = self.published_document_index.get(docs[end_cursor].doc_id) orelse break;
-                const next_locator = switch (self.published_documents.?[next_idx].body) {
-                    .artifact => |locator| locator,
-                    .owned, .cached, .deleted, .moved => break,
-                };
+            while (end_cursor < locator_count) : (end_cursor += 1) {
+                const next_locator = locators[end_cursor].locator;
                 if (next_locator.artifact_index != first_locator.artifact_index or next_locator.offset < range_end) break;
                 const gap = next_locator.offset - range_end;
                 const next_end = std.math.add(u64, next_locator.offset, next_locator.len) catch
@@ -5383,9 +5420,8 @@ const PublicGraphRequestCache = struct {
                 return error.InvalidDocumentSegment;
             }
             self.published_body_blocks.appendAssumeCapacity(block);
-            for (docs[cursor..end_cursor]) |candidate| {
-                const doc_idx = self.published_document_index.get(candidate.doc_id) orelse continue;
-                const doc = &self.published_documents.?[doc_idx];
+            for (locators[cursor..end_cursor]) |candidate| {
+                const doc = &self.published_documents.?[candidate.document_index];
                 const locator = switch (doc.body) {
                     .artifact => |value| value,
                     .owned, .cached, .deleted, .moved => continue,
@@ -5404,22 +5440,33 @@ const PublicGraphRequestCache = struct {
     }
 
     fn allocPublishedDocumentRefs(self: *PublicGraphRequestCache) ![]PublicDocumentRef {
-        var base = blk: {
+        const base_allocation = blk: {
             for (0..self.session.artifactCount()) |artifact_index| {
                 const artifact_ref = self.session.artifactRef(artifact_index) orelse continue;
                 if (artifact_ref.kind != .document_segment) continue;
                 break :blk try self.allocDocumentArtifactRefs(artifact_index, artifact_ref);
             }
-            break :blk try self.handler.alloc.alloc(PublicDocumentRef, 0);
+            break :blk PublicDocumentRefsAllocation{
+                .items = try self.handler.alloc.alloc(PublicDocumentRef, 0),
+                .retained_bytes = 0,
+            };
         };
+        var base = base_allocation.items;
+        var base_retained_bytes = base_allocation.retained_bytes;
         errdefer freePublicDocumentRefs(self.handler.alloc, base);
+        errdefer if (base_retained_bytes > 0)
+            self.retained_lease.resize(self.retained_lease.bytes - base_retained_bytes) catch unreachable;
 
-        const mutations = try self.handler.allocSessionMutationOverlayAlloc(self.session);
-        defer freeMaterializerMutations(self.handler.alloc, mutations);
-        if (mutations.len == 0) {
-            try self.reserveDocumentRefs(base);
+        var mutation_overlay = try self.allocBudgetedMutationOverlay();
+        defer mutation_overlay.deinit(self.handler.alloc);
+        if (mutation_overlay.items.len == 0) {
+            base_retained_bytes = 0;
             return base;
         }
+        const mutations = mutation_overlay.items;
+        const application_peak_bytes = try self.mutationApplicationPeakBytes(base.len, mutations);
+        var application_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, application_peak_bytes);
+        defer application_lease.deinit();
 
         var slots = std.ArrayListUnmanaged(PublicDocumentRef){ .items = base, .capacity = base.len };
         base = &.{};
@@ -5431,6 +5478,7 @@ const PublicGraphRequestCache = struct {
         defer slot_by_id.deinit(self.handler.alloc);
         const slot_capacity = std.math.add(usize, slots.items.len, mutations.len) catch
             return error.QueryCandidateBudgetExceeded;
+        try slots.ensureTotalCapacityPrecise(self.handler.alloc, slot_capacity);
         try slot_by_id.ensureTotalCapacity(self.handler.alloc, @intCast(slot_capacity));
         for (slots.items, 0..) |slot, idx| {
             const gop = slot_by_id.getOrPutAssumeCapacity(slot.doc_id);
@@ -5442,14 +5490,16 @@ const PublicGraphRequestCache = struct {
             const idx = slot_by_id.get(mutation.doc_id) orelse blk: {
                 const doc_id = try self.handler.alloc.dupe(u8, mutation.doc_id);
                 errdefer self.handler.alloc.free(doc_id);
-                try slots.append(self.handler.alloc, .{
+                slots.appendAssumeCapacity(.{
                     .doc_id = doc_id,
                     .body = .deleted,
                     .last_lsn = 0,
                     .last_timestamp_ns = 0,
                 });
                 const new_idx = slots.items.len - 1;
-                try slot_by_id.put(self.handler.alloc, slots.items[new_idx].doc_id, new_idx);
+                const gop = slot_by_id.getOrPutAssumeCapacity(slots.items[new_idx].doc_id);
+                std.debug.assert(!gop.found_existing);
+                gop.value_ptr.* = new_idx;
                 break :blk new_idx;
             };
             var slot = &slots.items[idx];
@@ -5472,6 +5522,22 @@ const PublicGraphRequestCache = struct {
             .deleted, .moved => {},
             .artifact, .owned, .cached => live_count += 1,
         };
+        var out_bytes = std.math.mul(usize, live_count, @sizeOf(PublicDocumentRef)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        for (slots.items) |slot| switch (slot.body) {
+            .deleted, .moved => {},
+            .artifact, .cached => out_bytes = std.math.add(usize, out_bytes, slot.doc_id.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+            .owned => |body| {
+                out_bytes = std.math.add(usize, out_bytes, slot.doc_id.len) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                out_bytes = std.math.add(usize, out_bytes, body.len) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            },
+        };
+        const before_out = self.retained_lease.bytes;
+        try self.reserveRetained(out_bytes);
+        errdefer self.retained_lease.resize(before_out) catch unreachable;
         const out = try self.handler.alloc.alloc(PublicDocumentRef, live_count);
         var out_idx: usize = 0;
         errdefer {
@@ -5488,15 +5554,144 @@ const PublicGraphRequestCache = struct {
             out_idx += 1;
         }
         std.mem.sort(PublicDocumentRef, out, {}, lessPublicDocumentRef);
-        try self.reserveDocumentRefs(out);
+        try self.retained_lease.resize(self.retained_lease.bytes - base_retained_bytes);
+        base_retained_bytes = 0;
         return out;
+    }
+
+    /// Decode the mutation tail under one lease that follows its actual live
+    /// allocation shape. The lease grows before each fetch, decode, list
+    /// reallocation, and copy, then contracts as transient owners are freed.
+    fn allocBudgetedMutationOverlay(self: *PublicGraphRequestCache) !BudgetedMutationOverlay {
+        var lease = graph_work_budget_mod.RetainedLease{ .budget = self.work_budget };
+        errdefer lease.deinit();
+        var mutations = std.ArrayListUnmanaged(query_materializer.Mutation).empty;
+        errdefer {
+            for (mutations.items) |mutation| {
+                self.handler.alloc.free(@constCast(mutation.doc_id));
+                if (mutation.body) |body| self.handler.alloc.free(@constCast(body));
+            }
+            mutations.deinit(self.handler.alloc);
+        }
+        var copied_bytes: usize = 0;
+        for (0..self.session.artifactCount()) |artifact_index| {
+            const artifact_ref = self.session.artifactRef(artifact_index) orelse continue;
+            if (artifact_ref.kind != .mutation_segment) continue;
+            const artifact_bytes = std.math.cast(usize, artifact_ref.byte_len) orelse
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            const owned_before = std.math.add(
+                usize,
+                std.math.mul(usize, mutations.capacity, @sizeOf(query_materializer.Mutation)) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                copied_bytes,
+            ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            try lease.resize(std.math.add(usize, owned_before, artifact_bytes) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes));
+            var retained_after = owned_before;
+            {
+                const contents = try self.session.fetchArtifactAlloc(artifact_index);
+                defer self.handler.alloc.free(contents);
+                if (contents.len != artifact_bytes) return error.InvalidSegment;
+
+                const header = try segment_mod.decodeHeader(contents);
+                const decoded_struct_bytes = std.math.mul(usize, header.count, @sizeOf(segment_mod.Entry)) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                const wire_fixed_entry_bytes: usize = 8 + 8 + 1 + 4 + 4;
+                const encoded_fixed_bytes = std.math.mul(usize, header.count, wire_fixed_entry_bytes) catch
+                    return error.InvalidSegment;
+                const minimum_bytes = std.math.add(usize, segment_mod.header_len, encoded_fixed_bytes) catch
+                    return error.InvalidSegment;
+                if (minimum_bytes > contents.len) return error.InvalidSegment;
+                const variable_bytes = contents.len - minimum_bytes;
+                const decoded_bytes = std.math.add(usize, decoded_struct_bytes, variable_bytes) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                try lease.resize(std.math.add(
+                    usize,
+                    std.math.add(usize, owned_before, artifact_bytes) catch
+                        return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                    decoded_bytes,
+                ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes));
+                const entries = try segment_mod.decodeAlloc(self.handler.alloc, contents);
+                defer segment_mod.freeEntries(self.handler.alloc, entries);
+
+                const required_capacity = std.math.add(usize, mutations.items.len, entries.len) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                const new_array_bytes = std.math.mul(usize, required_capacity, @sizeOf(query_materializer.Mutation)) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+                // During list growth both the old and new arrays may be live. The
+                // decoded strings and their copied owners also overlap briefly.
+                try lease.resize(std.math.add(
+                    usize,
+                    std.math.add(
+                        usize,
+                        std.math.add(usize, owned_before, artifact_bytes) catch
+                            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                        decoded_bytes,
+                    ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                    std.math.add(usize, new_array_bytes, variable_bytes) catch
+                        return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes));
+                try mutations.ensureTotalCapacityPrecise(self.handler.alloc, required_capacity);
+                for (entries) |entry| {
+                    const doc_id = try self.handler.alloc.dupe(u8, entry.doc_id);
+                    errdefer self.handler.alloc.free(doc_id);
+                    const body = if (entry.body) |value| try self.handler.alloc.dupe(u8, value) else null;
+                    errdefer if (body) |value| self.handler.alloc.free(value);
+                    mutations.appendAssumeCapacity(.{
+                        .lsn = entry.lsn,
+                        .timestamp_ns = entry.timestamp_ns,
+                        .kind = entry.kind,
+                        .doc_id = doc_id,
+                        .body = body,
+                    });
+                    copied_bytes = std.math.add(usize, copied_bytes, doc_id.len) catch unreachable;
+                    if (body) |value| copied_bytes = std.math.add(usize, copied_bytes, value.len) catch unreachable;
+                }
+                retained_after = std.math.add(
+                    usize,
+                    std.math.mul(usize, mutations.capacity, @sizeOf(query_materializer.Mutation)) catch unreachable,
+                    copied_bytes,
+                ) catch unreachable;
+            }
+            try lease.resize(retained_after);
+        }
+        const items = try mutations.toOwnedSlice(self.handler.alloc);
+        return .{ .items = items, .lease = lease };
+    }
+
+    fn mutationApplicationPeakBytes(
+        self: *PublicGraphRequestCache,
+        base_count: usize,
+        mutations: []const query_materializer.Mutation,
+    ) !usize {
+        const slot_count = std.math.add(usize, base_count, mutations.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const map_capacity = graph_work_budget_mod.hashMapCapacityForCount(
+            slot_count,
+            std.hash_map.default_max_load_percentage,
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var bytes = std.math.mul(usize, slot_count, @sizeOf(PublicDocumentRef)) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        bytes = std.math.add(
+            usize,
+            bytes,
+            graph_work_budget_mod.hashMapRetainedBytes([]const u8, usize, map_capacity) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        for (mutations) |mutation| {
+            bytes = std.math.add(usize, bytes, mutation.doc_id.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            if (mutation.body) |body| bytes = std.math.add(usize, bytes, body.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        }
+        return bytes;
     }
 
     fn allocDocumentArtifactRefs(
         self: *PublicGraphRequestCache,
         artifact_index: usize,
         artifact_ref: manifest_mod.ArtifactRef,
-    ) ![]PublicDocumentRef {
+    ) !PublicDocumentRefsAllocation {
         if (artifact_ref.byte_len < 12) return error.InvalidDocumentSegment;
         const initial_len: usize = @intCast(@min(artifact_ref.byte_len, document_segment_mod.header_len));
         var header_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, initial_len);
@@ -5516,11 +5711,10 @@ const PublicGraphRequestCache = struct {
                 std.math.mul(
                     usize,
                     header.count,
-                    @sizeOf(document_segment_mod.IndexEntry) + @sizeOf(PublicDocumentRef),
+                    @sizeOf(document_segment_mod.IndexEntry),
                 ) catch
                     return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
-                std.math.mul(usize, identity_bytes, 2) catch
-                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                identity_bytes,
             ) catch
                 return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
         ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
@@ -5531,6 +5725,15 @@ const PublicGraphRequestCache = struct {
         const index = try document_segment_mod.decodeIndexAlloc(self.handler.alloc, directory, artifact_ref.byte_len);
         defer document_segment_mod.freeIndexEntries(self.handler.alloc, index);
 
+        const retained_bytes = std.math.add(
+            usize,
+            std.math.mul(usize, index.len, @sizeOf(PublicDocumentRef)) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+            identity_bytes,
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const prior_retained = self.retained_lease.bytes;
+        try self.reserveRetained(retained_bytes);
+        errdefer self.retained_lease.resize(prior_retained) catch unreachable;
         const refs = try self.handler.alloc.alloc(PublicDocumentRef, index.len);
         errdefer self.handler.alloc.free(refs);
         var initialized: usize = 0;
@@ -5548,22 +5751,7 @@ const PublicGraphRequestCache = struct {
             };
             initialized += 1;
         }
-        return refs;
-    }
-
-    fn reserveDocumentRefs(self: *PublicGraphRequestCache, docs: []const PublicDocumentRef) !void {
-        var bytes = std.math.mul(usize, docs.len, @sizeOf(PublicDocumentRef)) catch
-            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
-        for (docs) |doc| {
-            bytes = std.math.add(usize, bytes, doc.doc_id.len) catch
-                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
-            switch (doc.body) {
-                .owned => |body| bytes = std.math.add(usize, bytes, body.len) catch
-                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
-                .artifact, .cached, .deleted, .moved => {},
-            }
-        }
-        try self.reserveRetained(bytes);
+        return .{ .items = refs, .retained_bytes = retained_bytes };
     }
 
     fn graphSegment(self: *PublicGraphRequestCache, index_name: []const u8) !*const CachedPublicGraphSegment {
@@ -5572,8 +5760,71 @@ const PublicGraphRequestCache = struct {
         }
         const graph_index = query_mod.graph_reader.findGraphArtifactIndex(self.session, index_name) orelse
             return error.GraphSegmentNotFound;
+        const artifact_ref = self.session.artifactRef(graph_index) orelse return error.GraphSegmentNotFound;
+        const payload_len = std.math.cast(usize, artifact_ref.byte_len) orelse
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        var payload_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, payload_len);
+        defer payload_lease.deinit();
         const payload = try self.session.fetchArtifactAlloc(graph_index);
         defer self.handler.alloc.free(payload);
+        if (payload.len != payload_len) return error.InvalidGraphSegment;
+
+        var persistent_bytes = graph_segment_mod.decodedRetainedBytes(payload) catch |err| switch (err) {
+            error.UnsupportedGraphSegmentVersion => return err,
+            else => return error.InvalidGraphSegment,
+        };
+        const adjacency_count = blk: {
+            if (payload.len < 14) return error.InvalidGraphSegment;
+            break :blk std.mem.readInt(u32, payload[10..14], .little);
+        };
+        const map_capacity = graph_work_budget_mod.hashMapCapacityForCount(
+            adjacency_count,
+            std.hash_map.default_max_load_percentage,
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        persistent_bytes = std.math.add(
+            usize,
+            persistent_bytes,
+            graph_work_budget_mod.hashMapRetainedBytes([]const u8, usize, map_capacity) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        const table_count = std.mem.readInt(u32, payload[6..10], .little);
+        persistent_bytes = std.math.add(
+            usize,
+            persistent_bytes,
+            std.math.mul(usize, table_count, @sizeOf([]u8)) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+        ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        // JSON string escaping expands one source byte to at most six bytes.
+        // Reserve that hard upper bound before metadata serialization.
+        var table_pos: usize = 14;
+        var reserved_metadata_payload_bytes: usize = 0;
+        for (0..table_count) |_| {
+            if (table_pos > payload.len or payload.len - table_pos < 4) return error.InvalidGraphSegment;
+            const table_len = std.mem.readInt(u32, payload[table_pos..][0..4], .little);
+            table_pos += 4;
+            if (table_len > payload.len - table_pos) return error.InvalidGraphSegment;
+            const metadata_len = std.math.add(
+                usize,
+                std.math.mul(usize, table_len, 6) catch
+                    return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes),
+                "{\"target_table\":\"\"}".len,
+            ) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            persistent_bytes = std.math.add(usize, persistent_bytes, metadata_len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            reserved_metadata_payload_bytes = std.math.add(usize, reserved_metadata_payload_bytes, metadata_len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+            table_pos += table_len;
+        }
+        persistent_bytes = std.math.add(usize, persistent_bytes, index_name.len) catch
+            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        if (self.segments.items.len == self.segments.capacity) {
+            persistent_bytes = std.math.add(usize, persistent_bytes, @sizeOf(CachedPublicGraphSegment)) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        }
+        const prior_retained = self.retained_lease.bytes;
+        try self.reserveRetained(persistent_bytes);
+        errdefer self.retained_lease.resize(prior_retained) catch unreachable;
+
         var segment = try graph_segment_mod.decodeAlloc(self.handler.alloc, payload);
         errdefer graph_segment_mod.freeSegment(self.handler.alloc, &segment);
         var adjacency_index = try graph_segment_mod.AdjacencyIndex.initWithCancellation(
@@ -5597,9 +5848,21 @@ const PublicGraphRequestCache = struct {
             );
             initialized_metadata += 1;
         }
+        var actual_metadata_payload_bytes: usize = 0;
+        for (neighbor_table_metadata) |metadata| {
+            actual_metadata_payload_bytes = std.math.add(usize, actual_metadata_payload_bytes, metadata.len) catch
+                return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        }
+        if (actual_metadata_payload_bytes < reserved_metadata_payload_bytes) {
+            try self.retained_lease.resize(
+                self.retained_lease.bytes - (reserved_metadata_payload_bytes - actual_metadata_payload_bytes),
+            );
+        }
         const owned_name = try self.handler.alloc.dupe(u8, index_name);
         errdefer self.handler.alloc.free(owned_name);
-        try self.segments.append(self.handler.alloc, .{
+        if (self.segments.items.len == self.segments.capacity)
+            try self.segments.ensureTotalCapacityPrecise(self.handler.alloc, self.segments.items.len + 1);
+        self.segments.appendAssumeCapacity(.{
             .index_name = owned_name,
             .segment = segment,
             .adjacency_index = adjacency_index,
@@ -5977,7 +6240,10 @@ fn nextConjunctiveAnchorPage(
     while (cursor.* < docs.len and page_len < buffer.len) {
         const raw_end = @min(docs.len, cursor.* + (buffer.len - page_len));
         if (anchor.filter.filter_query_json != null)
-            try filter_ctx.documents.prefetchDocumentBodies(docs[cursor.*..raw_end]);
+            try filter_ctx.documents.prefetchDocumentBodies(
+                docs[cursor.*..raw_end],
+                anchor.filter.filter_prefix,
+            );
         while (cursor.* < raw_end) {
             const doc = docs[cursor.*];
             cursor.* += 1;
@@ -6015,6 +6281,18 @@ fn conjunctivePatternHasExternalDocumentFilter(source_table: []const u8, pattern
         if (matchNodesHaveExternalDocumentFilter(source_table, optional_pattern.nodes)) return true;
     }
     return false;
+}
+
+test "serverless document body prefetch order is artifact monotonic" {
+    var locators = [_]PublicDocumentBodyPrefetch{
+        .{ .document_index = 0, .locator = .{ .artifact_index = 1, .offset = 90, .len = 5 } },
+        .{ .document_index = 1, .locator = .{ .artifact_index = 0, .offset = 40, .len = 5 } },
+        .{ .document_index = 2, .locator = .{ .artifact_index = 1, .offset = 10, .len = 5 } },
+    };
+    std.mem.sort(PublicDocumentBodyPrefetch, &locators, {}, PublicDocumentBodyPrefetch.lessThan);
+    try std.testing.expectEqual(@as(usize, 0), locators[0].locator.artifact_index);
+    try std.testing.expectEqual(@as(u64, 10), locators[1].locator.offset);
+    try std.testing.expectEqual(@as(u64, 90), locators[2].locator.offset);
 }
 
 test "serverless detects document filters on required and optional external aliases" {
@@ -6082,12 +6360,13 @@ fn publishedPatternNodeFilterBatchEvaluator(
     filter: graph_pattern_mod.NodeFilter,
 ) anyerror![]bool {
     const active: *PatternDocumentFilterContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
-    const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
-    defer alloc.free(refs);
-    var refs_len: usize = 0;
     if (filter.filter_query_json != null) {
+        const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
+        defer alloc.free(refs);
+        var refs_len: usize = 0;
         _ = try active.documents.documents();
         for (nodes) |node| {
+            if (filter.filter_prefix.len > 0 and !std.mem.startsWith(u8, node.key, filter.filter_prefix)) continue;
             if (node.table) |table| {
                 if (!std.mem.eql(u8, table, active.source_table)) continue;
             }
@@ -6095,7 +6374,7 @@ fn publishedPatternNodeFilterBatchEvaluator(
             refs[refs_len] = active.documents.published_documents.?[idx];
             refs_len += 1;
         }
-        try active.documents.prefetchDocumentBodies(refs[0..refs_len]);
+        try active.documents.prefetchDocumentBodies(refs[0..refs_len], filter.filter_prefix);
     }
     const decisions = try alloc.alloc(bool, nodes.len);
     errdefer alloc.free(decisions);
@@ -6111,12 +6390,14 @@ fn serverlessGraphNodeAdmission(
     nodes: []const graph_node_admission.NodeRef,
 ) anyerror![]bool {
     const active: *ServerlessGraphAdmissionContext = @ptrCast(@alignCast(ctx orelse return error.UnsupportedNodeFilterQuery));
-    const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
-    defer alloc.free(refs);
-    var refs_len: usize = 0;
     if (active.filter.filter_query_json != null) {
+        const refs = try alloc.alloc(PublicDocumentRef, nodes.len);
+        defer alloc.free(refs);
+        var refs_len: usize = 0;
         _ = try active.filter_ctx.documents.documents();
         for (nodes) |node| {
+            if (active.filter.filter_prefix.len > 0 and
+                !std.mem.startsWith(u8, node.key, active.filter.filter_prefix)) continue;
             if (node.external and if (node.table) |table|
                 !std.mem.eql(u8, table, active.filter_ctx.source_table)
             else
@@ -6125,7 +6406,7 @@ fn serverlessGraphNodeAdmission(
             refs[refs_len] = active.filter_ctx.documents.published_documents.?[idx];
             refs_len += 1;
         }
-        try active.filter_ctx.documents.prefetchDocumentBodies(refs[0..refs_len]);
+        try active.filter_ctx.documents.prefetchDocumentBodies(refs[0..refs_len], active.filter.filter_prefix);
     }
     const admitted = try alloc.alloc(bool, nodes.len);
     errdefer alloc.free(admitted);

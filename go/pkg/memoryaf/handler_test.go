@@ -542,9 +542,10 @@ func TestCanonicalGraphResultIsRequiredAndTableExact(t *testing.T) {
 		t.Fatalf("expected missing graph result error, got %v", err)
 	}
 
+	foreignTable := "foreign"
 	response := mockGraphQueryNodes("related", nil, []client.GraphResultNode{
 		{Key: "mem:local", Document: map[string]any{"content": "local"}},
-		{Table: "foreign", Key: "mem:local", Document: map[string]any{"content": "foreign"}},
+		{Table: &foreignTable, Key: "mem:local", Document: map[string]any{"content": "foreign"}},
 		{Key: "mem:deleted"},
 	})
 	hits, err := hitsWithRequiredGraphNodesFromResponse(response, "related")

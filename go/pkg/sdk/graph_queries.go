@@ -142,9 +142,9 @@ func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) 
 // without a discriminator is decoded as the only structural variant that
 // permits one to be absent: LegacyGraphQueryResult.
 func DecodeGraphResult(result GraphResult) (any, error) {
-	// Probe only the small control fields. Decoding into a RawMessage map would
-	// copy every top-level value, including result rows, paths, and hydrated
-	// documents, before the selected variant decodes the payload a second time.
+	// Probe control fields and identity presence without copying opaque hydrated
+	// documents. A RawMessage map would copy every top-level result value before
+	// the selected variant decodes the payload a second time.
 	var envelope graphQueryResultEnvelope
 	if err := result.DecodeInto(&envelope); err != nil {
 		return nil, err
@@ -180,15 +180,42 @@ func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
 }
 
 type graphQueryResultEnvelope struct {
-	Kind  json.RawMessage               `json:"kind"`
-	Type  json.RawMessage               `json:"type"`
-	Total json.RawMessage               `json:"total"`
-	Stats *graphQueryStatsPresenceProbe `json:"stats"`
+	Kind  json.RawMessage                          `json:"kind"`
+	Type  json.RawMessage                          `json:"type"`
+	Total json.RawMessage                          `json:"total"`
+	Stats *graphQueryStatsPresenceProbe            `json:"stats"`
+	Rows  []map[string]*graphIdentityPresenceProbe `json:"rows"`
+	Nodes []graphResultNodePresenceProbe           `json:"nodes"`
+	Paths []graphPathPresenceProbe                 `json:"paths"`
 }
 
 type graphQueryStatsPresenceProbe struct {
 	ReturnedItems *uint64 `json:"returned_items"`
 	Truncated     *bool   `json:"truncated"`
+}
+
+// These probes preserve the distinction between an omitted table qualifier
+// and an explicit JSON null without retaining or copying opaque hydrated
+// documents. The generated model deliberately uses *string for ergonomic
+// optional access, so wire-level presence validation belongs at this boundary.
+type graphIdentityPresenceProbe struct {
+	Table json.RawMessage `json:"table"`
+}
+
+type graphPathEdgePresenceProbe struct {
+	From graphIdentityPresenceProbe `json:"from"`
+	To   graphIdentityPresenceProbe `json:"to"`
+}
+
+type graphResultNodePresenceProbe struct {
+	graphIdentityPresenceProbe
+	Path      []graphIdentityPresenceProbe `json:"path"`
+	PathEdges []graphPathEdgePresenceProbe `json:"path_edges"`
+}
+
+type graphPathPresenceProbe struct {
+	Nodes []graphIdentityPresenceProbe `json:"nodes"`
+	Edges []graphPathEdgePresenceProbe `json:"edges"`
 }
 
 type strictGraphResultDecoder interface {
@@ -202,6 +229,9 @@ func decodeCanonicalGraphResult(
 ) (any, error) {
 	switch kind {
 	case string(GraphBindingsResultKindBindings):
+		if err := validateGraphIdentityPresence(envelope); err != nil {
+			return nil, err
+		}
 		var value GraphBindingsResult
 		if err := result.DecodeStrictInto(&value); err != nil {
 			return nil, fmt.Errorf("antfly: invalid bindings graph result: %w", err)
@@ -252,6 +282,9 @@ func decodeCanonicalGraphResult(
 		}
 		return value, nil
 	case string(GraphNodesResultKindNodes):
+		if err := validateGraphIdentityPresence(envelope); err != nil {
+			return nil, err
+		}
 		var value GraphNodesResult
 		if err := result.DecodeStrictInto(&value); err != nil {
 			return nil, fmt.Errorf("antfly: invalid nodes graph result: %w", err)
@@ -295,6 +328,58 @@ func decodeCanonicalGraphResult(
 	default:
 		return nil, fmt.Errorf("antfly: unknown canonical graph result discriminator %q", kind)
 	}
+}
+
+func validateGraphIdentityPresence(envelope graphQueryResultEnvelope) error {
+	validate := func(identity graphIdentityPresenceProbe) error {
+		if len(identity.Table) != 0 && isNullGraphJSON(identity.Table) {
+			return fmt.Errorf("antfly: graph node table must be omitted or non-null")
+		}
+		return nil
+	}
+	for _, row := range envelope.Rows {
+		for _, binding := range row {
+			if binding != nil {
+				if err := validate(*binding); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	validateEdge := func(edge graphPathEdgePresenceProbe) error {
+		if err := validate(edge.From); err != nil {
+			return err
+		}
+		return validate(edge.To)
+	}
+	for _, node := range envelope.Nodes {
+		if err := validate(node.graphIdentityPresenceProbe); err != nil {
+			return err
+		}
+		for _, endpoint := range node.Path {
+			if err := validate(endpoint); err != nil {
+				return err
+			}
+		}
+		for _, edge := range node.PathEdges {
+			if err := validateEdge(edge); err != nil {
+				return err
+			}
+		}
+	}
+	for _, path := range envelope.Paths {
+		for _, endpoint := range path.Nodes {
+			if err := validate(endpoint); err != nil {
+				return err
+			}
+		}
+		for _, edge := range path.Edges {
+			if err := validateEdge(edge); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func validateDecodedGraphStats(envelope graphQueryResultEnvelope, itemCount int, allowTruncated bool) error {

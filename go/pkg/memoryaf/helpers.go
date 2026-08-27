@@ -137,7 +137,7 @@ func hitsWithRequiredGraphNodesFromResponse(data []byte, graphResultName string)
 	for _, node := range nodes.Nodes {
 		// MemoryAF graph indexes are table-local. Never collapse a qualified
 		// foreign identity into a local memory key.
-		if node.Table != "" {
+		if node.Table != nil {
 			continue
 		}
 		// Every MemoryAF traversal requests hydration. A missing document means
