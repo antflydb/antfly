@@ -8,6 +8,7 @@ from attrs import field as _attrs_field
 
 from ..models.derived_coverage_policy import DerivedCoveragePolicy
 from ..models.distance_metric import DistanceMetric
+from ..models.index_publication_policy import IndexPublicationPolicy
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -24,6 +25,9 @@ class CreatedEmbeddingsIndexConfig:
     """Credential-free normalized embeddings configuration returned after creation.
 
     Attributes:
+        publication_policy (IndexPublicationPolicy | Unset): Publication behavior for a managed embeddings index.
+            `progressive` makes a safely checkpointed active generation queryable before initial source coverage is
+            complete. `atomic` keeps a new generation unavailable until complete validation and activation.
         coverage_policy (DerivedCoveragePolicy | Unset): How generation-scoped source outcomes determine derived-index
             completeness.
         external (bool | Unset):  Default: False.
@@ -50,6 +54,7 @@ class CreatedEmbeddingsIndexConfig:
             namespaces with runtime effects are accepted.
     """
 
+    publication_policy: IndexPublicationPolicy | Unset = UNSET
     coverage_policy: DerivedCoveragePolicy | Unset = UNSET
     external: bool | Unset = False
     sparse: bool | Unset = False
@@ -70,6 +75,10 @@ class CreatedEmbeddingsIndexConfig:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        publication_policy: str | Unset = UNSET
+        if not isinstance(self.publication_policy, Unset):
+            publication_policy = self.publication_policy.value
+
         coverage_policy: str | Unset = UNSET
         if not isinstance(self.coverage_policy, Unset):
             coverage_policy = self.coverage_policy.value
@@ -119,6 +128,8 @@ class CreatedEmbeddingsIndexConfig:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if publication_policy is not UNSET:
+            field_dict["publication_policy"] = publication_policy
         if coverage_policy is not UNSET:
             field_dict["coverage_policy"] = coverage_policy
         if external is not UNSET:
@@ -163,6 +174,13 @@ class CreatedEmbeddingsIndexConfig:
         from ..models.index_execution_config import IndexExecutionConfig
 
         d = dict(src_dict)
+        _publication_policy = d.pop("publication_policy", UNSET)
+        publication_policy: IndexPublicationPolicy | Unset
+        if isinstance(_publication_policy, Unset):
+            publication_policy = UNSET
+        else:
+            publication_policy = IndexPublicationPolicy(_publication_policy)
+
         _coverage_policy = d.pop("coverage_policy", UNSET)
         coverage_policy: DerivedCoveragePolicy | Unset
         if isinstance(_coverage_policy, Unset):
@@ -228,6 +246,7 @@ class CreatedEmbeddingsIndexConfig:
             execution = IndexExecutionConfig.from_dict(_execution)
 
         created_embeddings_index_config = cls(
+            publication_policy=publication_policy,
             coverage_policy=coverage_policy,
             external=external,
             sparse=sparse,

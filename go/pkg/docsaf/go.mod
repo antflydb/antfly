@@ -2,17 +2,12 @@ module github.com/antflydb/antfly/go/pkg/docsaf
 
 go 1.26.0
 
-replace (
-	github.com/antflydb/antfly/go/pkg/generating => ../generating
-	github.com/antflydb/antfly/go/pkg/libaf => ../libaf
-	github.com/antflydb/antfly/go/pkg/sdk => ../sdk
-)
+replace github.com/antflydb/antfly/go/pkg/sdk => ../sdk
 
 require (
 	github.com/PuerkitoBio/goquery v1.12.0
 	github.com/ajroetker/pdf v0.0.1-antfly001
 	github.com/ajroetker/pdf/render v0.0.1-antfly003
-	github.com/antflydb/antfly/go/pkg/libaf v0.0.1
 	github.com/antflydb/antfly/go/pkg/sdk v0.0.0
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -38,7 +33,6 @@ require (
 	github.com/antchfx/htmlquery v1.3.6 // indirect
 	github.com/antchfx/xmlquery v1.5.0 // indirect
 	github.com/antchfx/xpath v1.3.6 // indirect
-	github.com/antflydb/antfly/go/pkg/generating v0.0.0 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect

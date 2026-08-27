@@ -700,6 +700,64 @@ pub fn extractDenseVectorField(
     }
 }
 
+/// Extract a dense vector into caller-owned scratch without retaining a
+/// decoded allocation. Used by bounded exact-score fallback batches for
+/// pre-artifact direct-field indexes.
+pub fn extractDenseVectorFieldInto(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+    dims: u32,
+    scratch: []f32,
+) !?[]const f32 {
+    if (scratch.len < dims) return error.BufferTooSmall;
+    var scanner = std.json.Scanner.initCompleteInput(alloc, data);
+    defer scanner.deinit();
+    switch (try scanner.next()) {
+        .object_begin => {},
+        else => return null,
+    }
+    while (true) {
+        switch (try scanner.peekNextTokenType()) {
+            .object_end => {
+                _ = try scanner.next();
+                return null;
+            },
+            .string => {},
+            else => return null,
+        }
+        const key_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+        defer freeJsonAllocatedToken(alloc, key_token);
+        const key = jsonTokenSlice(key_token) orelse return error.InvalidEmbeddingField;
+        if (!std.mem.eql(u8, key, field_name)) {
+            try scanner.skipValue();
+            continue;
+        }
+        switch (try scanner.next()) {
+            .array_begin => {},
+            else => return null,
+        }
+        var count: usize = 0;
+        while (true) {
+            switch (try scanner.peekNextTokenType()) {
+                .array_end => {
+                    _ = try scanner.next();
+                    if (count != dims) return error.InvalidVectorDimensions;
+                    return scratch[0..count];
+                },
+                .number => {},
+                else => return error.InvalidVectorValue,
+            }
+            if (count >= dims) return error.InvalidVectorDimensions;
+            const value_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
+            defer freeJsonAllocatedToken(alloc, value_token);
+            const value_bytes = jsonTokenSlice(value_token) orelse return error.InvalidVectorValue;
+            scratch[count] = try std.fmt.parseFloat(f32, value_bytes);
+            count += 1;
+        }
+    }
+}
+
 pub fn extractSparseVectorField(
     alloc: Allocator,
     data: []const u8,

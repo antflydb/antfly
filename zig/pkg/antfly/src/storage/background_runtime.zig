@@ -23,6 +23,431 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const AtomicU64 = platform.atomic.Value(u64);
 
+pub const LsmOwnerKind = enum { primary, full_text, dense_vector };
+
+pub const LsmMutableSnapshotReason = enum(u8) {
+    bound_read_txn,
+    namespace_read_txn,
+    current_scan,
+    other,
+    bulk_current_scan,
+};
+
+pub const lsm_mutable_snapshot_reason_count = @typeInfo(LsmMutableSnapshotReason).@"enum".fields.len;
+
+pub const LsmMutableSnapshotCloneReasonStats = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+
+    fn accumulate(self: *@This(), other: @This()) void {
+        self.calls +|= other.calls;
+        self.bytes_total +|= other.bytes_total;
+        self.peak_bytes = @max(self.peak_bytes, other.peak_bytes);
+    }
+};
+
+pub const LsmOwnerCloneStats = struct {
+    calls: u64 = 0,
+    bytes_total: u64 = 0,
+    peak_bytes: u64 = 0,
+    bulk_current_scan_peak_active_bytes: u64 = 0,
+    /// Number of distinct retired owner labels folded into this bounded
+    /// attribution record. This is a counter, not owner residency.
+    labels_collapsed_total: u64 = 0,
+    by_reason: [lsm_mutable_snapshot_reason_count]LsmMutableSnapshotCloneReasonStats =
+        [_]LsmMutableSnapshotCloneReasonStats{.{}} ** lsm_mutable_snapshot_reason_count,
+
+    pub fn accumulate(self: *@This(), other: @This()) void {
+        self.calls +|= other.calls;
+        self.bytes_total +|= other.bytes_total;
+        self.peak_bytes = @max(self.peak_bytes, other.peak_bytes);
+        self.bulk_current_scan_peak_active_bytes = @max(
+            self.bulk_current_scan_peak_active_bytes,
+            other.bulk_current_scan_peak_active_bytes,
+        );
+        self.labels_collapsed_total +|= other.labels_collapsed_total;
+        for (&self.by_reason, other.by_reason) |*dst, src| dst.accumulate(src);
+    }
+};
+
+pub const LsmOwnerCloneMetricSnapshot = struct {
+    table_name: []u8,
+    group_id: u64,
+    owner_kind: LsmOwnerKind,
+    owner_name: []u8,
+    owner_overflow: bool = false,
+    stats: LsmOwnerCloneStats,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.owner_name);
+        self.* = undefined;
+    }
+};
+
+const LsmOwnerCloneRegistry = struct {
+    const max_entries: usize = 4096;
+    const max_sources: usize = 8192;
+
+    const Entry = struct {
+        table_name: []u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []u8,
+        owner_overflow: bool,
+        stats: LsmOwnerCloneStats,
+
+        fn deinit(self: *Entry, alloc: Allocator) void {
+            alloc.free(self.table_name);
+            alloc.free(self.owner_name);
+            self.* = undefined;
+        }
+    };
+
+    const EntryKey = struct {
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        owner_overflow: bool,
+    };
+
+    const EntryKeyContext = struct {
+        pub fn hash(_: @This(), key: EntryKey) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(std.mem.asBytes(&key.group_id));
+            hasher.update(std.mem.asBytes(&key.owner_kind));
+            hasher.update(std.mem.asBytes(&key.owner_overflow));
+            hasher.update(key.table_name);
+            hasher.update("\x00");
+            hasher.update(key.owner_name);
+            return hasher.final();
+        }
+
+        pub fn eql(_: @This(), lhs: EntryKey, rhs: EntryKey) bool {
+            return lhs.group_id == rhs.group_id and lhs.owner_kind == rhs.owner_kind and
+                lhs.owner_overflow == rhs.owner_overflow and
+                std.mem.eql(u8, lhs.table_name, rhs.table_name) and
+                std.mem.eql(u8, lhs.owner_name, rhs.owner_name);
+        }
+    };
+
+    const EntryMap = std.HashMapUnmanaged(EntryKey, usize, EntryKeyContext, 80);
+
+    const SourceKey = struct { id: usize, entry_index: usize };
+
+    const Source = struct {
+        key: SourceKey,
+        observed: LsmOwnerCloneStats,
+        previous_for_id: ?usize = null,
+        next_for_id: ?usize = null,
+    };
+
+    alloc: Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+    entry_by_key: EntryMap = .empty,
+    sources: std.ArrayListUnmanaged(Source) = .empty,
+    source_by_key: std.AutoHashMapUnmanaged(SourceKey, usize) = .empty,
+    source_head_by_id: std.AutoHashMapUnmanaged(usize, usize) = .empty,
+    dropped_observations: u64 = 0,
+    collapsed_labels: u64 = 0,
+
+    fn init(alloc: Allocator) LsmOwnerCloneRegistry {
+        return .{ .alloc = alloc };
+    }
+
+    fn deinit(self: *LsmOwnerCloneRegistry) void {
+        for (self.entries.items) |*entry| entry.deinit(self.alloc);
+        self.entries.deinit(self.alloc);
+        self.entry_by_key.deinit(self.alloc);
+        self.sources.deinit(self.alloc);
+        self.source_by_key.deinit(self.alloc);
+        self.source_head_by_id.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn findOrCreateEntryLocked(
+        self: *LsmOwnerCloneRegistry,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        owner_overflow: bool,
+    ) !?usize {
+        const lookup_key: EntryKey = .{
+            .table_name = table_name,
+            .group_id = group_id,
+            .owner_kind = owner_kind,
+            .owner_name = owner_name,
+            .owner_overflow = owner_overflow,
+        };
+        if (self.entry_by_key.get(lookup_key)) |index| return index;
+        if (self.entries.items.len >= max_entries) {
+            self.dropped_observations +|= 1;
+            return null;
+        }
+        const owned_table_name = try self.alloc.dupe(u8, table_name);
+        errdefer self.alloc.free(owned_table_name);
+        const owned_owner_name = try self.alloc.dupe(u8, owner_name);
+        errdefer self.alloc.free(owned_owner_name);
+        try self.entries.ensureUnusedCapacity(self.alloc, 1);
+        try self.entry_by_key.ensureUnusedCapacity(self.alloc, 1);
+        self.entries.appendAssumeCapacity(.{
+            .table_name = owned_table_name,
+            .group_id = group_id,
+            .owner_kind = owner_kind,
+            .owner_name = owned_owner_name,
+            .owner_overflow = owner_overflow,
+            .stats = .{},
+        });
+        const index = self.entries.items.len - 1;
+        const entry = &self.entries.items[index];
+        self.entry_by_key.putAssumeCapacity(.{
+            .table_name = entry.table_name,
+            .group_id = entry.group_id,
+            .owner_kind = entry.owner_kind,
+            .owner_name = entry.owner_name,
+            .owner_overflow = entry.owner_overflow,
+        }, index);
+        return index;
+    }
+
+    fn accumulateObserved(
+        total: *LsmOwnerCloneStats,
+        previous: LsmOwnerCloneStats,
+        current: LsmOwnerCloneStats,
+    ) void {
+        total.calls +|= current.calls -| previous.calls;
+        total.bytes_total +|= current.bytes_total -| previous.bytes_total;
+        total.peak_bytes = @max(total.peak_bytes, current.peak_bytes);
+        total.bulk_current_scan_peak_active_bytes = @max(
+            total.bulk_current_scan_peak_active_bytes,
+            current.bulk_current_scan_peak_active_bytes,
+        );
+        total.labels_collapsed_total +|= current.labels_collapsed_total -| previous.labels_collapsed_total;
+        for (&total.by_reason, previous.by_reason, current.by_reason) |*dst, prior, now| {
+            dst.calls +|= now.calls -| prior.calls;
+            dst.bytes_total +|= now.bytes_total -| prior.bytes_total;
+            dst.peak_bytes = @max(dst.peak_bytes, now.peak_bytes);
+        }
+    }
+
+    /// Observe absolute counters from one live DB generation. The registry
+    /// converts them to deltas under the same mutex that serves snapshots, so
+    /// a scrape can never fall back from live totals to a smaller archived
+    /// value while a cache entry is being retired.
+    fn observe(
+        self: *LsmOwnerCloneRegistry,
+        source_id: usize,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        owner_overflow: bool,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const lookup_key: EntryKey = .{
+            .table_name = table_name,
+            .group_id = group_id,
+            .owner_kind = owner_kind,
+            .owner_name = owner_name,
+            .owner_overflow = owner_overflow,
+        };
+        if (self.entry_by_key.get(lookup_key)) |entry_index| {
+            const source_key: SourceKey = .{ .id = source_id, .entry_index = entry_index };
+            if (self.source_by_key.get(source_key)) |source_index| {
+                const source = &self.sources.items[source_index];
+                const collapsed_delta = stats.labels_collapsed_total -| source.observed.labels_collapsed_total;
+                accumulateObserved(&self.entries.items[entry_index].stats, source.observed, stats);
+                self.collapsed_labels +|= collapsed_delta;
+                source.observed = stats;
+                return;
+            }
+        } else if (self.entries.items.len >= max_entries) {
+            // Reject a new label before reserving source storage. At the label
+            // ceiling this observation is intentionally dropped, so allocator
+            // pressure must not turn a healthy /metrics response into OOM.
+            self.dropped_observations +|= 1;
+            return;
+        }
+        // Never commit a permanent label entry unless its initial absolute
+        // source baseline can be retained. Otherwise source saturation could
+        // fill the entry registry with zero-valued tombstones that survive
+        // after live sources retire.
+        if (self.sources.items.len >= max_sources) {
+            self.dropped_observations +|= 1;
+            return;
+        }
+        // Reserve both source containers before publishing a new label entry.
+        // This makes admission transactional with respect to allocator failure:
+        // findOrCreateEntryLocked cannot leave an unreachable zero-stat entry
+        // if the initial source baseline cannot be stored.
+        try self.sources.ensureUnusedCapacity(self.alloc, 1);
+        try self.source_by_key.ensureUnusedCapacity(self.alloc, 1);
+        const previous_head = self.source_head_by_id.get(source_id);
+        if (previous_head == null) try self.source_head_by_id.ensureUnusedCapacity(self.alloc, 1);
+        const entry_index = (try self.findOrCreateEntryLocked(
+            table_name,
+            group_id,
+            owner_kind,
+            owner_name,
+            owner_overflow,
+        )) orelse return;
+        const source_key: SourceKey = .{ .id = source_id, .entry_index = entry_index };
+        self.sources.appendAssumeCapacity(.{
+            .key = source_key,
+            .observed = stats,
+            .next_for_id = previous_head,
+        });
+        const source_index = self.sources.items.len - 1;
+        self.source_by_key.putAssumeCapacity(source_key, source_index);
+        if (previous_head) |head_index| {
+            self.sources.items[head_index].previous_for_id = source_index;
+            self.source_head_by_id.getPtr(source_id).?.* = source_index;
+        } else {
+            self.source_head_by_id.putAssumeCapacity(source_id, source_index);
+        }
+        self.entries.items[entry_index].stats.accumulate(stats);
+        self.collapsed_labels +|= stats.labels_collapsed_total;
+    }
+
+    fn removeSourceAtLocked(self: *LsmOwnerCloneRegistry, source_index: usize) void {
+        const removed = self.sources.items[source_index];
+        _ = self.source_by_key.remove(removed.key);
+
+        if (removed.previous_for_id) |previous_index| {
+            self.sources.items[previous_index].next_for_id = removed.next_for_id;
+        } else if (removed.next_for_id) |next_index| {
+            self.source_head_by_id.getPtr(removed.key.id).?.* = next_index;
+        } else {
+            _ = self.source_head_by_id.remove(removed.key.id);
+        }
+        if (removed.next_for_id) |next_index| {
+            self.sources.items[next_index].previous_for_id = removed.previous_for_id;
+        }
+
+        const last_index = self.sources.items.len - 1;
+        if (source_index == last_index) {
+            _ = self.sources.pop();
+            return;
+        }
+
+        const moved = self.sources.items[last_index];
+        self.sources.items[source_index] = moved;
+        _ = self.sources.pop();
+        self.source_by_key.getPtr(moved.key).?.* = source_index;
+        if (moved.previous_for_id) |previous_index| {
+            self.sources.items[previous_index].next_for_id = source_index;
+        } else {
+            self.source_head_by_id.getPtr(moved.key.id).?.* = source_index;
+        }
+        if (moved.next_for_id) |next_index| {
+            self.sources.items[next_index].previous_for_id = source_index;
+        }
+    }
+
+    fn retireSource(self: *LsmOwnerCloneRegistry, source_id: usize) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        while (self.source_head_by_id.get(source_id)) |source_index| {
+            self.removeSourceAtLocked(source_index);
+        }
+    }
+
+    fn accumulate(
+        self: *LsmOwnerCloneRegistry,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        owner_overflow: bool,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const entry_index = (try self.findOrCreateEntryLocked(
+            table_name,
+            group_id,
+            owner_kind,
+            owner_name,
+            owner_overflow,
+        )) orelse return;
+        self.entries.items[entry_index].stats.accumulate(stats);
+        self.collapsed_labels +|= stats.labels_collapsed_total;
+    }
+
+    fn snapshotAlloc(self: *LsmOwnerCloneRegistry, alloc: Allocator) ![]LsmOwnerCloneMetricSnapshot {
+        // Registry labels are immutable and entries are never removed. Capture
+        // a prefix boundary under the mutex, then allocate outside it. Labels
+        // admitted after that boundary belong to the next scrape; retrying for
+        // them could turn sustained label admission into quadratic allocation
+        // churn or prevent a scrape from completing.
+        lockAtomic(&self.mutex);
+        const entry_count = self.entries.items.len;
+        self.mutex.unlock();
+        return try self.snapshotPrefixAlloc(alloc, entry_count);
+    }
+
+    fn snapshotPrefixAlloc(
+        self: *LsmOwnerCloneRegistry,
+        alloc: Allocator,
+        entry_count: usize,
+    ) ![]LsmOwnerCloneMetricSnapshot {
+        const result = try alloc.alloc(LsmOwnerCloneMetricSnapshot, entry_count);
+        lockAtomic(&self.mutex);
+        // Entries are append-only for the registry lifetime, so the prefix
+        // selected by snapshotAlloc remains present and its labels remain
+        // stable even if observations append entries during allocation.
+        std.debug.assert(self.entries.items.len >= result.len);
+        for (self.entries.items[0..result.len], result) |entry, *snapshot| {
+            snapshot.* = .{
+                // Temporarily borrowed. The loop below replaces both slices
+                // with owned copies after releasing the registry mutex.
+                .table_name = entry.table_name,
+                .group_id = entry.group_id,
+                .owner_kind = entry.owner_kind,
+                .owner_name = entry.owner_name,
+                .owner_overflow = entry.owner_overflow,
+                .stats = entry.stats,
+            };
+        }
+        self.mutex.unlock();
+
+        var initialized: usize = 0;
+        errdefer {
+            for (result[0..initialized]) |*entry| entry.deinit(alloc);
+            alloc.free(result);
+        }
+        for (result) |*snapshot| {
+            const table_name = try alloc.dupe(u8, snapshot.table_name);
+            const owner_name = alloc.dupe(u8, snapshot.owner_name) catch |err| {
+                alloc.free(table_name);
+                return err;
+            };
+            snapshot.table_name = table_name;
+            snapshot.owner_name = owner_name;
+            initialized += 1;
+        }
+        return result;
+    }
+
+    fn droppedObservationsTotal(self: *LsmOwnerCloneRegistry) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.dropped_observations;
+    }
+
+    fn collapsedLabelsTotal(self: *LsmOwnerCloneRegistry) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.collapsed_labels;
+    }
+};
+
 pub const Backend = runtime_backend.Backend;
 pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
@@ -430,6 +855,7 @@ pub const BackendRuntime = struct {
     retired_generation_cleanup_owner_id: u64,
     owner_registry: *OwnerRegistry,
     native_storage_pool: *storage_io.NativeStoragePool,
+    lsm_owner_clone_registry: LsmOwnerCloneRegistry,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -474,6 +900,7 @@ pub const BackendRuntime = struct {
             .retired_generation_cleanup_owner_id = retired_generation_cleanup_owner_id,
             .owner_registry = owner_registry,
             .native_storage_pool = native_storage_pool,
+            .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
             .durable_jobs = undefined,
         };
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
@@ -559,6 +986,7 @@ pub const BackendRuntime = struct {
         }
         self.native_storage_pool.deinit();
         self.alloc.destroy(self.native_storage_pool);
+        self.lsm_owner_clone_registry.deinit();
         self.owner_registry.deinit();
         self.alloc.destroy(self.owner_registry);
         self.* = undefined;
@@ -575,6 +1003,65 @@ pub const BackendRuntime = struct {
 
     pub fn snapshotNativeStorageStats(self: *const BackendRuntime) storage_io.NativeStorageStats {
         return self.native_storage_pool.snapshotStats();
+    }
+
+    pub fn accumulateRetiredLsmOwnerCloneStats(
+        self: *BackendRuntime,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        owner_overflow: bool,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        try self.lsm_owner_clone_registry.accumulate(
+            table_name,
+            group_id,
+            owner_kind,
+            owner_name,
+            owner_overflow,
+            stats,
+        );
+    }
+
+    pub fn observeLsmOwnerCloneStats(
+        self: *BackendRuntime,
+        source_id: usize,
+        table_name: []const u8,
+        group_id: u64,
+        owner_kind: LsmOwnerKind,
+        owner_name: []const u8,
+        owner_overflow: bool,
+        stats: LsmOwnerCloneStats,
+    ) !void {
+        try self.lsm_owner_clone_registry.observe(
+            source_id,
+            table_name,
+            group_id,
+            owner_kind,
+            owner_name,
+            owner_overflow,
+            stats,
+        );
+    }
+
+    pub fn retireLsmOwnerCloneSource(self: *BackendRuntime, source_id: usize) void {
+        self.lsm_owner_clone_registry.retireSource(source_id);
+    }
+
+    pub fn snapshotRetiredLsmOwnerCloneStatsAlloc(
+        self: *BackendRuntime,
+        alloc: Allocator,
+    ) ![]LsmOwnerCloneMetricSnapshot {
+        return try self.lsm_owner_clone_registry.snapshotAlloc(alloc);
+    }
+
+    pub fn retiredLsmOwnerCloneStatsDroppedTotal(self: *BackendRuntime) u64 {
+        return self.lsm_owner_clone_registry.droppedObservationsTotal();
+    }
+
+    pub fn retiredLsmOwnerCloneLabelsCollapsedTotal(self: *BackendRuntime) u64 {
+        return self.lsm_owner_clone_registry.collapsedLabelsTotal();
     }
 
     pub fn raftInboundIo(self: *BackendRuntime) ?Io {
@@ -1335,6 +1822,382 @@ test "backend runtime allocates stable nonzero owner ids" {
 
     try std.testing.expect(first != 0);
     try std.testing.expectEqual(first + 1, second);
+}
+
+test "backend runtime retains LSM owner clone counters across generations" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+
+    var first = LsmOwnerCloneStats{
+        .calls = 2,
+        .bytes_total = 1024,
+        .peak_bytes = 768,
+        .bulk_current_scan_peak_active_bytes = 512,
+    };
+    first.by_reason[@intFromEnum(LsmMutableSnapshotReason.bulk_current_scan)] = .{
+        .calls = 2,
+        .bytes_total = 1024,
+        .peak_bytes = 768,
+    };
+    try handle.ptr().accumulateRetiredLsmOwnerCloneStats("docs", 17, .dense_vector, "embedding", false, first);
+    try handle.ptr().accumulateRetiredLsmOwnerCloneStats("docs", 17, .dense_vector, "embedding", false, .{
+        .calls = 1,
+        .bytes_total = 256,
+        .peak_bytes = 256,
+    });
+
+    const snapshot = try handle.ptr().snapshotRetiredLsmOwnerCloneStatsAlloc(std.testing.allocator);
+    defer {
+        for (snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 1), snapshot.len);
+    try std.testing.expectEqualStrings("docs", snapshot[0].table_name);
+    try std.testing.expectEqualStrings("embedding", snapshot[0].owner_name);
+    try std.testing.expectEqual(@as(u64, 3), snapshot[0].stats.calls);
+    try std.testing.expectEqual(@as(u64, 1280), snapshot[0].stats.bytes_total);
+    try std.testing.expectEqual(@as(u64, 768), snapshot[0].stats.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 512), snapshot[0].stats.bulk_current_scan_peak_active_bytes);
+}
+
+test "backend runtime observes live clone counters monotonically across retirement" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+
+    try runtime.observeLsmOwnerCloneStats(101, "docs", 17, .dense_vector, "embedding", false, .{
+        .calls = 2,
+        .bytes_total = 1024,
+        .peak_bytes = 768,
+        .labels_collapsed_total = 1,
+    });
+    try runtime.observeLsmOwnerCloneStats(101, "docs", 17, .dense_vector, "embedding", false, .{
+        .calls = 5,
+        .bytes_total = 4096,
+        .peak_bytes = 2048,
+        .labels_collapsed_total = 3,
+    });
+    runtime.retireLsmOwnerCloneSource(101);
+
+    // A replacement generation starts its counters at zero. Its absolute
+    // values add to, rather than replace, the retired generation.
+    try runtime.observeLsmOwnerCloneStats(102, "docs", 17, .dense_vector, "embedding", false, .{
+        .calls = 1,
+        .bytes_total = 256,
+        .peak_bytes = 256,
+    });
+
+    const snapshot = try runtime.snapshotRetiredLsmOwnerCloneStatsAlloc(std.testing.allocator);
+    defer {
+        for (snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 1), snapshot.len);
+    try std.testing.expectEqual(@as(u64, 6), snapshot[0].stats.calls);
+    try std.testing.expectEqual(@as(u64, 4352), snapshot[0].stats.bytes_total);
+    try std.testing.expectEqual(@as(u64, 2048), snapshot[0].stats.peak_bytes);
+    try std.testing.expectEqual(@as(u64, 0), runtime.retiredLsmOwnerCloneStatsDroppedTotal());
+    try std.testing.expectEqual(@as(u64, 3), runtime.retiredLsmOwnerCloneLabelsCollapsedTotal());
+}
+
+test "backend runtime keeps synthetic overflow owners distinct from user names" {
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    defer handle.deinit();
+    const runtime = handle.ptr();
+
+    try runtime.observeLsmOwnerCloneStats(201, "docs", 17, .dense_vector, "__retired_owner_overflow__", false, .{
+        .calls = 2,
+        .bytes_total = 512,
+    });
+    try runtime.observeLsmOwnerCloneStats(201, "docs", 17, .dense_vector, "__retired_owner_overflow__", true, .{
+        .calls = 3,
+        .bytes_total = 1024,
+        .labels_collapsed_total = 7,
+    });
+
+    const snapshot = try runtime.snapshotRetiredLsmOwnerCloneStatsAlloc(std.testing.allocator);
+    defer {
+        for (snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 2), snapshot.len);
+    var concrete_calls: ?u64 = null;
+    var overflow_calls: ?u64 = null;
+    for (snapshot) |entry| {
+        if (entry.owner_overflow) {
+            overflow_calls = entry.stats.calls;
+        } else {
+            concrete_calls = entry.stats.calls;
+        }
+    }
+    try std.testing.expectEqual(@as(?u64, 2), concrete_calls);
+    try std.testing.expectEqual(@as(?u64, 3), overflow_calls);
+    try std.testing.expectEqual(@as(u64, 7), runtime.retiredLsmOwnerCloneLabelsCollapsedTotal());
+}
+
+test "LSM owner registry reports capacity loss in observation units" {
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    for (0..LsmOwnerCloneRegistry.max_entries) |i| {
+        try registry.observe(i + 1, "docs", @intCast(i), .primary, "primary", false, .{ .calls = 1 });
+    }
+    try registry.observe(999_999, "docs", LsmOwnerCloneRegistry.max_entries, .primary, "primary", false, .{ .calls = 1 });
+    try registry.observe(999_999, "docs", LsmOwnerCloneRegistry.max_entries, .primary, "primary", false, .{ .calls = 1 });
+
+    try std.testing.expectEqual(@as(u64, 2), registry.droppedObservationsTotal());
+    try std.testing.expectEqual(@as(u64, 0), registry.collapsedLabelsTotal());
+}
+
+test "LSM owner entry saturation rejects before reserving source storage" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var registry = LsmOwnerCloneRegistry.init(failing.allocator());
+    defer registry.deinit();
+
+    for (0..LsmOwnerCloneRegistry.max_entries) |i| {
+        try registry.observe(i + 1, "docs", @intCast(i), .primary, "primary", false, .{ .calls = 1 });
+    }
+    // Fill the source list to its current allocation boundary so the old
+    // reserve-before-label-cap ordering would necessarily allocate.
+    var source_id = LsmOwnerCloneRegistry.max_entries + 1;
+    while (registry.sources.items.len < registry.sources.capacity) : (source_id += 1) {
+        try registry.observe(source_id, "docs", 0, .primary, "primary", false, .{ .calls = 1 });
+    }
+    try std.testing.expect(registry.sources.items.len < LsmOwnerCloneRegistry.max_sources);
+
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const dropped_before = registry.droppedObservationsTotal();
+    try registry.observe(999_999, "other", 99_999, .primary, "primary", false, .{ .calls = 1 });
+    try std.testing.expectEqual(dropped_before + 1, registry.droppedObservationsTotal());
+    try std.testing.expectEqual(LsmOwnerCloneRegistry.max_entries, registry.entries.items.len);
+}
+
+test "LSM owner source saturation does not consume empty label entries" {
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    for (0..LsmOwnerCloneRegistry.max_sources) |i| {
+        try registry.observe(i + 1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    }
+    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    try registry.observe(999_999, "other", 23, .primary, "primary", false, .{ .calls = 1 });
+    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), registry.droppedObservationsTotal());
+
+    registry.retireSource(1);
+    try registry.observe(999_999, "other", 23, .primary, "primary", false, .{ .calls = 1 });
+    try std.testing.expectEqual(@as(usize, 2), registry.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 1), registry.entries.items[1].stats.calls);
+}
+
+test "LSM owner source allocation failure does not publish an empty label entry" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var registry = LsmOwnerCloneRegistry.init(failing.allocator());
+    defer registry.deinit();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), registry.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), registry.sources.items.len);
+
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 1), registry.sources.items.len);
+}
+
+test "LSM owner source admission is transactional across every allocation failure" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var registry = LsmOwnerCloneRegistry.init(alloc);
+            defer registry.deinit();
+            try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+            try std.testing.expectEqual(@as(usize, 1), registry.entries.items.len);
+            try std.testing.expectEqual(@as(usize, 1), registry.sources.items.len);
+            try std.testing.expectEqual(@as(usize, 1), registry.source_head_by_id.count());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "LSM owner indexed retirement repairs interleaved swap removals" {
+    const expectIndexIntegrity = struct {
+        fn run(source: *LsmOwnerCloneRegistry) !void {
+            for (source.sources.items, 0..) |item, index| {
+                try std.testing.expectEqual(index, source.source_by_key.get(item.key).?);
+                if (item.previous_for_id) |previous_index| {
+                    try std.testing.expectEqual(index, source.sources.items[previous_index].next_for_id.?);
+                } else {
+                    try std.testing.expectEqual(index, source.source_head_by_id.get(item.key.id).?);
+                }
+                if (item.next_for_id) |next_index| {
+                    try std.testing.expectEqual(index, source.sources.items[next_index].previous_for_id.?);
+                }
+            }
+        }
+    }.run;
+
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    try registry.observe(2, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 2 });
+    try registry.observe(1, "docs", 17, .primary, "primary", false, .{ .calls = 3 });
+    try registry.observe(3, "docs", 17, .full_text, "body", false, .{ .calls = 4 });
+
+    registry.retireSource(1);
+    try std.testing.expectEqual(@as(usize, 2), registry.sources.items.len);
+    try std.testing.expect(registry.source_head_by_id.get(1) == null);
+    try std.testing.expect(registry.source_head_by_id.get(2) != null);
+    try std.testing.expect(registry.source_head_by_id.get(3) != null);
+    try expectIndexIntegrity(&registry);
+
+    // Both surviving exact-key indexes must still target the entries moved by
+    // swap removal, and a replacement source must join a new per-ID chain.
+    try registry.observe(2, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 5 });
+    try registry.observe(3, "docs", 17, .full_text, "body", false, .{ .calls = 6 });
+    try registry.observe(4, "docs", 17, .primary, "primary", false, .{ .calls = 7 });
+    try expectIndexIntegrity(&registry);
+
+    const snapshot = try registry.snapshotAlloc(std.testing.allocator);
+    defer {
+        for (snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(snapshot);
+    }
+    var dense_calls: ?u64 = null;
+    var primary_calls: ?u64 = null;
+    var full_text_calls: ?u64 = null;
+    for (snapshot) |entry| switch (entry.owner_kind) {
+        .dense_vector => dense_calls = entry.stats.calls,
+        .primary => primary_calls = entry.stats.calls,
+        .full_text => full_text_calls = entry.stats.calls,
+    };
+    try std.testing.expectEqual(@as(?u64, 6), dense_calls);
+    try std.testing.expectEqual(@as(?u64, 10), primary_calls);
+    try std.testing.expectEqual(@as(?u64, 6), full_text_calls);
+}
+
+test "LSM owner snapshot is allocation-failure safe after capture" {
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+    try registry.observe(1, "docs", 17, .primary, "primary", false, .{ .calls = 2 });
+
+    const Runner = struct {
+        fn run(alloc: Allocator, source: *LsmOwnerCloneRegistry) !void {
+            const snapshot = try source.snapshotAlloc(alloc);
+            defer {
+                for (snapshot) |*entry| entry.deinit(alloc);
+                alloc.free(snapshot);
+            }
+            try std.testing.expectEqual(@as(usize, 2), snapshot.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{&registry});
+}
+
+test "LSM owner snapshot keeps its prefix boundary during concurrent label growth" {
+    var registry = LsmOwnerCloneRegistry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.observe(1, "docs", 17, .dense_vector, "embedding", false, .{ .calls = 1 });
+
+    const GrowingAllocator = struct {
+        backing: Allocator,
+        registry: *LsmOwnerCloneRegistry,
+        growth_injected: bool = false,
+        injection_error: ?anyerror = null,
+        snapshot_array_allocations: usize = 0,
+
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = allocate,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            } };
+        }
+
+        fn allocate(
+            context: *anyopaque,
+            len: usize,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (len == @sizeOf(LsmOwnerCloneMetricSnapshot) or
+                len == 2 * @sizeOf(LsmOwnerCloneMetricSnapshot))
+            {
+                self.snapshot_array_allocations += 1;
+            }
+            if (!self.growth_injected) {
+                self.growth_injected = true;
+                self.registry.observe(2, "docs", 17, .primary, "primary", false, .{ .calls = 2 }) catch |err| {
+                    self.injection_error = err;
+                    return null;
+                };
+            }
+            return self.backing.rawAlloc(len, alignment, return_address);
+        }
+
+        fn resize(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawResize(memory, alignment, new_len, return_address);
+        }
+
+        fn remap(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawRemap(memory, alignment, new_len, return_address);
+        }
+
+        fn free(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.backing.rawFree(memory, alignment, return_address);
+        }
+    };
+
+    // The allocator injects a new label after snapshotAlloc releases the
+    // sizing mutex and before it reacquires the mutex to capture counters.
+    var growing = GrowingAllocator{ .backing = std.testing.allocator, .registry = &registry };
+    const alloc = growing.allocator();
+    const prefix = try registry.snapshotAlloc(alloc);
+    defer {
+        for (prefix) |*entry| entry.deinit(alloc);
+        alloc.free(prefix);
+    }
+    try std.testing.expect(growing.growth_injected);
+    try std.testing.expectEqual(@as(?anyerror, null), growing.injection_error);
+    try std.testing.expectEqual(@as(usize, 1), growing.snapshot_array_allocations);
+    try std.testing.expectEqual(@as(usize, 1), prefix.len);
+    try std.testing.expectEqual(LsmOwnerKind.dense_vector, prefix[0].owner_kind);
+    try std.testing.expectEqual(@as(u64, 1), prefix[0].stats.calls);
+
+    const next_snapshot = try registry.snapshotAlloc(std.testing.allocator);
+    defer {
+        for (next_snapshot) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(next_snapshot);
+    }
+    try std.testing.expectEqual(@as(usize, 2), next_snapshot.len);
 }
 
 test "backend runtime API lane leases expose and release the interface" {

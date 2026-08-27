@@ -65,6 +65,7 @@ pub const Policy = struct {
 pub const Inspection = struct {
     architecture: []u8,
     expert_count: u32 = 0,
+    qualified_gemma4_a4b: bool = false,
     artifact_inspected: bool = true,
 
     pub fn deinit(self: *Inspection, allocator: std.mem.Allocator) void {
@@ -119,6 +120,7 @@ fn applyArtifactMetadata(
     metadata: gguf_format.SupportMetadata,
 ) !void {
     result.expert_count = metadata.expert_count;
+    result.qualified_gemma4_a4b = metadata.isQualifiedGemma4A4b();
     // The artifact is authoritative. A config.json sidecar is useful for discovery,
     // but it must not be able to relabel a GGUF and bypass a family safety block.
     // Canonical composite bundles are still recognized from their manifest contract
@@ -147,13 +149,27 @@ pub fn assessInspection(
             "GGUF compatibility metadata could not be inspected; start the server with --allow-unknown-models to opt in",
         );
     }
-    return assessWithFacts(man, inspection.architecture, inspection.expert_count);
+    return assessWithRuntimeFacts(
+        man,
+        inspection.architecture,
+        inspection.expert_count,
+        inspection.qualified_gemma4_a4b,
+    );
 }
 
 fn assessWithFacts(
     man: *const manifest_mod.ModelManifest,
     architecture: []const u8,
     expert_count: u32,
+) Assessment {
+    return assessWithRuntimeFacts(man, architecture, expert_count, false);
+}
+
+fn assessWithRuntimeFacts(
+    man: *const manifest_mod.ModelManifest,
+    architecture: []const u8,
+    expert_count: u32,
+    qualified_gemma4_a4b: bool,
 ) Assessment {
     if (man.hasIncompleteGlinerBundle() or
         man.hasIncompleteColqwenBundle() or
@@ -167,7 +183,8 @@ fn assessWithFacts(
         );
     }
 
-    if (man.model_type == .generator) return assessGenerator(architecture, expert_count);
+    if (man.model_type == .generator)
+        return assessGenerator(architecture, expert_count, qualified_gemma4_a4b);
 
     // Canonical Antfly bundles are known runtime contracts, even when their encoder
     // architecture names overlap with blocked standalone exports.
@@ -185,7 +202,11 @@ fn assessWithFacts(
     // GGUF with no explicit role or bundle metadata; this prevents a colocated
     // decoder-shaped artifact from relabeling an embedder contract.
     if (mayInferStandaloneGgufDecoder(man)) {
-        const decoder_assessment = assessGenerator(architecture, expert_count);
+        const decoder_assessment = assessGenerator(
+            architecture,
+            expert_count,
+            qualified_gemma4_a4b,
+        );
         if (decoder_assessment.level != .unknown) return decoder_assessment;
     }
 
@@ -271,12 +292,22 @@ fn mayInferStandaloneGgufDecoder(man: *const manifest_mod.ModelManifest) bool {
         man.inference_bundle_family.len == 0;
 }
 
-fn assessGenerator(architecture: []const u8, expert_count: u32) Assessment {
+fn assessGenerator(
+    architecture: []const u8,
+    expert_count: u32,
+    qualified_gemma4_a4b: bool,
+) Assessment {
     if (std.mem.startsWith(u8, architecture, "gemma4") and expert_count > 0) {
+        if (qualified_gemma4_a4b) {
+            return makeCompatible(
+                architecture,
+                "qualified Gemma 4 26B-A4B Q4_0 Metal runtime",
+            );
+        }
         return makeIncompatible(
             architecture,
             .unsupported_backend,
-            "Gemma 4 mixture-of-experts layouts are not enabled for this release",
+            "only the qualified Gemma 4 26B-A4B Q4_0 mixture-of-experts layout is enabled for this release",
         );
     }
 
@@ -441,7 +472,7 @@ test "artifact architecture remains authoritative over a supported sidecar famil
     try std.testing.expectEqual(Level.unknown, assessInspection(&man, inspection).level);
 }
 
-test "gemma 4 E4B architecture is enabled while unified layout is blocked" {
+test "qualified Gemma4 A4B architecture is enabled while unified layout is blocked" {
     var man = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     man.model_type = .generator;
     try std.testing.expectEqual(Level.compatible, assess(&man, "gemma4").level);
@@ -450,6 +481,17 @@ test "gemma 4 E4B architecture is enabled while unified layout is blocked" {
         Level.incompatible,
         assessWithFacts(&man, "gemma4", 128).level,
     );
+
+    var qualified = Inspection{
+        .architecture = try std.testing.allocator.dupe(u8, "gemma4"),
+        .expert_count = 128,
+        .qualified_gemma4_a4b = true,
+    };
+    defer qualified.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Level.compatible, assessInspection(&man, qualified).level);
+
+    qualified.qualified_gemma4_a4b = false;
+    try std.testing.expectEqual(Level.incompatible, assessInspection(&man, qualified).level);
 }
 
 test "standalone GGUF decoder architecture does not depend on directory taxonomy" {

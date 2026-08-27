@@ -27,7 +27,7 @@ import (
 	"time"
 	"unsafe"
 
-	chunking "github.com/antflydb/antfly/go/pkg/libaf/chunking"
+	"github.com/antflydb/antfly/go/pkg/sdk/chunking"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 

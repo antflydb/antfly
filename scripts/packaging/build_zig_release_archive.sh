@@ -238,9 +238,9 @@ run_zig_build_steps_with_retry() {
 
 (
   cd "$repo_root/zig"
-  # API and the shared PIC application/storage unit occupy the initial bounded
-  # memory group. Inference starts after API, while the short remote CLI unit
-  # starts after application/storage, preserving useful overlap deterministically.
+  # The runtime libraries carry measured max-RSS claims, so the build runner
+  # overlaps only the API, storage, serverless, inference, and CLI units that
+  # fit within its bounded memory group.
   run_zig_build_steps_with_retry archive antfly capi
 )
 

@@ -2,18 +2,16 @@ package docsaf
 
 import (
 	"testing"
-
-	"github.com/antflydb/antfly/go/pkg/libaf/s3"
 )
 
 func TestNewS3Source(t *testing.T) {
 	// Test missing bucket
 	_, err := NewS3Source(S3SourceConfig{
-		Credentials: s3.Credentials{
+		Credentials: S3Credentials{
 			Endpoint:        "localhost:9000",
-			AccessKeyId:     "minioadmin",
+			AccessKeyID:     "minioadmin",
 			SecretAccessKey: "minioadmin",
-			UseSsl:          false,
+			UseSSL:          false,
 		},
 	})
 	if err == nil {
@@ -22,6 +20,33 @@ func TestNewS3Source(t *testing.T) {
 
 	// Note: Further tests would require a real MinIO/S3 instance
 	// Integration tests should be added separately
+}
+
+func TestParseS3Endpoint(t *testing.T) {
+	tests := []struct {
+		name         string
+		endpoint     string
+		useSSL       bool
+		wantEndpoint string
+		wantSecure   bool
+	}{
+		{name: "AWS hostname", endpoint: "s3.amazonaws.com", useSSL: true, wantEndpoint: "s3.amazonaws.com", wantSecure: true},
+		{name: "local hostname", endpoint: "localhost:9000", wantEndpoint: "localhost:9000", wantSecure: false},
+		{name: "HTTPS URL", endpoint: "https://storage.googleapis.com/some/path", wantEndpoint: "storage.googleapis.com", wantSecure: true},
+		{name: "HTTP URL", endpoint: "http://localhost:9000", useSSL: true, wantEndpoint: "localhost:9000", wantSecure: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotEndpoint, gotSecure := parseS3Endpoint(tt.endpoint, tt.useSSL)
+			if gotEndpoint != tt.wantEndpoint {
+				t.Errorf("parseS3Endpoint() endpoint = %q, want %q", gotEndpoint, tt.wantEndpoint)
+			}
+			if gotSecure != tt.wantSecure {
+				t.Errorf("parseS3Endpoint() secure = %v, want %v", gotSecure, tt.wantSecure)
+			}
+		})
+	}
 }
 
 func TestS3Source_Type(t *testing.T) {

@@ -983,7 +983,7 @@ fn runMicrokernelCheck(allocator: std.mem.Allocator, check: CheckCase) !CheckRes
 // so the matmul machinery is untouched. This isolated float compare is a fast
 // pre-check for compile/dispatch/gross-logic errors ONLY — softmax is too
 // summation-sensitive for a tight isolated gate, so the real acceptance gate is
-// bit-identical *model tokens* (scripts/compare_metal_gemma4_e4b_qat.sh with the
+// bit-identical *model tokens* (scripts/gemma4/compare_metal_gemma4_e4b_qat.sh with the
 // generated route enabled). Every case is the "simplest case": q_len=1 decode,
 // f16 KV, single contiguous block, no sinks, softcap 0 — exercising GQA and the
 // causal + sliding-window masks against a self-contained CPU oracle.
@@ -1282,6 +1282,10 @@ const flash_prefill_shapes = [_]FlashPrefillShape{
     .{ .q_len = 8, .kv_tokens = 64, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 0, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 },
     .{ .q_len = 13, .kv_tokens = 50, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 37, .sliding_window = 0, .page_size = 16, .permuted_pages = true },
     .{ .q_len = 256, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 256, .sliding_window = 512, .page_size = 16, .permuted_pages = true },
+    // Production Gemma4 26B-A4B local attention (16Q/8KV, 2:1 GQA). The
+    // 1,040-token span crosses the first 1,024-token sliding-window boundary;
+    // page reversal plus a leading gap makes masked and mapped reads observable.
+    .{ .q_len = 16, .kv_tokens = 1040, .num_heads = 16, .num_kv_heads = 8, .head_dim = 256, .query_position_offset = 1024, .sliding_window = 1024, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 },
 };
 
 const flash_prefill_hd512_shapes = [_]FlashPrefillShape{
@@ -1321,7 +1325,7 @@ const split_gqa_policy_kv_boundaries = [_]usize{ 511, 512, 513, 1023, 1024, 2003
 // tighter than the former ad-hoc 5e-2 bound.
 const split_gqa_tensor_tolerance: f32 = 1e-2;
 
-// Production Gemma4 E2B/E4B decode geometries. 513 tokens leaves one valid row in
+// Production Gemma4 E2B/E4B/A4B decode geometries. 513 tokens leaves one valid row in
 // the final 8-row V tile; reversed pages plus a leading physical-page gap make
 // every masked lane observable when the unused private storage is NaN-poisoned.
 // The 2,003-token global case forces every split-cap candidate to execute
@@ -1334,6 +1338,8 @@ const split_gqa_checks = [_]SplitGqaCheckCase{
     .{ .name = "decode_gqa_split_q1_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 512, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
     .{ .name = "decode_gqa_split_q2_hd512_global", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
     .{ .name = "decode_gqa_split_q1_kv2003_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 2003, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 2002, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_a4b_q1_hd256_swa1024", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 16, .num_kv_heads = 8, .head_dim = 256, .query_position_offset = 512, .sliding_window = 1024, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_a4b_q1_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 513, .num_heads = 16, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 512, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
 };
 
 // The production local-attention fallback at the first ragged SWA boundary.
@@ -1367,6 +1373,10 @@ const split_gqa_production_selection_checks = [_]SplitGqaSelectionCheck{
     // 20-page physical rotation puts the retained page-table suffix across the
     // ring boundary while keeping the allocation a bounded page permutation.
     .{ .check = .{ .name = "decode_gqa_default_local_kv2003_ring_wrap", .shape = .{ .q_len = 1, .kv_tokens = 2003, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 2002, .sliding_window = 512, .page_size = 16, .physical_page_bias = 1, .physical_page_rotation = 20 } }, .expect_route = true },
+    // A4B shapes require the dedicated enable or high-memory umbrella; the
+    // default compact lane must stay on its established paged-1x route.
+    .{ .check = .{ .name = "decode_gqa_default_a4b_local_isolated", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 16, .num_kv_heads = 8, .head_dim = 256, .query_position_offset = 511, .sliding_window = 1024, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_a4b_global_isolated", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 16, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
 };
 
 const FlashPrefillCheckCase = struct {
@@ -1709,6 +1719,55 @@ fn runSplitGqaPolicyProbeChecks() !void {
         }
     }
 
+    const a4b_shapes = [_]struct { num_kv_heads: usize, head_dim: usize, sliding_window: usize }{
+        .{ .num_kv_heads = 8, .head_dim = 256, .sliding_window = 1024 },
+        .{ .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0 },
+    };
+    for (split_gqa_policy_variants) |requested| {
+        for (a4b_shapes) |shape| {
+            for ([_]usize{ 1, 2 }) |q_len| {
+                for (split_gqa_policy_kv_boundaries) |kv_tokens| {
+                    var resolved: u32 = 99;
+                    var split_count: u32 = 99;
+                    var scratch_bytes: usize = 99;
+                    const rc = termite_metal_decode_gqa_split_policy_probe(
+                        @intFromEnum(requested),
+                        q_len,
+                        kv_tokens,
+                        16,
+                        shape.num_kv_heads,
+                        shape.head_dim,
+                        shape.sliding_window,
+                        &resolved,
+                        &split_count,
+                        &scratch_bytes,
+                    );
+                    if (kv_tokens < 512) {
+                        if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
+                            split_count != 0 or scratch_bytes != 0)
+                        {
+                            return error.GeneratedMetalKernelMismatch;
+                        }
+                    } else {
+                        const expected_variant = splitGqaResolvedVariant(requested);
+                        const expected_splits: usize = @min(splitGqaVariantCap(requested), (kv_tokens + 31) / 32);
+                        const expected_scratch = q_len * 16 * expected_splits * (shape.head_dim + 2) * @sizeOf(f32);
+                        if (rc != 1 or resolved != @intFromEnum(expected_variant) or
+                            split_count != @as(u32, @intCast(expected_splits)) or scratch_bytes != expected_scratch)
+                        {
+                            std.debug.print(
+                                "split GQA A4B policy mismatch variant={s} q={d} kv={d} hd={d} kv_heads={d} rc={d} resolved={d}/{d} splits={d}/{d} scratch={d}/{d}\n",
+                                .{ @tagName(requested), q_len, kv_tokens, shape.head_dim, shape.num_kv_heads, rc, resolved, @intFromEnum(expected_variant), split_count, expected_splits, scratch_bytes, expected_scratch },
+                            );
+                            return error.GeneratedMetalKernelMismatch;
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+        }
+    }
+
     const unsupported = [_]struct {
         q_len: usize,
         num_heads: usize,
@@ -1718,7 +1777,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
     }{
         .{ .q_len = 0, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0 },
         .{ .q_len = 3, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0 },
-        .{ .q_len = 1, .num_heads = 16, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 0 },
+        .{ .q_len = 1, .num_heads = 16, .num_kv_heads = 4, .head_dim = 512, .sliding_window = 0 },
         .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 4, .head_dim = 512, .sliding_window = 0 },
         .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .sliding_window = 0 },
         .{ .q_len = 1, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .sliding_window = 512 },
@@ -1769,7 +1828,7 @@ fn runSplitGqaPolicyProbeChecks() !void {
 }
 
 fn splitGqaShapeIndex(shape: FlashPrefillShape) !usize {
-    if (shape.head_dim == 256 and shape.sliding_window == 512) return 0;
+    if (shape.head_dim == 256 and (shape.sliding_window == 512 or shape.sliding_window == 1024)) return 0;
     if (shape.head_dim == 512 and shape.sliding_window == 0) return 1;
     return error.InvalidArgument;
 }
@@ -2059,6 +2118,7 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     const disable_env = "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT";
     const swa_variant_env = "TERMITE_METAL_DECODE_GQA_SPLIT_SWA_VARIANT";
     const global_variant_env = "TERMITE_METAL_DECODE_GQA_SPLIT_GLOBAL_VARIANT";
+    const a4b_enable_env = "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT";
     const old_enable = if (std.c.getenv(enable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
     defer if (old_enable) |value| allocator.free(value);
     const old_disable = if (std.c.getenv(disable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
@@ -2067,6 +2127,8 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     defer if (old_swa_variant) |value| allocator.free(value);
     const old_global_variant = if (std.c.getenv(global_variant_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
     defer if (old_global_variant) |value| allocator.free(value);
+    const old_a4b_enable = if (std.c.getenv(a4b_enable_env)) |value| try allocator.dupeZ(u8, std.mem.span(value)) else null;
+    defer if (old_a4b_enable) |value| allocator.free(value);
     defer if (old_enable) |value| {
         _ = setenv(enable_env, value.ptr, 1);
     } else {
@@ -2087,9 +2149,15 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     } else {
         _ = unsetenv(global_variant_env);
     };
+    defer if (old_a4b_enable) |value| {
+        _ = setenv(a4b_enable_env, value.ptr, 1);
+    } else {
+        _ = unsetenv(a4b_enable_env);
+    };
 
     try runSplitGqaPolicyProbeChecks();
-    if (setenv(enable_env, "1", 1) != 0 or unsetenv(disable_env) != 0) return error.MetalRuntimeUnavailable;
+    if (setenv(enable_env, "1", 1) != 0 or unsetenv(disable_env) != 0 or
+        setenv(a4b_enable_env, "1", 1) != 0) return error.MetalRuntimeUnavailable;
     for (split_gqa_concrete_variants) |variant| {
         const env_value = splitGqaVariantEnvValue(variant);
         if (setenv(swa_variant_env, env_value, 1) != 0 or
@@ -2131,7 +2199,8 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     }
 
     if (unsetenv(enable_env) != 0 or unsetenv(disable_env) != 0 or
-        unsetenv(swa_variant_env) != 0 or unsetenv(global_variant_env) != 0)
+        unsetenv(swa_variant_env) != 0 or unsetenv(global_variant_env) != 0 or
+        unsetenv(a4b_enable_env) != 0)
     {
         return error.MetalRuntimeUnavailable;
     }
@@ -2388,12 +2457,12 @@ test "quant kernel metal runtime flash prefill checks cover the generated flash 
 }
 
 test "quant kernel metal runtime split GQA checks cover production shapes and poisoned ragged pages" {
-    try std.testing.expectEqual(@as(usize, 7), split_gqa_checks.len);
+    try std.testing.expectEqual(@as(usize, 9), split_gqa_checks.len);
     try std.testing.expectEqual(@as(usize, 4), split_gqa_concrete_variants.len);
     try std.testing.expectEqual(@as(usize, 5), split_gqa_policy_variants.len);
     try std.testing.expectEqual(@as(usize, 9), split_gqa_policy_kv_boundaries.len);
-    try std.testing.expectEqual(@as(usize, 28), split_gqa_concrete_variants.len * split_gqa_checks.len);
-    try std.testing.expectEqual(@as(usize, 360), split_gqa_policy_variants.len * 2 * 2 * 2 * split_gqa_policy_kv_boundaries.len);
+    try std.testing.expectEqual(@as(usize, 36), split_gqa_concrete_variants.len * split_gqa_checks.len);
+    try std.testing.expectEqual(@as(usize, 540), split_gqa_policy_variants.len * 2 * 2 * 2 * split_gqa_policy_kv_boundaries.len + split_gqa_policy_variants.len * 2 * 2 * split_gqa_policy_kv_boundaries.len);
     try std.testing.expect(split_gqa_tensor_tolerance < 5e-2);
     try std.testing.expectEqual(@as(f32, 1e-2), split_gqa_tensor_tolerance);
     var e2b_count: usize = 0;
@@ -2402,6 +2471,7 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
     var hd256_count: usize = 0;
     var hd512_count: usize = 0;
     var long_global_count: usize = 0;
+    var a4b_count: usize = 0;
     for (split_gqa_checks) |check| {
         const shape = check.shape;
         if (shape.kv_tokens == 2003) {
@@ -2412,11 +2482,16 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
         } else {
             try std.testing.expectEqual(@as(usize, 513), shape.kv_tokens);
         }
-        try std.testing.expectEqual(@as(usize, 8), shape.num_heads);
+        if (shape.num_heads == 16) {
+            a4b_count += 1;
+            try std.testing.expect(shape.num_kv_heads == 2 or shape.num_kv_heads == 8);
+        } else {
+            try std.testing.expectEqual(@as(usize, 8), shape.num_heads);
+        }
         if (shape.num_kv_heads == 1) {
             e2b_count += 1;
             try std.testing.expectEqual(@as(usize, 1), shape.q_len);
-        } else {
+        } else if (shape.num_heads == 8) {
             try std.testing.expectEqual(@as(usize, 2), shape.num_kv_heads);
         }
         try std.testing.expectEqual(@as(usize, 16), shape.page_size);
@@ -2426,7 +2501,7 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
         if (shape.q_len == 1) q1_count += 1 else if (shape.q_len == 2) q2_count += 1 else return error.TestUnexpectedResult;
         if (shape.head_dim == 256) {
             hd256_count += 1;
-            try std.testing.expectEqual(@as(usize, 512), shape.sliding_window);
+            try std.testing.expectEqual(@as(usize, if (shape.num_heads == 16) 1024 else 512), shape.sliding_window);
         } else if (shape.head_dim == 512) {
             hd512_count += 1;
             try std.testing.expectEqual(@as(usize, 0), shape.sliding_window);
@@ -2434,15 +2509,16 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
         try std.testing.expectEqual(shape.kv_tokens - shape.q_len, shape.query_position_offset);
     }
     try std.testing.expectEqual(@as(usize, 2), e2b_count);
-    try std.testing.expectEqual(@as(usize, 5), q1_count);
+    try std.testing.expectEqual(@as(usize, 7), q1_count);
     try std.testing.expectEqual(@as(usize, 2), q2_count);
-    try std.testing.expectEqual(@as(usize, 3), hd256_count);
-    try std.testing.expectEqual(@as(usize, 4), hd512_count);
+    try std.testing.expectEqual(@as(usize, 4), hd256_count);
+    try std.testing.expectEqual(@as(usize, 5), hd512_count);
     try std.testing.expectEqual(@as(usize, 2), long_global_count);
+    try std.testing.expectEqual(@as(usize, 2), a4b_count);
 }
 
 test "quant kernel metal runtime split GQA production policy starts at 512 tokens" {
-    try std.testing.expectEqual(@as(usize, 10), split_gqa_production_selection_checks.len);
+    try std.testing.expectEqual(@as(usize, 12), split_gqa_production_selection_checks.len);
     const e2b_local = split_gqa_production_selection_checks[0];
     try std.testing.expectEqual(@as(usize, 1), e2b_local.check.shape.num_kv_heads);
     try std.testing.expectEqual(@as(usize, 256), e2b_local.check.shape.head_dim);
@@ -2458,14 +2534,14 @@ test "quant kernel metal runtime split GQA production policy starts at 512 token
     for (expected_kv) |kv_tokens| {
         var found = false;
         for (split_gqa_production_selection_checks) |selection| {
-            if (selection.check.shape.head_dim == 512 and selection.check.shape.kv_tokens == kv_tokens) {
+            if (selection.check.shape.num_heads == 8 and selection.check.shape.head_dim == 512 and selection.check.shape.kv_tokens == kv_tokens) {
                 found = true;
                 try std.testing.expectEqual(kv_tokens >= 512, selection.expect_route);
             }
         }
         try std.testing.expect(found);
     }
-    const ring_wrap = split_gqa_production_selection_checks[split_gqa_production_selection_checks.len - 1];
+    const ring_wrap = split_gqa_production_selection_checks[9];
     try std.testing.expectEqual(@as(usize, 2003), ring_wrap.check.shape.kv_tokens);
     try std.testing.expectEqual(@as(usize, 256), ring_wrap.check.shape.head_dim);
     try std.testing.expectEqual(@as(usize, 512), ring_wrap.check.shape.sliding_window);
@@ -2479,6 +2555,10 @@ test "quant kernel metal runtime split GQA production policy starts at 512 token
     try std.testing.expectEqual(@as(usize, 126), ring_page_count);
     try std.testing.expectEqual(@as(usize, 125), physicalPageWithinSpan(ring_wrap.check.shape, ring_page_count, 105));
     try std.testing.expectEqual(@as(usize, 0), physicalPageWithinSpan(ring_wrap.check.shape, ring_page_count, 106));
+    for (split_gqa_production_selection_checks[10..]) |selection| {
+        try std.testing.expectEqual(@as(usize, 16), selection.check.shape.num_heads);
+        try std.testing.expect(!selection.expect_route);
+    }
     try std.testing.expectEqualSlices(
         usize,
         &.{ 511, 512, 513, 1023, 1024, 2003, 4095, 4096, 8191 },

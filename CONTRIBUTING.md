@@ -9,7 +9,6 @@ zig/e2e/             Zig runtime end-to-end suites
 go/pkg/
   antflylite/         Go binding for embedded Antfly Lite
   sdk/               Go SDK
-  libaf/             Shared library (JSON, embeddings, reranking, logging, S3)
   docsaf/            Content ingestion (filesystem, web crawl, git, S3)
   evalaf/            LLM/RAG evaluation framework
   genkit/            Firebase Genkit plugins (antfly, openrouter)
@@ -96,7 +95,6 @@ The repository contains multiple independent Go modules (no `go.work`). Each mus
 | Operator | `go/pkg/operator/` |
 | Antfly proxy | `go/pkg/proxy/antfly/` |
 | Inference proxy | `go/pkg/proxy/inference/` |
-| libaf | `go/pkg/libaf/` |
 | docsaf | `go/pkg/docsaf/` |
 | evalaf | `go/pkg/evalaf/` |
 | evalaf antfly plugin | `go/pkg/evalaf/plugins/antfly/` |

@@ -29,6 +29,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const ha_http_operation = @import("../storage/ha/http_operation.zig");
 const httpx = @import("httpx");
+const internal_routes = @import("../internal/routes.zig");
 
 const CreateContext = abi.CreateContext;
 const CallContext = abi.CallContext;
@@ -302,6 +303,68 @@ const OpaqueHttpxHandler = struct {
         return self.registerRoutesWithOptions(server, .generated_with_probes);
     }
 
+    fn installHostInternalServiceAuth(self: *OpaqueHttpxHandler, server: *httpx.Server) !void {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.internal_service_ingress))
+            return error.UnsupportedVersion;
+        try server.use(httpx.Middleware.bind(
+            "antfly-host-internal-service-auth",
+            self,
+            enforceHostInternalServiceAuth,
+        ));
+    }
+
+    fn enforceHostInternalServiceAuth(
+        self: *OpaqueHttpxHandler,
+        context: *httpx.Context,
+        next: *httpx.Next,
+    ) !httpx.Response {
+        if (!requiresHostInternalServicePrincipal(context.request.uri.path)) return next.call(context);
+
+        const source_headers = context.request.headers.iterator();
+        const headers = try context.allocator.alloc(abi.HeaderView, source_headers.len);
+        defer context.allocator.free(headers);
+        for (source_headers, 0..) |header, i| {
+            headers[i] = .{ .name = abi.Bytes.init(header.name), .value = abi.Bytes.init(header.value) };
+        }
+        const request_view: abi.HttpRequestView = .{
+            // Internal-service authorization is method independent. Preserve
+            // supported methods and use GET as a transport placeholder for an
+            // unsupported method so authentication still precedes the 405.
+            .method = switch (context.request.method) {
+                .GET => .get,
+                .POST => .post,
+                .PUT => .put,
+                .DELETE => .delete,
+                else => .get,
+            },
+            .path = abi.Bytes.init(context.request.uri.path),
+            .query = abi.OptionalBytes.init(context.request.uri.query),
+            .headers_ptr = if (headers.len == 0) null else headers.ptr,
+            .headers_len = headers.len,
+        };
+        var response_handle: ?*anyopaque = null;
+        var response_view: abi.HttpResponseView = undefined;
+        var legacy_accepted: u8 = 0;
+        const borrowed_io = context.io;
+        try callError(self.functions.handler_authorize_internal_service(&.{
+            .abi_version = abi.abi_version,
+            .handler_handle = self.handle,
+            .request = &request_view,
+            .executor = .init(&borrowed_io),
+            .out_response_handle = &response_handle,
+            .out_response = &response_view,
+            .out_legacy_accepted = &legacy_accepted,
+        }));
+        if (response_handle) |owned_handle|
+            return copyKernelResponse(context, self.functions, owned_handle, response_view);
+
+        var response = try next.call(context);
+        errdefer response.deinit();
+        if (legacy_accepted != 0)
+            try response.headers.set("X-Antfly-Internal-Auth", "legacy-migration");
+        return response;
+    }
+
     fn registerRoutesWithOptions(self: *OpaqueHttpxHandler, server: *httpx.Server, selection: RouteSelection) !void {
         if (!abi.validFunctionTable(self.functions, abi.Capability.route_manifest)) return error.UnsupportedVersion;
         if (self.runtime_routes.items.len != 0) return error.RoutesAlreadyRegistered;
@@ -355,6 +418,14 @@ const OpaqueHttpxHandler = struct {
         self.* = undefined;
     }
 };
+
+fn requiresHostInternalServicePrincipal(path: []const u8) bool {
+    const in_internal_namespace = std.mem.eql(u8, path, internal_routes.base) or
+        std.mem.startsWith(u8, path, internal_routes.base ++ "/");
+    const ha_exempt = std.mem.eql(u8, path, internal_routes.ha) or
+        std.mem.startsWith(u8, path, internal_routes.ha ++ "/");
+    return in_internal_namespace and !ha_exempt;
+}
 
 const RuntimeRoute = struct {
     functions: *const abi.FunctionTable,
@@ -411,9 +482,21 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
         .out_response_handle = &response_handle,
         .out_response = &response_view,
     }));
-    const owned_response_handle = response_handle orelse return error.RuntimeBoundaryFailure;
-    defer route.functions.handler_destroy_http_response(owned_response_handle);
+    return copyKernelResponse(
+        context,
+        route.functions,
+        response_handle orelse return error.RuntimeBoundaryFailure,
+        response_view,
+    );
+}
 
+fn copyKernelResponse(
+    context: *httpx.Context,
+    functions: *const abi.FunctionTable,
+    owned_response_handle: *anyopaque,
+    response_view: abi.HttpResponseView,
+) !httpx.Response {
+    defer functions.handler_destroy_http_response(owned_response_handle);
     var response = httpx.Response.init(context.allocator, response_view.status);
     errdefer response.deinit();
     if (response_view.content_type.slice()) |content_type|
@@ -428,6 +511,14 @@ fn runtimeApiHttpHandler(context: *httpx.Context) anyerror!httpx.Response {
     response.body = body;
     response.body_owned = true;
     return response;
+}
+
+/// Installs kernel-owned authentication for host-registered `/internal/v1`
+/// routes. Test builds use the direct registrar, which already installs the
+/// same middleware; production opaque builds cross the ABI explicitly.
+pub fn installHostInternalServiceAuth(handler: *HttpxHandler, server: *httpx.Server) !void {
+    if (comptime direct_codegen) return;
+    try handler.installHostInternalServiceAuth(server);
 }
 
 pub fn createHandler(server: *ApiHttpServer) !HttpxHandler {
@@ -482,6 +573,75 @@ pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.Ant
         server.antfly_provider = provider
     else
         server.setAntflyProvider(provider);
+}
+
+test "opaque host middleware protects direct internal routes across the kernel ABI" {
+    const FakeKernel = struct {
+        var calls: usize = 0;
+        var reject = true;
+        var legacy = false;
+
+        fn authorize(context: *const abi.InternalServiceAuthContext) callconv(.c) abi.Status {
+            calls += 1;
+            if (!std.mem.eql(u8, context.request.path.slice(), "/internal/v1/tables/docs"))
+                return abi.statusFromError(error.TestUnexpectedResult);
+            context.out_legacy_accepted.* = @intFromBool(legacy);
+            if (reject) {
+                context.out_response_handle.* = @ptrFromInt(1);
+                context.out_response.* = .{
+                    .status = 401,
+                    .body = abi.Bytes.init("unauthorized"),
+                };
+            } else {
+                context.out_response_handle.* = null;
+            }
+            return .ok;
+        }
+
+        fn destroy(_: *anyopaque) callconv(.c) void {}
+
+        fn next(_: *httpx.Next, ctx: *httpx.Context) anyerror!httpx.Response {
+            return ctx.status(204).text("");
+        }
+    };
+
+    var functions: abi.FunctionTable = undefined;
+    functions.handler_authorize_internal_service = FakeKernel.authorize;
+    functions.handler_destroy_http_response = FakeKernel.destroy;
+    var handler = OpaqueHttpxHandler{
+        .handle = @ptrFromInt(1),
+        .functions = &functions,
+    };
+    var next_handler = httpx.Next{ ._call = FakeKernel.next };
+
+    var internal_request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/tables/docs");
+    defer internal_request.deinit();
+    var internal_context = httpx.Context.init(std.testing.allocator, std.testing.io, &internal_request);
+    defer internal_context.deinit();
+
+    FakeKernel.calls = 0;
+    FakeKernel.reject = true;
+    FakeKernel.legacy = false;
+    var rejected = try handler.enforceHostInternalServiceAuth(&internal_context, &next_handler);
+    defer rejected.deinit();
+    try std.testing.expectEqual(@as(u16, 401), rejected.status.code);
+    try std.testing.expectEqual(@as(usize, 1), FakeKernel.calls);
+
+    FakeKernel.reject = false;
+    FakeKernel.legacy = true;
+    var admitted = try handler.enforceHostInternalServiceAuth(&internal_context, &next_handler);
+    defer admitted.deinit();
+    try std.testing.expectEqual(@as(u16, 204), admitted.status.code);
+    try std.testing.expectEqualStrings("legacy-migration", admitted.headers.get("X-Antfly-Internal-Auth").?);
+
+    var public_request = try httpx.Request.init(std.testing.allocator, .GET, "/db/v1/tables");
+    defer public_request.deinit();
+    var public_context = httpx.Context.init(std.testing.allocator, std.testing.io, &public_request);
+    defer public_context.deinit();
+    var public_response = try handler.enforceHostInternalServiceAuth(&public_context, &next_handler);
+    defer public_response.deinit();
+    try std.testing.expectEqual(@as(u16, 204), public_response.status.code);
+    try std.testing.expectEqual(@as(usize, 2), FakeKernel.calls);
 }
 
 test "linked transport projects the universal request cancellation callback" {

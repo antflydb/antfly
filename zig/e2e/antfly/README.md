@@ -152,6 +152,26 @@ export GOOGLE_CLOUD_PROJECT=my-project
 
 When these envs are absent, the remote backup tests skip cleanly.
 
+## Artifact Full-Text Scale Qualification
+
+`test_artifacts.py` includes an opt-in qualification that generates more than
+one million artifact-backed full-text chunks. It verifies that child ranges
+remain co-resident with their parents and that parents spanning a three-shard
+table produce indexed chunks on every shard. Its deliberately skewed parent
+distribution also drives one shard past the former 746k ceiling. The dedicated
+`Zig Scale Tests` workflow runs this gate daily, through manual dispatch, or on
+a same-repository pull request when the `ci:scale-tests` label is applied. It
+runs separately from the required and full E2E shards.
+
+Run it locally from `zig/` with:
+
+```bash
+ANTFLY_ARTIFACT_FULL_TEXT_SCALE=1 \
+  uv run --project e2e/antfly pytest \
+  e2e/antfly/test_artifacts.py::test_artifact_full_text_scale_exceeds_one_million_chunks_on_three_shards \
+  -q
+```
+
 ## Main Gaps
 
 Compared with `../antfly/e2e`, the biggest missing areas are:

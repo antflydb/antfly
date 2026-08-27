@@ -3108,7 +3108,7 @@ fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, data: []const
 /// Emit one `GLINER2_OPT_PARITY` JSON line per optimizer step with, for every
 /// host-resident LoRA parameter: the post-update weights, Adam m/v state and
 /// per-parameter step counter (first 8 elements + f64 abs-sum per tensor).
-/// Consumed by scripts/compare_gliner2_lora_python_zig.py --dump-optimizer-parity.
+/// Consumed by scripts/gliner2/compare_gliner2_lora_python_zig.py --dump-optimizer-parity.
 fn printOptimizerParityDump(
     allocator: std.mem.Allocator,
     trainer: *real_autodiff.RealAutodiffTrainer,

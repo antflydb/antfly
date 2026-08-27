@@ -616,11 +616,14 @@ pub const DBCore = struct {
         admission: ?index_manager_mod.IndexManager.AtomicCatalogMutation,
     ) !u64 {
         try self.index_manager.addManaged(self.store, cfg, admission);
-        // A managed generation with an admission marker is rebuilt from a
-        // stable source snapshot before replay catch-up. Starting at zero is
-        // fail-closed if the process exits before the outbox is materialized.
-        const applied = if (admission == null) self.nextDerivedSequence() else 0;
-        return applied;
+        // Managed admission reconstructs the pre-admission corpus from its
+        // stable source snapshot (and, for generated indexes, durable seed
+        // records appended after this fence). Replaying history before the
+        // fence is both redundant and unsafe: a later index would otherwise
+        // consume obsolete generated records belonging to earlier catalog
+        // generations. The admission marker and repair-unavailable gate keep
+        // service fail-closed if materialization is interrupted.
+        return self.nextDerivedSequence();
     }
 
     pub fn addEnrichment(self: *DBCore, cfg: types.EnrichmentConfig) !void {

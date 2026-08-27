@@ -21,6 +21,7 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  ZIG_VERSION: 0.16.0
 
 jobs:
   package:
@@ -70,6 +71,17 @@ jobs:
         with:
           node-version: 24.x
           registry-url: https://registry.npmjs.org/
+
+      - name: Set up Zig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xz-utils
+          curl --fail --location --retry 3 \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+            -o "$RUNNER_TEMP/zig.tar.xz"
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
 
       - name: Test Antfly C ABI packaging
         run: python scripts/packaging/test_cabi_packaging.py

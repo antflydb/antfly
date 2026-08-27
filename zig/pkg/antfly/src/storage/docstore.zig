@@ -924,14 +924,28 @@ pub const DocStore = struct {
     }
 
     pub fn beginReadTxn(self: *DocStore) !Txn {
+        return try self.beginReadTxnWithBlockCacheAdmission(.retain);
+    }
+
+    pub fn beginReadTxnWithBlockCacheAdmission(
+        self: *DocStore,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !Txn {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
-        var txn = try self.beginReadTxnUnchecked();
+        var txn = try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission);
         txn.portable_import_reader_owner = self;
         return txn;
     }
 
     fn beginReadTxnUnchecked(self: *DocStore) !Txn {
+        return try self.beginReadTxnUncheckedWithBlockCacheAdmission(.retain);
+    }
+
+    fn beginReadTxnUncheckedWithBlockCacheAdmission(
+        self: *DocStore,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !Txn {
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {
                 var txn = try self.env.begin(.{ .read_only = true });
@@ -945,7 +959,7 @@ pub const DocStore = struct {
             } else error.UnsupportedPlatform,
             .runtime => .{
                 .alloc = self.alloc,
-                .read = try self.runtime_store.beginRead(),
+                .read = try self.runtime_store.beginReadWithBlockCacheAdmission(admission),
             },
         };
     }
@@ -957,13 +971,23 @@ pub const DocStore = struct {
     /// requiring write access. LMDB keeps the normal read-only transaction
     /// because its snapshot semantics are cheap.
     pub fn beginProbeTxn(self: *DocStore) !Txn {
+        return try self.beginProbeTxnWithBlockCacheAdmission(.retain);
+    }
+
+    pub fn beginProbeTxnWithBlockCacheAdmission(
+        self: *DocStore,
+        admission: backend_types.Namespace.BlockCacheAdmission,
+    ) !Txn {
         try self.acquirePortableImportReader();
         errdefer self.releasePortableImportReader();
         var txn: Txn = switch (self.kind) {
-            .lmdb => try self.beginReadTxnUnchecked(),
+            // The outer probe transaction already owns the portable-import
+            // reader fence; use the unchecked LMDB path to avoid double
+            // accounting the same reader.
+            .lmdb => try self.beginReadTxnUncheckedWithBlockCacheAdmission(admission),
             .runtime => .{
                 .alloc = self.alloc,
-                .probe = try self.runtime_store.beginProbe(),
+                .probe = try self.runtime_store.beginProbeWithBlockCacheAdmission(admission),
             },
         };
         txn.portable_import_reader_owner = self;

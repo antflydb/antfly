@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/modelcache"
+	"github.com/antflydb/antfly/go/pkg/sdk/modelcache"
 )
 
 const (
