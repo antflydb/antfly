@@ -65,6 +65,8 @@ const export_source_mod = @import("../models/export_source.zig");
 const gguf_mod = @import("../gguf/root.zig");
 const c_file = @import("../util/c_file.zig");
 const runtime = @import("../runtime/root.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
+const gemma4_runtime = @import("gemma4_runtime.zig");
 const cuda_load_plan = @import("../ops/cuda/load_plan.zig");
 
 const cuda_compute_mod = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
@@ -454,6 +456,9 @@ pub const GgufInspectionReport = struct {
     missing_required_tensors: [][]const u8 = &.{},
     unmapped_tensor_names: [][]const u8 = &.{},
     packed_moe_expert_tensors: [][]const u8 = &.{},
+    packed_moe_expert_tensor_count: usize = 0,
+    packed_moe_q4_0_tensor_count: usize = 0,
+    a4b_packed_expert_layout_qualified: bool = false,
 
     pub fn deinit(self: *GgufInspectionReport) void {
         self.allocator.free(self.architecture);
@@ -471,6 +476,33 @@ pub const GgufInspectionReport = struct {
         self.allocator.free(self.packed_moe_expert_tensors);
     }
 };
+
+fn qualifiedA4bArtifact(report: GgufInspectionReport) bool {
+    const config = report.gpt_config orelse return false;
+    if (!gemma4_runtime.isQualifiedA4bArchitecture(config)) return false;
+    return report.a4b_packed_expert_layout_qualified and
+        report.packed_moe_expert_tensor_count == report.packed_moe_q4_0_tensor_count and
+        report.missing_required_tensors.len == 0;
+}
+
+pub fn resolveA4bInferenceConfigForModelListing(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: manifest_mod.ModelManifest,
+    request: ?backend_contracts.A4bInferenceRequest,
+) !?backend_contracts.A4bInferenceConfig {
+    var report_opt = try inspectGgufModelForListing(allocator, model_path, manifest);
+    defer if (report_opt) |*report| report.deinit();
+    const report = report_opt orelse {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    };
+    const config = report.gpt_config orelse {
+        if (request != null) return error.A4bUnsupportedGeometry;
+        return null;
+    };
+    return resolveA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
+}
 
 pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?GgufInspectionReport {
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
@@ -1084,7 +1116,31 @@ pub fn createMetalSessionWithKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(allocator, model_path, null, config, load_context);
+    return createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
+        allocator,
+        model_path,
+        config,
+        load_context,
+        null,
+    );
+}
+
+pub fn createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    config: kernel_jit.Config,
+    load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
+) !Session {
+    return createGpuHostedSessionWithTaskOverride(
+        allocator,
+        model_path,
+        null,
+        .metal,
+        config,
+        load_context,
+        a4b_request,
+    );
 }
 
 pub fn createMetalSessionWithTaskOverrideAndKernelJit(
@@ -1103,7 +1159,7 @@ pub fn createMetalSessionWithTaskOverrideAndKernelJitAndLoadContext(
     config: kernel_jit.Config,
     load_context: kernel_jit.LoadContext,
 ) !Session {
-    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context);
+    return createGpuHostedSessionWithTaskOverride(allocator, model_path, override, .metal, config, load_context, null);
 }
 
 pub fn createCudaSession(allocator: std.mem.Allocator, model_path: []const u8) !Session {
@@ -1409,6 +1465,7 @@ fn createGpuHostedSessionWithTaskOverride(
     backend_type: BackendType,
     kernel_jit_config: kernel_jit.Config,
     kernel_jit_load_context: kernel_jit.LoadContext,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !Session {
     try kernel_jit_config.validate();
     try metal_runtime.validateMetalJitLoadContext(kernel_jit_config, kernel_jit_load_context);
@@ -1426,6 +1483,7 @@ fn createGpuHostedSessionWithTaskOverride(
     var metal_jit_scope: MetalJitRouteScope = if (build_options.enable_metal)
         metal_runtime.MetalJitRouteScope.none()
     else {};
+    var a4b_artifact_qualified = false;
     if (mf.usesGgufWeights()) {
         var report_opt = try inspectGgufModel(allocator, model_path);
         defer if (report_opt) |*report| report.deinit();
@@ -1433,8 +1491,28 @@ fn createGpuHostedSessionWithTaskOverride(
             try ensureGgufInspectionCompatible(report, mf.gguf_path.?);
             if (backend_type == .metal) {
                 try ensureMetalGgufInspectionCompatible(report, mf.gguf_path.?);
+                a4b_artifact_qualified = qualifiedA4bArtifact(report);
             }
         }
+    }
+
+    const a4b_inference = try resolveA4bInferenceConfig(
+        arch_config,
+        a4b_request,
+        a4b_artifact_qualified,
+    );
+    if (a4b_inference) |config| {
+        std.log.info(
+            "gemma4_a4b_runtime: mode={s} budget_mb={d} kv_mb={d} safety_mb={d} expert_slots={d} model={s}",
+            .{
+                @tagName(config.residency_mode),
+                config.memory_budget_bytes / (1024 * 1024),
+                config.kv_budget_bytes / (1024 * 1024),
+                config.safety_reserve_bytes / (1024 * 1024),
+                config.expert_cache_slots,
+                model_path,
+            },
+        );
     }
 
     var lazy_weights = std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry){};
@@ -1456,7 +1534,10 @@ fn createGpuHostedSessionWithTaskOverride(
 
     var eager_dense = false;
     const resident_weight_bytes_override: usize = 0;
-    const budget_policy = gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
+    const budget_policy = if (a4b_inference) |config|
+        a4bGpuHostedBudgetPolicy(config)
+    else
+        gpuHostedBudgetPolicy(backend_type, model_weight_bytes, mf, arch_config, quant_mode);
     const prefer_f32_dense_tensors = budget_policy.prefer_f32_dense_tensors;
     const budget_floor = budget_policy.budget_floor;
     const shared_cache_floor = budget_policy.shared_cache_floor;
@@ -1555,7 +1636,10 @@ fn createGpuHostedSessionWithTaskOverride(
         else => 0,
     };
     const residency = if (lazy_weights.count() > 0 and moe_num_experts > 0)
-        runtime.moe.residency.SharedResidency.init(allocator, defaultResidentExpertsPerLayer(arch_config))
+        runtime.moe.residency.SharedResidency.init(
+            allocator,
+            if (a4b_inference) |config| config.expert_cache_slots else defaultResidentExpertsPerLayer(arch_config),
+        )
     else
         null;
     const tier_cache = if (lazy_weights.count() > 0) blk: {
@@ -1618,6 +1702,7 @@ fn createGpuHostedSessionWithTaskOverride(
             .lazy_weights = lazy_weights,
             .tensor_store = tensor_store,
             .moe_num_experts = @intCast(moe_num_experts),
+            .a4b_inference = a4b_inference,
             .residency = residency,
             .tier_cache = tier_cache,
             .allow_direct_quant = direct_quant_enabled,
@@ -2186,6 +2271,14 @@ fn buildGgufInspectionReportFromFile(
         normalized_names.deinit(allocator);
     }
     try collectNormalizedGgufNames(allocator, arch_config, file, &normalized_names, &unmapped, &packed_moe);
+    for (file.tensors) |tensor| {
+        if (!isPackedMoeExpertTensor(tensor.name)) continue;
+        report.packed_moe_expert_tensor_count += 1;
+        if (std.meta.eql(tensor.tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 })) {
+            report.packed_moe_q4_0_tensor_count += 1;
+        }
+    }
+    report.a4b_packed_expert_layout_qualified = qualifiedA4bPackedExpertLayout(arch_config, file);
 
     switch (arch_config) {
         .gpt => |cfg| try collectMissingRequiredGptWeights(allocator, cfg, &normalized_names, &missing, packed_moe.items.len > 0),
@@ -2548,6 +2641,54 @@ fn isPackedMoeExpertTensor(raw_name: []const u8) bool {
         std.mem.endsWith(u8, raw_name, ".ffn_down_exps.weight") or
         std.mem.endsWith(u8, raw_name, ".ffn_up_exps.weight") or
         std.mem.endsWith(u8, raw_name, ".ffn_gate_up_exps.weight");
+}
+
+/// Require one unambiguous Q4_0 routed-expert layout per A4B layer. GGUF may
+/// encode gate/up as two tensors or as one interleaved gate_up tensor; mixing
+/// both representations in a layer would make lazy weight registration order
+/// dependent and is rejected.
+fn qualifiedA4bPackedExpertLayout(arch_config: ArchConfig, file: *const gguf_mod.format.File) bool {
+    const config = switch (arch_config) {
+        .gpt => |cfg| cfg,
+        else => return false,
+    };
+    if (!gemma4_runtime.isQualifiedA4bArchitecture(config)) return false;
+
+    const layer_count = backend_contracts.qualified_a4b_geometries[0].moe_layer_count;
+    var layer_masks: [layer_count]u8 = @splat(0);
+    for (file.tensors) |tensor| {
+        const packed_tensor = parsePackedMoeTensor(tensor.name) orelse continue;
+        if (packed_tensor.layer >= layer_masks.len) return false;
+        if (!std.meta.eql(tensor.tensor_type, gguf_mod.tensor_types.TensorType{ .known = .Q4_0 })) return false;
+        if (tensor.dimensions.len != 3 or
+            tensor.dimensions[2] != @as(u64, @intCast(config.num_local_experts))) return false;
+        const bit: u8 = if (packed_tensor.fused_gate_up) blk: {
+            if (tensor.dimensions[0] != config.hidden_size or
+                tensor.dimensions[1] != @as(u64, config.expertIntermediateSize()) * 2) return false;
+            break :blk 1 << 3;
+        } else if (std.mem.eql(u8, packed_tensor.proj, "w1")) blk: {
+            if (tensor.dimensions[0] != config.hidden_size or
+                tensor.dimensions[1] != config.expertIntermediateSize()) return false;
+            break :blk 1 << 0;
+        } else if (std.mem.eql(u8, packed_tensor.proj, "w2")) blk: {
+            if (tensor.dimensions[0] != config.expertIntermediateSize() or
+                tensor.dimensions[1] != config.hidden_size) return false;
+            break :blk 1 << 1;
+        } else if (std.mem.eql(u8, packed_tensor.proj, "w3")) blk: {
+            if (tensor.dimensions[0] != config.hidden_size or
+                tensor.dimensions[1] != config.expertIntermediateSize()) return false;
+            break :blk 1 << 2;
+        } else return false;
+        if (layer_masks[packed_tensor.layer] & bit != 0) return false;
+        layer_masks[packed_tensor.layer] |= bit;
+    }
+
+    const separate_gate_up: u8 = (1 << 0) | (1 << 1) | (1 << 2);
+    const fused_gate_up: u8 = (1 << 1) | (1 << 3);
+    for (layer_masks) |mask| {
+        if (mask != separate_gate_up and mask != fused_gate_up) return false;
+    }
+    return true;
 }
 
 fn appendMissingFmt(
@@ -3739,6 +3880,40 @@ fn defaultResidentExpertsPerLayer(arch_config: ArchConfig) usize {
     };
 }
 
+fn resolveA4bInferenceConfig(
+    arch_config: ArchConfig,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
+    const gpt_config = switch (arch_config) {
+        .gpt => |config| config,
+        else => {
+            if (request != null) return error.A4bUnsupportedGeometry;
+            return null;
+        },
+    };
+    return resolveA4bGptInferenceConfig(gpt_config, request, artifact_qualified);
+}
+
+fn resolveA4bGptInferenceConfig(
+    gpt_config: gpt_mod.Config,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
+    if (!gemma4_runtime.isQualifiedA4bArchitecture(gpt_config)) {
+        if (request != null) return error.A4bUnsupportedGeometry;
+        return null;
+    }
+    if (!artifact_qualified) {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    }
+    return try backend_contracts.buildA4bInferenceConfig(
+        request orelse .{},
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+}
+
 fn shouldRetainTensorStore(store_kind: tensor_store_mod.StoreKind, lazy_weight_count: usize) bool {
     // Safetensors stores mmap weights and resident tensors may borrow those
     // buffers directly, so the store must live for the entire session.
@@ -3847,6 +4022,79 @@ test "gpu-hosted Metal availability gate agrees with linked runtime probe" {
     try ensureMetalHostedSessionAvailable();
 }
 
+test "A4B artifact qualification requires the complete Q4_0 expert set" {
+    var report = GgufInspectionReport{
+        .allocator = std.testing.allocator,
+        .architecture = "gemma4",
+        .tensor_count = 90,
+        .metadata_count = 0,
+        .gpt_config = .{
+            .family = .gemma,
+            .hidden_size = 2816,
+            .num_hidden_layers = 30,
+            .num_local_experts = 128,
+            .num_experts_per_tok = 8,
+            .num_shared_experts = 1,
+            .expert_intermediate_size = 704,
+        },
+        .packed_moe_expert_tensor_count = 60,
+        .packed_moe_q4_0_tensor_count = 60,
+        .a4b_packed_expert_layout_qualified = true,
+    };
+    try std.testing.expect(qualifiedA4bArtifact(report));
+    report.packed_moe_q4_0_tensor_count -= 1;
+    try std.testing.expect(!qualifiedA4bArtifact(report));
+}
+
+test "A4B geometry does not opt an unqualified artifact into A4B inference" {
+    const matching_geometry = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+
+    try std.testing.expect((try resolveA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        false,
+    )) == null);
+    try std.testing.expectError(error.A4bUnsupportedArtifact, resolveA4bGptInferenceConfig(
+        matching_geometry,
+        .{},
+        false,
+    ));
+    try std.testing.expect((try resolveA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        true,
+    )) != null);
+}
+
+test "A4B configured GGUF passes metadata-only production qualification" {
+    const model_path = platform.env.getenv("ANTFLY_INFERENCE_GEMMA4_A4B_TEST_MODEL") orelse
+        return error.SkipZigTest;
+    var manifest = try manifest_mod.loadListingFromDir(std.testing.allocator, model_path);
+    defer manifest.deinit();
+
+    const config = try resolveA4bInferenceConfigForModelListing(
+        std.testing.allocator,
+        model_path,
+        manifest,
+        .{
+            .residency_mode = .streamed,
+            .memory_budget_mb = 2048,
+        },
+    );
+    const qualified = config orelse return error.A4bUnsupportedArtifact;
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.streamed, qualified.residency_mode);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024 * 1024), qualified.memory_budget_bytes);
+    try std.testing.expectEqual(@as(u8, 8), qualified.expert_cache_slots);
+}
+
 fn openMetalHostedStream() !GpuHostedStream {
     try ensureMetalHostedSessionAvailable();
     if (comptime false) {
@@ -3861,6 +4109,31 @@ const GpuHostedBudgetPolicy = struct {
     plan_context: runtime.tier.planner.PlanContext,
     prefer_f32_dense_tensors: bool,
 };
+
+fn a4bGpuHostedBudgetPolicy(config: backend_contracts.A4bInferenceConfig) GpuHostedBudgetPolicy {
+    const budget: usize = @intCast(config.memory_budget_bytes);
+    const kv: usize = @intCast(config.kv_budget_bytes);
+    const scratch: usize = @intCast(config.safety_reserve_bytes);
+    const weights = budget -| kv -| scratch;
+    return .{
+        .budget_floor = .{
+            .backend_limit_bytes = budget,
+            .combined_limit_bytes = budget,
+            .kv_limit_bytes = kv,
+            .scratch_limit_bytes = scratch,
+        },
+        .shared_cache_floor = .{
+            .host_limit_bytes = weights,
+            .backend_limit_bytes = weights,
+        },
+        .plan_context = .{
+            .backend = .gpu,
+            .host_budget_bytes = weights,
+            .backend_budget_bytes = weights,
+        },
+        .prefer_f32_dense_tensors = false,
+    };
+}
 
 fn gpuHostedBudgetPolicy(
     backend_type: BackendType,
@@ -3993,6 +4266,7 @@ const GpuHostedBackendInit = struct {
     lazy_weights: std.StringHashMapUnmanaged(gpu_hosted_store_mod.LazyWeightEntry),
     tensor_store: ?tensor_store_mod.TensorStore,
     moe_num_experts: u32,
+    a4b_inference: ?backend_contracts.A4bInferenceConfig,
     residency: ?runtime.moe.residency.SharedResidency,
     tier_cache: ?runtime.tier.cache.SharedCache,
     allow_direct_quant: bool,
@@ -4016,6 +4290,7 @@ fn makeGpuHostedBackendData(
         .lazy_weights = init.lazy_weights,
         .tensor_store = init.tensor_store,
         .moe_num_experts = init.moe_num_experts,
+        .a4b_inference = init.a4b_inference,
         .residency = init.residency,
         .tier_cache = init.tier_cache,
         .allow_direct_quant = init.allow_direct_quant,

@@ -45,6 +45,8 @@ const RunConfig = struct {
         backend: ?[]const u8 = null,
         format: ?[]const u8 = null,
         quantization: ?[]const u8 = null,
+        residency_mode: ?inference.ops.A4bResidencyMode = null,
+        memory_budget_mb: ?u32 = null,
     };
 
     const PromptCacheConfig = struct {
@@ -174,8 +176,10 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
     var backend: ?inference.backends.BackendType = null;
     if (std.mem.indexOfScalar(u8, model_name, ':')) |backend_separator| {
         const backend_name = model_name[0..backend_separator];
-        backend = parseBackendType(backend_name) orelse return error.InvalidArguments;
-        model_name = model_name[backend_separator + 1 ..];
+        if (parseBackendType(backend_name)) |parsed_backend| {
+            backend = parsed_backend;
+            model_name = model_name[backend_separator + 1 ..];
+        }
     }
     if (model_name.len == 0) return error.InvalidArguments;
     return .{
@@ -184,7 +188,24 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .backend = backend,
         .format = null,
         .quantization = null,
+        .residency_mode = null,
+        .memory_budget_mb = null,
     };
+}
+
+test "preload model parser preserves registry variants and recognizes explicit backends" {
+    const variant = try parsePreloadModelFlag("embedder:owner/model:i8");
+    try std.testing.expectEqual(inference.server.WarmModelKind.embedder, variant.kind);
+    try std.testing.expectEqualStrings("owner/model:i8", variant.name);
+    try std.testing.expect(variant.backend == null);
+
+    const multi_component_variant = try parsePreloadModelFlag("generator:owner/model:gguf:Q4_K_M");
+    try std.testing.expectEqualStrings("owner/model:gguf:Q4_K_M", multi_component_variant.name);
+    try std.testing.expect(multi_component_variant.backend == null);
+
+    const backend = try parsePreloadModelFlag("generator:metal:owner/model:i8");
+    try std.testing.expectEqualStrings("owner/model:i8", backend.name);
+    try std.testing.expectEqual(inference.backends.BackendType.metal, backend.backend.?);
 }
 
 fn parseAdmissionLimit(value: []const u8) !usize {
@@ -226,6 +247,8 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .backend = try parseOptionalBackendType(value.backend),
             .format = value.format,
             .quantization = value.quantization,
+            .residency_mode = value.residency_mode,
+            .memory_budget_mb = value.memory_budget_mb,
         };
     }
     return out;

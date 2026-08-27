@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const tensor_types = @import("tensor_types.zig");
+const a4b_qualification = @import("../runtime/moe/a4b_qualification.zig");
 
 pub const magic = "GGUF";
 pub const default_alignment: u64 = 32;
@@ -289,6 +290,28 @@ fn parseWithOptions(allocator: std.mem.Allocator, bytes: []const u8, options: Pa
 pub const SupportMetadata = struct {
     architecture: ?[]const u8 = null,
     expert_count: u32 = 0,
+    block_count: u32 = 0,
+    embedding_length: u32 = 0,
+    expert_used_count: u32 = 0,
+    expert_feed_forward_length: u32 = 0,
+    file_type: u32 = 0,
+
+    /// Lightweight serving qualification for the single Gemma 4 26B-A4B
+    /// artifact geometry supported by the bounded Metal runtime. The backend
+    /// still validates every packed expert tensor and rejects mixed/non-Q4_0
+    /// layouts before publishing a session.
+    pub fn isQualifiedGemma4A4b(self: SupportMetadata) bool {
+        return self.architecture != null and
+            std.mem.eql(u8, self.architecture.?, a4b_qualification.architecture) and
+            a4b_qualification.matchesGeometry(
+                self.block_count,
+                self.expert_count,
+                self.expert_used_count,
+                self.embedding_length,
+                self.expert_feed_forward_length,
+            ) and
+            self.file_type == a4b_qualification.gguf_file_type;
+    }
 };
 
 /// Read the small set of GGUF metadata used to choose a safe serving path, skipping every
@@ -311,8 +334,18 @@ pub fn readSupportMetadata(bytes: []const u8) !SupportMetadata {
 
         if (value_type == .string and std.mem.eql(u8, key, "general.architecture")) {
             result.architecture = try cursor.readBorrowedString();
+        } else if (value_type == .u32 and std.mem.eql(u8, key, "general.file_type")) {
+            result.file_type = try cursor.readInt(u32);
         } else if (value_type == .u32 and std.mem.endsWith(u8, key, ".expert_count")) {
             result.expert_count = try cursor.readInt(u32);
+        } else if (value_type == .u32 and std.mem.endsWith(u8, key, ".block_count")) {
+            result.block_count = try cursor.readInt(u32);
+        } else if (value_type == .u32 and std.mem.endsWith(u8, key, ".embedding_length")) {
+            result.embedding_length = try cursor.readInt(u32);
+        } else if (value_type == .u32 and std.mem.endsWith(u8, key, ".expert_used_count")) {
+            result.expert_used_count = try cursor.readInt(u32);
+        } else if (value_type == .u32 and std.mem.endsWith(u8, key, ".expert_feed_forward_length")) {
+            result.expert_feed_forward_length = try cursor.readInt(u32);
         } else {
             try cursor.skipMetadataValue(value_type);
         }
@@ -544,7 +577,7 @@ test "readArchitecture skips past preceding metadata including token arrays" {
     try data.appendSlice(allocator, magic);
     try appendLe(u32, allocator, &data, 3);
     try appendLe(u64, allocator, &data, 0);
-    try appendLe(u64, allocator, &data, 5);
+    try appendLe(u64, allocator, &data, 9);
 
     // A string array, like tokenizer.ggml.tokens: the entry that makes a full parse
     // expensive, and the one readArchitecture must walk without allocating.
@@ -565,7 +598,7 @@ test "readArchitecture skips past preceding metadata including token arrays" {
 
     try appendString(allocator, &data, "gemma4.block_count");
     try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
-    try appendLe(u32, allocator, &data, 42);
+    try appendLe(u32, allocator, &data, 30);
 
     try appendString(allocator, &data, "general.architecture");
     try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.string));
@@ -577,9 +610,29 @@ test "readArchitecture skips past preceding metadata including token arrays" {
     try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
     try appendLe(u32, allocator, &data, 128);
 
+    try appendString(allocator, &data, "gemma4.embedding_length");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 2816);
+
+    try appendString(allocator, &data, "gemma4.expert_used_count");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 8);
+
+    try appendString(allocator, &data, "gemma4.expert_feed_forward_length");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 704);
+
+    try appendString(allocator, &data, "general.file_type");
+    try appendLe(u32, allocator, &data, @intFromEnum(MetadataValueType.u32));
+    try appendLe(u32, allocator, &data, 2);
+
     const metadata = try readSupportMetadata(data.items);
     try std.testing.expectEqualStrings("gemma4", metadata.architecture.?);
     try std.testing.expectEqual(@as(u32, 128), metadata.expert_count);
+    try std.testing.expect(metadata.isQualifiedGemma4A4b());
+    var unsupported = metadata;
+    unsupported.expert_used_count = 4;
+    try std.testing.expect(!unsupported.isQualifiedGemma4A4b());
 }
 
 test "encoded metadata prefix scan counts only matching entries" {

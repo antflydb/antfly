@@ -17,9 +17,9 @@ limitations under the License.
 package sdk
 
 import (
+	"encoding/json"
 	"fmt"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 )
 

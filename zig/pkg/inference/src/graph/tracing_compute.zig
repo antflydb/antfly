@@ -1060,13 +1060,15 @@ pub const TracingCompute = struct {
         return tc.makeHandle(id);
     }
 
-    fn moeSelectRoutesOp(ctx: *anyopaque, logits: CT, rows: usize, num_experts: usize, top_k: usize, allocator: std.mem.Allocator) anyerror!?MoeRouteSelection {
+    fn moeSelectRoutesOp(ctx: *anyopaque, layer_index: usize, logits: CT, rows: usize, num_experts: usize, top_k: usize, logit_scale: f32, allocator: std.mem.Allocator) anyerror!?MoeRouteSelection {
+        _ = logit_scale;
         const tc = fromCtx(ctx);
         const in_id = nodeIdFromCT(logits);
         // Record the select_routes node so the graph captures MoE structure.
         // Save its ID so downstream MoE ops can reference it as a dependency.
         tc.last_moe_select_routes = try tc.graph.addNode(.{
             .op = .{ .fused_moe_select_routes = .{
+                .layer_index = @intCast(layer_index),
                 .rows = @intCast(rows),
                 .num_experts = @intCast(num_experts),
                 .top_k = @intCast(top_k),

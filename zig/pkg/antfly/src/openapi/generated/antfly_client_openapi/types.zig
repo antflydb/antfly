@@ -917,8 +917,10 @@ pub const BatchResponse = struct {
 
 /// Configuration for the AWS Bedrock embedding provider. Uses the AWS credential chain: environment variables, web identity, shared credentials, ECS task roles, and EC2 instance roles. **Example Models:** cohere.embed-v4, amazon.titan-embed-text-v2:0 **Docs:** https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html
 pub const BedrockEmbedderConfig = struct {
-    /// The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+    /// The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
     model: []const u8,
+    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
+    request_format: ?[]const u8 = null,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
     /// Output dimension for Bedrock embedding models that support configurable dimensions.
@@ -1838,6 +1840,7 @@ pub const CreateEmbeddingsIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+    publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -2019,6 +2022,7 @@ pub const CreatedEmbeddingsIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
+    publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
     sparse: ?bool = null,
@@ -2041,6 +2045,7 @@ pub const CreatedEmbeddingsIndex = struct {
 
 /// Credential-free normalized embeddings configuration returned after creation.
 pub const CreatedEmbeddingsIndexConfig = struct {
+    publication_policy: ?IndexPublicationPolicy = null,
     coverage_policy: ?DerivedCoveragePolicy = null,
     external: ?bool = null,
     sparse: ?bool = null,
@@ -2914,6 +2919,8 @@ pub const EmbedderConfig = struct {
     credentials_path: ?[]const u8 = null,
     /// Output dimension for the embedding (uses MRL for dimension reduction). Recommended: 256, 512, 1024, 1536, or 3072.
     dimensions: ?i64 = null,
+    /// Bedrock provider request schema. `auto` recognizes direct foundation-model IDs, foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly for application inference profiles, provisioned throughput, custom models, and other aliases whose invocation target does not identify the underlying model.
+    request_format: ?[]const u8 = null,
     /// The AWS region for the Bedrock service (e.g., 'us-east-1').
     region: ?[]const u8 = null,
     /// Cohere Bedrock input type, such as search_document, search_query, classification, or clustering.
@@ -2982,6 +2989,7 @@ pub const Embedding = std.json.Value;
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
+    publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -4762,6 +4770,7 @@ pub const IndexConfig = struct {
     field: ?[]const u8 = null,
     /// Generated artifact stream indexed as text. Use with matching inline enrichments.
     artifact_name: ?[]const u8 = null,
+    publication_policy: ?IndexPublicationPolicy = null,
     /// Source-unit completeness policy for managed embeddings. `strict` requires one produced outcome per source document; `partial` permits intentional skips; `best_effort` also treats terminal failures as complete while reporting the index unhealthy. External indexes use `external: true` and must not set this field.
     coverage_policy: ?DerivedCoveragePolicy = null,
     /// When true, embeddings are supplied externally via _embeddings and the index does not derive prompts from a field or template.
@@ -4833,6 +4842,10 @@ pub const IndexConfig = struct {
         }
         if (self.artifact_name) |value| {
             try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.publication_policy) |value| {
+            try jw.objectField("publication_policy");
             try jw.write(value);
         }
         if (self.coverage_policy) |value| {
@@ -4947,15 +4960,43 @@ pub const IndexExecutionConfig = struct {
     embedding: ?ExecutionPolicy = null,
 };
 
-/// Authoritative query-readiness state for the desired index incarnation.
+/// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
+pub const IndexPublicationPolicy = enum {
+    progressive,
+    atomic,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .progressive => "progressive",
+            .atomic => "atomic",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "progressive", .progressive },
+            .{ "atomic", .atomic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Authoritative query-readiness and completeness state for the desired index incarnation.
 pub const IndexReadinessState = enum {
     pending,
+    queryable_partial,
     ready,
     failed,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .pending => "pending",
+            .queryable_partial => "queryable_partial",
             .ready => "ready",
             .failed => "failed",
         };
@@ -4969,6 +5010,7 @@ pub const IndexReadinessState = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "pending", .pending },
+            .{ "queryable_partial", .queryable_partial },
             .{ "ready", .ready },
             .{ "failed", .failed },
         });
@@ -4978,6 +5020,10 @@ pub const IndexReadinessState = enum {
 
 pub const IndexReadinessStatus = struct {
     state: IndexReadinessState,
+    /// Whether the published generation can safely answer queries.
+    queryable: bool,
+    /// Whether the desired incarnation has complete coverage and publication according to its configured policies.
+    complete: bool,
     /// Opaque identity for the desired index incarnation. Clients may compare it for equality but must not interpret its contents.
     incarnation: ?[]const u8 = null,
     /// Highest captured source/replay revision required by this readiness observation.
@@ -5073,6 +5119,35 @@ pub const IndexType = enum {
             .{ "embeddings", .embeddings },
             .{ "graph", .graph },
             .{ "algebraic", .algebraic },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+pub const InferenceA4bResidencyMode = enum {
+    auto,
+    streamed,
+    resident,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .streamed => "streamed",
+            .resident => "resident",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "streamed", .streamed },
+            .{ "resident", .resident },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -5605,6 +5680,8 @@ pub const InferenceGenerateDelta = struct {
     role: ?InferenceRole = null,
     /// Token content delta
     content: ?[]const u8 = null,
+    /// Reasoning content delta, separate from public content
+    reasoning_content: ?[]const u8 = null,
     /// Tool call deltas for streaming tool calls
     tool_calls: ?[]const InferenceToolCallDelta = null,
 };
@@ -5622,6 +5699,8 @@ pub const InferenceGenerateMessage = struct {
     role: InferenceRole,
     /// The generated message content (null when tool_calls is present)
     content: ?[]const u8 = null,
+    /// Model reasoning emitted on a private reasoning channel, separate from public content
+    reasoning_content: ?[]const u8 = null,
     /// Tool calls made by the model (only present when finish_reason is tool_calls)
     tool_calls: ?[]const ToolCall = null,
 };
@@ -5938,6 +6017,10 @@ pub const InferenceModelRef = struct {
     backend: ?InferenceModelBackend = null,
     format: ?InferenceModelFormat = null,
     quantization: ?InferenceModelQuantization = null,
+    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime. Other model geometries reject this field.
+    residency_mode: ?InferenceA4bResidencyMode = null,
+    /// Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
+    memory_budget_mb: ?i64 = null,
 };
 
 pub const InferenceModelsResponse = struct {

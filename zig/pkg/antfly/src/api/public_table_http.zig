@@ -137,6 +137,7 @@ pub const TableApi = struct {
         CorruptInput,
         UnsupportedVersion,
         Corrupted,
+        IncompletePublishedSnapshot,
         InternalFailure,
     };
 
@@ -181,6 +182,7 @@ pub const TableApi = struct {
         RestoreDurabilityPending,
         RestoreDurabilityConfirmed,
         BackupIntegrityFailure,
+        RestoreDestinationReauthorizationRequired,
         InvalidBackupRequest,
         InternalFailure,
     };
@@ -946,6 +948,10 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query embedding upstream failure table={s}", .{table_name});
                 return .{ .status = 502, .body = try alloc.dupe(u8, "query embedding provider failed") };
             },
+            error.IncompletePublishedSnapshot => {
+                std.log.warn("public table query detected incomplete index generation table={s}", .{table_name});
+                return try queryTemporarilyUnavailableOwnedResponse(alloc, .index_rebuilding);
+            },
             error.InvalidManifest,
             error.InvalidTableFile,
             error.TableBlockChecksumMismatch,
@@ -1200,6 +1206,10 @@ pub fn handleTableRestore(
         error.RestoreDurabilityPending => return .{ .status = 202, .body = try backups_api.encodeRestoreDurabilityPending(alloc), .json = true },
         error.RestoreDurabilityConfirmed => return .{ .status = 200, .body = try backups_api.encodeRestoreDurabilityConfirmed(alloc), .json = true },
         error.BackupIntegrityFailure => return .{ .status = 422, .body = try alloc.dupe(u8, backups_api.integrity_failure_message) },
+        error.RestoreDestinationReauthorizationRequired => return .{
+            .status = 409,
+            .body = try alloc.dupe(u8, "restore was queued before destination authorization was recorded; resubmit it to reauthorize CDC and graph destinations"),
+        },
         error.InvalidBackupRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "restore failed") },
     };
@@ -2745,6 +2755,7 @@ test "public table query handler preserves retryable failure status" {
         .{ .err = error.HierarchyCursorStale, .status = 409, .body = "{\"status\":409,\"error\":\"hierarchy_cursor_stale\",\"message\":\"the source hierarchy changed after this cursor was issued\",\"action\":\"restart_hierarchy_traversal\",\"restart_without\":\"search_after\",\"retryable\":false}", .json = true },
         .{ .err = error.InvalidManifest, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"InvalidManifest\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
         .{ .err = error.CorruptInput, .status = 500, .body = "{\"code\":\"table_storage_unreadable\",\"error\":\"CorruptInput\",\"message\":\"table storage unreadable\",\"retryable\":false}", .json = true },
+        .{ .err = error.IncompletePublishedSnapshot, .status = 503, .body = "", .json = true, .unavailable_code = "index_rebuilding", .unavailable_message = "required index is rebuilding" },
     };
 
     for (cases) |tc| {

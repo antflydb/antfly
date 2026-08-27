@@ -2,11 +2,7 @@ module github.com/antflydb/antfly/go/pkg/genkit/antfly
 
 go 1.26.0
 
-replace (
-	github.com/antflydb/antfly/go/pkg/generating => ../../generating
-	github.com/antflydb/antfly/go/pkg/libaf => ../../libaf
-	github.com/antflydb/antfly/go/pkg/sdk => ../../sdk
-)
+replace github.com/antflydb/antfly/go/pkg/sdk => ../../sdk
 
 require (
 	github.com/antflydb/antfly/go/pkg/sdk v0.0.1
@@ -16,8 +12,6 @@ require (
 )
 
 require (
-	github.com/antflydb/antfly/go/pkg/generating v0.0.0 // indirect
-	github.com/antflydb/antfly/go/pkg/libaf v0.0.1 // indirect
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect

@@ -3087,6 +3087,7 @@ paths:
 
         direct-path generation.
       operationId: restore
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -3126,6 +3127,13 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          description: The selected backup contains durable destinations that cannot be bound to this
+            credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
         '500':
@@ -3821,6 +3829,7 @@ paths:
       tags:
         - table_management
       operationId: createTable
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       requestBody:
         required: true
         content:
@@ -3836,6 +3845,12 @@ paths:
                 $ref: '#/components/schemas/Table'
         '400':
           $ref: '#/components/responses/BadRequest'
+        '422':
+          description: Durable destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -4136,6 +4151,7 @@ paths:
       tags:
         - data_operations
       operationId: restoreTable
+      x-antfly-credential-note: Durable CDC and graph destinations require Basic or API-key authentication.
       parameters:
         - name: Idempotency-Key
           in: header
@@ -4174,8 +4190,82 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          description: The backup contains durable destinations that cannot be bound to this credential
+            type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '503':
           $ref: '#/components/responses/ServiceUnavailable'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
+  /db/v1/tables/{tableName}/destination-authorization:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table whose stored destinations should be adopted
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Adopt stored write destinations with the current credential
+      description: >
+        Reauthorizes the table's existing CDC routes and graph resolver destinations
+
+        using the caller's current permissions. This idempotent operation is intended
+
+        for upgrading tables created before durable destination authorization was
+
+        introduced, and for explicitly transferring destination ownership after a
+
+        credential is rotated. The caller needs admin permission on the source table
+
+        and write permission on every eventual destination table.
+      tags:
+        - table_management
+      operationId: reauthorizeTableDestinations
+      responses:
+        '200':
+          description: Destination authorization was durably adopted
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - table
+                  - status
+                properties:
+                  table:
+                    type: string
+                  status:
+                    type: string
+                    enum:
+                      - authorized
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Caller lacks authority on the source or a destination table
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          description: Durable destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5264,6 +5354,7 @@ paths:
       tags:
         - index_management
       operationId: createIndex
+      x-antfly-credential-note: Graph resolver destinations require Basic or API-key authentication.
       requestBody:
         required: true
         content:
@@ -5285,6 +5376,12 @@ paths:
           $ref: '#/components/responses/MethodNotAllowed'
         '409':
           $ref: '#/components/responses/Conflict'
+        '422':
+          description: Graph resolver destinations cannot be bound to this credential type
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '429':
           $ref: '#/components/responses/StorageResourceExhausted'
         '503':
@@ -16692,6 +16789,15 @@ components:
               type: string
               enum:
                 - full_text
+    IndexPublicationPolicy:
+      type: string
+      enum:
+        - progressive
+        - atomic
+      default: progressive
+      description: Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed
+        active generation queryable before initial source coverage is complete. `atomic` keeps a new generation
+        unavailable until complete validation and activation.
     DerivedCoveragePolicy:
       type: string
       enum:
@@ -16928,8 +17034,26 @@ components:
       properties:
         model:
           type: string
-          description: The Bedrock model ID to use (e.g., 'cohere.embed-v4', 'amazon.titan-embed-text-v2:0').
+          description: The Bedrock model ID, inference profile ID, or ARN to invoke (e.g., 'cohere.embed-v4',
+            'amazon.titan-embed-text-v2:0', or an application inference profile ARN).
           example: cohere.embed-v4
+        request_format:
+          type: string
+          enum:
+            - auto
+            - titan_text
+            - titan_multimodal
+            - cohere_v3
+            - cohere_v4
+          description: >-
+            Bedrock provider request schema. `auto` recognizes direct foundation-model IDs,
+
+            foundation-model ARNs, and system inference-profile IDs/ARNs. Set this explicitly
+
+            for application inference profiles, provisioned throughput, custom models, and
+
+            other aliases whose invocation target does not identify the underlying model.
+          default: auto
         region:
           type: string
           description: The AWS region for the Bedrock service (e.g., 'us-east-1').
@@ -16960,6 +17084,7 @@ components:
       example:
         provider: bedrock
         model: cohere.embed-v4
+        request_format: cohere_v4
         region: us-east-1
     CohereEmbedderConfig:
       type: object
@@ -17933,6 +18058,8 @@ components:
         (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be
         auto-detected.
       properties:
+        publication_policy:
+          $ref: '#/components/schemas/IndexPublicationPolicy'
         coverage_policy:
           $ref: '#/components/schemas/DerivedCoveragePolicy'
           description: 'Source-unit completeness policy for managed embeddings. `strict` requires one
@@ -18732,18 +18859,28 @@ components:
       type: string
       enum:
         - pending
+        - queryable_partial
         - ready
         - failed
-      description: Authoritative query-readiness state for the desired index incarnation.
+      description: Authoritative query-readiness and completeness state for the desired index incarnation.
     IndexReadinessStatus:
       type: object
       additionalProperties: false
       required:
         - state
+        - queryable
+        - complete
         - pending_reasons
       properties:
         state:
           $ref: '#/components/schemas/IndexReadinessState'
+        queryable:
+          type: boolean
+          description: Whether the published generation can safely answer queries.
+        complete:
+          type: boolean
+          description: Whether the desired incarnation has complete coverage and publication according
+            to its configured policies.
         incarnation:
           type: string
           description: Opaque identity for the desired index incarnation. Clients may compare it for equality
@@ -22538,6 +22675,8 @@ components:
       type: object
       description: Credential-free normalized embeddings configuration returned after creation.
       properties:
+        publication_policy:
+          $ref: '#/components/schemas/IndexPublicationPolicy'
         coverage_policy:
           $ref: '#/components/schemas/DerivedCoveragePolicy'
         external:
@@ -24162,6 +24301,10 @@ components:
           type: string
           nullable: true
           description: The generated message content (null when tool_calls is present)
+        reasoning_content:
+          type: string
+          nullable: true
+          description: Model reasoning emitted on a private reasoning channel, separate from public content
         tool_calls:
           type: array
           items:
@@ -24248,6 +24391,10 @@ components:
           type: string
           nullable: true
           description: Token content delta
+        reasoning_content:
+          type: string
+          nullable: true
+          description: Reasoning content delta, separate from public content
         tool_calls:
           type: array
           items:
@@ -24333,6 +24480,13 @@ components:
         - q4_k
         - q8
         - fp16
+    InferenceA4bResidencyMode:
+      type: string
+      description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+      enum:
+        - auto
+        - streamed
+        - resident
     InferenceBackendPriorityEntry:
       type: string
       description: >
@@ -24386,6 +24540,19 @@ components:
           $ref: '#/components/schemas/InferenceModelFormat'
         quantization:
           $ref: '#/components/schemas/InferenceModelQuantization'
+        residency_mode:
+          $ref: '#/components/schemas/InferenceA4bResidencyMode'
+          default: auto
+          description: Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal runtime.
+            Other model geometries reject this field.
+        memory_budget_mb:
+          type: integer
+          format: uint32
+          minimum: 0
+          maximum: 1048576
+          default: 0
+          description: Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed
+            floor; explicit smaller values fail model load. Other model geometries reject this field.
     InferencePromptCacheConfig:
       type: object
       description: Native generator prompt KV cache configuration.

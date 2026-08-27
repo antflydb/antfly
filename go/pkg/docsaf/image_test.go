@@ -5,8 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/antflydb/antfly/go/pkg/libaf/ai"
-	"github.com/antflydb/antfly/go/pkg/libaf/reading"
+	"github.com/antflydb/antfly/go/pkg/docsaf/reading"
 )
 
 type mockReader struct {
@@ -14,7 +13,7 @@ type mockReader struct {
 	err     error
 }
 
-func (m *mockReader) Read(_ context.Context, _ []ai.BinaryContent, _ *reading.ReadOptions) ([]string, error) {
+func (m *mockReader) Read(_ context.Context, _ []reading.BinaryContent, _ *reading.ReadOptions) ([]string, error) {
 	if m.err != nil {
 		return nil, m.err
 	}
