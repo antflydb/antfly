@@ -551,8 +551,10 @@ fn ceilLog2(value: usize) !u6 {
 }
 
 fn decodeTextRegion(alloc: Allocator, work: *DecodeWorkBudget, arith: *ArithmeticDecoder, symbols: []const Bitmap, params: TextParams, shared_generic_contexts: ?[]u8, shared_iaid: ?[]u8, max_bytes: usize) !Bitmap {
-    const pixels = std.math.mul(u64, params.width, params.height) catch return error.Jbig2ImageTooLarge;
-    if (params.instances > pixels) return error.InvalidJbig2SymbolCount;
+    // Symbols may legally overlap, so instance count is not bounded by region
+    // pixels. Reserve the full control-loop cost up front instead; this accepts
+    // dense valid regions while rejecting impossible workloads before decode.
+    try work.chargeItems(params.instances, 32);
     const code_len = try ceilLog2(symbols.len);
     var int_ctx = try IntContexts.init(alloc, work);
     defer int_ctx.deinit(alloc);
@@ -584,7 +586,6 @@ fn decodeTextRegion(alloc: Allocator, work: *DecodeWorkBudget, arith: *Arithmeti
         var first = true;
         var current_s: i64 = 0;
         while (count < params.instances) {
-            try work.charge(32);
             if (first) {
                 const dfs = try decodeInteger(arith, int_ctx.fs) orelse return error.InvalidJbig2Integer;
                 first_s += dfs;
