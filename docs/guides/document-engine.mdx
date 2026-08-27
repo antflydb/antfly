@@ -392,7 +392,13 @@ The deprecated `graph_searches` request field remains a wire-compatibility
 adapter for the v0.2 shape. Its operation names remain opaque legacy map keys;
 the canonical GraphIdentifier policy applies only to `graph_queries`. The
 request-wide 64-operation safety limit applies to both dialects. New clients
-should generate only `graph_queries`.
+should generate only `graph_queries`. A successful stateful request that uses
+`graph_searches` includes the RFC 9745 deprecation date
+`Deprecation: @1787702400` (2026-08-26 UTC), and Antfly emits a stable
+low-cardinality acceptance log without table names, operation names, or query
+contents. The compatibility adapter must not be removed until fleet telemetry
+shows that legacy traffic has drained; serverless Antfly and MemoryAF remain
+canonical-only and do not emit legacy responses.
 
 ## Full-Text And Vector Search
 

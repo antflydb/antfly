@@ -425,9 +425,66 @@ pub const QueryResponseMeta = struct {
 /// executors and storage graph plans always use the canonical IR.
 const GraphResponseFormat = enum { canonical, legacy };
 
-fn graphResponseFormat(req: db_mod.types.SearchRequest) GraphResponseFormat {
+fn graphResponseFormat(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+) !GraphResponseFormat {
     const envelope = std.mem.trim(u8, req.graph_queries_proxy_json, &std.ascii.whitespace);
-    return if (std.mem.startsWith(u8, envelope, "{\"graph_searches\":")) .legacy else .canonical;
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, envelope, .{}) catch
+        return error.InvalidRemoteResponse;
+    defer parsed.deinit();
+    if (parsed.value != .object or parsed.value.object.count() != 1)
+        return error.InvalidRemoteResponse;
+
+    const canonical = parsed.value.object.get("graph_queries");
+    const legacy = parsed.value.object.get("graph_searches");
+    if ((canonical == null) == (legacy == null)) return error.InvalidRemoteResponse;
+    const operations = canonical orelse legacy.?;
+    if (operations != .object or operations.object.count() != req.graph_queries.len)
+        return error.InvalidRemoteResponse;
+    for (req.graph_queries) |query| {
+        if (operations.object.get(query.name) == null) return error.InvalidRemoteResponse;
+    }
+    return if (legacy != null) .legacy else .canonical;
+}
+
+test "graph response format classifies the admitted envelope structurally" {
+    const queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "walk",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+    try std.testing.expectEqual(GraphResponseFormat.canonical, try graphResponseFormat(
+        std.testing.allocator,
+        .{
+            .graph_queries = &queries,
+            .graph_queries_proxy_json = "{ \n \t\"graph_queries\" : {\"walk\":{}} }",
+        },
+    ));
+    try std.testing.expectEqual(GraphResponseFormat.legacy, try graphResponseFormat(
+        std.testing.allocator,
+        .{
+            .graph_queries = &queries,
+            .graph_queries_proxy_json = "{ \n \t\"graph_searches\" : {\"walk\":{}} }",
+        },
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
+        std.testing.allocator,
+        .{
+            .graph_queries = &queries,
+            .graph_queries_proxy_json = "{\"graph_queries\":{}}",
+        },
+    ));
+    try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
+        std.testing.allocator,
+        .{
+            .graph_queries = &queries,
+            .graph_queries_proxy_json = "{\"graph_queries\":{\"walk\":{}},\"graph_searches\":{}}",
+        },
+    ));
 }
 
 fn appendJsonFieldName(
@@ -5297,7 +5354,7 @@ fn buildGraphQueryResults(
 ) !std.json.ArrayHashMap(indexes_openapi.GraphResult) {
     var out: std.json.ArrayHashMap(indexes_openapi.GraphResult) = .{};
     errdefer out.deinit(alloc);
-    const response_format = graphResponseFormat(req);
+    const response_format = try graphResponseFormat(alloc, req);
 
     for (req.graph_queries) |requested| {
         var occurrences: usize = 0;

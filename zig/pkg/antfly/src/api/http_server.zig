@@ -174,6 +174,88 @@ fn isNdjsonContentType(content_type: ?[]const u8) bool {
     return std.ascii.eqlIgnoreCase(media_type, "application/x-ndjson");
 }
 
+/// Detect the deprecated public dialect only when the request can contain its
+/// member name. Ordinary canonical queries pay two bounded byte scans and no
+/// allocation; exact or escaped candidates receive one structural parse so a
+/// string value cannot create a false deprecation signal and escaped JSON
+/// member names retain the same semantics as admission.
+fn queryBodyUsesLegacyGraphSearchesAlloc(alloc: std.mem.Allocator, body: []const u8) !bool {
+    if (std.mem.indexOf(u8, body, "graph_searches") == null and
+        std.mem.indexOfScalar(u8, body, '\\') == null)
+    {
+        return false;
+    }
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch
+        return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const graph_searches = parsed.value.object.get("graph_searches") orelse return false;
+    return graph_searches != .null;
+}
+
+fn appendOwnedResponseHeader(
+    alloc: std.mem.Allocator,
+    response: *contextual_operations.OwnedResponse,
+    name: []const u8,
+    value: []const u8,
+) !void {
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_value = try alloc.dupe(u8, value);
+    errdefer alloc.free(owned_value);
+    const headers = try alloc.alloc(contextual_operations.Header, response.headers.len + 1);
+    errdefer alloc.free(headers);
+    @memcpy(headers[0..response.headers.len], response.headers);
+    headers[response.headers.len] = .{ .name = owned_name, .value = owned_value };
+    if (response.headers.len > 0) alloc.free(response.headers);
+    response.headers = headers;
+}
+
+fn markLegacyGraphSearchResponse(
+    alloc: std.mem.Allocator,
+    response: *contextual_operations.OwnedResponse,
+) !void {
+    // RFC 9745 requires an RFC 9651 Structured Field Date, not a boolean.
+    // This is the UTC date on which the canonical replacement contract was
+    // published for migration.
+    try appendOwnedResponseHeader(alloc, response, "Deprecation", "@1787702400");
+    // Deliberately omit table, operation, and query values. The stable message
+    // is a low-cardinality fleet signal that log aggregation can count without
+    // exposing request data or creating unbounded metric labels.
+    std.log.info("deprecated graph_searches request accepted surface=stateful replacement=graph_queries", .{});
+}
+
+test "legacy graph search deprecation detection is structural and escape-safe" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!try queryBodyUsesLegacyGraphSearchesAlloc(alloc, "{}"));
+    try std.testing.expect(!try queryBodyUsesLegacyGraphSearchesAlloc(
+        alloc,
+        "{\"query\":{\"term\":\"graph_searches\"}}",
+    ));
+    try std.testing.expect(!try queryBodyUsesLegacyGraphSearchesAlloc(
+        alloc,
+        "{\"graph_searches\":null}",
+    ));
+    try std.testing.expect(try queryBodyUsesLegacyGraphSearchesAlloc(
+        alloc,
+        "{\"graph_searches\":{\"walk\":{}}}",
+    ));
+    try std.testing.expect(try queryBodyUsesLegacyGraphSearchesAlloc(
+        alloc,
+        "{\"graph_\\u0073earches\":{\"walk\":{}}}",
+    ));
+}
+
+test "legacy graph search responses carry an owned deprecation signal" {
+    const alloc = std.testing.allocator;
+    var response = contextual_operations.json(try alloc.dupe(u8, "{}"), false);
+    defer response.deinit(alloc);
+    try markLegacyGraphSearchResponse(alloc, &response);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqualStrings("Deprecation", response.headers[0].name);
+    try std.testing.expectEqualStrings("@1787702400", response.headers[0].value);
+}
+
 fn mcpSampleDocumentsJsonAlloc(alloc: std.mem.Allocator, ndjson: []const u8) ![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -12164,7 +12246,12 @@ pub const ApiHttpServer = struct {
             authenticated_identity,
             if (cancellation) |value| value.token() else null,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
-        return contextual_operations.json(response_body, false);
+        var response = contextual_operations.json(response_body, false);
+        errdefer response.deinit(self.alloc);
+        if (try queryBodyUsesLegacyGraphSearchesAlloc(self.alloc, body)) {
+            try markLegacyGraphSearchResponse(self.alloc, &response);
+        }
+        return response;
     }
 
     fn handlePublicTableMultiQuery(
@@ -12191,6 +12278,7 @@ pub const ApiHttpServer = struct {
         defer out.deinit();
         try out.writer.writeAll("{\"responses\":[");
         var emitted: usize = 0;
+        var accepted_legacy_graph_search = false;
 
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |raw_line| {
@@ -12238,6 +12326,8 @@ pub const ApiHttpServer = struct {
                 if (cancellation) |value| value.token() else null,
             ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, line, err);
             defer self.alloc.free(response_body);
+            accepted_legacy_graph_search = accepted_legacy_graph_search or
+                try queryBodyUsesLegacyGraphSearchesAlloc(self.alloc, line);
 
             var parsed = std.json.parseFromSlice(std.json.Value, arena, response_body, .{
                 .allocate = .alloc_always,
@@ -12261,7 +12351,12 @@ pub const ApiHttpServer = struct {
 
         if (emitted == 0) return try contextual_operations.textAlloc(self.alloc, 400, "invalid query request");
         try out.writer.writeAll("]}");
-        return contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
+        var response = contextual_operations.json(try self.alloc.dupe(u8, out.written()), false);
+        errdefer response.deinit(self.alloc);
+        if (accepted_legacy_graph_search) {
+            try markLegacyGraphSearchResponse(self.alloc, &response);
+        }
+        return response;
     }
 
     const PublicRepairListRequest = struct {
