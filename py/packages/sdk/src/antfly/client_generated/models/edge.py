@@ -24,7 +24,7 @@ class Edge:
     Attributes:
         source (str): Base64-encoded source document key
         target (str): Base64-encoded target document key
-        type_ (str): Edge type (e.g., "cites", "similar_to", "authored_by")
+        type_ (str): Edge type encoded as at most 64 KiB of UTF-8 (e.g., "cites", "similar_to", "authored_by")
         weight (float): Finite non-negative edge cost or confidence. The max_weight path mode additionally requires
             values in [0,1].
         created_at (datetime.datetime | Unset): When the edge was created

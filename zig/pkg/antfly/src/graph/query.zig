@@ -24,6 +24,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
+const edge_type_mod = @import("edge_type.zig");
 const node_identity = @import("node_identity.zig");
 const NodeAdmission = @import("node_admission.zig").NodeAdmission;
 const NodeRef = @import("node_admission.zig").NodeRef;
@@ -45,7 +46,7 @@ pub const max_query_name_codepoints: usize = 128;
 pub const max_identifier_codepoints: usize = pattern_mod.max_identifier_codepoints;
 pub const max_identifier_bytes: usize = pattern_mod.max_identifier_bytes;
 pub const max_edge_types: usize = 64;
-pub const max_edge_type_bytes: usize = 64 * 1024;
+pub const max_edge_type_bytes: usize = edge_type_mod.max_bytes;
 
 const TraverseResultAdmissionContext = struct {
     alloc: Allocator,
@@ -309,6 +310,80 @@ pub const GraphResultNode = struct {
         self.* = undefined;
     }
 };
+
+/// Validate the allocation-free, cross-field invariants of a canonical result
+/// node. Callers at API boundaries map a false result to their local malformed-
+/// response error without exposing graph-internal error names on the wire.
+pub fn isCanonicalResultNode(node: GraphResultNode) bool {
+    if (node.key.len == 0) return false;
+    if (node.table) |table| if (table.len == 0) return false;
+    if (node.depth > pattern_mod.max_pattern_hops) return false;
+    if (!std.math.isFinite(node.distance) or node.distance < 0) return false;
+
+    const path = node.path orelse {
+        // Presence carries meaning in the canonical contract; `[]` is not an
+        // alternative spelling for an omitted path or edge list.
+        return node.path_tables == null and node.path_edges == null;
+    };
+    if (path.len == 0 or path.len > pattern_mod.max_pattern_hops + 1) return false;
+    if (node.depth != path.len - 1) return false;
+
+    const tables = node.path_tables;
+    if (tables) |items| if (items.len != path.len) return false;
+    for (path, 0..) |key, i| {
+        if (key.len == 0) return false;
+        if (tables) |items| if (items[i]) |table| if (table.len == 0) return false;
+    }
+    if (node.path_edges) |edges| if (edges.len != path.len - 1) return false;
+
+    const terminal_table = if (tables) |items| items[path.len - 1] else null;
+    return node_identity.equal(
+        .{ .table = terminal_table, .key = path[path.len - 1] },
+        .{ .table = node.table, .key = node.key },
+    );
+}
+
+test "canonical graph result node path is self-consistent" {
+    const valid_path: []const []const u8 = &.{ "a", "b" };
+    const valid_tables: []const ?[]const u8 = &.{ null, "entities" };
+    try std.testing.expect(isCanonicalResultNode(.{
+        .key = "b",
+        .table = "entities",
+        .depth = 1,
+        .distance = 1,
+        .path = valid_path,
+        .path_tables = valid_tables,
+    }));
+    try std.testing.expect(!isCanonicalResultNode(.{
+        .key = "b",
+        .table = "entities",
+        .depth = 0,
+        .distance = 0,
+        .path = valid_path,
+        .path_tables = valid_tables,
+    }));
+    try std.testing.expect(!isCanonicalResultNode(.{
+        .key = "wrong",
+        .table = "entities",
+        .depth = 1,
+        .distance = 1,
+        .path = valid_path,
+        .path_tables = valid_tables,
+    }));
+    try std.testing.expect(!isCanonicalResultNode(.{
+        .key = "b",
+        .depth = 1,
+        .distance = 1,
+        .path = valid_path,
+        .path_tables = valid_tables,
+    }));
+    try std.testing.expect(!isCanonicalResultNode(.{
+        .key = "b",
+        .depth = 0,
+        .distance = 0,
+        .path_edges = &.{},
+    }));
+}
 
 pub const GraphQueryResult = struct {
     nodes: []GraphResultNode,
@@ -1180,8 +1255,12 @@ fn pathToResultNodeRetained(
 
     const key = try alloc.dupe(u8, target_key);
     errdefer alloc.free(key);
+    const target_table = if (path.node_tables.len > 0) path.node_tables[path.node_tables.len - 1] else null;
+    const table = if (target_table) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (table) |value| alloc.free(value);
     return .{
         .key = key,
+        .table = table,
         .depth = path.length,
         .distance = path.total_weight,
         .path = path_nodes,
@@ -1200,6 +1279,8 @@ fn pathGraphResultNodeOwnedBytes(path: *const paths_mod.Path) !usize {
         for (path.node_tables) |table| if (table) |value| {
             total = try std.math.add(usize, total, value.len);
         };
+        if (path.node_tables[path.node_tables.len - 1]) |table|
+            total = try std.math.add(usize, total, table.len);
     }
     total = try std.math.add(usize, total, try std.math.mul(usize, path.edges.len, @sizeOf(PathEdgeInfo)));
     for (path.edges) |edge| {

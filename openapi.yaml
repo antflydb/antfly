@@ -16246,7 +16246,9 @@ components:
         type:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Edge type (e.g., "cites", "similar_to", "authored_by")
+          minLength: 1
+          maxLength: 65536
+          description: Edge type encoded as at most 64 KiB of UTF-8 (e.g., "cites", "similar_to", "authored_by")
         weight:
           x-go-type-skip-optional-pointer: true
           type: number
@@ -18601,7 +18603,9 @@ components:
       properties:
         name:
           type: string
-          description: Edge type name (e.g., 'cites', 'similar_to')
+          minLength: 1
+          maxLength: 65536
+          description: Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to')
         field:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -18673,6 +18677,9 @@ components:
           default: extraction_relation
         mention_edge_type:
           type: string
+          minLength: 1
+          maxLength: 65536
+          description: Edge type encoded as at most 64 KiB of UTF-8.
     GraphArtifactProducerSourceConfig:
       type: object
       additionalProperties: false
@@ -23941,6 +23948,7 @@ components:
           type: string
           minLength: 1
           maxLength: 65536
+          description: Edge type encoded as at most 64 KiB of UTF-8.
         weight:
           type: number
           format: double
@@ -23973,7 +23981,8 @@ components:
           type: integer
           minimum: 0
           maximum: 64
-          description: Hop count from the start node
+          description: Hop count from the start node; when path is present this equals path length minus
+            one
         document:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -23986,14 +23995,15 @@ components:
           maxItems: 65
           items:
             $ref: '#/components/schemas/GraphPathEndpoint'
-          description: Exact ordered node identities in the path from the start node to this node
+          description: Exact ordered node identities from the start node, terminating at this node's fully
+            qualified identity
         path_edges:
           x-go-type-skip-optional-pointer: true
           type: array
           maxItems: 64
           items:
             $ref: '#/components/schemas/GraphPathEdge'
-          description: Ordered typed edges in path from start to this node
+          description: Ordered typed edges in path from start to this node; omitted when path is omitted
         provenance:
           x-go-type-skip-optional-pointer: true
           type: array

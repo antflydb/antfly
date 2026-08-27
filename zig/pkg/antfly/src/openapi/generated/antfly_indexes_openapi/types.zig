@@ -863,7 +863,7 @@ pub const Edge = struct {
     source: []const u8,
     /// Base64-encoded target document key
     target: []const u8,
-    /// Edge type (e.g., "cites", "similar_to", "authored_by")
+    /// Edge type encoded as at most 64 KiB of UTF-8 (e.g., "cites", "similar_to", "authored_by")
     type: []const u8,
     /// Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
     weight: f64,
@@ -906,7 +906,7 @@ pub const EdgeDirection = enum {
 
 /// Configuration for a specific edge type
 pub const EdgeTypeConfig = struct {
-    /// Edge type name (e.g., 'cites', 'similar_to')
+    /// Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to')
     name: []const u8,
     /// Document field containing target node key(s) for automatic edge creation. Supports string (single target) or array of strings (multiple targets). When omitted, edges must be provided explicitly via _edges.
     field: ?[]const u8 = null,
@@ -1390,6 +1390,7 @@ pub const GraphArtifactSourceConfig = struct {
     artifact: []const u8,
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
+    /// Edge type encoded as at most 64 KiB of UTF-8.
     mention_edge_type: ?[]const u8 = null,
 };
 
@@ -2128,6 +2129,7 @@ pub const GraphPath = struct {
 pub const GraphPathEdge = struct {
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
+    /// Edge type encoded as at most 64 KiB of UTF-8.
     type: []const u8,
     /// Finite durable edge weight. max_weight paths further require values in [0,1].
     weight: f64,
@@ -2492,13 +2494,13 @@ pub const GraphResultNode = struct {
     key: []const u8,
     /// Owning table for a cross-table node; omitted for nodes in the queried table
     table: ?[]const u8 = null,
-    /// Hop count from the start node
+    /// Hop count from the start node; when path is present this equals path length minus one
     depth: i64,
     /// Full document (if include_documents=true)
     document: ?std.json.Value = null,
-    /// Exact ordered node identities in the path from the start node to this node
+    /// Exact ordered node identities from the start node, terminating at this node's fully qualified identity
     path: ?[]const GraphPathEndpoint = null,
-    /// Ordered typed edges in path from start to this node
+    /// Ordered typed edges in path from start to this node; omitted when path is omitted
     path_edges: ?[]const GraphPathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,

@@ -7821,7 +7821,7 @@ export interface components {
              * @description Base64-encoded target document key
              */
             target: string;
-            /** @description Edge type (e.g., "cites", "similar_to", "authored_by") */
+            /** @description Edge type encoded as at most 64 KiB of UTF-8 (e.g., "cites", "similar_to", "authored_by") */
             type: string;
             /**
              * Format: double
@@ -9505,7 +9505,7 @@ export interface components {
         };
         /** @description Configuration for a specific edge type */
         EdgeTypeConfig: {
-            /** @description Edge type name (e.g., 'cites', 'similar_to') */
+            /** @description Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to') */
             name: string;
             /**
              * @description Document field containing target node key(s) for automatic edge creation.
@@ -9552,6 +9552,7 @@ export interface components {
              * @enum {string}
              */
             format?: "extraction_relation" | "extraction_graph";
+            /** @description Edge type encoded as at most 64 KiB of UTF-8. */
             mention_edge_type?: string;
         };
         /** @description Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template. */
@@ -12480,6 +12481,7 @@ export interface components {
         GraphPathEdge: {
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
+            /** @description Edge type encoded as at most 64 KiB of UTF-8. */
             type: string;
             /**
              * Format: double
@@ -12496,15 +12498,15 @@ export interface components {
             key: string;
             /** @description Owning table for a cross-table node; omitted for nodes in the queried table */
             table?: string;
-            /** @description Hop count from the start node */
+            /** @description Hop count from the start node; when path is present this equals path length minus one */
             depth: number;
             /** @description Full document (if include_documents=true) */
             document?: {
                 [key: string]: unknown;
             };
-            /** @description Exact ordered node identities in the path from the start node to this node */
+            /** @description Exact ordered node identities from the start node, terminating at this node's fully qualified identity */
             path?: components["schemas"]["GraphPathEndpoint"][];
-            /** @description Ordered typed edges in path from start to this node */
+            /** @description Ordered typed edges in path from start to this node; omitted when path is omitted */
             path_edges?: components["schemas"]["GraphPathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];

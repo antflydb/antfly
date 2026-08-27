@@ -18,6 +18,7 @@ const ant_json = @import("antfly-json");
 const db_mod = @import("../storage/db/mod.zig");
 const document_query = @import("../storage/db/document_query.zig");
 const hierarchy_navigation = @import("../storage/hierarchy_navigation.zig");
+const graph_edge_type = @import("../graph/edge_type.zig");
 const graph_edge_weight = @import("../graph/edge_weight.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
@@ -6232,30 +6233,7 @@ fn toOpenApiGraphNodes(
 }
 
 fn validateCanonicalGraphResultNode(node: graph_query_mod.GraphResultNode) !void {
-    if (node.key.len == 0) return error.InvalidRemoteResponse;
-    if (node.table) |table| if (table.len == 0) return error.InvalidRemoteResponse;
-    if (node.depth > graph_pattern_mod.max_pattern_hops) return error.InvalidRemoteResponse;
-    if (!std.math.isFinite(node.distance) or node.distance < 0) return error.InvalidRemoteResponse;
-
-    if (node.path) |path| {
-        if (path.len == 0 or path.len > graph_pattern_mod.max_pattern_hops + 1)
-            return error.InvalidRemoteResponse;
-        if (node.path_tables) |tables| {
-            if (tables.len != path.len) return error.InvalidRemoteResponse;
-        }
-        for (path, 0..) |key, i| {
-            if (key.len == 0) return error.InvalidRemoteResponse;
-            if (node.path_tables) |tables| {
-                if (tables[i]) |table| if (table.len == 0) return error.InvalidRemoteResponse;
-            }
-        }
-        if (node.path_edges) |edges| {
-            if (edges.len != path.len - 1) return error.InvalidRemoteResponse;
-        }
-    } else {
-        if (node.path_tables != null) return error.InvalidRemoteResponse;
-        if (node.path_edges) |edges| if (edges.len != 0) return error.InvalidRemoteResponse;
-    }
+    if (!graph_query_mod.isCanonicalResultNode(node)) return error.InvalidRemoteResponse;
 }
 
 test "canonical graph result nodes fail closed outside the public contract" {
@@ -6279,6 +6257,24 @@ test "canonical graph result nodes fail closed outside the public contract" {
         .depth = 0,
         .distance = 0,
         .path = @constCast((&[_][]const u8{})[0..]),
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+        .key = @constCast("node"),
+        .depth = 0,
+        .distance = 0,
+        .path = &.{ "start", "node" },
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+        .key = @constCast("wrong"),
+        .depth = 1,
+        .distance = 1,
+        .path = &.{ "start", "node" },
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, validateCanonicalGraphResultNode(.{
+        .key = @constCast("node"),
+        .depth = 0,
+        .distance = 0,
+        .path_edges = &.{},
     }));
 }
 
@@ -6462,7 +6458,7 @@ fn toOpenApiGraphPathEdges(
     const out = try alloc.alloc(indexes_openapi.GraphPathEdge, edges.len);
     errdefer if (out.len > 0) alloc.free(out);
     for (edges, 0..) |edge, i| {
-        if (edge.edge_type.len == 0) return error.InvalidRemoteResponse;
+        graph_edge_type.validateStored(edge.edge_type) catch return error.InvalidRemoteResponse;
         graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
         const left_key = nodes[i];
         const right_key = nodes[i + 1];
@@ -6487,6 +6483,19 @@ fn toOpenApiGraphPathEdges(
         };
     }
     return out;
+}
+
+test "canonical graph path edges enforce durable type policy" {
+    const edges: []const graph_query_mod.PathEdgeInfo = &.{.{
+        .source = "a",
+        .target = "b",
+        .edge_type = "x" ** (graph_edge_type.max_bytes + 1),
+        .weight = 1,
+    }};
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        toOpenApiGraphPathEdges(std.testing.allocator, &.{ "a", "b" }, &.{}, edges),
+    );
 }
 
 fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
@@ -6646,6 +6655,7 @@ test "api query contract preserves algebraic graph path provenance" {
     const provenance: []const []const u8 = &.{ "A\x1fe\x1fB", "B\x1fe\x1fC" };
     const nodes: []const graph_query_mod.GraphResultNode = &.{.{
         .key = "C",
+        .table = "entities",
         .depth = 2,
         .distance = 2.0,
         .path = path_nodes,

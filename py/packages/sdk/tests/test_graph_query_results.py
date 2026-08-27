@@ -215,6 +215,40 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
             "stats": {"returned_items": 1, "truncated": False},
         },
         {
+            "kind": "nodes",
+            "nodes": [{"key": "b", "depth": 0, "path": [{"key": "a"}, {"key": "b"}]}],
+            "paths": [],
+            "stats": {"returned_items": 1, "truncated": False},
+        },
+        {
+            "kind": "nodes",
+            "nodes": [{"key": "wrong", "depth": 1, "path": [{"key": "a"}, {"key": "b"}]}],
+            "paths": [],
+            "stats": {"returned_items": 1, "truncated": False},
+        },
+        {
+            "kind": "nodes",
+            "nodes": [],
+            "paths": [
+                {
+                    "nodes": [{"key": "a"}, {"key": "b"}],
+                    "edges": [
+                        {
+                            "from": {"key": "a"},
+                            "to": {"key": "b"},
+                            "type": "é" * 32_769,
+                            "weight": 1,
+                        }
+                    ],
+                    "length": 1,
+                    "weight_mode": "min_hops",
+                    "weight_sum": 1,
+                    "objective_value": 1,
+                }
+            ],
+            "stats": {"returned_items": 1, "truncated": False},
+        },
+        {
             "kind": "unknown",
             "stats": {"returned_items": 0, "truncated": False},
         },

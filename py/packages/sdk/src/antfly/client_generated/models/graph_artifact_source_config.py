@@ -22,7 +22,7 @@ class GraphArtifactSourceConfig:
         path (str | Unset):
         format_ (GraphArtifactSourceConfigFormat | Unset):  Default:
             GraphArtifactSourceConfigFormat.EXTRACTION_RELATION.
-        mention_edge_type (str | Unset):
+        mention_edge_type (str | Unset): Edge type encoded as at most 64 KiB of UTF-8.
     """
 
     kind: GraphArtifactSourceConfigKind

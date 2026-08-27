@@ -47,7 +47,9 @@ const db_query_search = @import("../storage/db/query/search_exec.zig");
 const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
 const introducer_mod = @import("../introducer.zig");
 const graph_mod = @import("../graph/graph.zig");
+const graph_edge_type = @import("../graph/edge_type.zig");
 const graph_edge_weight = @import("../graph/edge_weight.zig");
+const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
@@ -18530,6 +18532,10 @@ fn parseRemoteGraphNodeWithKey(
     const distance: f64 = @floatFromInt(depth);
     if (item.path) |path| {
         try validateRemoteCanonicalGraphPathNodes(path);
+        if (depth != path.len - 1 or !graphPathEndpointEql(path[path.len - 1], .{
+            .key = key,
+            .table = item.table,
+        })) return error.InvalidRemoteResponse;
     }
     const owned_key = try alloc.dupe(u8, key);
     errdefer alloc.free(owned_key);
@@ -19074,7 +19080,7 @@ fn validateRemoteCanonicalGraphPathEdges(
     try validateRemoteCanonicalGraphPathNodes(nodes);
     if (edges.len != nodes.len - 1) return error.InvalidRemoteResponse;
     for (edges, 0..) |edge, i| {
-        if (edge.type.len == 0) return error.InvalidRemoteResponse;
+        graph_edge_type.validateStored(edge.type) catch return error.InvalidRemoteResponse;
         graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
         try validateRemoteCanonicalGraphIdentity(edge.from.key, edge.from.table);
         try validateRemoteCanonicalGraphIdentity(edge.to.key, edge.to.table);
@@ -19101,17 +19107,22 @@ fn graphPathEndpointEql(
     left: indexes_openapi.GraphPathEndpoint,
     right: indexes_openapi.GraphPathEndpoint,
 ) bool {
-    if (!std.mem.eql(u8, left.key, right.key)) return false;
-    if (left.table == null or right.table == null) return left.table == null and right.table == null;
-    return std.mem.eql(u8, left.table.?, right.table.?);
+    return graph_node_identity.equal(
+        .{ .table = left.table, .key = left.key },
+        .{ .table = right.table, .key = right.key },
+    );
 }
 
-test "remote canonical graph nodes reject invalid identity and numeric domains" {
+test "remote canonical graph nodes reject invalid identity and depth domains" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "", .{ .key = "" }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "", .{
+        .key = "",
+        .depth = 0,
+    }));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
         .table = "",
+        .depth = 0,
     }));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
@@ -19123,11 +19134,19 @@ test "remote canonical graph nodes reject invalid identity and numeric domains" 
     }));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
-        .distance = -0.1,
+        .depth = 0,
+        .path = &.{ .{ .key = "start" }, .{ .key = "node" } },
     }));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
         .key = "node",
-        .distance = std.math.inf(f64),
+        .depth = 1,
+        .path = &.{ .{ .key = "start" }, .{ .key = "wrong" } },
+    }));
+    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteGraphNodeWithKey(alloc, "node", .{
+        .key = "node",
+        .table = "entities",
+        .depth = 1,
+        .path = &.{ .{ .key = "start" }, .{ .key = "node" } },
     }));
 
     const too_many_path_nodes = [_]indexes_openapi.GraphPathEndpoint{.{ .key = "node" }} **
@@ -19219,6 +19238,11 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     );
 
     edges[0].type = "";
+    try std.testing.expectError(
+        error.InvalidRemoteResponse,
+        validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
+    );
+    edges[0].type = "x" ** (graph_edge_type.max_bytes + 1);
     try std.testing.expectError(
         error.InvalidRemoteResponse,
         validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),

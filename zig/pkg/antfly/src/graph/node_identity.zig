@@ -20,6 +20,16 @@ pub const Ref = struct {
     key: []const u8,
 };
 
+/// Compare complete graph identities. A missing table is semantically distinct
+/// from an explicitly qualified table, even when the document keys match.
+pub fn equal(left: Ref, right: Ref) bool {
+    if ((left.table == null) != (right.table == null)) return false;
+    if (left.table) |left_table| {
+        if (!std.mem.eql(u8, left_table, right.table.?)) return false;
+    }
+    return std.mem.eql(u8, left.key, right.key);
+}
+
 pub const Key = struct {
     storage: []u8,
     table_len: ?usize,
@@ -102,11 +112,7 @@ const RefContext = struct {
     }
 
     pub fn eql(_: RefContext, left: Ref, right: Ref) bool {
-        if ((left.table == null) != (right.table == null)) return false;
-        if (left.table) |left_table| {
-            if (!std.mem.eql(u8, left_table, right.table.?)) return false;
-        }
-        return std.mem.eql(u8, left.key, right.key);
+        return equal(left, right);
     }
 };
 

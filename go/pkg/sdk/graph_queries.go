@@ -331,6 +331,9 @@ func validateDecodedGraphResultNode(node GraphResultNode) error {
 		if len(node.Path) == 0 || len(node.Path) > maxGraphMatchEdges+1 {
 			return fmt.Errorf("graph node path must contain between 1 and %d nodes", maxGraphMatchEdges+1)
 		}
+		if node.Depth != len(node.Path)-1 {
+			return fmt.Errorf("graph node depth must equal path length minus one")
+		}
 		for _, endpoint := range node.Path {
 			if err := validateDecodedGraphIdentity(endpoint.Key, endpoint.Table); err != nil {
 				return err
@@ -401,7 +404,10 @@ func validateDecodedGraphPath(path GraphPath) error {
 }
 
 func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint, maxWeightMode bool) error {
-	if edge.Type == "" || !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
+	if edge.Type == "" || len(edge.Type) > maxGraphEdgeTypeBytes {
+		return fmt.Errorf("graph path edge type must encode to between 1 and %d UTF-8 bytes", maxGraphEdgeTypeBytes)
+	}
+	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
 		return fmt.Errorf("graph path edge does not match adjacent nodes")
 	}
 	if !finiteNonNegative(edge.Weight) || maxWeightMode && edge.Weight > 1 {

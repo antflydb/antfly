@@ -23,12 +23,13 @@ class GraphResultNode:
 
     Attributes:
         key (str): Document key
-        depth (int): Hop count from the start node
+        depth (int): Hop count from the start node; when path is present this equals path length minus one
         table (str | Unset): Owning table for a cross-table node; omitted for nodes in the queried table
         document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
-        path (list[GraphPathEndpoint] | Unset): Exact ordered node identities in the path from the start node to this
-            node
-        path_edges (list[GraphPathEdge] | Unset): Ordered typed edges in path from start to this node
+        path (list[GraphPathEndpoint] | Unset): Exact ordered node identities from the start node, terminating at this
+            node's fully qualified identity
+        path_edges (list[GraphPathEdge] | Unset): Ordered typed edges in path from start to this node; omitted when path
+            is omitted
         provenance (list[str] | Unset): Algebraic provenance labels folded into this result, when requested by an
             algebraic graph executor
         evidence (GraphResultNodeEvidence | Unset): Parsed evidence envelope for provenance labels and edge metadata

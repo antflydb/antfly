@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const graph_types = @import("types.zig");
+const graph_edge_type = @import("../../graph/edge_type.zig");
 const bounded_decode = @import("../bounded_decode.zig");
 
 pub const DecodeLimits = bounded_decode.Limits;
@@ -29,6 +30,7 @@ const no_neighbor_table = std.math.maxInt(u32);
 
 fn edgeEncodedSize(edge: graph_types.Edge, version: u16) !usize {
     _ = std.math.cast(u32, edge.neighbor_id.len) orelse return error.GraphSegmentTooLarge;
+    graph_edge_type.validateStored(edge.edge_type) catch return error.InvalidGraphSegment;
     _ = std.math.cast(u32, edge.edge_type.len) orelse return error.GraphSegmentTooLarge;
     if (version == legacy_wire_version and edge.neighbor_table_id != null) return error.InvalidGraphSegment;
     var size: usize = if (version == wire_version) 16 else 12;
@@ -281,6 +283,8 @@ fn decodeEdgesAlloc(
         pos.* += 4;
         const edge_type_len = std.mem.readInt(u32, data[pos.*..][0..4], .little);
         pos.* += 4;
+        if (edge_type_len == 0 or edge_type_len > graph_edge_type.max_bytes)
+            return error.InvalidGraphSegment;
         const weight_bits = std.mem.readInt(u32, data[pos.*..][0..4], .little);
         pos.* += 4;
         const neighbor_table_id: ?u32 = if (version == wire_version) blk: {
@@ -296,7 +300,9 @@ fn decodeEdgesAlloc(
         const neighbor_id = try alloc.dupe(u8, data[pos.* .. pos.* + neighbor_id_len]);
         pos.* += neighbor_id_len;
         errdefer alloc.free(neighbor_id);
-        const edge_type = try alloc.dupe(u8, data[pos.* .. pos.* + edge_type_len]);
+        const edge_type_bytes = data[pos.* .. pos.* + edge_type_len];
+        if (!graph_edge_type.isValid(edge_type_bytes)) return error.InvalidGraphSegment;
+        const edge_type = try alloc.dupe(u8, edge_type_bytes);
         pos.* += edge_type_len;
         edges[idx] = .{
             .neighbor_id = neighbor_id,
@@ -351,6 +357,45 @@ test "serverless graph segment codec round-trips" {
     try std.testing.expectEqualStrings("doc-b", decoded.adjacencies[0].out_edges[0].neighbor_id);
     try std.testing.expectEqualStrings("cites", decoded.adjacencies[1].in_edges[0].edge_type);
     try std.testing.expectEqualStrings("entities", decoded.neighborTable(decoded.adjacencies[0].out_edges[0]).?);
+}
+
+test "serverless graph segment codec rejects invalid edge types" {
+    const alloc = std.testing.allocator;
+    var segment = graph_types.Segment{
+        .adjacencies = try alloc.alloc(graph_types.Adjacency, 1),
+    };
+    defer graph_types.freeSegment(alloc, &segment);
+    segment.adjacencies[0] = .{
+        .node_id = try alloc.dupe(u8, "doc-a"),
+        .out_edges = try alloc.alloc(graph_types.Edge, 1),
+        .in_edges = try alloc.alloc(graph_types.Edge, 0),
+    };
+    segment.adjacencies[0].out_edges[0] = .{
+        .neighbor_id = try alloc.dupe(u8, "doc-b"),
+        .edge_type = try alloc.dupe(u8, ""),
+        .weight = 1,
+    };
+
+    try std.testing.expectError(error.InvalidGraphSegment, encodeAlloc(alloc, segment));
+    alloc.free(segment.adjacencies[0].out_edges[0].edge_type);
+    segment.adjacencies[0].out_edges[0].edge_type = try alloc.dupe(u8, "x" ** (graph_edge_type.max_bytes + 1));
+    try std.testing.expectError(error.InvalidGraphSegment, encodeAlloc(alloc, segment));
+    alloc.free(segment.adjacencies[0].out_edges[0].edge_type);
+    segment.adjacencies[0].out_edges[0].edge_type = try alloc.dupe(u8, "\xff");
+    try std.testing.expectError(error.InvalidGraphSegment, encodeAlloc(alloc, segment));
+
+    alloc.free(segment.adjacencies[0].out_edges[0].edge_type);
+    segment.adjacencies[0].out_edges[0].edge_type = try alloc.dupe(u8, "x");
+    const encoded = try encodeAlloc(alloc, segment);
+    defer alloc.free(encoded);
+    const edge_type_len_offset = legacy_header_len + 12 + segment.adjacencies[0].node_id.len + 4;
+    std.mem.writeInt(u32, encoded[edge_type_len_offset..][0..4], 0, .little);
+    try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(alloc, encoded));
+    std.mem.writeInt(u32, encoded[edge_type_len_offset..][0..4], graph_edge_type.max_bytes + 1, .little);
+    try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(alloc, encoded));
+    std.mem.writeInt(u32, encoded[edge_type_len_offset..][0..4], 1, .little);
+    encoded[encoded.len - 1] = 0xff;
+    try std.testing.expectError(error.InvalidGraphSegment, decodeAlloc(alloc, encoded));
 }
 
 test "serverless graph segment codec rejects non-canonical edge ordering" {

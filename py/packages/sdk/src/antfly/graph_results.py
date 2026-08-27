@@ -53,11 +53,16 @@ def _exact_keys(
         _invalid(path, f"contains unknown member {min(unexpected)!r}")
 
 
-def _nonempty_string(value: object, path: str, *, max_length: int | None = None) -> str:
+def _nonempty_string(value: object, path: str, *, max_utf8_bytes: int | None = None) -> str:
     if not isinstance(value, str) or not value:
         _invalid(path, "must be a non-empty string")
-    if max_length is not None and len(value) > max_length:
-        _invalid(path, f"must contain at most {max_length} characters")
+    if max_utf8_bytes is not None:
+        try:
+            encoded_length = len(value.encode("utf-8"))
+        except UnicodeEncodeError:
+            _invalid(path, "must contain valid UTF-8")
+        if encoded_length > max_utf8_bytes:
+            _invalid(path, f"must encode to at most {max_utf8_bytes} UTF-8 bytes")
     return value
 
 
@@ -111,7 +116,7 @@ def _validate_path_edge(
     to_endpoint = _validate_endpoint(edge["to"], f"{path}.to")
     if not _same_endpoint(from_endpoint, expected_from) or not _same_endpoint(to_endpoint, expected_to):
         _invalid(path, "endpoints do not match adjacent path nodes")
-    _nonempty_string(edge["type"], f"{path}.type", max_length=65_536)
+    _nonempty_string(edge["type"], f"{path}.type", max_utf8_bytes=65_536)
     weight = _finite_nonnegative(edge["weight"], f"{path}.weight", at_most_one=max_weight_mode)
     if "metadata" in edge:
         _object(edge["metadata"], f"{path}.metadata")
@@ -197,6 +202,8 @@ def _validate_result_node(value: object, path: str) -> Mapping[str, Any]:
         raw_path = _array(node["path"], f"{path}.path")
         if not 1 <= len(raw_path) <= _MAX_GRAPH_EDGES + 1:
             _invalid(f"{path}.path", f"must contain between 1 and {_MAX_GRAPH_EDGES + 1} items")
+        if node["depth"] != len(raw_path) - 1:
+            _invalid(f"{path}.depth", "must equal path length minus one")
         endpoints = [_validate_endpoint(endpoint, f"{path}.path[{index}]") for index, endpoint in enumerate(raw_path)]
         if not _same_endpoint(endpoints[-1], node):
             _invalid(f"{path}.path", "must terminate at the result node")

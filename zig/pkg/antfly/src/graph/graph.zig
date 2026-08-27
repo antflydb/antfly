@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
+const edge_type_mod = @import("edge_type.zig");
 const edge_weight = @import("edge_weight.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_scan = @import("../storage/backend_scan.zig");
@@ -975,8 +976,14 @@ pub const GraphIndex = struct {
         if (writes.len == 0 and deletes.len == 0) return;
 
         // Validate the complete batch before opening either physical write
-        // batch, so an invalid weight cannot partially mutate one direction.
-        for (writes) |write| try edge_weight.validateStored(write.weight);
+        // batch, so invalid durable fields cannot partially mutate one
+        // direction or create records that the public graph wire contract
+        // cannot represent.
+        for (writes) |write| {
+            try edge_type_mod.validateStored(write.edge_type);
+            try edge_weight.validateStored(write.weight);
+        }
+        for (deletes) |delete| try edge_type_mod.validateStored(delete.edge_type);
 
         try self.validateTreeBatchWrites(writes, deletes);
 
@@ -1925,6 +1932,33 @@ test "graph addEdge and getEdges out" {
     try std.testing.expectEqual(@as(usize, 2), edges.len);
     try std.testing.expectEqualStrings("doc1", edges[0].source);
     try std.testing.expectApproxEqAbs(@as(f64, 0.9), edges[0].weight, 0.001);
+}
+
+test "graph durable writes reject invalid edge types before mutation" {
+    const alloc = std.testing.allocator;
+    var store_buf: [256]u8 = undefined;
+    const store_path = tmpPath(&store_buf, "edge-type-policy-store");
+    defer cleanupTmp(store_path);
+    var rev_buf: [256]u8 = undefined;
+    const rev_path = tmpPath(&rev_buf, "edge-type-policy-rev");
+    defer cleanupTmp(rev_path);
+
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{});
+    defer graph.close();
+
+    try std.testing.expectError(
+        error.InvalidGraphEdges,
+        graph.addEdge("a", "b", "", 1, 0, 0, ""),
+    );
+    try std.testing.expectError(
+        error.InvalidGraphEdges,
+        graph.addEdge("a", "b", "x" ** (edge_type_mod.max_bytes + 1), 1, 0, 0, ""),
+    );
+    const edges = try graph.getEdges(alloc, "a", "", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
 }
 
 test "graph bounded adjacency pages preserve order and fail before budget overflow" {

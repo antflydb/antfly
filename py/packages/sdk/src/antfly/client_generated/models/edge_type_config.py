@@ -17,7 +17,7 @@ class EdgeTypeConfig:
     """Configuration for a specific edge type
 
     Attributes:
-        name (str): Edge type name (e.g., 'cites', 'similar_to')
+        name (str): Edge type name encoded as at most 64 KiB of UTF-8 (e.g., 'cites', 'similar_to')
         field (str | Unset): Document field containing target node key(s) for automatic edge creation.
             Supports string (single target) or array of strings (multiple targets).
             When omitted, edges must be provided explicitly via _edges.
