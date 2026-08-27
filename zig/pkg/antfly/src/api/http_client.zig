@@ -3401,6 +3401,22 @@ test "api http client preserves retryable group transaction unavailability" {
         }
     };
 
+    const UntrackedTimeoutExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+            try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.unknown, tracker.load());
+            return error.Timeout;
+        }
+    };
+
     var executor = UnavailableExecutor{};
     var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
     const base_uri = "http://127.0.0.1:1";
@@ -3444,6 +3460,45 @@ test "api http client preserves retryable group transaction unavailability" {
         500,
     ));
     try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, prepare_delivery.load());
+
+    // Crossing into an executor invalidates caller-side `not_sent` proof. An
+    // executor that cannot identify its send boundary may leave the state
+    // unknown, and transaction routing must fail closed rather than replay.
+    var untracked_executor = UntrackedTimeoutExecutor{};
+    var untracked_client = ApiHttpClient.init(std.testing.allocator, untracked_executor.executor());
+    var untracked_delivery: http_common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.Timeout, untracked_client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+        base_uri,
+        7,
+        "docs",
+        "{}",
+        &untracked_delivery,
+        1_000,
+        500,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), untracked_executor.calls);
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.unknown, untracked_delivery.load());
+
+    // Credential construction still occurs before the executor boundary, so
+    // a signing allocation failure retains definite no-delivery provenance.
+    var signing_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var signing_delivery: http_common.RequestDeliveryTracker = .{};
+    signing_delivery.markNotSent();
+    try std.testing.expectError(error.OutOfMemory, internal_service_auth.executeRequest(
+        signing_failing.allocator(),
+        untracked_executor.executor(),
+        .{
+            .method = .POST,
+            .uri = "http://127.0.0.1:1/internal/v1/groups/7/tables/docs/txn-begin",
+            .delivery_tracker = &signing_delivery,
+        },
+        .{
+            .secret = "0123456789abcdef0123456789abcdef",
+            .issuer = "cluster-a",
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 1), untracked_executor.calls);
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, signing_delivery.load());
 }
 
 fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {

@@ -909,6 +909,7 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
             post_send_transport,
             not_sent_timeout,
             post_send_timeout,
+            unknown_timeout,
             not_sent_local_failure,
             post_send_local_failure,
             unknown_group,
@@ -990,6 +991,9 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
                         tracker.markMayHaveBeenSent();
                         return error.Timeout;
                     },
+                    // A conforming executor may leave delivery unknown when
+                    // it cannot identify its send boundary precisely.
+                    .unknown_timeout => return error.Timeout,
                     .not_sent_local_failure => {
                         const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
                         tracker.markNotSent();
@@ -1130,6 +1134,15 @@ test "hosted participant rediscovery retries only pre-decision leader unavailabi
         .participants = &.{"table2:docs:group:7"},
     }));
     try std.testing.expectEqual(@as(usize, 1), post_send_timeout_executor.calls);
+
+    var unknown_timeout_executor = FakeExecutor{ .first_outcome = .unknown_timeout };
+    var unknown_timeout_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, unknown_timeout_executor.iface());
+    try std.testing.expectError(error.Timeout, unknown_timeout_worker.worker().beginGroup(std.testing.allocator, 7, "docs", .{
+        .txn_id = txn_id,
+        .begin_timestamp = 42,
+        .participants = &.{"table2:docs:group:7"},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), unknown_timeout_executor.calls);
 
     var not_sent_local_failure_executor = FakeExecutor{ .first_outcome = .not_sent_local_failure };
     var not_sent_local_failure_worker = HostedParticipantWorker.init(undefined, FakeRouter.iface(), undefined, not_sent_local_failure_executor.iface());
