@@ -611,7 +611,28 @@ const IndexRepairQueueEntry = struct {
 const IndexRepairQueueWake = enum {
     immediate,
     retained,
+    parked,
 };
+
+fn indexRepairQueueWakeFromAggregate(wake: antfly.db.DB.IndexRepairWake) IndexRepairQueueWake {
+    return switch (wake) {
+        // Pending debt paired with an empty aggregate is an inconsistent/lost
+        // wake observation. Fail toward a bounded audit instead of parking it.
+        .immediate, .empty => .immediate,
+        .at_realtime_ms => .retained,
+        .parked => .parked,
+    };
+}
+
+test "data runtime preserves tagged aggregate index repair wake semantics" {
+    try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.immediate));
+    try std.testing.expectEqual(IndexRepairQueueWake.immediate, indexRepairQueueWakeFromAggregate(.empty));
+    try std.testing.expectEqual(IndexRepairQueueWake.parked, indexRepairQueueWakeFromAggregate(.parked));
+    try std.testing.expectEqual(
+        IndexRepairQueueWake.retained,
+        indexRepairQueueWakeFromAggregate(.{ .at_realtime_ms = 42 }),
+    );
+}
 
 const IndexRepairQueueMutationGuard = union(enum) {
     unguarded,
@@ -12367,11 +12388,14 @@ pub const DataServer = struct {
         mutation_guard: IndexRepairQueueMutationGuard,
     ) !bool {
         const now_ms: u64 = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
-        const next_retry_at_ms = indexRepairMonotonicDeadlineMs(
-            next_retry_at_realtime_ms,
-            platform_clock.Clock.real().nowRealtimeMs(),
-            now_ms,
-        );
+        const next_retry_at_ms = if (wake == .parked)
+            std.math.maxInt(u64)
+        else
+            indexRepairMonotonicDeadlineMs(
+                next_retry_at_realtime_ms,
+                platform_clock.Clock.real().nowRealtimeMs(),
+                now_ms,
+            );
 
         // The overwhelmingly common path is retaining an exact durable wake
         // that is already in the linked queue. Keep that path allocation-free:
@@ -13411,7 +13435,7 @@ pub const DataServer = struct {
                     table_name,
                     group_id,
                     result.index_repair_retry_at_ms,
-                    .retained,
+                    indexRepairQueueWakeFromAggregate(result.index_repair_wake),
                     .{ .selected = candidate.queue_wake_generation },
                 ) catch |err| {
                     _ = self.provisioned_index_repair_failed.fetchAdd(1, .monotonic);
@@ -25032,6 +25056,17 @@ test "data runtime exact repair requeue is allocation-free and failed new enqueu
     ));
     try std.testing.expect(server.provisioned_index_repair_group_ages.contains(7001));
     try std.testing.expectEqual(selected_generation, server.provisioned_index_repair_group_ages.get(7001).?.wake_generation);
+    try std.testing.expect(try server.enqueueProvisionedIndexRepairWithRetryForTable(
+        "docs",
+        7001,
+        0,
+        .parked,
+        .{ .selected = selected_generation },
+    ));
+    try std.testing.expectEqual(
+        std.math.maxInt(u64),
+        server.provisioned_index_repair_group_ages.get(7001).?.next_retry_at_ms,
+    );
 
     // A newer external wake is allocation-free too, but advances ownership.
     // Completion of the selected generation cannot remove that later edge;

@@ -1288,7 +1288,8 @@ pub const IndexManager = struct {
     // replacement may load successfully after pointer activation while its
     // intent is still in activating/validating; queries must remain closed
     // until DB validation publishes a clean checkpoint.
-    repair_unavailable_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    repair_unavailable_indexes: std.StringHashMapUnmanaged(RepairAdmissionSlot) = .empty,
+    next_repair_admission_epoch: u64 = 1,
     // Primary-store admission markers captured once before catalog open. The
     // immutable snapshot makes full-text backfill suppression O(1) per index
     // and lets every open mode install the same fail-closed service gate.
@@ -1308,6 +1309,58 @@ pub const IndexManager = struct {
         loading,
         complete,
     };
+
+    /// Process-local projection of repair admission. Durable transitions use
+    /// `durable_revision`; `provisional_fences` closes admission before the
+    /// checkpoint CAS so allocation or callback failure after commit cannot
+    /// expose an unsafe generation. Legacy structural admission remains an
+    /// independent bit because it is authorized by a primary-store marker,
+    /// not an index-repair revision.
+    const RepairAdmissionSlot = struct {
+        repair_id: u128 = 0,
+        config_hash: u64 = 0,
+        root_generation: u64 = 0,
+        durable_revision: u64 = 0,
+        committed_epoch: u64 = 0,
+        durable_blocked: bool = false,
+        legacy_blocked: bool = false,
+        runtime_serviceable: bool = false,
+        provisional_fences: u32 = 0,
+
+        fn blocked(self: @This()) bool {
+            return self.legacy_blocked or self.provisional_fences != 0 or
+                (self.durable_blocked and !self.runtime_serviceable);
+        }
+
+        fn retained(self: @This()) bool {
+            return self.durable_blocked or self.legacy_blocked or self.provisional_fences != 0;
+        }
+    };
+
+    pub const RepairAdmissionFence = struct {
+        epoch: u64,
+        active: bool = true,
+    };
+
+    pub const RepairAdmissionVersion = struct {
+        repair_id: u128,
+        revision: u64,
+        config_hash: u64,
+        root_generation: u64,
+
+        fn matchesSlot(self: @This(), slot: RepairAdmissionSlot) bool {
+            return self.repair_id == slot.repair_id and
+                self.config_hash == slot.config_hash and
+                self.root_generation == slot.root_generation;
+        }
+    };
+
+    fn allocateRepairAdmissionEpochUnlocked(self: *IndexManager) u64 {
+        const epoch = self.next_repair_admission_epoch;
+        self.next_repair_admission_epoch +%= 1;
+        if (self.next_repair_admission_epoch == 0) self.next_repair_admission_epoch = 1;
+        return epoch;
+    }
 
     const TextMergeDeletionDelta = struct {
         bitmap: roaring.RoaringBitmap,
@@ -3108,31 +3161,193 @@ pub const IndexManager = struct {
         }
     }
 
-    pub fn markRepairUnavailable(self: *IndexManager, name: []const u8) !void {
+    /// Install a fail-closed gate for a structural condition which does not
+    /// yet have a durable repair identity. Exact durable publication consumes
+    /// this gate; clearing it can never erase incarnation-scoped repair debt.
+    pub fn markUnscopedRepairUnavailable(self: *IndexManager, name: []const u8) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (self.repair_unavailable_indexes.contains(name)) return;
+        if (self.repair_unavailable_indexes.getPtr(name)) |slot| {
+            slot.legacy_blocked = true;
+            slot.runtime_serviceable = false;
+            return;
+        }
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
-        try self.repair_unavailable_indexes.put(self.alloc, owned, {});
+        try self.repair_unavailable_indexes.put(self.alloc, owned, .{ .legacy_blocked = true });
     }
 
-    pub fn clearRepairUnavailable(self: *IndexManager, name: []const u8) void {
+    /// Preallocate a fail-closed slot while deliberately retiring the prior
+    /// repair incarnation. Root-generation replacement calls this before its
+    /// checkpoint commit, then binds the new identity without allocation.
+    pub fn prepareRepairAdmissionRebind(
+        self: *IndexManager,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+    ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
+        const slot = if (self.repair_unavailable_indexes.getPtr(name)) |existing|
+            existing
+        else blk: {
+            const owned = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(owned);
+            try self.repair_unavailable_indexes.put(self.alloc, owned, .{});
+            break :blk self.repair_unavailable_indexes.getPtr(name).?;
+        };
+        slot.repair_id = version.repair_id;
+        slot.config_hash = version.config_hash;
+        slot.root_generation = version.root_generation;
+        slot.durable_revision = version.revision;
+        // This is also an incarnation barrier: any old-root fence reserved
+        // before the checkpoint replacement can no longer publish afterward.
+        slot.committed_epoch = self.allocateRepairAdmissionEpochUnlocked();
+        slot.durable_blocked = false;
+        slot.runtime_serviceable = false;
+        slot.legacy_blocked = true;
+    }
+
+    pub fn clearUnscopedRepairUnavailable(self: *IndexManager, name: []const u8) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse return;
+        slot.legacy_blocked = false;
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    /// Reserve a non-fallible fail-closed publication before committing a
+    /// durable blocking transition. The returned fence must be finished or
+    /// cancelled exactly once.
+    pub fn beginRepairAdmissionFence(self: *IndexManager, name: []const u8) !RepairAdmissionFence {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const epoch = self.allocateRepairAdmissionEpochUnlocked();
+        if (self.repair_unavailable_indexes.getPtr(name)) |slot| {
+            slot.provisional_fences = std.math.add(u32, slot.provisional_fences, 1) catch
+                return error.IndexRepairAdmissionOverflow;
+            return .{ .epoch = epoch };
+        }
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.repair_unavailable_indexes.put(self.alloc, owned, .{ .provisional_fences = 1 });
+        return .{ .epoch = epoch };
+    }
+
+    /// Publish the committed checkpoint revision and release its provisional
+    /// fence without allocating. A delayed older publisher cannot overwrite a
+    /// newer admission decision.
+    pub fn finishRepairAdmissionFence(
+        self: *IndexManager,
+        fence: *RepairAdmissionFence,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+        blocked: bool,
+        preserve_serviceability: bool,
+    ) void {
+        std.debug.assert(fence.active);
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse unreachable;
+        std.debug.assert(slot.provisional_fences != 0);
+        if (fence.epoch >= slot.committed_epoch and
+            version.root_generation >= slot.root_generation)
+        {
+            slot.repair_id = version.repair_id;
+            slot.config_hash = version.config_hash;
+            slot.root_generation = version.root_generation;
+            slot.durable_revision = version.revision;
+            slot.committed_epoch = fence.epoch;
+            slot.durable_blocked = blocked;
+            slot.legacy_blocked = false;
+            if (!preserve_serviceability) slot.runtime_serviceable = false;
+        }
+        slot.provisional_fences -= 1;
+        fence.active = false;
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    pub fn cancelRepairAdmissionFence(
+        self: *IndexManager,
+        fence: *RepairAdmissionFence,
+        name: []const u8,
+    ) void {
+        if (!fence.active) return;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse unreachable;
+        std.debug.assert(slot.provisional_fences != 0);
+        slot.provisional_fences -= 1;
+        fence.active = false;
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    /// Apply a committed admission revision which did not require a new
+    /// fail-closed fence (normally a serviceability/opening transition).
+    pub fn publishRepairAdmission(
+        self: *IndexManager,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+        blocked: bool,
+        preserve_serviceability: bool,
+    ) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse {
+            // A blocking publication is required to reserve before commit.
+            std.debug.assert(!blocked);
+            return;
+        };
+        const bootstrap_preallocated_gate = slot.repair_id == 0 and slot.legacy_blocked;
+        if ((version.matchesSlot(slot.*) and version.revision >= slot.durable_revision) or
+            bootstrap_preallocated_gate)
+        {
+            slot.repair_id = version.repair_id;
+            slot.config_hash = version.config_hash;
+            slot.root_generation = version.root_generation;
+            slot.durable_revision = version.revision;
+            slot.durable_blocked = blocked;
+            slot.legacy_blocked = false;
+            if (!preserve_serviceability) slot.runtime_serviceable = false;
+        }
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    /// Publish a generation-scoped live proof which permits a progressive
+    /// active generation to serve while its durable corpus-wide repair intent
+    /// remains pending. Any newer blocking revision revokes this proof.
+    pub fn publishRepairServiceabilityProof(
+        self: *IndexManager,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+    ) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse return;
+        if (!version.matchesSlot(slot.*) or version.revision != slot.durable_revision) return;
+        slot.runtime_serviceable = true;
+    }
+
+    fn pruneRepairAdmissionSlotUnlocked(self: *IndexManager, name: []const u8) void {
+        const slot = self.repair_unavailable_indexes.get(name) orelse return;
+        if (slot.retained()) return;
         if (self.repair_unavailable_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
     }
 
     pub fn repairUnavailable(self: *IndexManager, name: []const u8) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return self.repair_unavailable_indexes.contains(name);
+        const slot = self.repair_unavailable_indexes.get(name) orelse return false;
+        return slot.blocked();
     }
 
     pub fn hasRepairUnavailableIndexes(self: *IndexManager) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return self.repair_unavailable_indexes.count() != 0;
+        var slots = self.repair_unavailable_indexes.valueIterator();
+        while (slots.next()) |slot| {
+            if (slot.blocked()) return true;
+        }
+        return false;
     }
 
     fn clearRepairUnavailableIndexes(self: *IndexManager) void {
@@ -3185,7 +3400,7 @@ pub const IndexManager = struct {
             var it = self.managed_admission_indexes.keyIterator();
             while (it.next()) |name| names.appendAssumeCapacity(try self.alloc.dupe(u8, name.*));
         }
-        for (names.items) |name| try self.markRepairUnavailable(name);
+        for (names.items) |name| try self.markUnscopedRepairUnavailable(name);
     }
 
     fn managedAdmissionPending(self: *IndexManager, name: []const u8) bool {

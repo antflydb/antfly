@@ -5675,6 +5675,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_repair_degraded: bool = false,
         index_repair_disk_wait: bool = false,
         index_repair_retry_at_ms: u64 = 0,
+        index_repair_wake: db_mod.DB.IndexRepairWake = .empty,
     };
 
     pub const LocalChangeKind = enum {
@@ -24514,6 +24515,7 @@ fn mergeLiveIndexRepairResult(
     result.index_repair_degraded = repair.index_repair_degraded;
     result.index_repair_disk_wait = repair.index_repair_disk_wait;
     result.index_repair_retry_at_ms = repair.index_repair_retry_at_ms;
+    result.index_repair_wake = repair.index_repair_wake;
     result.terminal_degraded = repair.terminal_degraded;
 }
 
@@ -24840,6 +24842,7 @@ fn catchUpManagedDb(
                 .index_repair_degraded = repair.degraded != 0,
                 .index_repair_disk_wait = repair.disk_waits != 0,
                 .index_repair_retry_at_ms = repair.next_retry_at_ms,
+                .index_repair_wake = repair.wake,
             };
         }
     }
