@@ -324,9 +324,18 @@ pub const Font = struct {
                     stack.clearRetainingCapacity();
                     width_seen.* = true;
                 },
-                6 => try executeAlternatingLines(alloc, stack, current, x, y, true),
-                7 => try executeAlternatingLines(alloc, stack, current, x, y, false),
-                8 => try executeRrcurveto(alloc, stack, current, x, y),
+                6 => {
+                    try executeAlternatingLines(alloc, stack, current, x, y, true);
+                    width_seen.* = true;
+                },
+                7 => {
+                    try executeAlternatingLines(alloc, stack, current, x, y, false);
+                    width_seen.* = true;
+                },
+                8 => {
+                    try executeRrcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
                 10 => {
                     if (active_local_subrs == null or stack.items.len == 0) return error.UnsupportedCff;
                     const subr_index = try subroutineIndex(stack.orderedRemove(stack.items.len - 1), active_local_subrs.?.count);
@@ -362,13 +371,24 @@ pub const Font = struct {
                         28 => try exchStack(stack),
                         29 => try indexStack(alloc, stack),
                         30 => try rollStack(alloc, stack),
-                        34 => try executeHflex(alloc, stack, current, x, y),
-                        35 => try executeFlex(alloc, stack, current, x, y),
-                        36 => try executeHflex1(alloc, stack, current, x, y),
-                        37 => try executeFlex1(alloc, stack, current, x, y),
+                        34 => {
+                            try executeHflex(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
+                        35 => {
+                            try executeFlex(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
+                        36 => {
+                            try executeHflex1(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
+                        37 => {
+                            try executeFlex1(alloc, stack, current, x, y);
+                            width_seen.* = true;
+                        },
                         else => return error.UnsupportedCff,
                     }
-                    width_seen.* = true;
                 },
                 14 => {
                     if (current.items.len > 0) try flushContour(alloc, contours, current);
@@ -393,10 +413,22 @@ pub const Font = struct {
                     stack.clearRetainingCapacity();
                     width_seen.* = true;
                 },
-                24 => try executeRcurveline(alloc, stack, current, x, y),
-                25 => try executeRlinecurve(alloc, stack, current, x, y),
-                26 => try executeVvcurveto(alloc, stack, current, x, y),
-                27 => try executeHhcurveto(alloc, stack, current, x, y),
+                24 => {
+                    try executeRcurveline(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                25 => {
+                    try executeRlinecurve(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                26 => {
+                    try executeVvcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                27 => {
+                    try executeHhcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
                 28 => {
                     if (i + 2 > program.len) return error.TruncatedCff;
                     const value: i16 = @bitCast((@as(u16, program[i]) << 8) | program[i + 1]);
@@ -409,8 +441,14 @@ pub const Font = struct {
                     const subr = try self.global_subrs.getObject(self.bytes, subr_index);
                     try self.executeCharStringAllocLimited(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, remaining_operations, subr_depth + 1);
                 },
-                30 => try executeVhcurveto(alloc, stack, current, x, y),
-                31 => try executeHvcurveto(alloc, stack, current, x, y),
+                30 => {
+                    try executeVhcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
+                31 => {
+                    try executeHvcurveto(alloc, stack, current, x, y);
+                    width_seen.* = true;
+                },
                 19, 20 => {
                     try consumeStemHints(stack, width_seen, hint_count);
                     const mask_bytes = (hint_count.* + 7) / 8;
@@ -442,7 +480,6 @@ pub const Font = struct {
                 },
                 else => return error.UnsupportedCff,
             }
-            width_seen.* = true;
         }
     }
 
@@ -1496,6 +1533,42 @@ test "cff hintmask skips mask bytes and continues outline parsing" {
     try std.testing.expectEqual(@as(usize, 1), hint_count);
     try std.testing.expectEqual(@as(usize, 1), contours.items.len);
     try std.testing.expectApproxEqAbs(@as(f64, 50), contours.items[0].points[1].x, 0.001);
+}
+
+test "cff consumes an explicit width before the first moveto" {
+    const alloc = std.testing.allocator;
+    const font = Font{
+        .bytes = &.{},
+        .charstrings = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .charset = &.{},
+        .global_subrs = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .local_subrs = null,
+        .fd_array = null,
+        .fd_select = null,
+    };
+    // 100 width; 10 20 rmoveto; 50 0 rlineto; endchar.
+    const program = [_]u8{ 239, 149, 159, 21, 189, 139, 5, 14 };
+
+    var contours = std.ArrayList(GlyphContour).empty;
+    defer {
+        for (contours.items) |*contour| contour.deinit(alloc);
+        contours.deinit(alloc);
+    }
+    var current = std.ArrayList(GlyphPoint).empty;
+    defer current.deinit(alloc);
+    var stack = std.ArrayList(f64).empty;
+    defer stack.deinit(alloc);
+    var x: f64 = 0;
+    var y: f64 = 0;
+    var width_seen = false;
+    var hint_count: usize = 0;
+    var transient: [32]f64 = [_]f64{0} ** 32;
+    try font.executeCharStringAlloc(alloc, &program, null, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
+
+    try std.testing.expectEqual(@as(usize, 1), contours.items.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), contours.items[0].points[0].x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), contours.items[0].points[0].y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 60), contours.items[0].points[1].x, 0.001);
 }
 
 test "cff enforces a shared charstring operation limit" {

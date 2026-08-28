@@ -426,6 +426,7 @@ const Type1Glyph = struct {
 const Type1Font = struct {
     local_subrs: [][]u8 = &.{},
     glyphs: []Type1Glyph = &.{},
+    missing_width: f64 = 0,
 
     fn deinit(self: *Type1Font, alloc: Allocator) void {
         for (self.local_subrs) |subr| alloc.free(subr);
@@ -458,6 +459,7 @@ const TrueTypeFont = struct {
     raw_code_bytes: usize = 0,
     cid_to_gid: ?[]u16 = null,
     pdf_widths: ?[]f64 = null,
+    pdf_missing_width: ?f64 = null,
     cid_widths: ?CidWidths = null,
 
     fn deinit(self: *TrueTypeFont, alloc: Allocator) void {
@@ -469,6 +471,14 @@ const TrueTypeFont = struct {
         self.* = undefined;
     }
 };
+
+fn simpleTrueTypePdfWidth(pdf_widths: ?[]f64, missing_width: ?f64, code: u8) ?f64 {
+    if (pdf_widths) |widths| {
+        const width = widths[code];
+        if (width >= 0) return width;
+    }
+    return missing_width;
+}
 
 const CidWidthRange = struct {
     first: u16,
@@ -777,6 +787,37 @@ const SharedImageRgba = struct {
             alloc.free(self.bytes);
             alloc.destroy(self);
         }
+    }
+};
+
+const CachedPageImage = struct {
+    shared_rgba: *SharedImageRgba,
+    width: u32,
+    height: u32,
+    interpolate: bool,
+};
+
+/// A request-scoped cache for decoded indirect image XObjects. Forms and
+/// patterns commonly reference the same image through several resource
+/// dictionaries; keeping one immutable RGBA allocation avoids repeated codec
+/// work while retained_bytes keeps subsequent decodes under the aggregate
+/// working-set ceiling.
+const DecodedImageCache = struct {
+    entries: std.AutoHashMapUnmanaged(u64, CachedPageImage) = .empty,
+    retained_bytes: usize = 0,
+    scope_depth: usize = 0,
+
+    fn clear(self: *DecodedImageCache, alloc: Allocator) void {
+        var values = self.entries.valueIterator();
+        while (values.next()) |entry| entry.shared_rgba.release(alloc);
+        self.entries.clearRetainingCapacity();
+        self.retained_bytes = 0;
+    }
+
+    fn deinit(self: *DecodedImageCache, alloc: Allocator) void {
+        self.clear(alloc);
+        self.entries.deinit(alloc);
+        self.* = undefined;
     }
 };
 
@@ -1998,6 +2039,7 @@ pub const Reader = struct {
     trailer: syntax.Object,
     page_index: ?[]syntax.Object = null,
     font_cache: *std.AutoHashMapUnmanaged(u64, PageFont),
+    image_cache: ?*DecodedImageCache = null,
     encryption: ?EncryptionContext = null,
     decrypted_streams: *std.AutoHashMapUnmanaged(usize, []u8),
     image_decode_target: ?ImageDecodeTarget = null,
@@ -2010,6 +2052,19 @@ pub const Reader = struct {
     /// release Reader-owned runs with this allocator.
     pub fn allocator(self: *const Reader) Allocator {
         return self.alloc;
+    }
+
+    fn beginImageCacheScope(self: *Reader) !void {
+        const cache = self.image_cache orelse return;
+        if (cache.scope_depth == 0) cache.clear(self.alloc);
+        cache.scope_depth = std.math.add(usize, cache.scope_depth, 1) catch return error.InvalidPdf;
+    }
+
+    fn endImageCacheScope(self: *Reader) void {
+        const cache = self.image_cache orelse return;
+        std.debug.assert(cache.scope_depth > 0);
+        cache.scope_depth -= 1;
+        if (cache.scope_depth == 0) cache.clear(self.alloc);
     }
 
     const TraversalGuard = struct {
@@ -2080,7 +2135,15 @@ pub const Reader = struct {
         };
         font_cache.* = .empty;
 
+        const image_cache = alloc.create(DecodedImageCache) catch |err| {
+            alloc.destroy(font_cache);
+            alloc.free(xref_entries);
+            return err;
+        };
+        image_cache.* = .{};
+
         const decrypted_streams = alloc.create(std.AutoHashMapUnmanaged(usize, []u8)) catch |err| {
+            alloc.destroy(image_cache);
             alloc.destroy(font_cache);
             alloc.free(xref_entries);
             return err;
@@ -2100,6 +2163,7 @@ pub const Reader = struct {
             .trailer = owned_trailer,
             .page_index = null,
             .font_cache = font_cache,
+            .image_cache = image_cache,
             .encryption = null,
             .decrypted_streams = decrypted_streams,
         };
@@ -2117,6 +2181,10 @@ pub const Reader = struct {
         while (font_iter.next()) |font| font.deinit(self.alloc);
         self.font_cache.deinit(self.alloc);
         self.alloc.destroy(self.font_cache);
+        if (self.image_cache) |cache| {
+            cache.deinit(self.alloc);
+            self.alloc.destroy(cache);
+        }
         var stream_iter = self.decrypted_streams.valueIterator();
         while (stream_iter.next()) |stream| self.alloc.free(stream.*);
         self.decrypted_streams.deinit(self.alloc);
@@ -2349,6 +2417,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageTextAlloc(self: *Reader, page_num: usize) ![]u8 {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -2409,6 +2479,8 @@ pub const Reader = struct {
     /// page object, resource collection, content stream resolution, and stream
     /// decoding work between both representations.
     pub fn extractPageTextAnalysisAlloc(self: *Reader, page_num: usize) !PageTextAnalysis {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -2439,6 +2511,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageTextRunsAlloc(self: *Reader, page_num: usize) ![]TextRun {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -2463,6 +2537,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageImageRunsAlloc(self: *Reader, page_num: usize) ![]ImageRun {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -2487,6 +2563,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageShadingRunsAlloc(self: *Reader, page_num: usize) ![]ShadingRun {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -2511,6 +2589,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPagePatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -2535,6 +2615,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageRenderRunsAlloc(self: *Reader, page_num: usize) !PageRenderRuns {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         const page_box = try self.extractPageBoxFromObject(&page);
@@ -2680,6 +2762,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         const gstates = try self.collectPageExtGStatesAlloc(&page);
@@ -2701,6 +2785,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageVectorTextShapeRunsAlloc(self: *Reader, page_num: usize) ![]ShapeRun {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -3027,6 +3113,8 @@ pub const Reader = struct {
     }
 
     pub fn extractPageVectorTextPatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
+        try self.beginImageCacheScope();
+        defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
 
@@ -4036,8 +4124,11 @@ pub const Reader = struct {
             }) orelse {
                 const missing_advance = if (cid_code != null and truetype.cid_widths != null)
                     truetype.cid_widths.?.width(cid_code.?) * run.font_size / 1000.0
-                else if (simple_code != null and truetype.pdf_widths != null and truetype.pdf_widths.?[simple_code.?] >= 0)
-                    truetype.pdf_widths.?[simple_code.?] * run.font_size / 1000.0
+                else if (simple_code) |code|
+                    if (simpleTrueTypePdfWidth(truetype.pdf_widths, truetype.pdf_missing_width, code)) |width|
+                        width * run.font_size / 1000.0
+                    else
+                        run.font_size * 0.6
                 else
                     run.font_size * 0.6;
                 cursor_x += (missing_advance + run.char_spacing + if (cp == ' ') run.word_spacing else 0.0) * run.horizontal_scale;
@@ -4061,11 +4152,13 @@ pub const Reader = struct {
             const spacing = run.char_spacing + if (cp == ' ') run.word_spacing else 0.0;
             const glyph_advance = if (cid_code != null and truetype.cid_widths != null)
                 truetype.cid_widths.?.width(cid_code.?) * run.font_size / 1000.0
-            else if (simple_code != null and truetype.pdf_widths != null) blk: {
-                const width = truetype.pdf_widths.?[simple_code.?];
-                if (width >= 0) break :blk width * run.font_size / 1000.0;
-                break :blk @as(f64, @floatFromInt(advance_width)) * scale;
-            } else @as(f64, @floatFromInt(advance_width)) * scale;
+            else if (simple_code) |code|
+                if (simpleTrueTypePdfWidth(truetype.pdf_widths, truetype.pdf_missing_width, code)) |width|
+                    width * run.font_size / 1000.0
+                else
+                    @as(f64, @floatFromInt(advance_width)) * scale
+            else
+                @as(f64, @floatFromInt(advance_width)) * scale;
             cursor_x += (glyph_advance + spacing) * run.horizontal_scale;
         }
         return true;
@@ -4088,7 +4181,7 @@ pub const Reader = struct {
         for (raw) |code| {
             const glyph = type1.glyphForCode(code) orelse {
                 complete = false;
-                cursor_x += estimateType1MissingAdvance(run, code);
+                cursor_x += estimateType1MissingAdvance(run, code, type1.missing_width);
                 continue;
             };
             const outline_value = font_lib.type1.glyphOutlineAllocLimited(alloc, glyph.charstring, type1.local_subrs, .{ .max_operations = max_glyph_charstring_operations }) catch |err| blk: {
@@ -4428,27 +4521,75 @@ pub const Reader = struct {
         }
         for (resolved_xobjects.dict) |entry| {
             if (!references.contains(entry.key)) continue;
+            const cache_key: ?u64 = if (entry.value == .obj_ref)
+                (@as(u64, entry.value.obj_ref.id) << 16) | entry.value.obj_ref.gen
+            else
+                null;
+            const active_cache = if (self.image_cache) |cache| if (cache.scope_depth > 0) cache else null else null;
+            if (active_cache) |cache| if (cache_key) |key| if (cache.entries.get(key)) |cached| {
+                var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+                errdefer if (name) |owned| self.alloc.free(owned);
+                cached.shared_rgba.retain();
+                var image_reference_owned = true;
+                errdefer if (image_reference_owned) cached.shared_rgba.release(self.alloc);
+                try out.append(self.alloc, .{
+                    .name = name.?,
+                    .rgba = cached.shared_rgba.bytes,
+                    .shared_rgba = cached.shared_rgba,
+                    .width = cached.width,
+                    .height = cached.height,
+                    .interpolate = cached.interpolate,
+                });
+                name = null;
+                image_reference_owned = false;
+                continue;
+            };
             var xobj = try self.resolveValue(&entry.value);
             defer xobj.deinit(self.alloc);
             if (xobj != .stream) continue;
             const subtype = xobj.get("Subtype") orelse continue;
             if (!std.mem.eql(u8, subtype.asName() orelse continue, "Image")) continue;
-            const decoded = try self.decodeImageToRgbaAlloc(&xobj);
+            const decoded = if (active_cache) |cache|
+                try self.decodeImageToRgbaWithInitialLiveBytesAlloc(&xobj, cache.retained_bytes)
+            else
+                try self.decodeImageToRgbaAlloc(&xobj);
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
-            errdefer self.alloc.free(decoded.rgba);
+            var rgba_owned = true;
+            errdefer if (rgba_owned) self.alloc.free(decoded.rgba);
             const shared = try self.alloc.create(SharedImageRgba);
-            errdefer self.alloc.destroy(shared);
             shared.* = .{ .bytes = decoded.rgba };
+            rgba_owned = false;
+            const interpolate = if (xobj.get("Interpolate")) |value| value.* == .boolean and value.boolean else false;
+
+            var shared_reference_owned = true;
+            errdefer if (shared_reference_owned) shared.release(self.alloc);
+            if (active_cache) |cache| if (cache_key) |key| {
+                const retained_bytes = std.math.add(usize, cache.retained_bytes, decoded.rgba.len) catch return error.PdfDecodeWorkingSetTooLarge;
+                if (retained_bytes > self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+                try cache.entries.put(self.alloc, key, .{
+                    .shared_rgba = shared,
+                    .width = decoded.width,
+                    .height = decoded.height,
+                    .interpolate = interpolate,
+                });
+                cache.retained_bytes = retained_bytes;
+                // The cache owns the initial reference; the PageImage owns a
+                // second reference that can outlive this extraction scope.
+                shared_reference_owned = false;
+                shared.retain();
+                shared_reference_owned = true;
+            };
             try out.append(self.alloc, .{
                 .name = name.?,
                 .rgba = decoded.rgba,
                 .shared_rgba = shared,
                 .width = decoded.width,
                 .height = decoded.height,
-                .interpolate = if (xobj.get("Interpolate")) |value| value.* == .boolean and value.boolean else false,
+                .interpolate = interpolate,
             });
             name = null;
+            shared_reference_owned = false;
         }
         return try out.toOwnedSlice(self.alloc);
     }
@@ -4911,10 +5052,15 @@ pub const Reader = struct {
     }
 
     fn decodeImageToRgbaAlloc(self: *const Reader, obj: *const syntax.Object) anyerror!DecodedRgbaImage {
+        return try self.decodeImageToRgbaWithInitialLiveBytesAlloc(obj, 0);
+    }
+
+    fn decodeImageToRgbaWithInitialLiveBytesAlloc(self: *const Reader, obj: *const syntax.Object, initial_live_bytes: usize) anyerror!DecodedRgbaImage {
         // Use one allocator budget for the complete image tree, including
         // codec scratch space and nested masks. The wrapper delegates to the
         // Reader allocator, so the detached RGBA result remains caller-owned.
-        var budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
+        if (initial_live_bytes > self.decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
+        var budget = DecodeBudgetAllocator.init(self.alloc, initial_live_bytes, self.decode_limits.max_working_set_bytes);
         var scoped_reader = self.*;
         scoped_reader.alloc = budget.allocator();
         var context = ImageDecodeContext{};
@@ -6674,66 +6820,119 @@ pub const Reader = struct {
         var raw_code_bytes: usize = 0;
         var cid_to_gid: ?[]u16 = null;
         var pdf_widths: ?[]f64 = null;
+        var pdf_missing_width: ?f64 = null;
         var cid_widths: ?CidWidths = null;
         errdefer if (cid_to_gid) |map| if (map.len > 0) self.alloc.free(map);
         errdefer if (pdf_widths) |widths| self.alloc.free(widths);
         errdefer if (cid_widths) |*widths| widths.deinit(self.alloc);
-        if (font_obj.get("Subtype")) |subtype| if (std.mem.eql(u8, subtype.asName() orelse "", "Type0")) {
+        const composite = if (font_obj.get("Subtype")) |subtype| std.mem.eql(u8, subtype.asName() orelse "", "Type0") else false;
+        if (composite) {
             var resolved_encoding: ?syntax.Object = null;
             defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
             if (font_obj.get("Encoding")) |encoding| resolved_encoding = try self.resolveValue(encoding);
             const encoding_name = if (resolved_encoding) |*encoding| encoding.asName() orelse "" else "";
             const identity_encoding = std.mem.eql(u8, encoding_name, "Identity-H");
-            const descendants_obj = font_obj.get("DescendantFonts") orelse return error.UnsupportedPdfRendering;
+            if (!identity_encoding) {
+                outline_fallback.* = true;
+                font.deinit(self.alloc);
+                self.alloc.free(bytes);
+                return null;
+            }
+            const descendants_obj = font_obj.get("DescendantFonts") orelse {
+                outline_fallback.* = true;
+                font.deinit(self.alloc);
+                self.alloc.free(bytes);
+                return null;
+            };
             var resolved_descendants = try self.resolveValue(descendants_obj);
             defer resolved_descendants.deinit(self.alloc);
-            if (resolved_descendants != .array or resolved_descendants.array.len == 0) return error.UnsupportedPdfRendering;
+            if (resolved_descendants != .array or resolved_descendants.array.len == 0) {
+                outline_fallback.* = true;
+                font.deinit(self.alloc);
+                self.alloc.free(bytes);
+                return null;
+            }
             var descendant = try self.resolveValue(&resolved_descendants.array[0]);
             defer descendant.deinit(self.alloc);
-            if (identity_encoding) {
-                cid_widths = self.parseCidWidthsAlloc(&descendant) catch |err| switch (err) {
-                    error.OutOfMemory => return err,
-                    else => CidWidths{ .default_width = self.cidDefaultWidthAlloc(&descendant) catch |default_err| switch (default_err) {
-                        error.OutOfMemory => return default_err,
-                        else => 1000,
-                    } },
-                };
-                if (descendant.get("CIDToGIDMap")) |mapping_obj| {
-                    var mapping = try self.resolveValue(mapping_obj);
-                    defer mapping.deinit(self.alloc);
-                    if (mapping == .name and std.mem.eql(u8, mapping.name, "Identity")) {
-                        cid_to_gid = try self.alloc.alloc(u16, 0);
-                        raw_code_bytes = 2;
-                    } else if (mapping == .stream) {
-                        const mapping_bytes = try self.readDecodedStreamData(&mapping);
-                        defer self.alloc.free(mapping_bytes);
-                        const count = mapping_bytes.len / 2;
-                        const map = try self.alloc.alloc(u16, count);
-                        for (map, 0..) |*gid, i| gid.* = (@as(u16, mapping_bytes[i * 2]) << 8) | mapping_bytes[i * 2 + 1];
-                        cid_to_gid = map;
-                        raw_code_bytes = 2;
-                    }
-                } else {
-                    // CIDFontType2 defaults to an identity CID-to-GID mapping.
+            if (descendant != .dict) {
+                outline_fallback.* = true;
+                font.deinit(self.alloc);
+                self.alloc.free(bytes);
+                return null;
+            }
+            const descendant_subtype = descendant.get("Subtype") orelse {
+                outline_fallback.* = true;
+                font.deinit(self.alloc);
+                self.alloc.free(bytes);
+                return null;
+            };
+            if (!std.mem.eql(u8, descendant_subtype.asName() orelse "", "CIDFontType2")) {
+                outline_fallback.* = true;
+                font.deinit(self.alloc);
+                self.alloc.free(bytes);
+                return null;
+            }
+            if (descendant.get("CIDToGIDMap")) |mapping_obj| {
+                var mapping = try self.resolveValue(mapping_obj);
+                defer mapping.deinit(self.alloc);
+                if (mapping == .name and std.mem.eql(u8, mapping.name, "Identity")) {
                     cid_to_gid = try self.alloc.alloc(u16, 0);
                     raw_code_bytes = 2;
+                } else if (mapping == .stream) {
+                    const mapping_bytes = try self.readDecodedStreamData(&mapping);
+                    defer self.alloc.free(mapping_bytes);
+                    if (mapping_bytes.len % 2 != 0) {
+                        outline_fallback.* = true;
+                        font.deinit(self.alloc);
+                        self.alloc.free(bytes);
+                        return null;
+                    }
+                    const count = mapping_bytes.len / 2;
+                    const map = try self.alloc.alloc(u16, count);
+                    for (map, 0..) |*gid, i| gid.* = (@as(u16, mapping_bytes[i * 2]) << 8) | mapping_bytes[i * 2 + 1];
+                    cid_to_gid = map;
+                    raw_code_bytes = 2;
+                } else {
+                    outline_fallback.* = true;
+                    font.deinit(self.alloc);
+                    self.alloc.free(bytes);
+                    return null;
                 }
+            } else {
+                // CIDFontType2 defaults to an identity CID-to-GID mapping.
+                cid_to_gid = try self.alloc.alloc(u16, 0);
+                raw_code_bytes = 2;
             }
-        };
+            cid_widths = self.parseCidWidthsAlloc(&descendant) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => CidWidths{ .default_width = self.cidDefaultWidthAlloc(&descendant) catch |default_err| switch (default_err) {
+                    error.OutOfMemory => return default_err,
+                    else => 1000,
+                } },
+            };
+        } else {
+            pdf_missing_width = try self.simpleFontMissingWidthAlloc(font_obj);
+        }
 
-        if (font_obj.get("Widths")) |widths_obj| {
-            var resolved_widths = try self.resolveValue(widths_obj);
-            defer resolved_widths.deinit(self.alloc);
-            if (resolved_widths == .array) {
-                const map = try self.alloc.alloc(f64, 256);
-                @memset(map, -1);
-                const first_char: usize = if (font_obj.get("FirstChar")) |obj| @intCast(@max(@as(i64, 0), obj.asInteger() orelse 0)) else 0;
-                for (resolved_widths.array, 0..) |width_obj, index| {
-                    const code = first_char + index;
-                    if (code >= map.len) break;
-                    map[code] = numericObjectValue(&width_obj) orelse -1;
+        if (!composite) {
+            if (font_obj.get("Widths")) |widths_obj| {
+                var resolved_widths = try self.resolveValue(widths_obj);
+                defer resolved_widths.deinit(self.alloc);
+                if (resolved_widths == .array) {
+                    const map = try self.alloc.alloc(f64, 256);
+                    @memset(map, -1);
+                    const first_char: usize = if (font_obj.get("FirstChar")) |obj| blk: {
+                        const value = (try self.resolvedIntegerObjectValue(obj)) orelse return error.InvalidPdf;
+                        if (value < 0 or value > 255) return error.InvalidPdf;
+                        break :blk @intCast(value);
+                    } else 0;
+                    for (resolved_widths.array, 0..) |width_obj, index| {
+                        const code = first_char + index;
+                        if (code >= map.len) break;
+                        map[code] = (try self.resolvedNumericObjectValue(&width_obj)) orelse pdf_missing_width.?;
+                    }
+                    pdf_widths = map;
                 }
-                pdf_widths = map;
             }
         }
 
@@ -6744,6 +6943,7 @@ pub const Reader = struct {
             .raw_code_bytes = raw_code_bytes,
             .cid_to_gid = cid_to_gid,
             .pdf_widths = pdf_widths,
+            .pdf_missing_width = pdf_missing_width,
             .cid_widths = cid_widths,
         };
     }
@@ -7096,16 +7296,25 @@ pub const Reader = struct {
             }
         }
 
-        const first_char: usize = if (font_obj.get("FirstChar")) |obj|
-            @intCast(@max(@as(i64, 0), obj.asInteger() orelse 0))
-        else
-            0;
+        const first_char: usize = if (font_obj.get("FirstChar")) |obj| blk: {
+            const value = (try self.resolvedIntegerObjectValue(obj)) orelse return error.InvalidPdf;
+            if (value < 0 or value > 255) return error.InvalidPdf;
+            break :blk @intCast(value);
+        } else 0;
+        const missing_width = try self.simpleFontMissingWidthAlloc(font_obj);
         var resolved_widths: ?syntax.Object = null;
         defer if (resolved_widths) |*obj| obj.deinit(self.alloc);
         if (font_obj.get("Widths")) |obj| resolved_widths = try self.resolveValue(obj);
-        const widths = if (resolved_widths) |*obj| if (obj.* == .array) obj.array else &[_]syntax.Object{} else &[_]syntax.Object{};
+        var width_values = std.ArrayList(f64).empty;
+        defer width_values.deinit(self.alloc);
+        if (resolved_widths) |*obj| {
+            if (obj.* == .array) {
+                try width_values.ensureTotalCapacity(self.alloc, obj.array.len);
+                for (obj.array) |*width| width_values.appendAssumeCapacity((try self.resolvedNumericObjectValue(width)) orelse missing_width);
+            }
+        }
 
-        const glyphs = try parseType1GlyphsAlloc(self.alloc, bytes, len_iv, base_encoding, &code_to_name, first_char, widths);
+        const glyphs = try parseType1GlyphsAlloc(self.alloc, bytes, len_iv, base_encoding, &code_to_name, first_char, width_values.items, missing_width);
         errdefer {
             for (glyphs) |*glyph| glyph.deinit(self.alloc);
             if (glyphs.len > 0) self.alloc.free(glyphs);
@@ -7113,6 +7322,7 @@ pub const Reader = struct {
         return .{
             .local_subrs = local_subrs,
             .glyphs = glyphs,
+            .missing_width = missing_width,
         };
     }
 
@@ -8888,9 +9098,10 @@ fn parseType1GlyphsAlloc(
     base_encoding: text_encoding.NamedEncoding,
     code_to_name: *[256]?[]const u8,
     first_char: usize,
-    widths: []const syntax.Object,
+    widths: []const f64,
+    missing_width: f64,
 ) ![]Type1Glyph {
-    const rd_result = parseType1GlyphsRdAlloc(alloc, bytes, len_iv, base_encoding, code_to_name, first_char, widths) catch |err| switch (err) {
+    const rd_result = parseType1GlyphsRdAlloc(alloc, bytes, len_iv, base_encoding, code_to_name, first_char, widths, missing_width) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => null,
     };
@@ -8898,7 +9109,7 @@ fn parseType1GlyphsAlloc(
         if (glyphs.len > 0) return glyphs;
         alloc.free(glyphs);
     }
-    return try parseType1GlyphsLexAlloc(alloc, bytes, len_iv, base_encoding, code_to_name, first_char, widths);
+    return try parseType1GlyphsLexAlloc(alloc, bytes, len_iv, base_encoding, code_to_name, first_char, widths, missing_width);
 }
 
 fn appendOwnedType1Glyph(
@@ -8943,7 +9154,8 @@ fn appendParsedType1Glyphs(
     glyph_names: [][]u8,
     glyph_programs: [][]u8,
     first_char: usize,
-    widths: []const syntax.Object,
+    widths: []const f64,
+    missing_width: f64,
 ) !void {
     // Index attacker-controlled CharStrings once. PDF encodings and the seac
     // StandardEncoding closure are both capped at 256 entries, keeping this
@@ -8962,9 +9174,9 @@ fn appendParsedType1Glyphs(
     for (code_to_name, 0..) |maybe_name, code| {
         const parsed_index = parsed_by_name.get(maybe_name orelse continue) orelse continue;
         const advance = if (code >= first_char and code - first_char < widths.len)
-            numericObjectValue(&widths[code - first_char]) orelse 1000.0
+            widths[code - first_char]
         else
-            1000.0;
+            missing_width;
         if (owner_by_parsed.get(parsed_index)) |owner_index| {
             // Copy the owner value before append potentially reallocates.
             try appendBorrowedType1Glyph(glyphs, alloc, glyphs.items[owner_index], @intCast(code), advance);
@@ -8998,7 +9210,8 @@ fn parseType1GlyphsLexAlloc(
     base_encoding: text_encoding.NamedEncoding,
     code_to_name: *[256]?[]const u8,
     first_char: usize,
-    widths: []const syntax.Object,
+    widths: []const f64,
+    missing_width: f64,
 ) ![]Type1Glyph {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
@@ -9070,7 +9283,7 @@ fn parseType1GlyphsLexAlloc(
         for (glyphs.items) |*glyph| glyph.deinit(alloc);
         glyphs.deinit(alloc);
     }
-    try appendParsedType1Glyphs(alloc, &glyphs, code_to_name, glyph_names.items, glyph_programs.items, first_char, widths);
+    try appendParsedType1Glyphs(alloc, &glyphs, code_to_name, glyph_names.items, glyph_programs.items, first_char, widths, missing_width);
 
     return try glyphs.toOwnedSlice(alloc);
 }
@@ -9136,7 +9349,8 @@ fn parseType1GlyphsRdAlloc(
     base_encoding: text_encoding.NamedEncoding,
     code_to_name: *[256]?[]const u8,
     first_char: usize,
-    widths: []const syntax.Object,
+    widths: []const f64,
+    missing_width: f64,
 ) ![]Type1Glyph {
     const section_start = std.mem.indexOf(u8, bytes, "/CharStrings") orelse return try alloc.alloc(Type1Glyph, 0);
     var i: usize = section_start + "/CharStrings".len;
@@ -9203,7 +9417,7 @@ fn parseType1GlyphsRdAlloc(
         for (glyphs.items) |*glyph| glyph.deinit(alloc);
         glyphs.deinit(alloc);
     }
-    try appendParsedType1Glyphs(alloc, &glyphs, code_to_name, glyph_names.items, glyph_programs.items, first_char, widths);
+    try appendParsedType1Glyphs(alloc, &glyphs, code_to_name, glyph_names.items, glyph_programs.items, first_char, widths, missing_width);
 
     return try glyphs.toOwnedSlice(alloc);
 }
@@ -11545,7 +11759,7 @@ fn measureFontAdvanceAlloc(
         const scale = state.font_size / 1000.0;
         for (raw) |code| {
             const glyph = type1.glyphForCode(code);
-            const glyph_advance = if (glyph) |g| g.advance * scale else state.font_size * 0.6;
+            const glyph_advance = if (glyph) |g| g.advance * scale else type1.missing_width * scale;
             const spacing = state.char_spacing + if (code == ' ') state.word_spacing else 0.0;
             advance += (glyph_advance + spacing) * state.horizontal_scale;
         }
@@ -11567,15 +11781,18 @@ fn measureFontAdvanceAlloc(
             }
             return advance;
         }
-        if (truetype.raw_code_bytes == 0 and truetype.pdf_widths != null) {
+        if (truetype.raw_code_bytes == 0 and truetype.pdf_missing_width != null) {
             var advance: f64 = 0;
             var raw_offset: usize = 0;
             var view = std.unicode.Utf8View.init(decoded) catch return estimateDecodedAdvance(decoded, state);
             var iter = view.iterator();
             while (iter.nextCodepoint()) |cp| {
-                const width = if (raw_offset < raw.len) truetype.pdf_widths.?[raw[raw_offset]] else -1;
+                const width = if (raw_offset < raw.len)
+                    simpleTrueTypePdfWidth(truetype.pdf_widths, truetype.pdf_missing_width, raw[raw_offset]).?
+                else
+                    truetype.pdf_missing_width.?;
                 raw_offset += 1;
-                const glyph_advance = if (width >= 0) width * state.font_size / 1000.0 else state.font_size * 0.6;
+                const glyph_advance = width * state.font_size / 1000.0;
                 advance += (glyph_advance + state.char_spacing + if (cp == ' ') state.word_spacing else 0.0) * state.horizontal_scale;
             }
             return advance;
@@ -12472,9 +12689,9 @@ fn estimateType3MissingAdvance(run: TextRun, code: u8) f64 {
     return (run.font_size * 0.6 + spacing) * run.horizontal_scale;
 }
 
-fn estimateType1MissingAdvance(run: TextRun, code: u8) f64 {
+fn estimateType1MissingAdvance(run: TextRun, code: u8, missing_width: f64) f64 {
     const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
-    return (run.font_size * 0.6 + spacing) * run.horizontal_scale;
+    return (missing_width * run.font_size / 1000.0 + spacing) * run.horizontal_scale;
 }
 
 fn estimateRenderedRunCodepointAdvance(run: TextRun, cp: u21) f64 {
@@ -15138,8 +15355,17 @@ test "Type1 and Type3 spacing follows horizontal scaling in measurement and geom
     var type1_program = [_]u8{14};
     var type1_glyphs = [_]Type1Glyph{.{ .code = 'A', .name = &a_name, .charstring = &type1_program, .advance = 1000 }};
     fonts[0].type3 = null;
-    fonts[0].type1 = .{ .glyphs = &type1_glyphs };
+    fonts[0].type1 = .{ .glyphs = &type1_glyphs, .missing_width = 375 };
     try std.testing.expectApproxEqAbs(@as(f64, 6), try measureFontAdvanceAlloc(alloc, &fonts, 0, "A", "A", state), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.875), try measureFontAdvanceAlloc(alloc, &fonts, 0, "B", "B", state), 0.001);
+}
+
+test "simple TrueType PDF widths fall back to MissingWidth" {
+    var widths = [_]f64{-1} ** 256;
+    widths['A'] = 600;
+    try std.testing.expectEqual(@as(?f64, 600), simpleTrueTypePdfWidth(&widths, 375, 'A'));
+    try std.testing.expectEqual(@as(?f64, 375), simpleTrueTypePdfWidth(&widths, 375, 'B'));
+    try std.testing.expectEqual(@as(?f64, null), simpleTrueTypePdfWidth(&widths, null, 'B'));
 }
 
 test "reader measures type1 text run advance width" {
@@ -19379,14 +19605,14 @@ test "reader extracts text and shapes through form xobject" {
     try std.testing.expect(shape_runs[0].paint_order < text_runs[0].paint_order);
 }
 
-test "reader extracts images through form xobject" {
+test "reader shares one decoded image across independent form xobjects" {
     const alloc = std.testing.allocator;
     const image_data = [_]u8{ 0xff, 0, 0 };
     const form_content = "q\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
-    const page_content = "q\n/Fm1 Do\nQ\n";
+    const page_content = "q\n/Fm1 Do\n/Fm2 Do\nQ\n";
     const obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
     const obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
-    const obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Fm1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n";
+    const obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Fm1 5 0 R /Fm2 7 0 R >> >> /Contents 4 0 R >>\nendobj\n";
     const obj4 = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content });
     defer alloc.free(obj4);
     const obj5 = try std.fmt.allocPrint(
@@ -19401,6 +19627,12 @@ test "reader extracts images through form xobject" {
         .{ image_data.len, image_data },
     );
     defer alloc.free(obj6);
+    const obj7 = try std.fmt.allocPrint(
+        alloc,
+        "7 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Im1 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ form_content.len, form_content },
+    );
+    defer alloc.free(obj7);
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
@@ -19417,15 +19649,17 @@ test "reader extracts images through form xobject" {
     try out.appendSlice(alloc, obj5);
     const obj6_offset = out.items.len;
     try out.appendSlice(alloc, obj6);
+    const obj7_offset = out.items.len;
+    try out.appendSlice(alloc, obj7);
     const xref_offset = out.items.len;
     const xref = try std.fmt.allocPrint(
         alloc,
-        "xref\n0 7\n0000000000 65535 f \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n",
-        .{ obj1_offset, obj2_offset, obj3_offset, obj4_offset, obj5_offset, obj6_offset },
+        "xref\n0 8\n0000000000 65535 f \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n{d:0>10} 00000 n \n",
+        .{ obj1_offset, obj2_offset, obj3_offset, obj4_offset, obj5_offset, obj6_offset, obj7_offset },
     );
     defer alloc.free(xref);
     try out.appendSlice(alloc, xref);
-    try out.appendSlice(alloc, "trailer\n<< /Root 1 0 R /Size 7 >>\nstartxref\n");
+    try out.appendSlice(alloc, "trailer\n<< /Root 1 0 R /Size 8 >>\nstartxref\n");
     const startxref = try std.fmt.allocPrint(alloc, "{d}\n", .{xref_offset});
     defer alloc.free(startxref);
     try out.appendSlice(alloc, startxref);
@@ -19439,7 +19673,10 @@ test "reader extracts images through form xobject" {
         for (image_runs) |*run| run.deinit(alloc);
         alloc.free(image_runs);
     }
-    try std.testing.expectEqual(@as(usize, 1), image_runs.len);
+    try std.testing.expectEqual(@as(usize, 2), image_runs.len);
+    try std.testing.expect(image_runs[0].shared_rgba != null);
+    try std.testing.expectEqual(image_runs[0].shared_rgba, image_runs[1].shared_rgba);
+    try std.testing.expectEqual(image_runs[0].rgba.ptr, image_runs[1].rgba.ptr);
 }
 
 test "reader does not decode images below an unused form xobject" {
@@ -20036,13 +20273,14 @@ test "type1 RD parsers advance across slash and binary delimiters" {
 
     var code_to_name = [_]?[]const u8{null} ** 256;
     code_to_name['A'] = "A";
-    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 375);
     defer {
         for (glyphs) |*glyph| glyph.deinit(alloc);
         if (glyphs.len > 0) alloc.free(glyphs);
     }
     try std.testing.expectEqual(@as(usize, 1), glyphs.len);
     try std.testing.expectEqual(@as(u8, 'A'), glyphs[0].code);
+    try std.testing.expectEqual(@as(f64, 375), glyphs[0].advance);
     try std.testing.expectEqualStrings("xyz", glyphs[0].charstring);
 }
 
@@ -20057,7 +20295,7 @@ test "type1 RD parser accepts compact charstrings without dup" {
     var code_to_name = [_]?[]const u8{null} ** 256;
     code_to_name['A'] = "A";
     code_to_name['B'] = "B";
-    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);
     defer {
         for (glyphs) |*glyph| glyph.deinit(alloc);
         if (glyphs.len > 0) alloc.free(glyphs);
@@ -20080,7 +20318,7 @@ test "type1 aliases share programs and only seac-reachable helpers survive" {
     code_to_name['A'] = "A";
     code_to_name['B'] = "A";
     code_to_name[194] = "different";
-    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);
     defer {
         for (glyphs) |*glyph| glyph.deinit(alloc);
         if (glyphs.len > 0) alloc.free(glyphs);
@@ -20778,7 +21016,7 @@ test "type1 font parsing is allocation-failure safe" {
             var code_to_name = [_]?[]const u8{null} ** 256;
             code_to_name['A'] = "A";
             code_to_name[194] = "different";
-            const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
+            const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{}, 0);
             defer {
                 for (glyphs) |*glyph| glyph.deinit(alloc);
                 if (glyphs.len > 0) alloc.free(glyphs);

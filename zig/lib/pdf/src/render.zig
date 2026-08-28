@@ -183,6 +183,7 @@ fn pixelWorldY(max_y: f64, margin: usize, py: usize) f64 {
 const GroupMeta = struct {
     id: u32,
     parent_id: ?u32,
+    parent_index: ?usize = null,
     isolated: bool,
     knockout: bool,
     min_paint_order: usize,
@@ -258,6 +259,7 @@ const RenderSchedule = std.ArrayListUnmanaged(RenderChoice);
 const RenderPlan = struct {
     groups: []GroupMeta,
     schedules: []RenderSchedule,
+    peak_canvas_count: usize,
 
     fn deinit(self: *RenderPlan, alloc: Allocator) void {
         for (self.schedules) |*schedule| schedule.deinit(alloc);
@@ -266,6 +268,39 @@ const RenderPlan = struct {
         self.* = undefined;
     }
 };
+
+fn peakRenderCanvasCountAlloc(alloc: Allocator, groups: []const GroupMeta) !usize {
+    const VisitState = enum { unseen, visiting, complete };
+    const states = try alloc.alloc(VisitState, groups.len);
+    defer alloc.free(states);
+    @memset(states, .unseen);
+    const counts = try alloc.alloc(usize, groups.len);
+    defer alloc.free(counts);
+
+    const Visitor = struct {
+        fn visit(all_groups: []const GroupMeta, all_states: []VisitState, all_counts: []usize, index: usize) !usize {
+            switch (all_states[index]) {
+                .complete => return all_counts[index],
+                .visiting => return error.InvalidRenderGroup,
+                .unseen => {},
+            }
+            all_states[index] = .visiting;
+            const parent_count = if (all_groups[index].parent_index) |parent|
+                try visit(all_groups, all_states, all_counts, parent)
+            else
+                1; // The page canvas.
+            const group_canvases: usize = 1 + if (all_groups[index].knockout) @as(usize, 2) else 0;
+            const count = std.math.add(usize, parent_count, group_canvases) catch return error.RenderedPageTooLarge;
+            all_counts[index] = count;
+            all_states[index] = .complete;
+            return count;
+        }
+    };
+
+    var peak: usize = 1;
+    for (groups, 0..) |_, index| peak = @max(peak, try Visitor.visit(groups, states, counts, index));
+    return peak;
+}
 
 fn renderChoiceKindOrder(choice: RenderChoice) u8 {
     return switch (choice) {
@@ -366,6 +401,12 @@ fn buildRenderPlanAlloc(
 
     const owned_groups = try groups.toOwnedSlice(alloc);
     errdefer alloc.free(owned_groups);
+    for (owned_groups) |*group| if (group.parent_id) |parent_id| {
+        const parent_index = group_indices.get(parent_id) orelse continue;
+        if (parent_index == group_indices.get(group.id).?) return error.InvalidRenderGroup;
+        group.parent_index = parent_index;
+    };
+    const peak_canvas_count = try peakRenderCanvasCountAlloc(alloc, owned_groups);
     const schedules = try alloc.alloc(RenderSchedule, owned_groups.len + 1);
     errdefer alloc.free(schedules);
     for (schedules) |*schedule| schedule.* = .empty;
@@ -395,7 +436,7 @@ fn buildRenderPlanAlloc(
     };
     for (schedules) |schedule| std.mem.sort(RenderChoice, schedule.items, sort_context, RenderChoiceSortContext.lessThan);
     initialized_schedules = 0;
-    return .{ .groups = owned_groups, .schedules = schedules };
+    return .{ .groups = owned_groups, .schedules = schedules, .peak_canvas_count = peak_canvas_count };
 }
 
 fn renderChildGroupAlloc(
@@ -581,8 +622,7 @@ fn renderPageContentRgbaInBoxAlloc(
 
     var plan = try buildRenderPlanAlloc(alloc, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
     defer plan.deinit(alloc);
-    const canvas_count = std.math.add(usize, plan.groups.len, 1) catch return error.RenderedPageTooLarge;
-    const planned_pixels = std.math.mul(usize, pixel_count, canvas_count) catch return error.RenderedPageTooLarge;
+    const planned_pixels = std.math.mul(usize, pixel_count, plan.peak_canvas_count) catch return error.RenderedPageTooLarge;
     if (planned_pixels > 200_000_000) return error.RenderedPageTooLarge;
 
     const rgba = try alloc.alloc(u8, rgba_len);
@@ -1893,18 +1933,20 @@ test "render plan preserves paint order ties and nested group schedules" {
     const alloc = std.testing.allocator;
     const text_runs = [_]reader.TextRun{
         .{ .text = "root", .x = 0, .y = 0, .font_size = 12, .paint_order = 4 },
-        .{ .text = "child", .x = 0, .y = 0, .font_size = 12, .paint_order = 6, .group_id = 1 },
-        .{ .text = "nested", .x = 0, .y = 0, .font_size = 12, .paint_order = 8, .group_id = 2, .group_parent_id = 1 },
+        .{ .text = "child", .x = 0, .y = 0, .font_size = 12, .paint_order = 6, .group_id = 1, .group_knockout = true },
+        .{ .text = "nested", .x = 0, .y = 0, .font_size = 12, .paint_order = 8, .group_id = 2, .group_parent_id = 1, .group_knockout = true },
     };
     const shape_runs = [_]reader.ShapeRun{
         .{ .kind = .fill, .paint_order = 4, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
-        .{ .kind = .fill, .paint_order = 7, .group_id = 1, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 7, .group_id = 1, .group_knockout = true, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
     };
 
     var plan = try buildRenderPlanAlloc(alloc, &text_runs, &.{}, &.{}, &.{}, &shape_runs);
     defer plan.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), plan.groups.len);
+    // Page + one child/backdrop/scratch trio for each active knockout group.
+    try std.testing.expectEqual(@as(usize, 7), plan.peak_canvas_count);
     try std.testing.expectEqual(@as(usize, 3), plan.schedules[0].items.len);
     try std.testing.expect(plan.schedules[0].items[0] == .text);
     try std.testing.expect(plan.schedules[0].items[1] == .shape);
