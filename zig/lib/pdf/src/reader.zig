@@ -798,6 +798,7 @@ pub const ShapeRun = struct {
     clip_points: ?[]const [2]f64 = null,
     clip_fill_rule: FillRule = .nonzero,
     points: [][2]f64,
+    antialias: bool = false,
     /// Start offsets for independently closed subpaths in `points`. Font
     /// glyphs need all contours painted as one path so counter contours
     /// (the holes in O, B, 8, and similar glyphs) participate in winding.
@@ -3056,6 +3057,7 @@ pub const Reader = struct {
             .clip_fill_rule = run.clip_fill_rule,
             .points = points,
             .subpath_starts = subpath_starts,
+            .antialias = shape.antialias,
         };
     }
 
@@ -3093,6 +3095,7 @@ pub const Reader = struct {
             .clip_fill_rule = run.clip_fill_rule,
             .points = owned_points,
             .subpath_starts = owned_subpath_starts,
+            .antialias = true,
         });
     }
 

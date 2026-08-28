@@ -725,8 +725,17 @@ fn drawShapeRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_
         while (px < x1) : (px += 1) {
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
             const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
-            if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
+            if (has_clip and !run.antialias and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
             const dst = (py * canvas_w + px) * 4;
+            if (run.antialias) {
+                const coverage = shapeCoverage4x(px, py, min_x, max_y, run);
+                if (coverage > 0) {
+                    var color = run.color;
+                    color[3] = @intCast((@as(u16, color[3]) * coverage + 2) / 4);
+                    blendPixelMode(canvas, dst, color, run.blend_mode);
+                }
+                continue;
+            }
             if (run.kind == .fill) {
                 if (pointInShape(world_x, world_y, run)) {
                     blendPixelMode(canvas, dst, run.color, run.blend_mode);
@@ -738,6 +747,23 @@ fn drawShapeRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_
             }
         }
     }
+}
+
+fn shapeCoverage4x(px: usize, py: usize, min_x: f64, max_y: f64, run: reader.ShapeRun) u16 {
+    const offsets = [2]f64{ 0.25, 0.75 };
+    var coverage: u16 = 0;
+    for (offsets) |oy| {
+        for (offsets) |ox| {
+            const x = min_x + @as(f64, @floatFromInt(px)) + ox;
+            const y = max_y - (@as(f64, @floatFromInt(py)) + oy);
+            if (run.clip_box != null or run.clip_points != null) {
+                if (!pointPassesClip(x, y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
+            }
+            const inside = if (run.kind == .fill) pointInShape(x, y, run) else pointInStrokeShape(x, y, run);
+            if (inside) coverage += 1;
+        }
+    }
+    return coverage;
 }
 
 fn drawShadingRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_y: f64, run: reader.ShadingRun) void {
