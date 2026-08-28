@@ -13020,12 +13020,20 @@ pub const DB = struct {
             inspection_limit,
         );
         defer quantum.deinit(alloc);
+        // Classification performs detached durable work. Preserve successful
+        // acknowledgements even if a later candidate errors, while exact
+        // epoch/revision checks prevent this unwind from certifying stale debt.
+        errdefer _ = self.core.index_manager.finishFailedIndexLoadRecoveryQuantum(
+            .rebuild_from_artifacts,
+            quantum.queue_epoch,
+            quantum.candidates,
+        );
         result.automatic_remaining = quantum.action_total;
         result.automatic_sweep_complete = quantum.sweep_complete;
-        for (quantum.candidates) |candidate| {
+        for (quantum.candidates) |*candidate| {
             const cfg = candidate.config;
             const action = candidate.action;
-            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate)) {
+            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate.*)) {
                 result.automatic_deferred += 1;
                 result.automatic_sweep_complete = false;
                 continue;
@@ -13045,15 +13053,17 @@ pub const DB = struct {
                     result.terminal += 1;
                     result.existing_terminal += 1;
                 } else {
-                    _ = self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate);
+                    _ = self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate.*);
                     result.already_pending += 1;
                 }
+                candidate.classified = true;
                 continue;
             }
             switch (action) {
                 .retry_open => continue,
                 .manual_intervention => {
                     result.terminal += 1;
+                    candidate.classified = true;
                     continue;
                 },
                 .rebuild_from_artifacts => {},
@@ -13063,6 +13073,7 @@ pub const DB = struct {
             // destructive automatic-reconstruction allowlist.
             if (cfg.kind != .dense_vector) {
                 result.terminal += 1;
+                candidate.classified = true;
                 continue;
             }
             if (result.discovered >= limit) {
@@ -13097,12 +13108,12 @@ pub const DB = struct {
             // catalog lock. Revalidate under the same short lifecycle boundary
             // used by drop/recreate and quarantine publication so the durable
             // intent cannot bind a stale same-name catalog incarnation.
-            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate)) {
+            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate.*)) {
                 result.automatic_deferred += 1;
                 result.automatic_sweep_complete = false;
                 continue;
             }
-            if (!self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate)) {
+            if (!self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate.*)) {
                 result.automatic_deferred += 1;
                 result.automatic_sweep_complete = false;
                 continue;
@@ -13147,11 +13158,12 @@ pub const DB = struct {
                 false,
             );
             result.discovered += 1;
+            candidate.classified = true;
         }
         const final_queue = self.core.index_manager.finishFailedIndexLoadRecoveryQuantum(
             .rebuild_from_artifacts,
             quantum.queue_epoch,
-            result.automatic_sweep_complete,
+            quantum.candidates,
         );
         result.automatic_remaining = final_queue.action_total;
         result.automatic_sweep_complete = final_queue.sweep_complete;
@@ -13426,6 +13438,17 @@ pub const DB = struct {
                 result.terminal = true;
                 return result;
             }
+        }
+        if (self.core.index_manager.recoveryActionForIndex(entry.intent.index_name) == .rebuild_from_artifacts) {
+            // Retryable terminal phases release their quarantine claim so an
+            // operator may intervene. Once durable execution resumes, reclaim
+            // the current same-config incarnation explicitly; completed
+            // discovery epochs no longer rescan merely to provide this side
+            // effect.
+            _ = self.core.index_manager.claimFailedIndexLoadRepair(
+                entry.intent.index_name,
+                entry.intent.config_hash,
+            );
         }
         // A candidate which already failed coverage cannot manufacture an
         // artifact missing below its snapshot floor. Discard only that
@@ -74720,7 +74743,8 @@ test "db index repair rebuilds dense index quarantined by incomplete bulk publis
     try std.testing.expect(try reopened.hasPendingIndexRepairIntents(alloc));
     const duplicate_discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
     try std.testing.expectEqual(@as(usize, 0), duplicate_discovery.discovered);
-    try std.testing.expectEqual(@as(usize, 1), duplicate_discovery.already_pending);
+    try std.testing.expectEqual(@as(usize, 0), duplicate_discovery.already_pending);
+    try std.testing.expect(duplicate_discovery.automatic_sweep_complete);
     var discovered_state = try reopened.loadIndexRepairState(alloc);
     const repair_id = discovered_state.entries.items[0].intent.repair_id;
     try std.testing.expectEqual(index_repair_state.Phase.detected, discovered_state.entries.items[0].intent.phase);
