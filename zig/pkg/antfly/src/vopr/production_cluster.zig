@@ -81,6 +81,7 @@ pub const Fixture = struct {
     pub const FaultMode = enum {
         clean,
         graph_transport_failure,
+        graph_owner_restart,
     };
 
     pub const Phase = enum(u8) {
@@ -166,12 +167,18 @@ pub const Fixture = struct {
     data_catalog_count: usize = 0,
     data_servers: [node_count]DataServer = undefined,
     data_server_count: usize = 0,
+    data_server_live: [node_count]bool = .{false} ** node_count,
     data_raft_listeners: [node_count]raft_transport.HttpxRuntime = undefined,
     data_raft_listener_count: usize = 0,
+    data_raft_listener_live: [node_count]bool = .{false} ** node_count,
     data_api_uris: [node_count][]u8 = undefined,
     data_api_uri_count: usize = 0,
+    data_api_uri_live: [node_count]bool = .{false} ** node_count,
+    data_api_ports: [node_count]u16 = .{0} ** node_count,
     data_raft_uris: [node_count][]u8 = undefined,
     data_raft_uri_count: usize = 0,
+    data_raft_uri_live: [node_count]bool = .{false} ** node_count,
+    data_raft_ports: [node_count]u16 = .{0} ** node_count,
     transition_routers: [node_count]api_table_router.CatalogBackedGroupRouter = undefined,
     transition_adapters: [node_count]hosted_shard_ops.HostedShardOperationAdapter = undefined,
     transition_registrations: [node_count]?shard_ops.OwnedShardOperationAdapter.Registration = .{null} ** node_count,
@@ -184,8 +191,11 @@ pub const Fixture = struct {
     control_driver_stop: bool = false,
     driver_done: bool = false,
     raft_driver_done: [node_count]bool = .{false} ** node_count,
+    raft_driver_active: [node_count]bool = .{false} ** node_count,
+    data_server_paused: [node_count]bool = .{false} ** node_count,
     driver_failure: ?anyerror = null,
     driver_rounds: u64 = 0,
+    metadata_recovery_campaigns: u64 = 0,
     raft_driver_rounds: [node_count]u64 = .{0} ** node_count,
     control_requests: std.Io.Semaphore = .{},
     control_completions: std.Io.Semaphore = .{},
@@ -219,6 +229,19 @@ pub const Fixture = struct {
     graph_partial_rejected_sound: bool = false,
     graph_transport_fault_armed: bool = false,
     graph_transport_fault_endpoint: ?std.Io.net.IpAddress = null,
+    graph_restart_requested: std.Io.Semaphore = .{},
+    graph_restart_down: std.Io.Semaphore = .{},
+    graph_restart_recover: std.Io.Semaphore = .{},
+    graph_restart_recovered: std.Io.Semaphore = .{},
+    graph_restart_future: ?std.Io.Future(void) = null,
+    graph_restart_target_index: usize = 0,
+    graph_restart_target_configured: bool = false,
+    graph_owner_restart_requested: bool = false,
+    graph_owner_restart_down: bool = false,
+    graph_owner_restart_failure_observed: bool = false,
+    graph_owner_restart_recovered: bool = false,
+    graph_owner_restart_error_code: u16 = 0,
+    graph_owner_restart_failure: ?anyerror = null,
     graph_probe_route_index: usize = 1,
     topology_sound: bool = false,
     split_sound: bool = false,
@@ -262,6 +285,17 @@ pub const Fixture = struct {
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
         std.debug.assert(self.phase == .created);
         self.fault_mode = mode;
+    }
+
+    pub fn currentGraphOwnerIndex(self: *Fixture) ?usize {
+        return self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id);
+    }
+
+    pub fn configureGraphRestartTarget(self: *Fixture, index: usize) !void {
+        if (self.phase != .leaders_ready or index >= self.data_server_count or !self.data_server_live[index])
+            return error.InvalidProductionGraphRestartTarget;
+        self.graph_restart_target_index = index;
+        self.graph_restart_target_configured = true;
     }
 
     pub fn bootstrap(self: *Fixture) !void {
@@ -339,11 +373,6 @@ pub const Fixture = struct {
         self.phase = .metadata_http_ready;
         std.log.debug("production data-plane VOPR started metadata HTTP listeners", .{});
 
-        const request_executors = [_]@TypeOf(self.executor.executor()){
-            self.executor.executor(),
-            self.executor.executor(),
-            self.executor.executor(),
-        };
         for (0..node_count) |index| {
             self.backend_runtimes[index] = try background_runtime.BackendRuntimeHandle.init(alloc, .{
                 .backend = .manual,
@@ -374,57 +403,10 @@ pub const Fixture = struct {
                     index + 1,
                 )),
             };
-            self.data_servers[index] = try DataServer.initFromMetadataApiUrls(alloc, .{
-                .replica_root_dir = self.data_roots[index],
-                .replica_catalog_path = self.data_catalogs[index],
-                .data_raft_state_backend = .file_image,
-                .store_registration = .{
-                    .node_id = index + 1,
-                    .store_id = index + 1,
-                    .api_url = "",
-                    .raft_url = "",
-                    .failure_domain = if (index == 0) "rack-a" else if (index == 1) "rack-b" else "rack-c",
-                },
-                .process_memory_limit_bytes = 512 * 1024 * 1024,
-                .capacity_source = self.capacity_sources[index].source(),
-                .backend_runtime = self.backend_runtimes[index].ptr(),
-                .api_server_cfg = .{
-                    .internal_service_secret = internal_service_secret,
-                    .internal_service_issuer = internal_service_issuer,
-                    .request_lifecycle_hook = .{
-                        .ptr = self,
-                        .reach_fn = observePublicRequestLifecycle,
-                    },
-                },
-                .metadata_request_executors = &request_executors,
-                .data_raft_request_executor = self.raft_executor.executor(),
-                .data_request_lifecycle_hook = .{
-                    .ptr = self,
-                    .reach_fn = observeDataRequestLifecycle,
-                },
-                .data_raft_listener_external = true,
-                // Keep the production async Raft delivery owner active. Its
-                // borrowed std.Io is VoprIo-backed, so the sender itself is a
-                // deterministic fiber and multi-replica commits traverse the
-                // same production queue/retry path as a native deployment.
-                .data_raft_async_send_worker_count = 1,
-            }, &self.metadata_base_uris);
+            try self.initializeDataServer(index);
             self.data_server_count += 1;
-            _ = self.data_servers[index].read_source.withDistributedGraphLifecycleHook(.{
-                .ptr = self,
-                .reach_fn = observeDistributedGraphLifecycle,
-            });
-            const data_raft = self.data_servers[index].data_raft orelse return error.MissingDataRaft;
-            self.data_raft_listeners[index] = try raft_transport.HttpxRuntime.start(
-                alloc,
-                self.sim.io(),
-                data_raft.host.http_host.server.executor(),
-            );
             self.data_raft_listener_count += 1;
-            self.data_raft_uris[index] = try alloc.dupe(u8, self.data_raft_listeners[index].base_uri);
             self.data_raft_uri_count += 1;
-            try self.data_servers[index].startPublicHttp();
-            self.data_api_uris[index] = try self.data_servers[index].baseUri(alloc);
             self.data_api_uri_count += 1;
         }
         for (self.data_api_uris[0..self.data_api_uri_count]) |uri|
@@ -442,6 +424,86 @@ pub const Fixture = struct {
         self.phase = .leaders_ready;
         try self.installExternalTransitionRouting();
         self.client = api_http_client.ApiHttpClient.init(alloc, self.public_executor.executor());
+    }
+
+    fn initializeDataServer(self: *Fixture, index: usize) !void {
+        std.debug.assert(index < node_count);
+        std.debug.assert(!self.data_server_live[index]);
+        std.debug.assert(!self.data_raft_listener_live[index]);
+        const request_executors = [_]@TypeOf(self.executor.executor()){
+            self.executor.executor(),
+            self.executor.executor(),
+            self.executor.executor(),
+        };
+        self.data_servers[index] = try DataServer.initFromMetadataApiUrls(self.alloc, .{
+            .bind_port = self.data_api_ports[index],
+            .replica_root_dir = self.data_roots[index],
+            .replica_catalog_path = self.data_catalogs[index],
+            .data_raft_state_backend = .file_image,
+            .store_registration = .{
+                .node_id = index + 1,
+                .store_id = index + 1,
+                .api_url = "",
+                .raft_url = "",
+                .failure_domain = if (index == 0) "rack-a" else if (index == 1) "rack-b" else "rack-c",
+            },
+            .process_memory_limit_bytes = 512 * 1024 * 1024,
+            .capacity_source = self.capacity_sources[index].source(),
+            .backend_runtime = self.backend_runtimes[index].ptr(),
+            .api_server_cfg = .{
+                .internal_service_secret = internal_service_secret,
+                .internal_service_issuer = internal_service_issuer,
+                .request_lifecycle_hook = .{
+                    .ptr = self,
+                    .reach_fn = observePublicRequestLifecycle,
+                },
+            },
+            .metadata_request_executors = &request_executors,
+            .data_raft_request_executor = self.raft_executor.executor(),
+            .data_request_lifecycle_hook = .{
+                .ptr = self,
+                .reach_fn = observeDataRequestLifecycle,
+            },
+            .data_raft_listener_external = true,
+            // Keep the production async Raft delivery owner active. Its
+            // borrowed std.Io is VoprIo-backed, so the sender itself is a
+            // deterministic fiber and multi-replica commits traverse the same
+            // production queue/retry path as a native deployment.
+            .data_raft_async_send_worker_count = 1,
+        }, &self.metadata_base_uris);
+        self.data_server_live[index] = true;
+        errdefer {
+            self.data_servers[index].deinit();
+            self.data_server_live[index] = false;
+        }
+        _ = self.data_servers[index].read_source.withDistributedGraphLifecycleHook(.{
+            .ptr = self,
+            .reach_fn = observeDistributedGraphLifecycle,
+        });
+        const data_raft = self.data_servers[index].data_raft orelse return error.MissingDataRaft;
+        self.data_raft_listeners[index] = try raft_transport.HttpxRuntime.startAt(
+            self.alloc,
+            self.sim.io(),
+            data_raft.host.http_host.server.executor(),
+            "127.0.0.1",
+            self.data_raft_ports[index],
+        );
+        self.data_raft_listener_live[index] = true;
+        errdefer {
+            self.data_raft_listeners[index].deinit();
+            self.data_raft_listener_live[index] = false;
+        }
+        self.data_raft_uris[index] = try self.alloc.dupe(u8, self.data_raft_listeners[index].base_uri);
+        self.data_raft_uri_live[index] = true;
+        self.data_raft_ports[index] = (try parseHttpBaseUriAddress(self.data_raft_uris[index])).getPort();
+        errdefer {
+            self.alloc.free(self.data_raft_uris[index]);
+            self.data_raft_uri_live[index] = false;
+        }
+        try self.data_servers[index].startPublicHttp();
+        self.data_api_uris[index] = try self.data_servers[index].baseUri(self.alloc);
+        self.data_api_uri_live[index] = true;
+        self.data_api_ports[index] = (try parseHttpBaseUriAddress(self.data_api_uris[index])).getPort();
     }
 
     fn installExternalTransitionRouting(self: *Fixture) !void {
@@ -477,7 +539,8 @@ pub const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         var replicas: usize = 0;
         var leader_known = false;
-        for (&self.data_servers) |*server| {
+        for (&self.data_servers, 0..) |*server, index| {
+            if (!self.data_server_live[index]) continue;
             const raft = server.data_raft orelse continue;
             const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
             replicas += 1;
@@ -513,23 +576,49 @@ pub const Fixture = struct {
         event: api_distributed_graph.LifecycleEvent,
     ) void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
-        if (self.fault_mode != .graph_transport_failure) return;
+        if (self.fault_mode == .clean) return;
         switch (event.phase) {
             .expand_round_completed => {
-                if (!self.graph_transport_fault_armed or event.depth != 1 or self.graph_transport_failure_injected) return;
-                self.graph_transport_fault_armed = false;
-                const endpoint = self.graph_transport_fault_endpoint orelse return;
-                self.sim.setOutboundEndpointPayloadOutage(endpoint, "/graph-expand") catch unreachable;
-                self.graph_transport_failure_injected = true;
+                if (!self.graph_transport_fault_armed or event.depth != 1) return;
+                switch (self.fault_mode) {
+                    .clean => unreachable,
+                    .graph_transport_failure => {
+                        if (self.graph_transport_failure_injected) return;
+                        self.graph_transport_fault_armed = false;
+                        const endpoint = self.graph_transport_fault_endpoint orelse return;
+                        self.sim.setOutboundEndpointPayloadOutage(endpoint, "/graph-expand") catch unreachable;
+                        self.graph_transport_failure_injected = true;
+                    },
+                    .graph_owner_restart => {
+                        if (self.graph_owner_restart_requested) return;
+                        self.graph_transport_fault_armed = false;
+                        self.graph_owner_restart_requested = true;
+                        self.graph_restart_requested.post(self.sim.io());
+                        self.graph_restart_down.wait(self.sim.io()) catch return;
+                    },
+                }
             },
             .attempt_failed => {
-                if (!self.graph_transport_failure_injected or self.graph_transport_failure_observed) return;
-                self.graph_transport_failure_observed = true;
-                self.graph_transport_failure_error_code = event.error_code;
-                // Heal before the coordinator converts the failed attempt into
-                // the public error response. This cuts the inter-owner fanout
-                // without making the client response itself undeliverable.
-                self.sim.setOutboundEndpointOutage(null);
+                switch (self.fault_mode) {
+                    .clean => unreachable,
+                    .graph_transport_failure => {
+                        if (!self.graph_transport_failure_injected or self.graph_transport_failure_observed) return;
+                        self.graph_transport_failure_observed = true;
+                        self.graph_transport_failure_error_code = event.error_code;
+                        // Heal before the coordinator converts the failed
+                        // attempt into the public error response. This cuts the
+                        // inter-owner fanout without making the client response
+                        // itself undeliverable.
+                        self.sim.setOutboundEndpointOutage(null);
+                    },
+                    .graph_owner_restart => {
+                        if (!self.graph_owner_restart_down or self.graph_owner_restart_failure_observed) return;
+                        self.graph_owner_restart_failure_observed = true;
+                        self.graph_owner_restart_error_code = event.error_code;
+                        self.graph_restart_recover.post(self.sim.io());
+                        self.graph_restart_recovered.wait(self.sim.io()) catch return;
+                    },
+                }
             },
             else => {},
         }
@@ -587,24 +676,39 @@ pub const Fixture = struct {
     }
 
     fn publishDataServerEndpoint(self: *Fixture, index: usize) !void {
-        const leader_index = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse
-            return error.MetadataLeaderUnavailable;
-        try self.metadata.?.cluster.node(leader_index).upsertStore(.{
-            .store_id = index + 1,
-            .node_id = index + 1,
-            .api_url = self.data_api_uris[index],
-            .raft_url = self.data_raft_uris[index],
-            .role = "data",
-            .health_class = "healthy",
-            .failure_domain = if (index == 0) "rack-a" else if (index == 1) "rack-b" else "rack-c",
-            .live = true,
-        });
-        try self.data_servers[index].acceptAuthoritativeStoreRegistration(index + 1, index + 1);
+        for (0..128) |round| {
+            const leader_index = self.metadata.?.cluster.currentMetadataLeaderIndex() orelse {
+                try self.recoverMetadataLeadership(round);
+                try self.metadata.?.cluster.stepAll();
+                continue;
+            };
+            self.metadata.?.cluster.node(leader_index).upsertStore(.{
+                .store_id = index + 1,
+                .node_id = index + 1,
+                .api_url = self.data_api_uris[index],
+                .raft_url = self.data_raft_uris[index],
+                .role = "data",
+                .health_class = "healthy",
+                .failure_domain = if (index == 0) "rack-a" else if (index == 1) "rack-b" else "rack-c",
+                .live = true,
+            }) catch |err| switch (err) {
+                error.NotLeader => {
+                    try self.recoverMetadataLeadership(round);
+                    try self.metadata.?.cluster.stepAll();
+                    continue;
+                },
+                else => return err,
+            };
+            try self.data_servers[index].acceptAuthoritativeStoreRegistration(index + 1, index + 1);
+            return;
+        }
+        return error.ProductionDataServerEndpointPublicationTimeout;
     }
 
     fn waitForPublishedDataServerEndpoints(self: *Fixture) !void {
-        for (0..128) |_| {
+        for (0..128) |round| {
             try self.metadata.?.cluster.stepAll();
+            try self.recoverMetadataLeadership(round);
             var all_published = true;
             for (0..node_count) |node_index| {
                 var snapshot = try self.metadata.?.cluster.node(node_index).adminSnapshot();
@@ -630,9 +734,17 @@ pub const Fixture = struct {
         return error.ProductionDataServerEndpointPublicationTimeout;
     }
 
+    fn recoverMetadataLeadership(self: *Fixture, round: usize) !void {
+        if (self.metadata.?.cluster.currentMetadataLeaderIndex() != null or round % 8 != 7) return;
+        const campaign_index = (round / 8) % node_count;
+        try self.metadata.?.cluster.node(campaign_index).campaignMetadataGroup();
+        self.metadata_recovery_campaigns +|= 1;
+    }
+
     fn waitForDataRaftTopology(self: *Fixture) !void {
         for (0..32) |_| {
-            for (&self.data_servers) |*server| {
+            for (&self.data_servers, 0..) |*server, index| {
+                if (!self.data_server_live[index]) continue;
                 server.runControlRoundOnly() catch |err| switch (err) {
                     error.LsmRootWriterAlreadyOpen,
                     error.WriterLocked,
@@ -645,7 +757,8 @@ pub const Fixture = struct {
             var hosted_replicas: usize = 0;
             for (initial_groups) |group_id| {
                 var group_replicas: usize = 0;
-                for (&self.data_servers) |*server| {
+                for (&self.data_servers, 0..) |*server, index| {
+                    if (!self.data_server_live[index]) continue;
                     const raft = server.data_raft orelse continue;
                     if (raft.host.http_host.host.raftStatus(group_id) != null)
                         group_replicas += 1;
@@ -662,11 +775,15 @@ pub const Fixture = struct {
 
     fn waitForInitialDataLeaders(self: *Fixture) !void {
         for (0..512) |_| {
-            for (&self.data_servers) |*server| try server.runRaftRoundOnly();
+            for (&self.data_servers, 0..) |*server, index| {
+                if (!self.data_server_live[index]) continue;
+                try server.runRaftRoundOnly();
+            }
 
             var leaders: usize = 0;
             for (initial_groups) |group_id| {
-                for (&self.data_servers) |*server| {
+                for (&self.data_servers, 0..) |*server, index| {
+                    if (!self.data_server_live[index]) continue;
                     const raft = server.data_raft orelse continue;
                     const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
                     if (status.soft.role == .leader) {
@@ -717,6 +834,14 @@ pub const Fixture = struct {
         defer self.control_round_active = false;
         try self.runDataControlRound();
         try self.metadata.?.cluster.stepAll();
+        if (self.metadata.?.cluster.currentMetadataLeaderIndex() == null and self.driver_rounds % 8 == 7) {
+            // The metadata simulation intentionally uses deterministic timers,
+            // so a long data-plane outage can align every healthy candidate.
+            // A production deployment gets the equivalent symmetry break from
+            // randomized election timeouts. Campaign one rotating healthy
+            // replica as a real Raft input; never fabricate leader state.
+            try self.recoverMetadataLeadership(@intCast(self.driver_rounds));
+        }
     }
 
     fn stopControlDriver(self: *Fixture) void {
@@ -743,11 +868,23 @@ pub const Fixture = struct {
     fn driveRaft(self: *Fixture, index: usize) void {
         defer self.raft_driver_done[index] = true;
         while (!self.driver_stop) {
+            if (self.data_server_paused[index] or !self.data_server_live[index]) {
+                self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err| {
+                    if (err == error.Canceled and self.driver_stop) return;
+                    self.driver_failure = err;
+                    self.driver_stop = true;
+                    return;
+                };
+                continue;
+            }
+            self.raft_driver_active[index] = true;
             self.data_servers[index].runRaftRoundOnly() catch |err| {
+                self.raft_driver_active[index] = false;
                 self.driver_failure = err;
                 self.driver_stop = true;
                 return;
             };
+            self.raft_driver_active[index] = false;
             self.raft_driver_rounds[index] +|= 1;
             self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err| {
                 if (err == error.Canceled and self.driver_stop) return;
@@ -759,7 +896,8 @@ pub const Fixture = struct {
     }
 
     fn runDataControlRound(self: *Fixture) !void {
-        for (&self.data_servers) |*server| {
+        for (&self.data_servers, 0..) |*server, index| {
+            if (self.data_server_paused[index] or !self.data_server_live[index]) continue;
             server.runControlRoundOnly() catch |err| switch (err) {
                 error.LsmRootWriterAlreadyOpen,
                 error.WriterLocked,
@@ -768,6 +906,90 @@ pub const Fixture = struct {
                 else => return err,
             };
         }
+    }
+
+    fn driveGraphOwnerRestart(self: *Fixture) void {
+        self.graph_restart_requested.wait(self.sim.io()) catch return;
+        if (self.driver_stop or self.teardown_started) return;
+        self.stopDataServerForRestart(self.graph_restart_target_index) catch |err| {
+            self.failGraphOwnerRestart(err);
+            return;
+        };
+        self.graph_owner_restart_down = true;
+        self.graph_restart_down.post(self.sim.io());
+
+        self.graph_restart_recover.wait(self.sim.io()) catch return;
+        if (self.teardown_started) return;
+        self.restartDataServer(self.graph_restart_target_index) catch |err| {
+            self.failGraphOwnerRestart(err);
+            return;
+        };
+        self.graph_owner_restart_recovered = true;
+        self.graph_restart_recovered.post(self.sim.io());
+    }
+
+    fn failGraphOwnerRestart(self: *Fixture, err: anyerror) void {
+        self.graph_owner_restart_failure = err;
+        self.driver_failure = err;
+        self.graph_restart_down.post(self.sim.io());
+        self.graph_restart_recovered.post(self.sim.io());
+    }
+
+    fn stopDataServerForRestart(self: *Fixture, index: usize) !void {
+        if (index >= self.data_server_count or !self.data_server_live[index])
+            return error.ProductionDataRestartTargetUnavailable;
+        self.data_server_paused[index] = true;
+        while (self.raft_driver_active[index] or self.control_round_active) {
+            if (self.driver_failure) |err| return err;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+
+        // Publish stop to both listener owners before joining either. The
+        // public listener is DataServer-owned; the Raft listener is external
+        // so its handler may continue borrowing the server until joined.
+        self.data_server_live[index] = false;
+        self.data_raft_listener_live[index] = false;
+        self.data_servers[index].beginTeardown();
+        self.data_raft_listeners[index].requestStop();
+        self.data_servers[index].quiesceBackgroundWork();
+        self.data_raft_listeners[index].deinit();
+        self.data_servers[index].deinit();
+        self.alloc.free(self.data_api_uris[index]);
+        self.data_api_uri_live[index] = false;
+        self.alloc.free(self.data_raft_uris[index]);
+        self.data_raft_uri_live[index] = false;
+    }
+
+    fn restartDataServer(self: *Fixture, index: usize) !void {
+        try self.initializeDataServer(index);
+        errdefer {
+            if (self.data_raft_listener_live[index]) {
+                self.data_raft_listeners[index].deinit();
+                self.data_raft_listener_live[index] = false;
+            }
+            if (self.data_server_live[index]) {
+                self.data_servers[index].deinit();
+                self.data_server_live[index] = false;
+            }
+            if (self.data_api_uri_live[index]) {
+                self.alloc.free(self.data_api_uris[index]);
+                self.data_api_uri_live[index] = false;
+            }
+            if (self.data_raft_uri_live[index]) {
+                self.alloc.free(self.data_raft_uris[index]);
+                self.data_raft_uri_live[index] = false;
+            }
+        }
+        // A process restart rebinds its stable advertised endpoints; it is not
+        // a metadata topology mutation. Reassert the local durable identity,
+        // then refresh every route consumer from the unchanged catalog.
+        try self.data_servers[index].acceptAuthoritativeStoreRegistration(index + 1, index + 1);
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, server_index| {
+            if (!self.data_server_live[server_index]) continue;
+            try server.refreshRemoteMetadataSnapshot();
+        }
+        self.data_server_paused[index] = false;
+        for (initial_groups) |group_id| try self.waitForDataLeader(group_id);
     }
 
     pub fn start(self: *Fixture) void {
@@ -787,6 +1009,23 @@ pub const Fixture = struct {
             self.failure = err;
         };
         self.workload_done = true;
+        if (self.graph_restart_future) |*future| {
+            if (self.graph_owner_restart_requested) {
+                // An unexpected successful graph response must not strand the
+                // stopped production owner. Complete recovery before reporting
+                // the property failure and beginning global teardown.
+                if (self.graph_owner_restart_down and !self.graph_owner_restart_recovered and
+                    self.graph_owner_restart_failure == null)
+                {
+                    self.graph_restart_recover.post(self.sim.io());
+                }
+                future.await(self.sim.io());
+            } else {
+                future.cancel(self.sim.io());
+            }
+            self.graph_restart_future = null;
+        }
+        if (self.failure == null) self.failure = self.graph_owner_restart_failure;
         self.driver_stop = true;
         if (self.driver_future) |*future| {
             // The driver polls this stop bit at a 1 ms logical cadence. Join
@@ -948,7 +1187,7 @@ pub const Fixture = struct {
             try self.waitForSplitInProgress();
             const ingress_before = self.public_request_ingress_count;
             self.split_graph_inflight_sound = probe: {
-                if (self.fault_mode == .graph_transport_failure) {
+                if (self.fault_mode != .clean) {
                     const start_leader_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
                         return error.ProductionDataGraphLeaderMissing;
                     const target_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id) orelse
@@ -956,7 +1195,17 @@ pub const Fixture = struct {
                     self.graph_probe_route_index = for (0..self.data_api_uri_count) |index| {
                         if (index != start_leader_index and index != target_index) break index;
                     } else return error.ProductionDataGraphRemoteCoordinatorMissing;
-                    self.graph_transport_fault_endpoint = try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
+                    switch (self.fault_mode) {
+                        .clean => unreachable,
+                        .graph_transport_failure => self.graph_transport_fault_endpoint =
+                            try parseHttpBaseUriAddress(self.data_api_uris[target_index]),
+                        .graph_owner_restart => {
+                            if (self.graph_restart_target_configured and self.graph_restart_target_index != target_index)
+                                return error.ProductionGraphRestartTargetLeadershipChanged;
+                            self.graph_restart_target_index = target_index;
+                            self.graph_restart_future = self.sim.io().async(driveGraphOwnerRestart, .{self});
+                        },
+                    }
                     self.graph_transport_fault_armed = true;
                 }
                 var in_flight_graph = self.sim.io().async(runSplitGraphProbe, .{self});
@@ -1076,7 +1325,7 @@ pub const Fixture = struct {
                     2,
                     &.{ "doc:x", "doc:k" },
                 );
-                if (self.fault_mode == .graph_transport_failure) return false;
+                if (self.fault_mode != .clean) return false;
                 return self.split_graph_inflight_complete;
             },
             409, 503 => {
@@ -1088,6 +1337,20 @@ pub const Fixture = struct {
                         self.graph_transport_failure_injected and
                         self.graph_transport_failure_observed and
                         self.graph_transport_failure_error_code != 0 and
+                        response.status == 503 and
+                        std.mem.indexOf(u8, response.body, "\"code\":\"distributed_query_unavailable\"") != null and
+                        std.mem.indexOf(u8, response.body, "\"retryable\":true") != null and
+                        self.split_graph_inflight_rejected;
+                    return self.graph_partial_rejected_sound;
+                }
+                if (self.fault_mode == .graph_owner_restart) {
+                    self.graph_partial_rejected_sound =
+                        self.graph_owner_restart_requested and
+                        self.graph_owner_restart_down and
+                        self.graph_owner_restart_failure_observed and
+                        self.graph_owner_restart_recovered and
+                        self.graph_owner_restart_failure == null and
+                        self.graph_owner_restart_error_code != 0 and
                         response.status == 503 and
                         std.mem.indexOf(u8, response.body, "\"code\":\"distributed_query_unavailable\"") != null and
                         std.mem.indexOf(u8, response.body, "\"retryable\":true") != null and
@@ -1201,8 +1464,10 @@ pub const Fixture = struct {
                 }
             }
             if (every_metadata_replica_ready) {
-                for (&self.data_servers) |*server|
+                for (&self.data_servers, 0..) |*server, index| {
+                    if (!self.data_server_live[index]) continue;
                     try server.refreshRemoteMetadataSnapshot();
+                }
                 return true;
             }
             try self.runOneControlRound();
@@ -1367,7 +1632,8 @@ pub const Fixture = struct {
 
     fn waitForDataLeader(self: *Fixture, group_id: u64) !void {
         for (0..30_000) |_| {
-            for (&self.data_servers) |*server| {
+            for (&self.data_servers, 0..) |*server, index| {
+                if (!self.data_server_live[index]) continue;
                 const raft = server.data_raft orelse continue;
                 const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
                 if (status.soft.role == .leader) return;
@@ -1380,6 +1646,7 @@ pub const Fixture = struct {
 
     fn currentDataLeaderIndex(self: *Fixture, group_id: u64) ?usize {
         for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            if (!self.data_server_live[index]) continue;
             const raft = server.data_raft orelse continue;
             const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
             if (status.soft.role == .leader) return index;
@@ -1421,12 +1688,15 @@ pub const Fixture = struct {
             for (metadata.raft_wire_runtimes[0..metadata.raft_wire_runtime_count]) |*runtime|
                 self.final_raft_wire_requests +|= runtime.requestCount();
         }
-        for (self.data_raft_listeners[0..self.data_raft_listener_count]) |*runtime|
+        for (self.data_raft_listeners[0..self.data_raft_listener_count], 0..) |*runtime, index| {
+            if (!self.data_raft_listener_live[index]) continue;
             self.final_raft_wire_requests +|= runtime.requestCount();
+        }
 
         var server_index = self.data_server_count;
         while (server_index > 0) {
             server_index -= 1;
+            if (!self.data_server_live[server_index]) continue;
             self.data_servers[server_index].quiesceBackgroundWork();
         }
         if (!self.complete and !self.workload_done and !self.teardown_started and self.executor_live and self.raft_executor_live and self.public_executor_live) std.log.err(
@@ -1436,7 +1706,9 @@ pub const Fixture = struct {
         var data_raft_listener_index = self.data_raft_listener_count;
         while (data_raft_listener_index > 0) {
             data_raft_listener_index -= 1;
+            if (!self.data_raft_listener_live[data_raft_listener_index]) continue;
             self.data_raft_listeners[data_raft_listener_index].deinit();
+            self.data_raft_listener_live[data_raft_listener_index] = false;
         }
         self.data_raft_listener_count = 0;
         if (!self.complete and !self.workload_done and !self.teardown_started and self.executor_live and self.raft_executor_live and self.public_executor_live) std.log.err(
@@ -1446,7 +1718,9 @@ pub const Fixture = struct {
         server_index = self.data_server_count;
         while (server_index > 0) {
             server_index -= 1;
+            if (!self.data_server_live[server_index]) continue;
             self.data_servers[server_index].deinit();
+            self.data_server_live[server_index] = false;
         }
         self.data_server_count = 0;
         if (!self.complete and !self.workload_done and !self.teardown_started and self.executor_live and self.raft_executor_live and self.public_executor_live) std.log.err(
@@ -1459,9 +1733,17 @@ pub const Fixture = struct {
             self.backend_runtimes[backend_runtime_index].deinit();
         }
         self.backend_runtime_count = 0;
-        for (self.data_api_uris[0..self.data_api_uri_count]) |uri| self.alloc.free(uri);
+        for (self.data_api_uris[0..self.data_api_uri_count], 0..) |uri, index| {
+            if (!self.data_api_uri_live[index]) continue;
+            self.alloc.free(uri);
+            self.data_api_uri_live[index] = false;
+        }
         self.data_api_uri_count = 0;
-        for (self.data_raft_uris[0..self.data_raft_uri_count]) |uri| self.alloc.free(uri);
+        for (self.data_raft_uris[0..self.data_raft_uri_count], 0..) |uri, index| {
+            if (!self.data_raft_uri_live[index]) continue;
+            self.alloc.free(uri);
+            self.data_raft_uri_live[index] = false;
+        }
         self.data_raft_uri_count = 0;
         if (self.raft_executor_live) {
             self.raft_executor.drainShutdown();
@@ -1535,6 +1817,7 @@ pub const Fixture = struct {
                 if (self.driver_failure) |err| @errorName(err) else "none",
             });
             for (initial_groups) |group_id| for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+                if (!self.data_server_live[index]) continue;
                 const raft = server.data_raft orelse continue;
                 const metrics = raft.host.http_host.metricsSnapshot();
                 const transport_host = &raft.host.http_host.transport_stack.transport_host;
@@ -1566,6 +1849,10 @@ pub const Fixture = struct {
         if (self.workload_future) |*future| {
             future.cancel(self.sim.io());
             self.workload_future = null;
+        }
+        if (self.graph_restart_future) |*future| {
+            future.cancel(self.sim.io());
+            self.graph_restart_future = null;
         }
         if (self.driver_future) |*future| {
             future.cancel(self.sim.io());
@@ -1603,12 +1890,16 @@ pub const Fixture = struct {
         if (self.transition_executor_live) self.transition_executor.beginShutdown();
         if (self.executor_live) self.executor.beginShutdown();
         if (self.raft_executor_live) self.raft_executor.beginShutdown();
-        for (self.data_servers[0..self.data_server_count]) |*server|
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            if (!self.data_server_live[index]) continue;
             server.beginTeardown();
+        }
         for (self.metadata_listeners[0..self.metadata_listener_count]) |*listener|
             listener.requestStop();
-        for (self.data_raft_listeners[0..self.data_raft_listener_count]) |*listener|
+        for (self.data_raft_listeners[0..self.data_raft_listener_count], 0..) |*listener, index| {
+            if (!self.data_raft_listener_live[index]) continue;
             listener.requestStop();
+        }
         if (self.metadata) |metadata| metadata.beginTeardown();
     }
 
@@ -1624,6 +1915,11 @@ pub const Fixture = struct {
         graph_transport_failure_injected: bool,
         graph_transport_failure_observed: bool,
         graph_transport_failure_error_code: u16,
+        graph_owner_restart_requested: bool,
+        graph_owner_restart_down: bool,
+        graph_owner_restart_failure_observed: bool,
+        graph_owner_restart_recovered: bool,
+        graph_owner_restart_error_code: u16,
         graph_partial_rejected_sound: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
@@ -1647,6 +1943,11 @@ pub const Fixture = struct {
             .graph_transport_failure_injected = self.graph_transport_failure_injected,
             .graph_transport_failure_observed = self.graph_transport_failure_observed,
             .graph_transport_failure_error_code = self.graph_transport_failure_error_code,
+            .graph_owner_restart_requested = self.graph_owner_restart_requested,
+            .graph_owner_restart_down = self.graph_owner_restart_down,
+            .graph_owner_restart_failure_observed = self.graph_owner_restart_failure_observed,
+            .graph_owner_restart_recovered = self.graph_owner_restart_recovered,
+            .graph_owner_restart_error_code = self.graph_owner_restart_error_code,
             .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally
@@ -1670,7 +1971,8 @@ pub const Fixture = struct {
     pub fn primaryGroupProgress(self: *const Fixture) RaftProgress {
         if (self.cleanup_started) return .{};
         var progress: RaftProgress = .{};
-        for (self.data_servers[0..self.data_server_count]) |*server| {
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            if (!self.data_server_live[index]) continue;
             const raft = server.data_raft orelse continue;
             const status = raft.host.http_host.host.raftStatus(initial_groups[0]) orelse continue;
             progress.commit_index = @max(progress.commit_index, status.hard.commit_index);

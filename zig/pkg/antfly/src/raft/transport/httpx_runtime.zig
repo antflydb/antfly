@@ -23,11 +23,24 @@ pub const Runtime = struct {
         io: std.Io,
         target: common.RequestExecutor,
     ) !Runtime {
+        return startAt(alloc, io, target, "127.0.0.1", 0);
+    }
+
+    /// Publish the production Raft handler at a caller-owned stable address.
+    /// Process restart compositions use this to rebind the advertised service
+    /// endpoint instead of inventing a metadata topology change.
+    pub fn startAt(
+        alloc: std.mem.Allocator,
+        io: std.Io,
+        target: common.RequestExecutor,
+        host: []const u8,
+        port: u16,
+    ) !Runtime {
         const server = try alloc.create(httpx.Server);
         errdefer alloc.destroy(server);
         server.* = httpx.Server.initWithConfig(alloc, io, .{
-            .host = "127.0.0.1",
-            .port = 0,
+            .host = host,
+            .port = port,
             .header_read_timeout_ms = 0,
             .body_read_timeout_ms = 0,
             .response_write_timeout_ms = 0,

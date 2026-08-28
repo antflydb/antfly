@@ -1642,7 +1642,15 @@ const RaftTableApplyStateMachine = struct {
         read_states: []const raft_engine.core.ReadState,
     ) !void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
-        if (snapshot == null and committed_entries.len == 0) return;
+        // ReadIndex can produce a Ready containing only ReadStates. Those are
+        // request completions, not empty apply work: dropping them strands the
+        // registered strong-read waiter until its timeout. Keep this fast path
+        // separate from retry checkpoint bookkeeping, which is only needed for
+        // durable snapshot/entry application.
+        if (snapshot == null and committed_entries.len == 0) {
+            self.observeReadStates(group_id, read_states);
+            return;
+        }
         const snapshot_index: u64 = if (snapshot) |value| value.metadata.index else 0;
         var last_index: u64 = snapshot_index;
         var completed_index = try self.prepareRetryApplyCheckpoint(group_id, snapshot, committed_entries);
@@ -20901,6 +20909,16 @@ test "data raft read lease completes only after matching ReadState apply" {
     try std.testing.expect(!apply_sm.takeCompletedReadLease(7001, 0x2b));
     try apply_sm.publishAppliedReady(7001, 0, &.{}, 9);
     try std.testing.expect(apply_sm.takeCompletedReadLease(7001, 0x2b));
+
+    // A quorum read commonly arrives as ReadState-only Ready work. Exercise
+    // the state-machine boundary rather than calling observeReadStates
+    // directly so an empty-apply optimization cannot discard the completion.
+    try apply_sm.registerReadLease(7001, 0x2c);
+    try apply_sm.stateMachine().applyReady(7001, null, &.{}, &.{.{
+        .index = 9,
+        .request_ctx = @constCast("lookup:read_index:vopr-read-v1:2c"),
+    }});
+    try std.testing.expect(apply_sm.takeCompletedReadLease(7001, 0x2c));
 
     var server: DataServer = undefined;
     server.backend_runtime = null;

@@ -455,6 +455,15 @@ pub const Network = struct {
             self.open_sockets -= 1;
             socket_state.read_open = false;
             self.closeWrite(socket_state) catch {};
+            // Closing a listening socket rejects every connection that
+            // completed its handshake but was not yet accepted. Retaining
+            // those server-side handles leaks one descriptor per shutdown
+            // wakeup and lets a later stable-port rebind inherit ghost peers.
+            if (socket_state.kind == .listener) {
+                while (socket_state.pending_accept.pop()) |pending_handle| {
+                    _ = self.close(&.{pending_handle});
+                }
+            }
             self.wait_port.?.wake(socket_state.readResource(), std.math.maxInt(u32)) catch {};
             self.wait_port.?.wake(socket_state.acceptResource(), std.math.maxInt(u32)) catch {};
         }
@@ -1022,6 +1031,32 @@ test "listener and connection identities are scoped to their logical endpoint" {
     try std.testing.expectEqual(first.getSocket(first_listener_b.handle).?.id, second.getSocket(second_listener_b.handle).?.id);
     try std.testing.expectEqual(first.getSocket(first_client_a.handle).?.id, second.getSocket(second_client_a.handle).?.id);
     try std.testing.expectEqual(first.getSocket(first_client_b.handle).?.id, second.getSocket(second_client_b.handle).?.id);
+}
+
+test "closing listener releases unaccepted server sockets" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake };
+    };
+
+    var network = try Network.init(std.testing.allocator, .{});
+    defer network.deinit();
+    var context: u8 = 0;
+    network.bindWaitPort(.{ .ptr = &context, .vtable = &NoopWaitPort.vtable });
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_003) };
+    const listener = try network.listenIp(&address, .{});
+    const client = try network.connectIp(&address, .{ .mode = .stream }, 303);
+    try std.testing.expectEqual(@as(usize, 3), network.openSocketCount());
+
+    try std.testing.expect(network.close(&.{listener.handle}));
+    try std.testing.expectEqual(@as(usize, 1), network.openSocketCount());
+    try std.testing.expect(network.close(&.{client.handle}));
+    try std.testing.expectEqual(@as(usize, 0), network.openSocketCount());
 }
 
 test "connection identities are scoped to logical clients on one listener" {

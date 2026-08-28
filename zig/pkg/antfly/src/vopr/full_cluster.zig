@@ -16,7 +16,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 15;
+    pub const version: u32 = 16;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -25,6 +25,7 @@ pub const Scenario = struct {
     const graph_query_id = vopr.id.stable(name, "public-cross-range-graph-query-sound");
     const graph_split_id = vopr.id.stable(name, "public-graph-survives-active-split");
     const graph_split_transport_id = vopr.id.stable(name, "public-graph-active-split-transport-fails-closed");
+    const graph_split_owner_restart_id = vopr.id.stable(name, "public-graph-active-split-owner-restart-fails-closed");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
     const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
@@ -46,6 +47,7 @@ pub const Scenario = struct {
         .{ .id = graph_query_id, .name = name ++ ".public-cross-range-graph-query-sound", .kind = .always },
         .{ .id = graph_split_id, .name = name ++ ".public-graph-survives-active-split", .kind = .always },
         .{ .id = graph_split_transport_id, .name = name ++ ".public-graph-active-split-transport-fails-closed", .kind = .always },
+        .{ .id = graph_split_owner_restart_id, .name = name ++ ".public-graph-active-split-owner-restart-fails-closed", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
         .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
@@ -76,18 +78,20 @@ pub const Scenario = struct {
         production_data_plane,
         production_data_plane_graph_split,
         production_data_plane_graph_split_transport_failure,
+        production_data_plane_graph_split_owner_restart,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
                 self == .production_data_plane_graph or
                 self == .production_data_plane or
                 self == .production_data_plane_graph_split or
-                self == .production_data_plane_graph_split_transport_failure;
+                self == .production_data_plane_graph_split_transport_failure or
+                self == .production_data_plane_graph_split_owner_restart;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -120,6 +124,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "production-data-plane"),
         vopr.id.stable(name, "production-data-plane-graph-split"),
         vopr.id.stable(name, "production-data-plane-graph-split-transport-failure"),
+        vopr.id.stable(name, "production-data-plane-graph-split-owner-restart"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -136,6 +141,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane",
         name ++ ".production-data-plane-graph-split",
         name ++ ".production-data-plane-graph-split-transport-failure",
+        name ++ ".production-data-plane-graph-split-owner-restart",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -143,6 +149,7 @@ pub const Scenario = struct {
     const production_split_ordinal: usize = @intFromEnum(Mode.production_data_plane);
     const production_graph_split_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split);
     const production_graph_split_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_transport_failure);
+    const production_graph_split_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_owner_restart);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -232,6 +239,11 @@ pub const Scenario = struct {
         graph_transport_failure_injected: bool = false,
         graph_transport_failure_observed: bool = false,
         graph_transport_failure_error_code: u64 = 0,
+        graph_owner_restart_requested: bool = false,
+        graph_owner_restart_down: bool = false,
+        graph_owner_restart_failure_observed: bool = false,
+        graph_owner_restart_recovered: bool = false,
+        graph_owner_restart_error_code: u64 = 0,
         graph_partial_rejected_sound: bool = false,
     };
 
@@ -353,6 +365,11 @@ pub const Scenario = struct {
                     .graph_transport_failure_injected = snapshot.graph_transport_failure_injected,
                     .graph_transport_failure_observed = snapshot.graph_transport_failure_observed,
                     .graph_transport_failure_error_code = snapshot.graph_transport_failure_error_code,
+                    .graph_owner_restart_requested = snapshot.graph_owner_restart_requested,
+                    .graph_owner_restart_down = snapshot.graph_owner_restart_down,
+                    .graph_owner_restart_failure_observed = snapshot.graph_owner_restart_failure_observed,
+                    .graph_owner_restart_recovered = snapshot.graph_owner_restart_recovered,
+                    .graph_owner_restart_error_code = snapshot.graph_owner_restart_error_code,
                     .graph_partial_rejected_sound = snapshot.graph_partial_rejected_sound,
                     .cleanup_ok = snapshot.cleanup_ok,
                     .raft_wire_requests = snapshot.raft_wire_requests,
@@ -411,17 +428,20 @@ pub const Scenario = struct {
                 self.production_cluster.?.setActiveSplitEnabled(
                     mode == .production_data_plane or
                         mode == .production_data_plane_graph_split or
-                        mode == .production_data_plane_graph_split_transport_failure,
+                        mode == .production_data_plane_graph_split_transport_failure or
+                        mode == .production_data_plane_graph_split_owner_restart,
                 );
                 self.production_cluster.?.setGraphEnabled(
                     mode == .production_data_plane_graph or
                         mode == .production_data_plane_graph_split or
-                        mode == .production_data_plane_graph_split_transport_failure,
+                        mode == .production_data_plane_graph_split_transport_failure or
+                        mode == .production_data_plane_graph_split_owner_restart,
                 );
-                self.production_cluster.?.setFaultMode(if (mode == .production_data_plane_graph_split_transport_failure)
-                    .graph_transport_failure
-                else
-                    .clean);
+                self.production_cluster.?.setFaultMode(switch (mode) {
+                    .production_data_plane_graph_split_transport_failure => .graph_transport_failure,
+                    .production_data_plane_graph_split_owner_restart => .graph_owner_restart,
+                    else => .clean,
+                });
                 self.production_cluster.?.bootstrap() catch |err| {
                     const teardown_cancelled = blk: {
                         std.Io.checkCancel(self.sim.io()) catch |cancel_err|
@@ -592,6 +612,18 @@ pub const Scenario = struct {
                     .network,
                     link.id,
                 ),
+                .production_data_plane_graph_split_owner_restart => {
+                    const production = self.production_cluster orelse
+                        return error.MissingProductionCluster;
+                    const target_index = production.currentGraphOwnerIndex() orelse
+                        return error.ProductionDataGraphLeaderMissing;
+                    try production.configureGraphRestartTarget(target_index);
+                    try deployment.activateFault(
+                        vopr.id.stable(name, "fault.production-graph-split-owner-restart"),
+                        .node_pause,
+                        process_domains[target_index],
+                    );
+                },
                 .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split => {},
             }
         }
@@ -680,6 +712,7 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".production-primary-frames-failed", if (production_progress) |progress| @intCast(progress.frames_failed) else 0);
         try builder.addNamed(allocator, name ++ ".production-primary-frames-sent", if (production_progress) |progress| @intCast(progress.frames_sent) else 0);
         try builder.addNamed(allocator, name ++ ".production-driver-rounds", if (production) |production_fixture| @intCast(production_fixture.driver_rounds) else 0);
+        try builder.addNamed(allocator, name ++ ".production-metadata-recovery-campaigns", if (production) |production_fixture| @intCast(production_fixture.metadata_recovery_campaigns) else 0);
         try builder.addNamed(allocator, name ++ ".production-driver-done", @intFromBool(if (production) |production_fixture| production_fixture.driver_done else false));
         try builder.addNamed(allocator, name ++ ".production-driver-error", if (production) |production_fixture| if (production_fixture.driver_failure) |err| @intFromError(err) else 0 else 0);
         try builder.addNamed(allocator, name ++ ".production-left-write-status", if (production) |production_fixture| production_fixture.write_statuses[0] else 0);
@@ -745,6 +778,11 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-injected", @intFromBool(if (cluster) |snapshot| snapshot.graph_transport_failure_injected else false));
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_transport_failure_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-transport-failure-error", if (cluster) |snapshot| @intCast(snapshot.graph_transport_failure_error_code) else 0);
+        try builder.addNamed(allocator, name ++ ".graph-owner-restart-requested", @intFromBool(if (cluster) |snapshot| snapshot.graph_owner_restart_requested else false));
+        try builder.addNamed(allocator, name ++ ".graph-owner-restart-down", @intFromBool(if (cluster) |snapshot| snapshot.graph_owner_restart_down else false));
+        try builder.addNamed(allocator, name ++ ".graph-owner-restart-failure-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_owner_restart_failure_observed else false));
+        try builder.addNamed(allocator, name ++ ".graph-owner-restart-recovered", @intFromBool(if (cluster) |snapshot| snapshot.graph_owner_restart_recovered else false));
+        try builder.addNamed(allocator, name ++ ".graph-owner-restart-error", if (cluster) |snapshot| @intCast(snapshot.graph_owner_restart_error_code) else 0);
         try builder.addNamed(allocator, name ++ ".graph-partial-result-rejected", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_rejected_sound else false));
         try builder.addNamed(allocator, name ++ ".request-errors", if (production) |value| @intFromBool(value.failure != null) else if (fixture) |public_cluster| @intCast(public_cluster.request_errors) else 0);
         try builder.addNamed(allocator, name ++ ".last-request-error", if (production) |value| if (value.failure) |err| @intFromError(err) else 0 else if (fixture) |public_cluster| @intCast(public_cluster.last_request_error_code) else 0);
@@ -773,9 +811,11 @@ pub const Scenario = struct {
         const production_mode = state.mode != null and state.mode.?.isProduction();
         const production_graph_mode = state.mode == .production_data_plane_graph or
             state.mode == .production_data_plane_graph_split or
-            state.mode == .production_data_plane_graph_split_transport_failure;
+            state.mode == .production_data_plane_graph_split_transport_failure or
+            state.mode == .production_data_plane_graph_split_owner_restart;
         const production_graph_split_mode = state.mode == .production_data_plane_graph_split or
-            state.mode == .production_data_plane_graph_split_transport_failure;
+            state.mode == .production_data_plane_graph_split_transport_failure or
+            state.mode == .production_data_plane_graph_split_owner_restart;
         const resources = state.sim.resourceSnapshot();
         try sink.check(allocator, acknowledged_id, !state.complete or (cluster != null and cluster.?.requests_ok));
         try sink.check(allocator, quorum_id, !state.complete or (cluster != null and cluster.?.topology_ok));
@@ -798,6 +838,14 @@ pub const Scenario = struct {
                 cluster.?.split_graph_inflight_rejected and cluster.?.split_graph_inflight_ok and
                 cluster.?.graph_transport_failure_injected and cluster.?.graph_transport_failure_observed and
                 cluster.?.graph_transport_failure_error_code != 0 and cluster.?.graph_partial_rejected_sound and
+                cluster.?.post_split_graph_query_ok));
+        try sink.check(allocator, graph_split_owner_restart_id, !state.complete or state.mode.? != .production_data_plane_graph_split_owner_restart or
+            (cluster != null and cluster.?.graph_query_ok and
+                cluster.?.split_graph_inflight_started and !cluster.?.split_graph_inflight_complete and
+                cluster.?.split_graph_inflight_rejected and cluster.?.split_graph_inflight_ok and
+                cluster.?.graph_owner_restart_requested and cluster.?.graph_owner_restart_down and
+                cluster.?.graph_owner_restart_failure_observed and cluster.?.graph_owner_restart_recovered and
+                cluster.?.graph_owner_restart_error_code != 0 and cluster.?.graph_partial_rejected_sound and
                 cluster.?.post_split_graph_query_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
@@ -871,11 +919,21 @@ fn runExactMode(
     const production_split_mode = mode_id == Scenario.mode_ids[Scenario.production_split_ordinal];
     const production_graph_split_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_ordinal];
     const production_graph_split_transport_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_transport_ordinal];
+    const production_graph_split_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_owner_restart_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
-        production_graph_split_transport_mode;
-    var fair_choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
-    var cooperative_choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{mode_id}, 0x4655_4c4c + mode_ordinal);
+        production_graph_split_transport_mode or production_graph_split_owner_restart_mode;
+    // Fault extensions of the promoted graph/split history keep its
+    // cooperative scheduling seed. The prefixed mode remains distinct replay
+    // truth, while comparable scheduling ensures the experiment changes the
+    // production fault rather than accidentally selecting a starvation-heavy
+    // unrelated schedule solely because a new enum ordinal was appended.
+    const schedule_ordinal = if (production_graph_split_owner_restart_mode)
+        Scenario.production_graph_split_transport_ordinal
+    else
+        mode_ordinal;
+    var fair_choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4655_4c4c + schedule_ordinal);
+    var cooperative_choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{mode_id}, 0x4655_4c4c + schedule_ordinal);
     const choice_source = if (production_mode)
         cooperative_choices.source()
     else
@@ -886,7 +944,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_graph_split_transport_mode)
+            (if (production_graph_split_owner_restart_mode)
+                "full-cluster-vopr-v16-graph-split-owner-restart"
+            else if (production_graph_split_transport_mode)
                 "full-cluster-vopr-v15-graph-split-transport"
             else if (production_graph_split_mode)
                 "full-cluster-vopr-v14-graph-split"
@@ -1021,6 +1081,19 @@ test "full cluster production data plane graph active split transport failure ex
         Scenario.mode_ids[ordinal],
         ordinal,
         450_000,
+        .complete,
+    );
+}
+
+test "full cluster production data plane graph active split owner restart exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_graph_split_owner_restart_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        650_000,
         .complete,
     );
 }
