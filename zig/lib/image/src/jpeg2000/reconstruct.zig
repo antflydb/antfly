@@ -1337,7 +1337,7 @@ pub fn assemblePlanesFromTier1IrreversibleAtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) ![][]i32 {
-    var assembler = try StreamingPlaneAssembler.init(allocator, state);
+    var assembler = try StreamingPlaneAssembler.initAtResolution(allocator, state, discard_levels);
     defer assembler.deinit();
     for (execution.codeblocks) |*codeblock_state| {
         try assembler.appendCodeblock(codeblock_state);
@@ -1356,6 +1356,7 @@ pub const StreamingPlaneAssembler = struct {
     initialized_planes: usize = 0,
     plane_buffers_owned: bool = true,
     finished: bool = false,
+    discard_levels: u8 = 0,
 
     /// The streaming assembler stores one four-byte coefficient plane per
     /// component: f32 for irreversible 9/7 and i32 for reversible 5/3. A mixed
@@ -1375,6 +1376,10 @@ pub const StreamingPlaneAssembler = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, state: *const codestream.State) !StreamingPlaneAssembler {
+        return initAtResolution(allocator, state, 0);
+    }
+
+    pub fn initAtResolution(allocator: std.mem.Allocator, state: *const codestream.State, discard_levels: u8) !StreamingPlaneAssembler {
         if (!try canAssemble(state)) return error.UnsupportedWaveletTransform;
         const component_count = state.header.components.len;
         const comp_widths = try allocator.alloc(usize, component_count);
@@ -1400,10 +1405,12 @@ pub const StreamingPlaneAssembler = struct {
                 component.xrsiz,
                 component.yrsiz,
             );
-            comp_widths[component_index] = @intCast(dims.width);
-            comp_heights[component_index] = @intCast(dims.height);
-            comp_origin_x[component_index] = @intCast(dims.origin_x);
-            comp_origin_y[component_index] = @intCast(dims.origin_y);
+            const coding_style = try tile.effectiveCodingStyle(state, component_index);
+            const component_discard = @min(discard_levels, coding_style.decomposition_levels);
+            comp_widths[component_index] = resolutionWidthAt(@intCast(dims.origin_x), @intCast(dims.width), component_discard);
+            comp_heights[component_index] = resolutionWidthAt(@intCast(dims.origin_y), @intCast(dims.height), component_discard);
+            comp_origin_x[component_index] = resolutionOriginAt(@intCast(dims.origin_x), component_discard);
+            comp_origin_y[component_index] = resolutionOriginAt(@intCast(dims.origin_y), component_discard);
             plane_storage[component_index] = try allocator.alloc(
                 f32,
                 comp_widths[component_index] * comp_heights[component_index],
@@ -1420,6 +1427,7 @@ pub const StreamingPlaneAssembler = struct {
             .comp_origin_y = comp_origin_y,
             .plane_storage = plane_storage,
             .initialized_planes = initialized_planes,
+            .discard_levels = discard_levels,
         };
     }
 
@@ -1428,6 +1436,9 @@ pub const StreamingPlaneAssembler = struct {
         const component_index: usize = codeblock_state.coordinate.component_index;
         if (component_index >= self.plane_storage.len) return error.InvalidPlaneIndex;
         const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
+        const component_discard = @min(self.discard_levels, coding_style.decomposition_levels);
+        const active_decomposition_levels = coding_style.decomposition_levels - component_discard;
+        if (codeblock_state.coordinate.resolution_index > active_decomposition_levels) return;
         const storage = self.plane_storage[component_index];
         const component_width = self.comp_widths[component_index];
         const component_height = self.comp_heights[component_index];
@@ -1439,7 +1450,7 @@ pub const StreamingPlaneAssembler = struct {
             component_height,
             self.comp_origin_x[component_index],
             self.comp_origin_y[component_index],
-            coding_style.decomposition_levels,
+            active_decomposition_levels,
             codeblock_state.coordinate.resolution_index,
             codeblock_state.subband,
         );
@@ -1505,13 +1516,15 @@ pub const StreamingPlaneAssembler = struct {
     pub fn finish(self: *StreamingPlaneAssembler, discard_levels: u8) ![][]i32 {
         if (self.finished or self.initialized_planes != self.plane_storage.len)
             return error.InvalidPlaneAssemblyState;
+        if (discard_levels != self.discard_levels) return error.InvalidPlaneAssemblyState;
         const default_coding_style = self.state.coding_style orelse
             return error.MissingCodingStyle;
 
         for (self.plane_storage, 0..) |plane, component_index| {
             const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
             if (coding_style.decomposition_levels == 0) continue;
-            const component_discard = @min(discard_levels, coding_style.decomposition_levels);
+            const component_discard = @min(self.discard_levels, coding_style.decomposition_levels);
+            const active_decomposition_levels = coding_style.decomposition_levels - component_discard;
             if (coding_style.wavelet_transform == 0) {
                 try inverseWavelet97MultiLevelOriginAtResolution(
                     self.allocator,
@@ -1520,8 +1533,8 @@ pub const StreamingPlaneAssembler = struct {
                     self.comp_heights[component_index],
                     self.comp_origin_x[component_index],
                     self.comp_origin_y[component_index],
-                    coding_style.decomposition_levels,
-                    component_discard,
+                    active_decomposition_levels,
+                    0,
                     !producedByAntfly(self.state.comments),
                 );
             } else {
@@ -1536,8 +1549,8 @@ pub const StreamingPlaneAssembler = struct {
                     self.comp_heights[component_index],
                     self.comp_origin_x[component_index],
                     self.comp_origin_y[component_index],
-                    coding_style.decomposition_levels,
-                    component_discard,
+                    active_decomposition_levels,
+                    0,
                 );
             }
         }
@@ -1585,18 +1598,6 @@ pub const StreamingPlaneAssembler = struct {
             for (planes) |plane| self.allocator.free(plane);
         }
 
-        if (discard_levels > 0) {
-            try cropPlanesToResolution(
-                self.allocator,
-                self.state,
-                planes,
-                self.comp_widths,
-                self.comp_heights,
-                self.comp_origin_x,
-                self.comp_origin_y,
-                discard_levels,
-            );
-        }
         self.finished = true;
         return planes;
     }
