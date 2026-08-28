@@ -2452,18 +2452,20 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     const font_bytes = try buildSimpleOpenTypeCffFontAlloc(alloc);
     defer alloc.free(font_bytes);
 
-    const content = "BT\n/F1 20 Tf\n10 10 Td\n<0001> Tj\nET\n";
+    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00010001> Tj\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
         "begincmap\n" ++
         "1 begincodespacerange\n" ++
-        "<0000> <FFFF>\n" ++
+        // Extraction consumes the whole string as one four-byte code while
+        // Identity-H painting must still consume two fixed-width CIDs.
+        "<00000000> <FFFFFFFF>\n" ++
         "endcodespacerange\n" ++
         "1 beginbfchar\n" ++
         // Extraction deliberately disagrees with both the raw CID and the
-        // font's only cmap entry. Painting must still select CFF CID 1.
-        "<0001> <0042>\n" ++
+        // font's only cmap entry. Painting must still select both CFF CID 1s.
+        "<00010001> <0042>\n" ++
         "endbfchar\n" ++
         "endcmap\n" ++
         "end\n" ++
@@ -2526,7 +2528,8 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     defer analysis.deinit(alloc);
     try std.testing.expectEqualStrings("B\n", analysis.text);
     try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 5), analysis.runs[0].advance_width, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), analysis.runs[0].advance_width, 0.001);
+    try std.testing.expect(!analysis.outline_fallback);
     const native_shapes = try parsed.extractPageVectorTextShapeRunsAlloc(1);
     defer {
         for (native_shapes) |*shape| shape.deinit(alloc);

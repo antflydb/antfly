@@ -358,18 +358,6 @@ const FontDecoder = struct {
 
         return @min(self.code_bytes, remaining.len);
     }
-
-    fn countCodes(self: *const FontDecoder, raw: []const u8) u64 {
-        var count: u64 = 0;
-        var offset: usize = 0;
-        while (offset < raw.len) {
-            const width = self.detectCodeWidth(raw[offset..]);
-            if (width == 0) break;
-            offset += @min(width, raw.len - offset);
-            count = saturatedAddU64(count, 1);
-        }
-        return count;
-    }
 };
 
 const PageFont = struct {
@@ -979,6 +967,26 @@ const max_glyph_charstring_operations: usize = 16_384;
 const min_text_materialization_bytes: usize = 256 * 1024;
 const max_text_materialization_bytes: usize = 64 * 1024 * 1024;
 
+fn fixedWidthCodeCount(byte_len: usize, code_bytes: usize) u64 {
+    if (code_bytes == 0) return byte_len;
+    const full_codes = byte_len / code_bytes;
+    return @intCast(full_codes + @intFromBool(byte_len % code_bytes != 0));
+}
+
+fn vectorTextGlyphCount(run: TextRun, font: PageFont) u64 {
+    if (run.raw_text) |raw| {
+        if (font.type3 != null or font.type1 != null) return raw.len;
+        if (font.truetype) |truetype| {
+            if (truetype.raw_code_bytes > 0) return fixedWidthCodeCount(raw.len, truetype.raw_code_bytes);
+            return std.unicode.utf8CountCodepoints(run.text) catch run.text.len;
+        }
+        if (font.cff_otf) |cff_otf| return fixedWidthCodeCount(raw.len, cff_otf.code_bytes);
+        if (font.cff) |cff| return fixedWidthCodeCount(raw.len, cff.code_bytes);
+        return raw.len;
+    }
+    return std.unicode.utf8CountCodepoints(run.text) catch run.text.len;
+}
+
 /// Caps native outline work in units that track the renderer's dominant
 /// operation: point-in-path edge tests. The allowance scales with the final
 /// raster, so thumbnails do not inherit page-sized work and large requested
@@ -1080,10 +1088,7 @@ const VectorTextWorkBudget = struct {
     /// before the page budget has a chance to reject it.
     fn reserveTextMaterialization(self: *VectorTextWorkBudget, run: TextRun, font: PageFont) ?MaterializationReservation {
         if (self.exhausted) return null;
-        const glyph_count: u64 = if (run.raw_text) |raw|
-            font.decoder.countCodes(raw)
-        else
-            (std.unicode.utf8CountCodepoints(run.text) catch run.text.len);
+        const glyph_count = vectorTextGlyphCount(run, font);
         const paint_copies: u64 = switch (@mod(run.render_mode, 8)) {
             2, 6 => 2,
             3, 7 => 0,
@@ -6467,15 +6472,21 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
-        font.truetype = try self.buildTrueTypeFont(font_obj, font.decoder.code_bytes, &font.outline_fallback);
-        font.cff_otf = try self.buildCffOpenTypeFont(font_obj, font.decoder.code_bytes, &font.outline_fallback);
-        font.cff = self.buildEmbeddedCffFont(font_obj, font.decoder.code_bytes) catch |err| switch (err) {
+        font.truetype = try self.buildTrueTypeFont(font_obj, &font.outline_fallback);
+        font.cff_otf = try self.buildCffOpenTypeFont(font_obj, &font.outline_fallback);
+        font.cff = self.buildEmbeddedCffFont(font_obj) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => blk: {
                 font.outline_fallback = true;
                 break :blk null;
             },
         };
+        // Outline builders probe mutually exclusive embedded formats. A
+        // missing `glyf` table in OpenType CFF (or missing `CFF ` in
+        // TrueType) is not a user-visible fallback when another native
+        // builder successfully claimed the font.
+        if (font.type3 != null or font.type1 != null or font.truetype != null or font.cff_otf != null or font.cff != null)
+            font.outline_fallback = false;
         return font;
     }
 
@@ -6635,7 +6646,7 @@ pub const Reader = struct {
         return font;
     }
 
-    fn buildTrueTypeFont(self: *const Reader, font_obj: *const syntax.Object, decoder_code_bytes: usize, outline_fallback: *bool) !?TrueTypeFont {
+    fn buildTrueTypeFont(self: *const Reader, font_obj: *const syntax.Object, outline_fallback: *bool) !?TrueTypeFont {
         const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
         errdefer self.alloc.free(bytes);
         var font = font_lib.sfnt.Font.init(self.alloc, bytes) catch |err| switch (err) {
@@ -6692,7 +6703,7 @@ pub const Reader = struct {
                     defer mapping.deinit(self.alloc);
                     if (mapping == .name and std.mem.eql(u8, mapping.name, "Identity")) {
                         cid_to_gid = try self.alloc.alloc(u16, 0);
-                        raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
+                        raw_code_bytes = 2;
                     } else if (mapping == .stream) {
                         const mapping_bytes = try self.readDecodedStreamData(&mapping);
                         defer self.alloc.free(mapping_bytes);
@@ -6700,12 +6711,12 @@ pub const Reader = struct {
                         const map = try self.alloc.alloc(u16, count);
                         for (map, 0..) |*gid, i| gid.* = (@as(u16, mapping_bytes[i * 2]) << 8) | mapping_bytes[i * 2 + 1];
                         cid_to_gid = map;
-                        raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
+                        raw_code_bytes = 2;
                     }
                 } else {
                     // CIDFontType2 defaults to an identity CID-to-GID mapping.
                     cid_to_gid = try self.alloc.alloc(u16, 0);
-                    raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
+                    raw_code_bytes = 2;
                 }
             }
         };
@@ -6737,7 +6748,7 @@ pub const Reader = struct {
         };
     }
 
-    fn buildCffPdfGlyphMapAlloc(self: *const Reader, font_obj: *const syntax.Object, cff: font_lib.cff.Font, decoder_code_bytes: usize) !?CffPdfGlyphMap {
+    fn buildCffPdfGlyphMapAlloc(self: *const Reader, font_obj: *const syntax.Object, cff: font_lib.cff.Font) !?CffPdfGlyphMap {
         const subtype = font_obj.get("Subtype") orelse return null;
         const composite = std.mem.eql(u8, subtype.asName() orelse "", "Type0");
         var glyphs = std.ArrayList(EmbeddedCffGlyph).empty;
@@ -6798,10 +6809,12 @@ pub const Reader = struct {
                     else => {},
                 };
             }
-            const first_char: usize = if (font_obj.get("FirstChar")) |obj|
-                @intCast(@max(@as(i64, 0), obj.asInteger() orelse 0))
-            else
-                0;
+            const first_char: usize = if (font_obj.get("FirstChar")) |obj| blk: {
+                const value = (try self.resolvedIntegerObjectValue(obj)) orelse return error.InvalidPdf;
+                if (value < 0 or value > 255) return error.InvalidPdf;
+                break :blk @intCast(value);
+            } else 0;
+            const missing_width = try self.simpleFontMissingWidthAlloc(font_obj);
             var resolved_widths: ?syntax.Object = null;
             defer if (resolved_widths) |*obj| obj.deinit(self.alloc);
             if (font_obj.get("Widths")) |obj| resolved_widths = try self.resolveValue(obj);
@@ -6812,7 +6825,10 @@ pub const Reader = struct {
                 else
                     cffGlyphIndexForBaseEncoding(cff, base_encoding, @intCast(code))) orelse continue;
                 const width_index = if (code >= first_char) code - first_char else widths.len;
-                const advance = if (width_index < widths.len) (try self.resolvedNumericObjectValue(&widths[width_index])) orelse 1000 else 1000;
+                const advance = if (width_index < widths.len)
+                    (try self.resolvedNumericObjectValue(&widths[width_index])) orelse missing_width
+                else
+                    missing_width;
                 try glyphs.append(self.alloc, .{ .code = @intCast(code), .glyph_index = glyph_index, .advance = advance });
             }
         }
@@ -6824,11 +6840,13 @@ pub const Reader = struct {
         }.lessThan);
         return .{
             .glyphs = try glyphs.toOwnedSlice(self.alloc),
-            .code_bytes = if (composite) @max(@as(usize, 2), decoder_code_bytes) else 1,
+            // Identity-H character codes are exactly two bytes. ToUnicode
+            // codespaces describe extraction and must never change painting.
+            .code_bytes = if (composite) 2 else 1,
         };
     }
 
-    fn buildCffOpenTypeFont(self: *const Reader, font_obj: *const syntax.Object, decoder_code_bytes: usize, outline_fallback: *bool) !?CffOpenTypeFont {
+    fn buildCffOpenTypeFont(self: *const Reader, font_obj: *const syntax.Object, outline_fallback: *bool) !?CffOpenTypeFont {
         const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
         errdefer self.alloc.free(bytes);
         var sfnt = font_lib.sfnt.Font.init(self.alloc, bytes) catch |err| switch (err) {
@@ -6863,7 +6881,7 @@ pub const Reader = struct {
             self.alloc.free(bytes);
             return null;
         };
-        const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff, decoder_code_bytes)) orelse {
+        const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff)) orelse {
             outline_fallback.* = true;
             cff.deinit(self.alloc);
             sfnt.deinit(self.alloc);
@@ -6882,7 +6900,7 @@ pub const Reader = struct {
         };
     }
 
-    fn buildEmbeddedCffFont(self: *const Reader, font_obj: *const syntax.Object, decoder_code_bytes: usize) !?EmbeddedCffFont {
+    fn buildEmbeddedCffFont(self: *const Reader, font_obj: *const syntax.Object) !?EmbeddedCffFont {
         const subtype = font_obj.get("Subtype") orelse return null;
         const composite = std.mem.eql(u8, subtype.asName() orelse "", "Type0");
         if (composite) {
@@ -6921,7 +6939,7 @@ pub const Reader = struct {
         errdefer self.alloc.free(bytes);
         var cff = try font_lib.cff.Font.init(self.alloc, bytes);
         errdefer cff.deinit(self.alloc);
-        const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff, decoder_code_bytes)) orelse {
+        const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff)) orelse {
             cff.deinit(self.alloc);
             self.alloc.free(bytes);
             return null;
@@ -6949,6 +6967,15 @@ pub const Reader = struct {
         var resolved = try self.resolveValue(obj);
         defer resolved.deinit(self.alloc);
         return numericObjectValue(&resolved);
+    }
+
+    fn simpleFontMissingWidthAlloc(self: *const Reader, font_obj: *const syntax.Object) !f64 {
+        const descriptor_obj = font_obj.get("FontDescriptor") orelse return 0;
+        var descriptor = try self.resolveValue(descriptor_obj);
+        defer descriptor.deinit(self.alloc);
+        if (descriptor != .dict) return 0;
+        const width_obj = descriptor.get("MissingWidth") orelse return 0;
+        return (try self.resolvedNumericObjectValue(width_obj)) orelse 0;
     }
 
     fn cidDefaultWidthAlloc(self: *const Reader, descendant: *const syntax.Object) !f64 {
@@ -20229,10 +20256,10 @@ test "vector text reserves before long glyph materialization and reconciles meas
 
     var cid_budget = VectorTextWorkBudget.init(.{ .width = 10, .height = 10 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
     cid_budget.remaining_points = max_flattened_glyph_points * 2;
-    const cid_font = PageFont{ .name = @constCast("CID"), .decoder = .{ .code_bytes = 2 } };
+    const cid_font = PageFont{ .name = @constCast("CID"), .decoder = .{ .code_bytes = 4 } };
     const cid_reservation = cid_budget.reserveTextMaterialization(.{
         .text = @constCast("A"),
-        .raw_text = @constCast(&[_]u8{ 0, 1 }),
+        .raw_text = @constCast(&[_]u8{1}),
         .font_index = 0,
         .x = 0,
         .y = 0,
@@ -20240,6 +20267,7 @@ test "vector text reserves before long glyph materialization and reconciles meas
     }, cid_font) orelse return error.UnexpectedTextMaterializationRejection;
     try std.testing.expectEqual(@as(u64, max_flattened_glyph_points * 2), cid_reservation.points);
     try std.testing.expectEqual(@as(u64, 0), cid_budget.remaining_points);
+    try std.testing.expectEqual(@as(u64, 2), fixedWidthCodeCount(4, 2));
 }
 
 test "image XObject occurrences retain one decoded sample buffer" {
@@ -20687,8 +20715,8 @@ test "reader vectorizes Type1C standard SID glyphs with StandardEncoding" {
         "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
         "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
         try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
-        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Test /FirstChar 65 /LastChar 65 /Widths [600] /Encoding /StandardEncoding /FontDescriptor 6 0 R >>\nendobj\n",
-        "6 0 obj\n<< /Type /FontDescriptor /FontName /Test /Flags 32 /FontBBox [0 0 1000 1000] /Ascent 800 /Descent -200 /FontFile3 7 0 R >>\nendobj\n",
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Test /FirstChar 66 /LastChar 66 /Widths [600] /Encoding /StandardEncoding /FontDescriptor 6 0 R >>\nendobj\n",
+        "6 0 obj\n<< /Type /FontDescriptor /FontName /Test /Flags 32 /FontBBox [0 0 1000 1000] /Ascent 800 /Descent -200 /MissingWidth 375 /FontFile3 7 0 R >>\nendobj\n",
         "",
     };
     defer alloc.free(objects[3]);
@@ -20720,6 +20748,11 @@ test "reader vectorizes Type1C standard SID glyphs with StandardEncoding" {
 
     var reader = try Reader.init(alloc, sample);
     defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), analysis.runs[0].advance_width, 0.001);
+    try std.testing.expect(!analysis.outline_fallback);
     var runs = try reader.extractPageRenderRunsAlloc(1);
     defer runs.deinit(alloc);
     try std.testing.expect(runs.shape_runs.len > 0);
