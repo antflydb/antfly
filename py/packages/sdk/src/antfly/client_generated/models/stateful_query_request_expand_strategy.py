@@ -1,7 +1,7 @@
 from enum import Enum
 
 
-class QueryRequestExpandStrategy(str, Enum):
+class StatefulQueryRequestExpandStrategy(str, Enum):
     INTERSECTION = "intersection"
     UNION = "union"
 

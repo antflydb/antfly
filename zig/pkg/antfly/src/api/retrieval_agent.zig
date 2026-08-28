@@ -31,7 +31,7 @@ const AgentQuestion = metadata_openapi.AgentQuestion;
 const AgentStatus = metadata_openapi.AgentStatus;
 const AgentStep = metadata_openapi.AgentStep;
 const QueryHit = metadata_openapi.QueryHit;
-const QueryRequest = metadata_openapi.CanonicalQueryRequest;
+const QueryRequest = metadata_openapi.QueryRequest;
 const QueryResponses = metadata_openapi.QueryResponses;
 const GraphPath = indexes_openapi.GraphPath;
 const RetrievalAgentRequest = metadata_openapi.RetrievalAgentRequest;
@@ -5465,9 +5465,8 @@ fn encodeQueryValueForRetrievalQuery(
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var parsed = ant_json.parseFromSlice(QueryRequest, arena, encoded, .{
-        .ignore_unknown_fields = true,
-    }) catch return error.InvalidRetrievalAgentRequest;
+    var parsed = ant_json.parseFromSlice(QueryRequest, arena, encoded, .{}) catch
+        return error.InvalidRetrievalAgentRequest;
     defer parsed.deinit();
 
     var query_request = parsed.value;

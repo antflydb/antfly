@@ -116,10 +116,8 @@ func NewGraphDocumentFilter(filter querydsl.Query) (GraphDocumentFilter, error) 
 	return convertGraphDocumentFilter(filter, 0, &visited)
 }
 
-// DecodeGraphResult returns the concrete response result selected by its
-// stable discriminator. During the v0.2 compatibility window, a response
-// without a discriminator is decoded as the only structural variant that
-// permits one to be absent: LegacyGraphQueryResult.
+// DecodeGraphResult returns the concrete canonical response selected by its
+// required stable discriminator.
 func DecodeGraphResult(result GraphResult) (any, error) {
 	// Probe control fields and identity presence without copying opaque hydrated
 	// documents. A RawMessage map would copy every top-level result value before
@@ -133,33 +131,9 @@ func DecodeGraphResult(result GraphResult) (any, error) {
 		if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
 			return nil, fmt.Errorf("antfly: graph result has an invalid discriminator")
 		}
-		if *kind == string(LegacyGraphQueryResultKindLegacy) {
-			return decodeLegacyGraphQueryResult(result, envelope)
-		}
 		return decodeCanonicalGraphResult(result, *kind, envelope)
 	}
-	return decodeLegacyGraphQueryResult(result, envelope)
-}
-
-// DecodeLegacyGraphResult decodes a deprecated graph_searches result. A
-// missing discriminator remains accepted during the stateful API's v0.2
-// compatibility window, but a canonical discriminator is never accepted at
-// this dialect-specific boundary.
-func DecodeLegacyGraphResult(result GraphResult) (LegacyGraphQueryResult, error) {
-	var envelope graphQueryResultEnvelope
-	if err := result.DecodeInto(&envelope); err != nil {
-		return LegacyGraphQueryResult{}, err
-	}
-	if envelope.Kind != nil {
-		var kind *string
-		if err := json.Unmarshal(envelope.Kind, &kind); err != nil || kind == nil {
-			return LegacyGraphQueryResult{}, fmt.Errorf("antfly: graph result has an invalid discriminator")
-		}
-		if *kind != string(LegacyGraphQueryResultKindLegacy) {
-			return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result requires discriminator %q", LegacyGraphQueryResultKindLegacy)
-		}
-	}
-	return decodeLegacyGraphQueryResult(result, envelope)
+	return nil, fmt.Errorf("antfly: canonical graph result requires a discriminator")
 }
 
 // validateQueryGraphResponses binds each graph result to the request that
@@ -171,7 +145,7 @@ func DecodeLegacyGraphResult(result GraphResult) (LegacyGraphQueryResult, error)
 func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses) error {
 	hasGraphRequest := false
 	for _, request := range requests {
-		if request.GraphQueries != nil || request.GraphSearches != nil {
+		if request.GraphQueries != nil {
 			hasGraphRequest = true
 			break
 		}
@@ -195,15 +169,6 @@ func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses
 			}
 			for name, raw := range response.GraphResults {
 				if err := validateCanonicalGraphResultForQuery(request.GraphQueries[name], raw); err != nil {
-					return fmt.Errorf("antfly: response %d graph result %q: %w", responseIndex, name, err)
-				}
-			}
-		case request.GraphSearches != nil:
-			if err := validateGraphResultNames(request.GraphSearches, response.GraphResults); err != nil {
-				return fmt.Errorf("antfly: response %d: %w", responseIndex, err)
-			}
-			for name, raw := range response.GraphResults {
-				if _, err := DecodeLegacyGraphResult(raw); err != nil {
 					return fmt.Errorf("antfly: response %d graph result %q: %w", responseIndex, name, err)
 				}
 			}
@@ -695,20 +660,9 @@ func validateGraphResultNames[T any](requested map[string]T, received map[string
 	return fmt.Errorf("graph_results operation names do not match the request (missing=%v unexpected=%v)", missing, unexpected)
 }
 
-// DecodeGraphQueryResult decodes a canonical graph_queries result. Legacy
-// compatibility is intentionally absent from this API.
-func DecodeGraphQueryResult(result GraphQueryResult) (any, error) {
-	envelope, kind, err := canonicalGraphResultEnvelope(result)
-	if err != nil {
-		return nil, err
-	}
-	return decodeCanonicalGraphResult(result, kind, envelope)
-}
-
 // DecodeCanonicalGraphResult decodes the GraphResult stored in
-// QueryResult.graph_results as a canonical graph_queries result. Unlike
-// DecodeGraphResult, this API never accepts the deprecated graph_searches
-// response shape.
+// QueryResult.graph_results and enforces its canonical discriminator and
+// structural invariants.
 func DecodeCanonicalGraphResult(result GraphResult) (any, error) {
 	envelope, kind, err := canonicalGraphResultEnvelope(result)
 	if err != nil {
@@ -837,23 +791,7 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 
 type graphQueryResultEnvelope struct {
 	Kind  json.RawMessage               `json:"kind"`
-	Type  json.RawMessage               `json:"type"`
-	Total json.RawMessage               `json:"total"`
 	Stats *graphQueryStatsPresenceProbe `json:"stats"`
-}
-
-// legacyGraphResultTopLevelValidation keeps strictness at the v0.2 envelope
-// boundary without recursively applying canonical closed-world rules to legacy
-// nested objects. RawMessage fields preserve the legacy schemas' extension
-// behavior while DecodeStrictInto rejects unknown top-level protocol members.
-type legacyGraphResultTopLevelValidation struct {
-	Kind    json.RawMessage `json:"kind,omitempty"`
-	Matches json.RawMessage `json:"matches,omitempty"`
-	Nodes   json.RawMessage `json:"nodes,omitempty"`
-	Paths   json.RawMessage `json:"paths,omitempty"`
-	Took    json.RawMessage `json:"took,omitempty"`
-	Total   json.RawMessage `json:"total"`
-	Type    json.RawMessage `json:"type"`
 }
 
 type graphQueryStatsPresenceProbe struct {
@@ -1130,55 +1068,6 @@ func isUnsignedDecimal(value string) bool {
 		}
 	}
 	return true
-}
-
-func decodeLegacyGraphQueryResult(result GraphResult, envelope graphQueryResultEnvelope) (LegacyGraphQueryResult, error) {
-	var strictEnvelope legacyGraphResultTopLevelValidation
-	if err := result.DecodeStrictInto(&strictEnvelope); err != nil {
-		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: invalid legacy graph result: %w", err)
-	}
-	for _, member := range [...]struct {
-		name  string
-		value json.RawMessage
-	}{
-		{name: "kind", value: strictEnvelope.Kind},
-		{name: "matches", value: strictEnvelope.Matches},
-		{name: "nodes", value: strictEnvelope.Nodes},
-		{name: "paths", value: strictEnvelope.Paths},
-		{name: "took", value: strictEnvelope.Took},
-	} {
-		if len(member.value) != 0 && bytes.Equal(bytes.TrimSpace(member.value), []byte("null")) {
-			return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result %s must be omitted or non-null", member.name)
-		}
-	}
-	if envelope.Type == nil || envelope.Total == nil {
-		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result requires type and total")
-	}
-	var legacyType GraphQueryType
-	if err := json.Unmarshal(envelope.Type, &legacyType); err != nil {
-		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: invalid legacy graph result type: %w", err)
-	}
-	switch legacyType {
-	case GraphQueryTypeNeighbors, GraphQueryTypeTraverse, GraphQueryTypeShortestPath,
-		GraphQueryTypeKShortestPaths, GraphQueryTypePattern:
-	default:
-		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: unknown legacy graph result type %q", legacyType)
-	}
-	var total *int
-	if err := json.Unmarshal(envelope.Total, &total); err != nil {
-		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: invalid legacy graph result total: %w", err)
-	}
-	if total == nil {
-		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result total must be an integer")
-	}
-	legacy, err := result.AsLegacyGraphQueryResult()
-	if err != nil {
-		return LegacyGraphQueryResult{}, err
-	}
-	if legacy.Type != legacyType {
-		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: inconsistent legacy graph result type")
-	}
-	return legacy, nil
 }
 
 type graphQueryMemberProbe struct {

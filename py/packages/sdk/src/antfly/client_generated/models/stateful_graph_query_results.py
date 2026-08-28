@@ -10,18 +10,21 @@ if TYPE_CHECKING:
     from ..models.graph_aggregates_result import GraphAggregatesResult
     from ..models.graph_bindings_result import GraphBindingsResult
     from ..models.graph_nodes_result import GraphNodesResult
-    from ..models.legacy_graph_query_result import LegacyGraphQueryResult
+    from ..models.legacy_graph_search_result import LegacyGraphSearchResult
 
 
-T = TypeVar("T", bound="QueryResultGraphResults")
+T = TypeVar("T", bound="StatefulGraphQueryResults")
 
 
 @_attrs_define
-class QueryResultGraphResults:
-    """Results from canonical graph_queries or deprecated graph_searches."""
+class StatefulGraphQueryResults:
+    """Stateful graph results keyed by operation name. Legacy values are possible only when the corresponding request used
+    graph_searches.
+
+    """
 
     additional_properties: dict[
-        str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphQueryResult
+        str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult
     ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -47,53 +50,53 @@ class QueryResultGraphResults:
         from ..models.graph_aggregates_result import GraphAggregatesResult
         from ..models.graph_bindings_result import GraphBindingsResult
         from ..models.graph_nodes_result import GraphNodesResult
-        from ..models.legacy_graph_query_result import LegacyGraphQueryResult
+        from ..models.legacy_graph_search_result import LegacyGraphSearchResult
 
         d = dict(src_dict)
-        query_result_graph_results = cls()
+        stateful_graph_query_results = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
 
             def _parse_additional_property(
                 data: object,
-            ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphQueryResult:
+            ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_graph_query_result_type_0 = GraphBindingsResult.from_dict(data)
+                    componentsschemas_graph_result_type_0 = GraphBindingsResult.from_dict(data)
 
-                    return componentsschemas_graph_query_result_type_0
+                    return componentsschemas_graph_result_type_0
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_graph_query_result_type_1 = GraphAggregatesResult.from_dict(data)
+                    componentsschemas_graph_result_type_1 = GraphAggregatesResult.from_dict(data)
 
-                    return componentsschemas_graph_query_result_type_1
+                    return componentsschemas_graph_result_type_1
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
-                    componentsschemas_graph_query_result_type_2 = GraphNodesResult.from_dict(data)
+                    componentsschemas_graph_result_type_2 = GraphNodesResult.from_dict(data)
 
-                    return componentsschemas_graph_query_result_type_2
+                    return componentsschemas_graph_result_type_2
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_result_type_1 = LegacyGraphQueryResult.from_dict(data)
+                componentsschemas_stateful_graph_result_type_1 = LegacyGraphSearchResult.from_dict(data)
 
-                return componentsschemas_graph_result_type_1
+                return componentsschemas_stateful_graph_result_type_1
 
             additional_property = _parse_additional_property(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        query_result_graph_results.additional_properties = additional_properties
-        return query_result_graph_results
+        stateful_graph_query_results.additional_properties = additional_properties
+        return stateful_graph_query_results
 
     @property
     def additional_keys(self) -> list[str]:
@@ -101,11 +104,11 @@ class QueryResultGraphResults:
 
     def __getitem__(
         self, key: str
-    ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphQueryResult:
+    ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult:
         return self.additional_properties[key]
 
     def __setitem__(
-        self, key: str, value: GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphQueryResult
+        self, key: str, value: GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult
     ) -> None:
         self.additional_properties[key] = value
 

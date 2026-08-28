@@ -3543,6 +3543,17 @@ components:
         - $ref: '#/components/schemas/GraphTraverseQuery'
         - $ref: '#/components/schemas/GraphShortestPathQuery'
         - $ref: '#/components/schemas/GraphKShortestPathsQuery'
+    GraphQueries:
+      type: object
+      maxProperties: 64
+      additionalProperties:
+        $ref: '#/components/schemas/GraphQuery'
+      x-antfly-property-name-schema:
+        $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
+      description: >-
+        Named canonical graph operations. A request may contain at most 64
+        operations, of which at most eight may be MATCH operations. Keys use
+        the versioned GraphIdentifier policy.
     GraphResultNode:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -3778,7 +3789,7 @@ components:
             in lockstep with nodes. Always empty for traversal results; requested
             traversal paths are stored on each result node.
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
-    LegacyGraphQueryResult:
+    LegacyGraphSearchResult:
       x-go-type-skip-optional-pointer: true
       type: object
       additionalProperties: false
@@ -3825,7 +3836,7 @@ components:
           format: int64
           deprecated: true
           description: "Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field."
-    GraphQueryResult:
+    GraphResult:
       description: >-
         A canonical result produced by graph_queries. Bindings, exact
         aggregates, and node/path results use required stable discriminators.
@@ -3833,15 +3844,26 @@ components:
         - $ref: '#/components/schemas/GraphBindingsResult'
         - $ref: '#/components/schemas/GraphAggregatesResult'
         - $ref: '#/components/schemas/GraphNodesResult'
-    GraphResult:
+    StatefulGraphResult:
       description: >-
-        Result value stored in QueryResult.graph_results. Canonical
-        graph_queries results are GraphQueryResult variants; the deprecated
-        legacy shape remains accepted only for graph_searches during its
-        compatibility window.
+        Graph result emitted by the stateful compatibility transport. Canonical
+        graph_queries produce GraphResult; deprecated graph_searches may produce
+        LegacyGraphSearchResult during the compatibility window.
       oneOf:
-        - $ref: '#/components/schemas/GraphQueryResult'
-        - $ref: '#/components/schemas/LegacyGraphQueryResult'
+        - $ref: '#/components/schemas/GraphResult'
+        - $ref: '#/components/schemas/LegacyGraphSearchResult'
+    GraphQueryResults:
+      type: object
+      additionalProperties:
+        $ref: '#/components/schemas/GraphResult'
+      description: Canonical graph results keyed by graph_queries operation name.
+    StatefulGraphQueryResults:
+      type: object
+      additionalProperties:
+        $ref: '#/components/schemas/StatefulGraphResult'
+      description: >-
+        Stateful graph results keyed by operation name. Legacy values are
+        possible only when the corresponding request used graph_searches.
     GraphBindingNode:
       type: object
       additionalProperties: false

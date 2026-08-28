@@ -67,16 +67,6 @@ func TestQueryRequestMarshalEnforcesMatchOperationLimit(t *testing.T) {
 	}
 }
 
-func TestQueryRequestMarshalRejectsMixedGraphContracts(t *testing.T) {
-	_, err := json.Marshal(QueryRequest{
-		GraphQueries:  map[string]GraphQuery{},
-		GraphSearches: map[string]LegacyGraphQuery{},
-	})
-	if err == nil {
-		t.Fatal("expected mixed canonical and legacy graph contracts to fail")
-	}
-}
-
 func TestQueryRequestMarshalValidatesDirectGraphUnionValues(t *testing.T) {
 	start, err := NewGraphKeySelector("doc:a")
 	if err != nil {

@@ -7,17 +7,20 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.analyses_result import AnalysesResult
+    from ..models.aggregation_result import AggregationResult
 
 
-T = TypeVar("T", bound="QueryResultAnalyses")
+T = TypeVar("T", bound="QueryResultBaseAggregations")
 
 
 @_attrs_define
-class QueryResultAnalyses:
-    """Analysis results like PCA and t-SNE per index embeddings."""
+class QueryResultBaseAggregations:
+    """Aggregation results keyed by the user-defined aggregation names from the request.
+    Contains computed metrics or buckets depending on the aggregation type.
 
-    additional_properties: dict[str, AnalysesResult] = _attrs_field(init=False, factory=dict)
+    """
+
+    additional_properties: dict[str, AggregationResult] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -29,28 +32,28 @@ class QueryResultAnalyses:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.analyses_result import AnalysesResult
+        from ..models.aggregation_result import AggregationResult
 
         d = dict(src_dict)
-        query_result_analyses = cls()
+        query_result_base_aggregations = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = AnalysesResult.from_dict(prop_dict)
+            additional_property = AggregationResult.from_dict(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        query_result_analyses.additional_properties = additional_properties
-        return query_result_analyses
+        query_result_base_aggregations.additional_properties = additional_properties
+        return query_result_base_aggregations
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> AnalysesResult:
+    def __getitem__(self, key: str) -> AggregationResult:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: AnalysesResult) -> None:
+    def __setitem__(self, key: str, value: AggregationResult) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

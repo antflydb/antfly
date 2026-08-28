@@ -12,11 +12,6 @@ if TYPE_CHECKING:
     from ..models.analyses import Analyses
     from ..models.bool_field_query import BoolFieldQuery
     from ..models.boolean_query import BooleanQuery
-    from ..models.canonical_query_request_aggregations import CanonicalQueryRequestAggregations
-    from ..models.canonical_query_request_embeddings import CanonicalQueryRequestEmbeddings
-    from ..models.canonical_query_request_foreign_sources import CanonicalQueryRequestForeignSources
-    from ..models.canonical_query_request_graph_queries import CanonicalQueryRequestGraphQueries
-    from ..models.canonical_query_request_query import CanonicalQueryRequestQuery
     from ..models.conjunction_query import ConjunctionQuery
     from ..models.date_range_string_query import DateRangeStringQuery
     from ..models.disjunction_query import DisjunctionQuery
@@ -26,6 +21,7 @@ if TYPE_CHECKING:
     from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
     from ..models.geo_distance_query import GeoDistanceQuery
     from ..models.geo_shape_query import GeoShapeQuery
+    from ..models.graph_queries import GraphQueries
     from ..models.ip_range_query import IPRangeQuery
     from ..models.join_clause import JoinClause
     from ..models.match_all_query import MatchAllQuery
@@ -40,6 +36,10 @@ if TYPE_CHECKING:
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
     from ..models.query_hierarchy import QueryHierarchy
+    from ..models.query_request_aggregations import QueryRequestAggregations
+    from ..models.query_request_embeddings import QueryRequestEmbeddings
+    from ..models.query_request_foreign_sources import QueryRequestForeignSources
+    from ..models.query_request_query import QueryRequestQuery
     from ..models.query_string_query import QueryStringQuery
     from ..models.regexp_query import RegexpQuery
     from ..models.reranker_config import RerankerConfig
@@ -64,7 +64,7 @@ class RetrievalQueryRequest:
 
         Attributes:
             table (str | Unset): Name of the table to query. Optional for global queries. Example: wikipedia.
-            query (CanonicalQueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
+            query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
 
                 Boolean clauses are normalized before planning:
                 - `bool.must` is scoring query input.
@@ -135,8 +135,8 @@ class RetrievalQueryRequest:
                 IPRangeQuery | MatchAllQuery | MatchNoneQuery | MatchPhraseQuery | MatchQuery | MultiMatchQuery |
                 MultiPhraseQuery | NumericRangeQuery | PhraseQuery | PrefixQuery | QueryStringQuery | RegexpQuery | TermQuery |
                 TermRangeQuery | Unset | WildcardQuery):
-            aggregations (CanonicalQueryRequestAggregations | Unset): Aggregation requests for computing metrics and
-                bucketing results.
+            aggregations (QueryRequestAggregations | Unset): Aggregation requests for computing metrics and bucketing
+                results.
                 Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
 
                 When `hierarchy.group_by` is present, aggregations operate on the complete
@@ -161,8 +161,8 @@ class RetrievalQueryRequest:
                   }
                 }
                 ```
-            embeddings (CanonicalQueryRequestEmbeddings | Unset): Pre-computed embeddings to use for semantic searches
-                instead of embedding the semantic_search string.
+            embeddings (QueryRequestEmbeddings | Unset): Pre-computed embeddings to use for semantic searches instead of
+                embedding the semantic_search string.
                 The keys are the index names. Values can be either:
                 - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]`
                 - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact)
@@ -283,16 +283,8 @@ class RetrievalQueryRequest:
             reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
                 'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
             analyses (Analyses | Unset):
-            graph_queries (CanonicalQueryRequestGraphQueries | Unset): Declarative graph matching, traversal, and path
-                queries. A nested node
-                `filter` is a typed, non-scoring stored-document predicate. It shares
-                familiar scalar syntax with document queries but deliberately excludes
-                analyzer-backed and index-only clauses. A request may contain at most
-                64 named graph operations, of which at most 8 may be named `match`
-                operations. Each operation key is a GraphIdentifier under the
-                versioned policy published in the GraphIdentifier schema.
-                Put multiple counts over one pattern in the same `match` return
-                object so they share one complete anchor scan.
+            graph_queries (GraphQueries | Unset): Named canonical graph operations. A request may contain at most 64
+                operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy.
             document_renderer (str | Unset): Optional Handlebars template string for rendering document content in RAG
                 queries.
                 Template has access to document fields via `{{this.fields.fieldName}}`.
@@ -334,8 +326,8 @@ class RetrievalQueryRequest:
                 score gaps or deviations from top results.
             join (JoinClause | Unset): Configuration for joining data from another table.
                 Supports inner, left, and right joins with automatic strategy selection.
-            foreign_sources (CanonicalQueryRequestForeignSources | Unset): Map of table name to foreign data source
-                configuration for query-time federated access.
+            foreign_sources (QueryRequestForeignSources | Unset): Map of table name to foreign data source configuration for
+                query-time federated access.
                 When a table name referenced in this query (or in a join's `right_table`) appears as a key
                 here, the query is routed to the external database instead of Antfly shards.
 
@@ -369,7 +361,7 @@ class RetrievalQueryRequest:
     """
 
     table: str | Unset = UNSET
-    query: CanonicalQueryRequestQuery | Unset = UNSET
+    query: QueryRequestQuery | Unset = UNSET
     full_text_search: (
         BooleanQuery
         | BoolFieldQuery
@@ -461,8 +453,8 @@ class RetrievalQueryRequest:
         | Unset
         | WildcardQuery
     ) = UNSET
-    aggregations: CanonicalQueryRequestAggregations | Unset = UNSET
-    embeddings: CanonicalQueryRequestEmbeddings | Unset = UNSET
+    aggregations: QueryRequestAggregations | Unset = UNSET
+    embeddings: QueryRequestEmbeddings | Unset = UNSET
     search_effort: float | Unset = 0.5
     fields: list[str] | Unset = UNSET
     hierarchy: QueryHierarchy | Unset = UNSET
@@ -479,11 +471,11 @@ class RetrievalQueryRequest:
     profile: bool | Unset = UNSET
     reranker: RerankerConfig | Unset = UNSET
     analyses: Analyses | Unset = UNSET
-    graph_queries: CanonicalQueryRequestGraphQueries | Unset = UNSET
+    graph_queries: GraphQueries | Unset = UNSET
     document_renderer: str | Unset = UNSET
     pruner: Pruner | Unset = UNSET
     join: JoinClause | Unset = UNSET
-    foreign_sources: CanonicalQueryRequestForeignSources | Unset = UNSET
+    foreign_sources: QueryRequestForeignSources | Unset = UNSET
     tree_search: TreeSearchConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -856,11 +848,6 @@ class RetrievalQueryRequest:
         from ..models.analyses import Analyses
         from ..models.bool_field_query import BoolFieldQuery
         from ..models.boolean_query import BooleanQuery
-        from ..models.canonical_query_request_aggregations import CanonicalQueryRequestAggregations
-        from ..models.canonical_query_request_embeddings import CanonicalQueryRequestEmbeddings
-        from ..models.canonical_query_request_foreign_sources import CanonicalQueryRequestForeignSources
-        from ..models.canonical_query_request_graph_queries import CanonicalQueryRequestGraphQueries
-        from ..models.canonical_query_request_query import CanonicalQueryRequestQuery
         from ..models.conjunction_query import ConjunctionQuery
         from ..models.date_range_string_query import DateRangeStringQuery
         from ..models.disjunction_query import DisjunctionQuery
@@ -870,6 +857,7 @@ class RetrievalQueryRequest:
         from ..models.geo_bounding_polygon_query import GeoBoundingPolygonQuery
         from ..models.geo_distance_query import GeoDistanceQuery
         from ..models.geo_shape_query import GeoShapeQuery
+        from ..models.graph_queries import GraphQueries
         from ..models.ip_range_query import IPRangeQuery
         from ..models.join_clause import JoinClause
         from ..models.match_all_query import MatchAllQuery
@@ -884,6 +872,10 @@ class RetrievalQueryRequest:
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
         from ..models.query_hierarchy import QueryHierarchy
+        from ..models.query_request_aggregations import QueryRequestAggregations
+        from ..models.query_request_embeddings import QueryRequestEmbeddings
+        from ..models.query_request_foreign_sources import QueryRequestForeignSources
+        from ..models.query_request_query import QueryRequestQuery
         from ..models.query_string_query import QueryStringQuery
         from ..models.regexp_query import RegexpQuery
         from ..models.reranker_config import RerankerConfig
@@ -897,11 +889,11 @@ class RetrievalQueryRequest:
         table = d.pop("table", UNSET)
 
         _query = d.pop("query", UNSET)
-        query: CanonicalQueryRequestQuery | Unset
+        query: QueryRequestQuery | Unset
         if isinstance(_query, Unset):
             query = UNSET
         else:
-            query = CanonicalQueryRequestQuery.from_dict(_query)
+            query = QueryRequestQuery.from_dict(_query)
 
         def _parse_full_text_search(
             data: object,
@@ -1635,18 +1627,18 @@ class RetrievalQueryRequest:
         exclusion_query = _parse_exclusion_query(d.pop("exclusion_query", UNSET))
 
         _aggregations = d.pop("aggregations", UNSET)
-        aggregations: CanonicalQueryRequestAggregations | Unset
+        aggregations: QueryRequestAggregations | Unset
         if isinstance(_aggregations, Unset):
             aggregations = UNSET
         else:
-            aggregations = CanonicalQueryRequestAggregations.from_dict(_aggregations)
+            aggregations = QueryRequestAggregations.from_dict(_aggregations)
 
         _embeddings = d.pop("embeddings", UNSET)
-        embeddings: CanonicalQueryRequestEmbeddings | Unset
+        embeddings: QueryRequestEmbeddings | Unset
         if isinstance(_embeddings, Unset):
             embeddings = UNSET
         else:
-            embeddings = CanonicalQueryRequestEmbeddings.from_dict(_embeddings)
+            embeddings = QueryRequestEmbeddings.from_dict(_embeddings)
 
         search_effort = d.pop("search_effort", UNSET)
 
@@ -1708,11 +1700,11 @@ class RetrievalQueryRequest:
             analyses = Analyses.from_dict(_analyses)
 
         _graph_queries = d.pop("graph_queries", UNSET)
-        graph_queries: CanonicalQueryRequestGraphQueries | Unset
+        graph_queries: GraphQueries | Unset
         if isinstance(_graph_queries, Unset):
             graph_queries = UNSET
         else:
-            graph_queries = CanonicalQueryRequestGraphQueries.from_dict(_graph_queries)
+            graph_queries = GraphQueries.from_dict(_graph_queries)
 
         document_renderer = d.pop("document_renderer", UNSET)
 
@@ -1731,11 +1723,11 @@ class RetrievalQueryRequest:
             join = JoinClause.from_dict(_join)
 
         _foreign_sources = d.pop("foreign_sources", UNSET)
-        foreign_sources: CanonicalQueryRequestForeignSources | Unset
+        foreign_sources: QueryRequestForeignSources | Unset
         if isinstance(_foreign_sources, Unset):
             foreign_sources = UNSET
         else:
-            foreign_sources = CanonicalQueryRequestForeignSources.from_dict(_foreign_sources)
+            foreign_sources = QueryRequestForeignSources.from_dict(_foreign_sources)
 
         _tree_search = d.pop("tree_search", UNSET)
         tree_search: TreeSearchConfig | Unset

@@ -541,16 +541,16 @@ export class AntflyClient {
         ...(options?.signal ? { signal: options.signal } : {}),
       });
       if (error) throw queryError("Table query failed", error, response);
-      validateGraphQueryResponses(data, [request]);
-      return data;
+      validateGraphQueryResponses(data as QueryResponses, [request]);
+      return data as QueryResponses;
     } else {
       const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: request,
         ...(options?.signal ? { signal: options.signal } : {}),
       });
       if (error) throw queryError("Query failed", error, response);
-      validateGraphQueryResponses(data, [request]);
-      return data;
+      validateGraphQueryResponses(data as QueryResponses, [request]);
+      return data as QueryResponses;
     }
   }
 
@@ -574,8 +574,8 @@ export class AntflyClient {
         },
       });
       if (error) throw queryError("Table multi-query failed", error, response);
-      validateGraphQueryResponses(data, requests);
-      return data;
+      validateGraphQueryResponses(data as QueryResponses, requests);
+      return data as QueryResponses;
     } else {
       const { data, error, response } = await this.client.POST("/db/v1/query", {
         body: ndjson,
@@ -584,8 +584,8 @@ export class AntflyClient {
         },
       });
       if (error) throw queryError("Multi-query failed", error, response);
-      validateGraphQueryResponses(data, requests);
-      return data;
+      validateGraphQueryResponses(data as QueryResponses, requests);
+      return data as QueryResponses;
     }
   }
 

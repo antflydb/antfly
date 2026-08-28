@@ -94,9 +94,9 @@ const query_request_description_json =
     \\    "path_table_argument": "tableName",
     \\    "raw_body_argument": "queryRequest",
     \\    "rules": [
-    \\      "queryRequest is forwarded unchanged as the POST /tables/{tableName}/query body.",
+    \\      "queryRequest is forwarded as the POST /tables/{tableName}/query body; a null table member is normalized to omission because tableName owns the path-scoped table.",
     \\      "queryRequest is mutually exclusive with shorthand query arguments such as fullTextSearch, semanticSearch, fields, limit, orderBy, indexes, and filterPrefix.",
-    \\      "queryRequest.table is rejected because tableName selects the table-scoped route.",
+    \\      "A non-null queryRequest.table is rejected because tableName selects the table-scoped route; null is treated as absent.",
     \\      "Use describe_query_request for this compact schema instead of relying on tools/list to inline the full recursive OpenAPI schema.",
     \\      "For hierarchical documents, the presence of hierarchy selects direct matches unless group_by is present; ancestors only controls projected context.",
     \\      "Use hierarchy.group_by.level=source or unit with bounded group_by.matches for grouped relevance results; nested matches default to three, cannot exceed 100, and top-level limit does not bound them.",
@@ -108,7 +108,7 @@ const query_request_description_json =
     \\      "Structured filter_query.geo_bbox accepts field, min_lat, min_lon, max_lat, and max_lon; min_lon greater than max_lon represents an antimeridian-wrapped box."
     \\    ]
     \\  },
-    \\  "top_level_fields": ["query", "full_text_search", "semantic_search", "embedding_template", "indexes", "filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings", "search_effort", "fields", "hierarchy", "limit", "offset", "timeout_ms", "order_by", "search_after", "search_before", "distance_under", "distance_over", "merge_config", "count", "profile", "reranker", "analyses", "graph_queries", "expand_strategy", "document_renderer", "pruner", "join", "foreign_sources"],
+    \\  "top_level_fields": ["query", "full_text_search", "semantic_search", "embedding_template", "indexes", "filter_prefix", "filter_query", "exclusion_query", "aggregations", "embeddings", "search_effort", "fields", "hierarchy", "limit", "offset", "timeout_ms", "order_by", "search_after", "search_before", "distance_under", "distance_over", "merge_config", "count", "profile", "reranker", "analyses", "graph_queries", "document_renderer", "pruner", "join", "foreign_sources"],
     \\  "examples": {
     \\    "fielded_full_text": {"full_text_search":{"match":"hello","field":"body"},"fields":["title","body"],"limit":5,"timeout_ms":5000},
     \\    "match_retrieval": {"semantic_search":"How does Antfly index documents?","indexes":["document_vectors"],"hierarchy":{"ancestors":{"source":{"fields":["title","url"]}}},"fields":["text"],"limit":5},
@@ -481,13 +481,19 @@ fn executeMcpRequestFiltered(server_ptr: anytype, request: McpRequest, authentic
             if (jsonValueArg(args, "queryRequest")) |query_request| {
                 if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
                 if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
+                var normalized_request = query_request;
                 if (query_request.object.get("table")) |table| {
                     if (table != .null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
+                    // Some generated MCP clients materialize absent optional
+                    // members as null. The table-scoped HTTP contract is
+                    // canonical and non-nullable, so normalize this one path
+                    // selector to omission at the MCP adapter boundary.
+                    _ = normalized_request.object.swapRemove("table");
                 }
 
                 return try ctx.executeOperation(alloc, .{ .query = .{
                     .table_name = table_name,
-                    .body = try stringifyJsonValue(alloc, query_request),
+                    .body = try stringifyJsonValue(alloc, normalized_request),
                 } });
             }
 

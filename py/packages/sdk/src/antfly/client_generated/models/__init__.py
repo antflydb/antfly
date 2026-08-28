@@ -69,12 +69,6 @@ from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
-from .canonical_query_request import CanonicalQueryRequest
-from .canonical_query_request_aggregations import CanonicalQueryRequestAggregations
-from .canonical_query_request_embeddings import CanonicalQueryRequestEmbeddings
-from .canonical_query_request_foreign_sources import CanonicalQueryRequestForeignSources
-from .canonical_query_request_graph_queries import CanonicalQueryRequestGraphQueries
-from .canonical_query_request_query import CanonicalQueryRequestQuery
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
 from .cdc_connection import CdcConnection
@@ -405,8 +399,10 @@ from .graph_path_weight_domain_error import GraphPathWeightDomainError
 from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
 from .graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
 from .graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
+from .graph_queries import GraphQueries
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
+from .graph_query_results import GraphQueryResults
 from .graph_query_stats import GraphQueryStats
 from .graph_query_type import GraphQueryType
 from .graph_query_unsupported_error import GraphQueryUnsupportedError
@@ -648,11 +644,11 @@ from .key_range import KeyRange
 from .legacy_graph_document_query import LegacyGraphDocumentQuery
 from .legacy_graph_node_selector import LegacyGraphNodeSelector
 from .legacy_graph_query import LegacyGraphQuery
-from .legacy_graph_query_result import LegacyGraphQueryResult
-from .legacy_graph_query_result_kind import LegacyGraphQueryResultKind
 from .legacy_graph_result_node import LegacyGraphResultNode
 from .legacy_graph_result_node_document import LegacyGraphResultNodeDocument
 from .legacy_graph_result_node_evidence import LegacyGraphResultNodeEvidence
+from .legacy_graph_search_result import LegacyGraphSearchResult
+from .legacy_graph_search_result_kind import LegacyGraphSearchResultKind
 from .linear_merge_page_status import LinearMergePageStatus
 from .linear_merge_request import LinearMergeRequest
 from .linear_merge_request_records import LinearMergeRequestRecords
@@ -751,13 +747,15 @@ from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
 from .query_request import QueryRequest
-from .query_request_expand_strategy import QueryRequestExpandStrategy
-from .query_request_graph_searches import QueryRequestGraphSearches
+from .query_request_aggregations import QueryRequestAggregations
+from .query_request_embeddings import QueryRequestEmbeddings
+from .query_request_foreign_sources import QueryRequestForeignSources
+from .query_request_query import QueryRequestQuery
 from .query_responses import QueryResponses
 from .query_result import QueryResult
-from .query_result_aggregations import QueryResultAggregations
-from .query_result_analyses import QueryResultAnalyses
-from .query_result_graph_results import QueryResultGraphResults
+from .query_result_base import QueryResultBase
+from .query_result_base_aggregations import QueryResultBaseAggregations
+from .query_result_base_analyses import QueryResultBaseAnalyses
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
@@ -831,6 +829,12 @@ from .sse_step_progress import SSEStepProgress
 from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
+from .stateful_graph_query_results import StatefulGraphQueryResults
+from .stateful_query_request import StatefulQueryRequest
+from .stateful_query_request_expand_strategy import StatefulQueryRequestExpandStrategy
+from .stateful_query_request_graph_searches import StatefulQueryRequestGraphSearches
+from .stateful_query_responses import StatefulQueryResponses
+from .stateful_query_result import StatefulQueryResult
 from .storage_maintenance_capabilities import StorageMaintenanceCapabilities
 from .storage_resource_exhausted_error import StorageResourceExhaustedError
 from .storage_resource_exhausted_error_code import StorageResourceExhaustedErrorCode
@@ -1007,12 +1011,6 @@ __all__ = (
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "CalendarInterval",
-    "CanonicalQueryRequest",
-    "CanonicalQueryRequestAggregations",
-    "CanonicalQueryRequestEmbeddings",
-    "CanonicalQueryRequestForeignSources",
-    "CanonicalQueryRequestGraphQueries",
-    "CanonicalQueryRequestQuery",
     "Capability",
     "CardinalityMode",
     "CdcConnection",
@@ -1341,8 +1339,10 @@ __all__ = (
     "GraphPathWeightDomainErrorError",
     "GraphPathWeightDomainErrorMode",
     "GraphPathWeightDomainErrorStatus",
+    "GraphQueries",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
+    "GraphQueryResults",
     "GraphQueryStats",
     "GraphQueryType",
     "GraphQueryUnsupportedError",
@@ -1582,11 +1582,11 @@ __all__ = (
     "LegacyGraphDocumentQuery",
     "LegacyGraphNodeSelector",
     "LegacyGraphQuery",
-    "LegacyGraphQueryResult",
-    "LegacyGraphQueryResultKind",
     "LegacyGraphResultNode",
     "LegacyGraphResultNodeDocument",
     "LegacyGraphResultNodeEvidence",
+    "LegacyGraphSearchResult",
+    "LegacyGraphSearchResultKind",
     "LinearMergePageStatus",
     "LinearMergeRequest",
     "LinearMergeRequestRecords",
@@ -1683,13 +1683,15 @@ __all__ = (
     "QueryHitsTotalRelation",
     "QueryProfile",
     "QueryRequest",
-    "QueryRequestExpandStrategy",
-    "QueryRequestGraphSearches",
+    "QueryRequestAggregations",
+    "QueryRequestEmbeddings",
+    "QueryRequestForeignSources",
+    "QueryRequestQuery",
     "QueryResponses",
     "QueryResult",
-    "QueryResultAggregations",
-    "QueryResultAnalyses",
-    "QueryResultGraphResults",
+    "QueryResultBase",
+    "QueryResultBaseAggregations",
+    "QueryResultBaseAnalyses",
     "QueryStrategy",
     "QueryStringQuery",
     "QueryTemporarilyUnavailableError",
@@ -1763,6 +1765,12 @@ __all__ = (
     "SSEStepStarted",
     "SSEToolMode",
     "SSEToolModeMode",
+    "StatefulGraphQueryResults",
+    "StatefulQueryRequest",
+    "StatefulQueryRequestExpandStrategy",
+    "StatefulQueryRequestGraphSearches",
+    "StatefulQueryResponses",
+    "StatefulQueryResult",
     "StorageMaintenanceCapabilities",
     "StorageResourceExhaustedError",
     "StorageResourceExhaustedErrorCode",

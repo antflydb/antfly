@@ -142,7 +142,7 @@ const ArdOpenApiSpec = struct {
 };
 
 const ParsedGlobalQueryTable = struct {
-    parsed: std.json.Parsed(metadata_openapi.QueryRequest),
+    parsed: std.json.Parsed(metadata_openapi.StatefulQueryRequest),
     table_name: []const u8,
 
     fn deinit(self: *@This()) void {
@@ -159,12 +159,12 @@ fn parseGlobalQueryTable(alloc: std.mem.Allocator, body: []const u8) !ParsedGlob
     };
 }
 
-fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+fn parsePublicGlobalQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     return metadata_openapi.server.parseGlobalQueryBody(alloc, body);
 }
 
-fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.QueryRequest) {
+fn parsePublicTableQueryBody(alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(metadata_openapi.StatefulQueryRequest) {
     try query_contract.validatePublicQuerySortTupleContract(alloc, body);
     return metadata_openapi.server.parseQueryTableBody(alloc, body);
 }
@@ -6357,7 +6357,10 @@ pub const ApiHttpServer = struct {
             table_name,
             storage_statuses,
         )) orelse return null;
-        return try std.json.Stringify.valueAlloc(alloc, response, .{});
+        // The debug envelope extends TableStatus but is not itself generated.
+        // Preserve the OpenAPI absent-vs-null contract used by TableStatus:
+        // optional non-nullable fields are omitted when unset.
+        return try std.json.Stringify.valueAlloc(alloc, response, .{ .emit_null_optional_fields = false });
     }
 
     pub fn encodeIndexRuntimeSchemaDebugAlloc(
@@ -19110,7 +19113,11 @@ test "api http server serves status" {
     var parsed = try std.json.parseFromSlice(cluster.ClusterStatus, std.testing.allocator, resp.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed.value.health);
-    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"data\"") == null);
+    var parsed_public = try ant_json.parseFromSlice(metadata_openapi.ClusterStatus, std.testing.allocator, resp.body, .{});
+    defer parsed_public.deinit();
+    var parsed_status_json = try ant_json.parseFromSlice(std.json.Value, std.testing.allocator, resp.body, .{});
+    defer parsed_status_json.deinit();
+    try std.testing.expect(parsed_status_json.value.object.get("data") == null);
 
     var cluster_resp = try executeHttpxTestRequest(&server, .{ .method = .GET, .uri = routes.Routes.cluster });
     defer cluster_resp.deinit(std.testing.allocator);
@@ -19119,6 +19126,8 @@ test "api http server serves status" {
     defer parsed_cluster.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.healthy, parsed_cluster.value.health);
     try std.testing.expectEqual(@as(usize, 0), parsed_cluster.value.data.nodes.len);
+    var parsed_public_cluster = try ant_json.parseFromSlice(metadata_openapi.ClusterTopology, std.testing.allocator, cluster_resp.body, .{});
+    defer parsed_public_cluster.deinit();
 
     const request_stats = server.requestStats();
     try std.testing.expectEqual(@as(u64, 2), request_stats.request_count);
@@ -25620,7 +25629,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     const query_properties = query_tool.inputSchema.object.get("properties") orelse return error.TestExpectedEqual;
     const query_request_schema = query_properties.object.get("queryRequest") orelse return error.TestExpectedEqual;
     const query_request_description = query_request_schema.object.get("description") orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw Antfly QueryRequest body"));
+    try std.testing.expect(std.mem.startsWith(u8, query_request_description.string, "Raw canonical Antfly query body"));
     const query_request_contract_schema = query_request_schema.object.get("anyOf").?.array.items[0];
     try std.testing.expect(query_properties.object.get("fullTextSearchField") != null);
     try std.testing.expect(query_properties.object.get("full_text_search") != null);

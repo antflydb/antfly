@@ -11,11 +11,11 @@ if TYPE_CHECKING:
     from ..models.embedding_type_3 import EmbeddingType3
 
 
-T = TypeVar("T", bound="CanonicalQueryRequestEmbeddings")
+T = TypeVar("T", bound="QueryRequestEmbeddings")
 
 
 @_attrs_define
-class CanonicalQueryRequestEmbeddings:
+class QueryRequestEmbeddings:
     """Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string.
     The keys are the index names. Values can be either:
     - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]`
@@ -56,7 +56,7 @@ class CanonicalQueryRequestEmbeddings:
         from ..models.embedding_type_3 import EmbeddingType3
 
         d = dict(src_dict)
-        canonical_query_request_embeddings = cls()
+        query_request_embeddings = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -92,8 +92,8 @@ class CanonicalQueryRequestEmbeddings:
 
             additional_properties[prop_name] = additional_property
 
-        canonical_query_request_embeddings.additional_properties = additional_properties
-        return canonical_query_request_embeddings
+        query_request_embeddings.additional_properties = additional_properties
+        return query_request_embeddings
 
     @property
     def additional_keys(self) -> list[str]:

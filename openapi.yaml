@@ -3420,7 +3420,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/QueryRequest'
+              $ref: '#/components/schemas/StatefulQueryRequest'
           application/x-ndjson:
             schema:
               type: string
@@ -3445,7 +3445,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/QueryResponses'
+                $ref: '#/components/schemas/StatefulQueryResponses'
         '400':
           description: Invalid query request
           content:
@@ -3921,7 +3921,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/QueryRequest'
+              $ref: '#/components/schemas/StatefulQueryRequest'
           application/x-ndjson:
             schema:
               type: string
@@ -3946,7 +3946,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/QueryResponses'
+                $ref: '#/components/schemas/StatefulQueryResponses'
         '400':
           $ref: '#/components/responses/BadRequest'
         '409':
@@ -13155,7 +13155,7 @@ components:
 
         are provided, the search results are used as start nodes for tree navigation.
       allOf:
-        - $ref: '#/components/schemas/CanonicalQueryRequest'
+        - $ref: '#/components/schemas/QueryRequest'
         - type: object
           properties:
             tree_search:
@@ -14145,7 +14145,7 @@ components:
         children:
           $ref: '#/components/schemas/HierarchyChildren'
           x-go-type-skip-optional-pointer: false
-    CanonicalQueryRequest:
+    QueryRequest:
       type: object
       not:
         anyOf:
@@ -14830,12 +14830,7 @@ components:
         analyses:
           $ref: '#/components/schemas/Analyses'
         graph_queries:
-          type: object
-          maxProperties: 64
-          additionalProperties:
-            $ref: '#/components/schemas/GraphQuery'
-          x-antfly-property-name-schema:
-            $ref: '#/components/schemas/GraphIdentifier'
+          $ref: '#/components/schemas/GraphQueries'
           description: >
             Declarative graph matching, traversal, and path queries. A nested node
 
@@ -15071,11 +15066,11 @@ components:
             }
 
             ```
-    QueryRequest:
+    StatefulQueryRequest:
       description: Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches
         is retained only at the stateful public transport boundary for the v0.2 transition window.
       allOf:
-        - $ref: '#/components/schemas/CanonicalQueryRequest'
+        - $ref: '#/components/schemas/QueryRequest'
         - type: object
           not:
             anyOf:
@@ -16018,15 +16013,25 @@ components:
           description: Whether value is exact or a lower bound.
     QueryResponses:
       type: object
-      description: Responses from multiple query operations.
+      description: Canonical responses from multiple query operations.
       properties:
         responses:
           type: array
           items:
             $ref: '#/components/schemas/QueryResult'
-    QueryResult:
+    StatefulQueryResponses:
       type: object
-      description: Result of a query operation as an array of results and a count.
+      description: Responses from the stateful compatibility transport. Canonical requests still produce
+        canonical graph result variants; deprecated graph_searches may produce LegacyGraphSearchResult
+        values during the transition window.
+      properties:
+        responses:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatefulQueryResult'
+    QueryResultBase:
+      type: object
+      description: Fields shared by canonical and stateful query result envelopes.
       required:
         - took
         - status
@@ -16046,11 +16051,6 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/AnalysesResult'
           description: Analysis results like PCA and t-SNE per index embeddings.
-        graph_results:
-          type: object
-          additionalProperties:
-            $ref: '#/components/schemas/GraphResult'
-          description: Results from canonical graph_queries or deprecated graph_searches.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -16072,6 +16072,22 @@ components:
         table:
           type: string
           description: Which table this result came from
+    QueryResult:
+      description: Result of a canonical query operation.
+      allOf:
+        - $ref: '#/components/schemas/QueryResultBase'
+        - type: object
+          properties:
+            graph_results:
+              $ref: '#/components/schemas/GraphQueryResults'
+    StatefulQueryResult:
+      description: Result emitted by the stateful compatibility transport.
+      allOf:
+        - $ref: '#/components/schemas/QueryResultBase'
+        - type: object
+          properties:
+            graph_results:
+              $ref: '#/components/schemas/StatefulGraphQueryResults'
     LinearMergePageStatus:
       type: string
       enum:
@@ -23581,6 +23597,15 @@ components:
         - $ref: '#/components/schemas/GraphTraverseQuery'
         - $ref: '#/components/schemas/GraphShortestPathQuery'
         - $ref: '#/components/schemas/GraphKShortestPathsQuery'
+    GraphQueries:
+      type: object
+      maxProperties: 64
+      additionalProperties:
+        $ref: '#/components/schemas/GraphQuery'
+      x-antfly-property-name-schema:
+        $ref: '#/components/schemas/GraphIdentifier'
+      description: Named canonical graph operations. A request may contain at most 64 operations, of which
+        at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy.
     Pruner:
       type: object
       description: >
@@ -24171,13 +24196,18 @@ components:
             result node.
         stats:
           $ref: '#/components/schemas/GraphQueryStats'
-    GraphQueryResult:
+    GraphResult:
       description: A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path
         results use required stable discriminators.
       oneOf:
         - $ref: '#/components/schemas/GraphBindingsResult'
         - $ref: '#/components/schemas/GraphAggregatesResult'
         - $ref: '#/components/schemas/GraphNodesResult'
+    GraphQueryResults:
+      type: object
+      additionalProperties:
+        $ref: '#/components/schemas/GraphResult'
+      description: Canonical graph results keyed by graph_queries operation name.
     LegacyGraphResultNode:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -24254,7 +24284,7 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PathEdge'
-    LegacyGraphQueryResult:
+    LegacyGraphSearchResult:
       x-go-type-skip-optional-pointer: true
       type: object
       additionalProperties: false
@@ -24305,13 +24335,19 @@ components:
           deprecated: true
           description: Whole-query execution time in milliseconds; optional for compatibility with v0.2
             responses. Use the parent query result's took field.
-    GraphResult:
-      description: Result value stored in QueryResult.graph_results. Canonical graph_queries results are
-        GraphQueryResult variants; the deprecated legacy shape remains accepted only for graph_searches
-        during its compatibility window.
+    StatefulGraphResult:
+      description: Graph result emitted by the stateful compatibility transport. Canonical graph_queries
+        produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the
+        compatibility window.
       oneOf:
-        - $ref: '#/components/schemas/GraphQueryResult'
-        - $ref: '#/components/schemas/LegacyGraphQueryResult'
+        - $ref: '#/components/schemas/GraphResult'
+        - $ref: '#/components/schemas/LegacyGraphSearchResult'
+    StatefulGraphQueryResults:
+      type: object
+      additionalProperties:
+        $ref: '#/components/schemas/StatefulGraphResult'
+      description: Stateful graph results keyed by operation name. Legacy values are possible only when
+        the corresponding request used graph_searches.
     EvalRequest:
       type: object
       x-go-type-skip-optional-pointer: true

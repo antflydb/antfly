@@ -9,19 +9,19 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.graph_query_results import GraphQueryResults
     from ..models.query_hits import QueryHits
     from ..models.query_profile import QueryProfile
     from ..models.query_result_base_aggregations import QueryResultBaseAggregations
     from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+    from ..models.stateful_graph_query_results import StatefulGraphQueryResults
 
 
-T = TypeVar("T", bound="QueryResult")
+T = TypeVar("T", bound="StatefulQueryResult")
 
 
 @_attrs_define
-class QueryResult:
-    """Result of a canonical query operation.
+class StatefulQueryResult:
+    """Result emitted by the stateful compatibility transport.
 
     Attributes:
         took (int): Duration of the query in milliseconds.
@@ -35,7 +35,8 @@ class QueryResult:
             when the request sets `profile: true`.
         error (str | Unset): Error message if the query failed.
         table (str | Unset): Which table this result came from
-        graph_results (GraphQueryResults | Unset): Canonical graph results keyed by graph_queries operation name.
+        graph_results (StatefulGraphQueryResults | Unset): Stateful graph results keyed by operation name. Legacy values
+            are possible only when the corresponding request used graph_searches.
     """
 
     took: int
@@ -46,7 +47,7 @@ class QueryResult:
     profile: QueryProfile | Unset = UNSET
     error: str | Unset = UNSET
     table: str | Unset = UNSET
-    graph_results: GraphQueryResults | Unset = UNSET
+    graph_results: StatefulGraphQueryResults | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -105,11 +106,11 @@ class QueryResult:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.graph_query_results import GraphQueryResults
         from ..models.query_hits import QueryHits
         from ..models.query_profile import QueryProfile
         from ..models.query_result_base_aggregations import QueryResultBaseAggregations
         from ..models.query_result_base_analyses import QueryResultBaseAnalyses
+        from ..models.stateful_graph_query_results import StatefulGraphQueryResults
 
         d = dict(src_dict)
         took = d.pop("took")
@@ -149,13 +150,13 @@ class QueryResult:
         table = d.pop("table", UNSET)
 
         _graph_results = d.pop("graph_results", UNSET)
-        graph_results: GraphQueryResults | Unset
+        graph_results: StatefulGraphQueryResults | Unset
         if isinstance(_graph_results, Unset):
             graph_results = UNSET
         else:
-            graph_results = GraphQueryResults.from_dict(_graph_results)
+            graph_results = StatefulGraphQueryResults.from_dict(_graph_results)
 
-        query_result = cls(
+        stateful_query_result = cls(
             took=took,
             status=status,
             hits=hits,
@@ -167,8 +168,8 @@ class QueryResult:
             graph_results=graph_results,
         )
 
-        query_result.additional_properties = d
-        return query_result
+        stateful_query_result.additional_properties = d
+        return stateful_query_result
 
     @property
     def additional_keys(self) -> list[str]:

@@ -16,9 +16,9 @@ from ...models.graph_query_unsupported_error import GraphQueryUnsupportedError
 from ...models.graph_work_budget_exceeded_error import GraphWorkBudgetExceededError
 from ...models.hierarchy_cursor_stale_error import HierarchyCursorStaleError
 from ...models.query_candidate_budget_exceeded_error import QueryCandidateBudgetExceededError
-from ...models.query_request import QueryRequest
-from ...models.query_responses import QueryResponses
 from ...models.query_temporarily_unavailable_error import QueryTemporarilyUnavailableError
+from ...models.stateful_query_request import StatefulQueryRequest
+from ...models.stateful_query_responses import StatefulQueryResponses
 from ...models.table_storage_unreadable_error import TableStorageUnreadableError
 from ...models.topology_changed_error import TopologyChangedError
 from ...types import File, Response
@@ -27,7 +27,7 @@ from ...types import File, Response
 def _get_kwargs(
     table_name: str,
     *,
-    body: QueryRequest | File,
+    body: StatefulQueryRequest | File,
 ) -> dict[str, Any]:
     headers: dict[str, Any] = {}
 
@@ -38,7 +38,7 @@ def _get_kwargs(
         ),
     }
 
-    if isinstance(body, QueryRequest):
+    if isinstance(body, StatefulQueryRequest):
         _kwargs["json"] = body.to_dict()
 
         headers["Content-Type"] = "application/json"
@@ -67,12 +67,12 @@ def _parse_response(
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | TopologyChangedError
-    | QueryResponses
     | QueryTemporarilyUnavailableError
+    | StatefulQueryResponses
     | None
 ):
     if response.status_code == 200:
-        response_200 = QueryResponses.from_dict(response.json())
+        response_200 = StatefulQueryResponses.from_dict(response.json())
 
         return response_200
 
@@ -235,8 +235,8 @@ def _build_response(
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | TopologyChangedError
-    | QueryResponses
     | QueryTemporarilyUnavailableError
+    | StatefulQueryResponses
 ]:
     return Response(
         status_code=HTTPStatus(response.status_code),
@@ -250,7 +250,7 @@ def sync_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: QueryRequest | File,
+    body: StatefulQueryRequest | File,
 ) -> Response[
     Error
     | Error
@@ -265,16 +265,16 @@ def sync_detailed(
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | TopologyChangedError
-    | QueryResponses
     | QueryTemporarilyUnavailableError
+    | StatefulQueryResponses
 ]:
     """Query a specific table
 
     Args:
         table_name (str):
-        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
-            deprecated graph_searches is retained only at the stateful public transport boundary for
-            the v0.2 transition window.
+        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
+            graph_queries; deprecated graph_searches is retained only at the stateful public transport
+            boundary for the v0.2 transition window.
         body (File):
 
     Raises:
@@ -282,7 +282,7 @@ def sync_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryResponses | QueryTemporarilyUnavailableError]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
     """
 
     kwargs = _get_kwargs(
@@ -301,7 +301,7 @@ def sync(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: QueryRequest | File,
+    body: StatefulQueryRequest | File,
 ) -> (
     Error
     | Error
@@ -316,17 +316,17 @@ def sync(
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | TopologyChangedError
-    | QueryResponses
     | QueryTemporarilyUnavailableError
+    | StatefulQueryResponses
     | None
 ):
     """Query a specific table
 
     Args:
         table_name (str):
-        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
-            deprecated graph_searches is retained only at the stateful public transport boundary for
-            the v0.2 transition window.
+        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
+            graph_queries; deprecated graph_searches is retained only at the stateful public transport
+            boundary for the v0.2 transition window.
         body (File):
 
     Raises:
@@ -334,7 +334,7 @@ def sync(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryResponses | QueryTemporarilyUnavailableError
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryTemporarilyUnavailableError | StatefulQueryResponses
     """
 
     return sync_detailed(
@@ -348,7 +348,7 @@ async def asyncio_detailed(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: QueryRequest | File,
+    body: StatefulQueryRequest | File,
 ) -> Response[
     Error
     | Error
@@ -363,16 +363,16 @@ async def asyncio_detailed(
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | TopologyChangedError
-    | QueryResponses
     | QueryTemporarilyUnavailableError
+    | StatefulQueryResponses
 ]:
     """Query a specific table
 
     Args:
         table_name (str):
-        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
-            deprecated graph_searches is retained only at the stateful public transport boundary for
-            the v0.2 transition window.
+        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
+            graph_queries; deprecated graph_searches is retained only at the stateful public transport
+            boundary for the v0.2 transition window.
         body (File):
 
     Raises:
@@ -380,7 +380,7 @@ async def asyncio_detailed(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryResponses | QueryTemporarilyUnavailableError]
+        Response[Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryTemporarilyUnavailableError | StatefulQueryResponses]
     """
 
     kwargs = _get_kwargs(
@@ -397,7 +397,7 @@ async def asyncio(
     table_name: str,
     *,
     client: AuthenticatedClient,
-    body: QueryRequest | File,
+    body: StatefulQueryRequest | File,
 ) -> (
     Error
     | Error
@@ -412,17 +412,17 @@ async def asyncio(
     | QueryCandidateBudgetExceededError
     | HierarchyCursorStaleError
     | TopologyChangedError
-    | QueryResponses
     | QueryTemporarilyUnavailableError
+    | StatefulQueryResponses
     | None
 ):
     """Query a specific table
 
     Args:
         table_name (str):
-        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
-            deprecated graph_searches is retained only at the stateful public transport boundary for
-            the v0.2 transition window.
+        body (StatefulQueryRequest): Stateful Antfly query request. Canonical clients use
+            graph_queries; deprecated graph_searches is retained only at the stateful public transport
+            boundary for the v0.2 transition window.
         body (File):
 
     Raises:
@@ -430,7 +430,7 @@ async def asyncio(
         httpx.TimeoutException: If the request takes longer than Client.timeout.
 
     Returns:
-        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryResponses | QueryTemporarilyUnavailableError
+        Error | Error | TableStorageUnreadableError | ExactSortError | GraphAnchorFilterRequiresIndexError | GraphDistinctBudgetExceededError | GraphMatchOperationLimitExceededError | GraphPathWeightDomainError | GraphQueryUnsupportedError | GraphWorkBudgetExceededError | QueryCandidateBudgetExceededError | HierarchyCursorStaleError | TopologyChangedError | QueryTemporarilyUnavailableError | StatefulQueryResponses
     """
 
     return (

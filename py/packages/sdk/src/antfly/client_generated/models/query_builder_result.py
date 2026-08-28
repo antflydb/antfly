@@ -37,9 +37,7 @@ class QueryBuilderResult:
         remaining_internal_iterations (int | Unset): Remaining internal reasoning passes for this interaction.
         remaining_user_clarifications (int | Unset): Remaining clarification turns allowed for this interaction.
         questions (list[AgentQuestion] | Unset): Clarification questions exposed in the shared bounded-agent envelope.
-        query_request (QueryRequest | Unset): Stateful Antfly query request. Canonical clients use graph_queries;
-            deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition
-            window.
+        query_request (QueryRequest | Unset):
         retrieval_query_request (RetrievalQueryRequest | Unset): A canonical query in the retrieval pipeline with an
             optional tree search
             configuration. Each query specifies its own table. Deprecated stateful

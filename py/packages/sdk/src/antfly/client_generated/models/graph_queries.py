@@ -13,20 +13,13 @@ if TYPE_CHECKING:
     from ..models.graph_traverse_query import GraphTraverseQuery
 
 
-T = TypeVar("T", bound="CanonicalQueryRequestGraphQueries")
+T = TypeVar("T", bound="GraphQueries")
 
 
 @_attrs_define
-class CanonicalQueryRequestGraphQueries:
-    """Declarative graph matching, traversal, and path queries. A nested node
-    `filter` is a typed, non-scoring stored-document predicate. It shares
-    familiar scalar syntax with document queries but deliberately excludes
-    analyzer-backed and index-only clauses. A request may contain at most
-    64 named graph operations, of which at most 8 may be named `match`
-    operations. Each operation key is a GraphIdentifier under the
-    versioned policy published in the GraphIdentifier schema.
-    Put multiple counts over one pattern in the same `match` return
-    object so they share one complete anchor scan.
+class GraphQueries:
+    """Named canonical graph operations. A request may contain at most 64 operations, of which at most eight may be MATCH
+    operations. Keys use the versioned GraphIdentifier policy.
 
     """
 
@@ -60,7 +53,7 @@ class CanonicalQueryRequestGraphQueries:
         from ..models.graph_traverse_query import GraphTraverseQuery
 
         d = dict(src_dict)
-        canonical_query_request_graph_queries = cls()
+        graph_queries = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -102,8 +95,8 @@ class CanonicalQueryRequestGraphQueries:
 
             additional_properties[prop_name] = additional_property
 
-        canonical_query_request_graph_queries.additional_properties = additional_properties
-        return canonical_query_request_graph_queries
+        graph_queries.additional_properties = additional_properties
+        return graph_queries
 
     @property
     def additional_keys(self) -> list[str]:

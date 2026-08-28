@@ -118,7 +118,7 @@ func mockQueryHit(id string, source map[string]any) []byte {
 }
 
 func mockGraphQueryNodes(name string, hits []rawHit, nodes []client.GraphResultNode) []byte {
-	var graphResult client.GraphQueryResult
+	var graphResult client.GraphResult
 	if err := graphResult.FromGraphNodesResult(client.GraphNodesResult{
 		Kind:  client.GraphNodesResultKindNodes,
 		Nodes: nodes,
@@ -129,7 +129,7 @@ func mockGraphQueryNodes(name string, hits []rawHit, nodes []client.GraphResultN
 	}
 	resp := queryResponse{Responses: []queryResult{{
 		Hits:         queryHits{Hits: hits, Total: exactQueryHitsTotal(uint64(len(hits)))},
-		GraphResults: map[string]client.GraphQueryResult{name: graphResult},
+		GraphResults: map[string]client.GraphResult{name: graphResult},
 	}}}
 	b, _ := json.Marshal(resp)
 	return b

@@ -22,7 +22,7 @@ import type {
   GraphDocumentFilter,
   GraphMatchQuery,
   GraphNodesResult,
-  LegacyGraphQueryResult,
+  LegacyGraphSearchResult,
   MatchQuery,
   NumericRangeQuery,
   QueryRequest,
@@ -214,7 +214,7 @@ describe("Antfly Query Type Integration", () => {
     });
 
     it("types pre-discriminator graph responses during the compatibility window", () => {
-      const legacy: LegacyGraphQueryResult = {
+      const legacy: LegacyGraphSearchResult = {
         type: "neighbors",
         total: 0,
       };

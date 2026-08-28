@@ -29,21 +29,10 @@ func (t GraphResult) DecodeInto(value any) error {
 	return json.Unmarshal(t.union, value)
 }
 
-// DecodeInto decodes a canonical GraphQueryResult without copying it through
-// an intermediate JSON map.
-func (t GraphQueryResult) DecodeInto(value any) error {
-	return json.Unmarshal(t.union, value)
-}
-
 // DecodeStrictInto decodes a GraphResult with the generated model while
 // rejecting fields that are not part of that model. Semantic graph invariants
 // are validated by the SDK after the concrete result variant is selected.
 func (t GraphResult) DecodeStrictInto(value any) error {
-	return decodeStrictJSON(t.union, value)
-}
-
-// DecodeStrictInto is the canonical GraphQueryResult equivalent.
-func (t GraphQueryResult) DecodeStrictInto(value any) error {
 	return decodeStrictJSON(t.union, value)
 }
 

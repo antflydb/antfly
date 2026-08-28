@@ -4289,10 +4289,8 @@ fn buildQueryBuilderQueryRequest(
     out.exclusion_query = try buildQueryBuilderConstraintExclusionQueryValue(alloc, request.constraints, fields);
     out.graph_queries = try queryBuilderGraphSearches(alloc, request, built, graph_indexes);
     const expand_strategy = queryBuilderConstraintString(request.constraints, "expand_strategy");
-    if (out.graph_queries != null and expand_strategy != null) {
+    if (expand_strategy != null) {
         try warnings.append(alloc, "Ignored deprecated constraints.expand_strategy because canonical graph_queries return independently typed graph results; consume response.graph_results explicitly.");
-    } else {
-        out.expand_strategy = expand_strategy;
     }
 
     switch (built.query_kind) {
@@ -9622,7 +9620,6 @@ test "query builder maps canonical graph queries and ignores legacy expansion" {
     }, null);
 
     const query_request = result.query_request.?;
-    try std.testing.expect(query_request.expand_strategy == null);
     try std.testing.expect(query_request.graph_queries != null);
     try std.testing.expectEqual(@as(usize, 1), query_request.graph_queries.?.map.count());
     const graph_query = query_request.graph_queries.?.map.get("related").?;

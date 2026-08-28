@@ -9,21 +9,22 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.query_result import QueryResult
+    from ..models.stateful_query_result import StatefulQueryResult
 
 
-T = TypeVar("T", bound="QueryResponses")
+T = TypeVar("T", bound="StatefulQueryResponses")
 
 
 @_attrs_define
-class QueryResponses:
-    """Canonical responses from multiple query operations.
+class StatefulQueryResponses:
+    """Responses from the stateful compatibility transport. Canonical requests still produce canonical graph result
+    variants; deprecated graph_searches may produce LegacyGraphSearchResult values during the transition window.
 
-    Attributes:
-        responses (list[QueryResult] | Unset):
+        Attributes:
+            responses (list[StatefulQueryResult] | Unset):
     """
 
-    responses: list[QueryResult] | Unset = UNSET
+    responses: list[StatefulQueryResult] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -44,24 +45,24 @@ class QueryResponses:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.query_result import QueryResult
+        from ..models.stateful_query_result import StatefulQueryResult
 
         d = dict(src_dict)
         _responses = d.pop("responses", UNSET)
-        responses: list[QueryResult] | Unset = UNSET
+        responses: list[StatefulQueryResult] | Unset = UNSET
         if _responses is not UNSET:
             responses = []
             for responses_item_data in _responses:
-                responses_item = QueryResult.from_dict(responses_item_data)
+                responses_item = StatefulQueryResult.from_dict(responses_item_data)
 
                 responses.append(responses_item)
 
-        query_responses = cls(
+        stateful_query_responses = cls(
             responses=responses,
         )
 
-        query_responses.additional_properties = d
-        return query_responses
+        stateful_query_responses.additional_properties = d
+        return stateful_query_responses
 
     @property
     def additional_keys(self) -> list[str]:

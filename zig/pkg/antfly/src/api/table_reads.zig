@@ -17078,11 +17078,12 @@ fn appendGraphQueriesField(
         transport.operations_json[0] != '{' or
         transport.operations_json[transport.operations_json.len - 1] != '}')
         return error.UnsupportedQueryRequest;
+    // Legacy is a public stateful edge contract, not a node-to-node protocol.
+    // Distributed graph coordination clears graph operations before generic
+    // shard fanout and performs compatibility conversion only at final egress.
+    if (transport.dialect != .canonical) return error.UnsupportedQueryRequest;
 
-    try appendJsonFieldName(alloc, out, first, switch (transport.dialect) {
-        .canonical => "graph_queries",
-        .legacy => "graph_searches",
-    });
+    try appendJsonFieldName(alloc, out, first, "graph_queries");
     try out.appendSlice(alloc, transport.operations_json);
 }
 
@@ -18260,17 +18261,14 @@ fn parseRemoteGraphResults(
     var it = value.map.iterator();
     while (it.next()) |entry| {
         const result_value = entry.value_ptr.*;
-        // Canonical response keys obey the same GraphIdentifier policy as the
-        // request. Compatibility responses retain arbitrary v0.2 map keys;
-        // request/result correlation still verifies them exactly downstream.
-        if (result_value != .legacy_graph_query_result and
-            !graph_query_mod.isValidQueryName(entry.key_ptr.*))
+        // Inter-node responses are always canonical, even when the coordinator
+        // is serving a legacy stateful client. Compatibility conversion occurs
+        // once at public egress and never widens the trusted shard protocol.
+        if (!graph_query_mod.isValidQueryName(entry.key_ptr.*))
             return error.InvalidRemoteResponse;
         const ResultView = struct {
             canonical_nodes: ?[]const indexes_openapi.GraphResultNode = null,
-            legacy_nodes: ?[]const indexes_openapi.LegacyGraphResultNode = null,
             canonical_paths: ?[]const indexes_openapi.GraphPath = null,
-            legacy_paths: ?[]const indexes_openapi.Path = null,
             rows: ?[]const indexes_openapi.GraphResultRow = null,
             aggregates: ?std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) = null,
             truncated: bool = false,
@@ -18321,15 +18319,9 @@ fn parseRemoteGraphResults(
                     .truncated = false,
                 };
             },
-            .legacy_graph_query_result => |result| .{
-                .legacy_nodes = result.nodes,
-                .legacy_paths = result.paths,
-            },
         };
         var parsed_nodes = if (view.canonical_nodes) |nodes_value|
             try parseRemoteGraphNodes(alloc, nodes_value)
-        else if (view.legacy_nodes) |nodes_value|
-            try parseRemoteLegacyGraphNodes(alloc, nodes_value)
         else
             ParsedRemoteGraphNodes{};
         errdefer parsed_nodes.deinit(alloc);
@@ -18340,8 +18332,6 @@ fn parseRemoteGraphResults(
         errdefer parsed_matches.deinit(alloc);
         const paths: []graph_paths.Path = if (view.canonical_paths) |paths_value|
             try parseRemoteCanonicalGraphPaths(alloc, paths_value)
-        else if (view.legacy_paths) |paths_value|
-            try parseRemoteLegacyGraphPaths(alloc, paths_value)
         else
             @constCast((&[_]graph_paths.Path{})[0..]);
         errdefer {

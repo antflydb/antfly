@@ -306,15 +306,14 @@ type (
 	PatternEdgeStep                = oapi.PatternEdgeStep
 	PatternMatch                   = oapi.PatternMatch
 	GraphResult                    = oapi.GraphResult
-	GraphQueryResult               = oapi.GraphQueryResult
 	GraphBindingsResult            = oapi.GraphBindingsResult
 	GraphBindingsResultKind        = oapi.GraphBindingsResultKind
 	GraphAggregatesResult          = oapi.GraphAggregatesResult
 	GraphAggregatesResultKind      = oapi.GraphAggregatesResultKind
 	GraphNodesResult               = oapi.GraphNodesResult
 	GraphNodesResultKind           = oapi.GraphNodesResultKind
-	LegacyGraphQueryResult         = oapi.LegacyGraphQueryResult
-	LegacyGraphQueryResultKind     = oapi.LegacyGraphQueryResultKind
+	LegacyGraphSearchResult        = oapi.LegacyGraphSearchResult
+	LegacyGraphSearchResultKind    = oapi.LegacyGraphSearchResultKind
 	GraphQueryStats                = oapi.GraphQueryStats
 	GraphNodeSelector              = oapi.GraphNodeSelector
 	GraphKeyNodeSelector           = oapi.GraphKeyNodeSelector
@@ -504,7 +503,7 @@ const (
 	GraphBindingsResultKindBindings     = oapi.GraphBindingsResultKindBindings
 	GraphAggregatesResultKindAggregates = oapi.GraphAggregatesResultKindAggregates
 	GraphNodesResultKindNodes           = oapi.GraphNodesResultKindNodes
-	LegacyGraphQueryResultKindLegacy    = oapi.LegacyGraphQueryResultKindLegacy
+	LegacyGraphSearchResultKindLegacy   = oapi.LegacyGraphSearchResultKindLegacy
 	GraphPathEdgeDirectionIn            = oapi.GraphPathEdgeDirectionIn
 	GraphPathEdgeDirectionOut           = oapi.GraphPathEdgeDirectionOut
 

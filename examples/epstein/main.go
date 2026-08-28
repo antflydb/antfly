@@ -2154,21 +2154,6 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 				addEdge(edge)
 			}
 		}
-	case antfly.LegacyGraphQueryResult:
-		for _, resultNode := range result.Nodes {
-			addNode(graphNodeFromDocument(resultNode.Key, resultNode.Document, resultNode.Depth))
-			for _, edge := range resultNode.PathEdges {
-				addEdge(GraphEdge{Source: edge.Source, Target: edge.Target, Type: edge.Type, Weight: edge.Weight})
-			}
-			if len(resultNode.PathEdges) == 0 {
-				for i := 1; i < len(resultNode.Path); i++ {
-					addEdge(GraphEdge{Source: resultNode.Path[i-1], Target: resultNode.Path[i], Type: "related", Weight: resultNode.Distance})
-				}
-			}
-			for _, edge := range resultNode.Edges {
-				addEdge(GraphEdge{Source: string(edge.Source), Target: string(edge.Target), Type: edge.Type, Weight: edge.Weight})
-			}
-		}
 	default:
 		return viz
 	}

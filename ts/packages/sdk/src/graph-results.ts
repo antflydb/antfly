@@ -8,7 +8,7 @@ const MAX_EDGE_TYPE_BYTES = 64 * 1024;
 const utf8 = new TextEncoder();
 
 type JsonObject = Record<string, unknown>;
-type GraphDialect = "canonical" | "legacy" | "none";
+type GraphDialect = "canonical" | "none";
 type CanonicalResultContract = {
   kind: "bindings" | "aggregates" | "nodes";
   names?: Set<string>;
@@ -441,129 +441,14 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
   return invalid(path, "does not contain a supported graph operation");
 }
 
-function legacySafeInteger(value: unknown, path: string): number {
-  if (!Number.isSafeInteger(value)) invalid(path, "must be a safely representable integer");
-  return value as number;
-}
-
-function legacyPathEdge(value: unknown, path: string): void {
-  const edge = object(value, path);
-  for (const name of ["source", "target", "type"] as const) {
-    if (edge[name] !== undefined && typeof edge[name] !== "string")
-      invalid(`${path}.${name}`, "must be a string");
-  }
-  if (
-    edge.weight !== undefined &&
-    (typeof edge.weight !== "number" || !Number.isFinite(edge.weight))
-  )
-    invalid(`${path}.weight`, "must be a finite number");
-  if (edge.metadata !== undefined) object(edge.metadata, `${path}.metadata`);
-}
-
-function legacyPath(value: unknown, path: string): void {
-  const graphPath = object(value, path);
-  if (graphPath.nodes !== undefined) {
-    array(graphPath.nodes, `${path}.nodes`).forEach((node, index) => {
-      if (typeof node !== "string") invalid(`${path}.nodes[${index}]`, "must be a string");
-    });
-  }
-  if (graphPath.edges !== undefined)
-    array(graphPath.edges, `${path}.edges`).forEach((edge, index) => {
-      legacyPathEdge(edge, `${path}.edges[${index}]`);
-    });
-  // The deprecated v0.2 Path contract allowed any finite double. Canonical
-  // paths retain their stronger non-negative invariant above.
-  if (graphPath.total_weight !== undefined)
-    finiteNumber(graphPath.total_weight, `${path}.total_weight`);
-  if (graphPath.length !== undefined) legacySafeInteger(graphPath.length, `${path}.length`);
-}
-
-function legacyNode(value: unknown, path: string): void {
-  const node = object(value, path);
-  if (typeof node.key !== "string") invalid(`${path}.key`, "must be a string");
-  if (node.table !== undefined && typeof node.table !== "string")
-    invalid(`${path}.table`, "must be a string");
-  if (node.depth !== undefined) legacySafeInteger(node.depth, `${path}.depth`);
-  if (
-    node.distance !== undefined &&
-    (typeof node.distance !== "number" || !Number.isFinite(node.distance))
-  )
-    invalid(`${path}.distance`, "must be a finite number");
-  if (node.document !== undefined) object(node.document, `${path}.document`);
-  if (node.evidence !== undefined) object(node.evidence, `${path}.evidence`);
-  for (const name of ["path", "provenance"] as const) {
-    if (node[name] !== undefined)
-      array(node[name], `${path}.${name}`).forEach((item, index) => {
-        if (typeof item !== "string") invalid(`${path}.${name}[${index}]`, "must be a string");
-      });
-  }
-  if (node.path_edges !== undefined)
-    array(node.path_edges, `${path}.path_edges`).forEach((edge, index) => {
-      legacyPathEdge(edge, `${path}.path_edges[${index}]`);
-    });
-  if (node.edges !== undefined) array(node.edges, `${path}.edges`);
-}
-
-function legacyResult(value: unknown, path: string): void {
-  const result = object(value, path);
-  exactKeys(result, path, ["type", "total"], ["kind", "nodes", "paths", "matches", "took"]);
-  if (result.kind !== undefined && result.kind !== "legacy")
-    invalid(`${path}.kind`, "must be legacy when present");
-  if (
-    result.type !== "neighbors" &&
-    result.type !== "traverse" &&
-    result.type !== "shortest_path" &&
-    result.type !== "k_shortest_paths" &&
-    result.type !== "pattern"
-  ) {
-    invalid(`${path}.type`, "has an unknown legacy graph query type");
-  }
-  legacySafeInteger(result.total, `${path}.total`);
-  if (result.took !== undefined) legacySafeInteger(result.took, `${path}.took`);
-  if (result.nodes !== undefined)
-    array(result.nodes, `${path}.nodes`).forEach((node, index) => {
-      legacyNode(node, `${path}.nodes[${index}]`);
-    });
-  if (result.paths !== undefined)
-    array(result.paths, `${path}.paths`).forEach((graphPath, index) => {
-      legacyPath(graphPath, `${path}.paths[${index}]`);
-    });
-  if (result.matches !== undefined) {
-    array(result.matches, `${path}.matches`).forEach((rawMatch, index) => {
-      const matchPath = `${path}.matches[${index}]`;
-      const match = object(rawMatch, matchPath);
-      if (match.bindings !== undefined) {
-        for (const [name, binding] of Object.entries(
-          object(match.bindings, `${matchPath}.bindings`)
-        ))
-          legacyNode(binding, `${matchPath}.bindings.${name}`);
-      }
-      if (match.path !== undefined)
-        array(match.path, `${matchPath}.path`).forEach((edge, edgeIndex) => {
-          legacyPathEdge(edge, `${matchPath}.path[${edgeIndex}]`);
-        });
-    });
-  }
-}
-
 function requestDialect(request: QueryRequest): RequestGraphContract {
   const canonical = request.graph_queries;
-  const legacy = request.graph_searches;
-  if (canonical !== undefined && canonical !== null && legacy !== undefined && legacy !== null) {
-    throw new TypeError("query accepts either graph_queries or graph_searches, not both");
-  }
   if (canonical !== undefined && canonical !== null) {
     const operations = new Map<string, CanonicalResultContract>();
     for (const [name, operation] of Object.entries(canonical)) {
       operations.set(name, canonicalOperationContract(operation, `request.graph_queries.${name}`));
     }
     return { dialect: "canonical", operations };
-  }
-  if (legacy !== undefined && legacy !== null) {
-    return {
-      dialect: "legacy",
-      operations: new Map(Object.keys(legacy).map((name) => [name, undefined])),
-    };
   }
   return { dialect: "none", operations: new Map() };
 }
@@ -614,12 +499,10 @@ export function validateGraphQueryResponses(
     for (const name of names) {
       const path = `response.responses[${index}].graph_results[${JSON.stringify(name)}]`;
       const result = object(results[name], path);
-      if (dialect === "canonical") {
-        if (!isValidGraphIdentifier(name)) invalid(path, "has an invalid canonical operation name");
-        const contract = operations.get(name);
-        if (!contract) invalid(path, "has no canonical request contract");
-        canonicalResult(result, path, contract);
-      } else legacyResult(result, path);
+      if (!isValidGraphIdentifier(name)) invalid(path, "has an invalid canonical operation name");
+      const contract = operations.get(name);
+      if (!contract) invalid(path, "has no canonical request contract");
+      canonicalResult(result, path, contract);
     }
   });
 }

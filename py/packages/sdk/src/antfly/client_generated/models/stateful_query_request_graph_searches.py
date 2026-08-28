@@ -7,20 +7,24 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.aggregation_result import AggregationResult
+    from ..models.legacy_graph_query import LegacyGraphQuery
 
 
-T = TypeVar("T", bound="QueryResultAggregations")
+T = TypeVar("T", bound="StatefulQueryRequestGraphSearches")
 
 
 @_attrs_define
-class QueryResultAggregations:
-    """Aggregation results keyed by the user-defined aggregation names from the request.
-    Contains computed metrics or buckets depending on the aggregation type.
+class StatefulQueryRequestGraphSearches:
+    """Deprecated compatibility alias for the v0.2 graph query contract.
+    Use `graph_queries`; requests containing both fields are rejected.
+    Legacy operation names remain opaque and byte-for-byte compatible;
+    canonical GraphIdentifier rules apply only to `graph_queries`.
+    The request-wide limit of 64 operations also applies here to bound
+    execution work during the compatibility window.
 
     """
 
-    additional_properties: dict[str, AggregationResult] = _attrs_field(init=False, factory=dict)
+    additional_properties: dict[str, LegacyGraphQuery] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -32,28 +36,28 @@ class QueryResultAggregations:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.aggregation_result import AggregationResult
+        from ..models.legacy_graph_query import LegacyGraphQuery
 
         d = dict(src_dict)
-        query_result_aggregations = cls()
+        stateful_query_request_graph_searches = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = AggregationResult.from_dict(prop_dict)
+            additional_property = LegacyGraphQuery.from_dict(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        query_result_aggregations.additional_properties = additional_properties
-        return query_result_aggregations
+        stateful_query_request_graph_searches.additional_properties = additional_properties
+        return stateful_query_request_graph_searches
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> AggregationResult:
+    def __getitem__(self, key: str) -> LegacyGraphQuery:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: AggregationResult) -> None:
+    def __setitem__(self, key: str, value: LegacyGraphQuery) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

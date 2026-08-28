@@ -19,7 +19,7 @@ _MAX_GRAPH_ALIASES = 64
 _MAX_GRAPH_EDGES = 64
 _MAX_GRAPH_ITEMS = 10_000
 _MISSING = object()
-GraphResultDialect = Literal["auto", "canonical", "legacy", "none"]
+GraphResultDialect = Literal["auto", "canonical", "none"]
 GraphResultKind = Literal["bindings", "aggregates", "nodes"]
 GraphNodeResultMode = Literal["traversal", "shortest_path", "k_shortest_paths"]
 
@@ -336,105 +336,6 @@ def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
     _validate_stats(value["stats"], f"{path}.stats", len(paths) if paths else len(nodes), allow_truncated=True)
 
 
-def _legacy_integer(value: object, path: str) -> int:
-    if type(value) is not int:
-        _invalid(path, "must be an integer")
-    return value
-
-
-def _validate_legacy_path_edge(value: object, path: str) -> None:
-    edge = _object(value, path)
-    for name in ("source", "target", "type"):
-        if name in edge and not isinstance(edge[name], str):
-            _invalid(f"{path}.{name}", "must be a string")
-    if "weight" in edge:
-        _finite_number(edge["weight"], f"{path}.weight")
-    if "metadata" in edge:
-        _object(edge["metadata"], f"{path}.metadata")
-
-
-def _validate_legacy_path(value: object, path: str) -> None:
-    graph_path = _object(value, path)
-    if "nodes" in graph_path:
-        for index, node in enumerate(_array(graph_path["nodes"], f"{path}.nodes")):
-            if not isinstance(node, str):
-                _invalid(f"{path}.nodes[{index}]", "must be a string")
-    if "edges" in graph_path:
-        for index, edge in enumerate(_array(graph_path["edges"], f"{path}.edges")):
-            _validate_legacy_path_edge(edge, f"{path}.edges[{index}]")
-    if "total_weight" in graph_path:
-        # The deprecated v0.2 Path contract allowed any finite double. Keep the
-        # compatibility decoder faithful even though canonical paths require
-        # non-negative weights.
-        _finite_number(graph_path["total_weight"], f"{path}.total_weight")
-    if "length" in graph_path:
-        _legacy_integer(graph_path["length"], f"{path}.length")
-
-
-def _validate_legacy_node(value: object, path: str) -> None:
-    node = _object(value, path)
-    if "key" not in node or not isinstance(node["key"], str):
-        _invalid(f"{path}.key", "must be a string")
-    if "table" in node and not isinstance(node["table"], str):
-        _invalid(f"{path}.table", "must be a string")
-    if "depth" in node:
-        _legacy_integer(node["depth"], f"{path}.depth")
-    if "distance" in node:
-        _finite_number(node["distance"], f"{path}.distance")
-    if "document" in node:
-        _object(node["document"], f"{path}.document")
-    if "evidence" in node:
-        _object(node["evidence"], f"{path}.evidence")
-    for name in ("path", "provenance"):
-        if name in node:
-            for index, item in enumerate(_array(node[name], f"{path}.{name}")):
-                if not isinstance(item, str):
-                    _invalid(f"{path}.{name}[{index}]", "must be a string")
-    if "path_edges" in node:
-        for index, edge in enumerate(_array(node["path_edges"], f"{path}.path_edges")):
-            _validate_legacy_path_edge(edge, f"{path}.path_edges[{index}]")
-    if "edges" in node:
-        _array(node["edges"], f"{path}.edges")
-
-
-def _validate_legacy_result(value: Mapping[str, Any], path: str) -> None:
-    _exact_keys(
-        value,
-        path,
-        required=frozenset({"type", "total"}),
-        optional=frozenset({"kind", "nodes", "paths", "matches", "took"}),
-    )
-    if "kind" in value and value["kind"] != "legacy":
-        _invalid(f"{path}.kind", "must be 'legacy' when present")
-    if not isinstance(value["type"], str) or value["type"] not in {
-        "neighbors",
-        "traverse",
-        "shortest_path",
-        "k_shortest_paths",
-        "pattern",
-    }:
-        _invalid(f"{path}.type", "has an unknown legacy graph query type")
-    _legacy_integer(value["total"], f"{path}.total")
-    if "took" in value:
-        _legacy_integer(value["took"], f"{path}.took")
-    if "nodes" in value:
-        for index, node in enumerate(_array(value["nodes"], f"{path}.nodes")):
-            _validate_legacy_node(node, f"{path}.nodes[{index}]")
-    if "paths" in value:
-        for index, graph_path in enumerate(_array(value["paths"], f"{path}.paths")):
-            _validate_legacy_path(graph_path, f"{path}.paths[{index}]")
-    if "matches" in value:
-        for index, raw_match in enumerate(_array(value["matches"], f"{path}.matches")):
-            match_path = f"{path}.matches[{index}]"
-            match = _object(raw_match, match_path)
-            if "bindings" in match:
-                for name, binding in _object(match["bindings"], f"{match_path}.bindings").items():
-                    _validate_legacy_node(binding, f"{match_path}.bindings.{name}")
-            if "path" in match:
-                for edge_index, edge in enumerate(_array(match["path"], f"{match_path}.path")):
-                    _validate_legacy_path_edge(edge, f"{match_path}.path[{edge_index}]")
-
-
 def _canonical_result_contract(value: object, path: str) -> _CanonicalResultContract:
     operation = _object(value, path)
     if "match" in operation:
@@ -499,12 +400,7 @@ def _validate_graph_result(
     if dialect == "none":
         _invalid(path, "was returned for a request without graph operations")
     if kind is _MISSING or kind == "legacy":
-        if dialect == "canonical":
-            _invalid(f"{path}.kind", "canonical graph results require a discriminator")
-        _validate_legacy_result(result, path)
-        return
-    if dialect == "legacy":
-        _invalid(f"{path}.kind", "legacy graph results must use the legacy result shape")
+        _invalid(f"{path}.kind", "canonical graph results require a discriminator")
     if not isinstance(kind, str):
         _invalid(f"{path}.kind", "must be a string")
     if contract is not None and kind != contract.kind:
@@ -587,12 +483,9 @@ def decode_query_responses(
     expected_graph_operations: frozenset[str] | None = None,
     expected_graph_queries: Mapping[str, object] | None = None,
 ) -> QueryResponses:
-    """Validate graph results against the request dialect, then decode them.
-
-    Supplying canonical graph query contracts selects the canonical dialect;
-    callers cannot accidentally validate those contracts against a legacy
-    graph_searches response while leaving ``graph_dialect`` at ``"auto"``.
-    """
+    """Validate canonical graph results against their request, then decode them."""
+    if graph_dialect not in {"auto", "canonical", "none"}:
+        raise ValueError("graph_dialect must be auto, canonical, or none")
     if expected_graph_operations is not None and expected_graph_queries is not None:
         raise ValueError("expected_graph_operations and expected_graph_queries are mutually exclusive")
     expected_names = expected_graph_operations
@@ -626,9 +519,7 @@ def decode_query_responses(
                     "operation names do not match the request",
                 )
             for name, graph_result in operations.items():
-                result_kind = graph_result.get("kind", _MISSING) if isinstance(graph_result, Mapping) else _MISSING
-                is_canonical = graph_dialect == "canonical" or result_kind in {"bindings", "aggregates", "nodes"}
-                if is_canonical and not is_valid_graph_identifier(name):
+                if graph_dialect != "none" and not is_valid_graph_identifier(name):
                     _invalid(f"{result_path}.graph_results", f"contains invalid operation name {name!r}")
                 contract = None
                 if expected_graph_queries is not None:

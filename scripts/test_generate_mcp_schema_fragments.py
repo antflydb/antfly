@@ -83,7 +83,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
 
         generated = generator.compact_query_request_schema(schemas)
 
-        self.assertNotIn("table", generated["properties"])
+        self.assertEqual({"type": "null"}, generated["properties"]["table"])
         self.assertIn("hierarchy", generated["properties"])
         invalid_states = generated["not"]["anyOf"]
         missing_group_fields = next(
@@ -108,7 +108,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
         with generator.SPEC.open(encoding="utf-8") as handle:
             schemas = yaml.safe_load(handle)["components"]["schemas"]
 
-        query_schema = schemas["CanonicalQueryRequest"]
+        query_schema = schemas["QueryRequest"]
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]

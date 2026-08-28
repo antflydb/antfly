@@ -32,7 +32,7 @@ type queryResponse struct {
 type queryResult struct {
 	Hits         queryHits                          `json:"hits"`
 	Aggregations map[string]aggregationResult       `json:"aggregations"`
-	GraphResults map[string]client.GraphQueryResult `json:"graph_results"`
+	GraphResults map[string]client.GraphResult `json:"graph_results"`
 	Error        string                             `json:"error"`
 }
 
@@ -126,7 +126,7 @@ func hitsWithRequiredGraphNodesFromResponse(data []byte, graphResultName string)
 	if !ok {
 		return nil, fmt.Errorf("query response is missing graph result %q", graphResultName)
 	}
-	decoded, err := client.DecodeGraphQueryResult(graphResult)
+	decoded, err := client.DecodeCanonicalGraphResult(graphResult)
 	if err != nil {
 		return nil, fmt.Errorf("decode graph result %q: %w", graphResultName, err)
 	}

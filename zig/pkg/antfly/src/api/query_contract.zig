@@ -2196,7 +2196,7 @@ pub const SemanticResolver = struct {
 
 fn applyCommonSearchRequestOptions(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     req: *db_mod.types.SearchRequest,
 ) !void {
     if (request.limit) |limit| req.limit = @intCast(limit);
@@ -2669,7 +2669,7 @@ pub fn parseQueryRequestWithDeadline(
     const body_for_contract = contract_body orelse effective_body;
 
     var parsed = ant_json.parseFromSlice(
-        metadata_openapi.QueryRequest,
+        metadata_openapi.StatefulQueryRequest,
         alloc,
         body_for_contract,
         .{},
@@ -2752,8 +2752,10 @@ pub fn parseQueryRequestWithDeadline(
     if (req.graph_queries.len > 0) {
         req.graph_query_transport = try captureGraphQueryTransportAlloc(alloc, effective_body, req.graph_queries);
     }
-    if (request.expand_strategy) |expand_strategy| {
-        req.expand_strategy = try parseExpandStrategy(expand_strategy);
+    if (comptime @hasField(@TypeOf(request), "expand_strategy")) {
+        if (request.expand_strategy) |expand_strategy| {
+            req.expand_strategy = try parseExpandStrategy(expand_strategy);
+        }
     }
     try validateScoreSortHasScoreBearingSource(req);
 
@@ -3056,7 +3058,7 @@ fn classifyPublicFilterContractErrorAlloc(
 
 pub fn preflightGraphSearchesAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !void {
     const graph_queries = try buildGraphQueries(alloc, request);
     defer freeNamedGraphQueries(alloc, graph_queries);
@@ -3064,7 +3066,7 @@ pub fn preflightGraphSearchesAlloc(
 
 pub fn queryRequestHasScoreBearingTextSourceAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !bool {
     var preflight_req = try buildPreflightSearchRequestAlloc(alloc, request);
     defer preflight_req.deinit(alloc);
@@ -3073,7 +3075,7 @@ pub fn queryRequestHasScoreBearingTextSourceAlloc(
 
 pub fn queryRequestHasScoreBearingSourceAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !bool {
     var preflight_req = try buildPreflightSearchRequestAlloc(alloc, request);
     defer preflight_req.deinit(alloc);
@@ -3104,7 +3106,7 @@ fn validateScoreSortHasScoreBearingSource(req: db_mod.types.SearchRequest) !void
 
 fn buildPreflightSearchRequestAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !OwnedQueryRequest {
     var req: db_mod.types.SearchRequest = .{};
     errdefer freeSearchRequest(alloc, &req);
@@ -3151,8 +3153,10 @@ fn buildPreflightSearchRequestAlloc(
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;
     req.graph_queries = try buildGraphQueries(alloc, request);
-    if (request.expand_strategy) |expand_strategy| {
-        req.expand_strategy = try parseExpandStrategy(expand_strategy);
+    if (comptime @hasField(@TypeOf(request), "expand_strategy")) {
+        if (request.expand_strategy) |expand_strategy| {
+            req.expand_strategy = try parseExpandStrategy(expand_strategy);
+        }
     }
     try validateScoreSortHasScoreBearingSource(req);
 
@@ -3202,7 +3206,7 @@ fn countAggregationRequests(aggregations: ?std.json.ArrayHashMap(metadata_openap
 
 pub fn preflightQueryRequestAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !QueryPreflightSummary {
     var preflight_req = try buildPreflightSearchRequestAlloc(alloc, request);
     defer preflight_req.deinit(alloc);
@@ -3447,28 +3451,67 @@ pub fn encodeQueryResponses(
         try graphResponseFormat(req)
     else
         null;
-    const graph_results = if (graph_dialect) |dialect|
-        try buildGraphQueryResults(arena, req, meta, result, dialect)
-    else
-        null;
     const aggregations = if (meta.aggregation_results.len > 0)
         try buildAggregationResults(arena, req, meta.aggregation_results)
     else
         null;
 
-    const query_results = try arena.alloc(metadata_openapi.QueryResult, 1);
-    query_results[0] = .{
-        .hits = .{
-            .total = queryHitsTotalFromSearchResult(result),
-            .hits = hits,
-            .max_score = computeMaxScore(emitted_hits),
+    const profile = if (req.profile) try buildProfileValue(arena, req, meta, result) else null;
+    const response_json = switch (graph_dialect orelse .canonical) {
+        .canonical => blk: {
+            const graph_results = if (graph_dialect != null)
+                try buildGraphQueryResults(indexes_openapi.GraphResult, arena, req, meta, result, .canonical)
+            else
+                null;
+            const query_results = try arena.alloc(metadata_openapi.QueryResult, 1);
+            query_results[0] = .{
+                .hits = .{
+                    .total = queryHitsTotalFromSearchResult(result),
+                    .hits = hits,
+                    .max_score = computeMaxScore(emitted_hits),
+                },
+                .aggregations = aggregations,
+                .graph_results = graph_results,
+                .profile = profile,
+                .took = meta.took_ms,
+                .status = 200,
+                .table = table_name,
+            };
+            break :blk try std.json.Stringify.valueAlloc(
+                alloc,
+                metadata_openapi.QueryResponses{ .responses = query_results },
+                .{ .emit_null_optional_fields = false },
+            );
         },
-        .aggregations = aggregations,
-        .graph_results = graph_results,
-        .profile = if (req.profile) try buildProfileValue(arena, req, meta, result) else null,
-        .took = meta.took_ms,
-        .status = 200,
-        .table = table_name,
+        .legacy => blk: {
+            const graph_results = try buildGraphQueryResults(
+                indexes_openapi.StatefulGraphResult,
+                arena,
+                req,
+                meta,
+                result,
+                .legacy,
+            );
+            const query_results = try arena.alloc(metadata_openapi.StatefulQueryResult, 1);
+            query_results[0] = .{
+                .hits = .{
+                    .total = queryHitsTotalFromSearchResult(result),
+                    .hits = hits,
+                    .max_score = computeMaxScore(emitted_hits),
+                },
+                .aggregations = aggregations,
+                .graph_results = graph_results,
+                .profile = profile,
+                .took = meta.took_ms,
+                .status = 200,
+                .table = table_name,
+            };
+            break :blk try std.json.Stringify.valueAlloc(
+                alloc,
+                metadata_openapi.StatefulQueryResponses{ .responses = query_results },
+                .{ .emit_null_optional_fields = false },
+            );
+        },
     };
 
     return .{
@@ -3477,11 +3520,7 @@ pub fn encodeQueryResponses(
         // OpenAPI optional response fields are absent unless populated; they
         // are not nullable. Keeping nulls out also preserves the compact wire
         // shape now that hierarchy is represented by generated response types.
-        .json = try std.json.Stringify.valueAlloc(
-            alloc,
-            metadata_openapi.QueryResponses{ .responses = query_results },
-            .{ .emit_null_optional_fields = false },
-        ),
+        .json = response_json,
     };
 }
 
@@ -5370,13 +5409,18 @@ fn jsonValueToI64(value: std.json.Value) !?i64 {
 }
 
 fn buildGraphQueryResults(
+    comptime Result: type,
     alloc: std.mem.Allocator,
     req: db_mod.types.SearchRequest,
     meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
     response_format: GraphResponseFormat,
-) !std.json.ArrayHashMap(indexes_openapi.GraphResult) {
-    var out: std.json.ArrayHashMap(indexes_openapi.GraphResult) = .{};
+) !std.json.ArrayHashMap(Result) {
+    comptime {
+        if (Result != indexes_openapi.GraphResult and Result != indexes_openapi.StatefulGraphResult)
+            @compileError("graph result map must use a canonical or stateful transport result");
+    }
+    var out: std.json.ArrayHashMap(Result) = .{};
     errdefer out.deinit(alloc);
 
     for (req.graph_queries) |requested| {
@@ -5390,13 +5434,16 @@ fn buildGraphQueryResults(
     for (result.graph_results) |graph_result| {
         const graph_query = findGraphQuery(req.graph_queries, graph_result.name) orelse
             return error.InvalidRemoteResponse;
-        const converted = toOpenApiGraphResultWithFormat(
-            alloc,
-            graph_query.query,
-            meta,
-            graph_result,
-            response_format,
-        ) catch |err| {
+        const converted: Result = (if (Result == indexes_openapi.GraphResult)
+            toOpenApiGraphQueryResult(alloc, graph_query.query, meta, graph_result)
+        else
+            toOpenApiStatefulGraphResultWithFormat(
+                alloc,
+                graph_query.query,
+                meta,
+                graph_result,
+                response_format,
+            )) catch |err| {
             if (graph_path_weight_diagnostic.isDomainError(err)) {
                 graph_path_weight_diagnostic.record(graph_query.name, err);
             }
@@ -5483,23 +5530,23 @@ fn toOpenApiGraphQueryResult(
     query: graph_query_mod.GraphQuery,
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
-) !indexes_openapi.GraphQueryResult {
-    const result = try toOpenApiGraphResultWithFormat(alloc, query, meta, graph_result, .canonical);
+) !indexes_openapi.GraphResult {
+    const result = try toOpenApiStatefulGraphResultWithFormat(alloc, query, meta, graph_result, .canonical);
     return switch (result) {
         .graph_nodes_result => |value| .{ .graph_nodes_result = value },
         .graph_aggregates_result => |value| .{ .graph_aggregates_result = value },
         .graph_bindings_result => |value| .{ .graph_bindings_result = value },
-        .legacy_graph_query_result => unreachable,
+        .legacy_graph_search_result => unreachable,
     };
 }
 
-fn toOpenApiGraphResultWithFormat(
+fn toOpenApiStatefulGraphResultWithFormat(
     alloc: std.mem.Allocator,
     query: graph_query_mod.GraphQuery,
     meta: QueryResponseMeta,
     graph_result: db_mod.types.GraphSearchResult,
     response_format: GraphResponseFormat,
-) !indexes_openapi.GraphResult {
+) !indexes_openapi.StatefulGraphResult {
     var document_lookup = try GraphDocumentLookup.init(
         alloc,
         graph_result.hits,
@@ -5508,7 +5555,7 @@ fn toOpenApiGraphResultWithFormat(
     defer document_lookup.deinit(alloc);
 
     if (response_format == .legacy) {
-        const response = try alloc.create(indexes_openapi.LegacyGraphQueryResult);
+        const response = try alloc.create(indexes_openapi.LegacyGraphSearchResult);
         errdefer alloc.destroy(response);
         response.* = .{
             .type = legacyGraphQueryType(query.query_type),
@@ -5523,7 +5570,7 @@ fn toOpenApiGraphResultWithFormat(
             .total = @intCast(graph_result.total_hits),
             .took = meta.took_ms,
         };
-        return .{ .legacy_graph_query_result = response };
+        return .{ .legacy_graph_search_result = response };
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
         const return_limit: usize = @intCast(if (query.return_limit == 0) 100 else query.return_limit);
@@ -5909,6 +5956,7 @@ test "graph aggregate response fails closed on missing or inexact results" {
     };
     const named_queries = [_]db_mod.types.NamedGraphQuery{.{ .name = "counted", .query = query }};
     try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
+        indexes_openapi.GraphResult,
         alloc,
         .{ .graph_queries = &named_queries },
         .{},
@@ -5984,6 +6032,7 @@ test "graph response encoding requires exactly one result per traversal operatio
         .total_hits = 0,
     }};
     try std.testing.expectError(error.InvalidRemoteResponse, buildGraphQueryResults(
+        indexes_openapi.GraphResult,
         alloc,
         .{ .graph_queries = &named_queries },
         .{},
@@ -6201,7 +6250,7 @@ test "deprecated graph search preserves its response envelope" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    const result = try toOpenApiGraphResultWithFormat(
+    const result = try toOpenApiStatefulGraphResultWithFormat(
         alloc,
         .{
             .query_type = .neighbors,
@@ -6217,8 +6266,8 @@ test "deprecated graph search preserves its response envelope" {
         .legacy,
     );
 
-    try std.testing.expect(result == .legacy_graph_query_result);
-    const legacy = result.legacy_graph_query_result;
+    try std.testing.expect(result == .legacy_graph_search_result);
+    const legacy = result.legacy_graph_search_result;
     try std.testing.expect(legacy.kind == null);
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, legacy.type);
     try std.testing.expectEqual(@as(i64, 12), legacy.total);
@@ -6273,7 +6322,7 @@ test "deprecated graph search preserves its response envelope" {
     // Model the strict v0.2 generated response type. Its decoder rejects
     // unknown fields, so this is the compatibility direction that merely
     // accepting pre-discriminator responses in new clients does not cover.
-    const LegacyGraphQueryResultV02 = struct {
+    const LegacyGraphSearchResultV02 = struct {
         type: indexes_openapi.GraphQueryType,
         nodes: ?std.json.Value = null,
         paths: ?std.json.Value = null,
@@ -6283,7 +6332,7 @@ test "deprecated graph search preserves its response envelope" {
     };
     const encoded_legacy_json = try std.json.Stringify.valueAlloc(alloc, encoded_legacy, .{});
     defer alloc.free(encoded_legacy_json);
-    var parsed_v02 = try std.json.parseFromSlice(LegacyGraphQueryResultV02, alloc, encoded_legacy_json, .{});
+    var parsed_v02 = try std.json.parseFromSlice(LegacyGraphSearchResultV02, alloc, encoded_legacy_json, .{});
     defer parsed_v02.deinit();
     try std.testing.expectEqual(indexes_openapi.GraphQueryType.neighbors, parsed_v02.value.type);
     try std.testing.expectEqual(@as(i64, 12), parsed_v02.value.total);
@@ -6350,9 +6399,9 @@ test "canonical graph paths preserve table-qualified node identities" {
     try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].weight_sum);
     try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].objective_value);
 
-    const legacy = try toOpenApiGraphResultWithFormat(alloc, query, .{}, graph_result, .legacy);
-    try std.testing.expect(legacy == .legacy_graph_query_result);
-    try std.testing.expectEqualStrings("shared", legacy.legacy_graph_query_result.paths.?[0].nodes.?[1]);
+    const legacy = try toOpenApiStatefulGraphResultWithFormat(alloc, query, .{}, graph_result, .legacy);
+    try std.testing.expect(legacy == .legacy_graph_search_result);
+    try std.testing.expectEqualStrings("shared", legacy.legacy_graph_search_result.paths.?[0].nodes.?[1]);
 }
 
 test "canonical graph path objective exposes max weight product" {
@@ -6370,45 +6419,45 @@ test "canonical graph path objective exposes max weight product" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.4), graphPathObjectiveValue(path, .max_weight), 0.000001);
 }
 
-test "generated graph result union decodes pre-discriminator legacy responses" {
+test "generated stateful graph result union decodes pre-discriminator legacy responses" {
     const raw =
         \\{"type":"neighbors","total":12}
     ;
 
     var stdlib_parsed = try std.json.parseFromSlice(
-        indexes_openapi.GraphResult,
+        indexes_openapi.StatefulGraphResult,
         std.testing.allocator,
         raw,
         .{},
     );
     defer stdlib_parsed.deinit();
-    try std.testing.expect(stdlib_parsed.value == .legacy_graph_query_result);
-    try std.testing.expectEqual(@as(i64, 12), stdlib_parsed.value.legacy_graph_query_result.total);
+    try std.testing.expect(stdlib_parsed.value == .legacy_graph_search_result);
+    try std.testing.expectEqual(@as(i64, 12), stdlib_parsed.value.legacy_graph_search_result.total);
 
     var simd_parsed = try ant_json.parseFromSlice(
-        indexes_openapi.GraphResult,
+        indexes_openapi.StatefulGraphResult,
         std.testing.allocator,
         raw,
         .{},
     );
     defer simd_parsed.deinit();
-    try std.testing.expect(simd_parsed.value == .legacy_graph_query_result);
-    try std.testing.expectEqual(@as(i64, 12), simd_parsed.value.legacy_graph_query_result.total);
+    try std.testing.expect(simd_parsed.value == .legacy_graph_search_result);
+    try std.testing.expectEqual(@as(i64, 12), simd_parsed.value.legacy_graph_search_result.total);
 }
 
-test "generated graph result union rejects an explicit null discriminator" {
+test "generated stateful graph result union rejects an explicit null discriminator" {
     const raw =
         \\{"kind":null,"type":"neighbors","total":12}
     ;
 
     try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(
-        indexes_openapi.GraphResult,
+        indexes_openapi.StatefulGraphResult,
         std.testing.allocator,
         raw,
         .{},
     ));
     try std.testing.expectError(error.UnexpectedToken, ant_json.parseFromSlice(
-        indexes_openapi.GraphResult,
+        indexes_openapi.StatefulGraphResult,
         std.testing.allocator,
         raw,
         .{},
@@ -7260,7 +7309,7 @@ fn parsePruner(generated: indexes_openapi.Pruner) !fusion_mod.Pruner {
     };
 }
 
-fn buildRerankerQueryText(alloc: std.mem.Allocator, request: metadata_openapi.QueryRequest) ![]const u8 {
+fn buildRerankerQueryText(alloc: std.mem.Allocator, request: anytype) ![]const u8 {
     if (request.semantic_search) |semantic_search| {
         return try alloc.dupe(u8, semantic_search);
     }
@@ -7371,7 +7420,7 @@ const NormalizedPublicQueryBuckets = struct {
 
 fn normalizePublicQueryBucketsAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     limit: u32,
 ) !NormalizedPublicQueryBuckets {
     var scoring_must = std.ArrayListUnmanaged(db_mod.types.TextQuery).empty;
@@ -9702,7 +9751,7 @@ fn buildSemanticVectorQueries(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,
     table_name: []const u8,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     limit: u32,
 ) !NamedVectorQueries {
     if (request.semantic_search == null and request.embeddings == null) return .{};
@@ -9766,7 +9815,7 @@ fn buildSemanticVectorQueries(
 
 fn buildPreflightSemanticVectorQueries(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     limit: u32,
 ) !NamedVectorQueries {
     if (request.semantic_search == null and request.embeddings == null) return .{};
@@ -9832,12 +9881,14 @@ fn buildPreflightSemanticVectorQueries(
 
 fn buildGraphQueries(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) ![]const db_mod.types.NamedGraphQuery {
-    if (request.graph_queries != null and request.graph_searches != null)
-        return error.InvalidQueryRequest;
-    if (request.graph_queries != null and request.expand_strategy != null)
-        return error.InvalidQueryRequest;
+    if (comptime @hasField(@TypeOf(request), "graph_searches")) {
+        if (request.graph_queries != null and request.graph_searches != null)
+            return error.InvalidQueryRequest;
+        if (request.graph_queries != null and request.expand_strategy != null)
+            return error.InvalidQueryRequest;
+    }
     if (request.graph_queries) |queries| {
         if (queries.map.count() > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
     }
@@ -9865,18 +9916,20 @@ fn buildGraphQueries(
             name_owned = false;
             query_owned = false;
         }
-    } else if (request.graph_searches) |graph_searches| {
-        var it = graph_searches.map.iterator();
-        while (it.next()) |entry| {
-            const name = try alloc.dupe(u8, entry.key_ptr.*);
-            var name_owned = true;
-            errdefer if (name_owned) alloc.free(name);
-            const query = try parseLegacyGraphQuery(alloc, entry.value_ptr.*);
-            var query_owned = true;
-            errdefer if (query_owned) freeGraphQuery(alloc, query);
-            try items.append(alloc, .{ .name = name, .query = query });
-            name_owned = false;
-            query_owned = false;
+    } else if (comptime @hasField(@TypeOf(request), "graph_searches")) {
+        if (request.graph_searches) |graph_searches| {
+            var it = graph_searches.map.iterator();
+            while (it.next()) |entry| {
+                const name = try alloc.dupe(u8, entry.key_ptr.*);
+                var name_owned = true;
+                errdefer if (name_owned) alloc.free(name);
+                const query = try parseLegacyGraphQuery(alloc, entry.value_ptr.*);
+                var query_owned = true;
+                errdefer if (query_owned) freeGraphQuery(alloc, query);
+                try items.append(alloc, .{ .name = name, .query = query });
+                name_owned = false;
+                query_owned = false;
+            }
         }
     }
     return try items.toOwnedSlice(alloc);

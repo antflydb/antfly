@@ -10,8 +10,8 @@ from antfly.client_generated.models.graph_query_unsupported_error import (
 from antfly.client_generated.models.graph_query_unsupported_error_reason import (
     GraphQueryUnsupportedErrorReason,
 )
-from antfly.client_generated.models.legacy_graph_query_result import LegacyGraphQueryResult
-from antfly.client_generated.models.query_result_graph_results import QueryResultGraphResults
+from antfly.client_generated.models.legacy_graph_search_result import LegacyGraphSearchResult
+from antfly.client_generated.models.stateful_graph_query_results import StatefulGraphQueryResults
 from antfly.client_generated.types import Unset
 from antfly.exceptions import AntflyException
 from antfly.graph_results import decode_query_responses
@@ -29,8 +29,8 @@ def _query_response(graph_result: object, operation: str = "result") -> dict[str
     }
 
 
-def test_pre_discriminator_graph_result_decodes_as_legacy() -> None:
-    results = QueryResultGraphResults.from_dict(
+def test_stateful_transport_model_decodes_pre_discriminator_legacy_result() -> None:
+    results = StatefulGraphQueryResults.from_dict(
         {
             "neighbors": {
                 "type": "neighbors",
@@ -40,7 +40,7 @@ def test_pre_discriminator_graph_result_decodes_as_legacy() -> None:
     )
 
     result = results["neighbors"]
-    assert isinstance(result, LegacyGraphQueryResult)
+    assert isinstance(result, LegacyGraphSearchResult)
     assert isinstance(result.kind, Unset)
     assert result.total == 12
 
@@ -141,7 +141,7 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
             expected_graph_queries=path_query,
         )
 
-    with pytest.raises(ValueError, match="requires the canonical graph dialect"):
+    with pytest.raises(ValueError, match="must be auto, canonical, or none"):
         decode_query_responses(
             _query_response(
                 {"type": "shortest_path", "total": 1},
@@ -298,7 +298,7 @@ def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> No
         )
 
 
-def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> None:
+def test_public_query_decoder_accepts_valid_canonical_results() -> None:
     canonical = decode_query_responses(
         _query_response(
             {
@@ -355,51 +355,6 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
     assert not isinstance(nodes.responses, Unset)
     assert not isinstance(nodes.responses[0].graph_results, Unset)
     assert isinstance(nodes.responses[0].graph_results["result"], GraphNodesResult)
-
-    legacy = decode_query_responses(
-        _query_response(
-            {
-                "type": "neighbors",
-                "total": 1,
-            },
-            operation="legacy operation name",
-        )
-    )
-    assert not isinstance(legacy.responses, Unset)
-    assert not isinstance(legacy.responses[0].graph_results, Unset)
-    assert isinstance(legacy.responses[0].graph_results["legacy operation name"], LegacyGraphQueryResult)
-
-    legacy_negative_weight = decode_query_responses(
-        _query_response(
-            {
-                "type": "shortest_path",
-                "total": 1,
-                "paths": [{"total_weight": -0.5}],
-            },
-            operation="legacy operation name",
-        ),
-        graph_dialect="legacy",
-        expected_graph_operations=frozenset({"legacy operation name"}),
-    )
-    assert not isinstance(legacy_negative_weight.responses, Unset)
-
-
-@pytest.mark.parametrize(
-    "legacy_result",
-    [
-        {"type": "neighbors", "total": "wrong"},
-        {"type": "neighbors", "total": 1, "unexpected": True},
-        {"type": "neighbors", "total": 1, "nodes": None},
-        {"type": "neighbors", "total": 1, "nodes": [{"key": 42}]},
-    ],
-)
-def test_legacy_query_decoder_rejects_malformed_known_shape(legacy_result: object) -> None:
-    with pytest.raises(AntflyException):
-        decode_query_responses(
-            _query_response(legacy_result, operation="legacy"),
-            graph_dialect="legacy",
-            expected_graph_operations=frozenset({"legacy"}),
-        )
 
 
 def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse_hydration() -> None:

@@ -148,7 +148,7 @@ pub fn parseSupportedJoinRequestValueAlloc(
     if (root != .object) return error.InvalidQueryRequest;
     const join_value = root.object.get("join") orelse return null;
     if (join_value == .null) return null;
-    var parsed_request = std.json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, alloc, body, .{
+    var parsed_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{
         .allocate = .alloc_always,
     }) catch return error.InvalidQueryRequest;
     defer parsed_request.deinit();

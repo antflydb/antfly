@@ -1,4 +1,4 @@
-import type { GraphResult, IndexStatus } from "@antfly/sdk";
+import type { IndexStatus } from "@antfly/sdk";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GraphIndexExplorer } from "./GraphIndexExplorer";
@@ -125,47 +125,6 @@ describe("GraphIndexExplorer", () => {
         },
       })
     );
-  });
-
-  it("summarizes a minimal pre-discriminator legacy result", async () => {
-    render(
-      <GraphIndexExplorer
-        tableName="papers"
-        indexes={[graphIndex]}
-        onRefreshIndexes={() => undefined}
-        initialResult={{ type: "neighbors", total: 12 } as unknown as GraphResult}
-      />
-    );
-
-    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
-    expect(screen.getByText("12")).toBeTruthy();
-    expect(screen.getByTestId("force-graph").textContent).toContain("0 nodes");
-  });
-
-  it("renders legacy path edges during the compatibility window", async () => {
-    render(
-      <GraphIndexExplorer
-        tableName="papers"
-        indexes={[graphIndex]}
-        onRefreshIndexes={() => undefined}
-        initialResult={
-          {
-            type: "traverse",
-            total: 1,
-            nodes: [
-              {
-                key: "bob",
-                path: ["alice", "bob"],
-                path_edges: [{ source: "alice", target: "bob", type: "cites", weight: 0.8 }],
-              },
-            ],
-          } as GraphResult
-        }
-      />
-    );
-
-    expect(await screen.findByText("Graph Explorer")).toBeTruthy();
-    expect(screen.getByTestId("force-graph").textContent).toContain("2 nodes / 1 edges");
   });
 
   it("keeps same-key path endpoints distinct across tables", async () => {

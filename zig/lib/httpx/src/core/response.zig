@@ -124,7 +124,7 @@ pub const Response = struct {
         var resp = Self.init(allocator, status_code);
         errdefer resp.deinit();
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
-        resp.body = try Json.stringify(allocator, value);
+        resp.body = try Json.stringifyOpenApi(allocator, value);
         resp.body_owned = true;
 
         if (resp.body) |b| {
@@ -212,7 +212,7 @@ pub const ResponseBuilder = struct {
     pub fn json(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
         self.freeOwnedBody();
-        const serialized = try Json.stringify(self.allocator, value);
+        const serialized = try Json.stringifyOpenApi(self.allocator, value);
         self.body_data = serialized;
         self.body_owned = true;
         return self;
@@ -355,6 +355,22 @@ test "Response fromText and fromJson constructors" {
     defer json_resp.deinit();
     try std.testing.expectEqualStrings("application/json", json_resp.contentType().?);
     try std.testing.expect(json_resp.text() != null);
+}
+
+test "OpenAPI JSON responses omit absent optional fields" {
+    const allocator = std.testing.allocator;
+    const Payload = struct {
+        ok: bool,
+        note: ?[]const u8 = null,
+    };
+
+    var response = try Response.fromJson(allocator, 200, Payload{ .ok = true });
+    defer response.deinit();
+    var parsed = try ant_json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(true, parsed.value.object.get("ok").?.bool);
+    try std.testing.expect(parsed.value.object.get("note") == null);
 }
 
 test "ResponseBuilder json replaces previous owned body without leak" {

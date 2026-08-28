@@ -137,8 +137,8 @@ fn rejectForbiddenDocIdentityControlFieldsAlloc(alloc: Allocator, body: []const 
 fn parseOwnedPublicQueryRequestAlloc(
     alloc: Allocator,
     body: []const u8,
-) !std.json.Parsed(metadata_openapi.CanonicalQueryRequest) {
-    return std.json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, alloc, body, .{
+) !std.json.Parsed(metadata_openapi.QueryRequest) {
+    return std.json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
@@ -146,7 +146,7 @@ fn parseOwnedPublicQueryRequestAlloc(
 
 fn parsePublicSearchPlanAlloc(
     alloc: Allocator,
-    query_request: metadata_openapi.CanonicalQueryRequest,
+    query_request: metadata_openapi.QueryRequest,
     published_search_sources: search_sources.PublishedSearchSources,
 ) !SearchPlan {
     var text_clauses = try public_search_request_mod.parseTextClausesAlloc(alloc, query_request);

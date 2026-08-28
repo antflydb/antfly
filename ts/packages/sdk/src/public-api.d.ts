@@ -5915,7 +5915,7 @@ export interface components {
          *     When both search fields (semantic_search, full_text_search) and tree_search
          *     are provided, the search results are used as start nodes for tree navigation.
          */
-        RetrievalQueryRequest: components["schemas"]["CanonicalQueryRequest"] & {
+        RetrievalQueryRequest: components["schemas"]["QueryRequest"] & {
             /** @description Optional tree search configuration */
             tree_search?: components["schemas"]["TreeSearchConfig"];
         };
@@ -6520,7 +6520,7 @@ export interface components {
             ancestors?: components["schemas"]["HierarchyAncestors"];
             children?: components["schemas"]["HierarchyChildren"];
         } & (unknown & unknown & unknown);
-        CanonicalQueryRequest: {
+        QueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
              * @example wikipedia
@@ -6909,9 +6909,7 @@ export interface components {
              *     Put multiple counts over one pattern in the same `match` return
              *     object so they share one complete anchor scan.
              */
-            graph_queries?: {
-                [key: string]: components["schemas"]["GraphQuery"];
-            };
+            graph_queries?: components["schemas"]["GraphQueries"];
             /**
              * @description Optional Handlebars template string for rendering document content in RAG queries.
              *     Template has access to document fields via `{{this.fields.fieldName}}`.
@@ -7064,7 +7062,7 @@ export interface components {
             };
         };
         /** @description Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window. */
-        QueryRequest: components["schemas"]["CanonicalQueryRequest"] & {
+        StatefulQueryRequest: components["schemas"]["QueryRequest"] & {
             /**
              * @deprecated
              * @description Deprecated compatibility alias for the v0.2 graph query contract.
@@ -7664,12 +7662,16 @@ export interface components {
              */
             relation: "exact" | "gte";
         };
-        /** @description Responses from multiple query operations. */
+        /** @description Canonical responses from multiple query operations. */
         QueryResponses: {
             responses?: components["schemas"]["QueryResult"][];
         };
-        /** @description Result of a query operation as an array of results and a count. */
-        QueryResult: {
+        /** @description Responses from the stateful compatibility transport. Canonical requests still produce canonical graph result variants; deprecated graph_searches may produce LegacyGraphSearchResult values during the transition window. */
+        StatefulQueryResponses: {
+            responses?: components["schemas"]["StatefulQueryResult"][];
+        };
+        /** @description Fields shared by canonical and stateful query result envelopes. */
+        QueryResultBase: {
             hits?: components["schemas"]["QueryHits"];
             /**
              * @description Aggregation results keyed by the user-defined aggregation names from the request.
@@ -7681,10 +7683,6 @@ export interface components {
             /** @description Analysis results like PCA and t-SNE per index embeddings. */
             analyses?: {
                 [key: string]: components["schemas"]["AnalysesResult"];
-            };
-            /** @description Results from canonical graph_queries or deprecated graph_searches. */
-            graph_results?: {
-                [key: string]: components["schemas"]["GraphResult"];
             };
             /** @description Detailed execution profile (present when `profile: true` in request). */
             profile?: components["schemas"]["QueryProfile"];
@@ -7702,6 +7700,14 @@ export interface components {
             error?: string;
             /** @description Which table this result came from */
             table?: string;
+        };
+        /** @description Result of a canonical query operation. */
+        QueryResult: components["schemas"]["QueryResultBase"] & {
+            graph_results?: components["schemas"]["GraphQueryResults"];
+        };
+        /** @description Result emitted by the stateful compatibility transport. */
+        StatefulQueryResult: components["schemas"]["QueryResultBase"] & {
+            graph_results?: components["schemas"]["StatefulGraphQueryResults"];
         };
         /**
          * @description Status of a linear merge page operation:
@@ -12284,6 +12290,10 @@ export interface components {
             k_shortest_paths: components["schemas"]["GraphKShortestPaths"];
         };
         GraphQuery: components["schemas"]["GraphMatchQuery"] | components["schemas"]["GraphTraverseQuery"] | components["schemas"]["GraphShortestPathQuery"] | components["schemas"]["GraphKShortestPathsQuery"];
+        /** @description Named canonical graph operations. A request may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy. */
+        GraphQueries: {
+            [key: string]: components["schemas"]["GraphQuery"];
+        };
         /**
          * @description Configuration for pruning search results based on score quality.
          *     Helps filter out low-relevance results in RAG pipelines by detecting
@@ -12573,7 +12583,11 @@ export interface components {
             stats: components["schemas"]["GraphQueryStats"];
         };
         /** @description A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators. */
-        GraphQueryResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"];
+        GraphResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"];
+        /** @description Canonical graph results keyed by graph_queries operation name. */
+        GraphQueryResults: {
+            [key: string]: components["schemas"]["GraphResult"];
+        };
         /**
          * @deprecated
          * @description Deprecated graph_searches node response with an unqualified string path.
@@ -12621,7 +12635,7 @@ export interface components {
          * @deprecated
          * @description Deprecated graph_searches response envelope.
          */
-        LegacyGraphQueryResult: {
+        LegacyGraphSearchResult: {
             /**
              * @description Optional transition discriminator accepted by current SDKs. Servers omit it for graph_searches during the v0.2 compatibility release so strict previously generated clients continue to decode the original response shape.
              * @enum {string}
@@ -12650,8 +12664,12 @@ export interface components {
              */
             took?: number;
         };
-        /** @description Result value stored in QueryResult.graph_results. Canonical graph_queries results are GraphQueryResult variants; the deprecated legacy shape remains accepted only for graph_searches during its compatibility window. */
-        GraphResult: components["schemas"]["GraphQueryResult"] | components["schemas"]["LegacyGraphQueryResult"];
+        /** @description Graph result emitted by the stateful compatibility transport. Canonical graph_queries produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the compatibility window. */
+        StatefulGraphResult: components["schemas"]["GraphResult"] | components["schemas"]["LegacyGraphSearchResult"];
+        /** @description Stateful graph results keyed by operation name. Legacy values are possible only when the corresponding request used graph_searches. */
+        StatefulGraphQueryResults: {
+            [key: string]: components["schemas"]["StatefulGraphResult"];
+        };
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
          *     Useful for testing evaluators without running a query.
@@ -15776,7 +15794,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QueryRequest"];
+                "application/json": components["schemas"]["StatefulQueryRequest"];
                 "application/x-ndjson": string;
             };
         };
@@ -15794,7 +15812,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryResponses"];
+                    "application/json": components["schemas"]["StatefulQueryResponses"];
                 };
             };
             /** @description Invalid query request */
@@ -16077,7 +16095,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["QueryRequest"];
+                "application/json": components["schemas"]["StatefulQueryRequest"];
                 "application/x-ndjson": string;
             };
         };
@@ -16095,7 +16113,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["QueryResponses"];
+                    "application/json": components["schemas"]["StatefulQueryResponses"];
                 };
             };
             400: components["responses"]["BadRequest"];

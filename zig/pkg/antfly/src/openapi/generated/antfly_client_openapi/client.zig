@@ -764,13 +764,13 @@ pub const Client = struct {
 
     /// Perform a global query
     /// POST /db/v1/query
-    pub fn globalQuery(self: *@This(), body: types.QueryRequest) !ApiResponse(types.QueryResponses) {
+    pub fn globalQuery(self: *@This(), body: types.StatefulQueryRequest) !ApiResponse(types.StatefulQueryResponses) {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/query", .{self.base_url});
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.QueryResponses).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.StatefulQueryResponses).fromResponse(self.allocator, &resp);
     }
 
     /// Restore multiple tables from a backup
@@ -1322,7 +1322,7 @@ pub const Client = struct {
 
     /// Query a specific table
     /// POST /db/v1/tables/{tableName}/query
-    pub fn queryTable(self: *@This(), table_name: []const u8, body: types.QueryRequest) !ApiResponse(types.QueryResponses) {
+    pub fn queryTable(self: *@This(), table_name: []const u8, body: types.StatefulQueryRequest) !ApiResponse(types.StatefulQueryResponses) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/query", .{ self.base_url, encoded_table_name });
@@ -1330,7 +1330,7 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(types.QueryResponses).fromResponse(self.allocator, &resp);
+        return ApiResponse(types.StatefulQueryResponses).fromResponse(self.allocator, &resp);
     }
 
     /// List table repair issues

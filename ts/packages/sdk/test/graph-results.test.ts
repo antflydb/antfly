@@ -202,39 +202,6 @@ describe("graph result admission", () => {
     ).toThrow("names do not match the requested aggregates");
   });
 
-  it("retains stateful legacy compatibility only for legacy requests", () => {
-    const request = {
-      graph_searches: { "legacy operation": { type: "neighbors", index_name: "graph_idx" } },
-    } as QueryRequest;
-    expect(() =>
-      validateGraphQueryResponses(responses({ type: "neighbors", total: 1 }, "legacy operation"), [
-        request,
-      ])
-    ).not.toThrow();
-    expect(() =>
-      validateGraphQueryResponses(
-        responses(
-          { type: "shortest_path", total: 1, paths: [{ total_weight: -0.5 }] },
-          "legacy operation"
-        ),
-        [request]
-      )
-    ).not.toThrow();
-
-    for (const malformed of [
-      { type: "neighbors" },
-      { total: 1 },
-      { type: "unknown", total: 1 },
-      { type: "neighbors", total: null },
-      { type: "neighbors", total: 1, unexpected: true },
-      { type: "neighbors", total: 1, nodes: [{ key: 42 }] },
-    ]) {
-      expect(() =>
-        validateGraphQueryResponses(responses(malformed, "legacy operation"), [request])
-      ).toThrow();
-    }
-  });
-
   it("rejects unrequested documents while allowing sparse requested hydration", () => {
     const nodeResult = (document?: Record<string, unknown>) => ({
       kind: "nodes",

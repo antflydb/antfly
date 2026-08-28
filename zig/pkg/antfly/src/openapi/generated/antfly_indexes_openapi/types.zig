@@ -6080,6 +6080,9 @@ pub const GraphPathObjective = enum {
     }
 };
 
+/// Named canonical graph operations. A request may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy.
+pub const GraphQueries = std.json.ArrayHashMap(GraphQuery);
+
 pub const GraphQuery = union(enum) {
     graph_match_query: *GraphMatchQuery,
     graph_k_shortest_paths_query: *GraphKShortestPathsQuery,
@@ -6259,98 +6262,8 @@ pub const GraphQueryParams = struct {
     }
 };
 
-/// A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators.
-pub const GraphQueryResult = union(enum) {
-    graph_nodes_result: *GraphNodesResult,
-    graph_aggregates_result: *GraphAggregatesResult,
-    graph_bindings_result: *GraphBindingsResult,
-
-    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => return null,
-        };
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
-        inline for (keys) |key| {
-            if (object.contains(key)) return true;
-        }
-        return false;
-    }
-
-    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
-        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
-        const value = try allocator.create(T);
-        value.* = parsed;
-        return value;
-    }
-
-    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
-        const DiscriminatorProbe = union(enum) {
-            missing,
-            value: []const u8,
-            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
-                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
-            }
-        };
-        const Probe = struct { kind: DiscriminatorProbe = .missing };
-        var probe_options = options;
-        probe_options.ignore_unknown_fields = true;
-        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
-        switch (probe.kind) {
-            .value => |disc_str| {
-                if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
-                if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
-                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
-                return error.UnexpectedToken;
-            },
-            .missing => {
-                return error.MissingField;
-            },
-        }
-    }
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
-        return try jsonParseFromValue(allocator, value, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("kind") orelse {
-            return error.MissingField;
-        };
-        const disc_str = switch (disc_val) {
-            .string => |value| value,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "nodes")) {
-            const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .graph_nodes_result = parsed };
-        }
-        if (std.mem.eql(u8, disc_str, "aggregates")) {
-            const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .graph_aggregates_result = parsed };
-        }
-        if (std.mem.eql(u8, disc_str, "bindings")) {
-            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .graph_bindings_result = parsed };
-        }
-        return error.UnexpectedToken;
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .graph_nodes_result => |v| try jw.write(v.*),
-            .graph_aggregates_result => |v| try jw.write(v.*),
-            .graph_bindings_result => |v| try jw.write(v.*),
-        }
-    }
-};
+/// Canonical graph results keyed by graph_queries operation name.
+pub const GraphQueryResults = std.json.ArrayHashMap(GraphResult);
 
 pub const GraphQueryStats = struct {
     /// Number of primary result items returned (nodes, paths, rows, or aggregates).
@@ -6529,12 +6442,11 @@ pub const GraphResolverConfig = struct {
     }
 };
 
-/// Result value stored in QueryResult.graph_results. Canonical graph_queries results are GraphQueryResult variants; the deprecated legacy shape remains accepted only for graph_searches during its compatibility window.
+/// A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators.
 pub const GraphResult = union(enum) {
     graph_nodes_result: *GraphNodesResult,
     graph_aggregates_result: *GraphAggregatesResult,
     graph_bindings_result: *GraphBindingsResult,
-    legacy_graph_query_result: *LegacyGraphQueryResult,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
         const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
@@ -6577,11 +6489,10 @@ pub const GraphResult = union(enum) {
                 if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
-                if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
                 return error.UnexpectedToken;
             },
             .missing => {
-                return .{ .legacy_graph_query_result = try parseStructuralVariantFromSlice(LegacyGraphQueryResult, allocator, input, options) };
+                return error.MissingField;
             },
         }
     }
@@ -6594,8 +6505,7 @@ pub const GraphResult = union(enum) {
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         if (source != .object) return error.UnexpectedToken;
         const disc_val = source.object.get("kind") orelse {
-            const parsed = try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .legacy_graph_query_result = parsed };
+            return error.MissingField;
         };
         const disc_str = switch (disc_val) {
             .string => |value| value,
@@ -6613,10 +6523,6 @@ pub const GraphResult = union(enum) {
             const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_bindings_result = parsed };
         }
-        if (std.mem.eql(u8, disc_str, "legacy")) {
-            const parsed = try parseStructuralVariant(LegacyGraphQueryResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .legacy_graph_query_result = parsed };
-        }
         return error.UnexpectedToken;
     }
 
@@ -6625,7 +6531,6 @@ pub const GraphResult = union(enum) {
             .graph_nodes_result => |v| try jw.write(v.*),
             .graph_aggregates_result => |v| try jw.write(v.*),
             .graph_bindings_result => |v| try jw.write(v.*),
-            .legacy_graph_query_result => |v| try jw.write(v.*),
         }
     }
 };
@@ -7801,76 +7706,6 @@ pub const LegacyGraphQuery = struct {
     }
 };
 
-/// Deprecated graph_searches response envelope.
-pub const LegacyGraphQueryResult = struct {
-    /// Optional transition discriminator accepted by current SDKs. Servers omit it for graph_searches during the v0.2 compatibility release so strict previously generated clients continue to decode the original response shape.
-    kind: ?[]const u8 = null,
-    type: GraphQueryType,
-    /// Result nodes. Optional for compatibility with v0.2 responses.
-    nodes: ?[]const LegacyGraphResultNode = null,
-    /// Result paths. Optional for compatibility with v0.2 responses.
-    paths: ?[]const Path = null,
-    /// Deprecated graph_searches pattern results; use rows for graph_queries.
-    matches: ?[]const PatternMatch = null,
-    /// Deprecated graph_searches result count; use stats or a named count aggregate.
-    total: i64,
-    /// Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
-    took: ?i64 = null,
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = true },
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = false },
-            .{ .json_name = "nodes", .zig_name = "nodes", .rejects_null = true },
-            .{ .json_name = "paths", .zig_name = "paths", .rejects_null = true },
-            .{ .json_name = "matches", .zig_name = "matches", .rejects_null = true },
-            .{ .json_name = "total", .zig_name = "total", .rejects_null = false },
-            .{ .json_name = "took", .zig_name = "took", .rejects_null = true },
-        }, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = true },
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = false },
-            .{ .json_name = "nodes", .zig_name = "nodes", .rejects_null = true },
-            .{ .json_name = "paths", .zig_name = "paths", .rejects_null = true },
-            .{ .json_name = "matches", .zig_name = "matches", .rejects_null = true },
-            .{ .json_name = "total", .zig_name = "total", .rejects_null = false },
-            .{ .json_name = "took", .zig_name = "took", .rejects_null = true },
-        }, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.kind) |value| {
-            try jw.objectField("kind");
-            try jw.write(value);
-        }
-        try jw.objectField("type");
-        try jw.write(self.type);
-        if (self.nodes) |value| {
-            try jw.objectField("nodes");
-            try jw.write(value);
-        }
-        if (self.paths) |value| {
-            try jw.objectField("paths");
-            try jw.write(value);
-        }
-        if (self.matches) |value| {
-            try jw.objectField("matches");
-            try jw.write(value);
-        }
-        try jw.objectField("total");
-        try jw.write(self.total);
-        if (self.took) |value| {
-            try jw.objectField("took");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
 /// Deprecated graph_searches node response with an unqualified string path.
 pub const LegacyGraphResultNode = struct {
     /// Document key
@@ -7962,6 +7797,76 @@ pub const LegacyGraphResultNode = struct {
         }
         if (self.edges) |value| {
             try jw.objectField("edges");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Deprecated graph_searches response envelope.
+pub const LegacyGraphSearchResult = struct {
+    /// Optional transition discriminator accepted by current SDKs. Servers omit it for graph_searches during the v0.2 compatibility release so strict previously generated clients continue to decode the original response shape.
+    kind: ?[]const u8 = null,
+    type: GraphQueryType,
+    /// Result nodes. Optional for compatibility with v0.2 responses.
+    nodes: ?[]const LegacyGraphResultNode = null,
+    /// Result paths. Optional for compatibility with v0.2 responses.
+    paths: ?[]const Path = null,
+    /// Deprecated graph_searches pattern results; use rows for graph_queries.
+    matches: ?[]const PatternMatch = null,
+    /// Deprecated graph_searches result count; use stats or a named count aggregate.
+    total: i64,
+    /// Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
+    took: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = true },
+            .{ .json_name = "type", .zig_name = "type", .rejects_null = false },
+            .{ .json_name = "nodes", .zig_name = "nodes", .rejects_null = true },
+            .{ .json_name = "paths", .zig_name = "paths", .rejects_null = true },
+            .{ .json_name = "matches", .zig_name = "matches", .rejects_null = true },
+            .{ .json_name = "total", .zig_name = "total", .rejects_null = false },
+            .{ .json_name = "took", .zig_name = "took", .rejects_null = true },
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = true },
+            .{ .json_name = "type", .zig_name = "type", .rejects_null = false },
+            .{ .json_name = "nodes", .zig_name = "nodes", .rejects_null = true },
+            .{ .json_name = "paths", .zig_name = "paths", .rejects_null = true },
+            .{ .json_name = "matches", .zig_name = "matches", .rejects_null = true },
+            .{ .json_name = "total", .zig_name = "total", .rejects_null = false },
+            .{ .json_name = "took", .zig_name = "took", .rejects_null = true },
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.paths) |value| {
+            try jw.objectField("paths");
+            try jw.write(value);
+        }
+        if (self.matches) |value| {
+            try jw.objectField("matches");
+            try jw.write(value);
+        }
+        try jw.objectField("total");
+        try jw.write(self.total);
+        if (self.took) |value| {
+            try jw.objectField("took");
             try jw.write(value);
         }
         try jw.endObject();
@@ -8578,6 +8483,110 @@ pub const Pruner = struct {
 pub const SortDirection = antfly_sort_openapi.SortDirection;
 
 pub const SortField = antfly_sort_openapi.SortField;
+
+/// Stateful graph results keyed by operation name. Legacy values are possible only when the corresponding request used graph_searches.
+pub const StatefulGraphQueryResults = std.json.ArrayHashMap(StatefulGraphResult);
+
+/// Graph result emitted by the stateful compatibility transport. Canonical graph_queries produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the compatibility window.
+pub const StatefulGraphResult = union(enum) {
+    graph_nodes_result: *GraphNodesResult,
+    graph_aggregates_result: *GraphAggregatesResult,
+    graph_bindings_result: *GraphBindingsResult,
+    legacy_graph_search_result: *LegacyGraphSearchResult,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    fn parseStructuralVariantFromSlice(comptime T: type, allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !*T {
+        const parsed = try std.json.parseFromSliceLeaky(T, allocator, input, options);
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    pub fn jsonParseFromSliceLeaky(allocator: std.mem.Allocator, input: []const u8, options: std.json.ParseOptions) !@This() {
+        const DiscriminatorProbe = union(enum) {
+            missing,
+            value: []const u8,
+            pub fn jsonParse(probe_allocator: std.mem.Allocator, probe_source: anytype, probe_options: std.json.ParseOptions) !@This() {
+                return .{ .value = try std.json.innerParse([]const u8, probe_allocator, probe_source, probe_options) };
+            }
+        };
+        const Probe = struct { kind: DiscriminatorProbe = .missing };
+        var probe_options = options;
+        probe_options.ignore_unknown_fields = true;
+        const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
+        switch (probe.kind) {
+            .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_search_result = try parseStructuralVariantFromSlice(LegacyGraphSearchResult, allocator, input, options) };
+                return error.UnexpectedToken;
+            },
+            .missing => {
+                return .{ .legacy_graph_search_result = try parseStructuralVariantFromSlice(LegacyGraphSearchResult, allocator, input, options) };
+            },
+        }
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.innerParse(std.json.Value, allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("kind") orelse {
+            const parsed = try parseStructuralVariant(LegacyGraphSearchResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .legacy_graph_search_result = parsed };
+        };
+        const disc_str = switch (disc_val) {
+            .string => |value| value,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "nodes")) {
+            const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_nodes_result = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "aggregates")) {
+            const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_aggregates_result = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_bindings_result = parsed };
+        }
+        if (std.mem.eql(u8, disc_str, "legacy")) {
+            const parsed = try parseStructuralVariant(LegacyGraphSearchResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .legacy_graph_search_result = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .graph_nodes_result => |v| try jw.write(v.*),
+            .graph_aggregates_result => |v| try jw.write(v.*),
+            .graph_bindings_result => |v| try jw.write(v.*),
+            .legacy_graph_search_result => |v| try jw.write(v.*),
+        }
+    }
+};
 
 /// A single result from graph traversal
 pub const TraversalResult = struct {

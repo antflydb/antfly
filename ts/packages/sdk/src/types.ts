@@ -56,6 +56,8 @@ export type QueryResult = components["schemas"]["QueryResult"];
 export type QueryHit = components["schemas"]["QueryHit"];
 export type QueryHitsTotal = components["schemas"]["QueryHitsTotal"];
 export type QueryResponses = components["schemas"]["QueryResponses"];
+/** Stateful transport response; legacy graph values appear only for old graph_searches clients. */
+export type StatefulQueryResponses = components["schemas"]["StatefulQueryResponses"];
 
 export interface QueryHitsTotalFormatOptions {
   locale?: Intl.LocalesArgument;
@@ -221,11 +223,10 @@ export type PatternStep = components["schemas"]["PatternStep"];
 /** @deprecated Compatibility type for legacy graph result matches. */
 export type PatternMatch = components["schemas"]["PatternMatch"];
 export type GraphResult = components["schemas"]["GraphResult"];
-export type GraphQueryResult = components["schemas"]["GraphQueryResult"];
 export type GraphBindingsResult = components["schemas"]["GraphBindingsResult"];
 export type GraphAggregatesResult = components["schemas"]["GraphAggregatesResult"];
 export type GraphNodesResult = components["schemas"]["GraphNodesResult"];
-export type LegacyGraphQueryResult = components["schemas"]["LegacyGraphQueryResult"];
+export type LegacyGraphSearchResult = components["schemas"]["LegacyGraphSearchResult"];
 export type GraphAggregateValue = components["schemas"]["GraphAggregateValue"];
 export type GraphQueryStats = components["schemas"]["GraphQueryStats"];
 export type GraphResultRow = components["schemas"]["GraphResultRow"];

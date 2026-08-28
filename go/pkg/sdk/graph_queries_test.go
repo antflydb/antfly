@@ -613,13 +613,13 @@ func TestGraphIdentifiersReserveControlTokens(t *testing.T) {
 	}
 }
 
-func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
-	var canonical GraphQueryResult
+func TestGraphResultUsesStableDiscriminator(t *testing.T) {
+	var canonical GraphResult
 	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &canonical); err != nil {
 		t.Fatal(err)
 	}
 
-	value, err := DecodeGraphQueryResult(canonical)
+	value, err := DecodeCanonicalGraphResult(canonical)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,52 +632,34 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	}
 
 	var result GraphResult
-	if err := json.Unmarshal([]byte(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}`), &result); err != nil {
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &result); err != nil {
 		t.Fatal(err)
 	}
 	value, err = DecodeGraphResult(result)
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy, ok := value.(LegacyGraphQueryResult)
+	nodes, ok = value.(GraphNodesResult)
 	if !ok {
-		t.Fatalf("result = %T, want LegacyGraphQueryResult", value)
-	}
-	if legacy.Type != GraphQueryTypeNeighbors {
-		t.Fatalf("legacy type = %q, want neighbors", legacy.Type)
-	}
-	if err := json.Unmarshal([]byte(`{"type":"shortest_path","total":1,"paths":[{"total_weight":-0.5}]}`), &result); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeGraphResult(result); err != nil {
-		t.Fatalf("v0.2 finite negative path weight must remain compatible: %v", err)
+		t.Fatalf("result = %T, want GraphNodesResult", value)
 	}
 
 	for _, malformed := range []string{
+		`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":1}`,
 		`{"type":"neighbors"}`,
-		`{"type":"neighbors","total":null}`,
-		`{"type":"unknown","total":0}`,
 		`{"kind":null,"type":"neighbors","total":0}`,
-		`{"type":"neighbors","total":0,"unexpected":true}`,
-		`{"type":"neighbors","total":0,"nodes":null}`,
+		`{"kind":"unknown"}`,
 	} {
 		if err := json.Unmarshal([]byte(malformed), &result); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := DecodeGraphResult(result); err == nil {
-			t.Fatalf("expected malformed legacy graph result to fail: %s", malformed)
+			t.Fatalf("expected malformed canonical graph result to fail: %s", malformed)
 		}
-	}
-
-	if err := json.Unmarshal([]byte(`{"kind":"unknown"}`), &result); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeGraphResult(result); err == nil {
-		t.Fatal("expected unknown graph result kind to fail")
 	}
 }
 
-func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
+func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 	decode := func(encoded string) GraphResult {
 		t.Helper()
 		var result GraphResult
@@ -687,7 +669,6 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 		return result
 	}
 	canonical := decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"application_field":{"nested":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
-	legacy := decode(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":0}`)
 	var traversal GraphQuery
 	if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]},"include_documents":true}}`), &traversal); err != nil {
 		t.Fatal(err)
@@ -713,14 +694,6 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 		t.Fatalf("valid canonical response: %v", err)
 	}
 
-	legacyRequest := []QueryRequest{{GraphSearches: map[string]LegacyGraphQuery{"walk": {}}}}
-	legacyResponse := QueryResponses{Responses: []QueryResult{{
-		GraphResults: map[string]GraphResult{"walk": legacy},
-	}}}
-	if err := validateQueryGraphResponses(legacyRequest, &legacyResponse); err != nil {
-		t.Fatalf("valid legacy response: %v", err)
-	}
-
 	tests := []struct {
 		name      string
 		requests  []QueryRequest
@@ -728,16 +701,12 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 		contains  string
 	}{
 		{
-			name:      "canonical rejects legacy",
-			requests:  canonicalRequest,
-			responses: legacyResponse,
-			contains:  "canonical graph result requires a discriminator",
-		},
-		{
-			name:      "legacy rejects canonical",
-			requests:  legacyRequest,
-			responses: canonicalResponse,
-			contains:  "legacy graph result requires discriminator",
+			name:     "canonical rejects legacy",
+			requests: canonicalRequest,
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": decode(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":0}`)},
+			}}},
+			contains: "canonical graph result requires a discriminator",
 		},
 		{
 			name:     "operation names must match",
@@ -1003,11 +972,11 @@ func TestDecodeGraphResultForQueryEnforcesOperationCardinalityAndPathOwnership(t
 }
 
 func TestCanonicalGraphResultPreservesOpaqueHydratedJSON(t *testing.T) {
-	var canonical GraphQueryResult
+	var canonical GraphResult
 	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"title":"alpha","nested":{"values":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`), &canonical); err != nil {
 		t.Fatal(err)
 	}
-	value, err := DecodeGraphQueryResult(canonical)
+	value, err := DecodeCanonicalGraphResult(canonical)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1034,11 +1003,11 @@ func TestCanonicalGraphResultRejectsRowsOverSchemaPropertyLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var canonical GraphQueryResult
+	var canonical GraphResult
 	if err := json.Unmarshal(encoded, &canonical); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DecodeGraphQueryResult(canonical); err == nil || !strings.Contains(err.Error(), "between 1 and 64 properties") {
+	if _, err := DecodeCanonicalGraphResult(canonical); err == nil || !strings.Contains(err.Error(), "between 1 and 64 properties") {
 		t.Fatalf("expected row property limit error, got %v", err)
 	}
 }
@@ -1096,11 +1065,11 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 
 	for _, encoded := range malformed {
 		t.Run(encoded, func(t *testing.T) {
-			var canonical GraphQueryResult
+			var canonical GraphResult
 			if err := json.Unmarshal([]byte(encoded), &canonical); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := DecodeGraphQueryResult(canonical); err == nil {
+			if _, err := DecodeCanonicalGraphResult(canonical); err == nil {
 				t.Fatal("expected canonical graph query result to be rejected")
 			}
 

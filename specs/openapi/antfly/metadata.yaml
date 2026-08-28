@@ -6027,7 +6027,7 @@ components:
         When both search fields (semantic_search, full_text_search) and tree_search
         are provided, the search results are used as start nodes for tree navigation.
       allOf:
-        - $ref: "#/components/schemas/CanonicalQueryRequest"
+        - $ref: "#/components/schemas/QueryRequest"
         - type: object
           properties:
             tree_search:
@@ -6939,7 +6939,7 @@ components:
         children:
           $ref: "#/components/schemas/HierarchyChildren"
           x-go-type-skip-optional-pointer: false
-    CanonicalQueryRequest: # Based on remoteindex.Query
+    QueryRequest: # Based on remoteindex.Query
       type: object
       not:
         anyOf:
@@ -7410,12 +7410,7 @@ components:
         analyses:
           $ref: "#/components/schemas/Analyses"
         graph_queries:
-          type: object
-          maxProperties: 64
-          additionalProperties:
-            $ref: "indexes.yaml#/components/schemas/GraphQuery"
-          x-antfly-property-name-schema:
-            $ref: "generated/graph_identifier.yaml#/components/schemas/GraphIdentifier"
+          $ref: "indexes.yaml#/components/schemas/GraphQueries"
           description: |
             Declarative graph matching, traversal, and path queries. A nested node
             `filter` is a typed, non-scoring stored-document predicate. It shares
@@ -7576,13 +7571,13 @@ components:
               }
             }
             ```
-    QueryRequest:
+    StatefulQueryRequest:
       description: >-
         Stateful Antfly query request. Canonical clients use graph_queries;
         deprecated graph_searches is retained only at the stateful public
         transport boundary for the v0.2 transition window.
       allOf:
-        - $ref: '#/components/schemas/CanonicalQueryRequest'
+        - $ref: '#/components/schemas/QueryRequest'
         - type: object
           not:
             anyOf:
@@ -8362,15 +8357,26 @@ components:
           description: Whether value is exact or a lower bound.
     QueryResponses:
       type: object
-      description: Responses from multiple query operations.
+      description: Canonical responses from multiple query operations.
       properties:
         responses:
           type: array
           items:
             $ref: "#/components/schemas/QueryResult"
-    QueryResult:
+    StatefulQueryResponses:
       type: object
-      description: Result of a query operation as an array of results and a count.
+      description: >-
+        Responses from the stateful compatibility transport. Canonical requests
+        still produce canonical graph result variants; deprecated graph_searches
+        may produce LegacyGraphSearchResult values during the transition window.
+      properties:
+        responses:
+          type: array
+          items:
+            $ref: "#/components/schemas/StatefulQueryResult"
+    QueryResultBase:
+      type: object
+      description: Fields shared by canonical and stateful query result envelopes.
       required:
         - took
         - status
@@ -8389,11 +8395,6 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/AnalysesResult"
           description: Analysis results like PCA and t-SNE per index embeddings.
-        graph_results:
-          type: object
-          additionalProperties:
-            $ref: "indexes.yaml#/components/schemas/GraphResult"
-          description: Results from canonical graph_queries or deprecated graph_searches.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -8415,6 +8416,22 @@ components:
         table:
           type: string
           description: Which table this result came from
+    QueryResult:
+      description: Result of a canonical query operation.
+      allOf:
+        - $ref: "#/components/schemas/QueryResultBase"
+        - type: object
+          properties:
+            graph_results:
+              $ref: "indexes.yaml#/components/schemas/GraphQueryResults"
+    StatefulQueryResult:
+      description: Result emitted by the stateful compatibility transport.
+      allOf:
+        - $ref: "#/components/schemas/QueryResultBase"
+        - type: object
+          properties:
+            graph_results:
+              $ref: "indexes.yaml#/components/schemas/StatefulGraphQueryResults"
     LinearMergePageStatus:
       type: string
       enum:
@@ -10051,7 +10068,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryRequest"
+              $ref: "#/components/schemas/StatefulQueryRequest"
           application/x-ndjson:
             schema:
               type: string
@@ -10073,7 +10090,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryResponses"
+                $ref: "#/components/schemas/StatefulQueryResponses"
         "400":
           description: Invalid query request
           content:
@@ -10460,7 +10477,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/QueryRequest" # Table name in path takes precedence
+              $ref: "#/components/schemas/StatefulQueryRequest" # Table name in path takes precedence
           application/x-ndjson:
             schema:
               type: string
@@ -10482,7 +10499,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/QueryResponses"
+                $ref: "#/components/schemas/StatefulQueryResponses"
         "400":
           $ref: "#/components/responses/BadRequest"
         "409":

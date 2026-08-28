@@ -297,7 +297,7 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 }
 
 func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
-	var graphResult antfly.GraphQueryResult
+	var graphResult antfly.GraphResult
 	err := graphResult.FromGraphNodesResult(antfly.GraphNodesResult{
 		Kind: antfly.GraphNodesResultKindNodes,
 		Nodes: []antfly.GraphResultNode{
@@ -342,18 +342,14 @@ func TestBuildGraphVisualizationConvertsGraphResults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("construct graph result: %v", err)
 	}
-	var wireResult antfly.GraphResult
-	if err := wireResult.FromGraphQueryResult(graphResult); err != nil {
-		t.Fatalf("construct graph result envelope: %v", err)
-	}
-	if _, err := antfly.DecodeCanonicalGraphResult(wireResult); err != nil {
+	if _, err := antfly.DecodeCanonicalGraphResult(graphResult); err != nil {
 		t.Fatalf("decode graph result envelope: %v", err)
 	}
 	resp := antfly.QueryResponses{
 		Responses: []antfly.QueryResult{
 			{
 				GraphResults: map[string]antfly.GraphResult{
-					"relations": wireResult,
+					"relations": graphResult,
 				},
 			},
 		},

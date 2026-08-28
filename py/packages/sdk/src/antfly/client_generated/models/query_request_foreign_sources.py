@@ -10,11 +10,11 @@ if TYPE_CHECKING:
     from ..models.foreign_source import ForeignSource
 
 
-T = TypeVar("T", bound="CanonicalQueryRequestForeignSources")
+T = TypeVar("T", bound="QueryRequestForeignSources")
 
 
 @_attrs_define
-class CanonicalQueryRequestForeignSources:
+class QueryRequestForeignSources:
     """Map of table name to foreign data source configuration for query-time federated access.
     When a table name referenced in this query (or in a join's `right_table`) appears as a key
     here, the query is routed to the external database instead of Antfly shards.
@@ -61,7 +61,7 @@ class CanonicalQueryRequestForeignSources:
         from ..models.foreign_source import ForeignSource
 
         d = dict(src_dict)
-        canonical_query_request_foreign_sources = cls()
+        query_request_foreign_sources = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -69,8 +69,8 @@ class CanonicalQueryRequestForeignSources:
 
             additional_properties[prop_name] = additional_property
 
-        canonical_query_request_foreign_sources.additional_properties = additional_properties
-        return canonical_query_request_foreign_sources
+        query_request_foreign_sources.additional_properties = additional_properties
+        return query_request_foreign_sources
 
     @property
     def additional_keys(self) -> list[str]:

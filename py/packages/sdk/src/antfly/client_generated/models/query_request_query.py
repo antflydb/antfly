@@ -6,11 +6,11 @@ from typing import Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
-T = TypeVar("T", bound="CanonicalQueryRequestQuery")
+T = TypeVar("T", bound="QueryRequestQuery")
 
 
 @_attrs_define
-class CanonicalQueryRequestQuery:
+class QueryRequestQuery:
     """Canonical public query AST. Prefer this field for new clients.
 
     Boolean clauses are normalized before planning:
@@ -40,10 +40,10 @@ class CanonicalQueryRequestQuery:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         d = dict(src_dict)
-        canonical_query_request_query = cls()
+        query_request_query = cls()
 
-        canonical_query_request_query.additional_properties = d
-        return canonical_query_request_query
+        query_request_query.additional_properties = d
+        return query_request_query
 
     @property
     def additional_keys(self) -> list[str]:

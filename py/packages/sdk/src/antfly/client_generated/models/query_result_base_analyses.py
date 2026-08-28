@@ -7,24 +7,17 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 if TYPE_CHECKING:
-    from ..models.legacy_graph_query import LegacyGraphQuery
+    from ..models.analyses_result import AnalysesResult
 
 
-T = TypeVar("T", bound="QueryRequestGraphSearches")
+T = TypeVar("T", bound="QueryResultBaseAnalyses")
 
 
 @_attrs_define
-class QueryRequestGraphSearches:
-    """Deprecated compatibility alias for the v0.2 graph query contract.
-    Use `graph_queries`; requests containing both fields are rejected.
-    Legacy operation names remain opaque and byte-for-byte compatible;
-    canonical GraphIdentifier rules apply only to `graph_queries`.
-    The request-wide limit of 64 operations also applies here to bound
-    execution work during the compatibility window.
+class QueryResultBaseAnalyses:
+    """Analysis results like PCA and t-SNE per index embeddings."""
 
-    """
-
-    additional_properties: dict[str, LegacyGraphQuery] = _attrs_field(init=False, factory=dict)
+    additional_properties: dict[str, AnalysesResult] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
 
@@ -36,28 +29,28 @@ class QueryRequestGraphSearches:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.legacy_graph_query import LegacyGraphQuery
+        from ..models.analyses_result import AnalysesResult
 
         d = dict(src_dict)
-        query_request_graph_searches = cls()
+        query_result_base_analyses = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
-            additional_property = LegacyGraphQuery.from_dict(prop_dict)
+            additional_property = AnalysesResult.from_dict(prop_dict)
 
             additional_properties[prop_name] = additional_property
 
-        query_request_graph_searches.additional_properties = additional_properties
-        return query_request_graph_searches
+        query_result_base_analyses.additional_properties = additional_properties
+        return query_result_base_analyses
 
     @property
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> LegacyGraphQuery:
+    def __getitem__(self, key: str) -> AnalysesResult:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: LegacyGraphQuery) -> None:
+    def __setitem__(self, key: str, value: AnalysesResult) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

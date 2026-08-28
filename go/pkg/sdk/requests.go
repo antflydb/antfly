@@ -186,11 +186,6 @@ type QueryRequest struct {
 	// GraphQueries contains declarative graph matching, traversal, and path queries.
 	GraphQueries map[string]GraphQuery `json:"graph_queries,omitempty"`
 
-	// GraphSearches is the deprecated v0.2 graph query contract. Use GraphQueries.
-	// Requests must not set both fields.
-	// Deprecated: use GraphQueries.
-	GraphSearches map[string]LegacyGraphQuery `json:"graph_searches,omitempty"`
-
 	// Hierarchy controls top-level result shape, bounded child hits, and projected ancestors.
 	// A non-nil empty object selects direct index matches without ancestor hydration.
 	Hierarchy *QueryHierarchy `json:"hierarchy,omitempty"`
@@ -210,9 +205,6 @@ type QueryRequest struct {
 // It converts the strongly-typed *query.Query fields to json.RawMessage
 // for compatibility with the OAPI layer.
 func (q QueryRequest) MarshalJSON() ([]byte, error) {
-	if q.GraphQueries != nil && q.GraphSearches != nil {
-		return nil, fmt.Errorf("antfly: query accepts either graph_queries or graph_searches, not both")
-	}
 	if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
 		return nil, err
 	}
@@ -239,7 +231,6 @@ func (q QueryRequest) MarshalJSON() ([]byte, error) {
 		SemanticSearch:   q.SemanticSearch,
 		DocumentRenderer: q.DocumentRenderer,
 		GraphQueries:     q.GraphQueries,
-		GraphSearches:    q.GraphSearches,
 		Hierarchy:        q.Hierarchy,
 		ForeignSources:   q.ForeignSources,
 	}
@@ -323,7 +314,6 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
 	q.GraphQueries = oapiReq.GraphQueries
-	q.GraphSearches = oapiReq.GraphSearches
 	q.Hierarchy = oapiReq.Hierarchy
 	q.Join = oapiReq.Join
 	q.ForeignSources = oapiReq.ForeignSources

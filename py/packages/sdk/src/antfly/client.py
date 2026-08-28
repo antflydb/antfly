@@ -18,7 +18,6 @@ from antfly.client_generated.client import AuthenticatedClient
 from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
-    CanonicalQueryRequestGraphQueries,
     CreateAlgebraicIndexRequest,
     CreatedAlgebraicIndex,
     CreatedEmbeddingsIndex,
@@ -32,6 +31,7 @@ from antfly.client_generated.models import (
     Error,
     GraphKShortestPathsQuery,
     GraphMatchQuery,
+    GraphQueries,
     GraphShortestPathQuery,
     GraphTraverseQuery,
     InferenceGenerateChunk,
@@ -61,7 +61,7 @@ CreateIndexRequest: TypeAlias = (
 )
 CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
 GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
-GraphQueriesInput: TypeAlias = CanonicalQueryRequestGraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
+GraphQueriesInput: TypeAlias = GraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
 _CREATE_INDEX_REQUEST_TYPES = (
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
@@ -223,9 +223,7 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
 
 def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]:
     """Serialize typed canonical graph operations while preserving raw-map compatibility."""
-    operations = (
-        graph_queries.to_dict() if isinstance(graph_queries, CanonicalQueryRequestGraphQueries) else graph_queries
-    )
+    operations = graph_queries.to_dict() if isinstance(graph_queries, GraphQueries) else graph_queries
     if len(operations) > 64:
         raise AntflyException("graph_queries accepts at most 64 named operations")
 
@@ -800,13 +798,10 @@ class AntflyClient:
         reranker: dict[str, Any] | None = None,
         analyses: dict[str, Any] | None = None,
         graph_queries: GraphQueriesInput | None = None,
-        graph_searches: dict[str, Any] | None = None,
-        expand_strategy: str | None = None,
         document_renderer: str | None = None,
         pruner: dict[str, Any] | None = None,
         join: dict[str, Any] | None = None,
         foreign_sources: dict[str, Any] | None = None,
-        extra: dict[str, Any] | None = None,
     ) -> QueryResponses:
         """
         Query a table.
@@ -843,16 +838,11 @@ class AntflyClient:
             reranker: Reranker configuration
             analyses: Analysis configuration
             graph_queries: Named canonical graph operations. Accepts generated graph query models,
-                ``CanonicalQueryRequestGraphQueries``, or raw mappings.
-            graph_searches: Deprecated v0.2 graph query configuration. Use
-                ``graph_queries``; this compatibility argument will be removed
-                in the next major release.
-            expand_strategy: Graph result expansion strategy
+                ``GraphQueries``, or raw mappings.
             document_renderer: Handlebars document renderer
             pruner: Result pruning configuration
             join: Join configuration
             foreign_sources: Query-time foreign source configuration
-            extra: Additional query request fields for forward compatibility
 
         Returns:
             Generated ``QueryResponses`` model.
@@ -863,13 +853,9 @@ class AntflyClient:
         """
         if aggregations is not None and facets is not None:
             raise AntflyException("query accepts either aggregations or facets, not both")
-        if graph_queries is not None and graph_searches is not None:
-            raise AntflyException("query accepts either graph_queries or graph_searches, not both")
         encoded_graph_queries = _serialize_graph_queries(graph_queries) if graph_queries is not None else None
 
         body: dict[str, Any] = {}
-        if extra is not None:
-            body.update(extra)
 
         query_fields = {
             "query": query,
@@ -898,8 +884,6 @@ class AntflyClient:
             "reranker": reranker,
             "analyses": analyses,
             "graph_queries": encoded_graph_queries,
-            "graph_searches": graph_searches,
-            "expand_strategy": expand_strategy,
             "document_renderer": document_renderer,
             "pruner": pruner,
             "join": join,
@@ -915,9 +899,6 @@ class AntflyClient:
             graph_dialect = "canonical"
             expected_graph_operations = None
             expected_graph_queries = encoded_graph_queries
-        elif graph_searches is not None:
-            graph_dialect = "legacy"
-            expected_graph_operations = frozenset(graph_searches)
         else:
             graph_dialect = "none"
             expected_graph_operations = frozenset()

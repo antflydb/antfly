@@ -1,6 +1,5 @@
 import type {
   AntflyClient,
-  GraphQueryResult,
   GraphResult,
   IndexStatus,
   QueryRequest,
@@ -65,7 +64,7 @@ const graphIndex = {
   },
 } as unknown as IndexStatus;
 
-const traversalResult: GraphQueryResult = {
+const traversalResult: GraphResult = {
   kind: "nodes",
   nodes: [
     {
@@ -151,7 +150,7 @@ const traversalResult: GraphQueryResult = {
   stats: { returned_items: 4, truncated: false },
 };
 
-const shortestPathResult: GraphQueryResult = {
+const shortestPathResult: GraphResult = {
   kind: "nodes",
   nodes: [],
   paths: [
