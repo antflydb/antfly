@@ -22,6 +22,7 @@
 
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -89,27 +90,90 @@ pub fn capture(
     capture_target_sequence: u64,
     projections: []const Projection,
 ) !u64 {
+    var copied_bytes = try stageGeneratedArtifacts(alloc, io, source_root, snapshot_root);
+    copied_bytes = std.math.add(u64, copied_bytes, try finalizeCapture(
+        alloc,
+        io,
+        snapshot_root,
+        capture_target_sequence,
+        projections,
+    )) catch return error.FileTooBig;
+    return copied_bytes;
+}
+
+/// Copies the mutable generated portion while the caller owns the DB capture
+/// fence. Manifest hashing is deliberately excluded so writes can resume as
+/// soon as the revision-consistent files have been staged.
+pub fn stageGeneratedArtifacts(
+    alloc: Allocator,
+    io: Io,
+    source_root: []const u8,
+    snapshot_root: []const u8,
+) !u64 {
+    return try stageGeneratedArtifactsWithCancellation(alloc, io, source_root, snapshot_root, .none);
+}
+
+pub fn stageGeneratedArtifactsWithCancellation(
+    alloc: Allocator,
+    io: Io,
+    source_root: []const u8,
+    snapshot_root: []const u8,
+    cancellation: CancellationToken,
+) !u64 {
+    try ensureActive(cancellation);
     var copied_bytes: u64 = 0;
     const source_indexes = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_root, indexes_directory_name });
     defer alloc.free(source_indexes);
     if (try pathExists(io, source_indexes)) {
         const snapshot_indexes = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, indexes_directory_name });
         defer alloc.free(snapshot_indexes);
-        copied_bytes = try fs_paths.copyDirectoryDurablePortable(alloc, io, source_indexes, snapshot_indexes);
+        copied_bytes = try copyDirectoryDurableCancellable(alloc, io, source_indexes, snapshot_indexes, cancellation);
     }
 
     inline for (.{ applied_checkpoint_file_name, repair_checkpoint_file_name }) |name| {
+        try ensureActive(cancellation);
         const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_root, name });
         defer alloc.free(source);
         if (try pathExists(io, source)) {
             const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, name });
             defer alloc.free(destination);
-            copied_bytes = std.math.add(u64, copied_bytes, try fs_paths.copyFileDurablePortable(io, source, destination)) catch
+            copied_bytes = std.math.add(u64, copied_bytes, try copyFileDurableCancellable(io, source, destination, cancellation)) catch
                 return error.FileTooBig;
         }
     }
 
-    var artifacts = try collectArtifacts(alloc, io, snapshot_root);
+    return copied_bytes;
+}
+
+/// Hashes an immutable staged generation and writes its manifest. Callers must
+/// publish the directory only after this succeeds.
+pub fn finalizeCapture(
+    alloc: Allocator,
+    io: Io,
+    snapshot_root: []const u8,
+    capture_target_sequence: u64,
+    projections: []const Projection,
+) !u64 {
+    return try finalizeCaptureWithCancellation(
+        alloc,
+        io,
+        snapshot_root,
+        capture_target_sequence,
+        projections,
+        .none,
+    );
+}
+
+pub fn finalizeCaptureWithCancellation(
+    alloc: Allocator,
+    io: Io,
+    snapshot_root: []const u8,
+    capture_target_sequence: u64,
+    projections: []const Projection,
+    cancellation: CancellationToken,
+) !u64 {
+    try ensureActive(cancellation);
+    var artifacts = try collectArtifacts(alloc, io, snapshot_root, cancellation);
     defer {
         for (artifacts.items) |*artifact| artifact.deinit(alloc);
         artifacts.deinit(alloc);
@@ -131,14 +195,14 @@ pub fn capture(
         .projections = projections,
     }, .{});
     defer alloc.free(encoded);
+    try ensureActive(cancellation);
     if (encoded.len > max_manifest_bytes) return error.NativeBackupManifestTooLarge;
 
     const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, manifest_file_name });
     defer alloc.free(manifest_path);
-    copied_bytes = std.math.add(u64, copied_bytes, try writeFileDurable(io, manifest_path, encoded)) catch
-        return error.FileTooBig;
+    const manifest_bytes = try writeFileDurable(io, manifest_path, encoded);
     try fs_paths.syncDirPortable(io, snapshot_root);
-    return copied_bytes;
+    return manifest_bytes;
 }
 
 /// Validates every declared artifact before copying generated state into the
@@ -191,7 +255,7 @@ pub fn validateAndMaterialize(
         };
         if (stat.size != artifact.size_bytes) return error.NativeBackupArtifactIntegrityMismatch;
         var digest: [Sha256.digest_length]u8 = undefined;
-        try hashFile(io, source, stat, &digest);
+        try hashFile(io, source, stat, &digest, .none);
         const actual = std.fmt.bytesToHex(digest, .lower);
         if (!std.mem.eql(u8, &actual, artifact.sha256))
             return error.NativeBackupArtifactIntegrityMismatch;
@@ -215,7 +279,7 @@ fn isGeneratedArtifact(path: []const u8) bool {
         std.mem.eql(u8, path, repair_checkpoint_file_name);
 }
 
-fn collectArtifacts(alloc: Allocator, io: Io, root: []const u8) !std.ArrayListUnmanaged(OwnedArtifact) {
+fn collectArtifacts(alloc: Allocator, io: Io, root: []const u8, cancellation: CancellationToken) !std.ArrayListUnmanaged(OwnedArtifact) {
     var result = std.ArrayListUnmanaged(OwnedArtifact).empty;
     errdefer {
         for (result.items) |*artifact| artifact.deinit(alloc);
@@ -229,6 +293,7 @@ fn collectArtifacts(alloc: Allocator, io: Io, root: []const u8) !std.ArrayListUn
     var walker = try dir.walk(alloc);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
+        try ensureActive(cancellation);
         switch (entry.kind) {
             .directory => {},
             .file => {
@@ -241,7 +306,7 @@ fn collectArtifacts(alloc: Allocator, io: Io, root: []const u8) !std.ArrayListUn
                 defer alloc.free(absolute);
                 const stat = try statRegularFile(io, absolute);
                 var digest: [Sha256.digest_length]u8 = undefined;
-                try hashFile(io, absolute, stat, &digest);
+                try hashFile(io, absolute, stat, &digest, cancellation);
                 const hex = std.fmt.bytesToHex(digest, .lower);
                 const sha256 = try alloc.dupe(u8, &hex);
                 errdefer alloc.free(sha256);
@@ -312,6 +377,91 @@ fn validateRelativePath(path: []const u8) !void {
     }
 }
 
+fn ensureActive(cancellation: CancellationToken) !void {
+    if (cancellation.isCancelled()) return error.Canceled;
+}
+
+fn copyDirectoryDurableCancellable(
+    alloc: Allocator,
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    cancellation: CancellationToken,
+) !u64 {
+    try fs_paths.createDirPathPortable(io, destination_path);
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openDirAbsolute(io, source_path, .{ .iterate = true })
+    else
+        try std.Io.Dir.cwd().openDir(io, source_path, .{ .iterate = true });
+    defer source.close(io);
+
+    var walker = try source.walk(alloc);
+    defer walker.deinit();
+    var total: u64 = 0;
+    while (try walker.next(io)) |entry| {
+        try ensureActive(cancellation);
+        const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ destination_path, entry.path });
+        defer alloc.free(destination);
+        switch (entry.kind) {
+            .directory => try fs_paths.createDirPathPortable(io, destination),
+            .file => {
+                const source_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_path, entry.path });
+                defer alloc.free(source_file);
+                total = std.math.add(u64, total, try copyFileDurableCancellable(
+                    io,
+                    source_file,
+                    destination,
+                    cancellation,
+                )) catch return error.FileTooBig;
+            },
+            else => return error.UnsupportedFileType,
+        }
+    }
+    try ensureActive(cancellation);
+    try fs_paths.syncDirPortable(io, destination_path);
+    return total;
+}
+
+fn copyFileDurableCancellable(
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    cancellation: CancellationToken,
+) !u64 {
+    if (std.fs.path.dirname(destination_path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source.close(io);
+    const initial = try source.stat(io);
+    if (initial.kind != .file) return error.UnsupportedFileType;
+
+    var destination = try fs_paths.createFilePortable(io, destination_path, .{ .truncate = true });
+    defer destination.close(io);
+    var writer_buffer: [64 * 1024]u8 = undefined;
+    var writer = destination.writer(io, &writer_buffer);
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < initial.size) {
+        try ensureActive(cancellation);
+        const wanted: usize = @intCast(@min(initial.size - offset, buffer.len));
+        const read = try source.readPositionalAll(io, buffer[0..wanted], offset);
+        if (read != wanted) return error.SourceFileChanged;
+        try writer.interface.writeAll(buffer[0..read]);
+        offset += read;
+    }
+    try writer.end();
+    try ensureActive(cancellation);
+    const final = try source.stat(io);
+    if (final.size != initial.size or !std.meta.eql(final.mtime, initial.mtime))
+        return error.SourceFileChanged;
+    try destination.sync(io);
+    const parent = std.fs.path.dirname(destination_path) orelse if (std.fs.path.isAbsolute(destination_path)) "/" else ".";
+    try fs_paths.syncDirPortable(io, parent);
+    return initial.size;
+}
+
 fn statRegularFile(io: Io, path: []const u8) !std.Io.File.Stat {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
@@ -323,7 +473,13 @@ fn statRegularFile(io: Io, path: []const u8) !std.Io.File.Stat {
     return stat;
 }
 
-fn hashFile(io: Io, path: []const u8, initial: std.Io.File.Stat, digest: *[Sha256.digest_length]u8) !void {
+fn hashFile(
+    io: Io,
+    path: []const u8,
+    initial: std.Io.File.Stat,
+    digest: *[Sha256.digest_length]u8,
+    cancellation: CancellationToken,
+) !void {
     var file = if (std.fs.path.isAbsolute(path))
         try std.Io.Dir.openFileAbsolute(io, path, .{})
     else
@@ -333,12 +489,14 @@ fn hashFile(io: Io, path: []const u8, initial: std.Io.File.Stat, digest: *[Sha25
     var buffer: [256 * 1024]u8 = undefined;
     var offset: u64 = 0;
     while (offset < initial.size) {
+        try ensureActive(cancellation);
         const wanted: usize = @intCast(@min(initial.size - offset, buffer.len));
         const read = try file.readPositionalAll(io, buffer[0..wanted], offset);
         if (read != wanted) return error.SourceFileChanged;
         hasher.update(buffer[0..read]);
         offset += read;
     }
+    try ensureActive(cancellation);
     var extra: [1]u8 = undefined;
     if (try file.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
     const final = try file.stat(io);

@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const snapshot_admission_mod = @import("snapshot_admission.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
@@ -270,6 +271,8 @@ pub const OpenedCoreResources = struct {
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
@@ -282,6 +285,10 @@ pub const OpenedCoreResources = struct {
         alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         alloc.destroy(self.apply_mutex);
+        self.snapshot_admission.* = undefined;
+        alloc.destroy(self.snapshot_admission);
+        self.snapshot_replay_admission.* = undefined;
+        alloc.destroy(self.snapshot_replay_admission);
         self.repair_replay_mutex.* = undefined;
         alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
@@ -318,6 +325,8 @@ pub const BatchExecutionResources = struct {
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
@@ -352,6 +361,8 @@ pub const DBCore = struct {
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
@@ -371,6 +382,8 @@ pub const DBCore = struct {
             .shard_manager = opened.shard_manager,
             .index_manager = opened.index_manager,
             .apply_mutex = opened.apply_mutex,
+            .snapshot_admission = opened.snapshot_admission,
+            .snapshot_replay_admission = opened.snapshot_replay_admission,
             .repair_replay_mutex = opened.repair_replay_mutex,
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
@@ -385,6 +398,10 @@ pub const DBCore = struct {
         self.alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         self.alloc.destroy(self.apply_mutex);
+        self.snapshot_admission.* = undefined;
+        self.alloc.destroy(self.snapshot_admission);
+        self.snapshot_replay_admission.* = undefined;
+        self.alloc.destroy(self.snapshot_replay_admission);
         self.repair_replay_mutex.* = undefined;
         self.alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
@@ -431,6 +448,8 @@ pub const DBCore = struct {
             .replay_source = self.replaySource(),
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .snapshot_admission = self.snapshot_admission,
+            .snapshot_replay_admission = self.snapshot_replay_admission,
             .repair_replay_mutex = self.repair_replay_mutex,
             .log_mutex = self.log_mutex,
             .identity_namespace = self.identity_namespace,
@@ -1771,12 +1790,16 @@ pub fn openCoreResourcesFromPrimaryStore(
     var owned_shard_manager: ?*shard_mod.ShardManager = null;
     var owned_index_manager: ?*index_manager_mod.IndexManager = null;
     var owned_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null;
+    var owned_snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
+    var owned_snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
     var owned_repair_replay_mutex: ?*std.atomic.Mutex = null;
     var owned_log_mutex: ?*std.atomic.Mutex = null;
     errdefer {
         if (owned_log_mutex) |ptr| alloc.destroy(ptr);
         if (owned_repair_replay_mutex) |ptr| alloc.destroy(ptr);
         if (owned_apply_mutex) |ptr| alloc.destroy(ptr);
+        if (owned_snapshot_admission) |ptr| alloc.destroy(ptr);
+        if (owned_snapshot_replay_admission) |ptr| alloc.destroy(ptr);
         if (owned_index_manager) |ptr| alloc.destroy(ptr);
         if (owned_shard_manager) |ptr| alloc.destroy(ptr);
         if (owned_change_journal) |ptr| alloc.destroy(ptr);
@@ -1803,6 +1826,12 @@ pub fn openCoreResourcesFromPrimaryStore(
     const apply_mutex = try alloc.create(apply_rw_lock_mod.ApplyRwLock);
     apply_mutex.* = .{};
     owned_apply_mutex = apply_mutex;
+    const snapshot_admission = try alloc.create(snapshot_admission_mod.SnapshotAdmission);
+    snapshot_admission.* = .{};
+    owned_snapshot_admission = snapshot_admission;
+    const snapshot_replay_admission = try alloc.create(snapshot_admission_mod.SnapshotAdmission);
+    snapshot_replay_admission.* = .{};
+    owned_snapshot_replay_admission = snapshot_replay_admission;
     const repair_replay_mutex = try alloc.create(std.atomic.Mutex);
     repair_replay_mutex.* = .unlocked;
     owned_repair_replay_mutex = repair_replay_mutex;
@@ -1887,6 +1916,8 @@ pub fn openCoreResourcesFromPrimaryStore(
     owned_shard_manager = null;
     owned_index_manager = null;
     owned_apply_mutex = null;
+    owned_snapshot_admission = null;
+    owned_snapshot_replay_admission = null;
     owned_repair_replay_mutex = null;
     owned_log_mutex = null;
 
@@ -1901,6 +1932,8 @@ pub fn openCoreResourcesFromPrimaryStore(
         .shard_manager = shard_manager,
         .index_manager = index_manager,
         .apply_mutex = apply_mutex,
+        .snapshot_admission = snapshot_admission,
+        .snapshot_replay_admission = snapshot_replay_admission,
         .repair_replay_mutex = repair_replay_mutex,
         .log_mutex = log_mutex,
         .schema = schema,

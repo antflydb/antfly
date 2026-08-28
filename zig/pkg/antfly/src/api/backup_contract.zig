@@ -162,6 +162,10 @@ pub const TableBackupPlan = struct {
     format: BackupFormat = .native,
     io: ?std.Io = null,
     fence: ?TableBackupFence = null,
+    /// Borrowed cooperative cancellation for capture, hashing, and local
+    /// materialization. Durable publication still reports ambiguity according
+    /// to the backup protocol once its commit point has been crossed.
+    cancellation: CancellationToken = .none,
 };
 
 pub const TableRestorePlan = struct {

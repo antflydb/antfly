@@ -33,6 +33,7 @@ const db_config = @import("config.zig");
 const generation_lifecycle = @import("generation_lifecycle.zig");
 const native_backup = @import("native_backup.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const snapshot_admission_mod = @import("snapshot_admission.zig");
 const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
@@ -1301,6 +1302,8 @@ const EnrichmentAppendContext = struct {
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
+    snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     change_journal: *change_journal_mod.Journal,
     replay_source: replay_source_mod.Source,
@@ -1326,6 +1329,8 @@ const EnrichmentAppendContext = struct {
             .replay_source = self.replay_source,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .snapshot_admission = self.snapshot_admission,
+            .snapshot_replay_admission = self.snapshot_replay_admission,
             .repair_replay_mutex = self.repair_replay_mutex,
             .log_mutex = self.log_mutex,
             .identity_namespace = doc_identity.default_namespace,
@@ -1367,6 +1372,8 @@ const BatchExecutionContext = struct {
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
+    snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
@@ -2735,6 +2742,27 @@ fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
     }
 }
 
+fn ensureSnapshotActive(cancellation: types.CancellationToken) !void {
+    if (cancellation.isCancelled()) return error.Canceled;
+}
+
+fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: types.CancellationToken) !void {
+    var attempts: usize = 0;
+    while (!mutex.tryLock()) : (attempts += 1) {
+        try ensureSnapshotActive(cancellation);
+        if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
+            std.atomic.spinLoopHint();
+        } else if (attempts < 128) {
+            std.Thread.yield() catch {};
+        } else {
+            const backoff_step = @min(attempts - 128, 5);
+            sleepNs(@min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000)));
+        }
+    }
+    errdefer mutex.unlock();
+    try ensureSnapshotActive(cancellation);
+}
+
 fn splitBootstrapMarkersEqual(a: range_state_mod.SplitBootstrapMarker, b: range_state_mod.SplitBootstrapMarker) bool {
     return a.transition_id == b.transition_id and
         a.attempt_epoch == b.attempt_epoch and
@@ -3167,6 +3195,7 @@ pub const DB = struct {
     managed_admission_materialization_completed: std.atomic.Value(u64) = .init(0),
     managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
     index_structural_mutation_mutex: std.atomic.Mutex = .unlocked,
+    snapshot_publication_mutex: std.atomic.Mutex = .unlocked,
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     generation_replace_mutex: std.atomic.Mutex = .unlocked,
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
@@ -3207,6 +3236,8 @@ pub const DB = struct {
             .replay_source = resources.replay_source,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .snapshot_admission = resources.snapshot_admission,
+            .snapshot_replay_admission = resources.snapshot_replay_admission,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .log_mutex = resources.log_mutex,
             .identity_namespace = resources.identity_namespace,
@@ -3965,6 +3996,8 @@ pub const DB = struct {
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .snapshot_admission = resources.snapshot_admission,
+            .snapshot_replay_admission = resources.snapshot_replay_admission,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .change_journal = resources.change_journal,
             .replay_source = resources.replay_source,
@@ -4136,6 +4169,8 @@ pub const DB = struct {
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
             .apply_mutex = resources.apply_mutex,
+            .snapshot_admission = resources.snapshot_admission,
+            .snapshot_replay_admission = resources.snapshot_replay_admission,
             .repair_replay_mutex = resources.repair_replay_mutex,
             .change_journal = resources.change_journal,
             .replay_source = resources.replay_source,
@@ -4213,6 +4248,8 @@ pub const DB = struct {
                 .replay_source = batch_resources.replay_source,
                 .index_manager = batch_resources.index_manager,
                 .apply_mutex = batch_resources.apply_mutex,
+                .snapshot_admission = batch_resources.snapshot_admission,
+                .snapshot_replay_admission = batch_resources.snapshot_replay_admission,
                 .log_mutex = batch_resources.log_mutex,
                 .identity_namespace = batch_resources.identity_namespace,
                 .executor = self.executor,
@@ -5773,6 +5810,8 @@ pub const DB = struct {
 
         try self.executor.failIfUnhealthy();
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -5893,6 +5932,7 @@ pub const DB = struct {
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
 
         var pressure_ctx = self.batchContext();
         try self.markPrecomputedEnrichmentAppliedForSync(child_batch.sync_level, sequence);
@@ -5940,6 +5980,8 @@ pub const DB = struct {
             try manager.awaitAdmission(.lsm_in_memory_state, projectedBatchLsmAdmissionBytes(req));
         }
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -6805,6 +6847,7 @@ pub const DB = struct {
         }
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
         if (opts.document_child_range_dispatcher) |dispatcher| {
             _ = try self.drainDocumentArtifactChildRangeOutbox(dispatcher, 0);
         }
@@ -7490,6 +7533,7 @@ pub const DB = struct {
 
     const IndexStructuralMutationGuard = struct {
         db: *DB,
+        snapshot_mutation: snapshot_admission_mod.SnapshotAdmission.MutationLease,
         operation: []const u8,
         index_name: []const u8,
         restart_text_merge: bool,
@@ -7525,6 +7569,7 @@ pub const DB = struct {
                 self.db.restartTextMergeAfterStructuralMutation(self.operation, self.index_name);
             }
             self.db.index_structural_mutation_mutex.unlock();
+            self.snapshot_mutation.release();
             self.active = false;
         }
 
@@ -7584,9 +7629,11 @@ pub const DB = struct {
         operation: []const u8,
         index_name: []const u8,
     ) IndexStructuralMutationGuard {
+        const snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
         return .{
             .db = self,
+            .snapshot_mutation = snapshot_mutation,
             .operation = operation,
             .index_name = index_name,
             .restart_text_merge = self.quiesceTextMergeForStructuralMutation(),
@@ -8735,6 +8782,8 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -8801,6 +8850,7 @@ pub const DB = struct {
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
 
         if (self.executor.hasWorkers()) {
             self.executor.forceSequence(sequence);
@@ -15394,6 +15444,8 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         _ = dest_dir1;
         while (true) {
             const target_sequence = self.core.nextDerivedSequence();
@@ -15430,74 +15482,160 @@ pub const DB = struct {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
         try self.enforceHAWriteGate();
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         defer self.core.unlockApply();
         try finalizeSplitLocked(self, new_range);
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
-        return try self.snapshotInternal(id, false);
+        return try self.snapshotInternal(id, false, .none);
     }
 
     /// Captures the primary store and its validated generated projections as
     /// one self-contained generation for the native table-backup format.
     pub fn snapshotNative(self: *DB, id: []const u8) !u64 {
-        return try self.snapshotInternal(id, true);
+        return try self.snapshotNativeWithCancellation(id, .none);
+    }
+
+    pub fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types.CancellationToken) !u64 {
+        return try self.snapshotInternal(id, true, cancellation);
     }
 
     const SnapshotFenceTestHook = struct {
         ptr: *anyopaque,
-        before_apply_lock: *const fn (*anyopaque) void,
+        after_capture_admission: *const fn (*anyopaque) void,
+        after_apply_release: ?*const fn (*anyopaque) void = null,
     };
     var test_snapshot_fence_hook: ?SnapshotFenceTestHook = null;
 
-    fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool) !u64 {
-        // Maintenance cannot run while the apply mutex is held, so converge
-        // optimistically and then fence the exact target. A writer that lands
-        // between convergence and lock acquisition advances the target and
-        // forces another round instead of producing a primary/index generation
-        // whose watermarks can never validate together.
+    fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken) !u64 {
+        // Serialize only snapshot construction/publication. Normal writes can
+        // resume before native manifest hashing, while same-ID captures cannot
+        // race the fresh-directory check or atomic rename.
+        try lockAtomicWithCancellation(&self.snapshot_publication_mutex, cancellation);
+        defer self.snapshot_publication_mutex.unlock();
+        try ensureSnapshotActive(cancellation);
+        try validateSnapshotId(id);
+        var io_impl = threadedIo();
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.snapshots", .{self.core.path});
+        defer self.alloc.free(snapshot_parent);
+        const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ snapshot_parent, id });
+        defer self.alloc.free(snapshot_root);
+        try fs_paths.createDirPathPortable(io, snapshot_parent);
+        if (try snapshotPathExists(io, snapshot_root)) return error.SnapshotAlreadyExists;
+        const staging_root = try createSnapshotStagingRoot(self.alloc, io, snapshot_parent, id);
+        defer self.alloc.free(staging_root);
+        var published = false;
+        defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
+
+        if (!include_generated) {
+            lockApply(self);
+            var apply_held = true;
+            defer if (apply_held) self.core.unlockApply();
+            try self.core.syncStore(true);
+            const total = try self.core.writeSnapshot(staging_root);
+            self.core.unlockApply();
+            apply_held = false;
+            try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
+            published = true;
+            return total;
+        }
+
+        // Close primary/catalog admission before selecting the target. The
+        // barrier is writer preferring, so continuous client traffic cannot
+        // starve capture. Internal enrichment and resolution callbacks remain
+        // admitted while maintenance drains already-committed work.
+        var capture = self.core.snapshot_admission.acquireCaptureIo(io, @as(?types.CancellationToken, cancellation)) catch |err| switch (err) {
+            error.Cancelled => return error.Canceled,
+            else => return err,
+        };
+        defer capture.release();
+        if (builtin.is_test) {
+            if (test_snapshot_fence_hook) |hook| hook.after_capture_admission(hook.ptr);
+        }
+
+        var structural: ?IndexStructuralMutationGuard = null;
+        defer if (structural) |*guard| guard.release();
+        var replay_capture: ?snapshot_admission_mod.SnapshotAdmission.CaptureLease = null;
+        defer if (replay_capture) |*lease| lease.release();
+        var apply_held = false;
+        defer if (apply_held) self.core.unlockApply();
+        var capture_target_sequence: u64 = undefined;
+
+        // An internal callback can append a finite follow-up replay record
+        // during the drain. Recheck under the final apply fence; unlike the old
+        // optimistic loop, primary writes and catalog churn are already barred,
+        // so an external write stream cannot keep this loop alive forever.
         while (true) {
             const target_sequence = self.currentMaintenanceTargetSequence();
-            try self.runMaintenanceUntil(target_sequence, .{});
-            if (include_generated) try self.flushAppliedSequencesForIdle();
-            if (builtin.is_test) {
-                if (test_snapshot_fence_hook) |hook| hook.before_apply_lock(hook.ptr);
-            }
+            self.runMaintenanceUntilWithCancellation(
+                target_sequence,
+                .{},
+                cancellation,
+                std.math.maxInt(u64),
+            ) catch |err| switch (err) {
+                error.Cancelled => return error.Canceled,
+                else => return err,
+            };
+            try ensureSnapshotActive(cancellation);
+            try self.flushAppliedSequencesForIdle();
 
+            structural = self.beginIndexStructuralMutation("native snapshot", "*");
+            replay_capture = self.core.snapshot_replay_admission.acquireCaptureIo(
+                io,
+                @as(?types.CancellationToken, cancellation),
+            ) catch |err| switch (err) {
+                error.Cancelled => return error.Canceled,
+                else => return err,
+            };
             lockApply(self);
-            if (self.currentMaintenanceTargetSequence() == target_sequence) break;
+            apply_held = true;
+            if (self.currentMaintenanceTargetSequence() == target_sequence) {
+                capture_target_sequence = self.core.nextDerivedSequence();
+                break;
+            }
             self.core.unlockApply();
+            apply_held = false;
+            replay_capture.?.release();
+            replay_capture = null;
+            structural.?.release();
+            structural = null;
         }
-        defer self.core.unlockApply();
 
         try self.core.syncStore(true);
         try self.core.index_manager.syncAll(true);
-        if (include_generated) {
-            if (self.loadIndexRepairState(self.alloc)) |repair_state_value| {
-                var repair_state = repair_state_value;
-                defer repair_state.deinit(self.alloc);
-                if (repair_state.entries.items.len != 0)
-                    return error.NativeBackupRepairStateNotQuiescent;
-            } else |err| switch (err) {
-                error.FileNotFound, error.DurableIndexRepairStateUnavailable => {},
-                else => return err,
-            }
+        if (self.loadIndexRepairState(self.alloc)) |repair_state_value| {
+            var repair_state = repair_state_value;
+            defer repair_state.deinit(self.alloc);
+            if (repair_state.entries.items.len != 0)
+                return error.NativeBackupRepairStateNotQuiescent;
+        } else |err| switch (err) {
+            error.FileNotFound, error.DurableIndexRepairStateUnavailable => {},
+            else => return err,
         }
 
-        const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}.snapshots/{s}", .{ self.core.path, id });
-        defer self.alloc.free(snapshot_root);
-        try ensureDirPath(snapshot_root);
-
-        var total = try self.core.writeSnapshot(snapshot_root);
-        if (!include_generated) return total;
-        if (comptime builtin.os.tag == .freestanding) return total;
+        var total = try self.core.writeSnapshot(staging_root);
+        if (comptime builtin.os.tag == .freestanding) {
+            self.core.unlockApply();
+            apply_held = false;
+            replay_capture.?.release();
+            replay_capture = null;
+            structural.?.release();
+            structural = null;
+            capture.release();
+            try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
+            published = true;
+            return total;
+        }
 
         const configs = try self.core.listIndexes(self.alloc);
         defer types.freeIndexConfigs(self.alloc, configs);
         const projections = try self.alloc.alloc(native_backup.Projection, configs.len);
         defer self.alloc.free(projections);
-        const capture_target_sequence = self.core.nextDerivedSequence();
         for (configs, 0..) |cfg, i| {
             const checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, cfg.name);
             if (checkpoint.status != .clean or
@@ -15522,16 +15660,43 @@ pub const DB = struct {
             }
         }.lessThan);
 
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        total = std.math.add(u64, total, try native_backup.capture(
+        // The primary store, projection checkpoints, and index files now form
+        // one stable generation. Keep the admission/structural fences while
+        // copying it, but release the latency-sensitive apply lock first.
+        self.core.unlockApply();
+        apply_held = false;
+        if (builtin.is_test) {
+            if (test_snapshot_fence_hook) |hook| {
+                if (hook.after_apply_release) |run| run(hook.ptr);
+            }
+        }
+
+        total = std.math.add(u64, total, try native_backup.stageGeneratedArtifactsWithCancellation(
             self.alloc,
-            io_impl.io(),
+            io,
             self.core.path,
-            snapshot_root,
+            staging_root,
+            cancellation,
+        )) catch return error.FileTooBig;
+        replay_capture.?.release();
+        replay_capture = null;
+        structural.?.release();
+        structural = null;
+        capture.release();
+
+        // The staged tree is immutable now. Expensive hashing and manifest
+        // encoding stay off both the apply lock and mutation-admission path.
+        total = std.math.add(u64, total, try native_backup.finalizeCaptureWithCancellation(
+            self.alloc,
+            io,
+            staging_root,
             capture_target_sequence,
             projections,
+            cancellation,
         )) catch return error.FileTooBig;
+        try ensureSnapshotActive(cancellation);
+        try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
+        published = true;
         return total;
     }
 
@@ -17754,6 +17919,8 @@ pub const DB = struct {
         try self.enforceHAWriteGate();
         try self.executor.failIfUnhealthy();
 
+        var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
+        defer snapshot_mutation.release();
         lockApply(self);
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
@@ -17803,6 +17970,7 @@ pub const DB = struct {
         self.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
         self.core.unlockApply();
         apply_mutex_held = false;
+        snapshot_mutation.release();
 
         if (self.executor.hasWorkers()) {
             self.executor.forceSequence(sequence);
@@ -35148,6 +35316,8 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    var snapshot_mutation = acquireSnapshotMutationContext(ctx);
+    defer if (snapshot_mutation) |*lease| lease.release();
     ctx.apply_mutex.lockExclusive();
     var apply_mutex_held = true;
     errdefer if (apply_mutex_held) ctx.apply_mutex.unlockExclusive();
@@ -35289,6 +35459,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
     }
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
+    if (snapshot_mutation) |*lease| lease.release();
     try mirrorHAReplayPayloadCommitContext(ctx, replay_payload);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
@@ -35350,6 +35521,8 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    var snapshot_replay = acquireSnapshotReplayContext(ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     ctx.apply_mutex.lockExclusive();
     defer ctx.apply_mutex.unlockExclusive();
     const sequence = ctx.store.reserveNextReplaySequence(1);
@@ -35362,6 +35535,10 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
 }
 
 fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, record: ha_replication_record_mod.RecordView) !u64 {
+    var snapshot_mutation = acquireSnapshotMutationContext(ctx);
+    defer if (snapshot_mutation) |*lease| lease.release();
+    var snapshot_replay = acquireSnapshotReplayContext(ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     var decoded = try ha_effects_mod.decodeDerivedChangeRecord(ctx.alloc, record);
     defer decoded.deinit();
 
@@ -35422,6 +35599,16 @@ fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationB
 fn acquireHAMutationSharedContext(ctx: *const BatchExecutionContext) ?HAMutationBarrier.SharedLease {
     const barrier = haMutationBarrierFromContext(ctx) orelse return null;
     return barrier.acquireShared();
+}
+
+fn acquireSnapshotMutationContext(ctx: *const BatchExecutionContext) ?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const admission = ctx.snapshot_admission orelse return null;
+    return admission.acquireMutation();
+}
+
+fn acquireSnapshotReplayContext(ctx: *const BatchExecutionContext) ?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const admission = ctx.snapshot_replay_admission orelse return null;
+    return admission.acquireMutation();
 }
 
 fn haTransitionMutexFromContext(ctx: *const BatchExecutionContext) ?*std.atomic.Mutex {
@@ -36909,6 +37096,8 @@ fn appendResolutionRecordWithHook(
     var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+    var snapshot_replay = acquireSnapshotReplayContext(&batch_ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
 
     const store_writes = try batch_ctx.alloc.alloc(docstore_mod.KVPair, write.artifact_writes.len);
     defer batch_ctx.alloc.free(store_writes);
@@ -36936,6 +37125,8 @@ fn appendResolutionRecordWithHook(
     }
     batch_ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
+    snapshot_replay.?.release();
+    snapshot_replay = null;
 
     try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
     before_handoff_publish.run();
@@ -37613,6 +37804,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
+    var snapshot_replay = acquireSnapshotReplayContext(&batch_ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
     defer batch_ctx.alloc.free(replay_deleted_keys);
     var replay_batch = batch;
@@ -37656,6 +37849,8 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
         batch_ctx.executor.trackBacklogBytes(reserved_sequence, @intCast(payload.len)) catch {};
         break :blk reserved_sequence;
     };
+    snapshot_replay.?.release();
+    snapshot_replay = null;
 
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
     if (ctx.executor.hasWorkers()) {
@@ -43835,6 +44030,62 @@ fn ensureDirPath(path: []const u8) !void {
     var io_impl = threadedIo();
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), path);
+}
+
+fn validateSnapshotId(id: []const u8) !void {
+    if (id.len == 0 or id.len > 255 or
+        std.mem.eql(u8, id, ".") or
+        std.mem.eql(u8, id, "..") or
+        std.mem.indexOfScalar(u8, id, '/') != null or
+        std.mem.indexOfScalar(u8, id, '\\') != null)
+    {
+        return error.InvalidSnapshotId;
+    }
+}
+
+fn snapshotPathExists(io: Io, path: []const u8) !bool {
+    if (std.fs.path.isAbsolute(path)) {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+    } else {
+        std.Io.Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+    }
+    return true;
+}
+
+fn createSnapshotStagingRoot(alloc: Allocator, io: Io, parent: []const u8, id: []const u8) ![]u8 {
+    for (0..64) |_| {
+        var entropy: [8]u8 = undefined;
+        try io.randomSecure(&entropy);
+        const nonce = std.fmt.bytesToHex(entropy, .lower);
+        const candidate = try std.fmt.allocPrint(alloc, "{s}/.{s}.staging-{s}", .{ parent, id, &nonce });
+        errdefer alloc.free(candidate);
+        std.Io.Dir.cwd().createDir(io, candidate, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                alloc.free(candidate);
+                continue;
+            },
+            else => return err,
+        };
+        errdefer std.Io.Dir.cwd().deleteTree(io, candidate) catch {};
+        try fs_paths.syncDirPortable(io, parent);
+        return candidate;
+    }
+    return error.SnapshotStagingCollision;
+}
+
+fn publishSnapshotStaging(io: Io, parent: []const u8, staging: []const u8, destination: []const u8) !void {
+    if (try snapshotPathExists(io, destination)) return error.SnapshotAlreadyExists;
+    if (std.fs.path.isAbsolute(destination))
+        try std.Io.Dir.renameAbsolute(staging, destination, io)
+    else
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), staging, std.Io.Dir.cwd(), destination, io);
+    try fs_paths.syncDirPortable(io, parent);
 }
 
 fn directoryUsageBytes(alloc: Allocator, path: []const u8) !u64 {
@@ -91878,8 +92129,14 @@ test "db native snapshot exports self-contained generation" {
         .writes = &.{.{ .key = "doc:snap", .value = "{\"title\":\"snap\"}" }},
     });
 
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        db.snapshotNativeWithCancellation("cancelled", types.CancellationToken.fromAtomic(&canceled)),
+    );
     const snapshot_size = try db.snapshotNative("snap1");
     try std.testing.expect(snapshot_size > 0);
+    try std.testing.expectError(error.SnapshotAlreadyExists, db.snapshotNative("snap1"));
 
     const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/store.bin", .{std.mem.span(path)});
     defer alloc.free(store_snapshot_path);
@@ -91899,7 +92156,7 @@ test "db native snapshot exports self-contained generation" {
     try std.Io.Dir.accessAbsolute(io_impl.io(), generation_manifest_path, .{});
 }
 
-test "db native snapshot retries when a write advances the fenced revision" {
+test "db native snapshot admission bounds capture under concurrent writes" {
     const alloc = std.heap.page_allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
@@ -91928,15 +92185,22 @@ test "db native snapshot retries when a write advances the fenced revision" {
     });
 
     const Fence = struct {
-        calls: std.atomic.Value(u32) = .init(0),
+        db: *DB,
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
+        apply_released: std.atomic.Value(bool) = .init(false),
 
-        fn beforeApplyLock(ptr: *anyopaque) void {
+        fn afterCaptureAdmission(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
             self.entered.store(true, .release);
             while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        fn afterApplyRelease(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.db.core.apply_mutex.tryLockExclusive()) return;
+            self.db.core.apply_mutex.unlockExclusive();
+            self.apply_released.store(true, .release);
         }
     };
     const SnapshotWorker = struct {
@@ -91950,25 +92214,56 @@ test "db native snapshot retries when a write advances the fenced revision" {
             };
         }
     };
+    const Writer = struct {
+        db: *DB,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
 
-    var fence = Fence{};
-    DB.test_snapshot_fence_hook = .{ .ptr = &fence, .before_apply_lock = Fence.beforeApplyLock };
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.db.batch(.{
+                .writes = &.{.{ .key = "doc:during", .value = "{\"embedding\":[0,1,0]}" }},
+                .sync_level = .write,
+            }) catch |err| {
+                self.err = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+
+    var fence = Fence{ .db = &db };
+    DB.test_snapshot_fence_hook = .{
+        .ptr = &fence,
+        .after_capture_admission = Fence.afterCaptureAdmission,
+        .after_apply_release = Fence.afterApplyRelease,
+    };
     defer DB.test_snapshot_fence_hook = null;
     var worker = SnapshotWorker{ .db = &db };
     const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});
     while (!fence.entered.load(.acquire)) std.atomic.spinLoopHint();
 
-    // This write commits after the first maintenance pass but before the apply
-    // fence. A one-shot capture would pair this primary revision with the prior
-    // dense checkpoint and create a backup that only fails later at restore.
-    try db.batch(.{
-        .writes = &.{.{ .key = "doc:during", .value = "{\"embedding\":[0,1,0]}" }},
-        .sync_level = .write,
-    });
+    // Maintenance-owned replay production is not a client mutation and must
+    // remain able to finish after primary admission closes. The capture drain
+    // includes this advance before selecting its final checkpoint.
+    const internal_sequence = try appendDerivedBatchRecord(&db, .{});
+    try std.testing.expect(internal_sequence > 0);
+
+    // A writer arriving after capture intent is published cannot advance the
+    // selected revision. It resumes immediately after staging, before manifest
+    // hashing and publication complete.
+    var writer = Writer{ .db = &db };
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    while (!writer.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..1024) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!writer.done.load(.acquire));
     fence.release.store(true, .release);
     snapshot_thread.join();
+    writer_thread.join();
     if (worker.err) |err| return err;
-    try std.testing.expect(fence.calls.load(.acquire) >= 2);
+    if (writer.err) |err| return err;
+    try std.testing.expect(writer.done.load(.acquire));
+    try std.testing.expect(fence.apply_released.load(.acquire));
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/fenced-native", .{std.mem.span(path)});
     defer alloc.free(snapshot_root);

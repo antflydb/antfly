@@ -5091,6 +5091,7 @@ pub const BoundTableWriteSource = struct {
     ) !?[]backups_api.ShardSnapshot {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        if (plan.cancellation.isCancelled()) return error.Canceled;
         const db = try self.activeDb();
         if (plan.format == .portable) {
             return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
@@ -5098,10 +5099,11 @@ pub const BoundTableWriteSource = struct {
 
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
         defer alloc.free(snapshot_token);
-        _ = try db.snapshotNative(snapshot_token);
+        _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
         defer alloc.free(snapshot_root);
+        defer ProvisionedTableWriteSource.deleteLocalNativeSnapshot(plan.io, snapshot_root);
         const dest_root = try backups_api.shardSnapshotPath(alloc, plan.backup_root, plan.backup_id, 0);
         defer alloc.free(dest_root);
         try backups_api.copyDirectoryRecursiveUsingIo(alloc, plan.io, snapshot_root, dest_root);
@@ -15286,6 +15288,7 @@ pub const ProvisionedTableWriteSource = struct {
         plan: backups_api.TableBackupPlan,
     ) !?[]backups_api.ShardSnapshot {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (plan.cancellation.isCancelled()) return error.Canceled;
         const group_id = (try resolveFencedBackupGroup(self.catalog, table_name, plan.fence)) orelse return null;
         self.beginGroupOperation(table_name, group_id);
         defer {
@@ -15372,6 +15375,7 @@ pub const ProvisionedTableWriteSource = struct {
         owns_shard: bool = true,
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            deleteLocalNativeSnapshot(self.io, self.snapshot_root);
             alloc.free(@constCast(self.snapshot_root));
             alloc.free(@constCast(self.dest_root));
             if (self.owns_shard) self.shard.deinit(alloc);
@@ -15386,6 +15390,20 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
+    fn deleteLocalNativeSnapshot(maybe_io: ?std.Io, snapshot_root: []const u8) void {
+        if (maybe_io) |io| {
+            std.Io.Dir.cwd().deleteTree(io, snapshot_root) catch |err| {
+                std.log.warn("failed to remove exported native snapshot staging root={s} err={s}", .{ snapshot_root, @errorName(err) });
+            };
+            return;
+        }
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch |err| {
+            std.log.warn("failed to remove exported native snapshot staging root={s} err={s}", .{ snapshot_root, @errorName(err) });
+        };
+    }
+
     fn prepareNativeBackupShardSnapshot(
         alloc: std.mem.Allocator,
         db: *db_mod.DB,
@@ -15397,7 +15415,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ plan.backup_id, group_id });
         defer alloc.free(snapshot_token);
-        _ = try db.snapshotNative(snapshot_token);
+        _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
         errdefer alloc.free(snapshot_root);
@@ -25601,6 +25619,9 @@ test "bound native restore preserves the validated generated generation" {
         .format = .native,
     })).?;
     defer freeBackupShards(alloc, shards);
+    const local_snapshot = try std.fmt.allocPrint(alloc, "{s}.snapshots/bound-native-local", .{path});
+    defer alloc.free(local_snapshot);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, local_snapshot, .{}));
     const manifest = backups_api.TableBackupManifest{
         .format = .native,
         .backup_id = "bound-native",
@@ -26629,6 +26650,9 @@ test "bound table write source backs up and restores a local table" {
         .backup_id = "snap1",
     })).?;
     defer freeBackupShards(alloc, shards);
+    const local_snapshot = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1-local", .{path});
+    defer alloc.free(local_snapshot);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), local_snapshot, .{}));
 
     var manifest = try backups_api.createManifest(alloc, "snap1", .native, &.{
         .table_id = 1,
