@@ -4333,6 +4333,19 @@ pub const AntflyApiHandler = struct {
         };
         defer drop_result.deinit(alloc);
         var repair_required = false;
+        // A forwarded metadata commit can return before this API node applies
+        // the absence locally. Observe it before destructive ownership checks
+        // so a healthy drop does not manufacture repair debt from a stale
+        // follower projection. Metadata is already committed, so every wait
+        // failure is reported as convergence debt rather than a replayable DDL
+        // failure.
+        self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| {
+            repair_required = true;
+            std.log.warn(
+                "public drop table committed before local absence became observable table={s} err={s}",
+                .{ decoded_table_name, @errorName(err) },
+            );
+        };
         if (self.api_server.table_writes) |write_source| {
             _ = write_source.dropTable(alloc, decoded_table_name, drop_result.cleanupContract()) catch |err| switch (err) {
                 error.TableNotFound => null,
@@ -4353,13 +4366,6 @@ pub const AntflyApiHandler = struct {
                 },
             };
         }
-        self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| switch (err) {
-            error.TableVisibilityTimeout => {
-                repair_required = true;
-                std.log.warn("public drop table committed with visibility repair required table={s}", .{decoded_table_name});
-            },
-            else => return err,
-        };
         if (repair_required) {
             _ = ctx.status(202);
             return ctx.json(.{ .status = "committed_repair_required" });

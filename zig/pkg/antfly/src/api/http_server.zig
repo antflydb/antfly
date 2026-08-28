@@ -35253,7 +35253,7 @@ test "api index status reports missing remote shard as not ready" {
     try std.testing.expectEqual(@as(?bool, true), shard.replay_catch_up_required);
 }
 
-test "api http server drop table waits for metadata lifecycle absence" {
+test "api http server drop table observes metadata absence before local cleanup" {
     const alloc = std.testing.allocator;
 
     const FakeSource = struct {
@@ -35332,6 +35332,8 @@ test "api http server drop table waits for metadata lifecycle absence" {
     };
 
     const FakeWrites = struct {
+        lifecycle_wait_calls: *std.atomic.Value(u32),
+        expected_lifecycle_wait_calls: u32 = 1,
         observed_group_id: ?u64 = null,
         fail_cleanup: bool = false,
 
@@ -35358,13 +35360,17 @@ test "api http server drop table waits for metadata lifecycle absence" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(@as(usize, 1), contract.group_ids.len);
+            try std.testing.expectEqual(
+                self.expected_lifecycle_wait_calls,
+                self.lifecycle_wait_calls.load(.monotonic),
+            );
             self.observed_group_id = contract.group_ids[0];
             if (self.fail_cleanup) return error.InjectedCleanupFailure;
         }
     };
 
     var source = FakeSource{};
-    var writes = FakeWrites{};
+    var writes = FakeWrites{ .lifecycle_wait_calls = &source.lifecycle_wait_calls };
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
 
     var resp = try executeHttpxTestRequest(&server, .{
@@ -35378,6 +35384,7 @@ test "api http server drop table waits for metadata lifecycle absence" {
 
     source.created = true;
     writes.fail_cleanup = true;
+    writes.expected_lifecycle_wait_calls = 2;
     var repair_response = try executeHttpxTestRequest(&server, .{
         .method = .DELETE,
         .uri = "/tables/docs",

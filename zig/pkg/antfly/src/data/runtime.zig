@@ -15717,6 +15717,72 @@ const RemoteMetadataSource = struct {
         return last_err;
     }
 
+    /// Mutation failover is deliberately narrower than ordinary metadata API
+    /// failover. Once a request may have crossed an admission boundary, only
+    /// `NotLeader` proves that replaying it against another configured URI is
+    /// safe. Every other result, especially MetadataMutationOutcomeUnknown,
+    /// must reach the public caller unchanged.
+    fn withMetadataMutationApiClient(
+        self: *RemoteMetadataSource,
+        comptime T: type,
+        comptime callFn: anytype,
+        ctx: anytype,
+    ) !T {
+        const deadline_ns = platform_time.monotonicNs() +|
+            @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        var forwarding_hops_remaining = antfly.public_api.raft_mutation_forwarding.max_forwards;
+        var last_pre_admission_err: anyerror = error.MissingMetadataApi;
+        var mutation_attempted = false;
+        for (0..self.base_uris.len) |attempt| {
+            const index = self.metadataApiIndexForAttempt(attempt);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var metadata_client = self.metadataClient(scratch);
+            const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
+                last_pre_admission_err = err;
+                continue;
+            };
+            self.acceptMetadataIdentity(head.metadata_group_id, head.metadata_incarnation) catch |err| {
+                last_pre_admission_err = err;
+                continue;
+            };
+            if (forwarding_hops_remaining == 0)
+                return error.RaftMutationForwardLimitReached;
+            const forwarding = antfly.public_api.raft_mutation_forwarding.contextForDeadline(
+                platform_time.monotonicNs(),
+                deadline_ns,
+                50 * std.time.ns_per_ms,
+                forwarding_hops_remaining,
+                !mutation_attempted,
+            ) orelse return error.RaftMutationDeadlineExceeded;
+            forwarding_hops_remaining = forwarding.forwards_remaining;
+            mutation_attempted = true;
+            const result = callFn(
+                self,
+                &metadata_client,
+                self.base_uris[index],
+                forwarding,
+                ctx,
+            ) catch |err| {
+                if (!remoteMetadataMutationRetryable(err)) return err;
+                last_pre_admission_err = err;
+                continue;
+            };
+            self.noteMetadataAuthoritySuccess(index);
+            return result;
+        }
+        return last_pre_admission_err;
+    }
+
+    fn remoteMetadataMutationRetryable(err: anyerror) bool {
+        // The authenticated forwarding endpoint emits NotLeader only with its
+        // explicit not-proposed outcome. Transport ambiguity, deterministic
+        // catalog results, and local allocation failures must never be hidden
+        // by endpoint failover.
+        return err == error.NotLeader;
+    }
+
     fn remoteHead(ptr: *anyopaque) !antfly.metadata_api.MetadataHead {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.fetchRemoteHead(null);
@@ -15969,9 +16035,21 @@ const RemoteMetadataSource = struct {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         const body = try antfly.public_api.table_contract.encodeCreateTableRequest(alloc, req);
         defer alloc.free(body);
-        try self.withMetadataApiClient(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: anytype) !void {
-                try client.createTable(base_uri, ctx.table_name, ctx.body);
+        try self.withMetadataMutationApiClient(void, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                forwarding: antfly.public_api.raft_mutation_forwarding.Context,
+                ctx: anytype,
+            ) !void {
+                try client.forwardTableMutation(
+                    base_uri,
+                    .create_table,
+                    ctx.table_name,
+                    ctx.body,
+                    forwarding,
+                );
             }
         }.call, .{ .table_name = table_name, .body = body });
         self.invalidateCache();
@@ -15993,13 +16071,8 @@ const RemoteMetadataSource = struct {
     }
 
     fn remoteDropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
-        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        try self.withMetadataApiClient(void, struct {
-            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
-                try client.dropTable(base_uri, ctx);
-            }
-        }.call, table_name);
-        self.invalidateCache();
+        var result = try remoteDropTableExact(ptr, std.heap.page_allocator, table_name);
+        result.deinit(std.heap.page_allocator);
     }
 
     fn remoteDropTableExact(
@@ -16012,23 +16085,20 @@ const RemoteMetadataSource = struct {
             table_name: []const u8,
             result_alloc: std.mem.Allocator,
         };
-        const result = try self.withMetadataApiClient(
+        const result = try self.withMetadataMutationApiClient(
             antfly.metadata.topology_protocol.DropResult,
             struct {
                 fn call(
                     _: *RemoteMetadataSource,
                     client: *antfly.metadata_http_client.MetadataHttpClient,
                     base_uri: []const u8,
+                    forwarding: antfly.public_api.raft_mutation_forwarding.Context,
                     ctx: Context,
                 ) !antfly.metadata.topology_protocol.DropResult {
                     var remote = try client.forwardTableDropMutationExact(
                         base_uri,
                         ctx.table_name,
-                        .{
-                            .remaining_ms = 5_000,
-                            .forwards_remaining = 2,
-                            .campaign_allowed = true,
-                        },
+                        forwarding,
                     );
                     defer remote.deinit(client.alloc);
                     return .{
@@ -30633,6 +30703,14 @@ test "remote metadata status source advertises exact table drop cleanup" {
     defer source.deinit();
 
     try std.testing.expect(source.statusSource().vtable.drop_table_exact != null);
+}
+
+test "remote metadata mutation failover preserves ambiguous and deterministic outcomes" {
+    try std.testing.expect(RemoteMetadataSource.remoteMetadataMutationRetryable(error.NotLeader));
+    try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.MetadataMutationOutcomeUnknown));
+    try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableNotFound));
+    try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.TableAlreadyExists));
+    try std.testing.expect(!RemoteMetadataSource.remoteMetadataMutationRetryable(error.OutOfMemory));
 }
 
 test "remote metadata source retains mutation authority across cache invalidation" {

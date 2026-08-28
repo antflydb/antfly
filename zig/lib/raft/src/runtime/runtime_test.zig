@@ -2219,7 +2219,7 @@ test "multi raft drainReady always makes progress on one oversized Ready" {
     try std.testing.expect(!host.group(257).?.hasReady());
 }
 
-test "multi raft drainReady surfaces an impossible outbound Ready hard ceiling" {
+test "multi raft drainReady quarantines an impossible outbound Ready hard ceiling" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
@@ -2245,14 +2245,22 @@ test "multi raft drainReady surfaces an impossible outbound Ready hard ceiling" 
     });
     try host.campaignGroup(258);
 
-    try std.testing.expectError(error.OutboundReadyTooLarge, host.drainReady(1));
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_bytes);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().transport_queue_denials);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
+    try std.testing.expect(host.isGroupQuiesced(258));
     try std.testing.expect(host.group(258).?.hasReady());
+    // A quarantined group is not reconsidered every round, avoiding warning
+    // and counter storms while preserving its Ready for operator recovery.
+    try std.testing.expectError(error.GroupHardQuarantined, host.campaignGroup(258));
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
+    try host.resumeGroup(258);
+    try std.testing.expect(!host.isGroupQuiesced(258));
 }
 
-test "multi raft drainReady surfaces an impossible apply Ready hard ceiling" {
+test "multi raft drainReady quarantines an impossible apply Ready hard ceiling" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
@@ -2272,11 +2280,57 @@ test "multi raft drainReady surfaces an impossible apply Ready hard ceiling" {
     try addSingleNodeGroup(&host, 259, &store, false);
     try host.campaignGroup(259);
 
-    try std.testing.expectError(error.ApplyReadyTooLarge, host.drainReady(1));
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_bytes);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().apply_queue_denials);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_apply_ready_rejections);
+    try std.testing.expect(host.isGroupQuiesced(259));
     try std.testing.expect(host.group(259).?.hasReady());
+}
+
+test "multi raft oversized Ready isolation still flushes healthy groups in the batch" {
+    var healthy_store = core.MemoryStorage.init(std.testing.allocator);
+    defer healthy_store.deinit();
+    var oversized_store = core.MemoryStorage.init(std.testing.allocator);
+    defer oversized_store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(260, &healthy_store);
+    try storage_recorder.registerStore(261, &oversized_store);
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_single_outbound_ready_bytes = 1,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 260, &healthy_store, false);
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 261,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 261,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = oversized_store.storage(),
+    });
+    try host.campaignGroup(260);
+    try host.campaignGroup(261);
+
+    const drained = try host.drainReady(8);
+    try std.testing.expectEqual(@as(usize, 1), drained.processed_ready_steps);
+    try std.testing.expect(apply_recorder.applied_entries > 0);
+    try std.testing.expect(!host.group(260).?.hasReady());
+    try std.testing.expect(host.isGroupQuiesced(261));
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
 }
 
 test "multi raft removal drops pending applies and retires replica storage" {

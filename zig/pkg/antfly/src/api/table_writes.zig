@@ -3801,6 +3801,7 @@ const HostedManagedDbCache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     write_cache: ProvisionedTableWriteCache,
     runtime_status_cache: runtime_status.TableRuntimeSnapshotCache,
+    drop_cleanup_source: ?*ProvisionedTableWriteSource = null,
 
     fn init(alloc: std.mem.Allocator, replica_root_dir: []const u8) !*HostedManagedDbCache {
         const cache = try alloc.create(HostedManagedDbCache);
@@ -3853,6 +3854,14 @@ pub fn closeHostedManagedDbCacheForRoot(replica_root_dir: []const u8) void {
     }
 
     const cache = removed orelse return;
+    // The persistent hosted cleanup owner may have durable jobs waiting for
+    // cache exclusion. Quiesce it before taking the cache mutex so those jobs
+    // can finish without a shutdown deadlock, then retire the borrowed caches.
+    if (cache.drop_cleanup_source) |cleanup| {
+        cleanup.deinit();
+        alloc.destroy(cleanup);
+        cache.drop_cleanup_source = null;
+    }
     lockAtomic(&cache.mutex);
     cache.write_cache.deinit();
     cache.runtime_status_cache.deinit();
@@ -6073,6 +6082,9 @@ pub const ProvisionedTableWriteSource = struct {
     write_cache: ?*ProvisionedTableWriteCache = null,
     startup_write_cache: ?*ProvisionedTableWriteCache = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
+    // Hosted storage shares a process-wide cache whose mutex must fence both
+    // foreground opens and persistent dropped-table recovery jobs.
+    dropped_table_cleanup_outer_mutex: ?*std.atomic.Mutex = null,
     dropped_table_delete_owner_id: u64 = 0,
     dropped_table_recovery_started: std.atomic.Value(bool) = .init(false),
     dropped_table_recovery_scheduled: std.atomic.Value(bool) = .init(false),
@@ -14997,6 +15009,8 @@ pub const ProvisionedTableWriteSource = struct {
         contract: metadata_topology_protocol.DropCleanupContract,
         retire_publication_authority: bool,
     ) !void {
+        if (self.dropped_table_cleanup_outer_mutex) |outer_mutex| lockAtomic(outer_mutex);
+        defer if (self.dropped_table_cleanup_outer_mutex) |outer_mutex| outer_mutex.unlock();
         const group_ids = contract.group_ids;
         // A durable index repair owns group admission while it advances one
         // bounded build slice. Publish cancellation before waiting for the
@@ -18631,6 +18645,24 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 
     pub fn source(self: *HostedProvisionedTableWriteSource) TableWriteSource {
+        // Source publication is the hosted process startup boundary. Create
+        // the persistent cleanup owner here so intents left by a crash are
+        // recovered even when no subsequent table drop happens.
+        if (hostedManagedDbCacheForRoot(self.replica_root_dir)) |cache| {
+            if (self.persistentDropCleanupSource(cache)) |cleanup| {
+                _ = cleanup.source();
+            } else |err| {
+                std.log.warn(
+                    "hosted dropped-table recovery owner unavailable root={s} err={s}",
+                    .{ self.replica_root_dir, @errorName(err) },
+                );
+            }
+        } else |err| {
+            std.log.warn(
+                "hosted dropped-table cache unavailable root={s} err={s}",
+                .{ self.replica_root_dir, @errorName(err) },
+            );
+        }
         return .{
             .ptr = self,
             .vtable = &.{
@@ -18679,6 +18711,29 @@ pub const HostedProvisionedTableWriteSource = struct {
         };
     }
 
+    fn persistentDropCleanupSource(
+        self: *HostedProvisionedTableWriteSource,
+        cache: *HostedManagedDbCache,
+    ) !*ProvisionedTableWriteSource {
+        lockAtomic(&cache.mutex);
+        defer cache.mutex.unlock();
+        if (cache.drop_cleanup_source == null) {
+            const cleanup = try std.heap.page_allocator.create(ProvisionedTableWriteSource);
+            errdefer std.heap.page_allocator.destroy(cleanup);
+            cleanup.* = ProvisionedTableWriteSource.init(self.replica_root_dir, self.catalog);
+            cleanup.write_cache = &cache.write_cache;
+            cleanup.runtime_status_cache = &cache.runtime_status_cache;
+            cleanup.dropped_table_cleanup_outer_mutex = &cache.mutex;
+            cleanup.backend_runtime = self.backend_runtime;
+            cache.drop_cleanup_source = cleanup;
+        } else if (self.backend_runtime) |runtime| {
+            // Runtime attachment may happen after the process-wide hosted
+            // cache was first opened. Publish it before recovery scheduling.
+            cache.drop_cleanup_source.?.backend_runtime = runtime;
+        }
+        return cache.drop_cleanup_source.?;
+    }
+
     fn dropTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
@@ -18688,18 +18743,15 @@ pub const HostedProvisionedTableWriteSource = struct {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (contract.group_ids.len == 0) return null;
 
-        // Hosted reads and writes share this process-wide cache. Serialize the
-        // eviction with every hosted open, then use the same crash-safe cleanup
-        // implementation as data nodes. Keep deletion synchronous because the
-        // adapter is request-scoped and must not escape into a background job.
+        // Hosted reads and writes share this process-wide cache. A persistent
+        // cleanup source owns startup scans and durable retry jobs; unlike a
+        // request-scoped adapter it remains valid until the cache is closed.
         const cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
-        lockAtomic(&cache.mutex);
-        defer cache.mutex.unlock();
-        var cleanup = ProvisionedTableWriteSource.init(self.replica_root_dir, self.catalog);
-        defer cleanup.deinit();
-        cleanup.write_cache = &cache.write_cache;
-        cleanup.runtime_status_cache = &cache.runtime_status_cache;
-        return try ProvisionedTableWriteSource.dropTable(&cleanup, alloc, table_name, contract);
+        const cleanup = try self.persistentDropCleanupSource(cache);
+        // Publishing the source schedules the one-time startup recovery scan.
+        // Later failures schedule additional runs through the same persistent
+        // owner, and every run takes cache.mutex inside the cleanup path.
+        return try cleanup.source().dropTable(alloc, table_name, contract);
     }
 
     fn createIndex(
@@ -43162,6 +43214,52 @@ test "provisioned table drop retains repair intent until catalog ownership clear
     defer repair_dir.close(io_impl.io());
     var iterator = repair_dir.iterate();
     try std.testing.expect((try iterator.next(io_impl.io())) == null);
+}
+
+test "hosted source publication recovers durable dropped-table intent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/hosted-drop-table-startup-recovery",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    defer closeHostedManagedDbCacheForRoot(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
+    const intent_path = try persistDroppedTableRepairIntent(
+        alloc,
+        replica_root_dir,
+        "docs",
+        .{
+            .table_id = 7,
+            .expected_transition_generation = 1,
+            .group_ids = &.{7001},
+        },
+    );
+    defer alloc.free(intent_path);
+
+    // Router and executor are never consulted by cleanup recovery. Keeping
+    // them undefined makes the test fail immediately if that contract drifts.
+    var source = HostedProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+        undefined,
+        undefined,
+    );
+    _ = source.source();
+
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), intent_path, .{}));
+    const cache = hostedManagedDbCacheForRootIfPresent(replica_root_dir) orelse
+        return error.TestExpectedHostedCache;
+    try std.testing.expect(cache.drop_cleanup_source != null);
 }
 
 test "provisioned table write source drop table retires old publication authority" {

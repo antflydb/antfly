@@ -489,8 +489,8 @@ pub const MultiRaft = struct {
         if (self.group(desc.group.group_id)) |existing| {
             if (existing.localNodeId() != desc.group.local_node_id) return error.LocalNodeIdMismatch;
             if (self.isGroupQuiesced(desc.group.group_id)) {
-                try self.resumeGroup(desc.group.group_id);
-                result.resumed = true;
+                result.resumed = self.scheduler.resumeGroupOnActivity(desc.group.group_id);
+                if (result.resumed) self.refreshMetricsTopology();
             }
         } else {
             try self.addGroup(desc.group);
@@ -863,10 +863,31 @@ pub const MultiRaft = struct {
     pub fn processReady(self: *MultiRaft, group_id: core.types.GroupId) !bool {
         var outbox = TransportOutbox{};
         defer outbox.deinit(self.alloc);
+        // The single-group path must remain allocation-free until Ready passes
+        // admission (backpressure tests deliberately install a failing
+        // allocator). Back this one-element quarantine sink with stack memory.
+        var oversized_ready_group_buf: [1]core.types.GroupId = undefined;
+        var oversized_ready_groups = std.ArrayListUnmanaged(core.types.GroupId){
+            .items = oversized_ready_group_buf[0..0],
+            .capacity = oversized_ready_group_buf.len,
+        };
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
         if (batch != null) self.metrics.persist_batches += 1;
         defer if (batch) |persist_batch| persist_batch.finish() catch unreachable;
-        const processed = try self.processReadyIntoOutbox(group_id, &outbox, batch, false, false, null);
+        const processed = try self.processReadyIntoOutbox(
+            group_id,
+            &outbox,
+            batch,
+            false,
+            false,
+            null,
+            &oversized_ready_groups,
+        );
+        var oversized_quarantine_cursor: usize = 0;
+        self.quiesceOversizedReadyGroups(
+            oversized_ready_groups.items,
+            &oversized_quarantine_cursor,
+        );
         try outbox.drainInto(self.alloc, &self.pending_outbox);
         try self.flushPendingApply();
         try self.flushPendingTransport();
@@ -897,6 +918,10 @@ pub const MultiRaft = struct {
 
         var fair_attempts: usize = 0;
         const scan_limit = self.groups.count();
+        var oversized_ready_groups = std.ArrayListUnmanaged(core.types.GroupId).empty;
+        defer oversized_ready_groups.deinit(self.alloc);
+        try oversized_ready_groups.ensureTotalCapacity(self.alloc, scan_limit);
+        var oversized_quarantine_cursor: usize = 0;
         const scan_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         {
             var ready_pass = self.scheduler.beginReadyPass(.fair);
@@ -904,12 +929,16 @@ pub const MultiRaft = struct {
             while (fair_attempts < scan_limit) : (fair_attempts += 1) {
                 if (result.processed_ready_steps >= max_ready_steps) break;
                 const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
-                if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
+                if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, &oversized_ready_groups)) {
                     result.processed_groups += 1;
                     result.processed_ready_steps += 1;
                 }
             }
         }
+        self.quiesceOversizedReadyGroups(
+            oversized_ready_groups.items,
+            &oversized_quarantine_cursor,
+        );
 
         // If budget remains, every group received one fair opportunity above.
         // Spend that budget only on hints produced while useful work advanced.
@@ -932,12 +961,16 @@ pub const MultiRaft = struct {
                     const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
                     continuation_attempts += 1;
                     attempted_this_pass += 1;
-                    if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics)) {
+                    if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, &oversized_ready_groups)) {
                         result.processed_ready_steps += 1;
                         progressed_this_pass += 1;
                     }
                 }
             }
+            self.quiesceOversizedReadyGroups(
+                oversized_ready_groups.items,
+                &oversized_quarantine_cursor,
+            );
             if (attempted_this_pass == 0 or progressed_this_pass == 0) break;
         }
         if (diagnostics) |diag| diag.scan_elapsed_ns = clock.elapsedSinceNs(scan_start_ns);
@@ -964,12 +997,34 @@ pub const MultiRaft = struct {
         return result;
     }
 
+    fn quiesceOversizedReadyGroups(
+        self: *MultiRaft,
+        group_ids: []const core.types.GroupId,
+        cursor: *usize,
+    ) void {
+        var changed = false;
+        while (cursor.* < group_ids.len) : (cursor.* += 1) {
+            const group_id = group_ids[cursor.*];
+            self.scheduler.quarantineGroup(group_id) catch |err| {
+                std.log.err(
+                    "failed to quiesce oversized Ready group_id={d} err={s}",
+                    .{ group_id, @errorName(err) },
+                );
+                self.scheduler.deferReady(group_id);
+                continue;
+            };
+            changed = true;
+        }
+        if (changed) self.refreshMetricsTopology();
+    }
+
     fn processReadyCandidate(
         self: *MultiRaft,
         group_id: core.types.GroupId,
         outbox: *TransportOutbox,
         persist_batch: ?storage_iface.PersistBatch,
         diagnostics: ?*DrainReadyDiagnostics,
+        oversized_ready_groups: *std.ArrayListUnmanaged(core.types.GroupId),
     ) !bool {
         if (diagnostics) |diag| {
             var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
@@ -981,6 +1036,7 @@ pub const MultiRaft = struct {
                 false,
                 false,
                 &ready_diag,
+                oversized_ready_groups,
             );
             ready_diag.elapsed_ns = clock.elapsedSinceNs(ready_start_ns);
             ready_diag.processed = processed;
@@ -996,6 +1052,7 @@ pub const MultiRaft = struct {
             false,
             false,
             null,
+            oversized_ready_groups,
         );
     }
 
@@ -1007,6 +1064,7 @@ pub const MultiRaft = struct {
         flush_transport: bool,
         flush_apply_queue: bool,
         diagnostics: ?*ReadyGroupDiagnostics,
+        oversized_ready_groups: *std.ArrayListUnmanaged(core.types.GroupId),
     ) !bool {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         if (!grp.hasReady()) {
@@ -1073,10 +1131,17 @@ pub const MultiRaft = struct {
             }
             self.metrics.oversized_outbound_ready_rejections += 1;
             std.log.warn(
-                "raft Ready exceeds hard outbound ceiling group_id={d} message_bytes={d} max_bytes={d}",
+                "raft Ready exceeds hard outbound ceiling; quiescing group group_id={d} message_bytes={d} max_bytes={d}",
                 .{ group_id, ready_pressure.message_bytes, self.cfg.max_single_outbound_ready_bytes },
             );
-            return error.OutboundReadyTooLarge;
+            // This is a group-local invariant violation. Returning from the
+            // middle of a multi-group drain would discard the local outbox
+            // for Ready batches already persisted and advanced earlier in the
+            // pass. Quarantine only the offending group and let the batch
+            // flush normally; metrics and quiesced status retain the operator
+            // signal without starving healthy groups or log-spinning.
+            oversized_ready_groups.appendAssumeCapacity(group_id);
+            return false;
         }
         if (!outbound_capacity_available and !outbound_single_ready_progress) {
             if (diagnostics) |diag| {
@@ -1102,10 +1167,11 @@ pub const MultiRaft = struct {
             }
             self.metrics.oversized_apply_ready_rejections += 1;
             std.log.warn(
-                "raft Ready exceeds hard apply ceiling group_id={d} apply_bytes={d} max_bytes={d} snapshot_bytes={d}",
+                "raft Ready exceeds hard apply ceiling; quiescing group group_id={d} apply_bytes={d} max_bytes={d} snapshot_bytes={d}",
                 .{ group_id, apply_ready_bytes, self.cfg.max_single_apply_ready_bytes, ready_pressure.snapshot_bytes },
             );
-            return error.ApplyReadyTooLarge;
+            oversized_ready_groups.appendAssumeCapacity(group_id);
+            return false;
         }
         if (!apply_capacity_available and !apply_single_ready_progress) {
             if (diagnostics) |diag| {
@@ -1768,7 +1834,8 @@ pub const MultiRaft = struct {
 
     fn resumeOnActivity(self: *MultiRaft, group_id: core.types.GroupId) !void {
         if (!self.groups.contains(group_id)) return error.UnknownGroup;
-        if (self.isGroupQuiesced(group_id)) try self.resumeGroup(group_id);
+        if (self.scheduler.isHardQuarantined(group_id)) return error.GroupHardQuarantined;
+        if (self.scheduler.resumeGroupOnActivity(group_id)) self.refreshMetricsTopology();
         self.scheduler.noteActivity(group_id);
     }
 

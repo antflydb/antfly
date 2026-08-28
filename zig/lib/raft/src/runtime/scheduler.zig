@@ -34,6 +34,7 @@ pub const Scheduler = struct {
 
     const GroupState = struct {
         quiesced: bool = false,
+        hard_quarantined: bool = false,
         ready_visit_epoch: u64 = 0,
         fair_ready: QueueLinks = .{},
         continuation_ready: QueueLinks = .{},
@@ -194,10 +195,36 @@ pub const Scheduler = struct {
         self.removeQueuedGroup(group_id);
     }
 
+    /// Quarantine a group whose Ready output violated a host safety limit.
+    /// Unlike ordinary quiescence, traffic must not implicitly resume it: the
+    /// offending Ready remains present until an operator explicitly resumes or
+    /// removes the group after correcting the underlying condition.
+    pub fn quarantineGroup(self: *Scheduler, group_id: core.types.GroupId) !void {
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.getPtr(group_id) orelse return error.UnknownGroup;
+        state.hard_quarantined = true;
+        if (state.quiesced) return;
+        state.quiesced = true;
+        self.active_group_count -= 1;
+        self.removeQueuedGroup(group_id);
+    }
+
     pub fn resumeGroup(self: *Scheduler, group_id: core.types.GroupId) bool {
         std.debug.assert(!self.ready_pass_active);
         const state = self.groups.getPtr(group_id) orelse return false;
+        state.hard_quarantined = false;
         if (!state.quiesced) return false;
+        state.quiesced = false;
+        self.active_group_count += 1;
+        return true;
+    }
+
+    /// Resume ordinary idle quiescence in response to traffic. Hard-limit
+    /// quarantines require the explicit resumeGroup path instead.
+    pub fn resumeGroupOnActivity(self: *Scheduler, group_id: core.types.GroupId) bool {
+        std.debug.assert(!self.ready_pass_active);
+        const state = self.groups.getPtr(group_id) orelse return false;
+        if (state.hard_quarantined or !state.quiesced) return false;
         state.quiesced = false;
         self.active_group_count += 1;
         return true;
@@ -206,6 +233,11 @@ pub const Scheduler = struct {
     pub fn isQuiesced(self: *const Scheduler, group_id: core.types.GroupId) bool {
         const state = self.groups.get(group_id) orelse return false;
         return state.quiesced;
+    }
+
+    pub fn isHardQuarantined(self: *const Scheduler, group_id: core.types.GroupId) bool {
+        const state = self.groups.get(group_id) orelse return false;
+        return state.hard_quarantined;
     }
 
     pub fn activeGroupCount(self: *const Scheduler) usize {
@@ -384,6 +416,22 @@ test "scheduler skips quiesced groups" {
     try std.testing.expect(scheduler.resumeGroup(2));
     try std.testing.expectEqual(@as(?core.types.GroupId, 1), scheduler.nextTickGroup());
     try std.testing.expectEqual(@as(?core.types.GroupId, 2), scheduler.nextTickGroup());
+}
+
+test "scheduler hard quarantine requires explicit resume" {
+    var scheduler = Scheduler.init(std.testing.allocator, .{});
+    defer scheduler.deinit();
+
+    try scheduler.registerGroup(1);
+    try scheduler.quarantineGroup(1);
+    try std.testing.expect(scheduler.isQuiesced(1));
+    try std.testing.expect(scheduler.isHardQuarantined(1));
+    try std.testing.expect(!scheduler.resumeGroupOnActivity(1));
+    try std.testing.expect(scheduler.isQuiesced(1));
+
+    try std.testing.expect(scheduler.resumeGroup(1));
+    try std.testing.expect(!scheduler.isQuiesced(1));
+    try std.testing.expect(!scheduler.isHardQuarantined(1));
 }
 
 test "scheduler prioritizes each ready group once per pass" {
