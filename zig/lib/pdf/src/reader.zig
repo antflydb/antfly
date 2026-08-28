@@ -601,6 +601,10 @@ const Type3Glyph = struct {
     content: []u8,
     advance_x: f64,
     advance_y: f64,
+    /// True only when the native outline path accounts for every
+    /// pixel-affecting CharProc operator. Resource-backed paint must never be
+    /// silently dropped while the enclosing text run remains vectorizable.
+    vectorizable: bool = true,
 
     fn deinit(self: *Type3Glyph, alloc: Allocator) void {
         alloc.free(self.name);
@@ -3183,9 +3187,10 @@ pub const Reader = struct {
         for (raw) |code| {
             const glyph = type3.glyphForCode(code) orelse {
                 complete = false;
-                cursor_x += estimateType3MissingAdvance(run);
+                cursor_x += estimateType3MissingAdvance(run, code);
                 continue;
             };
+            if (!glyph.vectorizable) return false;
 
             var glyph_shapes = std.ArrayList(ShapeRun).empty;
             defer {
@@ -3198,10 +3203,9 @@ pub const Reader = struct {
                 paint_phase.* += 1;
             }
 
-            cursor_x += glyph.advance_x * run.font_size * run.horizontal_scale;
+            const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
+            cursor_x += (glyph.advance_x * run.font_size + spacing) * run.horizontal_scale;
             cursor_y += glyph.advance_y * run.font_size;
-            cursor_x += run.char_spacing;
-            if (code == ' ') cursor_x += run.word_spacing;
         }
         return complete;
     }
@@ -3451,7 +3455,7 @@ pub const Reader = struct {
         for (raw) |code| {
             const glyph = type1.glyphForCode(code) orelse {
                 complete = false;
-                cursor_x += estimateType1MissingAdvance(run);
+                cursor_x += estimateType1MissingAdvance(run, code);
                 continue;
             };
             const outline_value = font_lib.type1.glyphOutlineAlloc(alloc, glyph.charstring, type1.local_subrs) catch |err| blk: {
@@ -5827,10 +5831,14 @@ pub const Reader = struct {
                 },
                 .dict => {
                     if (resolved_encoding.get("BaseEncoding")) |base_obj| {
-                        if (base_obj.asName()) |name| decoder.base_encoding = namedEncodingFromName(name);
+                        var resolved_base = try self.resolveValue(base_obj);
+                        defer resolved_base.deinit(self.alloc);
+                        if (resolved_base.asName()) |name| decoder.base_encoding = namedEncodingFromName(name);
                     }
                     if (resolved_encoding.get("Differences")) |diff_obj| {
-                        try applyEncodingDifferences(self.alloc, &decoder, diff_obj);
+                        var resolved_differences = try self.resolveValue(diff_obj);
+                        defer resolved_differences.deinit(self.alloc);
+                        try applyEncodingDifferences(self.alloc, &decoder, &resolved_differences);
                     }
                 },
                 else => {},
@@ -5874,12 +5882,15 @@ pub const Reader = struct {
         var code_to_name = [_]?[]const u8{null} ** 256;
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
+        var resolved_differences: ?syntax.Object = null;
+        defer if (resolved_differences) |*differences| differences.deinit(self.alloc);
         if (font_obj.get("Encoding")) |encoding_obj| {
             resolved_encoding = try self.resolveValue(encoding_obj);
             if (resolved_encoding) |*encoding| {
                 if (encoding.* == .dict) {
                     if (encoding.get("Differences")) |diff_obj| {
-                        try applyEncodingDifferenceNames(&code_to_name, diff_obj);
+                        resolved_differences = try self.resolveValue(diff_obj);
+                        try applyEncodingDifferenceNames(&code_to_name, &resolved_differences.?);
                     }
                 }
             }
@@ -5932,6 +5943,7 @@ pub const Reader = struct {
                 .content = content,
                 .advance_x = advance_x,
                 .advance_y = advance_y,
+                .vectorizable = try type3CharProcIsVectorizableAlloc(self.alloc, content),
             });
             name = null;
         }
@@ -6151,6 +6163,8 @@ pub const Reader = struct {
             var code_to_name = [_]?[]const u8{null} ** 256;
             var resolved_encoding: ?syntax.Object = null;
             defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
+            var resolved_differences: ?syntax.Object = null;
+            defer if (resolved_differences) |*differences| differences.deinit(self.alloc);
             if (font_obj.get("Encoding")) |encoding_obj| {
                 resolved_encoding = try self.resolveValue(encoding_obj);
                 if (resolved_encoding) |*encoding| switch (encoding.*) {
@@ -6161,7 +6175,10 @@ pub const Reader = struct {
                             defer resolved_base.deinit(self.alloc);
                             if (resolved_base.asName()) |name| base_encoding = simpleCffBaseEncodingFromName(name);
                         }
-                        if (encoding.get("Differences")) |differences| try applyEncodingDifferenceNames(&code_to_name, differences);
+                        if (encoding.get("Differences")) |differences| {
+                            resolved_differences = try self.resolveValue(differences);
+                            try applyEncodingDifferenceNames(&code_to_name, &resolved_differences.?);
+                        }
                     },
                     else => {},
                 };
@@ -6306,15 +6323,28 @@ pub const Reader = struct {
         }
 
         var code_to_name = [_]?[]const u8{null} ** 256;
+        var base_encoding = text_encoding.NamedEncoding.standard;
         var resolved_encoding: ?syntax.Object = null;
         defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
+        var resolved_differences: ?syntax.Object = null;
+        defer if (resolved_differences) |*differences| differences.deinit(self.alloc);
         if (font_obj.get("Encoding")) |encoding_obj| {
             resolved_encoding = try self.resolveValue(encoding_obj);
             if (resolved_encoding) |*encoding| {
-                if (encoding.* == .dict) {
-                    if (encoding.get("Differences")) |diff_obj| {
-                        try applyEncodingDifferenceNames(&code_to_name, diff_obj);
-                    }
+                switch (encoding.*) {
+                    .name => |name| base_encoding = namedEncodingFromName(name),
+                    .dict => {
+                        if (encoding.get("BaseEncoding")) |base_obj| {
+                            var resolved_base = try self.resolveValue(base_obj);
+                            defer resolved_base.deinit(self.alloc);
+                            if (resolved_base.asName()) |name| base_encoding = namedEncodingFromName(name);
+                        }
+                        if (encoding.get("Differences")) |diff_obj| {
+                            resolved_differences = try self.resolveValue(diff_obj);
+                            try applyEncodingDifferenceNames(&code_to_name, &resolved_differences.?);
+                        }
+                    },
+                    else => {},
                 }
             }
         }
@@ -6328,7 +6358,7 @@ pub const Reader = struct {
         if (font_obj.get("Widths")) |obj| resolved_widths = try self.resolveValue(obj);
         const widths = if (resolved_widths) |*obj| if (obj.* == .array) obj.array else &[_]syntax.Object{} else &[_]syntax.Object{};
 
-        const glyphs = try parseType1GlyphsAlloc(self.alloc, bytes, len_iv, font_obj, &code_to_name, first_char, widths);
+        const glyphs = try parseType1GlyphsAlloc(self.alloc, bytes, len_iv, base_encoding, &code_to_name, first_char, widths);
         errdefer {
             for (glyphs) |*glyph| glyph.deinit(self.alloc);
             if (glyphs.len > 0) self.alloc.free(glyphs);
@@ -8017,33 +8047,29 @@ fn type1EncodingGlyphName(enc: text_encoding.NamedEncoding, code: u8) ?[]const u
 }
 
 fn populateType1EncodingFallbacks(
-    font_obj: *const syntax.Object,
+    alloc: Allocator,
+    base_encoding: text_encoding.NamedEncoding,
     code_to_name: *[256]?[]const u8,
     glyph_names: []const []const u8,
 ) !void {
-    var base_encoding = text_encoding.NamedEncoding.standard;
-    if (font_obj.get("Encoding")) |encoding_obj| {
-        switch (encoding_obj.*) {
-            .name => |name| base_encoding = namedEncodingFromName(name),
-            .dict => {
-                if (encoding_obj.get("BaseEncoding")) |base_obj| {
-                    if (base_obj.asName()) |name| base_encoding = namedEncodingFromName(name);
-                }
-            },
-            else => {},
+    var names = std.StringHashMapUnmanaged([]const u8).empty;
+    defer names.deinit(alloc);
+    var runes = std.AutoHashMapUnmanaged(u21, []const u8).empty;
+    defer runes.deinit(alloc);
+    for (glyph_names) |name| {
+        const name_result = try names.getOrPut(alloc, name);
+        if (!name_result.found_existing) name_result.value_ptr.* = name;
+        if (text_encoding.glyphNameToRune(name)) |cp| {
+            const rune_result = try runes.getOrPut(alloc, cp);
+            if (!rune_result.found_existing) rune_result.value_ptr.* = name;
         }
     }
-    for (glyph_names) |name| {
-        var code: usize = 0;
-        while (code < 256) : (code += 1) {
-            if (code_to_name[code] != null) continue;
-            if (type1EncodingGlyphName(base_encoding, @intCast(code))) |encoded_name| {
-                if (!std.mem.eql(u8, encoded_name, name)) continue;
-            } else if (base_encoding == .pdf_doc) {
-                const cp = text_encoding.glyphNameToRune(name) orelse continue;
-                if (text_encoding.pdf_doc_encoding[code] != cp) continue;
-            } else continue;
-            code_to_name[code] = name;
+    for (code_to_name, 0..) |*maybe_name, code| {
+        if (maybe_name.* != null) continue;
+        if (type1EncodingGlyphName(base_encoding, @intCast(code))) |encoded_name| {
+            maybe_name.* = names.get(encoded_name);
+        } else if (base_encoding == .pdf_doc) {
+            maybe_name.* = runes.get(text_encoding.pdf_doc_encoding[code]);
         }
     }
 }
@@ -8112,12 +8138,12 @@ fn parseType1GlyphsAlloc(
     alloc: Allocator,
     bytes: []const u8,
     len_iv: i64,
-    font_obj: *const syntax.Object,
+    base_encoding: text_encoding.NamedEncoding,
     code_to_name: *[256]?[]const u8,
     first_char: usize,
     widths: []const syntax.Object,
 ) ![]Type1Glyph {
-    const rd_result = parseType1GlyphsRdAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths) catch |err| switch (err) {
+    const rd_result = parseType1GlyphsRdAlloc(alloc, bytes, len_iv, base_encoding, code_to_name, first_char, widths) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => null,
     };
@@ -8125,15 +8151,7 @@ fn parseType1GlyphsAlloc(
         if (glyphs.len > 0) return glyphs;
         alloc.free(glyphs);
     }
-    return try parseType1GlyphsLexAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths);
-}
-
-fn type1GlyphNameIsStandardComponent(glyph_name: []const u8) bool {
-    for (0..256) |code| {
-        const name = font_lib.cff.standardEncodingGlyphName(@intCast(code)) orelse continue;
-        if (std.mem.eql(u8, name, glyph_name)) return true;
-    }
-    return false;
+    return try parseType1GlyphsLexAlloc(alloc, bytes, len_iv, base_encoding, code_to_name, first_char, widths);
 }
 
 fn appendOwnedType1Glyph(
@@ -8180,43 +8198,49 @@ fn appendParsedType1Glyphs(
     first_char: usize,
     widths: []const syntax.Object,
 ) !void {
-    // Resolve each PDF code to one parsed CharString first. Encoded aliases
-    // then borrow the same immutable name/program instead of duplicating up to
-    // 256 copies of attacker-controlled font data.
-    var parsed_index_for_code = [_]?usize{null} ** 256;
+    // Index attacker-controlled CharStrings once. PDF encodings and the seac
+    // StandardEncoding closure are both capped at 256 entries, keeping this
+    // phase O(glyphs + 256) and under the caller's decode budget.
+    var parsed_by_name = std.StringHashMapUnmanaged(usize).empty;
+    defer parsed_by_name.deinit(alloc);
+    for (glyph_names, 0..) |name, parsed_index| {
+        const result = try parsed_by_name.getOrPut(alloc, name);
+        // Type 1 dictionaries use first-definition semantics in our tolerant
+        // parser, matching the prior linear lookup.
+        if (!result.found_existing) result.value_ptr.* = parsed_index;
+    }
+
+    var owner_by_parsed = std.AutoHashMapUnmanaged(usize, usize).empty;
+    defer owner_by_parsed.deinit(alloc);
     for (code_to_name, 0..) |maybe_name, code| {
-        const encoded_name = maybe_name orelse continue;
-        for (glyph_names, 0..) |parsed_name, parsed_index| {
-            if (std.mem.eql(u8, encoded_name, parsed_name)) {
-                parsed_index_for_code[code] = parsed_index;
-                break;
-            }
+        const parsed_index = parsed_by_name.get(maybe_name orelse continue) orelse continue;
+        const advance = if (code >= first_char and code - first_char < widths.len)
+            numericObjectValue(&widths[code - first_char]) orelse 1000.0
+        else
+            1000.0;
+        if (owner_by_parsed.get(parsed_index)) |owner_index| {
+            // Copy the owner value before append potentially reallocates.
+            try appendBorrowedType1Glyph(glyphs, alloc, glyphs.items[owner_index], @intCast(code), advance);
+        } else {
+            const owner_index = glyphs.items.len;
+            try appendOwnedType1Glyph(glyphs, alloc, @intCast(code), true, glyph_names[parsed_index], glyph_programs[parsed_index], advance);
+            glyph_names[parsed_index] = &.{};
+            glyph_programs[parsed_index] = &.{};
+            try owner_by_parsed.put(alloc, parsed_index, owner_index);
         }
     }
 
-    for (glyph_names, glyph_programs, 0..) |glyph_name, program, parsed_index| {
-        var owner_index: ?usize = null;
-        for (parsed_index_for_code, 0..) |maybe_index, code| {
-            if (maybe_index != parsed_index) continue;
-            const advance = if (code >= first_char and code - first_char < widths.len)
-                numericObjectValue(&widths[code - first_char]) orelse 1000.0
-            else
-                1000.0;
-            if (owner_index) |index| {
-                // Copy the owner value before append potentially reallocates.
-                try appendBorrowedType1Glyph(glyphs, alloc, glyphs.items[index], @intCast(code), advance);
-            } else {
-                owner_index = glyphs.items.len;
-                try appendOwnedType1Glyph(glyphs, alloc, @intCast(code), true, glyph_name, program, advance);
-                glyph_names[parsed_index] = &.{};
-                glyph_programs[parsed_index] = &.{};
-            }
-        }
-        if (owner_index == null and type1GlyphNameIsStandardComponent(glyph_name)) {
-            try appendOwnedType1Glyph(glyphs, alloc, 0, false, glyph_name, program, 1000.0);
-            glyph_names[parsed_index] = &.{};
-            glyph_programs[parsed_index] = &.{};
-        }
+    // Retain unencoded StandardEncoding components needed by the Type 1 seac
+    // operator, once per parsed program rather than scanning every glyph.
+    for (0..256) |code| {
+        const standard_name = font_lib.cff.standardEncodingGlyphName(@intCast(code)) orelse continue;
+        const parsed_index = parsed_by_name.get(standard_name) orelse continue;
+        if (owner_by_parsed.contains(parsed_index)) continue;
+        const owner_index = glyphs.items.len;
+        try appendOwnedType1Glyph(glyphs, alloc, 0, false, glyph_names[parsed_index], glyph_programs[parsed_index], 1000.0);
+        glyph_names[parsed_index] = &.{};
+        glyph_programs[parsed_index] = &.{};
+        try owner_by_parsed.put(alloc, parsed_index, owner_index);
     }
 }
 
@@ -8224,7 +8248,7 @@ fn parseType1GlyphsLexAlloc(
     alloc: Allocator,
     bytes: []const u8,
     len_iv: i64,
-    font_obj: *const syntax.Object,
+    base_encoding: text_encoding.NamedEncoding,
     code_to_name: *[256]?[]const u8,
     first_char: usize,
     widths: []const syntax.Object,
@@ -8292,7 +8316,7 @@ fn parseType1GlyphsLexAlloc(
     for (glyph_names.items) |name| {
         if (name.len == 1 and code_to_name[name[0]] == null) code_to_name[name[0]] = name;
     }
-    try populateType1EncodingFallbacks(font_obj, code_to_name, glyph_names.items);
+    try populateType1EncodingFallbacks(alloc, base_encoding, code_to_name, glyph_names.items);
 
     var glyphs = std.ArrayList(Type1Glyph).empty;
     errdefer {
@@ -8362,7 +8386,7 @@ fn parseType1GlyphsRdAlloc(
     alloc: Allocator,
     bytes: []const u8,
     len_iv: i64,
-    font_obj: *const syntax.Object,
+    base_encoding: text_encoding.NamedEncoding,
     code_to_name: *[256]?[]const u8,
     first_char: usize,
     widths: []const syntax.Object,
@@ -8425,7 +8449,7 @@ fn parseType1GlyphsRdAlloc(
     for (glyph_names.items) |name| {
         if (name.len == 1 and code_to_name[name[0]] == null) code_to_name[name[0]] = name;
     }
-    try populateType1EncodingFallbacks(font_obj, code_to_name, glyph_names.items);
+    try populateType1EncodingFallbacks(alloc, base_encoding, code_to_name, glyph_names.items);
 
     var glyphs = std.ArrayList(Type1Glyph).empty;
     errdefer {
@@ -10759,9 +10783,9 @@ fn measureFontAdvanceAlloc(
         var advance: f64 = 0;
         for (raw) |code| {
             const glyph = type3.glyphForCode(code);
-            advance += (if (glyph) |g| g.advance_x * state.font_size else state.font_size * 0.6) * state.horizontal_scale;
-            advance += state.char_spacing;
-            if (code == ' ') advance += state.word_spacing;
+            const glyph_advance = if (glyph) |g| g.advance_x * state.font_size else state.font_size * 0.6;
+            const spacing = state.char_spacing + if (code == ' ') state.word_spacing else 0.0;
+            advance += (glyph_advance + spacing) * state.horizontal_scale;
         }
         return advance;
     }
@@ -10770,9 +10794,9 @@ fn measureFontAdvanceAlloc(
         const scale = state.font_size / 1000.0;
         for (raw) |code| {
             const glyph = type1.glyphForCode(code);
-            advance += (if (glyph) |g| g.advance * scale else state.font_size * 0.6) * state.horizontal_scale;
-            advance += state.char_spacing;
-            if (code == ' ') advance += state.word_spacing;
+            const glyph_advance = if (glyph) |g| g.advance * scale else state.font_size * 0.6;
+            const spacing = state.char_spacing + if (code == ' ') state.word_spacing else 0.0;
+            advance += (glyph_advance + spacing) * state.horizontal_scale;
         }
         return advance;
     }
@@ -11034,6 +11058,37 @@ fn isLayoutIgnoredTextOperator(op: []const u8) bool {
 fn isTextShowOperator(op: []const u8) bool {
     return std.mem.eql(u8, op, "Tj") or std.mem.eql(u8, op, "TJ") or
         std.mem.eql(u8, op, "'") or std.mem.eql(u8, op, "\"");
+}
+
+/// The outline-only Type3 path is intentionally conservative. A CharProc is
+/// committed as vector output only when its complete paint semantics are
+/// represented by `extractShapeRunsFromContentAppend`. Resource-backed paint
+/// and nested text are handled by the general page fallback; accepting either
+/// here would produce a plausible-looking but incomplete glyph.
+fn type3CharProcIsVectorizableAlloc(alloc: Allocator, bytes: []const u8) !bool {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    while (true) {
+        var lex = (try readContentLexeme(&scanner)) orelse continue;
+        defer syntax.Scanner.freeLexeme(alloc, &lex);
+        switch (lex) {
+            .eof => return true,
+            .keyword => |op| {
+                if (isTextShowOperator(op) or
+                    std.mem.eql(u8, op, "Do") or
+                    std.mem.eql(u8, op, "sh") or
+                    std.mem.eql(u8, op, "gs") or
+                    std.mem.eql(u8, op, "BI") or
+                    std.mem.eql(u8, op, "ID") or
+                    std.mem.eql(u8, op, "EI") or
+                    std.mem.eql(u8, op, "cs") or
+                    std.mem.eql(u8, op, "CS") or
+                    std.mem.eql(u8, op, "scn") or
+                    std.mem.eql(u8, op, "SCN")) return false;
+            },
+            else => {},
+        }
+    }
 }
 
 fn contentMayContainOperator(bytes: []const u8, operator: []const u8) bool {
@@ -11631,12 +11686,14 @@ fn scaleType3StrokeWidth(stroke_width: f64, run: TextRun, type3: Type3Font) f64 
     return @max(0.1, stroke_width * run.font_size * @max(scale, 0.0001));
 }
 
-fn estimateType3MissingAdvance(run: TextRun) f64 {
-    return (run.font_size * 0.6) * run.horizontal_scale + run.char_spacing;
+fn estimateType3MissingAdvance(run: TextRun, code: u8) f64 {
+    const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
+    return (run.font_size * 0.6 + spacing) * run.horizontal_scale;
 }
 
-fn estimateType1MissingAdvance(run: TextRun) f64 {
-    return (run.font_size * 0.6) * run.horizontal_scale + run.char_spacing;
+fn estimateType1MissingAdvance(run: TextRun, code: u8) f64 {
+    const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
+    return (run.font_size * 0.6 + spacing) * run.horizontal_scale;
 }
 
 fn estimateRenderedRunCodepointAdvance(run: TextRun, cp: u21) f64 {
@@ -14256,6 +14313,52 @@ test "reader applies text state operators to positioned runs" {
     try std.testing.expectApproxEqAbs(@as(f64, 2), runs.items[0].char_spacing, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 5), runs.items[0].word_spacing, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 43.5), runs.items[0].advance_width, 0.001);
+}
+
+test "Type1 and Type3 spacing follows horizontal scaling in measurement and geometry" {
+    const alloc = std.testing.allocator;
+    var a_name = [_]u8{'A'};
+    var space_name = [_]u8{' '};
+    var a_content = [_]u8{ '0', ' ', '0', ' ', '1', ' ', '1', ' ', 'r', 'e', ' ', 'f' };
+    var empty_content: [0]u8 = .{};
+    var type3_glyphs = [_]Type3Glyph{
+        .{ .code = 'A', .name = &a_name, .content = &a_content, .advance_x = 1, .advance_y = 0 },
+        .{ .code = ' ', .name = &space_name, .content = &empty_content, .advance_x = 1, .advance_y = 0 },
+    };
+    var font_name = [_]u8{'F'};
+    var fonts = [_]PageFont{.{
+        .name = &font_name,
+        .decoder = .{},
+        .type3 = .{ .paint_type = 1, .font_matrix = .{ 1, 0, 0, 1, 0, 0 }, .glyphs = &type3_glyphs },
+        .borrowed = true,
+    }};
+    const state = TextRunState{ .font_size = 10, .horizontal_scale = 0.5, .char_spacing = 2, .word_spacing = 4 };
+    try std.testing.expectApproxEqAbs(@as(f64, 20), try measureFontAdvanceAlloc(alloc, &fonts, 0, "A A", "A A", state), 0.001);
+
+    const run = TextRun{
+        .text = "A A",
+        .x = 0,
+        .y = 0,
+        .font_size = 10,
+        .horizontal_scale = 0.5,
+        .char_spacing = 2,
+        .word_spacing = 4,
+    };
+    var shapes = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (shapes.items) |*shape| shape.deinit(alloc);
+        shapes.deinit(alloc);
+    }
+    var paint_phase: usize = 0;
+    try std.testing.expect(try Reader.appendType3RunShapesAlloc(alloc, &shapes, run, fonts[0].type3.?, "A A", &paint_phase));
+    try std.testing.expectEqual(@as(usize, 2), shapes.items.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 14), pathBounds(shapes.items[1].points).min_x, 0.001);
+
+    var type1_program = [_]u8{14};
+    var type1_glyphs = [_]Type1Glyph{.{ .code = 'A', .name = &a_name, .charstring = &type1_program, .advance = 1000 }};
+    fonts[0].type3 = null;
+    fonts[0].type1 = .{ .glyphs = &type1_glyphs };
+    try std.testing.expectApproxEqAbs(@as(f64, 6), try measureFontAdvanceAlloc(alloc, &fonts, 0, "A", "A", state), 0.001);
 }
 
 test "reader measures type1 text run advance width" {
@@ -19152,8 +19255,7 @@ test "type1 RD parsers advance across slash and binary delimiters" {
 
     var code_to_name = [_]?[]const u8{null} ** 256;
     code_to_name['A'] = "A";
-    const empty_font = syntax.Object{ .dict = &.{} };
-    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
     defer {
         for (glyphs) |*glyph| glyph.deinit(alloc);
         if (glyphs.len > 0) alloc.free(glyphs);
@@ -19174,8 +19276,7 @@ test "type1 RD parser accepts compact charstrings without dup" {
     var code_to_name = [_]?[]const u8{null} ** 256;
     code_to_name['A'] = "A";
     code_to_name['B'] = "B";
-    const empty_font = syntax.Object{ .dict = &.{} };
-    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
     defer {
         for (glyphs) |*glyph| glyph.deinit(alloc);
         if (glyphs.len > 0) alloc.free(glyphs);
@@ -19198,8 +19299,7 @@ test "type1 aliases share programs and only seac-reachable helpers survive" {
     code_to_name['A'] = "A";
     code_to_name['B'] = "A";
     code_to_name[194] = "different";
-    const empty_font = syntax.Object{ .dict = &.{} };
-    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
     defer {
         for (glyphs) |*glyph| glyph.deinit(alloc);
         if (glyphs.len > 0) alloc.free(glyphs);
@@ -19220,6 +19320,14 @@ test "content XObject discovery ignores unpainted resource names" {
     try std.testing.expect(try contentReferencesXObjectNameAlloc(alloc, content, "Used"));
     try std.testing.expect(try contentReferencesXObjectNameAlloc(alloc, content, "Form"));
     try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, content, "Unused"));
+}
+
+test "Type3 CharProc preflight rejects dropped resource paint transactionally" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(try type3CharProcIsVectorizableAlloc(alloc, "1000 0 d0 0 0 1000 1000 re f"));
+    try std.testing.expect(!try type3CharProcIsVectorizableAlloc(alloc, "q /Logo Do Q"));
+    try std.testing.expect(!try type3CharProcIsVectorizableAlloc(alloc, "/GS1 gs 0 0 10 10 re f"));
+    try std.testing.expect(!try type3CharProcIsVectorizableAlloc(alloc, "BT /F1 10 Tf (x) Tj ET"));
 }
 
 test "content resource discovery requires the name as the immediate operand" {
@@ -19305,6 +19413,28 @@ test "CID widths resolve indirect defaults ranges and array members" {
     try std.testing.expectEqual(@as(f64, 510), widths.width(11));
     try std.testing.expectEqual(@as(f64, 700), widths.width(21));
     try std.testing.expectEqual(@as(f64, 900), widths.width(19));
+}
+
+test "font encoding resolves indirect BaseEncoding and Differences members" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\n<< /Type /Font /Subtype /Type1 /Encoding << /BaseEncoding 3 0 R /Differences 4 0 R >> >>\nendobj\n",
+        "3 0 obj\n/WinAnsiEncoding\nendobj\n",
+        "4 0 obj\n[65 /Aacute]\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var font_obj = try reader.readIndirectObject(.{ .id = 2, .gen = 0 });
+    defer font_obj.deinit(alloc);
+    var decoder = try reader.buildFontDecoder(&font_obj);
+    defer decoder.deinit(alloc);
+    const decoded = try decoder.decodeAlloc(alloc, &.{ 65, 128 });
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("Á€", decoded);
 }
 
 test "flattened glyph ownership transfer is allocation-failure safe" {
@@ -19629,8 +19759,7 @@ test "type1 font parsing is allocation-failure safe" {
             var code_to_name = [_]?[]const u8{null} ** 256;
             code_to_name['A'] = "A";
             code_to_name[194] = "different";
-            const empty_font = syntax.Object{ .dict = &.{} };
-            const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
+            const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, .standard, &code_to_name, 0, &.{});
             defer {
                 for (glyphs) |*glyph| glyph.deinit(alloc);
                 if (glyphs.len > 0) alloc.free(glyphs);
