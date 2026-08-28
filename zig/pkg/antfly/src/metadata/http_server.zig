@@ -2313,6 +2313,7 @@ const ParsedRuntimeIndexSourceReplayStatus = struct {
     artifact_name: ?[]const u8 = null,
     published_sequence: ?u64 = null,
     target_sequence: ?u64 = null,
+    failed: ?bool = null,
 };
 
 const ParsedRuntimeGroupStatus = struct {
@@ -2670,6 +2671,7 @@ fn cloneParsedRuntimeIndexStatus(
             .artifact_name = try alloc.dupe(u8, artifact_name),
             .published_sequence = source.published_sequence orelse 0,
             .target_sequence = source.target_sequence orelse 0,
+            .failed = source.failed orelse false,
         };
         source_count += 1;
     }

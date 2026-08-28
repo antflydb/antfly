@@ -3245,22 +3245,25 @@ fn upsertVersionedFullTextIndex(
         else => return error.InvalidTableIndexMetadata,
     };
 
-    const stale_name = try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{current_version});
-    defer alloc.free(stale_name);
     const next_name = try std.fmt.allocPrint(alloc, "full_text_index_v{d}", .{next_version});
     defer alloc.free(next_name);
+
+    // A table may contain any number of named full-text indexes with artifact
+    // or field-selective sources. Only the index selected for the current read
+    // schema is the primary document index and may seed the next schema
+    // version. Picking the first full-text config silently promotes an
+    // unrelated named index when catalog insertion order changes.
+    const active_name = try selectFullTextIndexNameForVersion(alloc, current_indexes_json, current_version);
+    defer if (active_name) |name| alloc.free(name);
+    const active_config = if (active_name) |name| root.get(name) else null;
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
 
-    var full_text_config: ?std.json.Value = null;
     var first = true;
     var it = root.iterator();
     while (it.next()) |entry| {
-        if (full_text_config == null and isFullTextIndexConfig(entry.value_ptr.*)) {
-            full_text_config = entry.value_ptr.*;
-        }
         if (std.mem.eql(u8, entry.key_ptr.*, next_name)) continue;
 
         if (!first) try out.append(alloc, ',');
@@ -3272,15 +3275,37 @@ fn upsertVersionedFullTextIndex(
         try out.appendSlice(alloc, encoded);
     }
 
-    if (full_text_config) |config| {
+    if (active_config) |config| {
+        var next_config = try buildCanonicalIndexConfigValue(alloc, next_name, config);
+        defer deinitJsonValue(alloc, &next_config);
+        // A versioned index is a distinct desired incarnation. Retaining the
+        // previous private token would let stale runtime observations satisfy
+        // readiness for the newly built index.
+        removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.incarnation_field);
+        removeOwnedJsonObjectField(alloc, &next_config.object, coverage_policy_mod.legacy_coverage_incarnation_field);
+        const encoded_next_config = try coverage_policy_mod.withFreshIncarnationAlloc(alloc, next_config);
+        defer alloc.free(encoded_next_config);
+
         if (!first) try out.append(alloc, ',');
         try appendJsonString(alloc, &out, next_name);
         try out.append(alloc, ':');
-        try appendCanonicalIndexConfig(alloc, &out, next_name, config);
+        try out.appendSlice(alloc, encoded_next_config);
     }
 
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+fn removeOwnedJsonObjectField(
+    alloc: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    field: []const u8,
+) void {
+    if (object.fetchOrderedRemove(field)) |removed| {
+        alloc.free(@constCast(removed.key));
+        var removed_value = removed.value;
+        deinitJsonValue(alloc, &removed_value);
+    }
 }
 
 fn selectActiveFullTextIndexName(
@@ -4721,7 +4746,7 @@ test "metadata.schema update preserves read schema and adds versioned full-text 
     try std.testing.expect(std.mem.indexOf(u8, updated.read_schema_json, "\"document_schemas\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v0\":{\"type\":\"full_text\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"embed_idx\":{\"type\":\"embeddings\",\"dimension\":384}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v1\":{\"name\":\"full_text_index_v1\",\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v1\":{\"name\":\"full_text_index_v1\",\"type\":\"full_text\"") != null);
 }
 
 test "metadata.schema update versions template-only changes" {
@@ -4745,7 +4770,38 @@ test "metadata.schema update versions template-only changes" {
     try std.testing.expect(std.mem.indexOf(u8, updated.schema_json, "\"version\":3") != null);
     try std.testing.expectEqualStrings(table.read_schema_json, updated.read_schema_json);
     try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v2\":{\"type\":\"full_text\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\":{\"name\":\"full_text_index_v3\",\"type\":\"full_text\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, updated.indexes_json, "\"full_text_index_v3\":{\"name\":\"full_text_index_v3\",\"type\":\"full_text\"") != null);
+}
+
+test "metadata.schema update versions only the active primary full-text index with a fresh incarnation" {
+    const alloc = std.testing.allocator;
+    const table: metadata_table_manager.TableRecord = .{
+        .table_id = 7,
+        .name = "docs",
+        .schema_json = "{\"version\":2,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\"}}}}",
+        .read_schema_json = "{\"version\":1}",
+        // Put a named artifact index first and an older version before the
+        // current primary to prove neither insertion order nor history wins.
+        .indexes_json = "{\"chunks\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"document_chunks_v1\"}],\"_index_incarnation\":11},\"full_text_index_v1\":{\"type\":\"full_text\",\"field\":\"old_body\",\"_index_incarnation\":12},\"full_text_index_v2\":{\"type\":\"full_text\",\"field\":\"body\",\"_index_incarnation\":13}}",
+        .replication_sources_json = "[]",
+        .placement_role = "data",
+    };
+
+    const updated = try applySchemaUpdateRecord(
+        alloc,
+        &table,
+        "{\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"string\"}}}}}}",
+    );
+    defer metadata_table_manager.freeTable(alloc, updated);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, updated.indexes_json, .{});
+    defer parsed.deinit();
+    const next = parsed.value.object.get("full_text_index_v3") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("body", next.object.get("field").?.string);
+    try std.testing.expect(next.object.get("sources") == null);
+    const next_incarnation = coverage_policy_mod.incarnation(next) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(next_incarnation != 13);
+    try std.testing.expectEqual(@as(u64, 13), coverage_policy_mod.incarnation(parsed.value.object.get("full_text_index_v2").?).?);
 }
 
 test "metadata.schema update avoids a generation for semantically identical JSON" {

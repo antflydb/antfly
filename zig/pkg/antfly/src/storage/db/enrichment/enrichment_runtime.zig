@@ -1498,6 +1498,9 @@ fn clearIsolatedFailedIndexes(runtime: *EnrichmentRuntime) void {
     var it = runtime.isolated_failed_indexes.iterator();
     while (it.next()) |entry| runtime.alloc.free(@constCast(entry.key_ptr.*));
     runtime.isolated_failed_indexes.clearAndFree(runtime.alloc);
+    var source_it = runtime.isolated_failed_sources.iterator();
+    while (source_it.next()) |entry| runtime.alloc.free(@constCast(entry.key_ptr.*));
+    runtime.isolated_failed_sources.clearAndFree(runtime.alloc);
 }
 
 fn markIsolatedFailedIndex(runtime: *EnrichmentRuntime, index_name: []const u8) void {
@@ -1505,6 +1508,28 @@ fn markIsolatedFailedIndex(runtime: *EnrichmentRuntime, index_name: []const u8) 
     const owned_key = runtime.alloc.dupe(u8, index_name) catch return;
     errdefer runtime.alloc.free(owned_key);
     runtime.isolated_failed_indexes.put(runtime.alloc, owned_key, {}) catch return;
+}
+
+fn markIsolatedFailedSource(runtime: *EnrichmentRuntime, index_name: []const u8, artifact_name: []const u8) void {
+    if (index_name.len == 0 or artifact_name.len == 0 or index_name.len > std.math.maxInt(u32)) return;
+    const key = runtime.alloc.alloc(u8, @sizeOf(u32) + index_name.len + artifact_name.len) catch return;
+    errdefer runtime.alloc.free(key);
+    std.mem.writeInt(u32, key[0..4], @intCast(index_name.len), .big);
+    @memcpy(key[4 .. 4 + index_name.len], index_name);
+    @memcpy(key[4 + index_name.len ..], artifact_name);
+    if (runtime.isolated_failed_sources.getKey(key) != null) {
+        runtime.alloc.free(key);
+        return;
+    }
+    runtime.isolated_failed_sources.put(runtime.alloc, key, {}) catch return;
+}
+
+fn isolatedFailedSourceMatches(key: []const u8, index_name: []const u8, artifact_name: []const u8) bool {
+    if (key.len < @sizeOf(u32)) return false;
+    const index_len: usize = std.mem.readInt(u32, key[0..4], .big);
+    if (index_len > key.len - 4) return false;
+    return std.mem.eql(u8, key[4 .. 4 + index_len], index_name) and
+        std.mem.eql(u8, key[4 + index_len ..], artifact_name);
 }
 
 fn generatedArtifactAlreadyPublished(runtime: *EnrichmentRuntime, artifact_key: []const u8) bool {
@@ -2193,6 +2218,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     chunk_artifact_bytes_written: u64 = 0,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(
         alloc: Allocator,
@@ -2523,6 +2549,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
         return self.isolated_failed_indexes.contains(index_name);
     }
+
+    pub fn indexSourceHasIsolatedFailure(self: *@This(), index_name: []const u8, artifact_name: []const u8) bool {
+        var it = self.isolated_failed_sources.iterator();
+        while (it.next()) |entry| if (isolatedFailedSourceMatches(entry.key_ptr.*, index_name, artifact_name)) return true;
+        return false;
+    }
 } else struct {
     alloc: Allocator,
     io_impl: ?*Io.Threaded,
@@ -2589,6 +2621,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_error_name: ?[]const u8 = null,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
     future: ?Io.Future(void) = null,
 
@@ -3104,6 +3137,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         return self.isolated_failed_indexes.contains(index_name);
     }
 
+    pub fn indexSourceHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8, artifact_name: []const u8) bool {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        var it = self.isolated_failed_sources.iterator();
+        while (it.next()) |entry| if (isolatedFailedSourceMatches(entry.key_ptr.*, index_name, artifact_name)) return true;
+        return false;
+    }
+
     fn recordError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
         std.log.err("enrichment worker failed: {s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
@@ -3592,6 +3634,7 @@ fn noteTerminalRequestFailure(
     runtime: *EnrichmentRuntime,
     sequence: u64,
     indexes: []const []const u8,
+    artifact_name: []const u8,
     completed_failure_fingerprint: u64,
 ) !void {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
@@ -3620,7 +3663,10 @@ fn noteTerminalRequestFailure(
     runtime.retrying = false;
     runtime.next_retry_at_ms = 0;
     runtime.worker_failed = false;
-    for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
+    for (indexes) |index_name| if (index_name.len > 0) {
+        markIsolatedFailedIndex(runtime, index_name);
+        markIsolatedFailedSource(runtime, index_name, artifact_name);
+    };
     const status = runtimeStatusSnapshot(runtime);
     if (maybe_io) |io| {
         broadcastRuntimeStateChanged(runtime, io);
@@ -3673,6 +3719,15 @@ fn skipPersistedRequestFailure(
         if (!try pending_fn(failure_ctx, failure_identity, index_name)) return false;
     }
 
+    // Rehydrate the source-local diagnostic from the durable repair ledger on
+    // crash replay. The aggregate terminal envelope is intentionally compact,
+    // so the exact request identity is recovered only after the bounded ledger
+    // lookup above proves that this failure is still current.
+    for (indexes) |index_name| if (index_name.len > 0) {
+        markIsolatedFailedIndex(runtime, index_name);
+        markIsolatedFailedSource(runtime, index_name, failure_identity.artifact_name);
+    };
+
     if (runtime.coverage_apply_mutex != null) {
         try queueDerivedCoverageOutcome(runtime, window, request, indexes, .terminal_failed);
     }
@@ -3720,7 +3775,16 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
             try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
         }
     }
-    try noteTerminalRequestFailure(runtime, request.sequence, indexes, requestFailureFingerprint(request));
+    try noteTerminalRequestFailure(
+        runtime,
+        request.sequence,
+        indexes,
+        switch (request.kind) {
+            .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
+            .asset, .chunk_text => requestArtifactName(request),
+        },
+        requestFailureFingerprint(request),
+    );
     runtime.notifyStatusHook();
 }
 
@@ -3732,6 +3796,17 @@ const TestFailureCapture = struct {
         const self: *TestFailureCapture = @ptrCast(@alignCast(ptr));
         self.failure = failure;
         self.count += 1;
+    }
+
+    fn pending(ptr: *anyopaque, failure: FailureIdentity, index_name: []const u8) !bool {
+        const self: *TestFailureCapture = @ptrCast(@alignCast(ptr));
+        const recorded = self.failure orelse return false;
+        return std.mem.eql(u8, recorded.index_name, index_name) and
+            recorded.kind == failure.kind and
+            std.mem.eql(u8, recorded.artifact_name, failure.artifact_name) and
+            std.mem.eql(u8, recorded.source_artifact_name, failure.source_artifact_name) and
+            std.mem.eql(u8, recorded.doc_key, failure.doc_key) and
+            recorded.sequence == failure.sequence;
     }
 };
 
@@ -3833,6 +3908,9 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expect(!runtime.worker_failed);
     try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
     try std.testing.expect(!runtime.indexHasIsolatedFailure("healthy_text"));
+    try std.testing.expect(runtime.indexSourceHasIsolatedFailure("bad_visual", "clipclap"));
+    try std.testing.expect(!runtime.indexSourceHasIsolatedFailure("bad_visual", "other_embedding"));
+    try std.testing.expect(!runtime.indexSourceHasIsolatedFailure("healthy_text", "clipclap"));
     const persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 1), persisted.error_count);
     try std.testing.expectEqual(@as(u64, 1), persisted.fatal_error_count);
@@ -3848,6 +3926,24 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expectEqualStrings("UnsupportedEmbeddingProvider", failure.error_name);
     try std.testing.expectEqual(@as(u64, 7), failure.attempts);
     try std.testing.expectEqual(@as(u64, 11), failure.sequence);
+
+    // Model a restart/new replay episode: the in-memory diagnostic is empty,
+    // while the terminal envelope and repair ledger remain durable. Skipping
+    // that parked request must reconstruct the exact failed source.
+    clearIsolatedFailedIndexes(&runtime);
+    runtime.failure_pending_fn = TestFailureCapture.pending;
+    var replay_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer replay_window.deinit();
+    try std.testing.expect(try skipPersistedRequestFailure(&runtime, &replay_window, .{
+        .kind = .dense_embedding,
+        .index_name = "bad_visual",
+        .embedding_name = "clipclap",
+        .doc_key = "doc:1",
+        .source_field = "image_url",
+        .sequence = 11,
+    }));
+    try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
+    try std.testing.expect(runtime.indexSourceHasIsolatedFailure("bad_visual", "clipclap"));
 }
 
 test "chunked dense terminal failure is recorded once per parent request" {
@@ -13161,14 +13257,14 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     runtime.consecutive_retry_count = 6;
     runtime.retry_failure_fingerprint = 91;
     runtime.retry_failure_count = 4;
-    try noteTerminalRequestFailure(&runtime, 7, &.{}, 92);
+    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
     // Parking the request which owns the budget retires that debt.
-    try noteTerminalRequestFailure(&runtime, 8, &.{}, 91);
+    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);

@@ -2862,6 +2862,9 @@ pub const IndexSourceReplayStatus = struct {
     artifact_name: []const u8,
     published_sequence: u64 = 0,
     target_sequence: u64 = 0,
+    /// A terminal request failure isolated to this configured artifact stream.
+    /// Global worker/index failures remain index-level readiness facts.
+    failed: bool = false,
     // Internal distributed-status proof; not part of the public contract.
     observation_count: u64 = 1,
 };

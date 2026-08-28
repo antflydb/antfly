@@ -2694,13 +2694,6 @@ fn appendIncomingProbeBatches(
     if (fanout_io) |io| {
         if (plan.parallel) {
             const start_ns = platform_time.monotonicNs();
-            const slots = try alloc.alloc(GraphHydrateFanoutSlot, entries.len);
-            defer {
-                for (slots) |*slot| slot.deinit();
-                alloc.free(slots);
-            }
-            for (slots) |*slot| slot.* = .init();
-
             const Fiber = struct {
                 fn run(
                     worker_inner: Worker,
@@ -2731,8 +2724,12 @@ fn appendIncomingProbeBatches(
             var start: usize = 0;
             while (start < entries.len) : (start += plan.width) {
                 const end = @min(start + plan.width, entries.len);
+                const slots = try alloc.alloc(GraphHydrateFanoutSlot, end - start);
+                defer alloc.free(slots);
+                for (slots) |*slot| slot.* = .init();
+                defer for (slots) |*slot| slot.deinit();
                 var group: std.Io.Group = .init;
-                for (entries[start..end], start..end) |entry, i| {
+                for (entries[start..end], 0..) |entry, i| {
                     group.async(io, Fiber.run, .{
                         worker,
                         &slots[i],
@@ -2745,12 +2742,12 @@ fn appendIncomingProbeBatches(
                     });
                 }
                 group.await(io) catch {};
+                for (slots) |slot| if (slot.err) |err| return err;
+                for (slots, entries[start..end]) |slot, entry| {
+                    try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, slot.result.?.has_incoming);
+                }
             }
             recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - start_ns));
-            for (slots) |slot| if (slot.err) |err| return err;
-            for (slots, entries) |slot, entry| {
-                try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, slot.result.?.has_incoming);
-            }
             return;
         }
     }
@@ -3388,9 +3385,10 @@ fn hydrateHitsForKeys(
 }
 
 /// Probe graph in-degree exactly across source-owned reverse projections.
-/// Every shard receives one compact key batch and the returned bitsets are
-/// OR-reduced. Full graph expansion uses the same probe to avoid decoding on
-/// shards with no matching reverse rows.
+/// Returned bitsets are OR-reduced in bounded shard waves; keys are retired
+/// from later waves as soon as any shard proves they have an incoming edge.
+/// This preserves exact root discovery while avoiding shard-count response
+/// retention and the common-case `shards * frontier` request payload.
 pub fn probeIncomingEdgesForKeys(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -3413,26 +3411,27 @@ pub fn probeIncomingEdgesForKeys(
     try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
     if (group_ids.len == 0) return error.TableNotFound;
 
-    const indexes = try alloc.alloc(usize, keys.len);
-    defer alloc.free(indexes);
-    for (indexes, 0..) |*index, i| index.* = i;
+    var unresolved = std.ArrayListUnmanaged(usize).empty;
+    defer unresolved.deinit(alloc);
+    try unresolved.ensureTotalCapacityPrecise(alloc, keys.len);
+    for (keys, 0..) |_, i| unresolved.appendAssumeCapacity(i);
 
     const Entry = struct {
         group_id: u64,
         keys: []const []const u8,
         indexes: []const usize,
     };
-    const entries = try alloc.alloc(Entry, group_ids.len);
-    defer alloc.free(entries);
-    for (group_ids, 0..) |group_id, entry_index| {
-        entries[entry_index] = .{
-            .group_id = group_id,
-            .keys = keys,
-            .indexes = indexes,
-        };
-    }
-
     const Probe = struct {
+        fn keysForIndexesAlloc(
+            a: std.mem.Allocator,
+            all_keys: []const []const u8,
+            indexes: []const usize,
+        ) ![]const []const u8 {
+            const selected = try a.alloc([]const u8, indexes.len);
+            for (indexes, 0..) |index, i| selected[i] = all_keys[index];
+            return selected;
+        }
+
         fn run(
             a: std.mem.Allocator,
             worker_inner: Worker,
@@ -3467,21 +3466,24 @@ pub fn probeIncomingEdgesForKeys(
                 output[output_index] = output[output_index] or has_incoming;
             }
         }
+
+        fn retainUnresolved(indexes: *std.ArrayListUnmanaged(usize), output: []const bool) void {
+            var write: usize = 0;
+            for (indexes.items) |index| {
+                if (output[index]) continue;
+                indexes.items[write] = index;
+                write += 1;
+            }
+            indexes.shrinkRetainingCapacity(write);
+        }
     };
 
     const fanout_io = worker.fanoutIo();
-    const plan = planGraphFanout(fanout_io != null, worker.fanoutWidthCap(), entries.len);
+    const plan = planGraphFanout(fanout_io != null, worker.fanoutWidthCap(), group_ids.len);
     recordGraphFanoutPlan(.hydrate, plan);
     if (fanout_io) |io| {
         if (plan.parallel) {
             const start_ns = platform_time.monotonicNs();
-            const slots = try alloc.alloc(GraphHydrateFanoutSlot, entries.len);
-            defer {
-                for (slots) |*slot| slot.deinit();
-                alloc.free(slots);
-            }
-            for (slots) |*slot| slot.* = .init();
-
             const Fiber = struct {
                 fn run(
                     worker_inner: Worker,
@@ -3510,10 +3512,18 @@ pub fn probeIncomingEdgesForKeys(
             };
 
             var start: usize = 0;
-            while (start < entries.len) : (start += plan.width) {
-                const end = @min(start + plan.width, entries.len);
+            while (start < group_ids.len and unresolved.items.len > 0) : (start += plan.width) {
+                const end = @min(start + plan.width, group_ids.len);
+                const probe_indexes = try alloc.dupe(usize, unresolved.items);
+                defer alloc.free(probe_indexes);
+                const probe_keys = try Probe.keysForIndexesAlloc(alloc, keys, probe_indexes);
+                defer alloc.free(probe_keys);
+                const slots = try alloc.alloc(GraphHydrateFanoutSlot, end - start);
+                defer alloc.free(slots);
+                for (slots) |*slot| slot.* = .init();
+                defer for (slots) |*slot| slot.deinit();
                 var group: std.Io.Group = .init;
-                for (entries[start..end], start..end) |entry, i| {
+                for (group_ids[start..end], 0..) |group_id, i| {
                     group.async(io, Fiber.run, .{
                         worker,
                         &slots[i],
@@ -3521,24 +3531,33 @@ pub fn probeIncomingEdgesForKeys(
                         topology_epoch,
                         identity_read_generation,
                         index_name,
-                        entry,
+                        Entry{ .group_id = group_id, .keys = probe_keys, .indexes = probe_indexes },
                         consistency,
                     });
                 }
                 group.await(io) catch {};
+                for (slots) |slot| if (slot.err) |err| return err;
+                for (slots, group_ids[start..end]) |slot, group_id| {
+                    try Probe.copy(
+                        slot.result.?.has_incoming,
+                        .{ .group_id = group_id, .keys = probe_keys, .indexes = probe_indexes },
+                        result,
+                    );
+                }
+                Probe.retainUnresolved(&unresolved, result);
             }
             recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - start_ns));
-            for (slots) |slot| {
-                if (slot.err) |err| return err;
-            }
-            for (slots, entries) |slot, entry| {
-                try Probe.copy(slot.result.?.has_incoming, entry, result);
-            }
             return result;
         }
     }
 
-    for (entries) |entry| {
+    for (group_ids) |group_id| {
+        if (unresolved.items.len == 0) break;
+        const probe_indexes = try alloc.dupe(usize, unresolved.items);
+        defer alloc.free(probe_indexes);
+        const probe_keys = try Probe.keysForIndexesAlloc(alloc, keys, probe_indexes);
+        defer alloc.free(probe_keys);
+        const entry = Entry{ .group_id = group_id, .keys = probe_keys, .indexes = probe_indexes };
         var response = try Probe.run(
             alloc,
             worker,
@@ -3551,8 +3570,115 @@ pub fn probeIncomingEdgesForKeys(
         );
         defer response.deinit(alloc);
         try Probe.copy(response.has_incoming, entry, result);
+        Probe.retainUnresolved(&unresolved, result);
     }
     return result;
+}
+
+test "distributed graph root probe retires resolved keys between shard waves" {
+    const alloc = std.testing.allocator;
+    const TestState = struct {
+        calls: usize = 0,
+        request_sizes: [3]usize = .{ 0, 0, 0 },
+    };
+    const FakeCatalog = struct {
+        const tables = [_]metadata_table_manager.TableRecord{
+            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+        };
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = "g" },
+            .{ .group_id = 22, .table_id = 7, .start_key = "g", .end_key = "n" },
+            .{ .group_id = 33, .table_id = 7, .start_key = "n", .end_key = null },
+        };
+
+        fn iface() table_catalog.CatalogSource {
+            return .{ .ptr = undefined, .vtable = &.{
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+            } };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast(tables[0..]),
+                .ranges = @constCast(ranges[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{ .ptr = state, .vtable = &.{
+                .execute_graph_expand = executeGraphExpand,
+                .execute_graph_hydrate = executeGraphHydrate,
+            } };
+        }
+
+        fn executeGraphExpand(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn executeGraphHydrate(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            req: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            if (state.calls >= state.request_sizes.len) return error.UnexpectedTestCall;
+            state.request_sizes[state.calls] = req.keys.len;
+            state.calls += 1;
+            const mask = try a.alloc(bool, req.keys.len);
+            @memset(mask, false);
+            switch (group_id) {
+                11 => {
+                    try std.testing.expectEqual(@as(usize, 2), req.keys.len);
+                    mask[0] = true;
+                },
+                22 => {
+                    try std.testing.expectEqual(@as(usize, 1), req.keys.len);
+                    try std.testing.expectEqualStrings("root:b", req.keys[0]);
+                    mask[0] = true;
+                },
+                else => return error.UnexpectedTestCall,
+            }
+            return .{ .has_incoming = mask };
+        }
+    };
+
+    var state = TestState{};
+    const catalog = FakeCatalog.iface();
+    const topology_epoch = try table_catalog.topologyEpoch(alloc, catalog, "docs");
+    const roots = try probeIncomingEdgesForKeys(
+        alloc,
+        catalog,
+        FakeWorker.iface(&state),
+        "docs",
+        topology_epoch,
+        null,
+        "graph_idx",
+        &.{ "root:a", "root:b" },
+        .stale,
+    );
+    defer alloc.free(roots);
+    try std.testing.expectEqualSlices(bool, &.{ true, true }, roots);
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, &state.request_sizes);
 }
 
 fn finalizeHydratedHits(

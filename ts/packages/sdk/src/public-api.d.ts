@@ -10062,7 +10062,7 @@ export interface components {
          * @description Stable machine-readable reason why an artifact source is pending or failed.
          * @enum {string}
          */
-        IndexSourceReadinessReason: "index_failed" | "runtime_unavailable" | "shard_observation_incomplete" | "source_observation_incomplete" | "publication";
+        IndexSourceReadinessReason: "index_failed" | "enrichment_failure" | "runtime_unavailable" | "shard_observation_incomplete" | "source_observation_incomplete" | "publication";
         IndexSourceReadinessStatus: {
             /** @description Configured artifact stream identity. */
             artifact: string;

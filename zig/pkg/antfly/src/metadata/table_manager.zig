@@ -877,6 +877,7 @@ pub const RuntimeIndexSourceReplayStatusReport = struct {
     artifact_name: []const u8 = "",
     published_sequence: u64 = 0,
     target_sequence: u64 = 0,
+    failed: bool = false,
 };
 
 pub const SchemaProgressRecord = struct {
@@ -2185,6 +2186,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
             .artifact_name = try alloc.dupe(u8, source.artifact_name),
             .published_sequence = source.published_sequence,
             .target_sequence = source.target_sequence,
+            .failed = source.failed,
         };
         source_count += 1;
     }

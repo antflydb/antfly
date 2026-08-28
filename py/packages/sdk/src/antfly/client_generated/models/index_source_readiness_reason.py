@@ -2,6 +2,7 @@ from enum import Enum
 
 
 class IndexSourceReadinessReason(str, Enum):
+    ENRICHMENT_FAILURE = "enrichment_failure"
     INDEX_FAILED = "index_failed"
     PUBLICATION = "publication"
     RUNTIME_UNAVAILABLE = "runtime_unavailable"

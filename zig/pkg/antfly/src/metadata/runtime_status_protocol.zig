@@ -24,4 +24,8 @@ pub const repair_status_record_version: u16 = 13;
 /// capability used to keep artifact-index admission closed during rolling
 /// upgrades.
 pub const artifact_source_status_record_version: u16 = 14;
-pub const current_record_version: u16 = artifact_source_status_record_version;
+/// V15 carries source-local terminal failure state. This keeps one failed
+/// enrichment stream from poisoning otherwise ready sources in a multi-source
+/// index while retaining V14 decoding during rolling upgrades.
+pub const artifact_source_failure_status_record_version: u16 = 15;
+pub const current_record_version: u16 = artifact_source_failure_status_record_version;

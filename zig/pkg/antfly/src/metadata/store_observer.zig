@@ -486,7 +486,8 @@ fn runtimeIndexSourceReplayEqual(
     for (lhs, rhs) |left, right| {
         if (!std.mem.eql(u8, left.artifact_name, right.artifact_name) or
             left.published_sequence != right.published_sequence or
-            left.target_sequence != right.target_sequence) return false;
+            left.target_sequence != right.target_sequence or
+            left.failed != right.failed) return false;
     }
     return true;
 }

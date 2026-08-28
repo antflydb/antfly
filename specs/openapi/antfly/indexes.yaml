@@ -700,6 +700,7 @@ components:
       type: string
       enum:
         - index_failed
+        - enrichment_failure
         - runtime_unavailable
         - shard_observation_incomplete
         - source_observation_incomplete

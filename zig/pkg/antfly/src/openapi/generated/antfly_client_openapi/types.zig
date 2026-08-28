@@ -5186,6 +5186,7 @@ pub const IndexRuntimeCapabilities = struct {
 /// Stable machine-readable reason why an artifact source is pending or failed.
 pub const IndexSourceReadinessReason = enum {
     index_failed,
+    enrichment_failure,
     runtime_unavailable,
     shard_observation_incomplete,
     source_observation_incomplete,
@@ -5194,6 +5195,7 @@ pub const IndexSourceReadinessReason = enum {
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .index_failed => "index_failed",
+            .enrichment_failure => "enrichment_failure",
             .runtime_unavailable => "runtime_unavailable",
             .shard_observation_incomplete => "shard_observation_incomplete",
             .source_observation_incomplete => "source_observation_incomplete",
@@ -5209,6 +5211,7 @@ pub const IndexSourceReadinessReason = enum {
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "index_failed", .index_failed },
+            .{ "enrichment_failure", .enrichment_failure },
             .{ "runtime_unavailable", .runtime_unavailable },
             .{ "shard_observation_incomplete", .shard_observation_incomplete },
             .{ "source_observation_incomplete", .source_observation_incomplete },

@@ -2047,6 +2047,7 @@ fn accumulateSourceReplayStatus(aggregate: *AggregatedIndexStatus, source: db_mo
         if (!std.mem.eql(u8, existing.artifact_name, source.artifact_name)) continue;
         existing.published_sequence +|= source.published_sequence;
         existing.target_sequence +|= source.target_sequence;
+        existing.failed = existing.failed or source.failed;
         existing.observation_count +|= source.observation_count;
         return;
     }
@@ -4264,6 +4265,7 @@ fn appendSingleIndexRuntimeStatus(
         backfill_active,
         terminal_load_failure,
         terminal_enrichment_failure,
+        (if (visible_enrichment) |stats| stats.worker_failed else false),
         repair_state,
         replay_applied_sequence,
         replay_target_sequence,
@@ -4289,6 +4291,7 @@ fn appendIndexReadinessStatus(
     backfill_active: bool,
     terminal_load_failure: bool,
     terminal_enrichment_failure: bool,
+    terminal_enrichment_global_failure: bool,
     repair_state: ?[]const u8,
     replay_applied_sequence: u64,
     replay_target_sequence: u64,
@@ -4318,6 +4321,7 @@ fn appendIndexReadinessStatus(
     else
         false;
     const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
+    const globally_failed = terminal_load_failure or repair_failed or terminal_enrichment_global_failure;
     const publication_pending = index_type == .embeddings and incarnation_current and
         replay_target_sequence > replay_applied_sequence;
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
@@ -4395,7 +4399,7 @@ fn appendIndexReadinessStatus(
                 item.source_replay[0..item.source_replay_count],
                 observation_fresh,
                 topology_complete,
-                failed,
+                globally_failed,
                 expected_source_observations,
             );
         } else {
@@ -4405,7 +4409,7 @@ fn appendIndexReadinessStatus(
                 item.source_replay,
                 observation_fresh,
                 topology_complete,
-                failed,
+                globally_failed,
                 expected_source_observations,
             );
         }
@@ -4421,7 +4425,7 @@ fn indexSourcesComplete(
 ) bool {
     if (!observation_fresh or !topology_complete) return false;
     for (sources) |source| {
-        if (source.observation_count < expected_observation_count or
+        if (source.failed or source.observation_count < expected_observation_count or
             source.published_sequence < source.target_sequence) return false;
     }
     return true;
@@ -4442,18 +4446,24 @@ fn appendIndexSourceReadinessStatuses(
         if (i != 0) try out.append(alloc, ',');
         const replay_pending = source.published_sequence < source.target_sequence;
         const source_observation_complete = source.observation_count >= expected_observation_count;
-        const pending = !index_failed and (!observation_fresh or !topology_complete or !source_observation_complete or replay_pending);
-        const state = if (index_failed) "failed" else if (pending) "pending" else "ready";
+        const source_failed = index_failed or source.failed;
+        const pending = !source_failed and (!observation_fresh or !topology_complete or !source_observation_complete or replay_pending);
+        const state = if (source_failed) "failed" else if (pending) "pending" else "ready";
         try out.appendSlice(alloc, "{\"artifact\":");
         try appendJsonString(alloc, out, source.artifact_name);
         try out.appendSlice(alloc, ",\"state\":");
         try appendJsonString(alloc, out, state);
         try out.appendSlice(alloc, ",\"complete\":");
-        try out.appendSlice(alloc, if (!index_failed and !pending) "true" else "false");
+        try out.appendSlice(alloc, if (!source_failed and !pending) "true" else "false");
         try out.appendSlice(alloc, ",\"pending_reasons\":[");
         var emitted = false;
         if (index_failed) {
             try appendJsonString(alloc, out, "index_failed");
+            emitted = true;
+        }
+        if (source.failed) {
+            if (emitted) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "enrichment_failure");
             emitted = true;
         }
         if (!observation_fresh) {
@@ -4504,6 +4514,20 @@ test "source readiness distinguishes lagging artifact streams" {
     try appendIndexSourceReadinessStatuses(std.testing.allocator, &out, &sources, true, true, false, 1);
     try std.testing.expectEqualStrings(
         ",\"sources\":[{\"artifact\":\"document_vectors\",\"state\":\"ready\",\"complete\":true,\"pending_reasons\":[]},{\"artifact\":\"chunk_vectors\",\"state\":\"pending\",\"complete\":false,\"pending_reasons\":[\"publication\"]}]",
+        out.items,
+    );
+}
+
+test "source readiness isolates terminal enrichment failures" {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    const sources = [_]db_mod.types.IndexSourceReplayStatus{
+        .{ .artifact_name = "document_vectors", .published_sequence = 41, .target_sequence = 41 },
+        .{ .artifact_name = "chunk_vectors", .published_sequence = 41, .target_sequence = 41, .failed = true },
+    };
+    try appendIndexSourceReadinessStatuses(std.testing.allocator, &out, &sources, true, true, false, 1);
+    try std.testing.expectEqualStrings(
+        ",\"sources\":[{\"artifact\":\"document_vectors\",\"state\":\"ready\",\"complete\":true,\"pending_reasons\":[]},{\"artifact\":\"chunk_vectors\",\"state\":\"failed\",\"complete\":false,\"pending_reasons\":[\"enrichment_failure\"]}]",
         out.items,
     );
 }

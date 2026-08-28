@@ -6196,6 +6196,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
             "distributed graph incoming probe expands only positive source shards",
+            "distributed graph root probe retires resolved keys between shard waves",
             "distributed graph supports cross-range traverse target selectors",
             "distributed graph edge reader carries identity generation",
         },
@@ -6220,6 +6221,7 @@ pub fn build(b: *std.Build) void {
             "index configs receive persistent private incarnations across index kinds",
             "create table parser preserves supported metadata fields",
             "create table rejects caller-managed schema versions",
+            "metadata.schema update versions only the active primary full-text index with a fresh incarnation",
             "restore manifest preserves trusted coverage incarnation metadata",
             "public index config encoders redact coverage incarnation",
             "public index config encoders redact nested credentials",
@@ -6252,6 +6254,7 @@ pub fn build(b: *std.Build) void {
             "managed embeddings readiness ignores finalizing catch-up after rate-limit recovery",
             "single embeddings index encoder keeps retrying coverage gaps catch-up coherent",
             "multi-source embedding enrichments receive a shared semantic producer identity",
+            "source readiness isolates terminal enrichment failures",
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
             "repair-free embeddings aggregate retains live dense catch-up",
             "serviceable repair preserves sibling shard dense catch-up fallback",

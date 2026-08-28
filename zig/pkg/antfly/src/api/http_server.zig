@@ -3790,6 +3790,7 @@ pub const ApiHttpServer = struct {
                     .artifact_name = try alloc.dupe(u8, source.artifact_name),
                     .published_sequence = source.published_sequence,
                     .target_sequence = source.target_sequence,
+                    .failed = source.failed,
                 };
                 source_count += 1;
             }

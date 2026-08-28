@@ -16071,30 +16071,100 @@ pub const DB = struct {
         }
     };
 
+    const graph_ownership_restore_cursor_magic = "GRC1";
+
+    const GraphOwnershipRestoreCursor = struct {
+        artifact_key: []const u8,
+        graph_index_offset: u32,
+    };
+
+    fn decodeGraphOwnershipRestoreCursor(cursor: ?[]const u8) ?GraphOwnershipRestoreCursor {
+        const raw = cursor orelse return null;
+        const header_len = graph_ownership_restore_cursor_magic.len + @sizeOf(u32);
+        if (raw.len < header_len or !std.mem.startsWith(u8, raw, graph_ownership_restore_cursor_magic)) return null;
+        return .{
+            .artifact_key = raw[header_len..],
+            .graph_index_offset = std.mem.readInt(u32, raw[graph_ownership_restore_cursor_magic.len..header_len], .big),
+        };
+    }
+
+    fn encodeGraphOwnershipRestoreCursorAlloc(
+        alloc: Allocator,
+        artifact_key: []const u8,
+        graph_index_offset: usize,
+    ) ![]u8 {
+        if (graph_index_offset > std.math.maxInt(u32)) return error.InvalidRestoreState;
+        const header_len = graph_ownership_restore_cursor_magic.len + @sizeOf(u32);
+        const out = try alloc.alloc(u8, header_len + artifact_key.len);
+        @memcpy(out[0..graph_ownership_restore_cursor_magic.len], graph_ownership_restore_cursor_magic);
+        std.mem.writeInt(
+            u32,
+            out[graph_ownership_restore_cursor_magic.len..header_len],
+            @intCast(graph_index_offset),
+            .big,
+        );
+        @memcpy(out[header_len..], artifact_key);
+        return out;
+    }
+
+    fn rebuildOneGraphArtifactOwnershipForRestore(
+        self: *DB,
+        alloc: Allocator,
+        artifact_key: []const u8,
+        graph_index_offset: usize,
+    ) !GraphOwnershipRestorePage {
+        const graph_indexes = self.core.index_manager.graphIndexes();
+        if (graph_index_offset >= graph_indexes.len) return error.InvalidRestoreState;
+
+        // Runtime restore repair operates on an unpublished staged generation
+        // with optional workers disabled. Parsing, contender reconstruction,
+        // and mutation filtering can be proportional to one admitted artifact;
+        // do not hold the shard apply lock across that work. The durable restore
+        // cursor serializes these units and advances only after putBatch returns.
+        const changed = try materializeGraphSourceArtifactsForIndex(
+            alloc,
+            self.core.store,
+            self.core.index_manager,
+            &.{artifact_key},
+            graph_indexes[graph_index_offset].config.name,
+            .{},
+        );
+        freeOwnedKeySlice(alloc, changed);
+
+        return .{
+            .replayed = 1,
+            .next_cursor = if (graph_index_offset + 1 < graph_indexes.len)
+                try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset + 1)
+            else
+                try alloc.dupe(u8, artifact_key),
+        };
+    }
+
     fn rebuildGraphArtifactOwnershipForRestorePage(
         self: *DB,
         alloc: Allocator,
         cursor: ?[]const u8,
     ) !GraphOwnershipRestorePage {
-        lockApply(self);
-        defer self.core.unlockApply();
-
         if (!self.core.index_manager.hasGraphIndexes()) return .{ .complete = true };
-        // Bound both decoded input and mutation fan-in while the shard apply
-        // lock is held. Row count alone is not a useful latency bound because
-        // generated artifact payloads vary by orders of magnitude. Always
-        // consume at least one row so an oversized-but-valid record cannot
-        // permanently wedge restore progress.
+        if (decodeGraphOwnershipRestoreCursor(cursor)) |continuation| {
+            return try self.rebuildOneGraphArtifactOwnershipForRestore(
+                alloc,
+                continuation.artifact_key,
+                continuation.graph_index_offset,
+            );
+        }
+
+        // Scanning is bounded independently from materialization. Once an
+        // artifact is found, process exactly one graph index and persist a
+        // continuation for the remaining indexes. This prevents source count,
+        // graph index count, and artifact size from multiplying in one quantum.
         const scan_page_size: usize = 128;
         const max_page_input_bytes: usize = 4 * 1024 * 1024;
-        const max_page_artifacts: usize = 64;
         const user_prefix = [_]u8{internal_keys.user_namespace};
         const rows = try self.core.store.scanPrefixPage(alloc, &user_prefix, cursor, scan_page_size);
         defer docstore_mod.DocStore.freeResults(alloc, rows);
         if (rows.len == 0) return .{ .complete = true };
 
-        var source_keys = std.ArrayListUnmanaged([]const u8).empty;
-        defer source_keys.deinit(alloc);
         var consumed_rows: usize = 0;
         var consumed_bytes: usize = 0;
         for (rows) |row| {
@@ -16102,35 +16172,16 @@ pub const DB = struct {
             const artifact_row = internal_keys.isAssetArtifactKey(row.key) or
                 internal_keys.isChunkArtifactRecordKey(row.key) or
                 internal_keys.isResolutionArtifactKey(row.key);
-            if (consumed_rows > 0 and
-                (consumed_bytes +| row_bytes > max_page_input_bytes or
-                    (artifact_row and source_keys.items.len >= max_page_artifacts)))
-            {
-                break;
-            }
+            if (consumed_rows > 0 and consumed_bytes +| row_bytes > max_page_input_bytes) break;
             consumed_rows += 1;
             consumed_bytes +|= row_bytes;
             if (artifact_row) {
-                try source_keys.append(alloc, row.key);
-            }
-        }
-
-        if (source_keys.items.len > 0) {
-            for (self.core.index_manager.graphIndexes()) |graph_entry| {
-                const changed = try materializeGraphSourceArtifactsForIndex(
-                    alloc,
-                    self.core.store,
-                    self.core.index_manager,
-                    source_keys.items,
-                    graph_entry.config.name,
-                    .{},
-                );
-                freeOwnedKeySlice(alloc, changed);
+                return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, row.key, 0);
             }
         }
 
         return .{
-            .replayed = source_keys.items.len,
+            .replayed = 0,
             .next_cursor = if (consumed_rows < rows.len or rows.len == scan_page_size)
                 try alloc.dupe(u8, rows[consumed_rows - 1].key)
             else
@@ -22164,6 +22215,9 @@ pub const DB = struct {
             if (self.async_context.enrichment_runtime) |runtime| {
                 for (runtime_stats.indexes) |*item| {
                     item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
+                    for (item.source_replay) |*source| {
+                        source.failed = runtime.indexSourceHasIsolatedFailure(item.name, source.artifact_name);
+                    }
                 }
             }
         }
@@ -95400,6 +95454,16 @@ test "db restore state uses strict structured content identity markers" {
         error.InvalidRestoreState,
         DB.readRestoreStateForPath(alloc, std.mem.span(path)),
     );
+}
+
+test "db graph ownership restore cursor resumes one artifact index exactly" {
+    const alloc = std.testing.allocator;
+    const encoded = try DB.encodeGraphOwnershipRestoreCursorAlloc(alloc, "\x01artifact:key", 37);
+    defer alloc.free(encoded);
+    const decoded = DB.decodeGraphOwnershipRestoreCursor(encoded) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("\x01artifact:key", decoded.artifact_key);
+    try std.testing.expectEqual(@as(u32, 37), decoded.graph_index_offset);
+    try std.testing.expect(DB.decodeGraphOwnershipRestoreCursor("\x01legacy-scan-cursor") == null);
 }
 
 test "db restore graph ownership replay persists a bounded page cursor" {
