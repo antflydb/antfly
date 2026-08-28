@@ -31,6 +31,7 @@ const httpx = @import("httpx");
 const extension_domain = @import("../extensions/mod.zig");
 const google_auth = @import("antfly_google").auth;
 const backup_contract = @import("backup_contract.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 pub const BackupRequest = metadata_openapi.BackupRequest;
 pub const RestoreRequest = metadata_openapi.RestoreRequest;
@@ -1613,11 +1614,43 @@ const RemoteBackupStore = struct {
     }
 
     fn downloadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8) !void {
-        return try self.downloadDirectoryRecursiveWithPageSize(alloc, src_suffix, dest_path, 1000);
+        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, src_suffix, dest_path, 1000, .none);
+    }
+
+    fn downloadDirectoryRecursiveWithCancellation(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        src_suffix: []const u8,
+        dest_path: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
+        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(
+            alloc,
+            src_suffix,
+            dest_path,
+            1000,
+            cancellation,
+        );
     }
 
     fn downloadDirectoryRecursiveWithPageSize(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8, page_size: u32) !void {
+        return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, src_suffix, dest_path, page_size, .none);
+    }
+
+    fn downloadDirectoryRecursiveWithPageSizeAndCancellation(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        src_suffix: []const u8,
+        dest_path: []const u8,
+        page_size: u32,
+        cancellation: CancellationToken,
+    ) !void {
         if (page_size == 0) return error.InvalidPageSize;
+        try cancellation.check();
+        const object_cancellation = object_storage.CancellationToken.fromCallback(
+            cancellation.ptr,
+            cancellation.is_cancelled_fn,
+        );
         const base_key = try self.keyAlloc(alloc, src_suffix);
         defer alloc.free(base_key);
         const key_prefix = if (base_key.len == 0)
@@ -1626,15 +1659,21 @@ const RemoteBackupStore = struct {
             try std.fmt.allocPrint(alloc, "{s}/", .{base_key});
         defer alloc.free(key_prefix);
 
-        if (try self.client.getPrefixWithIo(self.io, self.bucket, key_prefix, dest_path)) |downloaded| {
-            if (downloaded == 0) return error.FileNotFound;
-            return;
+        // Native prefix transfers do not yet expose semantic cancellation.
+        // Preserve that fast path for uncancellable callers; restore jobs use
+        // per-object transfers so active provider requests can be interrupted.
+        if (object_cancellation == null) {
+            if (try self.client.getPrefixWithIo(self.io, self.bucket, key_prefix, dest_path)) |downloaded| {
+                if (downloaded == 0) return error.FileNotFound;
+                return;
+            }
         }
 
         var found = false;
         var continuation_token: ?[]u8 = null;
         defer if (continuation_token) |token| alloc.free(token);
         while (true) {
+            try cancellation.check();
             var listed = try self.client.listObjects(self.bucket, .{
                 .prefix = key_prefix,
                 .recursive = true,
@@ -1642,17 +1681,21 @@ const RemoteBackupStore = struct {
                 .continuation_token = continuation_token,
             });
             defer listed.deinit(alloc);
+            try cancellation.check();
             var next_token = if (listed.next_continuation_token) |token| try alloc.dupe(u8, token) else null;
             errdefer if (next_token) |token| alloc.free(token);
 
             for (listed.entries) |entry| {
+                try cancellation.check();
                 if (!std.mem.startsWith(u8, entry.key, key_prefix)) return error.InvalidBackupArtifactPath;
                 const rel = entry.key[key_prefix.len..];
                 if (rel.len == 0) continue;
                 try validateArtifactRelativePath(rel);
                 const dest_file = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, rel });
                 defer alloc.free(dest_file);
-                try self.client.getFileWithIo(self.io, self.bucket, entry.key, dest_file, .{});
+                try self.client.getFileWithIo(self.io, self.bucket, entry.key, dest_file, .{
+                    .cancellation = object_cancellation,
+                });
                 found = true;
             }
 
@@ -10910,20 +10953,44 @@ pub fn copyDirectoryFromLocationUsingIo(
     snapshot_path: []const u8,
     dest_path: []const u8,
 ) !void {
+    return try copyDirectoryFromLocationUsingIoWithCancellation(
+        alloc,
+        shared_io,
+        location,
+        snapshot_path,
+        dest_path,
+        .none,
+    );
+}
+
+pub fn copyDirectoryFromLocationUsingIoWithCancellation(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    location: *BackupLocation,
+    snapshot_path: []const u8,
+    dest_path: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
     try validateArtifactRelativePath(snapshot_path);
     switch (location.*) {
         .file => |backup_root| {
             const src_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
             defer alloc.free(src_root);
             if (shared_io) |io|
-                try copyDirectoryRecursiveWithIo(alloc, io, src_root, dest_path, .transient)
+                try copyDirectoryRecursiveWithIo(alloc, io, src_root, dest_path, .transient, cancellation)
             else {
                 var io_impl = std.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
-                try copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_root, dest_path, .transient);
+                try copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_root, dest_path, .transient, cancellation);
             }
         },
-        .remote => |*store| try store.downloadDirectoryRecursive(alloc, snapshot_path, dest_path),
+        .remote => |*store| try store.downloadDirectoryRecursiveWithCancellation(
+            alloc,
+            snapshot_path,
+            dest_path,
+            cancellation,
+        ),
     }
 }
 
@@ -10993,6 +11060,27 @@ pub fn populateShardArtifactIntegrity(
     integrity = undefined;
 }
 
+pub fn populateShardArtifactIntegrityWithCancellation(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    format: BackupFormat,
+    artifact_path: []const u8,
+    shard: *ShardSnapshot,
+    cancellation: CancellationToken,
+) !void {
+    var integrity = try artifactIntegrityAllocWithCancellation(
+        alloc,
+        shared_io,
+        format,
+        artifact_path,
+        cancellation,
+    );
+    if (shard.artifact_sha256.len > 0) alloc.free(@constCast(shard.artifact_sha256));
+    shard.artifact_size_bytes = integrity.size_bytes;
+    shard.artifact_sha256 = integrity.sha256;
+    integrity = undefined;
+}
+
 pub fn deriveManifestArtifactIntegrity(
     alloc: std.mem.Allocator,
     shared_io: ?std.Io,
@@ -11030,6 +11118,30 @@ pub fn verifyShardArtifactIntegrity(
     }
 }
 
+pub fn verifyShardArtifactIntegrityWithCancellation(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    format: BackupFormat,
+    artifact_path: []const u8,
+    shard: *const ShardSnapshot,
+    cancellation: CancellationToken,
+) !void {
+    if (!isLowerSha256Hex(shard.artifact_sha256)) return error.BackupIntegrityMissing;
+    var actual = try artifactIntegrityAllocWithCancellation(
+        alloc,
+        shared_io,
+        format,
+        artifact_path,
+        cancellation,
+    );
+    defer actual.deinit(alloc);
+    if (actual.size_bytes != shard.artifact_size_bytes or
+        !std.mem.eql(u8, actual.sha256, shard.artifact_sha256))
+    {
+        return error.BackupArtifactIntegrityMismatch;
+    }
+}
+
 pub fn artifactIntegrityAlloc(
     alloc: std.mem.Allocator,
     shared_io: ?std.Io,
@@ -11040,6 +11152,34 @@ pub fn artifactIntegrityAlloc(
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try artifactIntegrityAllocWithIo(alloc, io_impl.io(), format, artifact_path);
+}
+
+pub fn artifactIntegrityAllocWithCancellation(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    format: BackupFormat,
+    artifact_path: []const u8,
+    cancellation: CancellationToken,
+) !ArtifactIntegrity {
+    try cancellation.check();
+    if (shared_io) |io|
+        return try artifactIntegrityAllocCancellableWithIo(alloc, io, format, artifact_path, cancellation);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return try artifactIntegrityAllocCancellableWithIo(alloc, io_impl.io(), format, artifact_path, cancellation);
+}
+
+fn artifactIntegrityAllocCancellableWithIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    format: BackupFormat,
+    artifact_path: []const u8,
+    cancellation: CancellationToken,
+) !ArtifactIntegrity {
+    return switch (format) {
+        .portable => try fileArtifactIntegrityAllocCancellable(alloc, io, artifact_path, cancellation),
+        .native => try directoryArtifactIntegrityAllocCancellable(alloc, io, artifact_path, cancellation),
+    };
 }
 
 pub fn portableBytesIntegrityAlloc(alloc: std.mem.Allocator, bytes: []const u8) !ArtifactIntegrity {
@@ -11089,6 +11229,30 @@ fn fileArtifactIntegrityAllocWithIdentity(
     try hashFileContents(io, file, initial_stat, &hasher);
     if (identity_hasher) |identity|
         hashLocalArtifactStat(identity, initial_stat);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return .{
+        .size_bytes = initial_stat.size,
+        .sha256 = try alloc.dupe(u8, &hex),
+    };
+}
+
+fn fileArtifactIntegrityAllocCancellable(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    cancellation: CancellationToken,
+) !ArtifactIntegrity {
+    try cancellation.check();
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const initial_stat = try file.stat(io);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    try hashFileContentsCancellable(io, file, initial_stat, &hasher, cancellation);
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -11195,6 +11359,76 @@ fn directoryArtifactIntegrityAllocWithIdentity(
     };
 }
 
+fn directoryArtifactIntegrityAllocCancellable(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    cancellation: CancellationToken,
+) !ArtifactIntegrity {
+    try cancellation.check();
+    var dir = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true })
+    else
+        try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+
+    var files = std.ArrayListUnmanaged(NativeArtifactFile).empty;
+    defer {
+        for (files.items) |entry| entry.deinit(alloc);
+        files.deinit(alloc);
+    }
+    var walker = try dir.walk(alloc);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        try cancellation.check();
+        switch (entry.kind) {
+            .directory => {},
+            .file => {
+                if (files.items.len == backup_integrity_max_native_files)
+                    return error.BackupArtifactTooLarge;
+                const stat = try dir.statFile(io, entry.path, .{});
+                const normalized = try alloc.dupe(u8, entry.path);
+                errdefer alloc.free(normalized);
+                if (std.fs.path.sep != '/') {
+                    for (normalized) |*c| {
+                        if (c.* == std.fs.path.sep) c.* = '/';
+                    }
+                }
+                try files.append(alloc, .{ .path = normalized, .stat = stat });
+            },
+            else => return error.UnsupportedBackupArtifact,
+        }
+    }
+    if (files.items.len == 0) return error.BackupArtifactMissing;
+    std.mem.sort(NativeArtifactFile, files.items, {}, nativeArtifactFileLessThan);
+
+    var total_size: u64 = 0;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-native-backup-tree-v1");
+    hashArtifactU64(&hasher, @intCast(files.items.len));
+    for (files.items) |entry| {
+        try cancellation.check();
+        total_size = std.math.add(u64, total_size, entry.stat.size) catch
+            return error.BackupArtifactTooLarge;
+        hashArtifactBytes(&hasher, entry.path);
+        hashArtifactU64(&hasher, entry.stat.size);
+        var file = try dir.openFile(io, entry.path, .{});
+        defer file.close(io);
+        const initial_stat = try file.stat(io);
+        if (!localArtifactStatsEqual(initial_stat, entry.stat))
+            return error.SourceFileChanged;
+        try hashFileContentsCancellable(io, file, initial_stat, &hasher, cancellation);
+    }
+    hashArtifactU64(&hasher, total_size);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return .{
+        .size_bytes = total_size,
+        .sha256 = try alloc.dupe(u8, &hex),
+    };
+}
+
 fn nativeArtifactFileLessThan(_: void, lhs: NativeArtifactFile, rhs: NativeArtifactFile) bool {
     return std.mem.order(u8, lhs.path, rhs.path) == .lt;
 }
@@ -11214,6 +11448,31 @@ fn hashFileContents(
         hasher.update(buf[0..n]);
         offset += n;
     }
+    var extra: [1]u8 = undefined;
+    if (try file.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
+    const final_stat = try file.stat(io);
+    if (!localArtifactStatsEqual(final_stat, initial_stat))
+        return error.SourceFileChanged;
+}
+
+fn hashFileContentsCancellable(
+    io: std.Io,
+    file: std.Io.File,
+    initial_stat: std.Io.File.Stat,
+    hasher: *std.crypto.hash.sha2.Sha256,
+    cancellation: CancellationToken,
+) !void {
+    var buf: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < initial_stat.size) {
+        try cancellation.check();
+        const wanted: usize = @intCast(@min(initial_stat.size - offset, buf.len));
+        const n = try file.readPositionalAll(io, buf[0..wanted], offset);
+        if (n != wanted) return error.SourceFileChanged;
+        hasher.update(buf[0..n]);
+        offset += n;
+    }
+    try cancellation.check();
     var extra: [1]u8 = undefined;
     if (try file.readPositionalAll(io, &extra, offset) != 0) return error.SourceFileChanged;
     const final_stat = try file.stat(io);
@@ -11476,10 +11735,153 @@ pub fn copyDirectoryRecursiveUsingIo(
     src_path: []const u8,
     dest_path: []const u8,
 ) !void {
-    if (shared_io) |io| return try copyDirectoryRecursiveWithIo(alloc, io, src_path, dest_path, .durable);
+    return copyDirectoryRecursiveUsingIoWithCancellation(alloc, shared_io, src_path, dest_path, .none);
+}
+
+pub fn copyDirectoryRecursiveUsingIoWithCancellation(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    src_path: []const u8,
+    dest_path: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
+    if (shared_io) |io| return try copyDirectoryRecursiveWithIo(alloc, io, src_path, dest_path, .durable, cancellation);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    return copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_path, dest_path, .durable);
+    return copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_path, dest_path, .durable, cancellation);
+}
+
+/// Copies a native artifact and computes the canonical tree digest from the
+/// exact bytes written. This avoids a second corpus-sized read after local
+/// materialization and binds the advertised integrity to the destination.
+pub fn copyNativeDirectoryWithIntegrityUsingIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    src_path: []const u8,
+    dest_path: []const u8,
+    cancellation: CancellationToken,
+) !ArtifactIntegrity {
+    try cancellation.check();
+    try ensureDirPathWithIo(io, dest_path);
+    var src_dir = if (std.fs.path.isAbsolute(src_path))
+        try std.Io.Dir.openDirAbsolute(io, src_path, .{ .iterate = true })
+    else
+        try std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true });
+    defer src_dir.close(io);
+
+    var files = std.ArrayListUnmanaged(NativeArtifactFile).empty;
+    defer {
+        for (files.items) |entry| entry.deinit(alloc);
+        files.deinit(alloc);
+    }
+    var durable_dirs = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (durable_dirs.items) |path| alloc.free(path);
+        durable_dirs.deinit(alloc);
+    }
+    try durable_dirs.append(alloc, try alloc.dupe(u8, dest_path));
+
+    var walker = try src_dir.walk(alloc);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        try cancellation.check();
+        switch (entry.kind) {
+            .directory => {
+                const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, entry.path });
+                errdefer alloc.free(destination);
+                try ensureDirPathWithIo(io, destination);
+                try durable_dirs.append(alloc, destination);
+            },
+            .file => {
+                if (files.items.len == backup_integrity_max_native_files)
+                    return error.BackupArtifactTooLarge;
+                const normalized = try alloc.dupe(u8, entry.path);
+                errdefer alloc.free(normalized);
+                if (std.fs.path.sep != '/') {
+                    for (normalized) |*c| {
+                        if (c.* == std.fs.path.sep) c.* = '/';
+                    }
+                }
+                try files.append(alloc, .{
+                    .path = normalized,
+                    .stat = try src_dir.statFile(io, entry.path, .{}),
+                });
+            },
+            else => return error.UnsupportedBackupArtifact,
+        }
+    }
+    if (files.items.len == 0) return error.BackupArtifactMissing;
+    std.mem.sort(NativeArtifactFile, files.items, {}, nativeArtifactFileLessThan);
+
+    var total_size: u64 = 0;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-native-backup-tree-v1");
+    hashArtifactU64(&hasher, @intCast(files.items.len));
+    for (files.items) |entry| {
+        try cancellation.check();
+        total_size = std.math.add(u64, total_size, entry.stat.size) catch
+            return error.BackupArtifactTooLarge;
+        hashArtifactBytes(&hasher, entry.path);
+        hashArtifactU64(&hasher, entry.stat.size);
+        const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ src_path, entry.path });
+        defer alloc.free(source);
+        const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, entry.path });
+        defer alloc.free(destination);
+        try copyFileAndHashCancellable(io, source, destination, entry.stat, &hasher, cancellation);
+    }
+    hashArtifactU64(&hasher, total_size);
+
+    std.mem.sort([]u8, durable_dirs.items, {}, struct {
+        fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+            if (lhs.len != rhs.len) return lhs.len > rhs.len;
+            return std.mem.order(u8, lhs, rhs) == .gt;
+        }
+    }.lessThan);
+    for (durable_dirs.items) |directory| {
+        try cancellation.check();
+        try fs_paths.syncDirPortable(io, directory);
+    }
+    try syncPathAncestorsWithIo(io, std.fs.path.dirname(dest_path) orelse ".");
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return .{
+        .size_bytes = total_size,
+        .sha256 = try alloc.dupe(u8, &hex),
+    };
+}
+
+fn copyFileAndHashCancellable(
+    io: std.Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    initial_stat: std.Io.File.Stat,
+    hasher: *std.crypto.hash.sha2.Sha256,
+    cancellation: CancellationToken,
+) !void {
+    if (std.fs.path.dirname(destination_path)) |parent| try ensureDirPathWithIo(io, parent);
+    var source = if (std.fs.path.isAbsolute(source_path))
+        try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, source_path, .{});
+    defer source.close(io);
+    if (!localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    var destination = try fs_paths.createFilePortable(io, destination_path, .{ .truncate = true });
+    defer destination.close(io);
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < initial_stat.size) {
+        try cancellation.check();
+        const len: usize = @intCast(@min(initial_stat.size - offset, buffer.len));
+        if (try source.readPositionalAll(io, buffer[0..len], offset) != len)
+            return error.SourceFileChanged;
+        hasher.update(buffer[0..len]);
+        try destination.writePositionalAll(io, buffer[0..len], offset);
+        offset += len;
+    }
+    if (!localArtifactStatsEqual(try source.stat(io), initial_stat)) return error.SourceFileChanged;
+    try destination.sync(io);
 }
 
 const CopyDurability = enum {
@@ -11493,7 +11895,9 @@ fn copyDirectoryRecursiveWithIo(
     src_path: []const u8,
     dest_path: []const u8,
     durability: CopyDurability,
+    cancellation: CancellationToken,
 ) !void {
+    try cancellation.check();
     try ensureDirPathWithIo(io, dest_path);
 
     var durable_dirs = std.ArrayListUnmanaged([]u8).empty;
@@ -11516,6 +11920,7 @@ fn copyDirectoryRecursiveWithIo(
     defer walker.deinit();
 
     while (try walker.next(io)) |entry| {
+        try cancellation.check();
         const src_entry_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ src_path, entry.path });
         defer alloc.free(src_entry_path);
         const dest_entry_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dest_path, entry.path });
@@ -11532,7 +11937,7 @@ fn copyDirectoryRecursiveWithIo(
                     };
                 }
             },
-            .file => try copyFileAbsoluteWithIoOptions(io, src_entry_path, dest_entry_path, durability),
+            .file => try copyFileAbsoluteWithIoOptionsCancellable(io, src_entry_path, dest_entry_path, durability, cancellation),
             else => return error.UnsupportedBackupArtifact,
         }
     }
@@ -11544,7 +11949,10 @@ fn copyDirectoryRecursiveWithIo(
             return std.mem.order(u8, lhs, rhs) == .gt;
         }
     }.lessThan);
-    for (durable_dirs.items) |dir_path| try fs_paths.syncDirPortable(io, dir_path);
+    for (durable_dirs.items) |dir_path| {
+        try cancellation.check();
+        try fs_paths.syncDirPortable(io, dir_path);
+    }
     try syncPathAncestorsWithIo(io, std.fs.path.dirname(dest_path) orelse ".");
 }
 
@@ -11758,7 +12166,6 @@ fn copyFileAbsoluteWithIoOptions(
 
     var dest = try fs_paths.createFilePortable(io, dest_path, .{ .truncate = true });
     defer dest.close(io);
-
     var writer_buf: [1024]u8 = undefined;
     var writer = dest.writer(io, &writer_buf);
     var src_reader: std.Io.File.Reader = .initSize(src, io, &.{}, src_stat.size);
@@ -11767,6 +12174,44 @@ fn copyFileAbsoluteWithIoOptions(
         error.WriteFailed => return writer.err.?,
     };
     try writer.end();
+    const final_src_stat = try src.stat(io);
+    if (final_src_stat.size != src_stat.size or !std.meta.eql(final_src_stat.mtime, src_stat.mtime))
+        return error.SourceFileChanged;
+    if (durability == .durable) try dest.sync(io);
+}
+
+fn copyFileAbsoluteWithIoOptionsCancellable(
+    io: std.Io,
+    src_path: []const u8,
+    dest_path: []const u8,
+    durability: CopyDurability,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
+    if (cancellation.ptr == null or cancellation.is_cancelled_fn == null)
+        return copyFileAbsoluteWithIoOptions(io, src_path, dest_path, durability);
+    if (std.fs.path.dirname(dest_path)) |dir_name| try ensureDirPathWithIo(io, dir_name);
+
+    var src = if (std.fs.path.isAbsolute(src_path))
+        try std.Io.Dir.openFileAbsolute(io, src_path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, src_path, .{});
+    defer src.close(io);
+    const src_stat = try src.stat(io);
+
+    var dest = try fs_paths.createFilePortable(io, dest_path, .{ .truncate = true });
+    defer dest.close(io);
+
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < src_stat.size) {
+        try cancellation.check();
+        const wanted: usize = @intCast(@min(src_stat.size - offset, buffer.len));
+        const read = try src.readPositionalAll(io, buffer[0..wanted], offset);
+        if (read != wanted) return error.SourceFileChanged;
+        try dest.writePositionalAll(io, buffer[0..read], offset);
+        offset += read;
+    }
     const final_src_stat = try src.stat(io);
     if (final_src_stat.size != src_stat.size or !std.meta.eql(final_src_stat.mtime, src_stat.mtime))
         return error.SourceFileChanged;
@@ -11795,6 +12240,47 @@ fn syncPathAncestorsWithIo(io: std.Io, start_path: []const u8) !void {
 
 fn stringifyJsonAlloc(alloc: std.mem.Allocator, value: anytype) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, value, .{ .emit_null_optional_fields = false });
+}
+
+test "native artifact copy observes cancellation between io chunks" {
+    const alloc = std.testing.allocator;
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var destination_tmp = std.testing.tmpDir(.{});
+    defer destination_tmp.cleanup();
+    const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
+    defer alloc.free(source);
+    const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/copy", .{destination_tmp.sub_path});
+    defer alloc.free(destination);
+    const source_file = try std.fmt.allocPrint(alloc, "{s}/large.bin", .{source});
+    defer alloc.free(source_file);
+    var file = try fs_paths.createFilePortable(std.testing.io, source_file, .{ .truncate = true });
+    defer file.close(std.testing.io);
+    var writer_buffer: [4096]u8 = undefined;
+    var writer = file.writer(std.testing.io, &writer_buffer);
+    const zeros = [_]u8{0} ** (256 * 1024);
+    for (0..4) |_| try writer.interface.writeAll(&zeros);
+    try writer.end();
+
+    const CancelAfter = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+
+        fn isCancelled(ptr: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(ptr)));
+            return self.calls.fetchAdd(1, .acq_rel) >= 4;
+        }
+    };
+    var state = CancelAfter{};
+    try std.testing.expectError(
+        error.Canceled,
+        copyNativeDirectoryWithIntegrityUsingIo(
+            alloc,
+            std.testing.io,
+            source,
+            destination,
+            .{ .ptr = &state, .is_cancelled_fn = CancelAfter.isCancelled },
+        ),
+    );
 }
 
 fn cloneOptionalStringSlice(alloc: std.mem.Allocator, values: ?[]const []const u8) !?[]const []const u8 {

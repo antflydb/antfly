@@ -19,6 +19,7 @@ const backups_api = @import("../../api/backups.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const portable_backup = @import("../../storage/portable_backup.zig");
+const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 
 pub const RestoreAuthority = union(enum) {
     /// A private artifact already admitted and staged by Antfly.
@@ -38,6 +39,7 @@ pub const RestoreSource = struct {
     expected_artifact_sha256: []const u8,
     manifest: ?*const backups_api.TableBackupManifest = null,
     io: ?std.Io = null,
+    cancellation: CancellationToken = .none,
     open_options: backups_api.OpenOptions = .{},
 };
 
@@ -377,6 +379,7 @@ fn prepareRestoreSnapshotIfNeeded(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !?db_mod.generation_lifecycle.StagedGeneration {
+    try restore.cancellation.check();
     var io_scope = try RestoreIoScope.init(alloc, restore);
     defer io_scope.deinit();
     const io = io_scope.io();
@@ -460,21 +463,22 @@ fn prepareRestoreSnapshot(
         .native => {},
     }
 
-    const snapshot_root = try stageRestoreSnapshot(alloc, io, path, &location, snapshot_path);
+    const snapshot_root = try stageRestoreSnapshot(alloc, io, path, &location, snapshot_path, restore.cancellation);
     defer {
         destroyPathIfExistsWithIo(io, snapshot_root);
         alloc.free(snapshot_root);
     }
-    try backups_api.verifyShardArtifactIntegrity(
+    try backups_api.verifyShardArtifactIntegrityWithCancellation(
         alloc,
         io,
         .native,
         snapshot_root,
         shard,
+        restore.cancellation,
     );
 
     std.log.info("native restore staged generation phase=materialization", .{});
-    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIo(&staged_generation, alloc, io, snapshot_root, staged_path, .{
+    try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(&staged_generation, alloc, io, snapshot_root, staged_path, .{
         .identity_namespace = options.expected_identity_namespace,
     }, .{
         .backup_id = restore.backup_id,
@@ -482,7 +486,7 @@ fn prepareRestoreSnapshot(
         .artifact_sha256 = shard.artifact_sha256,
         .snapshot_path = snapshot_path,
         .group_id = group_id,
-    });
+    }, restore.cancellation);
     std.log.info("native restore staged generation phase=prepared", .{});
     return staged_generation;
 }
@@ -616,12 +620,20 @@ fn stageRestoreSnapshot(
     path: []const u8,
     location: *backups_api.BackupLocation,
     snapshot_path: []const u8,
+    cancellation: CancellationToken,
 ) ![]u8 {
     const staging_root = try std.fmt.allocPrint(alloc, "{s}.restore-source", .{path});
     errdefer alloc.free(staging_root);
     destroyPathIfExistsWithIo(io, staging_root);
     errdefer destroyPathIfExistsWithIo(io, staging_root);
-    try backups_api.copyDirectoryFromLocationUsingIo(alloc, io, location, snapshot_path, staging_root);
+    try backups_api.copyDirectoryFromLocationUsingIoWithCancellation(
+        alloc,
+        io,
+        location,
+        snapshot_path,
+        staging_root,
+        cancellation,
+    );
     return staging_root;
 }
 

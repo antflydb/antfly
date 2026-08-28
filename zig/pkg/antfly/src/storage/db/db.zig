@@ -15529,6 +15529,7 @@ pub const DB = struct {
         ptr: *anyopaque,
         after_capture_admission: *const fn (*anyopaque) void,
         after_apply_release: ?*const fn (*anyopaque) void = null,
+        before_artifact_materialize: ?*const fn (*anyopaque) void = null,
     };
     var test_snapshot_fence_hook: ?SnapshotFenceTestHook = null;
 
@@ -15540,9 +15541,7 @@ pub const DB = struct {
         defer self.snapshot_publication_mutex.unlock();
         try ensureSnapshotActive(cancellation);
         try validateSnapshotId(id);
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
+        const io = self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
         const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.snapshots", .{self.core.path});
         defer self.alloc.free(snapshot_parent);
         const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ snapshot_parent, id });
@@ -15564,9 +15563,16 @@ pub const DB = struct {
             defer if (apply_held) self.core.unlockApply();
             try self.core.syncStore(true);
             try self.core.index_manager.syncAll(true);
-            const total = try self.core.writeSnapshot(staging_root);
+            var primary_snapshot = try self.core.pinPortableSnapshot();
+            defer primary_snapshot.deinit();
             self.core.unlockApply();
             apply_held = false;
+            const total = try primary_snapshot.materialize(
+                self.alloc,
+                io,
+                staging_root,
+                cancellation,
+            );
             try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
             published = true;
             return total;
@@ -15645,7 +15651,11 @@ pub const DB = struct {
             else => return err,
         }
 
-        var total = try self.core.writeSnapshot(staging_root);
+        // Pin the primary MVCC/read-snapshot while the selected revision is
+        // fenced. Its corpus-sized serialization happens only after writers
+        // resume and therefore does not extend write unavailability.
+        var primary_snapshot = try self.core.pinNativeSnapshot();
+        defer primary_snapshot.deinit();
         if (comptime builtin.os.tag == .freestanding) {
             self.core.unlockApply();
             apply_held = false;
@@ -15654,6 +15664,12 @@ pub const DB = struct {
             structural.?.release();
             structural = null;
             capture.release();
+            const total = try primary_snapshot.materialize(
+                self.alloc,
+                io,
+                staging_root,
+                cancellation,
+            );
             try publishSnapshotStaging(io, snapshot_parent, staging_root, snapshot_root);
             published = true;
             return total;
@@ -15679,6 +15695,8 @@ pub const DB = struct {
                 .checkpoint_generation = checkpoint.generation,
                 .applied_sequence = checkpoint.applied_sequence,
                 .target_sequence = capture_target_sequence,
+                .artifact_format = "antfly-managed-index-tree",
+                .artifact_version = 1,
             };
         }
         std.mem.sort(native_backup.Projection, projections, {}, struct {
@@ -15687,9 +15705,23 @@ pub const DB = struct {
             }
         }.lessThan);
 
-        // The primary store, projection checkpoints, and index files now form
-        // one stable generation. Keep the admission/structural fences while
-        // copying it, but release the latency-sensitive apply lock first.
+        // Pin the exact generated-file generation while mutations remain
+        // excluded. This is metadata work only: corpus-sized reads happen
+        // after every capture fence has been released.
+        const generated_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-pin", .{staging_root});
+        defer self.alloc.free(generated_pin_root);
+        var generated_snapshot = try native_backup.pinGeneratedArtifacts(
+            self.alloc,
+            io,
+            self.core.path,
+            generated_pin_root,
+            cancellation,
+        );
+        defer generated_snapshot.deinit();
+
+        // The primary store and hardlink-pinned generated files now form one
+        // stable generation. Release the latency-sensitive apply lock first,
+        // then all mutation admission before reading corpus bytes.
         self.core.unlockApply();
         apply_held = false;
         if (builtin.is_test) {
@@ -15698,27 +15730,38 @@ pub const DB = struct {
             }
         }
 
-        total = std.math.add(u64, total, try native_backup.stageGeneratedArtifactsWithCancellation(
-            self.alloc,
-            io,
-            self.core.path,
-            staging_root,
-            cancellation,
-        )) catch return error.FileTooBig;
         replay_capture.?.release();
         replay_capture = null;
         structural.?.release();
         structural = null;
         capture.release();
 
-        // The staged tree is immutable now. Expensive hashing and manifest
-        // encoding stay off both the apply lock and mutation-admission path.
-        total = std.math.add(u64, total, try native_backup.finalizeCaptureWithCancellation(
+        // Both primary and generated artifacts remain pinned. Expensive file
+        // copies, primary serialization, hashing, and manifest encoding stay
+        // off both the apply lock and mutation-admission paths.
+        if (builtin.is_test) {
+            if (test_snapshot_fence_hook) |hook| {
+                if (hook.before_artifact_materialize) |run| run(hook.ptr);
+            }
+        }
+        var total = try generated_snapshot.materialize(staging_root, cancellation);
+        total = std.math.add(u64, total, try primary_snapshot.materialize(
+            self.alloc,
+            io,
+            staging_root,
+            cancellation,
+        )) catch return error.FileTooBig;
+        total = std.math.add(u64, total, try native_backup.finalizeCaptureGenerationWithCancellation(
             self.alloc,
             io,
             staging_root,
             capture_target_sequence,
             projections,
+            .{
+                .artifact_format = primary_snapshot.artifactFormat(),
+                .artifact_version = primary_snapshot.artifactVersion(),
+                .source_backend = @tagName(self.primary_backend),
+            },
             cancellation,
         )) catch return error.FileTooBig;
         try ensureSnapshotActive(cancellation);
@@ -15746,7 +15789,10 @@ pub const DB = struct {
         opts: OpenOptions,
         restore_identity: ?RestoreIdentity,
         restore_io: ?Io,
+        cancellation: types.CancellationToken,
+        native_manifest: ?*const native_backup.Manifest,
     ) !void {
+        try cancellation.check();
         const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.io() else null;
         if (restore_identity) |identity| {
             if (shared_io) |io|
@@ -15754,6 +15800,15 @@ pub const DB = struct {
             else
                 try beginRestoreImport(alloc, path, snapshot_root, identity);
         }
+        const physical_primary = if (native_manifest) |manifest|
+            std.mem.eql(u8, manifest.primary.artifact_format, "antfly-lsm-checkpoint")
+        else
+            false;
+        if (physical_primary) switch (opts.primary_backend) {
+            .lsm => {},
+            else => return error.UnsupportedBackupFormat,
+        };
+
         var opened_primary = try openPrimaryStore(alloc, path, .{
             .map_size = opts.map_size,
             .no_sync = opts.no_sync,
@@ -15767,11 +15822,22 @@ pub const DB = struct {
             opened_primary.owner.close(alloc);
         }
 
-        try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
-        try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
+        const streaming_store = if (physical_primary)
+            true
+        else blk: {
+            try db_core.clearAllKeysFromStore(alloc, &opened_primary.store);
+            break :blk if (shared_io) |io|
+                try db_core.importStoreSnapshotWithIo(alloc, io, &opened_primary.store, snapshot_root, cancellation)
+            else fallback: {
+                try db_core.importStoreSnapshot(alloc, &opened_primary.store, snapshot_root);
+                break :fallback false;
+            };
+        };
+        try cancellation.check();
         try doc_identity.validateStoreAlloc(alloc, &opened_primary.store);
         try validateRestoredIdentityNamespace(&opened_primary.store, opts);
-        try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
+        if (!streaming_store)
+            try db_core.importChangeJournalSnapshot(alloc, &opened_primary.store, snapshot_root);
         // The candidate root owns its identity. Creating it while the staged
         // capability is still held makes identity part of the durable tree
         // that is sealed and atomically published, rather than an open-time
@@ -15814,7 +15880,7 @@ pub const DB = struct {
     }
 
     fn restoreSnapshotTo(alloc: Allocator, snapshot_root: []const u8, path: []const u8, opts: OpenOptions) !void {
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, null, .none, null);
         // Graph reverse indexes are derived from stored outgoing edge keys, so
         // restore them after the logical store and derived log are rehydrated.
         var restored = try DB.open(alloc, path, opts);
@@ -15847,11 +15913,33 @@ pub const DB = struct {
         identity: RestoreIdentity,
     ) !void {
         try staged_generation.validatePath(path);
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, null);
-        if (comptime builtin.os.tag == .freestanding) return;
+        if (comptime builtin.os.tag == .freestanding) {
+            try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, null, .none, null);
+            return;
+        }
         var io_impl = threadedIo();
         defer io_impl.deinit();
-        _ = try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io_impl.io(), snapshot_root, path, opts, true);
+        const io = io_impl.io();
+        var native_generation = try native_backup.validateAndMaterializeWithCancellation(
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            .none,
+        );
+        defer if (native_generation) |*generation| generation.deinit();
+        try restoreSnapshotStoreTo(
+            alloc,
+            snapshot_root,
+            path,
+            opts,
+            identity,
+            io,
+            .none,
+            if (native_generation) |*generation| generation.value() else null,
+        );
+        if (native_generation) |*generation|
+            try validateInstalledNativeBackupGeneration(staged_generation, alloc, io, path, opts, generation, true);
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepairWithIo(
@@ -15863,9 +15951,49 @@ pub const DB = struct {
         opts: OpenOptions,
         identity: RestoreIdentity,
     ) !void {
+        return try restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            opts,
+            identity,
+            .none,
+        );
+    }
+
+    pub fn restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+        cancellation: types.CancellationToken,
+    ) !void {
         try staged_generation.validatePath(path);
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io);
-        _ = try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io, snapshot_root, path, opts, true);
+        var native_generation = try native_backup.validateAndMaterializeWithCancellation(
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            cancellation,
+        );
+        defer if (native_generation) |*generation| generation.deinit();
+        try restoreSnapshotStoreTo(
+            alloc,
+            snapshot_root,
+            path,
+            opts,
+            identity,
+            io,
+            cancellation,
+            if (native_generation) |*generation| generation.value() else null,
+        );
+        if (native_generation) |*generation|
+            try validateInstalledNativeBackupGeneration(staged_generation, alloc, io, path, opts, generation, true);
     }
 
     /// Local bound databases do not have a non-zero Raft group identity. Return
@@ -15879,23 +16007,61 @@ pub const DB = struct {
         path: []const u8,
         opts: OpenOptions,
     ) !bool {
-        try staged_generation.validatePath(path);
-        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, io);
-        return try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io, snapshot_root, path, opts, false);
+        return try restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            opts,
+            .none,
+        );
     }
 
-    fn restoreNativeBackupGenerationIfPresent(
+    pub fn restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(
         staged_generation: *const generation_lifecycle.StagedGeneration,
         alloc: Allocator,
         io: Io,
         snapshot_root: []const u8,
         path: []const u8,
         opts: OpenOptions,
-        complete_runtime_repair: bool,
+        cancellation: types.CancellationToken,
     ) !bool {
-        var native_generation = (try native_backup.validateAndMaterialize(alloc, io, snapshot_root, path)) orelse return false;
-        defer native_generation.deinit();
+        try staged_generation.validatePath(path);
+        var native_generation = try native_backup.validateAndMaterializeWithCancellation(
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            cancellation,
+        );
+        defer if (native_generation) |*generation| generation.deinit();
+        try restoreSnapshotStoreTo(
+            alloc,
+            snapshot_root,
+            path,
+            opts,
+            null,
+            io,
+            cancellation,
+            if (native_generation) |*generation| generation.value() else null,
+        );
+        if (native_generation) |*generation| {
+            try validateInstalledNativeBackupGeneration(staged_generation, alloc, io, path, opts, generation, false);
+            return true;
+        }
+        return false;
+    }
 
+    fn validateInstalledNativeBackupGeneration(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        opts: OpenOptions,
+        native_generation: *native_backup.LoadedManifest,
+        complete_runtime_repair: bool,
+    ) !void {
         // Repair identities are replica-local capabilities. The checkpoint is
         // part of the checksummed generation so pending debt cannot disappear,
         // but a quiesced fast-path snapshot is required to carry no entries.
@@ -15931,7 +16097,6 @@ pub const DB = struct {
         try restored.validateNativeBackupGeneration(alloc, native_generation.value());
         if (complete_runtime_repair)
             try markRestoreRuntimeRepairCompleteWithIo(alloc, io, path);
-        return true;
     }
 
     fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, manifest: *const native_backup.Manifest) !void {
@@ -16042,7 +16207,7 @@ pub const DB = struct {
             .group_id = identity_state.group_id,
         };
         std.log.warn("recovering incomplete restore import phase=startup", .{});
-        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io);
+        try restoreSnapshotStoreTo(alloc, import_state.snapshot_root, path, opts, identity, io, .none, null);
         return true;
     }
 
@@ -92214,7 +92379,10 @@ test "db native snapshot exports self-contained generation" {
     try std.testing.expect(snapshot_size > 0);
     try std.testing.expectError(error.SnapshotAlreadyExists, db.snapshotNative("snap1"));
 
-    const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/store.bin", .{std.mem.span(path)});
+    const store_snapshot_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/{s}/manifest.bin", .{
+        std.mem.span(path),
+        db_core.primary_lsm_checkpoint_directory_name,
+    });
     defer alloc.free(store_snapshot_path);
     defer {
         var snapshots_buf: [512]u8 = undefined;
@@ -92230,6 +92398,18 @@ test "db native snapshot exports self-contained generation" {
     const generation_manifest_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/{s}", .{ std.mem.span(path), native_backup.manifest_file_name });
     defer alloc.free(generation_manifest_path);
     try std.Io.Dir.accessAbsolute(io_impl.io(), generation_manifest_path, .{});
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(
+        io_impl.io(),
+        generation_manifest_path,
+        alloc,
+        .limited(1024 * 1024),
+    );
+    defer alloc.free(manifest_raw);
+    var parsed_manifest = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
+    defer parsed_manifest.deinit();
+    try std.testing.expectEqual(@as(u32, 2), parsed_manifest.value.format_version);
+    try std.testing.expectEqualStrings("antfly-lsm-checkpoint", parsed_manifest.value.primary.artifact_format);
+    try std.testing.expectEqual(@as(u32, 1), parsed_manifest.value.primary.artifact_version);
 }
 
 test "db native snapshot admission bounds capture under concurrent writes" {
@@ -92267,6 +92447,8 @@ test "db native snapshot admission bounds capture under concurrent writes" {
         apply_released: std.atomic.Value(bool) = .init(false),
         copy_entered: std.atomic.Value(bool) = .init(false),
         release_copy: std.atomic.Value(bool) = .init(false),
+        materialize_entered: std.atomic.Value(bool) = .init(false),
+        release_materialize: std.atomic.Value(bool) = .init(false),
 
         fn afterCaptureAdmission(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -92282,6 +92464,12 @@ test "db native snapshot admission bounds capture under concurrent writes" {
             }
             self.copy_entered.store(true, .release);
             while (!self.release_copy.load(.acquire)) std.atomic.spinLoopHint();
+        }
+
+        fn beforeArtifactMaterialize(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.materialize_entered.store(true, .release);
+            while (!self.release_materialize.load(.acquire)) std.atomic.spinLoopHint();
         }
     };
     const SnapshotWorker = struct {
@@ -92334,6 +92522,7 @@ test "db native snapshot admission bounds capture under concurrent writes" {
         .ptr = &fence,
         .after_capture_admission = Fence.afterCaptureAdmission,
         .after_apply_release = Fence.afterApplyRelease,
+        .before_artifact_materialize = Fence.beforeArtifactMaterialize,
     };
     defer DB.test_snapshot_fence_hook = null;
     var worker = SnapshotWorker{ .db = &db };
@@ -92357,20 +92546,33 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     fence.release.store(true, .release);
     while (!fence.copy_entered.load(.acquire)) std.atomic.spinLoopHint();
 
-    // Releasing apply keeps foreground latency bounded, but physical index
-    // maintenance remains excluded until every generated artifact is staged.
+    // Apply release alone is not the publication boundary: the short metadata
+    // pin still excludes physical index maintenance.
     var maintenance = Maintenance{ .db = &db };
     const maintenance_thread = try std.Thread.spawn(.{}, Maintenance.run, .{&maintenance});
     while (!maintenance.started.load(.acquire)) std.atomic.spinLoopHint();
     for (0..1024) |_| std.Thread.yield() catch {};
     try std.testing.expect(!maintenance.done.load(.acquire));
     fence.release_copy.store(true, .release);
+    while (!fence.materialize_entered.load(.acquire)) std.atomic.spinLoopHint();
+    // Every corpus-sized generated and primary read is outside both mutation
+    // fences. Foreground writes and index maintenance must finish even while
+    // artifact materialization is deliberately held.
+    for (0..100_000) |_| {
+        if (writer.done.load(.acquire) and maintenance.done.load(.acquire)) break;
+        std.Thread.yield() catch {};
+    }
+    const writer_finished_outside_fence = writer.done.load(.acquire);
+    const maintenance_finished_outside_fence = maintenance.done.load(.acquire);
+    fence.release_materialize.store(true, .release);
     snapshot_thread.join();
     maintenance_thread.join();
     writer_thread.join();
     if (worker.err) |err| return err;
     if (maintenance.err) |err| return err;
     if (writer.err) |err| return err;
+    try std.testing.expect(writer_finished_outside_fence);
+    try std.testing.expect(maintenance_finished_outside_fence);
     try std.testing.expect(writer.done.load(.acquire));
     try std.testing.expect(fence.apply_released.load(.acquire));
 

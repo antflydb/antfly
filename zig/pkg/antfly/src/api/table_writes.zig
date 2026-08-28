@@ -61,6 +61,27 @@ const public_table_http = @import("public_table_http.zig");
 const runtime_status = @import("runtime_status.zig");
 const stored_destination_authorization = @import("stored_destination_authorization.zig");
 
+fn nativeSnapshotAttemptTokenAlloc(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    backup_id: []const u8,
+    shard_label: []const u8,
+) ![]u8 {
+    var entropy: [16]u8 = undefined;
+    try io.randomSecure(&entropy);
+    const nonce = std.fmt.bytesToHex(entropy, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}-{s}-attempt-{s}", .{ backup_id, shard_label, &nonce });
+}
+
+test "native backup local attempt tokens are retry unique" {
+    const first = try nativeSnapshotAttemptTokenAlloc(std.testing.allocator, std.testing.io, "backup", "g7");
+    defer std.testing.allocator.free(first);
+    const second = try nativeSnapshotAttemptTokenAlloc(std.testing.allocator, std.testing.io, "backup", "g7");
+    defer std.testing.allocator.free(second);
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+    try std.testing.expect(std.mem.startsWith(u8, first, "backup-g7-attempt-"));
+}
+
 pub const LsmOwnerMetricStats = struct {
     table_name: []u8,
     group_id: u64,
@@ -5097,17 +5118,17 @@ pub const BoundTableWriteSource = struct {
             return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
         }
 
-        const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
+        const snapshot_io = plan.io orelse db.backend_runtime.io() orelse
+            return error.BackendRuntimeIoUnavailable;
+        const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, "local");
         defer alloc.free(snapshot_token);
         _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
         defer alloc.free(snapshot_root);
-        defer ProvisionedTableWriteSource.deleteLocalNativeSnapshot(plan.io, snapshot_root);
+        defer ProvisionedTableWriteSource.deleteLocalNativeSnapshot(snapshot_io, snapshot_root);
         const dest_root = try backups_api.shardSnapshotPath(alloc, plan.backup_root, plan.backup_id, 0);
         defer alloc.free(dest_root);
-        try backups_api.copyDirectoryRecursiveUsingIo(alloc, plan.io, snapshot_root, dest_root);
-
         const rel_path = try backups_api.shardSnapshotRelPath(alloc, plan.backup_id, 0);
         errdefer alloc.free(rel_path);
         const byte_range = db.getRange();
@@ -5119,7 +5140,16 @@ pub const BoundTableWriteSource = struct {
             .snapshot_path = rel_path,
         };
         errdefer shards[0].deinit(alloc);
-        try backups_api.populateShardArtifactIntegrity(alloc, plan.io, .native, dest_root, &shards[0]);
+        var integrity = try backups_api.copyNativeDirectoryWithIntegrityUsingIo(
+            alloc,
+            snapshot_io,
+            snapshot_root,
+            dest_root,
+            plan.cancellation,
+        );
+        shards[0].artifact_size_bytes = integrity.size_bytes;
+        shards[0].artifact_sha256 = integrity.sha256;
+        integrity = undefined;
         return shards;
     }
 
@@ -5139,12 +5169,13 @@ pub const BoundTableWriteSource = struct {
         const shard = &plan.manifest.shards[0];
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, shard.snapshot_path });
         defer alloc.free(snapshot_root);
-        try backups_api.verifyShardArtifactIntegrity(
+        try backups_api.verifyShardArtifactIntegrityWithCancellation(
             alloc,
             plan.io,
             plan.manifest.format,
             snapshot_root,
             shard,
+            plan.cancellation,
         );
 
         const db_path = try alloc.dupe(u8, db.core.path);
@@ -5234,13 +5265,14 @@ pub const BoundTableWriteSource = struct {
                 try restored.syncIndexes(true);
             },
             .native => {
-                const restored_native_generation = try db_mod.DB.restoreSnapshotToLocalDeferredRuntimeRepairWithIo(
+                const restored_native_generation = try db_mod.DB.restoreSnapshotToLocalDeferredRuntimeRepairWithIoAndCancellation(
                     &staged,
                     alloc,
                     restore_io,
                     snapshot_root,
                     staged.path(),
                     open_options,
+                    plan.cancellation,
                 );
                 if (!restored_native_generation) {
                     // Legacy native backups contain only the primary store.
@@ -15370,7 +15402,8 @@ pub const ProvisionedTableWriteSource = struct {
     const NativeBackupShardSnapshot = struct {
         snapshot_root: []const u8,
         dest_root: []const u8,
-        io: ?std.Io,
+        io: std.Io,
+        cancellation: db_mod.types.CancellationToken,
         shard: backups_api.ShardSnapshot,
         owns_shard: bool = true,
 
@@ -15413,7 +15446,11 @@ pub const ProvisionedTableWriteSource = struct {
     ) !NativeBackupShardSnapshot {
         std.debug.assert(plan.format == .native);
 
-        const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ plan.backup_id, group_id });
+        const snapshot_io = plan.io orelse db.backend_runtime.io() orelse
+            return error.BackendRuntimeIoUnavailable;
+        const group_label = try std.fmt.allocPrint(alloc, "g{d}", .{group_id});
+        defer alloc.free(group_label);
+        const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, group_label);
         defer alloc.free(snapshot_token);
         _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
@@ -15433,7 +15470,8 @@ pub const ProvisionedTableWriteSource = struct {
         return .{
             .snapshot_root = snapshot_root,
             .dest_root = dest_root,
-            .io = plan.io,
+            .io = snapshot_io,
+            .cancellation = plan.cancellation,
             .shard = .{
                 .group_id = group_id,
                 .start_key = start_key,
@@ -15448,19 +15486,16 @@ pub const ProvisionedTableWriteSource = struct {
         native_snapshot: *NativeBackupShardSnapshot,
     ) ![]backups_api.ShardSnapshot {
         runTestBeforeNativeBackupCopyHook();
-        try backups_api.copyDirectoryRecursiveUsingIo(
+        var integrity = try backups_api.copyNativeDirectoryWithIntegrityUsingIo(
             alloc,
             native_snapshot.io,
             native_snapshot.snapshot_root,
             native_snapshot.dest_root,
+            native_snapshot.cancellation,
         );
-        try backups_api.populateShardArtifactIntegrity(
-            alloc,
-            native_snapshot.io,
-            .native,
-            native_snapshot.dest_root,
-            &native_snapshot.shard,
-        );
+        native_snapshot.shard.artifact_size_bytes = integrity.size_bytes;
+        native_snapshot.shard.artifact_sha256 = integrity.sha256;
+        integrity = undefined;
         return try native_snapshot.toShardsAlloc(alloc);
     }
 
@@ -15501,6 +15536,7 @@ pub const ProvisionedTableWriteSource = struct {
             .expected_artifact_sha256 = source_shard.artifact_sha256,
             .manifest = plan.manifest,
             .io = restore_io,
+            .cancellation = plan.cancellation,
         };
 
         var all_groups_already_admitted = true;

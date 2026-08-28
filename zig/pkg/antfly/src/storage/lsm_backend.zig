@@ -37,6 +37,8 @@ const wal_mod = @import("lsm_backend/wal.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
+const fs_paths = @import("../common/fs_paths.zig");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;
@@ -207,6 +209,45 @@ const RunSnapshotRefRegistry = struct {
 };
 
 var run_snapshot_refs = RunSnapshotRefRegistry{};
+
+fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8) !u64 {
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var writer_buffer: [16 * 1024]u8 = undefined;
+    var writer = file.writer(io, &writer_buffer);
+    try writer.interface.writeAll(bytes);
+    try writer.end();
+    try file.sync(io);
+    return @intCast(bytes.len);
+}
+
+fn copyCheckpointStorageFile(
+    allocator: Allocator,
+    storage: storage_io.Storage,
+    io: std.Io,
+    source: []const u8,
+    destination: []const u8,
+    cancellation: CancellationToken,
+) !u64 {
+    if (std.fs.path.dirname(destination)) |parent| try fs_paths.createDirPathPortable(io, parent);
+    const size = try storage.fileSize(source);
+    var file = try fs_paths.createFilePortable(io, destination, .{ .truncate = true });
+    defer file.close(io);
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        try cancellation.check();
+        const len: usize = @intCast(@min(size - offset, buffer.len));
+        try storage.readFileRangeInto(allocator, source, offset, buffer[0..len]);
+        try file.writePositionalAll(io, buffer[0..len], offset);
+        offset += len;
+    }
+    try cancellation.check();
+    if (try storage.fileSize(source) != size) return error.SourceFileChanged;
+    try file.sync(io);
+    return size;
+}
 
 pub const MutableSnapshotReason = background_runtime_mod.LsmMutableSnapshotReason;
 
@@ -1733,6 +1774,109 @@ pub const Backend = struct {
         }
         try self.finalizeDeferredStorageWorkLocked();
         return .{};
+    }
+
+    pub const NativeCheckpoint = struct {
+        allocator: Allocator,
+        storage: storage_io.Storage,
+        manifest_bytes: []u8,
+        run_ids: []u64,
+        run_paths: [][]u8,
+
+        pub fn deinit(self: *NativeCheckpoint) void {
+            for (self.run_paths) |path| {
+                run_snapshot_refs.release(path);
+                self.allocator.free(path);
+            }
+            self.allocator.free(self.run_paths);
+            self.allocator.free(self.run_ids);
+            self.allocator.free(self.manifest_bytes);
+            self.* = undefined;
+        }
+
+        pub fn materialize(
+            self: *const NativeCheckpoint,
+            io: std.Io,
+            destination_root: []const u8,
+            cancellation: CancellationToken,
+        ) !u64 {
+            try cancellation.check();
+            try fs_paths.createDirPathPortable(io, destination_root);
+            const manifest_path = try std.fmt.allocPrint(self.allocator, "{s}/manifest.bin", .{destination_root});
+            defer self.allocator.free(manifest_path);
+            var total = try writeCheckpointBytes(io, manifest_path, self.manifest_bytes);
+            for (self.run_paths, self.run_ids) |source, run_id| {
+                try cancellation.check();
+                const destination = try std.fmt.allocPrint(self.allocator, "{s}/runs/{d}.tbl", .{ destination_root, run_id });
+                defer self.allocator.free(destination);
+                total = std.math.add(
+                    u64,
+                    total,
+                    try copyCheckpointStorageFile(
+                        self.allocator,
+                        self.storage,
+                        io,
+                        source,
+                        destination,
+                        cancellation,
+                    ),
+                ) catch return error.FileTooBig;
+            }
+            if (self.run_paths.len > 0) {
+                const runs_directory = try std.fmt.allocPrint(self.allocator, "{s}/runs", .{destination_root});
+                defer self.allocator.free(runs_directory);
+                try fs_paths.syncDirPortable(io, runs_directory);
+            }
+            try fs_paths.syncDirPortable(io, destination_root);
+            return total;
+        }
+    };
+
+    /// Pins a fully manifested immutable LSM generation. Mutable state is
+    /// flushed while the caller owns the DB revision fence; copying run bytes
+    /// happens later and obsolete-file reclamation observes the snapshot refs.
+    pub fn pinNativeCheckpoint(self: *Backend) !NativeCheckpoint {
+        const root_dir = self.root_dir orelse return error.Unsupported;
+        const storage = self.storage orelse return error.Unsupported;
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+
+        try self.flushMutable();
+        if (self.manifest_dirty or self.obsolete_manifest_dirty or self.manifest_backing == null) {
+            try self.writeManifestSnapshotLocked(root_dir, self.writeStatsNowNs());
+        }
+        const manifest_path = try repository_mod.manifestPath(self.allocator, root_dir);
+        defer self.allocator.free(manifest_path);
+        const manifest_bytes = try storage.readFileAlloc(self.allocator, manifest_path, 64 * 1024 * 1024);
+        errdefer self.allocator.free(manifest_bytes);
+        const run_ids = try self.allocator.alloc(u64, self.runs.items.len);
+        errdefer self.allocator.free(run_ids);
+        const run_paths = try self.allocator.alloc([]u8, self.runs.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (run_paths[0..initialized]) |path| {
+                run_snapshot_refs.release(path);
+                self.allocator.free(path);
+            }
+            self.allocator.free(run_paths);
+        }
+        for (self.runs.items, 0..) |run, index| {
+            const source = run.path orelse return error.InvalidTableFile;
+            const owned = try self.allocator.dupe(u8, source);
+            errdefer self.allocator.free(owned);
+            try run_snapshot_refs.retain(owned);
+            run_ids[index] = run.id;
+            run_paths[index] = owned;
+            initialized += 1;
+        }
+        return .{
+            .allocator = self.allocator,
+            .storage = storage,
+            .manifest_bytes = manifest_bytes,
+            .run_ids = run_ids,
+            .run_paths = run_paths,
+        };
     }
 
     pub fn commitProvidesDurability(self: *const Backend) bool {
