@@ -145,17 +145,7 @@ pub fn extractIndexConfigJsonWithOptions(
     var first = true;
     var it = value.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "type") or
-            std.mem.eql(u8, entry.key_ptr.*, "name") or
-            std.mem.eql(u8, entry.key_ptr.*, "description") or
-            std.mem.eql(u8, entry.key_ptr.*, "validation") or
-            std.mem.eql(u8, entry.key_ptr.*, "enrichments") or
-            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.incarnation_field) or
-            std.mem.eql(u8, entry.key_ptr.*, coverage_policy_mod.legacy_coverage_incarnation_field))
-        {
-            continue;
-        }
-        if (std.mem.eql(u8, entry.key_ptr.*, "version") and kind != .algebraic) continue;
+        if (isCatalogMetadataField(kind, entry.key_ptr.*)) continue;
         if (!first) try out.append(alloc, ',');
         first = false;
         try appendJsonString(alloc, &out, entry.key_ptr.*);
@@ -166,6 +156,24 @@ pub fn extractIndexConfigJsonWithOptions(
     }
     try out.append(alloc, '}');
     return try out.toOwnedSlice(alloc);
+}
+
+/// Fields owned by the table/catalog API rather than an index runtime. Keep
+/// this boundary centralized: leaking private lifecycle metadata into strict
+/// runtime parsers changes config hashes and can strand an index incarnation.
+pub fn isCatalogMetadataField(kind: db_types.IndexKind, field: []const u8) bool {
+    if (std.mem.eql(u8, field, "type") or
+        std.mem.eql(u8, field, "name") or
+        std.mem.eql(u8, field, "description") or
+        std.mem.eql(u8, field, "validation") or
+        std.mem.eql(u8, field, "enrichments") or
+        std.mem.eql(u8, field, "derive_from_schema") or
+        std.mem.eql(u8, field, coverage_policy_mod.incarnation_field) or
+        std.mem.eql(u8, field, coverage_policy_mod.legacy_coverage_incarnation_field))
+    {
+        return true;
+    }
+    return kind != .algebraic and std.mem.eql(u8, field, "version");
 }
 
 pub fn normalizeManagedEmbeddingIndexDimensionJsonWithOptions(
@@ -220,6 +228,32 @@ pub fn appendJsonString(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u
     const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
     defer alloc.free(escaped);
     try out.appendSlice(alloc, escaped);
+}
+
+test "runtime index config strips catalog-only lifecycle metadata" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        name: []const u8,
+        input: []const u8,
+        retained: []const u8,
+    }{
+        .{ .name = "text", .input = "{\"type\":\"full_text\",\"field\":\"body\",\"_index_incarnation\":17}", .retained = "field" },
+        .{ .name = "graph", .input = "{\"type\":\"graph\",\"edge_types\":[],\"_coverage_incarnation\":18}", .retained = "edge_types" },
+        .{ .name = "algebraic", .input = "{\"type\":\"algebraic\",\"version\":1,\"derive_from_schema\":true,\"materializations\":[],\"_index_incarnation\":19}", .retained = "version" },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, case.input, .{});
+        defer parsed.deinit();
+        const runtime_json = try extractIndexConfigJson(alloc, case.name, parsed.value);
+        defer alloc.free(runtime_json);
+        var runtime = try std.json.parseFromSlice(std.json.Value, alloc, runtime_json, .{});
+        defer runtime.deinit();
+        try std.testing.expect(runtime.value.object.get(case.retained) != null);
+        try std.testing.expect(runtime.value.object.get("type") == null);
+        try std.testing.expect(runtime.value.object.get("derive_from_schema") == null);
+        try std.testing.expect(runtime.value.object.get("_index_incarnation") == null);
+        try std.testing.expect(runtime.value.object.get("_coverage_incarnation") == null);
+    }
 }
 
 test "graph index validation runs the runtime parser before catalog admission" {

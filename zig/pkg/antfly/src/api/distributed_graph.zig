@@ -697,13 +697,8 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
 
     for (req.graph_queries) |graph_query| {
         // Incoming projections are partitioned with their source-owned edge.
-        // Neighbors/traverse can therefore fan out one frontier across source
-        // owners. The path and pattern executors still assume key routing, so
-        // reject their incoming variants instead of returning partial results.
-        if (graph_query.query.params.direction != .out) switch (graph_query.query.query_type) {
-            .neighbors, .traverse => {},
-            else => return false,
-        };
+        // Both traversal and edge-reader plans use exact batched reverse-index
+        // probes before fetching from positive source shards.
         if (!graph_query.query.params.deduplicate) return false;
         if (!supportsSelectorRef(req, graph_query.query.start_nodes)) return false;
         if (graph_query.query.target_nodes) |target_nodes| {
@@ -1401,14 +1396,70 @@ const DistributedEdgeReader = struct {
         const table_name = table orelse self.source_table;
         const table_state = try self.admission.ensureTable(table_name);
         if (!table_state.allowed) return try a.alloc(graph_mod.Edge, 0);
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(
+        const owner_group_id = (try table_catalog.resolveGroupForKeyPinned(
             a,
             self.catalog,
             table_name,
             key,
             table_state.topology_epoch,
         )) orelse return error.TableNotFound;
+        if (direction == .out) {
+            return try self.getEdgesFromGroup(a, table_state, owner_group_id, key, edge_types, .out);
+        }
 
+        try table_catalog.validateTopologyEpoch(a, self.catalog, table_name, table_state.topology_epoch);
+        const group_ids = try table_catalog.resolveGroupsForSpan(a, self.catalog, table_name, "", "");
+        defer if (group_ids.len > 0) a.free(group_ids);
+        try table_catalog.validateTopologyEpoch(a, self.catalog, table_name, table_state.topology_epoch);
+        if (group_ids.len == 0) return error.TableNotFound;
+
+        var positive = GraphExpandBatches.empty;
+        defer freeFrontierBatches(a, &positive);
+        try appendIncomingProbeBatches(
+            a,
+            self.worker,
+            &positive,
+            table_state,
+            group_ids,
+            &.{0},
+            &.{key},
+            self.index_name,
+            self.consistency,
+        );
+
+        var edges = std.ArrayListUnmanaged(graph_mod.Edge).empty;
+        errdefer {
+            for (edges.items) |edge| graph_mod.GraphIndex.freeEdge(a, edge);
+            edges.deinit(a);
+        }
+        // Iterate in range order for deterministic path and pattern planning.
+        // The target owner is always included for `.both` to read outgoing
+        // adjacency; all other groups are included only after a positive probe.
+        for (group_ids) |group_id| {
+            const has_incoming = positive.contains(.{
+                .table_name = table_state.table_name,
+                .group_id = group_id,
+            });
+            const is_owner = group_id == owner_group_id;
+            if (!has_incoming and !(direction == .both and is_owner)) continue;
+            const group_direction: graph_mod.EdgeDirection = if (direction == .both and is_owner) .both else .in;
+            const group_edges = try self.getEdgesFromGroup(a, table_state, group_id, key, edge_types, group_direction);
+            errdefer graph_mod.GraphIndex.freeEdges(a, group_edges);
+            try edges.appendSlice(a, group_edges);
+            if (group_edges.len > 0) a.free(group_edges);
+        }
+        return try edges.toOwnedSlice(a);
+    }
+
+    fn getEdgesFromGroup(
+        self: @This(),
+        a: std.mem.Allocator,
+        table_state: *const GraphAdmissionTableState,
+        group_id: u64,
+        key: []const u8,
+        edge_types: []const []const u8,
+        direction: graph_mod.EdgeDirection,
+    ) ![]graph_mod.Edge {
         const index_name = try a.dupe(u8, self.index_name);
         errdefer a.free(index_name);
         const owned_key = try a.dupe(u8, key);
@@ -1420,7 +1471,6 @@ const DistributedEdgeReader = struct {
         errdefer tensor_access_path.deinit(a);
         var tensor_program = try graphEdgesTensorProgramEnvelopeAlloc(a, self.index_name);
         errdefer tensor_program.deinit(a);
-
         var req = GraphEdgesRequest{
             .index_name = index_name,
             .key = owned_key,
@@ -1432,10 +1482,7 @@ const DistributedEdgeReader = struct {
             .identity_read_generation = try table_state.generationForGroup(group_id),
         };
         defer req.deinit(a);
-
-        var resp = try self.worker.executeGraphGetEdges(a, group_id, table_name, req, self.consistency);
-
-        // Transfer ownership of edges to caller — don't free them in response deinit.
+        var resp = try self.worker.executeGraphGetEdges(a, group_id, table_state.table_name, req, self.consistency);
         const edges = resp.edges;
         resp.edges = @constCast((&[_]graph_mod.Edge{})[0..]);
         resp.deinit(a);
@@ -1693,10 +1740,13 @@ fn executeDistributedTraverse(
         var batches = try batchFrontierByGroup(
             alloc,
             catalog,
+            worker,
             table_name,
             frontier,
             effective_max_depth,
             graph_query.query.params.direction,
+            graph_query.query.index_name,
+            consistency,
             admission,
         );
         defer freeFrontierBatches(alloc, &batches);
@@ -2472,25 +2522,30 @@ fn appendFrontierBatch(
     {
         return error.InvalidQueryResult;
     }
-    try gop.value_ptr.frontier_ids.append(alloc, frontier_id);
+    if (std.mem.indexOfScalar(u32, gop.value_ptr.frontier_ids.items, frontier_id) == null) {
+        try gop.value_ptr.frontier_ids.append(alloc, frontier_id);
+    }
 }
 
 fn batchFrontierByGroup(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
+    worker: Worker,
     source_table: []const u8,
     frontier: []const FrontierState,
     max_depth: u32,
     direction: graph_mod.EdgeDirection,
+    index_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
     admission: *GraphNodeAdmissionContext,
 ) !GraphExpandBatches {
     var batches = GraphExpandBatches.empty;
     errdefer freeFrontierBatches(alloc, &batches);
-    var incoming_groups_by_table = std.StringHashMapUnmanaged([]u64).empty;
+    var incoming_frontier_by_table = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)).empty;
     defer {
-        var it = incoming_groups_by_table.valueIterator();
-        while (it.next()) |group_ids| if (group_ids.len > 0) alloc.free(group_ids.*);
-        incoming_groups_by_table.deinit(alloc);
+        var it = incoming_frontier_by_table.valueIterator();
+        while (it.next()) |ids| ids.deinit(alloc);
+        incoming_frontier_by_table.deinit(alloc);
     }
 
     for (frontier, 0..) |item, i| {
@@ -2510,26 +2565,284 @@ fn batchFrontierByGroup(
                 try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
             },
             .in, .both => {
-                // Reverse projections live with their source-owned outgoing
-                // edge, so a target may have incoming edges on any source
-                // shard. The existing fanout executor runs these batches in
-                // parallel and QueryState deduplicates converging nodes. Cache
-                // the range set once per table for the whole frontier quantum.
-                const gop = try incoming_groups_by_table.getOrPut(alloc, table_state.table_name);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = @constCast(&.{});
-                    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
-                    gop.value_ptr.* = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
-                    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
+                // Preserve the target-owner route for `.both` so outgoing
+                // adjacency is read even when that shard has no reverse row.
+                if (direction == .both) {
+                    const owner_group_id = (try table_catalog.resolveGroupForKeyPinned(
+                        alloc,
+                        catalog,
+                        table_name,
+                        item.key,
+                        table_state.topology_epoch,
+                    )) orelse return error.TableNotFound;
+                    try appendFrontierBatch(alloc, &batches, table_state, owner_group_id, @intCast(i));
                 }
-                if (gop.value_ptr.len == 0) return error.TableNotFound;
-                for (gop.value_ptr.*) |group_id| {
-                    try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
-                }
+                const gop = try incoming_frontier_by_table.getOrPut(alloc, table_state.table_name);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.append(alloc, @intCast(i));
             },
         }
     }
+
+    // Reverse rows remain colocated with their authoritative source-owned
+    // edge. First issue a compact, batched existence probe to each shard, then
+    // send full expansion requests only to positive shards. This avoids
+    // multiplying graph decoding, filtering, and response materialization by
+    // the table's shard count while retaining exact incoming-edge semantics.
+    var incoming_it = incoming_frontier_by_table.iterator();
+    while (incoming_it.next()) |entry| {
+        const table_name = entry.key_ptr.*;
+        const table_state = try admission.ensureTable(table_name);
+        try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
+        const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+        defer if (group_ids.len > 0) alloc.free(group_ids);
+        try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
+        if (group_ids.len == 0) return error.TableNotFound;
+
+        const frontier_ids = entry.value_ptr.items;
+        const keys = try alloc.alloc([]const u8, frontier_ids.len);
+        defer alloc.free(keys);
+        for (frontier_ids, 0..) |frontier_id, key_index| keys[key_index] = frontier[frontier_id].key;
+
+        try appendIncomingProbeBatches(
+            alloc,
+            worker,
+            &batches,
+            table_state,
+            group_ids,
+            frontier_ids,
+            keys,
+            index_name,
+            consistency,
+        );
+    }
     return batches;
+}
+
+fn appendIncomingProbeBatches(
+    alloc: std.mem.Allocator,
+    worker: Worker,
+    batches: *GraphExpandBatches,
+    table_state: *const GraphAdmissionTableState,
+    group_ids: []const u64,
+    frontier_ids: []const u32,
+    keys: []const []const u8,
+    index_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    if (frontier_ids.len != keys.len) return error.InvalidQueryResult;
+    const Entry = struct {
+        group_id: u64,
+        identity_read_generation: ?u64,
+    };
+    const entries = try alloc.alloc(Entry, group_ids.len);
+    defer alloc.free(entries);
+    for (group_ids, 0..) |group_id, i| {
+        entries[i] = .{
+            .group_id = group_id,
+            .identity_read_generation = try table_state.generationForGroup(group_id),
+        };
+    }
+
+    const Probe = struct {
+        fn run(
+            a: std.mem.Allocator,
+            worker_inner: Worker,
+            table_name_inner: []const u8,
+            topology_epoch_inner: u64,
+            index_name_inner: []const u8,
+            keys_inner: []const []const u8,
+            entry: Entry,
+            consistency_inner: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            var req = GraphHydrateRequest{
+                .keys = try dupKeys(a, keys_inner),
+                .topology_epoch = topology_epoch_inner,
+                .identity_read_generation = entry.identity_read_generation,
+                .include_stored = false,
+                .include_hits = false,
+                .incoming_index_name = index_name_inner,
+            };
+            defer req.deinit(a);
+            return try worker_inner.executeGraphHydrate(
+                a,
+                entry.group_id,
+                table_name_inner,
+                req,
+                consistency_inner,
+            );
+        }
+
+        fn appendPositive(
+            a: std.mem.Allocator,
+            output: *GraphExpandBatches,
+            state: *const GraphAdmissionTableState,
+            entry: Entry,
+            ids: []const u32,
+            mask: []const bool,
+        ) !void {
+            if (mask.len != ids.len) return error.InvalidGraphNodeAdmissionResult;
+            for (ids, mask) |frontier_id, has_incoming| {
+                if (has_incoming) try appendFrontierBatch(a, output, state, entry.group_id, frontier_id);
+            }
+        }
+    };
+
+    const fanout_io = worker.fanoutIo();
+    const plan = planGraphFanout(fanout_io != null, worker.fanoutWidthCap(), entries.len);
+    recordGraphFanoutPlan(.hydrate, plan);
+    if (fanout_io) |io| {
+        if (plan.parallel) {
+            const start_ns = platform_time.monotonicNs();
+            const slots = try alloc.alloc(GraphHydrateFanoutSlot, entries.len);
+            defer {
+                for (slots) |*slot| slot.deinit();
+                alloc.free(slots);
+            }
+            for (slots) |*slot| slot.* = .init();
+
+            const Fiber = struct {
+                fn run(
+                    worker_inner: Worker,
+                    slot: *GraphHydrateFanoutSlot,
+                    table_name_inner: []const u8,
+                    topology_epoch_inner: u64,
+                    index_name_inner: []const u8,
+                    keys_inner: []const []const u8,
+                    entry: Entry,
+                    consistency_inner: raft_mod.ReadConsistency,
+                ) void {
+                    slot.result = Probe.run(
+                        slot.arena.allocator(),
+                        worker_inner,
+                        table_name_inner,
+                        topology_epoch_inner,
+                        index_name_inner,
+                        keys_inner,
+                        entry,
+                        consistency_inner,
+                    ) catch |err| {
+                        slot.err = err;
+                        return;
+                    };
+                }
+            };
+
+            var start: usize = 0;
+            while (start < entries.len) : (start += plan.width) {
+                const end = @min(start + plan.width, entries.len);
+                var group: std.Io.Group = .init;
+                for (entries[start..end], start..end) |entry, i| {
+                    group.async(io, Fiber.run, .{
+                        worker,
+                        &slots[i],
+                        table_state.table_name,
+                        table_state.topology_epoch,
+                        index_name,
+                        keys,
+                        entry,
+                        consistency,
+                    });
+                }
+                group.await(io) catch {};
+            }
+            recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - start_ns));
+            for (slots) |slot| if (slot.err) |err| return err;
+            for (slots, entries) |slot, entry| {
+                try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, slot.result.?.has_incoming);
+            }
+            return;
+        }
+    }
+
+    for (entries) |entry| {
+        var response = try Probe.run(
+            alloc,
+            worker,
+            table_state.table_name,
+            table_state.topology_epoch,
+            index_name,
+            keys,
+            entry,
+            consistency,
+        );
+        defer response.deinit(alloc);
+        try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, response.has_incoming);
+    }
+}
+
+test "distributed graph incoming probe expands only positive source shards" {
+    const alloc = std.testing.allocator;
+    const TestState = struct { calls: usize = 0 };
+    const FakeWorker = struct {
+        fn iface(state: *TestState) Worker {
+            return .{ .ptr = state, .vtable = &.{
+                .execute_graph_expand = executeGraphExpand,
+                .execute_graph_hydrate = executeGraphHydrate,
+            } };
+        }
+
+        fn executeGraphExpand(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn executeGraphHydrate(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            group_id: u64,
+            _: []const u8,
+            req: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.calls += 1;
+            try std.testing.expectEqualStrings("graph_idx", req.incoming_index_name);
+            try std.testing.expectEqual(@as(usize, 2), req.keys.len);
+            const mask = try a.alloc(bool, 2);
+            const expected: [2]bool = switch (group_id) {
+                11 => .{ true, false },
+                22 => .{ false, true },
+                33 => .{ false, false },
+                else => return error.UnexpectedTestCall,
+            };
+            @memcpy(mask, &expected);
+            return .{ .has_incoming = mask };
+        }
+    };
+
+    var state = TestState{};
+    const table_state = GraphAdmissionTableState{
+        .table_name = @constCast("docs"),
+        .topology_epoch = 9,
+        .allowed = true,
+        .requires_admission = false,
+        .requires_hydration = false,
+    };
+    var batches = GraphExpandBatches.empty;
+    defer freeFrontierBatches(alloc, &batches);
+    try appendIncomingProbeBatches(
+        alloc,
+        FakeWorker.iface(&state),
+        &batches,
+        &table_state,
+        &.{ 11, 22, 33 },
+        &.{ 0, 1 },
+        &.{ "doc:a", "doc:z" },
+        "graph_idx",
+        .read_index,
+    );
+    try std.testing.expectEqual(@as(usize, 3), state.calls);
+    try std.testing.expectEqual(@as(usize, 2), batches.count());
+    try std.testing.expectEqualSlices(u32, &.{0}, batches.get(.{ .table_name = "docs", .group_id = 11 }).?.frontier_ids.items);
+    try std.testing.expectEqualSlices(u32, &.{1}, batches.get(.{ .table_name = "docs", .group_id = 22 }).?.frontier_ids.items);
+    try std.testing.expect(batches.get(.{ .table_name = "docs", .group_id = 33 }) == null);
 }
 
 fn freeFrontierBatches(
@@ -3074,8 +3387,10 @@ fn hydrateHitsForKeys(
     return try finalizeHydratedHits(alloc, &out, cross_group_hydrate);
 }
 
-/// Probe graph in-degree at the owner of each key. Keys are partitioned by a
-/// topology epoch and each shard receives one batched reverse-index request.
+/// Probe graph in-degree exactly across source-owned reverse projections.
+/// Every shard receives one compact key batch and the returned bitsets are
+/// OR-reduced. Full graph expansion uses the same probe to avoid decoding on
+/// shards with no matching reverse rows.
 pub fn probeIncomingEdgesForKeys(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
@@ -3092,51 +3407,29 @@ pub fn probeIncomingEdgesForKeys(
     @memset(result, false);
     if (keys.len == 0) return result;
 
-    const Batch = struct {
-        keys: std.ArrayListUnmanaged([]const u8) = .empty,
-        indexes: std.ArrayListUnmanaged(usize) = .empty,
+    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
+    const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+    defer if (group_ids.len > 0) alloc.free(group_ids);
+    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
+    if (group_ids.len == 0) return error.TableNotFound;
 
-        fn deinit(self: *@This(), a: std.mem.Allocator) void {
-            self.keys.deinit(a);
-            self.indexes.deinit(a);
-        }
-    };
-    var batches = std.AutoHashMapUnmanaged(u64, Batch).empty;
-    defer {
-        var it = batches.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(alloc);
-        batches.deinit(alloc);
-    }
-    for (keys, 0..) |key, key_index| {
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(
-            alloc,
-            catalog,
-            table_name,
-            key,
-            topology_epoch,
-        )) orelse return error.TableNotFound;
-        const batch = try batches.getOrPut(alloc, group_id);
-        if (!batch.found_existing) batch.value_ptr.* = .{};
-        try batch.value_ptr.keys.append(alloc, key);
-        try batch.value_ptr.indexes.append(alloc, key_index);
-    }
+    const indexes = try alloc.alloc(usize, keys.len);
+    defer alloc.free(indexes);
+    for (indexes, 0..) |*index, i| index.* = i;
 
     const Entry = struct {
         group_id: u64,
         keys: []const []const u8,
         indexes: []const usize,
     };
-    const entries = try alloc.alloc(Entry, batches.count());
+    const entries = try alloc.alloc(Entry, group_ids.len);
     defer alloc.free(entries);
-    var batch_it = batches.iterator();
-    var entry_index: usize = 0;
-    while (batch_it.next()) |entry| {
+    for (group_ids, 0..) |group_id, entry_index| {
         entries[entry_index] = .{
-            .group_id = entry.key_ptr.*,
-            .keys = entry.value_ptr.keys.items,
-            .indexes = entry.value_ptr.indexes.items,
+            .group_id = group_id,
+            .keys = keys,
+            .indexes = indexes,
         };
-        entry_index += 1;
     }
 
     const Probe = struct {
@@ -3171,7 +3464,7 @@ pub fn probeIncomingEdgesForKeys(
         fn copy(mask: []const bool, entry: Entry, output: []bool) !void {
             if (mask.len != entry.indexes.len) return error.InvalidGraphNodeAdmissionResult;
             for (entry.indexes, mask) |output_index, has_incoming| {
-                output[output_index] = has_incoming;
+                output[output_index] = output[output_index] or has_incoming;
             }
         }
     };
@@ -6933,13 +7226,10 @@ test "distributed graph edge reader carries identity generation" {
             .replication_sources_json = "[]",
             .placement_role = "data",
         }};
-        const ranges = [_]metadata_table_manager.RangeRecord{.{
-            .group_id = 11,
-            .table_id = 7,
-            .range_id = 11,
-            .start_key = "",
-            .end_key = null,
-        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{
+            .{ .group_id = 11, .table_id = 7, .range_id = 11, .start_key = "", .end_key = "doc:m" },
+            .{ .group_id = 22, .table_id = 7, .range_id = 22, .start_key = "doc:m", .end_key = null },
+        };
 
         fn iface() table_catalog.CatalogSource {
             return .{
@@ -6967,7 +7257,8 @@ test "distributed graph edge reader carries identity generation" {
     };
 
     const TestState = struct {
-        calls: u32 = 0,
+        edge_calls: u32 = 0,
+        probe_calls: u32 = 0,
     };
 
     const FakeWorker = struct {
@@ -6994,47 +7285,66 @@ test "distributed graph edge reader carries identity generation" {
         }
 
         fn executeGraphHydrate(
-            _: *anyopaque,
-            _: std.mem.Allocator,
-            _: u64,
+            ptr: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            group_id: u64,
             _: []const u8,
-            _: GraphHydrateRequest,
+            req: GraphHydrateRequest,
             _: raft_mod.ReadConsistency,
         ) !GraphHydrateResponse {
-            return error.UnsupportedQueryRequest;
+            const state: *TestState = @ptrCast(@alignCast(ptr));
+            state.probe_calls += 1;
+            try std.testing.expectEqualStrings("graph_idx", req.incoming_index_name);
+            const mask = try inner_alloc.alloc(bool, req.keys.len);
+            @memset(mask, group_id == 22);
+            return .{ .has_incoming = mask };
         }
 
         fn executeGraphGetEdges(
             ptr: *anyopaque,
-            _: std.mem.Allocator,
+            inner_alloc: std.mem.Allocator,
             group_id: u64,
             table_name: []const u8,
             req: GraphEdgesRequest,
             consistency: raft_mod.ReadConsistency,
         ) !GraphEdgesResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
-            state.calls += 1;
-            try std.testing.expectEqual(@as(u64, 11), group_id);
+            state.edge_calls += 1;
             try std.testing.expectEqualStrings("docs", table_name);
             try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
             try std.testing.expectEqualStrings("graph_idx", req.index_name);
             try std.testing.expectEqualStrings("doc:a", req.key);
             try std.testing.expectEqual(@as(usize, 1), req.edge_types.len);
             try std.testing.expectEqualStrings("links", req.edge_types[0]);
-            try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
-            try std.testing.expectEqual(@as(u64, 0), req.topology_epoch);
             try std.testing.expectEqual(@as(?u64, 12345), req.identity_read_generation);
-            return .{ .edges = @constCast((&[_]graph_mod.Edge{})[0..]) };
+            if (group_id == 11) {
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, req.direction);
+                return .{ .edges = @constCast((&[_]graph_mod.Edge{})[0..]) };
+            }
+            try std.testing.expectEqual(@as(u64, 22), group_id);
+            try std.testing.expectEqual(graph_mod.EdgeDirection.in, req.direction);
+            const result_edges = try inner_alloc.alloc(graph_mod.Edge, 1);
+            result_edges[0] = .{
+                .source = try inner_alloc.dupe(u8, "doc:z"),
+                .target = try inner_alloc.dupe(u8, "doc:a"),
+                .edge_type = try inner_alloc.dupe(u8, "links"),
+                .weight = 1,
+                .created_at = 0,
+                .updated_at = 0,
+                .metadata = "",
+            };
+            return .{ .edges = result_edges };
         }
     };
 
     var state = TestState{};
+    const topology_epoch = try table_catalog.topologyEpoch(alloc, FakeCatalog.iface(), "docs");
     var admission = GraphNodeAdmissionContext.init(
         alloc,
         FakeCatalog.iface(),
         FakeWorker.iface(&state),
         "docs",
-        0,
+        topology_epoch,
         .{ .identity_read_generation = 12345 },
         null,
         &.{},
@@ -7055,7 +7365,14 @@ test "distributed graph edge reader carries identity generation" {
     const edges = try reader.getEdges(alloc, null, "doc:a", &.{"links"}, .out);
     defer reader.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
-    try std.testing.expectEqual(@as(u32, 1), state.calls);
+    try std.testing.expectEqual(@as(u32, 1), state.edge_calls);
+
+    const incoming = try reader.getEdges(alloc, null, "doc:a", &.{"links"}, .in);
+    defer reader.freeEdges(alloc, incoming);
+    try std.testing.expectEqual(@as(usize, 1), incoming.len);
+    try std.testing.expectEqualStrings("doc:z", incoming[0].source);
+    try std.testing.expectEqual(@as(u32, 2), state.probe_calls);
+    try std.testing.expectEqual(@as(u32, 2), state.edge_calls);
 }
 
 test "distributed graph edges response round trips owned edges" {
@@ -7708,6 +8025,21 @@ test "distributed graph supports cross-range traverse target selectors" {
         .identity_read_generation = 9,
     };
     try std.testing.expect(supportsCrossRange(req));
+
+    const incoming_shortest_path = db_mod.types.SearchRequest{
+        .graph_queries = &[_]db_mod.types.NamedGraphQuery{.{
+            .name = "reverse_path",
+            .query = .{
+                .query_type = .shortest_path,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &[_][]const u8{"doc:z"} },
+                .target_nodes = .{ .keys = &[_][]const u8{"doc:a"} },
+                .params = .{ .direction = .in },
+            },
+        }},
+        .identity_read_generation = 9,
+    };
+    try std.testing.expect(supportsCrossRange(incoming_shortest_path));
 
     const unsupported_weight_mode = db_mod.types.SearchRequest{
         .graph_queries = &[_]db_mod.types.NamedGraphQuery{

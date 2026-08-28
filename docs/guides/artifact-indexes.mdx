@@ -125,9 +125,10 @@ Artifact-backed edges are owned by the source document key; `nodes.target`
 maps the other endpoint. Source ownership is intentionally not configurable,
 so replay, deletion, routing, and range splits share one identity contract.
 Outgoing traversal routes directly to that source owner. Incoming and
-bidirectional traversal fan out across source shards in parallel and
-deduplicate results, which preserves cross-range edges without cross-shard
-dual writes.
+bidirectional traversal first probes each shard's reverse index with one
+compact key batch, then expands only the shards that report matching edges.
+This preserves exact cross-range paths without synchronous cross-shard dual
+writes or cluster-wide graph materialization work.
 
 ## Readiness And Operations
 

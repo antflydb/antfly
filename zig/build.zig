@@ -6195,6 +6195,9 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
+            "distributed graph incoming probe expands only positive source shards",
+            "distributed graph supports cross-range traverse target selectors",
+            "distributed graph edge reader carries identity generation",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -6215,6 +6218,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "coverage policy accepts only the public embeddings contract",
             "index configs receive persistent private incarnations across index kinds",
+            "create table parser preserves supported metadata fields",
+            "create table rejects caller-managed schema versions",
             "restore manifest preserves trusted coverage incarnation metadata",
             "public index config encoders redact coverage incarnation",
             "public index config encoders redact nested credentials",

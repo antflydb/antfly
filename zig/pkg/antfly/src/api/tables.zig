@@ -737,9 +737,9 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             const normalized_indexes_json = try normalizeRawCreateTableIndexesAlloc(alloc, value);
             defer alloc.free(normalized_indexes_json);
             req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, normalized_indexes_json);
-        } else req.indexes_json = try alloc.dupe(u8, default_indexes_json);
+        } else req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
     } else {
-        req.indexes_json = try alloc.dupe(u8, default_indexes_json);
+        req.indexes_json = try coverage_policy_mod.withMissingIncarnationsAlloc(alloc, default_indexes_json);
     }
     if (root.get("schema")) |value| {
         if (value != .null) {
@@ -4297,7 +4297,10 @@ test "create table parser preserves supported metadata fields" {
     try std.testing.expectEqual(@as(?u32, 1), parsed.num_shards);
     try std.testing.expectEqualStrings("docs table", parsed.description.?);
     try std.testing.expectEqualStrings("{\"version\":0,\"kind\":\"demo\"}", parsed.schema_json.?);
-    try std.testing.expectEqualStrings(default_indexes_json, parsed.indexes_json.?);
+    var stored_indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, parsed.indexes_json.?, .{});
+    defer stored_indexes.deinit();
+    const default_index = stored_indexes.value.object.get("full_text_index_v0") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(coverage_policy_mod.incarnation(default_index) != null);
     try std.testing.expectEqualStrings("[{\"type\":\"postgres\",\"dsn\":\"postgres://db\",\"postgres_table\":\"users\"}]", parsed.replication_sources_json.?);
 }
 
@@ -4319,7 +4322,10 @@ test "create table rejects caller-managed schema versions" {
     );
     defer stored.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("{\"version\":0}", stored.schema_json.?);
-    try std.testing.expectEqualStrings(default_indexes_json, stored.indexes_json.?);
+    var stored_indexes = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, stored.indexes_json.?, .{});
+    defer stored_indexes.deinit();
+    const default_index = stored_indexes.value.object.get("full_text_index_v0") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(coverage_policy_mod.incarnation(default_index) != null);
 }
 
 test "create table raw parser merges default full text with quickstart embedding index" {

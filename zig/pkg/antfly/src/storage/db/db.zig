@@ -16080,19 +16080,37 @@ pub const DB = struct {
         defer self.core.unlockApply();
 
         if (!self.core.index_manager.hasGraphIndexes()) return .{ .complete = true };
-        const page_size: usize = 512;
+        // Bound both decoded input and mutation fan-in while the shard apply
+        // lock is held. Row count alone is not a useful latency bound because
+        // generated artifact payloads vary by orders of magnitude. Always
+        // consume at least one row so an oversized-but-valid record cannot
+        // permanently wedge restore progress.
+        const scan_page_size: usize = 128;
+        const max_page_input_bytes: usize = 4 * 1024 * 1024;
+        const max_page_artifacts: usize = 64;
         const user_prefix = [_]u8{internal_keys.user_namespace};
-        const rows = try self.core.store.scanPrefixPage(alloc, &user_prefix, cursor, page_size);
+        const rows = try self.core.store.scanPrefixPage(alloc, &user_prefix, cursor, scan_page_size);
         defer docstore_mod.DocStore.freeResults(alloc, rows);
         if (rows.len == 0) return .{ .complete = true };
 
         var source_keys = std.ArrayListUnmanaged([]const u8).empty;
         defer source_keys.deinit(alloc);
+        var consumed_rows: usize = 0;
+        var consumed_bytes: usize = 0;
         for (rows) |row| {
-            if (internal_keys.isAssetArtifactKey(row.key) or
+            const row_bytes = row.key.len +| row.value.len;
+            const artifact_row = internal_keys.isAssetArtifactKey(row.key) or
                 internal_keys.isChunkArtifactRecordKey(row.key) or
-                internal_keys.isResolutionArtifactKey(row.key))
+                internal_keys.isResolutionArtifactKey(row.key);
+            if (consumed_rows > 0 and
+                (consumed_bytes +| row_bytes > max_page_input_bytes or
+                    (artifact_row and source_keys.items.len >= max_page_artifacts)))
             {
+                break;
+            }
+            consumed_rows += 1;
+            consumed_bytes +|= row_bytes;
+            if (artifact_row) {
                 try source_keys.append(alloc, row.key);
             }
         }
@@ -16113,11 +16131,11 @@ pub const DB = struct {
 
         return .{
             .replayed = source_keys.items.len,
-            .next_cursor = if (rows.len == page_size)
-                try alloc.dupe(u8, rows[rows.len - 1].key)
+            .next_cursor = if (consumed_rows < rows.len or rows.len == scan_page_size)
+                try alloc.dupe(u8, rows[consumed_rows - 1].key)
             else
                 null,
-            .complete = rows.len < page_size,
+            .complete = consumed_rows == rows.len and rows.len < scan_page_size,
         };
     }
 
@@ -95436,7 +95454,7 @@ test "db restore graph ownership replay persists a bounded page cursor" {
         var before = (try DB.readRestoreStateForPath(alloc, std.mem.span(path))).?;
         defer before.deinit(alloc);
         if (!std.mem.eql(u8, before.phase, "rebuild_graph")) break;
-        try std.testing.expect(page_steps < 8);
+        try std.testing.expect(page_steps < 16);
         const cursor_before = try alloc.dupe(u8, before.graph_ownership_cursor);
         defer alloc.free(cursor_before);
 

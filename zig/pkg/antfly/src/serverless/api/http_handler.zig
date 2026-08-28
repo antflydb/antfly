@@ -5634,8 +5634,6 @@ fn parseEnsureTableRequest(alloc: Allocator, body: []const u8) !api_types.Ensure
 const ServerlessIndexStatus = struct {
     readiness_ready: bool,
     readiness_incarnation: ?u64,
-    readiness_target_revision: u64,
-    readiness_published_revision: ?u64,
     rebuilding: bool,
     backfill_active: bool,
     doc_count: u64,
@@ -5733,15 +5731,11 @@ fn appendServerlessIndexStatusJson(
     if (status.readiness_incarnation) |incarnation| {
         try out.print(alloc, ",\"incarnation\":\"g-{x:0>16}\"", .{incarnation});
     }
-    try out.print(alloc, ",\"target_revision\":{}", .{status.readiness_target_revision});
-    if (status.readiness_published_revision) |published_revision| {
-        try out.print(alloc, ",\"published_revision\":{}", .{published_revision});
-    }
     try out.appendSlice(alloc, ",\"pending_reasons\":");
     if (status.readiness_ready) {
         try out.appendSlice(alloc, "[]}");
     } else if (status.materialization_blocked) {
-        try out.appendSlice(alloc, "[\"materialization\",\"publication\"]}");
+        try out.appendSlice(alloc, "[\"runtime_unavailable\",\"publication\"]}");
     } else {
         try out.appendSlice(alloc, "[\"publication\"]}");
     }
@@ -5952,8 +5946,6 @@ fn serverlessIndexStatus(
     return .{
         .readiness_ready = readiness_ready,
         .readiness_incarnation = if (config_action) |action| action.incarnation else null,
-        .readiness_target_revision = if (readiness_ready) status.head_version else status.next_version,
-        .readiness_published_revision = if (config_published and status.head_version != 0) status.head_version else null,
         .rebuilding = !built and has_documents,
         .backfill_active = !built and has_documents,
         .doc_count = doc_count,
@@ -6070,8 +6062,6 @@ test "serverless readiness serializes durable incarnation as an opaque token" {
     try appendServerlessIndexStatusJson(alloc, &encoded, .{
         .readiness_ready = true,
         .readiness_incarnation = 42,
-        .readiness_target_revision = 7,
-        .readiness_published_revision = 7,
         .rebuilding = false,
         .backfill_active = false,
         .doc_count = 0,
@@ -6093,8 +6083,6 @@ test "serverless pending readiness is explicitly non-queryable and incomplete" {
     try appendServerlessIndexStatusJson(alloc, &encoded, .{
         .readiness_ready = false,
         .readiness_incarnation = null,
-        .readiness_target_revision = 7,
-        .readiness_published_revision = null,
         .rebuilding = true,
         .backfill_active = true,
         .doc_count = 0,
@@ -6627,8 +6615,6 @@ const ServerlessIndexStatusTestResponse = struct {
         readiness: ?struct {
             state: []const u8,
             incarnation: ?[]const u8 = null,
-            target_revision: ?u64 = null,
-            published_revision: ?u64 = null,
             pending_reasons: []const []const u8,
         } = null,
         rebuilding: ?bool = null,
@@ -8460,8 +8446,8 @@ test "serverless http handler index status exposes graph publication actions" {
     // Graph indexes do not yet persist a private incarnation. Omitting the
     // optional token is safer than deriving one from redacted response JSON.
     try std.testing.expectEqual(@as(?[]const u8, null), parsed_planned.value.status.readiness.?.incarnation);
-    try std.testing.expectEqual(@as(?u64, 2), parsed_planned.value.status.readiness.?.target_revision);
-    try std.testing.expectEqual(@as(?u64, null), parsed_planned.value.status.readiness.?.published_revision);
+    try std.testing.expect(std.mem.indexOf(u8, planned.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, planned.body, "published_revision") == null);
 
     var rebuild = try catalog.buildTable("docs");
     defer rebuild.deinit(alloc);
@@ -8479,10 +8465,8 @@ test "serverless http handler index status exposes graph publication actions" {
     try std.testing.expectEqualStrings("ready", parsed_head.value.status.readiness.?.state);
     try std.testing.expectEqual(@as(usize, 0), parsed_head.value.status.readiness.?.pending_reasons.len);
     try std.testing.expectEqual(@as(?[]const u8, null), parsed_head.value.status.readiness.?.incarnation);
-    try std.testing.expectEqual(
-        parsed_head.value.status.readiness.?.target_revision,
-        parsed_head.value.status.readiness.?.published_revision,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, head.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, head.body, "published_revision") == null);
 }
 
 test "http handler index status predicts graph reuse and rebuild before publish" {
@@ -8694,8 +8678,8 @@ test "serverless http handler create index expands schema-derived algebraic conf
     try std.testing.expectEqualStrings("pending", parsed_detail.value.status.readiness.?.state);
     const planned_incarnation = parsed_detail.value.status.readiness.?.incarnation.?;
     try std.testing.expect(std.mem.startsWith(u8, planned_incarnation, "g-"));
-    try std.testing.expectEqual(@as(?u64, 2), parsed_detail.value.status.readiness.?.target_revision);
-    try std.testing.expectEqual(@as(?u64, null), parsed_detail.value.status.readiness.?.published_revision);
+    try std.testing.expect(std.mem.indexOf(u8, detail.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.body, "published_revision") == null);
 
     var algebraic_build = try catalog.buildTable("docs");
     defer algebraic_build.deinit(alloc);
@@ -8711,10 +8695,8 @@ test "serverless http handler create index expands schema-derived algebraic conf
     defer parsed_published.deinit();
     try std.testing.expectEqualStrings("ready", parsed_published.value.status.readiness.?.state);
     try std.testing.expectEqualStrings(planned_incarnation, parsed_published.value.status.readiness.?.incarnation.?);
-    try std.testing.expectEqual(
-        parsed_published.value.status.readiness.?.target_revision,
-        parsed_published.value.status.readiness.?.published_revision,
-    );
+    try std.testing.expect(std.mem.indexOf(u8, published_detail.body, "target_revision") == null);
+    try std.testing.expect(std.mem.indexOf(u8, published_detail.body, "published_revision") == null);
 }
 
 test "serverless create index normalization resolves and persists one probed embedding dimension" {
