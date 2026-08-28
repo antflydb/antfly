@@ -1254,6 +1254,84 @@ fn computeRuntimeShapeCaptureSet(allocator: std.mem.Allocator, graph: *const Gra
     return capture;
 }
 
+/// Request-scoped concrete shapes shared by partition executors. Imported
+/// graphs can retain symbolic dimensions in their declarations after the
+/// backend has resolved them for a particular request; interpreter fallbacks
+/// inside a partition need the same provenance as whole-graph interpretation.
+pub const RuntimeShapeTracker = struct {
+    allocator: std.mem.Allocator,
+    capture: []const bool = &.{},
+    owned_capture: ?[]bool = null,
+    shapes: ?[]?[]i64 = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        cached_analysis: ?CachedAnalysis,
+    ) !RuntimeShapeTracker {
+        var tracker = RuntimeShapeTracker{ .allocator = allocator };
+        errdefer tracker.deinit();
+
+        if (cached_analysis) |analysis| {
+            tracker.capture = analysis.runtime_shape_capture;
+        } else {
+            const capture = try computeRuntimeShapeCaptureSet(allocator, graph);
+            tracker.capture = capture;
+            tracker.owned_capture = capture;
+        }
+
+        if (shapeCaptureSetHasAny(tracker.capture) and graphNeedsRuntimeShapeTracking(graph)) {
+            const shapes = try allocator.alloc(?[]i64, graph.nodeCount());
+            @memset(shapes, null);
+            tracker.shapes = shapes;
+        }
+        return tracker;
+    }
+
+    pub fn deinit(self: *RuntimeShapeTracker) void {
+        if (self.shapes) |shapes| {
+            for (shapes) |maybe_shape| {
+                if (maybe_shape) |shape| self.allocator.free(shape);
+            }
+            self.allocator.free(shapes);
+            self.shapes = null;
+        }
+        if (self.owned_capture) |capture| {
+            self.allocator.free(capture);
+            self.owned_capture = null;
+        }
+        self.capture = &.{};
+    }
+
+    pub fn runtimeShapes(self: *const RuntimeShapeTracker) ?[]const ?[]const i64 {
+        return self.shapes;
+    }
+
+    pub fn record(
+        self: *RuntimeShapeTracker,
+        cb: *const ComputeBackend,
+        node_id: NodeId,
+        value: CT,
+    ) !void {
+        try recordRuntimeShape(self.allocator, cb, self.shapes, self.capture, node_id, value);
+    }
+};
+
+fn graphNeedsRuntimeShapeTracking(graph: *const Graph) bool {
+    for (0..graph.nodeCount()) |index| {
+        const node = graph.node(@intCast(index));
+        for (0..node.output_shape.rank()) |axis| {
+            if (node.output_shape.dim(@intCast(axis)) < 0) return true;
+        }
+        switch (node.op) {
+            .reshape => |attrs| if (attrs.runtime_shape) return true,
+            .broadcast_in_dim => if (node.num_inputs > 1) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 /// Convert a flat MoeRouteSelection (rows * top_k entries) into a grouped
 /// format sorted by expert. Mirrors the grouping in gpt.zig's
 /// runGroupedExpertBatchTensor.
