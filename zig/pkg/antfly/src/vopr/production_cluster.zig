@@ -85,10 +85,21 @@ pub const Fixture = struct {
     pub const FaultMode = enum {
         clean,
         graph_transport_failure,
+        graph_transport_resource_pressure,
         graph_owner_restart,
         graph_partial_write,
         resource_pressure,
         join_finalizer_ack_failure,
+
+        fn hasGraphTransportFailure(self: FaultMode) bool {
+            return self == .graph_transport_failure or
+                self == .graph_transport_resource_pressure;
+        }
+
+        fn hasResourcePressure(self: FaultMode) bool {
+            return self == .resource_pressure or
+                self == .graph_transport_resource_pressure;
+        }
     };
 
     pub const Phase = enum(u8) {
@@ -259,9 +270,12 @@ pub const Fixture = struct {
     graph_transport_failure_injected: bool = false,
     graph_transport_failure_observed: bool = false,
     graph_transport_failure_error_code: u16 = 0,
+    overlapping_faults_active_observed: bool = false,
     graph_partial_rejected_sound: bool = false,
     graph_transport_fault_armed: bool = false,
     graph_transport_fault_endpoint: ?std.Io.net.IpAddress = null,
+    graph_transport_target_index: usize = 0,
+    graph_transport_target_configured: bool = false,
     graph_partial_write_injected: bool = false,
     graph_partial_write_observed: bool = false,
     graph_partial_write_count_before: u64 = 0,
@@ -369,6 +383,23 @@ pub const Fixture = struct {
         } else return error.ProductionDataGraphRemoteCoordinatorMissing;
         self.graph_partial_write_target_index = target_index;
         self.graph_partial_write_target_configured = true;
+        self.graph_probe_route_index = coordinator_index;
+        return coordinator_index;
+    }
+
+    /// Freeze the production coordinator-to-owner link represented by an
+    /// endpoint-scoped graph transport fault. The workload rejects leadership
+    /// drift instead of applying a fault outside its registered domain.
+    pub fn configureGraphTransportTarget(self: *Fixture, target_index: usize) !usize {
+        if (self.phase != .leaders_ready or target_index >= self.data_server_count or !self.data_server_live[target_index])
+            return error.InvalidProductionGraphTransportTarget;
+        const start_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
+            return error.ProductionDataGraphLeaderMissing;
+        const coordinator_index = for (0..self.data_api_uri_count) |index| {
+            if (index != start_index and index != target_index) break index;
+        } else return error.ProductionDataGraphRemoteCoordinatorMissing;
+        self.graph_transport_target_index = target_index;
+        self.graph_transport_target_configured = true;
         self.graph_probe_route_index = coordinator_index;
         return coordinator_index;
     }
@@ -676,12 +707,26 @@ pub const Fixture = struct {
                 if (!self.graph_transport_fault_armed or event.depth != 1) return;
                 switch (self.fault_mode) {
                     .clean => unreachable,
-                    .graph_transport_failure => {
+                    .graph_transport_failure, .graph_transport_resource_pressure => {
                         if (self.graph_transport_failure_injected) return;
                         self.graph_transport_fault_armed = false;
+                        if (self.fault_mode.hasResourcePressure()) {
+                            self.saturateNodeMemory() catch |err| {
+                                self.failure = err;
+                                return;
+                            };
+                            if (!self.allNodeMemorySaturated()) {
+                                self.failure = error.ProductionDataResourceEnvelopeNotSaturated;
+                                self.releaseNodeMemory();
+                                return;
+                            }
+                        }
                         const endpoint = self.graph_transport_fault_endpoint orelse return;
                         self.sim.setOutboundEndpointPayloadOutage(endpoint, "/graph-expand") catch unreachable;
                         self.graph_transport_failure_injected = true;
+                        self.overlapping_faults_active_observed =
+                            self.fault_mode == .graph_transport_resource_pressure and
+                            self.allNodeMemorySaturated();
                     },
                     .graph_owner_restart => {
                         if (self.graph_owner_restart_requested) return;
@@ -704,10 +749,16 @@ pub const Fixture = struct {
             .attempt_failed => {
                 switch (self.fault_mode) {
                     .clean => unreachable,
-                    .graph_transport_failure => {
+                    .graph_transport_failure, .graph_transport_resource_pressure => {
                         if (!self.graph_transport_failure_injected or self.graph_transport_failure_observed) return;
                         self.graph_transport_failure_observed = true;
                         self.graph_transport_failure_error_code = event.error_code;
+                        if (self.fault_mode.hasResourcePressure()) {
+                            self.overlapping_faults_active_observed =
+                                self.overlapping_faults_active_observed and
+                                self.allNodeMemorySaturated();
+                            self.releaseNodeMemory();
+                        }
                         // Heal before the coordinator converts the failed
                         // attempt into the public error response. This cuts the
                         // inter-owner fanout without making the client response
@@ -992,7 +1043,7 @@ pub const Fixture = struct {
     }
 
     fn driverCadenceMs(self: *const Fixture) i64 {
-        return if (self.fault_mode == .resource_pressure)
+        return if (self.fault_mode.hasResourcePressure())
             @intCast(raft_runtime_loop.RuntimeCadence.default_raft_tick_ms)
         else
             1;
@@ -1369,7 +1420,7 @@ pub const Fixture = struct {
         }
         if (self.graph_enabled) {
             if (!self.join_enabled) try self.waitForSplitInProgress();
-            if (self.fault_mode == .resource_pressure)
+            if (self.fault_mode.hasResourcePressure())
                 try self.runResourcePressureDuringSplit();
             const ingress_before = self.public_request_ingress_count;
             self.split_graph_inflight_sound = probe: {
@@ -1383,8 +1434,13 @@ pub const Fixture = struct {
                     } else return error.ProductionDataGraphRemoteCoordinatorMissing;
                     switch (self.fault_mode) {
                         .clean => unreachable,
-                        .graph_transport_failure => self.graph_transport_fault_endpoint =
-                            try parseHttpBaseUriAddress(self.data_api_uris[target_index]),
+                        .graph_transport_failure, .graph_transport_resource_pressure => {
+                            if (self.graph_transport_target_configured and
+                                self.graph_transport_target_index != target_index)
+                                return error.ProductionGraphTransportTargetLeadershipChanged;
+                            self.graph_transport_fault_endpoint =
+                                try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
+                        },
                         .graph_owner_restart => {
                             if (self.graph_restart_target_configured and self.graph_restart_target_index != target_index)
                                 return error.ProductionGraphRestartTargetLeadershipChanged;
@@ -1440,7 +1496,7 @@ pub const Fixture = struct {
         self.phase = .post_split_read_complete;
         if (!self.split_sound) return error.ProductionDataSplitRoundTripFailed;
 
-        if (self.fault_mode == .resource_pressure) {
+        if (self.fault_mode.hasResourcePressure()) {
             self.resource_post_split_sound = try self.lookupContains(
                 "docs",
                 "pressure:probe",
@@ -1695,11 +1751,13 @@ pub const Fixture = struct {
                 // A request crossing topology publication may fail closed,
                 // but it must never return a successful partial traversal.
                 self.split_graph_inflight_rejected = graphResponseFailClosed(response.status, response.body);
-                if (self.fault_mode == .graph_transport_failure) {
+                if (self.fault_mode.hasGraphTransportFailure()) {
                     self.graph_partial_rejected_sound =
                         self.graph_transport_failure_injected and
                         self.graph_transport_failure_observed and
                         self.graph_transport_failure_error_code != 0 and
+                        (self.fault_mode != .graph_transport_resource_pressure or
+                            self.overlapping_faults_active_observed) and
                         response.status == 503 and
                         std.mem.indexOf(u8, response.body, "\"code\":\"distributed_query_unavailable\"") != null and
                         std.mem.indexOf(u8, response.body, "\"retryable\":true") != null and
@@ -2460,6 +2518,7 @@ pub const Fixture = struct {
         graph_transport_failure_injected: bool,
         graph_transport_failure_observed: bool,
         graph_transport_failure_error_code: u16,
+        overlapping_faults_active_observed: bool,
         graph_owner_restart_requested: bool,
         graph_owner_restart_down: bool,
         graph_owner_restart_failure_observed: bool,
@@ -2509,6 +2568,7 @@ pub const Fixture = struct {
             .graph_transport_failure_injected = self.graph_transport_failure_injected,
             .graph_transport_failure_observed = self.graph_transport_failure_observed,
             .graph_transport_failure_error_code = self.graph_transport_failure_error_code,
+            .overlapping_faults_active_observed = self.overlapping_faults_active_observed,
             .graph_owner_restart_requested = self.graph_owner_restart_requested,
             .graph_owner_restart_down = self.graph_owner_restart_down,
             .graph_owner_restart_failure_observed = self.graph_owner_restart_failure_observed,
