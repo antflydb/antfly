@@ -20,6 +20,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const platform_time = @import("antfly_platform").time;
 
 fn lockCatalogMutation(service: anytype) bool {
@@ -73,7 +74,10 @@ fn probeLifecycleProtocolReadiness(
     // the metadata-member decoder capability barrier so a rolling upgrade can
     // never let an older follower ignore the compare-and-set fence.
     if (required and @hasDecl(ServiceDeclType, "ensureTableTopologyProtocolReadyWithContext"))
-        return try service.ensureTableTopologyProtocolReadyWithContext(.{});
+        return try service.ensureTableTopologyProtocolReadyWithContext(
+            .{},
+            metadata_topology_protocol.extension_lifecycle_table_cas_version,
+        );
     return null;
 }
 
@@ -105,49 +109,6 @@ fn captureLifecycleSnapshot(service: anytype) !metadata_api.AdminSnapshot {
     return try service.adminSnapshot();
 }
 
-fn scopeEqual(lhs: extension_domain.ExtensionScope, rhs: extension_domain.ExtensionScope) bool {
-    return lhs.kind == rhs.kind and std.mem.eql(u8, lhs.table_name, rhs.table_name);
-}
-
-fn capabilitiesEqual(lhs: []const extension_domain.Capability, rhs: []const extension_domain.Capability) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |left, right| {
-        if (!std.mem.eql(u8, left.name, right.name) or !std.mem.eql(u8, left.scope, right.scope)) return false;
-    }
-    return true;
-}
-
-fn installedEqual(lhs: extension_domain.InstalledExtension, rhs: extension_domain.InstalledExtension) bool {
-    return std.mem.eql(u8, lhs.name, rhs.name) and
-        std.mem.eql(u8, lhs.package_name, rhs.package_name) and
-        std.mem.eql(u8, lhs.package_version, rhs.package_version) and
-        std.mem.eql(u8, lhs.package_digest, rhs.package_digest) and
-        scopeEqual(lhs.scope, rhs.scope) and
-        std.mem.eql(u8, lhs.config_json, rhs.config_json) and
-        capabilitiesEqual(lhs.granted_capabilities, rhs.granted_capabilities) and
-        lhs.installed_at_epoch_ms == rhs.installed_at_epoch_ms and
-        lhs.status == rhs.status;
-}
-
-fn memberEqual(lhs: extension_domain.ExtensionMember, rhs: extension_domain.ExtensionMember) bool {
-    return std.mem.eql(u8, lhs.extension_name, rhs.extension_name) and
-        scopeEqual(lhs.scope, rhs.scope) and
-        lhs.object_kind == rhs.object_kind and
-        std.mem.eql(u8, lhs.object_name, rhs.object_name) and
-        std.mem.eql(u8, lhs.table_name, rhs.table_name) and
-        lhs.shape_kind == rhs.shape_kind and
-        std.mem.eql(u8, lhs.shape_name, rhs.shape_name) and
-        std.mem.eql(u8, lhs.shape_version, rhs.shape_version) and
-        std.mem.eql(u8, lhs.owner_metadata_json, rhs.owner_metadata_json);
-}
-
-fn dependencyEqual(lhs: extension_domain.ExtensionDependency, rhs: extension_domain.ExtensionDependency) bool {
-    return std.mem.eql(u8, lhs.extension_name, rhs.extension_name) and
-        std.mem.eql(u8, lhs.required_extension_name, rhs.required_extension_name) and
-        std.mem.eql(u8, lhs.package_name, rhs.package_name) and
-        std.mem.eql(u8, lhs.version_requirement, rhs.version_requirement);
-}
-
 fn lifecycleDeltaApplied(snapshot: *const metadata_api.AdminSnapshot, delta: metadata_storage.ExtensionLifecycleDelta) bool {
     for (delta.upsert_tables) |expected| {
         var found = false;
@@ -162,12 +123,16 @@ fn lifecycleDeltaApplied(snapshot: *const metadata_api.AdminSnapshot, delta: met
         var found = false;
         for (snapshot.installed_extensions) |actual| {
             if (!std.mem.eql(u8, actual.name, expected.name)) continue;
-            found = installedEqual(actual, expected);
+            found = extension_domain.installedExtensionsEqual(actual, expected);
             break;
         }
         if (!found) return false;
     }
     for (delta.remove_installed_extensions) |name| {
+        const replaced = for (delta.upsert_installed_extensions) |upsert| {
+            if (std.mem.eql(u8, upsert.name, name)) break true;
+        } else false;
+        if (replaced) continue;
         for (snapshot.installed_extensions) |actual| {
             if (std.mem.eql(u8, actual.name, name)) return false;
         }
@@ -175,7 +140,7 @@ fn lifecycleDeltaApplied(snapshot: *const metadata_api.AdminSnapshot, delta: met
     for (delta.upsert_extension_members) |expected| {
         var found = false;
         for (snapshot.extension_members) |actual| {
-            if (memberEqual(actual, expected)) {
+            if (extension_domain.extensionMembersEqual(actual, expected)) {
                 found = true;
                 break;
             }
@@ -198,7 +163,7 @@ fn lifecycleDeltaApplied(snapshot: *const metadata_api.AdminSnapshot, delta: met
     for (delta.upsert_extension_dependencies) |expected| {
         var found = false;
         for (snapshot.extension_dependencies) |actual| {
-            if (dependencyEqual(actual, expected)) {
+            if (extension_domain.extensionDependenciesEqual(actual, expected)) {
                 found = true;
                 break;
             }
@@ -221,6 +186,26 @@ fn lifecycleDeltaApplied(snapshot: *const metadata_api.AdminSnapshot, delta: met
     return true;
 }
 
+fn verifyLifecycleProjection(
+    service: anytype,
+    delta: metadata_storage.ExtensionLifecycleDelta,
+) !bool {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "verifyExtensionLifecycleProjection"))
+        return try service.verifyExtensionLifecycleProjection(delta);
+
+    // Lightweight test and embedding services may not expose a projected
+    // store. Preserve compatibility for those adapters only; production
+    // services use the bounded point-read verifier above.
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    return lifecycleDeltaApplied(&snapshot, delta);
+}
+
 fn proposeLifecycleMutation(
     service: anytype,
     readiness: ?metadata_service.TableTopologyProtocolReadiness,
@@ -230,9 +215,9 @@ fn proposeLifecycleMutation(
     // term and exact membership under the lane immediately before admission.
     try validateLifecycleProtocolReadiness(service, readiness);
     try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = delta });
-    var snapshot = try service.adminSnapshot();
-    defer service.freeAdminSnapshot(&snapshot);
-    if (!lifecycleDeltaApplied(&snapshot, delta)) return error.ExtensionLifecycleConflict;
+    const applied = verifyLifecycleProjection(service, delta) catch
+        return error.MetadataMutationOutcomeUnknown;
+    if (!applied) return error.ExtensionLifecycleConflict;
 }
 
 fn lifecycleTablePreconditionsAlloc(
@@ -307,6 +292,39 @@ test "extension lifecycle proposal preserves post-admission ambiguity" {
     try std.testing.expectError(
         error.MetadataMutationOutcomeUnknown,
         proposeCatalogMutation(&service, .{ .remove_reconcile_lease = .{} }),
+    );
+}
+
+test "extension lifecycle verification distinguishes conflicts from unknown outcomes" {
+    const FakeService = struct {
+        const Receipt = struct { term: u64, index: u64 };
+        verification_error: bool = false,
+
+        pub fn proposeTransitionCommandWithReceipt(
+            _: *@This(),
+            _: metadata_storage.TransitionCommand,
+        ) !Receipt {
+            return .{ .term = 3, .index = 9 };
+        }
+
+        pub fn waitForTransitionApplied(_: *@This(), _: Receipt) !void {}
+
+        pub fn verifyExtensionLifecycleProjection(self: *@This(), _: metadata_storage.ExtensionLifecycleDelta) !bool {
+            if (self.verification_error) return error.StorageUnavailable;
+            return false;
+        }
+    };
+
+    var conflict = FakeService{};
+    try std.testing.expectError(
+        error.ExtensionLifecycleConflict,
+        proposeLifecycleMutation(&conflict, null, .{}),
+    );
+
+    var unknown = FakeService{ .verification_error = true };
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        proposeLifecycleMutation(&unknown, null, .{}),
     );
 }
 
@@ -887,13 +905,25 @@ test "extension lifecycle verification rejects a committed no-op and accepts the
     };
     var missing = metadata_api.AdminSnapshot{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
     };
     try std.testing.expect(!lifecycleDeltaApplied(&missing, delta));
 
     var projected = [_]extension_domain.InstalledExtension{installed};
     var exact = metadata_api.AdminSnapshot{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
         .installed_extensions = projected[0..],
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
     };
     try std.testing.expect(lifecycleDeltaApplied(&exact, delta));
 
@@ -931,8 +961,14 @@ test "extension lifecycle verification rejects a committed no-op and accepts the
     var dependencies = [_]extension_domain.ExtensionDependency{dependency};
     var replaced = metadata_api.AdminSnapshot{
         .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = &.{},
+        .ranges = &.{},
+        .stores = &.{},
+        .placement_intents = &.{},
         .extension_members = members[0..],
         .extension_dependencies = dependencies[0..],
+        .split_transitions = &.{},
+        .merge_transitions = &.{},
     };
     try std.testing.expect(lifecycleDeltaApplied(&replaced, replacement_delta));
 }

@@ -74,7 +74,10 @@ pub fn create(
     // Decoder capability probes perform remote I/O. Complete them before
     // entering the catalog lane, then revalidate their term/membership token
     // under the lane immediately before deriving the admission snapshot.
-    const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(request);
+    const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
+        request,
+        topology_protocol.atomic_table_topology_version,
+    );
     lockTableCatalogMutation(svc, table_name);
     var catalog_locked = true;
     defer if (catalog_locked) unlockTableCatalogMutation(svc, table_name);
@@ -128,7 +131,10 @@ pub fn drop(
     request: operation.RequestContext,
     table_name: []const u8,
 ) !DropResult {
-    const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(request);
+    const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
+        request,
+        topology_protocol.atomic_table_topology_version,
+    );
     lockTableCatalogMutation(svc, table_name);
     var catalog_locked = true;
     defer if (catalog_locked) unlockTableCatalogMutation(svc, table_name);

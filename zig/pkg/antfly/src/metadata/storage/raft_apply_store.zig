@@ -2556,6 +2556,129 @@ pub const RaftApplyStore = struct {
         alloc.free(records);
     }
 
+    /// Verifies the exact rows affected by a committed extension lifecycle
+    /// command. Callers serialize catalog mutations while this runs, so point
+    /// reads are sufficient and avoid cloning and scanning the full catalog.
+    pub fn extensionLifecycleDeltaApplied(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        delta: ExtensionLifecycleDelta,
+    ) !bool {
+        for (delta.upsert_tables) |expected| {
+            const actual = (try self.getTable(alloc, group_id, expected.table_id)) orelse return false;
+            defer metadata_table_manager.freeTable(alloc, actual);
+            if (!metadata_table_manager.tableDefinitionsEqual(actual, expected)) return false;
+        }
+        for (delta.upsert_installed_extensions) |expected| {
+            var key_buf: [192]u8 = undefined;
+            const key = try installedExtensionKeyForGroup(&key_buf, group_id, expected.name);
+            const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer alloc.free(encoded);
+            var actual = try decodeInstalledExtensionRecord(alloc, encoded);
+            defer actual.deinitOwned(alloc);
+            if (!extension_domain.installedExtensionsEqual(actual, expected)) return false;
+        }
+        for (delta.remove_installed_extensions) |name| {
+            const replaced = for (delta.upsert_installed_extensions) |upsert| {
+                if (std.mem.eql(u8, upsert.name, name)) break true;
+            } else false;
+            if (replaced) continue;
+            var key_buf: [192]u8 = undefined;
+            const key = try installedExtensionKeyForGroup(&key_buf, group_id, name);
+            const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            alloc.free(encoded);
+            return false;
+        }
+        for (delta.upsert_extension_members) |expected| {
+            var key_buf: [256]u8 = undefined;
+            const key = try extensionMemberKeyForGroup(
+                &key_buf,
+                group_id,
+                expected.extension_name,
+                expected.object_kind,
+                expected.object_name,
+            );
+            const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer alloc.free(encoded);
+            var actual = try decodeExtensionMemberRecord(alloc, encoded);
+            defer actual.deinitOwned(alloc);
+            if (!extension_domain.extensionMembersEqual(actual, expected)) return false;
+        }
+        for (delta.remove_extension_members) |removed| {
+            const replaced = for (delta.upsert_extension_members) |upsert| {
+                if (std.mem.eql(u8, upsert.extension_name, removed.extension_name) and
+                    upsert.object_kind == removed.object_kind and
+                    std.mem.eql(u8, upsert.object_name, removed.object_name)) break true;
+            } else false;
+            if (replaced) continue;
+            var key_buf: [256]u8 = undefined;
+            const key = try extensionMemberKeyForGroup(
+                &key_buf,
+                group_id,
+                removed.extension_name,
+                removed.object_kind,
+                removed.object_name,
+            );
+            const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            alloc.free(encoded);
+            return false;
+        }
+        for (delta.upsert_extension_dependencies) |expected| {
+            var key_buf: [320]u8 = undefined;
+            const key = try extensionDependencyKeyForGroup(
+                &key_buf,
+                group_id,
+                expected.extension_name,
+                expected.required_extension_name,
+                expected.package_name,
+            );
+            const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            };
+            defer alloc.free(encoded);
+            var actual = try decodeExtensionDependencyRecord(alloc, encoded);
+            defer actual.deinitOwned(alloc);
+            if (!extension_domain.extensionDependenciesEqual(actual, expected)) return false;
+        }
+        for (delta.remove_extension_dependencies) |removed| {
+            const replaced = for (delta.upsert_extension_dependencies) |upsert| {
+                if (std.mem.eql(u8, upsert.extension_name, removed.extension_name) and
+                    std.mem.eql(u8, upsert.required_extension_name, removed.required_extension_name) and
+                    std.mem.eql(u8, upsert.package_name, removed.package_name)) break true;
+            } else false;
+            if (replaced) continue;
+            var key_buf: [320]u8 = undefined;
+            const key = try extensionDependencyKeyForGroup(
+                &key_buf,
+                group_id,
+                removed.extension_name,
+                removed.required_extension_name,
+                removed.package_name,
+            );
+            const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            alloc.free(encoded);
+            return false;
+        }
+        return true;
+    }
+
     pub fn listShuffleJoinLeases(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.ShuffleJoinLeaseRecord {
         var prefix_buf: [128]u8 = undefined;
         const prefix = try shuffleJoinLeasePrefixForGroup(&prefix_buf, group_id);
@@ -11989,26 +12112,28 @@ test "metadata extension lifecycle table precondition prevents stale replacement
     const original = metadata.TableRecord{ .table_id = 7, .name = "docs", .indexes_json = "{}" };
     const concurrent = metadata.TableRecord{ .table_id = 7, .name = "docs", .indexes_json = "{\"search\":{\"type\":\"full_text\"}}" };
     const stale_replacement = metadata.TableRecord{ .table_id = 7, .name = "docs", .indexes_json = "{\"extension_idx\":{\"type\":\"full_text\"}}" };
-
-    const seed = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = original });
-    defer std.testing.allocator.free(seed);
-    const concurrent_update = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = concurrent });
-    defer std.testing.allocator.free(concurrent_update);
-    const lifecycle = try encodeTransitionCommand(std.testing.allocator, .{ .apply_extension_lifecycle = .{
+    const installed_record = extension_domain.InstalledExtension{
+        .name = "docaf",
+        .package_name = "docaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:abc",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .status = .ready,
+    };
+    const stale_delta = ExtensionLifecycleDelta{
         .expected_tables = &.{.{
             .table_id = original.table_id,
             .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(original),
         }},
         .upsert_tables = &.{stale_replacement},
-        .upsert_installed_extensions = &.{.{
-            .name = "docaf",
-            .package_name = "docaf",
-            .package_version = "1.0.0",
-            .package_digest = "sha256:abc",
-            .scope = .{ .kind = .table, .table_name = "docs" },
-            .status = .ready,
-        }},
-    } });
+        .upsert_installed_extensions = &.{installed_record},
+    };
+
+    const seed = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = original });
+    defer std.testing.allocator.free(seed);
+    const concurrent_update = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = concurrent });
+    defer std.testing.allocator.free(concurrent_update);
+    const lifecycle = try encodeTransitionCommand(std.testing.allocator, .{ .apply_extension_lifecycle = stale_delta });
     defer std.testing.allocator.free(lifecycle);
     const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = seed },
@@ -12029,6 +12154,34 @@ test "metadata extension lifecycle table precondition prevents stale replacement
     const installed = try store.listInstalledExtensions(std.testing.allocator, metadata_group_id);
     defer store.freeInstalledExtensions(std.testing.allocator, installed);
     try std.testing.expectEqual(@as(usize, 0), installed.len);
+    try std.testing.expect(!try store.extensionLifecycleDeltaApplied(
+        std.testing.allocator,
+        metadata_group_id,
+        stale_delta,
+    ));
+
+    const exact_delta = ExtensionLifecycleDelta{
+        .upsert_tables = &.{concurrent},
+        .upsert_installed_extensions = &.{installed_record},
+    };
+    const exact_lifecycle = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_extension_lifecycle = exact_delta,
+    });
+    defer std.testing.allocator.free(exact_lifecycle);
+    const exact_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = exact_lifecycle },
+    });
+    defer std.testing.allocator.free(exact_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 4,
+        .entries_bytes = exact_entries,
+    });
+    try std.testing.expect(try store.extensionLifecycleDeltaApplied(
+        std.testing.allocator,
+        metadata_group_id,
+        exact_delta,
+    ));
 }
 
 test "metadata raft apply store projects schema progress records from committed entries" {

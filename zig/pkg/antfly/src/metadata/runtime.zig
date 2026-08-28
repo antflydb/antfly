@@ -42,19 +42,23 @@ fn isExpectedControlRoundError(err: anyerror) bool {
     return antfly.metadata.authority.isRetryableError(err);
 }
 
-const metadata_raft_max_single_ready_bytes: usize = 256 * 1024 * 1024;
+const metadata_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
         .max_tick_batch = 32,
         .max_pending_outbound_messages = 4096,
         .max_pending_outbound_bytes = 16 * 1024 * 1024,
-        .max_single_outbound_ready_bytes = metadata_raft_max_single_ready_bytes,
+        // Metadata snapshots are indivisible Raft Ready work and their size is
+        // not bounded by any one admitted command. A finite single-Ready cap
+        // would permanently quarantine an otherwise healthy consensus group.
+        // Queue budgets still provide backpressure around the isolated Ready.
+        .max_single_outbound_ready_bytes = std.math.maxInt(usize),
         .max_transport_messages_per_round = 64,
         .max_transport_bytes_per_round = 512 * 1024,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
-        .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
+        .max_single_apply_ready_bytes = std.math.maxInt(usize),
         .max_apply_tasks_per_round = 16,
         .applied_log_retained_entries = metadata_raft_retained_entries,
         .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
@@ -499,7 +503,7 @@ pub const Server = struct {
                         .trace_logger = if (build_options.with_tla) tracing.stderrRaftTraceLogger() else null,
                     },
                     .listener = antfly.raft.httpListenerConfig(result.bind_host, cfg.bind_port),
-                    .max_snapshot_bytes = metadata_raft_max_single_ready_bytes,
+                    .max_snapshot_bytes = metadata_raft_max_snapshot_transfer_bytes,
                     .transport = .{
                         .snapshot = .{
                             .root_dir = result.snapshot_root_dir,

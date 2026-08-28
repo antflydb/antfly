@@ -530,10 +530,11 @@ const MetadataProposalProgressDriver = struct {
     }
 };
 
-/// Serializes the expensive peer capability fanout and retains only a positive
-/// result. The readiness identity includes the leader term, incarnation, and
-/// complete protected membership, so membership or leadership changes
-/// invalidate the cache without a timer or a stale negative result.
+/// Serializes the expensive peer capability fanout. A positive result is
+/// shared only with callers that actually waited for that same in-flight
+/// probe; a later request always probes again. Peer process rollback does not
+/// change Raft term, membership, or cluster incarnation, so cross-request
+/// caching would turn an ephemeral observation into an unsafe decoder proof.
 const TableTopologyProtocolProbeCoordinator = struct {
     lane: std.atomic.Mutex = .unlocked,
     wake_epoch: std.atomic.Value(u32) = .init(0),
@@ -591,12 +592,13 @@ test "metadata proposal receipt progress uses a single transferable driver" {
     next.deinit();
 }
 
-test "table topology protocol probes singleflight and retain only matching positive readiness" {
+test "table topology protocol probes share only matching in-flight readiness" {
     var coordinator = TableTopologyProtocolProbeCoordinator{};
     var first = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
     try std.testing.expect(coordinator.tryAcquire() == null);
     const readiness = TableTopologyProtocolReadiness{
         .term = 3,
+        .required_version = 3,
         .metadata_incarnation = null,
         .protected_member_count = 2,
         .protected_membership_fingerprint = [_]u8{7} ** std.crypto.hash.sha2.Sha256.digest_length,
@@ -908,6 +910,7 @@ const ReallocationBarrierContract = struct {
 
 pub const TableTopologyProtocolReadiness = struct {
     term: u64,
+    required_version: u16,
     metadata_incarnation: ?metadata_mod.MetadataClusterIncarnation,
     protected_member_count: u32,
     protected_membership_fingerprint: metadata_reallocation_request.MembershipFingerprint,
@@ -915,13 +918,17 @@ pub const TableTopologyProtocolReadiness = struct {
 
 fn tableTopologyProtocolReadiness(
     term: u64,
+    required_version: u16,
     metadata_incarnation: ?metadata_mod.MetadataClusterIncarnation,
     sorted_node_ids: []const u64,
 ) !TableTopologyProtocolReadiness {
-    if (term == 0 or sorted_node_ids.len == 0)
+    if (term == 0 or required_version == 0 or
+        required_version > metadata_topology_protocol.current_version or
+        sorted_node_ids.len == 0)
         return error.TableTopologyProtocolUpgradeRequired;
     return .{
         .term = term,
+        .required_version = required_version,
         .metadata_incarnation = metadata_incarnation,
         .protected_member_count = std.math.cast(u32, sorted_node_ids.len) orelse
             return error.TableTopologyProtocolUpgradeRequired,
@@ -942,6 +949,7 @@ fn tableTopologyReadinessEqual(
     rhs: TableTopologyProtocolReadiness,
 ) bool {
     return lhs.term == rhs.term and
+        lhs.required_version == rhs.required_version and
         metadataIncarnationsEqual(lhs.metadata_incarnation, rhs.metadata_incarnation) and
         lhs.protected_member_count == rhs.protected_member_count and
         std.mem.eql(
@@ -984,12 +992,13 @@ fn tableTopologyProtocolCompatible(
     metadata_group_id: u64,
     node_id: u64,
     incarnation: metadata_mod.MetadataClusterIncarnation,
+    required_version: u16,
 ) bool {
     const peer_incarnation = peer_status.metadata_incarnation orelse return false;
     return peer_status.metadata_group_id == metadata_group_id and
         peer_status.metadata_raft_local_node_id == node_id and
         std.mem.eql(u8, &peer_incarnation, &incarnation) and
-        peer_status.table_topology_protocol_version >= metadata_topology_protocol.current_version;
+        peer_status.table_topology_protocol_version >= required_version;
 }
 
 fn runtimeStatusProtocolCompatible(
@@ -2517,6 +2526,7 @@ pub const MetadataService = struct {
     pub fn ensureTableTopologyProtocolReadyWithContext(
         self: *MetadataService,
         request: api_operation.RequestContext,
+        required_version: u16,
     ) !TableTopologyProtocolReadiness {
         try request.ensureActive();
         const incarnation = try self.metadataIncarnation();
@@ -2536,6 +2546,7 @@ pub const MetadataService = struct {
         defer self.alloc.free(required_node_ids);
         return try tableTopologyProtocolReadiness(
             raft_status.hard.current_term,
+            required_version,
             incarnation,
             required_node_ids,
         );
@@ -2564,6 +2575,7 @@ pub const MetadataService = struct {
         defer self.alloc.free(required_node_ids);
         const current = try tableTopologyProtocolReadiness(
             raft_status.hard.current_term,
+            expected.required_version,
             incarnation,
             required_node_ids,
         );
@@ -2825,6 +2837,18 @@ pub const MetadataService = struct {
             metadata_table_manager.freeTable(alloc, projected);
             return error.TableTransitionActive;
         }
+    }
+
+    pub fn verifyExtensionLifecycleProjection(
+        self: *MetadataService,
+        delta: metadata_storage.ExtensionLifecycleDelta,
+    ) !bool {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.extensionLifecycleDeltaApplied(
+            self.alloc,
+            self.metadata_group_id,
+            delta,
+        );
     }
 
     pub fn lockCatalogMutation(self: *MetadataService) void {
@@ -5615,15 +5639,19 @@ pub const MetadataHttpService = struct {
         return try reallocationBarrierContract(incarnation, required_node_ids);
     }
 
-    /// Atomic topology entries use a new Raft wire tag, so every current and
-    /// configured metadata member must advertise decoder support before the
-    /// leader may append one. Successful probes are singleflight-cached by the
-    /// complete readiness identity; failures are never cached.
+    /// Atomic topology entries use versioned Raft wire semantics, so every
+    /// current and configured metadata member must advertise the version
+    /// required by this command before the leader may append it. Concurrent
+    /// waiters share one successful fanout; later calls probe again because a
+    /// peer process rollback does not change the Raft readiness identity.
     pub fn ensureTableTopologyProtocolReadyWithContext(
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
+        required_version: u16,
     ) !TableTopologyProtocolReadiness {
         try request.ensureActive();
+        if (required_version == 0 or required_version > metadata_topology_protocol.current_version)
+            return error.TableTopologyProtocolUpgradeRequired;
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         // Status.conf_state borrows the Raft group's membership arrays. Copy
         // the required IDs while the runtime lock protects those arrays, then
@@ -5651,23 +5679,32 @@ pub const MetadataHttpService = struct {
             return error.TableTopologyProtocolUpgradeRequired;
         const expected_readiness = try tableTopologyProtocolReadiness(
             observation.term,
+            required_version,
             incarnation,
             required_node_ids,
         );
 
+        var joined_in_flight_probe = false;
         var probe_lease = while (true) {
             try request.ensureActive();
             const observed_epoch = self.table_topology_protocol_probe.currentEpoch();
             if (self.table_topology_protocol_probe.tryAcquire()) |lease| break lease;
+            joined_in_flight_probe = true;
             self.table_topology_protocol_probe.waitForHandoff(
                 observed_epoch,
                 table_topology_protocol_probe_wait_ns,
             );
         };
         defer probe_lease.deinit();
-        if (self.table_topology_protocol_probe.cached) |cached| {
-            if (tableTopologyReadinessEqual(cached, expected_readiness)) return expected_readiness;
+        if (joined_in_flight_probe) {
+            if (self.table_topology_protocol_probe.cached) |cached| {
+                if (tableTopologyReadinessEqual(cached, expected_readiness)) return expected_readiness;
+            }
         }
+        // A caller that acquired the lane without waiting must never reuse an
+        // older peer-process observation. Clear it before the fresh fanout so
+        // failures cannot be consumed by concurrent waiters as success.
+        self.table_topology_protocol_probe.cached = null;
 
         const now_ns = platform_time.monotonicNs();
         const request_deadline = request.deadline_ns orelse std.math.maxInt(u64);
@@ -5753,7 +5790,13 @@ pub const MetadataHttpService = struct {
                 std.log.warn("table topology protocol probe failed member={d} err={s}", .{ slot.node_id, @errorName(err) });
                 return error.TableTopologyProtocolUpgradeRequired;
             }
-            if (!tableTopologyProtocolCompatible(slot.status, self.metadata_group_id, slot.node_id, incarnation)) {
+            if (!tableTopologyProtocolCompatible(
+                slot.status,
+                self.metadata_group_id,
+                slot.node_id,
+                incarnation,
+                required_version,
+            )) {
                 std.log.warn(
                     "table topology protocol blocked member={d} reports node={d} group={d} protocol={d}",
                     .{ slot.node_id, slot.status.metadata_raft_local_node_id, slot.status.metadata_group_id, slot.status.table_topology_protocol_version },
@@ -5792,6 +5835,7 @@ pub const MetadataHttpService = struct {
         defer self.alloc.free(required_node_ids);
         const current = try tableTopologyProtocolReadiness(
             raft_status.hard.current_term,
+            expected.required_version,
             incarnation,
             required_node_ids,
         );
@@ -6916,6 +6960,18 @@ pub const MetadataHttpService = struct {
         }
     }
 
+    pub fn verifyExtensionLifecycleProjection(
+        self: *MetadataHttpService,
+        delta: metadata_storage.ExtensionLifecycleDelta,
+    ) !bool {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.extensionLifecycleDeltaApplied(
+            self.alloc,
+            self.metadata_group_id,
+            delta,
+        );
+    }
+
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {
         metadata_api.freeSnapshot(self.alloc, self, snapshot);
     }
@@ -7887,7 +7943,7 @@ test "metadata service reallocation barrier requires a current protocol from the
     try std.testing.expect(!reallocationBarrierStatusCompatible(current_status, 42, 7, incarnation));
 }
 
-test "metadata table topology protocol requires the exact current metadata replica" {
+test "metadata table topology protocol checks the command's required version and exact replica" {
     const incarnation: metadata_mod.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     var status = MetadataStatus{
         .metadata_group_id = 42,
@@ -7895,13 +7951,50 @@ test "metadata table topology protocol requires the exact current metadata repli
         .metadata_raft_local_node_id = 7,
         .metrics = .{},
     };
-    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation));
-    status.table_topology_protocol_version = metadata_topology_protocol.current_version;
-    try std.testing.expect(tableTopologyProtocolCompatible(status, 42, 7, incarnation));
-    try std.testing.expect(!tableTopologyProtocolCompatible(status, 43, 7, incarnation));
-    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 8, incarnation));
+    try std.testing.expect(!tableTopologyProtocolCompatible(
+        status,
+        42,
+        7,
+        incarnation,
+        metadata_topology_protocol.atomic_table_topology_version,
+    ));
+    status.table_topology_protocol_version = metadata_topology_protocol.atomic_table_topology_version;
+    try std.testing.expect(tableTopologyProtocolCompatible(
+        status,
+        42,
+        7,
+        incarnation,
+        metadata_topology_protocol.atomic_table_topology_version,
+    ));
+    try std.testing.expect(!tableTopologyProtocolCompatible(
+        status,
+        42,
+        7,
+        incarnation,
+        metadata_topology_protocol.extension_lifecycle_table_cas_version,
+    ));
+    try std.testing.expect(!tableTopologyProtocolCompatible(
+        status,
+        43,
+        7,
+        incarnation,
+        metadata_topology_protocol.atomic_table_topology_version,
+    ));
+    try std.testing.expect(!tableTopologyProtocolCompatible(
+        status,
+        42,
+        8,
+        incarnation,
+        metadata_topology_protocol.atomic_table_topology_version,
+    ));
     status.metadata_incarnation = null;
-    try std.testing.expect(!tableTopologyProtocolCompatible(status, 42, 7, incarnation));
+    try std.testing.expect(!tableTopologyProtocolCompatible(
+        status,
+        42,
+        7,
+        incarnation,
+        metadata_topology_protocol.atomic_table_topology_version,
+    ));
 }
 
 test "metadata runtime status protocol requires the exact current metadata replica" {

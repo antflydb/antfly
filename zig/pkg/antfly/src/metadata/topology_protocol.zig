@@ -22,6 +22,13 @@ const std = @import("std");
 /// Version 4 adds compare-and-set table preconditions to extension lifecycle
 /// entries; leaders gate those entries on the same all-member capability.
 pub const current_version: u16 = 4;
+/// Minimum decoder capability required by the atomic create/drop wire format.
+/// Later, unrelated metadata features must not unnecessarily stop table DDL
+/// during a rolling upgrade.
+pub const atomic_table_topology_version: u16 = 3;
+/// Decoder capability required only when lifecycle entries carry table CAS
+/// preconditions.
+pub const extension_lifecycle_table_cas_version: u16 = 4;
 
 /// Creating thousands of Raft groups is an operational workflow, not one
 /// catalog request. Keep one create bounded in CPU, memory, and log growth.
