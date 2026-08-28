@@ -1325,8 +1325,9 @@ VOPR work has found concrete production and harness defects:
   `StdHttpExecutor` and listener for data-Raft when its backend exposed general
   `std.Io` but no specialized Raft lanes. `DataServerConfig` now accepts a
   caller-owned request executor and external-listener ownership, allowing the
-  v11/v12/v13/v14 production modes to keep the real Raft HTTP codec and handler on `VoprIo` with no
-  hidden Threaded transport. The production defaults remain unchanged.
+  v11/v12/v13/v14/v15 production modes to keep the real Raft HTTP codec and
+  handler on `VoprIo` with no hidden Threaded transport. The production
+  defaults remain unchanged.
 - Serverless public-catalog teardown published `public_live = false` only after
   poisoning its client, listener, and status owners. Parent-history
   cancellation could enter a second fixture teardown while that flag was still
@@ -1568,6 +1569,19 @@ VOPR work has found concrete production and harness defects:
   replica status, and every unexpected response path heals the fault and
   terminates its obligation before cleanup. This was a harness/topology defect,
   not a product property failure.
+- A whole-network or persistent endpoint outage was too broad for the
+  production-owner graph/split composition: it could starve data-Raft or
+  intercept split-control traffic sharing the same listener. `VoprIo` now owns
+  an endpoint-, request-direction-, and semantic-byte-stream-scoped outage, so
+  v15 cuts only the selected remote `/graph-expand` request while responses and
+  unrelated protocols continue. This was a fault-model composition defect,
+  not an Antfly product failure.
+- The first semantic-stream selector searched each socket write independently,
+  so a route marker fragmented across HTTP writes could evade the injected
+  outage. The selector now retains per-connection KMP match state across
+  writes, owns its pattern for the fault lifetime, and has a focused fragmented-
+  write regression. This was a `VoprIo` model defect found while making the
+  production failure evidence non-vacuous.
 - A real internal graph-fanout send failure escaped through two public dispatch
   wrappers as `SendFailed` and then `InternalFailure`, produced error-level
   logs for an expected availability fault, and returned an opaque HTTP 500.
@@ -2048,7 +2062,10 @@ The 61-test ReleaseSafe table-read gate, focused ReadState regression, and v13
 ReleaseSafe exact-replay gate prove this static-topology seam. V14 additionally
 proves a public graph request starts during a durable nonterminal active split,
 never publishes a successful partial traversal, and completes against the
-post-cutover topology. V9's fault modes are not yet on those production owners.
+post-cutover topology. V15 cuts the real next-owner graph stream during that
+split, requires a typed no-partial 503, heals, and completes the post-cutover
+traversal. V9's restart, topology, partial-write, and resource fault modes are
+not yet on those production owners.
 
 HA, per-group Raft, LSM/WAL/LMDB/persistent/index-manager/DB-split, metadata
 distributed data, the deployment-shaped full cluster, and the newer P0/P1/P2
@@ -2063,13 +2080,16 @@ boundaries explicitly named in an integrated row, are not finished. In
 particular, one trace does not yet co-reside every HA/data-plane/serverless
 owner; v9's public graph covers an in-flight leader restart and a production-
 coordinator range merge across different leader roots, while v13 covers the
-static traversal on production `DataServer` owners and v14 composes that
+static traversal on production `DataServer` owners, v14 composes that
 production traversal with a metadata-driven range split and replicated
-transition execution. Cancellation, authorization changes, and public
+transition execution, and v15 adds one scoped next-owner graph-transport cut.
+Cancellation, authorization changes, and public
 hydration are not yet composed into that production-owner history. V9's fail-
 closed topology/transport interruption and post-recovery complete retry,
-v13's strong-read/derived-visibility barrier, and v14's graph-during-split
-contract are integrated; live mixed-
+v13's strong-read/derived-visibility barrier, v14's graph-during-split
+contract, and v15's graph-stream failure during that split are integrated;
+v9's remaining restart, topology, partial-write, and resource breadth is not;
+live mixed-
 binary operation is not modeled; and arbitrary unmodified sidecars or process
 address spaces remain differential/integration concerns.
 
@@ -2663,7 +2683,10 @@ The shortest current summary is:
    replays a depth-two public graph on those production owners after repairing
    public owner routing and combined Raft/derived-index visibility. V14 now
    composes the graph and split and passes its current-tree 15/15 complete
-   gate. Next add v9 fault breadth to v14; then add disjoint placement,
+   gate. V15 adds one scoped next-owner graph-transport failure during that
+   split and passes its 450,000-transition record and fresh-world replay 15/15.
+   Next add v9's remaining restart, topology, partial-write, and resource
+   breadth to the production owners; then add disjoint placement,
    retained-history pressure, snapshot/derived-state recovery, and partitions.
 2. **Deepen public distributed operations.** Add public
    hydration, cancellation, authorization changes, joins, and global queries;
@@ -2734,8 +2757,10 @@ The detailed backlog behind that summary is:
    ReleaseSafe gate passed 15/15 under record and fresh-state replay at its
    cited checkpoint. V14 now keeps the production-owner graph and serverless
    clients co-scheduled with that transition and passes 15/15 on the current
-   tree. Next add v9's transport/restart/resource fault modes and remove the
-   current co-location assumption with
+   tree. V15 adds a real remote-owner graph-transport cut during that split,
+   proves typed fail-closed recovery, and passes 15/15 at 450,000 transitions.
+   Next add v9's remaining restart/topology/partial-write/resource fault modes
+   and remove the current co-location assumption with
    disjoint donor/receiver replica sets, page
    retained delete-history replay within an explicit resource budget, inject
    partitions, and prove snapshot install rehydrates each live DB owner and its
@@ -2756,7 +2781,10 @@ The detailed backlog behind that summary is:
    `DataServer`/data-Raft owners and exact-replays the repaired ReadState/full-
    index visibility contract. V14 composes that seam with item 1's active
    split and proves complete-or-fail-closed behavior in flight plus complete
-   traversal after cutover. Next add v9's transport/restart/resource modes and
+   traversal after cutover. V15 now adds one scoped remote-owner transport
+   failure during the active split, a no-partial typed 503, healing, and a
+   complete post-cutover traversal. Next add v9's remaining
+   restart/topology/partial-write/resource modes and
    compose cancellation, authorization change, and public document hydration. Add
    distributed joins and global queries with the same fail-closed publication
    rule; introduce an explicit partial-response schema only if product semantics
@@ -2930,10 +2958,13 @@ non-owner public routing, asynchronous ReadIndex, stale-fallback, and derived-
 index visibility defects. V14 now overlaps that graph with the active split,
 requires complete-or-fail-closed behavior while the transition is nonterminal,
 requires complete traversals after post-cutover publication, and passes its
-current-tree 15/15 gate. It does not yet overlap v9 fault modes. Continue by
-extending coverage through disjoint placement, bounded transfer, partitions, and
-projection/DB/derived-state snapshot recovery; then by running public graph requests
-under those replicated topology transitions, cancellation, authorization, and
+current-tree 15/15 gate. V15 adds one scoped real next-owner graph-transport
+failure during that split, requires the typed no-partial 503, heals, and passes
+its 450,000-transition record and fresh-world exact replay 15/15. It does not
+yet overlap v9's restart, topology, partial-write, or resource modes. Continue
+by extending coverage through disjoint placement, bounded transfer, partitions,
+and projection/DB/derived-state snapshot recovery; then by running public graph
+requests under those replicated topology transitions, cancellation, authorization, and
 hydration faults; distributed joins/global queries under real worker failure;
 co-resident HA/data-plane owners; authenticated tenants; resource interference;
 and eventually live mixed-version operation—without
