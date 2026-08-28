@@ -1188,12 +1188,13 @@ const ProjectedCoreSnapshot = struct {
             if (intent.record.backup_restore_bootstrap) |record| {
                 out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
                     record.location.len + record.snapshot_path.len + record.connection.len +
-                    record.artifact_sha256.len;
+                    record.artifact_sha256.len + record.native_manifest_sha256.len;
             }
         }
         for (self.restore_progresses) |record| {
             out.estimated_bytes += record.backup_id.len + record.artifact_backup_id.len +
                 record.location.len + record.snapshot_path.len + record.artifact_sha256.len +
+                record.native_manifest_sha256.len +
                 record.phase.len + record.last_error.len;
         }
         for (self.replication_source_statuses) |record| {
@@ -1238,7 +1239,8 @@ const CatalogValidationSnapshot = struct {
             out.estimated_bytes += record.start_key.len + optionalLen(record.end_key) +
                 record.restore_backup_id.len + record.restore_artifact_backup_id.len +
                 record.restore_location.len + record.restore_snapshot_path.len +
-                record.restore_connection.len + record.restore_artifact_sha256.len;
+                record.restore_connection.len + record.restore_artifact_sha256.len +
+                record.restore_native_manifest_sha256.len;
         }
     }
 };
@@ -7466,6 +7468,8 @@ fn restoreProgressEquivalent(a: metadata_table_manager.RestoreProgressRecord, b:
         std.mem.eql(u8, a.location, b.location) and
         std.mem.eql(u8, a.snapshot_path, b.snapshot_path) and
         std.mem.eql(u8, a.artifact_sha256, b.artifact_sha256) and
+        a.native_manifest_size_bytes == b.native_manifest_size_bytes and
+        std.mem.eql(u8, a.native_manifest_sha256, b.native_manifest_sha256) and
         a.primary_restored == b.primary_restored and
         a.runtime_repair_complete == b.runtime_repair_complete and
         std.mem.eql(u8, a.phase, b.phase) and
@@ -7552,6 +7556,8 @@ fn rangeRestoreIntentComplete(
         if (!std.mem.eql(u8, restored.location, restore_location)) return false;
         if (!std.mem.eql(u8, restored.snapshot_path, range.restore_snapshot_path)) return false;
         if (!std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256)) return false;
+        if (restored.native_manifest_size_bytes != range.restore_native_manifest_size_bytes) return false;
+        if (!std.mem.eql(u8, restored.native_manifest_sha256, range.restore_native_manifest_sha256)) return false;
         if (!restored.primary_restored or !restored.runtime_repair_complete) return false;
     }
     return found_any_placement;
@@ -9870,6 +9876,8 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         hashProjectedProvisioningBytes(&hasher, range.restore_connection);
         hasher.update(std.mem.asBytes(&range.restore_artifact_size_bytes));
         hashProjectedProvisioningBytes(&hasher, range.restore_artifact_sha256);
+        hasher.update(std.mem.asBytes(&range.restore_native_manifest_size_bytes));
+        hashProjectedProvisioningBytes(&hasher, range.restore_native_manifest_sha256);
         hasher.update(&range.completed_restore_fingerprint);
     }
 
@@ -9896,11 +9904,14 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
         if (intent.record.backup_restore_bootstrap) |restore| {
             hasher.update(&.{1});
             hashProjectedProvisioningBytes(&hasher, restore.backup_id);
+            hashProjectedProvisioningBytes(&hasher, restore.artifact_backup_id);
             hashProjectedProvisioningBytes(&hasher, restore.location);
             hashProjectedProvisioningBytes(&hasher, restore.snapshot_path);
             hashProjectedProvisioningBytes(&hasher, restore.connection);
             hasher.update(std.mem.asBytes(&restore.artifact_size_bytes));
             hashProjectedProvisioningBytes(&hasher, restore.artifact_sha256);
+            hasher.update(std.mem.asBytes(&restore.native_manifest_size_bytes));
+            hashProjectedProvisioningBytes(&hasher, restore.native_manifest_sha256);
         } else {
             hasher.update(&.{0});
         }

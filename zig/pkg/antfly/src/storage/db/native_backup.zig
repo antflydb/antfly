@@ -98,6 +98,9 @@ pub const InvalidProjectionReason = enum {
     missing_artifact,
     integrity_mismatch,
     backend_mismatch,
+    config_mismatch,
+    coverage_mismatch,
+    checkpoint_mismatch,
     capture_repair_required,
     unreadable,
 };

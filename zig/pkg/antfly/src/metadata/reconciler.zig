@@ -1288,7 +1288,9 @@ fn backupRestoreBootstrapEqual(
         std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path) and
         std.mem.eql(u8, a.?.connection, b.?.connection) and
         a.?.artifact_size_bytes == b.?.artifact_size_bytes and
-        std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256);
+        std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256) and
+        a.?.native_manifest_size_bytes == b.?.native_manifest_size_bytes and
+        std.mem.eql(u8, a.?.native_manifest_sha256, b.?.native_manifest_sha256);
 }
 
 fn findPlacementIntent(intents: []const raft_reconciler.PlacementIntent, group_id: u64, local_node_id: u64) ?raft_reconciler.PlacementIntent {
@@ -1332,6 +1334,8 @@ fn normalizeRestoreBootstrapIntent(
         range.restore_location,
         range.restore_snapshot_path,
         range.restore_artifact_sha256,
+        range.restore_native_manifest_size_bytes,
+        range.restore_native_manifest_sha256,
     )) |progress| {
         if (!progress.primary_restored) return effective;
         effective.record.bootstrap_mode = .persisted;
@@ -1348,6 +1352,8 @@ fn normalizeRestoreBootstrapIntent(
             .connection = range.restore_connection,
             .artifact_size_bytes = range.restore_artifact_size_bytes,
             .artifact_sha256 = range.restore_artifact_sha256,
+            .native_manifest_size_bytes = range.restore_native_manifest_size_bytes,
+            .native_manifest_sha256 = range.restore_native_manifest_sha256,
         };
     }
     return effective;
@@ -2089,6 +2095,8 @@ fn findRestoreProgress(
     location: []const u8,
     snapshot_path: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64,
+    native_manifest_sha256: []const u8,
 ) ?table_manager.RestoreProgressRecord {
     for (records) |record| {
         if (record.table_id != table_id) continue;
@@ -2098,6 +2106,8 @@ fn findRestoreProgress(
         if (!std.mem.eql(u8, record.location, location)) continue;
         if (!std.mem.eql(u8, record.snapshot_path, snapshot_path)) continue;
         if (!std.mem.eql(u8, record.artifact_sha256, artifact_sha256)) continue;
+        if (record.native_manifest_size_bytes != native_manifest_size_bytes) continue;
+        if (!std.mem.eql(u8, record.native_manifest_sha256, native_manifest_sha256)) continue;
         return record;
     }
     return null;
@@ -3736,6 +3746,8 @@ fn rangeRecordsEqual(a: table_manager.RangeRecord, b: table_manager.RangeRecord)
         std.mem.eql(u8, a.restore_connection, b.restore_connection) and
         a.restore_artifact_size_bytes == b.restore_artifact_size_bytes and
         std.mem.eql(u8, a.restore_artifact_sha256, b.restore_artifact_sha256) and
+        a.restore_native_manifest_size_bytes == b.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, a.restore_native_manifest_sha256, b.restore_native_manifest_sha256) and
         std.mem.eql(
             u8,
             &a.completed_restore_fingerprint,

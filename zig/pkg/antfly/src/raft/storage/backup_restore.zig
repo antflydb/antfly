@@ -37,6 +37,8 @@ pub const RestoreSource = struct {
     authority: RestoreAuthority,
     expected_artifact_size_bytes: u64,
     expected_artifact_sha256: []const u8,
+    expected_native_manifest_size_bytes: u64 = 0,
+    expected_native_manifest_sha256: []const u8 = "",
     manifest: ?*const backups_api.TableBackupManifest = null,
     io: ?std.Io = null,
     cancellation: CancellationToken = .none,
@@ -118,6 +120,11 @@ fn validateExpectedArtifactBinding(
     {
         return error.RestoreArtifactIdentityMismatch;
     }
+    if (restore.expected_native_manifest_size_bytes != shard.native_manifest_size_bytes or
+        !std.mem.eql(u8, restore.expected_native_manifest_sha256, shard.native_manifest_sha256))
+    {
+        return error.RestoreArtifactIdentityMismatch;
+    }
 }
 
 pub const RestoreOptions = struct {
@@ -182,8 +189,60 @@ pub fn applyRestoreSnapshotToPathWithExclusiveTransition(
         options,
     )) orelse return;
     defer prepared.deinit();
+    try repairPreparedRestoreUntilComplete(alloc, &prepared, restore, options);
     const outcome = try publishPreparedRestore(alloc, path, &prepared);
     if (outcome == .durability_uncertain) return error.GenerationDurabilityUncertain;
+}
+
+fn repairPreparedRestoreUntilComplete(
+    alloc: std.mem.Allocator,
+    prepared: *const db_mod.generation_lifecycle.StagedGeneration,
+    restore: RestoreSource,
+    options: RestoreOptions,
+) !void {
+    var io_scope = try RestoreIoScope.init(alloc, restore);
+    defer io_scope.deinit();
+    const io = io_scope.io();
+    var state = (try db_mod.DB.readRestoreStateForPathWithIo(alloc, io, prepared.path())) orelse return;
+    defer state.deinit(alloc);
+    // Legacy/portable repair may require table-managed provider wiring and is
+    // completed by the provisioning restore job. Native selective repair is
+    // self-contained and must finish before this lower-level bootstrap can
+    // publish the candidate.
+    if (!std.mem.eql(u8, state.phase, "repair_indexes")) return;
+
+    const open_options = db_mod.OpenOptions{
+        .open_mode = .writer_no_replay,
+        .identity_namespace = options.expected_identity_namespace,
+        .prefer_existing_identity_namespace = true,
+        .staged_generation = prepared,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+    };
+    var restored = try db_mod.DB.open(alloc, prepared.path(), open_options);
+    defer restored.close();
+    while (try restored.restoreRuntimeRepairNeeded()) {
+        try restore.cancellation.check();
+        _ = restored.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io) catch |err| switch (err) {
+            error.RestoreRuntimeRepairIncomplete,
+            error.RestoreDenseArtifactRebuildIncomplete,
+            error.RestoreDenseConfigProofIncomplete,
+            error.RestoreDenseCounterProofIncomplete,
+            error.RestoreDenseIndexProofIncomplete,
+            error.RestoreDenseCoverageProofIncomplete,
+            error.RestoreDenseCheckpointIncomplete,
+            error.RestoreIndexAvailabilityIncomplete,
+            => {
+                io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
+                    error.Canceled => std.Io.recancel(io),
+                };
+                continue;
+            },
+            else => return err,
+        };
+    }
+    try restored.syncIndexes(true);
 }
 
 /// Builds and validates a replacement generation without mutating the live
@@ -285,6 +344,8 @@ pub fn validateCommittedRestoreIdentityWithIo(
         !std.mem.eql(u8, state.backup_id, restore.backup_id) or
         !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
         !std.mem.eql(u8, state.artifact_sha256, restore.expected_artifact_sha256) or
+        state.native_manifest_size_bytes != restore.expected_native_manifest_size_bytes or
+        !std.mem.eql(u8, state.native_manifest_sha256, restore.expected_native_manifest_sha256) or
         !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
     {
         return error.RestoreIdentityMismatch;
@@ -332,6 +393,8 @@ pub fn validateImportedRestoreIdentityWithIo(
         !std.mem.eql(u8, state.backup_id, restore.backup_id) or
         !std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) or
         !std.mem.eql(u8, state.artifact_sha256, restore.expected_artifact_sha256) or
+        state.native_manifest_size_bytes != restore.expected_native_manifest_size_bytes or
+        !std.mem.eql(u8, state.native_manifest_sha256, restore.expected_native_manifest_sha256) or
         !std.mem.eql(u8, state.snapshot_path, restore.snapshot_path))
     {
         return error.RestoreIdentityMismatch;
@@ -365,6 +428,8 @@ pub fn applyBackupRestoreFromRecordWithOptions(
         .authority = .{ .external = restore.connection },
         .expected_artifact_size_bytes = restore.artifact_size_bytes,
         .expected_artifact_sha256 = restore.artifact_sha256,
+        .expected_native_manifest_size_bytes = restore.native_manifest_size_bytes,
+        .expected_native_manifest_sha256 = restore.native_manifest_sha256,
         .open_options = open_options,
     };
     if (try publishedRestoreAlreadyApplied(alloc, path, group_id, source)) return;
@@ -391,6 +456,8 @@ fn prepareRestoreSnapshotIfNeeded(
             std.mem.eql(u8, state.backup_id, restore.backup_id) and
             std.mem.eql(u8, state.location, restoreIdentityLocation(restore)) and
             std.mem.eql(u8, state.artifact_sha256, restore.expected_artifact_sha256) and
+            state.native_manifest_size_bytes == restore.expected_native_manifest_size_bytes and
+            std.mem.eql(u8, state.native_manifest_sha256, restore.expected_native_manifest_sha256) and
             std.mem.eql(u8, state.snapshot_path, restore.snapshot_path) and
             state.group_id == group_id)
         {
@@ -484,6 +551,8 @@ fn prepareRestoreSnapshot(
         .backup_id = restore.backup_id,
         .location = restoreIdentityLocation(restore),
         .artifact_sha256 = shard.artifact_sha256,
+        .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+        .native_manifest_sha256 = shard.native_manifest_sha256,
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     }, restore.cancellation);
@@ -540,16 +609,15 @@ fn applyPortableRestore(
     db.close();
     db_closed = true;
     destroyPathIfExists(indexes_path);
-    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifactWithIo(
-        alloc,
-        io,
-        path,
-        restore.backup_id,
-        restoreIdentityLocation(restore),
-        shard.artifact_sha256,
-        shard.snapshot_path,
-        group_id,
-    );
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithIdentityWithIo(alloc, io, path, .{
+        .backup_id = restore.backup_id,
+        .location = restoreIdentityLocation(restore),
+        .artifact_sha256 = shard.artifact_sha256,
+        .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+        .native_manifest_sha256 = shard.native_manifest_sha256,
+        .snapshot_path = shard.snapshot_path,
+        .group_id = group_id,
+    });
 }
 
 fn resolveRestoreShard(
@@ -690,6 +758,39 @@ fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) !
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
+}
+
+test "restore binding pins the authenticated native generation manifest" {
+    const artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const native_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const shard = backups_api.ShardSnapshot{
+        .group_id = 7,
+        .start_key = "",
+        .snapshot_path = "backup/groups/7",
+        .artifact_size_bytes = 4096,
+        .artifact_sha256 = artifact_sha256,
+        .native_manifest_size_bytes = 512,
+        .native_manifest_sha256 = native_sha256,
+    };
+    const exact = RestoreSource{
+        .backup_id = "backup",
+        .artifact_backup_id = "backup-artifacts",
+        .location = "file:///tmp/backup",
+        .snapshot_path = shard.snapshot_path,
+        .authority = .staged_local,
+        .expected_artifact_size_bytes = shard.artifact_size_bytes,
+        .expected_artifact_sha256 = artifact_sha256,
+        .expected_native_manifest_size_bytes = shard.native_manifest_size_bytes,
+        .expected_native_manifest_sha256 = native_sha256,
+    };
+    try validateExpectedArtifactBinding(exact, &shard);
+
+    var changed_inner_manifest = exact;
+    changed_inner_manifest.expected_native_manifest_sha256 = artifact_sha256;
+    try std.testing.expectError(
+        error.RestoreArtifactIdentityMismatch,
+        validateExpectedArtifactBinding(changed_inner_manifest, &shard),
+    );
 }
 
 fn reconcileDbIndexes(

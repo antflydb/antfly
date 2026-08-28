@@ -3541,6 +3541,19 @@ pub const IndexManager = struct {
         };
     }
 
+    /// Native backup is a physical-generation contract, not merely a codec
+    /// label. Backends opt in only when a durable boundary can be converted to
+    /// immutable files that remain stable after capture admission reopens.
+    pub fn nativeBackupSupportsImmutableCheckpoint(self: *const IndexManager, kind: types.IndexKind) bool {
+        return switch (kind) {
+            .full_text => self.text_main_backend == .lsm,
+            .dense_vector => self.dense_storage_backend == .lsm,
+            .sparse_vector => self.sparse_backend == .lsm,
+            .graph => self.graph_reverse_backend == .lsm,
+            .algebraic => true,
+        };
+    }
+
     /// Publish every mutable LSM generation before native snapshot pinning.
     /// This is intentionally separate from `syncAll`: sync is a durability
     /// operation, while this establishes manifested immutable runs. Native

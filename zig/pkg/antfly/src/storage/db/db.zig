@@ -2388,6 +2388,8 @@ pub const RestoreState = struct {
     backup_id: []u8,
     location: []u8,
     artifact_sha256: []u8,
+    native_manifest_size_bytes: u64,
+    native_manifest_sha256: []u8,
     snapshot_path: []u8,
     group_id: u64,
     phase: []u8,
@@ -2399,6 +2401,7 @@ pub const RestoreState = struct {
         alloc.free(self.backup_id);
         alloc.free(self.location);
         alloc.free(self.artifact_sha256);
+        alloc.free(self.native_manifest_sha256);
         alloc.free(self.snapshot_path);
         alloc.free(self.phase);
         alloc.free(self.last_error);
@@ -2410,6 +2413,8 @@ pub const RestoreIdentity = struct {
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     snapshot_path: []const u8,
     group_id: u64,
 };
@@ -2422,6 +2427,8 @@ const RestoreStateDisk = struct {
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     snapshot_path: []const u8,
     group_id: u64,
     phase: []const u8,
@@ -2436,6 +2443,8 @@ const RestoreImportDisk = struct {
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     snapshot_path: []const u8,
     group_id: u64,
 };
@@ -2445,6 +2454,8 @@ fn restoreStateAlloc(
     backup_id: []const u8,
     location: []const u8,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64,
+    native_manifest_sha256: []const u8,
     snapshot_path: []const u8,
     group_id: u64,
     phase: []const u8,
@@ -2458,6 +2469,8 @@ fn restoreStateAlloc(
     errdefer alloc.free(location_owned);
     const artifact_sha256_owned = try alloc.dupe(u8, artifact_sha256);
     errdefer alloc.free(artifact_sha256_owned);
+    const native_manifest_sha256_owned = try alloc.dupe(u8, native_manifest_sha256);
+    errdefer alloc.free(native_manifest_sha256_owned);
     const snapshot_path_owned = try alloc.dupe(u8, snapshot_path);
     errdefer alloc.free(snapshot_path_owned);
     const phase_owned = try alloc.dupe(u8, phase);
@@ -2469,6 +2482,8 @@ fn restoreStateAlloc(
         .backup_id = backup_id_owned,
         .location = location_owned,
         .artifact_sha256 = artifact_sha256_owned,
+        .native_manifest_size_bytes = native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256_owned,
         .snapshot_path = snapshot_path_owned,
         .group_id = group_id,
         .phase = phase_owned,
@@ -2501,6 +2516,8 @@ fn validRestoreIdentity(identity: RestoreIdentity) bool {
     return identity.backup_id.len > 0 and
         identity.location.len > 0 and
         validRestoreArtifactSha256(identity.artifact_sha256) and
+        ((identity.native_manifest_size_bytes == 0 and identity.native_manifest_sha256.len == 0) or
+            (identity.native_manifest_size_bytes > 0 and validRestoreArtifactSha256(identity.native_manifest_sha256))) and
         identity.snapshot_path.len > 0 and
         identity.group_id != 0;
 }
@@ -2562,6 +2579,8 @@ fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8
         disk.backup_id.len == 0 or
         disk.location.len == 0 or
         !validRestoreArtifactSha256(disk.artifact_sha256) or
+        ((disk.native_manifest_size_bytes == 0) != (disk.native_manifest_sha256.len == 0)) or
+        (disk.native_manifest_sha256.len > 0 and !validRestoreArtifactSha256(disk.native_manifest_sha256)) or
         disk.snapshot_path.len == 0 or
         disk.group_id == 0 or
         disk.phase.len == 0)
@@ -2573,6 +2592,8 @@ fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8
         disk.backup_id,
         disk.location,
         disk.artifact_sha256,
+        disk.native_manifest_size_bytes,
+        disk.native_manifest_sha256,
         disk.snapshot_path,
         disk.group_id,
         disk.phase,
@@ -2593,6 +2614,8 @@ fn writeRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8, st
         .backup_id = state.backup_id,
         .location = state.location,
         .artifact_sha256 = state.artifact_sha256,
+        .native_manifest_size_bytes = state.native_manifest_size_bytes,
+        .native_manifest_sha256 = state.native_manifest_sha256,
         .snapshot_path = state.snapshot_path,
         .group_id = state.group_id,
     }) or state.phase.len == 0) return error.InvalidRestoreState;
@@ -2603,6 +2626,8 @@ fn writeRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8, st
         .backup_id = state.backup_id,
         .location = state.location,
         .artifact_sha256 = state.artifact_sha256,
+        .native_manifest_size_bytes = state.native_manifest_size_bytes,
+        .native_manifest_sha256 = state.native_manifest_sha256,
         .snapshot_path = state.snapshot_path,
         .group_id = state.group_id,
         .phase = state.phase,
@@ -2638,6 +2663,8 @@ fn readRestoreImportStateAllocWithIo(alloc: Allocator, io: Io, path: []const u8)
         disk.backup_id.len == 0 or
         disk.location.len == 0 or
         !validRestoreArtifactSha256(disk.artifact_sha256) or
+        ((disk.native_manifest_size_bytes == 0) != (disk.native_manifest_sha256.len == 0)) or
+        (disk.native_manifest_sha256.len > 0 and !validRestoreArtifactSha256(disk.native_manifest_sha256)) or
         disk.snapshot_path.len == 0 or
         disk.group_id == 0)
     {
@@ -2650,6 +2677,8 @@ fn readRestoreImportStateAllocWithIo(alloc: Allocator, io: Io, path: []const u8)
         disk.backup_id,
         disk.location,
         disk.artifact_sha256,
+        disk.native_manifest_size_bytes,
+        disk.native_manifest_sha256,
         disk.snapshot_path,
         disk.group_id,
         "runtime_repair",
@@ -13129,6 +13158,27 @@ pub const DB = struct {
         next_retry_at_ms: u64 = 0,
     };
 
+    /// Advances one durable projection-repair intent created while validating
+    /// a native restore. `true` means the staged generation has no remaining
+    /// repair debt and is eligible for sealing/publication. Existing healthy
+    /// projections are never reset or replayed by this path.
+    pub fn repairNativeRestoreProjectionIntentsStep(
+        self: *DB,
+        alloc: Allocator,
+        options: types.ArtifactRepairRunOptions,
+    ) !bool {
+        const before = try self.indexRepairIntentSummary(alloc);
+        if (before.terminal != 0) return error.NativeBackupProjectionRepairFailed;
+        if (before.paused != 0) return error.NativeBackupProjectionRepairPaused;
+        if (before.runnable == 0) return true;
+
+        const result = try self.repairRecoverableStartupIndexFailures(alloc, 1, options);
+        const after = try self.indexRepairIntentSummary(alloc);
+        if (after.terminal != 0) return error.NativeBackupProjectionRepairFailed;
+        if (after.paused != 0) return error.NativeBackupProjectionRepairPaused;
+        return result.remaining == 0 and after.runnable == 0;
+    }
+
     /// Bounded owner-side pass used by managed startup workers and periodic
     /// repair scans. Discovery itself is cheap; callers choose when execution
     /// is admitted by passing a small `limit` (normally one per node).
@@ -15689,7 +15739,14 @@ pub const DB = struct {
                 return error.NativeBackupProjectionNotQuiescent;
             }
             const backend_id = self.core.index_manager.nativeBackupBackendId(cfg.kind);
-            const has_immutable_checkpoint = cfg.kind == .algebraic or std.mem.eql(u8, backend_id, "lsm");
+            const has_immutable_checkpoint = self.core.index_manager.nativeBackupSupportsImmutableCheckpoint(cfg.kind);
+            if (!has_immutable_checkpoint) {
+                std.log.err(
+                    "native backup requires an immutable projection checkpoint index={s} kind={s} backend={s}",
+                    .{ cfg.name, @tagName(cfg.kind), backend_id },
+                );
+                return error.NativeBackupProjectionBackendUnsupported;
+            }
             projections[i] = .{
                 .name = cfg.name,
                 .kind = @tagName(cfg.kind),
@@ -15702,8 +15759,8 @@ pub const DB = struct {
                 .artifact_version = 1,
                 .backend_id = backend_id,
                 .codec_version = 1,
-                .artifact_state = if (has_immutable_checkpoint) .complete else .repair_required,
-                .repair_reason = if (has_immutable_checkpoint) "" else "backend_has_no_immutable_native_checkpoint",
+                .artifact_state = .complete,
+                .repair_reason = "",
             };
         }
         std.mem.sort(native_backup.Projection, projections, {}, struct {
@@ -15802,11 +15859,12 @@ pub const DB = struct {
     ) !void {
         try cancellation.check();
         const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.io() else null;
+        const identity_io = if (restore_identity != null)
+            shared_io orelse return error.BackendRuntimeIoUnavailable
+        else
+            null;
         if (restore_identity) |identity| {
-            if (shared_io) |io|
-                try beginRestoreImportWithIo(alloc, io, path, snapshot_root, identity)
-            else
-                try beginRestoreImport(alloc, path, snapshot_root, identity);
+            try beginRestoreImportWithIo(alloc, identity_io.?, path, snapshot_root, identity);
         }
         const physical_primary = if (native_manifest) |manifest|
             std.mem.eql(u8, manifest.primary.artifact_format, "antfly-lsm-checkpoint")
@@ -15857,27 +15915,7 @@ pub const DB = struct {
                 try loadOrCreateDurableRootIdentity(alloc, opts.backend_runtime, path);
         }
         if (restore_identity) |identity| {
-            if (shared_io) |io|
-                try markRestorePrimaryRestoredForPathWithArtifactWithIo(
-                    alloc,
-                    io,
-                    path,
-                    identity.backup_id,
-                    identity.location,
-                    identity.artifact_sha256,
-                    identity.snapshot_path,
-                    identity.group_id,
-                )
-            else
-                try markRestorePrimaryRestoredForPathWithArtifact(
-                    alloc,
-                    path,
-                    identity.backup_id,
-                    identity.location,
-                    identity.artifact_sha256,
-                    identity.snapshot_path,
-                    identity.group_id,
-                );
+            try markRestorePrimaryRestoredForPathWithIdentityWithIo(alloc, identity_io.?, path, identity);
         }
     }
 
@@ -15920,36 +15958,17 @@ pub const DB = struct {
         opts: OpenOptions,
         identity: RestoreIdentity,
     ) !void {
-        try staged_generation.validatePath(path);
-        if (comptime builtin.os.tag == .freestanding) {
-            try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, null, .none, null);
-            return;
-        }
-        var io_impl = threadedIo();
-        defer io_impl.deinit();
-        const io = io_impl.io();
-        var native_generation = try native_backup.validateAndMaterializeWithCancellation(
+        const runtime = opts.backend_runtime orelse return error.BackendRuntimeIoUnavailable;
+        const io = runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        return try restoreSnapshotToDeferredRuntimeRepairWithIo(
+            staged_generation,
             alloc,
             io,
-            snapshot_root,
-            path,
-            .none,
-        );
-        defer if (native_generation) |*generation| generation.deinit();
-        if (native_generation) |*generation|
-            try classifyAndDiscardIncompatibleNativeProjections(generation, io, path, opts);
-        try restoreSnapshotStoreTo(
-            alloc,
             snapshot_root,
             path,
             opts,
             identity,
-            io,
-            .none,
-            if (native_generation) |*generation| generation.value() else null,
         );
-        if (native_generation) |*generation|
-            try validateInstalledNativeBackupGeneration(staged_generation, alloc, io, path, opts, generation, true);
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepairWithIo(
@@ -16120,8 +16139,10 @@ pub const DB = struct {
             var restored = try DB.open(alloc, path, validation_opts);
             defer restored.close();
             for (native_generation.invalid_projections.items) |invalid| {
-                const cfg = restored.core.index_manager.get(invalid.name) orelse
-                    return error.NativeBackupProjectionMismatch;
+                // A projection present only in the native manifest is stale
+                // relative to the restored catalog. Its files were discarded,
+                // but there is no configured runtime generation to repair.
+                const cfg = restored.core.index_manager.get(invalid.name) orelse continue;
                 const previous = try restored.core.loadProjectionCheckpoint(alloc, invalid.name);
                 try restored.core.saveProjectionCheckpoint(invalid.name, .{
                     .applied_sequence = 0,
@@ -16140,6 +16161,9 @@ pub const DB = struct {
                 );
             }
             try restored.core.index_manager.syncAll(true);
+            if (complete_runtime_repair) {
+                try restored.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "repair_indexes", false);
+            }
         } else if (complete_runtime_repair) {
             try markRestoreRuntimeRepairCompleteWithIo(alloc, io, path);
         }
@@ -16149,20 +16173,45 @@ pub const DB = struct {
         const manifest = native_generation.value();
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
-        if (configs.len != manifest.projections.len)
-            return error.NativeBackupProjectionMismatch;
+
+        // A catalog projection omitted from the physical generation is local
+        // repair debt, not permission to reject an otherwise valid primary
+        // snapshot. It will receive a durable repair intent below.
+        for (configs) |cfg| {
+            var found = false;
+            for (manifest.projections) |projection| {
+                if (std.mem.eql(u8, projection.name, cfg.name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try native_generation.invalidateProjection(cfg.name, .missing_artifact);
+        }
 
         for (manifest.projections) |projection| {
             if (native_generation.projectionInvalid(projection.name)) continue;
-            const cfg = self.core.index_manager.get(projection.name) orelse
-                return error.NativeBackupProjectionMismatch;
+            const cfg = blk: {
+                for (configs) |*candidate| {
+                    if (std.mem.eql(u8, projection.name, candidate.name)) break :blk candidate;
+                }
+                try native_generation.invalidateProjection(projection.name, .config_mismatch);
+                continue;
+            };
             if (!std.mem.eql(u8, projection.kind, @tagName(cfg.kind)) or
-                projection.config_hash != types.indexConfigHash(cfg.*) or
-                projection.coverage_generation != cfg.coverage_generation or
-                projection.target_sequence != manifest.capture_target_sequence or
+                projection.config_hash != types.indexConfigHash(cfg.*))
+            {
+                try native_generation.invalidateProjection(projection.name, .config_mismatch);
+                continue;
+            }
+            if (projection.coverage_generation != cfg.coverage_generation) {
+                try native_generation.invalidateProjection(projection.name, .coverage_mismatch);
+                continue;
+            }
+            if (projection.target_sequence != manifest.capture_target_sequence or
                 projection.applied_sequence != projection.target_sequence)
             {
-                return error.NativeBackupProjectionMismatch;
+                try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
+                continue;
             }
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, projection.name);
             if (checkpoint.status != .clean or
@@ -16182,11 +16231,19 @@ pub const DB = struct {
                     projection.applied_sequence,
                     projection.target_sequence,
                 });
-                return error.NativeBackupProjectionCheckpointMismatch;
-            }
-            if (self.core.index_manager.loadFailure(projection.name) != null) {
-                try native_generation.invalidateProjection(projection.name, .unreadable);
+                try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
                 continue;
+            }
+            if (self.core.index_manager.loadFailure(projection.name)) |err_name| {
+                if (nativeBackupProjectionLoadFailureIsRepairable(err_name)) {
+                    try native_generation.invalidateProjection(projection.name, .unreadable);
+                    continue;
+                }
+                // Unknown, resource, and transient I/O failures are not proof
+                // that a checksummed generation is corrupt. Leave the staged
+                // tree intact so the asynchronous restore job can retry.
+                std.log.warn("native backup projection validation deferred index={s} err={s}", .{ projection.name, err_name });
+                return error.NativeBackupProjectionValidationIndeterminate;
             }
             if (cfg.kind == .dense_vector) {
                 const dense = self.core.index_manager.denseIndex(projection.name) orelse {
@@ -16194,12 +16251,36 @@ pub const DB = struct {
                     continue;
                 };
                 if (@hasDecl(@TypeOf(dense.index), "validateStoredStructure")) {
-                    dense.index.validateStoredStructure(alloc) catch {
-                        try native_generation.invalidateProjection(projection.name, .unreadable);
+                    dense.index.validateStoredStructure(alloc) catch |err| switch (err) {
+                        error.NotFound, error.FileNotFound, error.Corrupted => {
+                            try native_generation.invalidateProjection(projection.name, .unreadable);
+                        },
+                        else => {
+                            // A transient resource or I/O failure is not
+                            // evidence that the checksummed artifact is bad.
+                            // Preserve the staged generation and let the
+                            // durable restore job retry validation.
+                            std.log.warn("native backup dense projection validation deferred index={s} err={s}", .{ projection.name, @errorName(err) });
+                            return error.NativeBackupProjectionValidationIndeterminate;
+                        },
                     };
                 }
             }
         }
+    }
+
+    fn nativeBackupProjectionLoadFailureIsRepairable(err_name: []const u8) bool {
+        const repairable = [_][]const u8{
+            "Corrupted",
+            "FileNotFound",
+            "NotFound",
+            "UnsupportedVersion",
+            "IncompleteBulkPublish",
+        };
+        for (repairable) |candidate| {
+            if (std.mem.eql(u8, err_name, candidate)) return true;
+        }
+        return false;
     }
 
     fn classifyAndDiscardIncompatibleNativeProjections(
@@ -16252,6 +16333,8 @@ pub const DB = struct {
             .backup_id = identity.backup_id,
             .location = identity.location,
             .artifact_sha256 = identity.artifact_sha256,
+            .native_manifest_size_bytes = identity.native_manifest_size_bytes,
+            .native_manifest_sha256 = identity.native_manifest_sha256,
             .snapshot_path = identity.snapshot_path,
             .group_id = identity.group_id,
         }, .{});
@@ -16284,6 +16367,8 @@ pub const DB = struct {
             .backup_id = identity_state.backup_id,
             .location = identity_state.location,
             .artifact_sha256 = identity_state.artifact_sha256,
+            .native_manifest_size_bytes = identity_state.native_manifest_size_bytes,
+            .native_manifest_sha256 = identity_state.native_manifest_sha256,
             .snapshot_path = identity_state.snapshot_path,
             .group_id = identity_state.group_id,
         };
@@ -16333,7 +16418,35 @@ pub const DB = struct {
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "");
+        return try markRestorePrimaryRestoredForPathWithIdentityWithIo(alloc, io, path, .{
+            .backup_id = backup_id,
+            .location = location,
+            .artifact_sha256 = artifact_sha256,
+            .snapshot_path = snapshot_path,
+            .group_id = group_id,
+        });
+    }
+
+    pub fn markRestorePrimaryRestoredForPathWithIdentityWithIo(
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        identity: RestoreIdentity,
+    ) !void {
+        var state = try restoreStateAlloc(
+            alloc,
+            identity.backup_id,
+            identity.location,
+            identity.artifact_sha256,
+            identity.native_manifest_size_bytes,
+            identity.native_manifest_sha256,
+            identity.snapshot_path,
+            identity.group_id,
+            "runtime_repair",
+            true,
+            false,
+            "",
+        );
         defer state.deinit(alloc);
         try writeRestoreStateForPathWithIo(alloc, io, path, state);
         const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
@@ -16426,6 +16539,14 @@ pub const DB = struct {
         defer state.deinit(alloc);
         if (!state.primary_restored or state.runtime_repair_complete) return false;
         const phase = state.phase;
+
+        if (std.mem.eql(u8, phase, "repair_indexes")) {
+            std.log.info("restore runtime repair phase=repair_indexes", .{});
+            if (!try self.repairNativeRestoreProjectionIntentsStep(alloc, .{}))
+                return error.RestoreRuntimeRepairIncomplete;
+            try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "complete", true);
+            return true;
+        }
 
         if (std.mem.eql(u8, phase, "runtime_repair") or std.mem.eql(u8, phase, "reset_watermarks")) {
             std.log.info("restore runtime repair phase=reset_index_watermarks", .{});
@@ -92437,6 +92558,16 @@ test "db hbc posting lazy versus eager profile benchmark" {
     }
 }
 
+test "native restore deletes projections only for explicit physical corruption" {
+    try std.testing.expect(DB.nativeBackupProjectionLoadFailureIsRepairable("Corrupted"));
+    try std.testing.expect(DB.nativeBackupProjectionLoadFailureIsRepairable("FileNotFound"));
+    try std.testing.expect(DB.nativeBackupProjectionLoadFailureIsRepairable("UnsupportedVersion"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("OutOfMemory"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("InputOutput"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("TableReadChurn"));
+    try std.testing.expect(!DB.nativeBackupProjectionLoadFailureIsRepairable("UnknownBackendFailure"));
+}
+
 test "db native snapshot exports self-contained generation" {
     const alloc = std.testing.allocator;
 
@@ -92491,6 +92622,39 @@ test "db native snapshot exports self-contained generation" {
     try std.testing.expectEqual(native_backup.format_version, parsed_manifest.value.format_version);
     try std.testing.expectEqualStrings("antfly-lsm-checkpoint", parsed_manifest.value.primary.artifact_format);
     try std.testing.expectEqual(@as(u32, 1), parsed_manifest.value.primary.artifact_version);
+}
+
+test "db native snapshot rejects projections without immutable checkpoints" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
+            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+        } else |_| {}
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    // Install the physical backend before materializing the projection. DB
+    // config resolution deliberately couples backend overrides to their
+    // storage override, while this test needs a local LMDB generation.
+    db.core.index_manager.setDenseStorageBackend(.lmdb);
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:one", .value = "{\"embedding\":[1,0,0]}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expectError(
+        error.NativeBackupProjectionBackendUnsupported,
+        db.snapshotNative("unsupported-projection-backend"),
+    );
 }
 
 test "db native snapshot admission bounds capture under concurrent writes" {
@@ -92918,6 +93082,9 @@ test "db native restore preserves primary generation and repairs only a missing 
         },
     );
     try std.testing.expect(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, std.testing.io, staged.path()));
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, staged.path())).?;
+    defer restore_state.deinit(alloc);
+    try std.testing.expectEqualStrings("repair_indexes", restore_state.phase);
     const repair_path = try index_repair_state.checkpointPathAlloc(alloc, staged.path());
     defer alloc.free(repair_path);
     var repair_state = try index_repair_state.load(alloc, repair_path);
@@ -93049,9 +93216,10 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
         defer transition.deinit();
         var staged_generation = try transition.beginStaging();
         defer staged_generation.deinit();
-        try DB.restoreSnapshotToDeferredRuntimeRepair(
+        try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
             &staged_generation,
             alloc,
+            std.testing.io,
             snapshot_root,
             staged_generation.path(),
             .{
@@ -93187,9 +93355,10 @@ test "db deferred restore rejects strict doc identity namespace mismatch" {
     defer transition.deinit();
     var staged_generation = try transition.beginStaging();
     defer staged_generation.deinit();
-    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepair(
+    try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
         &staged_generation,
         alloc,
+        std.testing.io,
         snapshot_root,
         staged_generation.path(),
         .{

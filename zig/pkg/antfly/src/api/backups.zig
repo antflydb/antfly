@@ -10899,6 +10899,8 @@ fn deriveRestoreRange(
     errdefer alloc.free(restore_connection);
     const restore_artifact_sha256 = try alloc.dupe(u8, shard.artifact_sha256);
     errdefer alloc.free(restore_artifact_sha256);
+    const restore_native_manifest_sha256 = try alloc.dupe(u8, shard.native_manifest_sha256);
+    errdefer alloc.free(restore_native_manifest_sha256);
     return .{
         .group_id = shard.group_id,
         .table_id = table_id,
@@ -10911,6 +10913,8 @@ fn deriveRestoreRange(
         .restore_connection = restore_connection,
         .restore_artifact_size_bytes = shard.artifact_size_bytes,
         .restore_artifact_sha256 = restore_artifact_sha256,
+        .restore_native_manifest_size_bytes = shard.native_manifest_size_bytes,
+        .restore_native_manifest_sha256 = restore_native_manifest_sha256,
     };
 }
 

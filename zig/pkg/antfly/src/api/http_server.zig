@@ -7796,7 +7796,9 @@ pub const ApiHttpServer = struct {
                 range.restore_snapshot_path.len > 0 or
                 range.restore_connection.len > 0 or
                 range.restore_artifact_size_bytes > 0 or
-                range.restore_artifact_sha256.len > 0;
+                range.restore_artifact_sha256.len > 0 or
+                range.restore_native_manifest_size_bytes > 0 or
+                range.restore_native_manifest_sha256.len > 0;
             if (!has_active_restore) {
                 if (!std.mem.eql(
                     u8,
@@ -9602,6 +9604,7 @@ pub const ApiHttpServer = struct {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
+            error.NativeBackupProjectionBackendUnsupported => return error.UnsupportedBackupFormat,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
             else => {
@@ -9748,6 +9751,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedBackupMigrationState => error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => error.UnsupportedMultiRangeTable,
             error.UnsupportedBackupFormat => error.UnsupportedBackupFormat,
+            error.NativeBackupProjectionValidationIndeterminate => error.RestoreValidationPending,
             error.RestoreDurabilityPending, error.GenerationDurabilityUncertain => error.RestoreDurabilityPending,
             error.RestoreDurabilityConfirmed => error.RestoreDurabilityConfirmed,
             error.BackupManifestTooLarge => error.BackupManifestTooLarge,
@@ -13472,6 +13476,22 @@ pub const ApiHttpServer = struct {
                         },
                         else => {
                             if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
+                            if (err == error.RestoreValidationPending) {
+                                const retry_delay_ns = restoreRepositoryRetryDelayNs(
+                                    state.job_id,
+                                    state.attempt_id,
+                                );
+                                const retried = try self.restore_job_store.retryRunning(
+                                    self.alloc,
+                                    state,
+                                    @errorName(err),
+                                    retry_delay_ns,
+                                );
+                                self.alloc.free(retried);
+                                self.signalRestoreRetryWakeup();
+                                try self.ensureRestoreRetryWakeup();
+                                return;
+                            }
                             const failed = try self.restore_job_store.fail(self.alloc, state, @errorName(err));
                             self.alloc.free(failed);
                             return;
@@ -14018,6 +14038,14 @@ test "restore job ownership failures remain retryable" {
     try std.testing.expect(!restoreJobErrorIsFenced(error.InvalidArguments));
     try std.testing.expect(restoreJobFailureRequiresRecovery(false, error.OutOfMemory));
     try std.testing.expect(!restoreJobFailureRequiresRecovery(true, error.OutOfMemory));
+}
+
+test "native restore validation uncertainty remains an asynchronous retry" {
+    try std.testing.expectEqual(
+        @as(public_table_http.TableApi.ExecuteRestoreError, error.RestoreValidationPending),
+        ApiHttpServer.mapExecuteRestoreError(error.NativeBackupProjectionValidationIndeterminate),
+    );
+    try std.testing.expect(!restoreJobErrorIsFenced(error.RestoreValidationPending));
 }
 
 test "restore worker authority is fenced across leadership reacquisition" {

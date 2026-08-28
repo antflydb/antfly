@@ -707,6 +707,41 @@ fn repairRestoredDbRuntimeStateUntilCompleteWithIo(
     });
 }
 
+const NativeRestoreRepairCancellation = struct {
+    token: db_mod.types.CancellationToken,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.token.isCancelled();
+    }
+
+    fn check(self: *@This()) db_mod.types.RepairCancelCheck {
+        return .{ .ptr = self, .is_requested = requested };
+    }
+};
+
+fn repairNativeRestoreProjectionsUntilCompleteWithIo(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    io: Io,
+    cancellation: db_mod.types.CancellationToken,
+) !void {
+    var cancel_ctx = NativeRestoreRepairCancellation{ .token = cancellation };
+    var attempts: usize = 0;
+    while (true) {
+        try cancellation.check();
+        attempts += 1;
+        if (try db.repairNativeRestoreProjectionIntentsStep(alloc, .{
+            .cancel_check = cancel_ctx.check(),
+        })) break;
+        io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |err| switch (err) {
+            error.Canceled => Io.recancel(io),
+        };
+    }
+    try db.syncIndexes(true);
+    std.log.info("native restore projection repair complete attempts={d}", .{attempts});
+}
+
 const TestExecutionHook = struct {
     ptr: *anyopaque,
     run: *const fn (ptr: *anyopaque) void,
@@ -5489,12 +5524,8 @@ pub const BoundTableWriteSource = struct {
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
-        var owned_io: ?std.Io.Threaded = if (plan.io == null)
-            std.Io.Threaded.init(std.heap.page_allocator, .{})
-        else
-            null;
-        defer if (owned_io) |*io_impl| io_impl.deinit();
-        const restore_io = plan.io orelse owned_io.?.io();
+        const backend_runtime = open_options.backend_runtime orelse return error.MissingBackendRuntime;
+        const restore_io = plan.io orelse backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
 
         switch (plan.manifest.format) {
             .portable => {
@@ -5502,7 +5533,7 @@ pub const BoundTableWriteSource = struct {
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
-                try importPortableBackupFile(alloc, restored.core.store, snapshot_root, plan.io);
+                try importPortableBackupFileWithIo(alloc, restored.core.store, snapshot_root, restore_io);
                 try plan.cancellation.check();
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
                 try plan.cancellation.check();
@@ -5537,6 +5568,25 @@ pub const BoundTableWriteSource = struct {
                     try plan.cancellation.check();
                     try restored.rebuildGraphIndexesForTargetCoverage(alloc);
                     try restored.syncIndexes(true);
+                } else {
+                    // Native validation may have retained healthy projections
+                    // while creating durable intents for only the damaged or
+                    // incompatible ones. Keep the candidate unservable until
+                    // every such intent has activated and validated.
+                    var staged_open_options = open_options;
+                    staged_open_options.open_mode = .writer_no_replay;
+                    staged_open_options.staged_generation = &staged;
+                    staged_open_options.start_index_workers = false;
+                    staged_open_options.start_optional_runtimes = false;
+                    staged_open_options.start_optional_runtime_workers = false;
+                    var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
+                    defer restored.close();
+                    try repairNativeRestoreProjectionsUntilCompleteWithIo(
+                        alloc,
+                        &restored,
+                        restore_io,
+                        plan.cancellation,
+                    );
                 }
             },
         }
@@ -15803,6 +15853,8 @@ pub const ProvisionedTableWriteSource = struct {
             .authority = .staged_local,
             .expected_artifact_size_bytes = source_shard.artifact_size_bytes,
             .expected_artifact_sha256 = source_shard.artifact_sha256,
+            .expected_native_manifest_size_bytes = source_shard.native_manifest_size_bytes,
+            .expected_native_manifest_sha256 = source_shard.native_manifest_sha256,
             .manifest = plan.manifest,
             .io = restore_io,
             .cancellation = plan.cancellation,
@@ -27350,14 +27402,19 @@ test "provisioned table restore retry repairs exact incomplete restore state thr
     source.restore_repair_work_group.await(source.table_activity_threaded.io()) catch {};
     source.drainRestoreRepairCompletionsScheduled();
 
-    try db_mod.DB.markRestorePrimaryRestoredForPathWithArtifact(
+    try db_mod.DB.markRestorePrimaryRestoredForPathWithIdentityWithIo(
         alloc,
+        io_impl.io(),
         db_path,
-        "snap1",
-        location,
-        shards[0].artifact_sha256,
-        shards[0].snapshot_path,
-        7001,
+        .{
+            .backup_id = "snap1",
+            .location = location,
+            .artifact_sha256 = shards[0].artifact_sha256,
+            .native_manifest_size_bytes = shards[0].native_manifest_size_bytes,
+            .native_manifest_sha256 = shards[0].native_manifest_sha256,
+            .snapshot_path = shards[0].snapshot_path,
+            .group_id = 7001,
+        },
     );
 
     // An object-store key can be overwritten between retries without changing

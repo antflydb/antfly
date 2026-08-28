@@ -370,6 +370,8 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                 .connection = identity.connection,
                 .artifact_size_bytes = identity.artifact_size_bytes,
                 .artifact_sha256 = identity.artifact_sha256,
+                .native_manifest_size_bytes = identity.native_manifest_size_bytes,
+                .native_manifest_sha256 = identity.native_manifest_sha256,
             };
             bootstrap.validate() catch {
                 return error.InvalidRestoreIntentIdentity;
@@ -6075,6 +6077,14 @@ fn appendPlacementIntent(
     try appendInt(alloc, out, u64, intent.relocation_disk_bytes_watermark);
     try appendInt(alloc, out, u64, intent.relocation_target_sequence);
     try appendInt(alloc, out, u64, intent.relocation_applied_sequence);
+    if (intent.record.backup_restore_bootstrap) |backup| {
+        if (backup.native_manifest_size_bytes != 0 or backup.native_manifest_sha256.len != 0) {
+            // Appended after the legacy placement payload so older decoders
+            // ignore it rather than misreading it as serving/relocation state.
+            try appendInt(alloc, out, u64, backup.native_manifest_size_bytes);
+            try appendRequiredString(alloc, out, backup.native_manifest_sha256);
+        }
+    }
 }
 
 fn appendTableRecord(
@@ -6152,6 +6162,11 @@ fn appendRestoreProgressRecord(
     try out.appendSlice(alloc, record.artifact_sha256);
     try appendInt(alloc, out, u32, @intCast(record.artifact_backup_id.len));
     try out.appendSlice(alloc, record.artifact_backup_id);
+    if (record.native_manifest_size_bytes != 0 or record.native_manifest_sha256.len != 0) {
+        try appendInt(alloc, out, u64, record.native_manifest_size_bytes);
+        try appendInt(alloc, out, u32, @intCast(record.native_manifest_sha256.len));
+        try out.appendSlice(alloc, record.native_manifest_sha256);
+    }
 }
 
 fn appendReplicationSourceStatusRecord(
@@ -6235,6 +6250,11 @@ fn appendRangeRecord(
     try appendInt(alloc, out, u32, @intCast(record.restore_artifact_backup_id.len));
     try out.appendSlice(alloc, record.restore_artifact_backup_id);
     try out.appendSlice(alloc, &record.completed_restore_fingerprint);
+    if (record.restore_native_manifest_size_bytes != 0 or record.restore_native_manifest_sha256.len != 0) {
+        try appendInt(alloc, out, u64, record.restore_native_manifest_size_bytes);
+        try appendInt(alloc, out, u32, @intCast(record.restore_native_manifest_sha256.len));
+        try out.appendSlice(alloc, record.restore_native_manifest_sha256);
+    }
 }
 
 fn appendSplitTransitionRecord(
@@ -6596,6 +6616,10 @@ fn appendRestoreIntentIdentity(
     try appendRequiredString(alloc, out, identity.connection);
     try appendInt(alloc, out, u64, identity.artifact_size_bytes);
     try appendRequiredString(alloc, out, identity.artifact_sha256);
+    if (identity.native_manifest_size_bytes != 0 or identity.native_manifest_sha256.len != 0) {
+        try appendInt(alloc, out, u64, identity.native_manifest_size_bytes);
+        try appendRequiredString(alloc, out, identity.native_manifest_sha256);
+    }
 }
 
 fn readRestoreIntentIdentity(
@@ -6617,6 +6641,16 @@ fn readRestoreIntentIdentity(
     errdefer alloc.free(connection);
     const artifact_size_bytes = try readInt(encoded, pos, u64);
     const artifact_sha256 = try readRequiredString(alloc, encoded, pos);
+    errdefer alloc.free(artifact_sha256);
+    const native_manifest_size_bytes = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const native_manifest_sha256 = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(native_manifest_sha256);
     return .{
         .group_id = group_id,
         .table_id = table_id,
@@ -6627,6 +6661,8 @@ fn readRestoreIntentIdentity(
         .connection = connection,
         .artifact_size_bytes = artifact_size_bytes,
         .artifact_sha256 = artifact_sha256,
+        .native_manifest_size_bytes = native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256,
     };
 }
 
@@ -6756,6 +6792,15 @@ fn readRangeRecord(
         );
         pos.* += @sizeOf(metadata_table_manager.RestoreCompletionFingerprint);
     }
+    const restore_native_manifest_size_bytes = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const restore_native_manifest_sha256 = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(restore_native_manifest_sha256);
     return .{
         .group_id = group_id,
         .range_id = if (range_id == 0) group_id else range_id,
@@ -6772,6 +6817,8 @@ fn readRangeRecord(
         .restore_connection = restore_connection,
         .restore_artifact_size_bytes = restore_artifact_size_bytes,
         .restore_artifact_sha256 = restore_artifact_sha256,
+        .restore_native_manifest_size_bytes = restore_native_manifest_size_bytes,
+        .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = completed_restore_fingerprint,
     };
 }
@@ -6830,6 +6877,15 @@ fn readRestoreProgressRecord(
     else
         try alloc.dupe(u8, "");
     errdefer alloc.free(artifact_backup_id);
+    const native_manifest_size_bytes = if (pos.* < encoded.len)
+        try readInt(encoded, pos, u64)
+    else
+        0;
+    const native_manifest_sha256 = if (pos.* < encoded.len)
+        try readRequiredString(alloc, encoded, pos)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(native_manifest_sha256);
     return .{
         .table_id = table_id,
         .node_id = node_id,
@@ -6839,6 +6895,8 @@ fn readRestoreProgressRecord(
         .location = location,
         .snapshot_path = snapshot_path,
         .artifact_sha256 = artifact_sha256,
+        .native_manifest_size_bytes = native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256,
         .primary_restored = primary_restored,
         .runtime_repair_complete = runtime_repair_complete,
         .phase = phase,
@@ -7032,6 +7090,15 @@ fn readPlacementIntent(
         relocation_disk_bytes_watermark = try readInt(encoded, pos, u64);
         relocation_target_sequence = try readInt(encoded, pos, u64);
         relocation_applied_sequence = try readInt(encoded, pos, u64);
+    }
+    if (backup_restore_bootstrap != null and pos.* < encoded.len) {
+        const native_manifest_size_bytes = try readInt(encoded, pos, u64);
+        const native_manifest_sha256 = try readRequiredString(alloc, encoded, pos);
+        errdefer alloc.free(native_manifest_sha256);
+        backup_restore_bootstrap.?.native_manifest_size_bytes = native_manifest_size_bytes;
+        backup_restore_bootstrap.?.native_manifest_sha256 = native_manifest_sha256;
+        backup_restore_bootstrap.?.validate() catch
+            return error.InvalidMetadataTransitionEncoding;
     }
     return .{
         .record = .{
@@ -10092,6 +10159,8 @@ test "metadata restore progress transition command round-trips" {
             .artifact_backup_id = "snap1-artifacts",
             .location = "s3://archive/snap1",
             .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .native_manifest_size_bytes = 8192,
+            .native_manifest_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         },
     };
 
@@ -10115,6 +10184,11 @@ test "metadata restore progress transition command round-trips" {
     try std.testing.expectEqualStrings(
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         decoded.?.upsert_restore_progress.artifact_sha256,
+    );
+    try std.testing.expectEqual(@as(u64, 8192), decoded.?.upsert_restore_progress.native_manifest_size_bytes);
+    try std.testing.expectEqualStrings(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        decoded.?.upsert_restore_progress.native_manifest_sha256,
     );
 }
 
@@ -10949,6 +11023,8 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
                         .connection = "backup-store",
                         .artifact_size_bytes = 4096,
                         .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        .native_manifest_size_bytes = 2048,
+                        .native_manifest_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     },
                 },
                 .store_id = 45,
@@ -10990,6 +11066,11 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
         try std.testing.expectEqualStrings(
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             intents[0].record.backup_restore_bootstrap.?.artifact_sha256,
+        );
+        try std.testing.expectEqual(@as(u64, 2048), intents[0].record.backup_restore_bootstrap.?.native_manifest_size_bytes);
+        try std.testing.expectEqualStrings(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            intents[0].record.backup_restore_bootstrap.?.native_manifest_sha256,
         );
     }
 }
