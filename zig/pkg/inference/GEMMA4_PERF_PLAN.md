@@ -325,3 +325,154 @@ The final PR-candidate rerun is performance-neutral versus the immediately prece
 2. Resolve the existing exact-v1 E2B free-form fixture mismatch from §13.4 (164 observed words versus the reviewed 180-word floor) or change model behavior; do not waive it implicitly.
 3. Retain raw evidence outside `/private/tmp` and reproduce the gates in hosted M-series CI.
 4. Close the measured short-context llama.cpp gaps. The next bounded experiment is command-plan reuse/concurrent dispatch; the next kernel/layout workstream is A3 Q4_0 scales-plane/interleave. Both require the existing watchdog, exact-token, route, and quality gates.
+
+## 15. Round-3 attribution and plan: the short-context anomaly is solved; the residual is priced (2026-08-27, M4 Pro reference box, investigation only — zero source changes, no commits)
+
+This round ran a 10-agent investigation (six code/docs/competitor mappers, two independent on-GPU attribution campaigns totaling ~70 fresh-process runs, a three-lens hypothesis panel, plus independent verification of every load-bearing claim) against HEAD `bada963a6f` (clean tree). Binary: local ReleaseFast Metal build SHA-256 `19021e9e90695922537d2acbc3534cec841e8c9b8eb282fc68d5c0770e75e7b6` — matches none of the §13/§14 pinned hashes (none are archived; see §15.5.7) but was validated by **byte-identical token-ID streams vs the §14.4 pinned campaign on all four scenarios** and throughput within −1.3%/+0.2%. Evidence bundle (durable, per release-gate 3): `~/Documents/af/antfly-gemma4-round3-evidence/` (six mapper reports, measurement report, 11 scored candidates, 49 run JSONs).
+
+### 15.1 Headline: the short-context anomaly — named, root-caused, measured, and cheap to fix
+
+**The anomaly no prior round named:** Antfly's own short-context decode is absolutely slower per token than its long-context decode (§14.4: E2B 13.96 vs 11.83 ms/tok; E4B 21.09 vs 18.65), while llama.cpp scales physically (9.20 short < 9.60 long). A 23+256-token KV is strictly less work than 2334+128 — this was a structural defect, not a "short-context gap vs llama.cpp."
+
+**Root cause (code + measurement, triple-confirmed):** `TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS 512u` (`metal_kernels.m:66`, enforced in the selector at `:19439` and the dispatch gate at `:19595`) is a **compile-time policy floor with no env override** — `TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT=1` measured as a no-op below it. Below KV 512 every layer decodes attention through `termite_paged_attention_kv_1x` (`metal_kernels.m:10041-10048`), dispatched as only `q_len × num_heads` = **8 (E2B) / 16 (E4B) threadgroups on a 20-core GPU** (`:51687-51690`), with a per-thread serial `for (ki=0; ki<kv_tokens; ++ki)` V-accumulation over strided gathers. Measured cost: **0.695 µs per KV-token per dispatch on BOTH models** (E2B 24.3 µs/KV-token/frame over 35 attention dispatches, E4B 29.2 over 42; independent second campaign: 26.3/25.2) ≈ 3–6 GB/s effective KV read on a 273 GB/s machine — occupancy/latency-bound, not bandwidth. The split-GQA route costs ~0.2–0.35 µs/KV-token/frame — **30–100× cheaper** — and its `key_chunk=32` schedule (`:19376`) is valid at any KV; git provenance shows 512 landed inside the split-GQA feature commit (`f3f930ff27`) as a scope gate, never a measured crossover.
+
+Decisive measured cells (this binary, campaign protocol, medians; full grid in the evidence bundle):
+
+| Cell | route | E2B ms/tok | E4B ms/tok |
+|---|---|---:|---:|
+| short64 (KV 23–87) | paged_1x | 11.817 | 18.381 |
+| short256 (KV 23–279) = benchmark | paged_1x | 14.153 | 21.182 |
+| mid606 (606+128) | split-GQA | **11.465** | **18.047** |
+| long (2334+128) | split-GQA | 11.803 | 18.626 |
+| long, split force-disabled | paged_1x | 40.386 | 48.276 |
+
+The KV→0 paged intercept (11.817) equals the long split frame (11.803): **there is no fixed short-route overhead at all** — the entire +2.33 ms/tok (E2B) / +2.80 (E4B) short-context excess is the paged_1x slope integrated over mean-KV 151. The linear model is exact (predicts 14.15 vs measured 14.153). Split is *faster* at KV 606 than paged at KV 23, so the crossover is far below 512. llama.cpp ground truth (§15.2): it has **no short-context special case whatsoever** — flash-attn vec with `nwg=32` KV-split + reduce unconditionally from KV=1 (`ggml-metal-ops.cpp:3232-3238`), KV padded to ≥256. Our split route is already their design; we just refuse to run it when it matters most.
+
+Also measured and root-caused this round: a **0.287 (E2B) / 0.340 (E4B) ms/frame GPU-idle bubble** — the pipelined loop encodes frame k+1, waits on k, checks `shouldStopOnEos`, and only then commits k+1 (`pipelines/generation.zig:5944-5957`, order verified in source). Under the benchmark's `--ignore-eos` the deferral is provably pure waste; the general path can speculative-submit + discard-on-EOS.
+
+**What remains after both fixes:** a flat, model-size-independent residual vs llama.cpp of ~2.2–2.6 ms/frame at every context (KV→0: 11.82 vs 9.20 E2B, 18.38 vs 15.89 E4B), attribution still open between serial-encoder dispatch-boundary drain (~525/~655 dispatches per frame, in-repo estimates disagree 5×: 1.7–2.5 vs 10–13 µs/boundary), split-GQA KV-read efficiency at long context, and blended kernel efficiency — §15.3 P1 is designed to split exactly this.
+
+### 15.2 Competitor ground truth and route-audit discoveries (all verified against source or pinned evidence)
+
+1. **llama.cpp v10342 measured/read from its exact source** (`~/.unsloth/llama.cpp` = build 10342; live runs of the pinned binary): E2B is **35 layers, only 15 own KV** (20 shared-KV layers skip K/V projection and KV writes — Antfly's lowering does the same, 13-op vs 16-op layers, parity confirmed); decode graph = 819 nodes/token in 2 compute CBs + 1 blit, first ~81 nodes committed early; graph reuse 161/162 tokens (enabled by padding n_kv to multiples of 256) but **all 819 nodes are still re-encoded every token**; one CPU-GPU sync per token; sampling ~27 µs. Concurrent encoder with **~686 memory barriers per token** (only 16% of nodes overlap) — at 9.2 ms/tok. **Barrier/dispatch minimization is NOT where llama.cpp's speed comes from**; this caps expectations for pure dispatch-overlap work (§15.3 P3) and its e2e bandwidth efficiency is only **~56% (E2B) / ~65% (E4B) of 273 GB/s** — there is ~2× roofline headroom above llama.cpp, so kernel work is how we eventually go *past* them.
+2. **E4B pair-activation fusion never engages in production.** The pinned §14.4 campaign JSON shows `routes.pair_activation = 0` in every E4B sample (short and long) vs 8960/4480 on E2B (= 35 layers × tokens; the E2B zero-rows are the deliberate pair-off rollback lanes). The fusion is promoted device-wide for M4 (`metal_kernels.m:22849-22857`) and E4B dims pass the `%32` checks; the C-side eligibility (`:49546-49557`) can bounce to the split gate/up path with **no counter** (rc −2..−6 silent fallback). E4B's entire 1239 MB/tok gate/up stream runs the census-worst 67% route with ~84 extra dispatches/frame. Diagnosis-first item, est. −0.6 to −1.0 ms/tok on both E4B workloads (§15.3 P1b).
+3. **E2B runs 100% of its Q4_0 traffic on untuned legacy-heuristic routes.** The M4 AUTO table covers exactly two shapes — E4B's FFN pair/down (`metal_kernels.m:14007-14015`). E2B (hidden 1536; FFN 6144 layers 0-14 / 12288 layers 15-34 — per-GGUF verified; down-proj on NR8_NSG2 by the `in>4096` heuristic) matches nothing and its shapes were never microbenched. The worst competitive case has had zero shape-tuning attention.
+4. **The §12.3 attention-shape mystery (28.4 vs 69.9 GB/s, e2e-neutral) is resolved as an isolation artifact:** at 28.4 GB/s in-frame, E4B's 330 MB/tok of attention weights alone would take 11.6 ms of a 21.1 ms frame — arithmetically impossible. The solo microbench measures launch/occupancy latency of a 16k-thread dispatch, not the in-frame regime. Retire the mystery; measure in-frame rates only via dilution (`--ops-per-frame ≥64`) or route-algebra A/Bs.
+5. **Measured on the M4 Pro flat testbed (KV≈580, split engaged, CV<0.2%):** pair-activation fusion is worth **+2.77%** here (ledger previously recorded 0.5–1% from the Air — correction); PLE model-proj Q8 staging **+1.10%**, and its marginal rate prices bulk weight streaming at **~323 GB/s** — big-stream bandwidth is at/above nominal peak, which constrains how much of the flat residual can be bulk-stream inefficiency and honestly deflates A3's central case (hence the S0 gate in P2); LM-head Q4_K repack −1.65% (still quality-blocked, unchanged).
+
+### 15.3 Ranked plan (each item: expected gain, gates, rollback; sequence as numbered)
+
+**P0 — Split-GQA floor: runtime-tunable, sweep, lower default (S; the round's headline).** Replace the `#define` with a runtime field read once at decode-runtime creation (`TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV`), consumed at `:19439`/`:19595`; add a `below_min_kv` counter at the currently-silent early-out; sweep {32, 64, 128, 256, 511} on both models; ship the empirical crossover (expected ~64 or lower). Extend the on-device split-GQA oracle below KV 512 (geometry sweep to KV 23) and add a threshold-discontinuity probe (~470 vs ~530 prompts must show no step). Expected: E2B short 71.6 → **84–87 tok/s** (65.9% → 77–80% of llama.cpp), E4B short 47.4 → **54–55.4** (75.3% → 86–88%); long lanes unchanged; the anomaly inverts to physical ordering. Pure route swap — bit-identical tokens expected (measured identical across forced flips). Rollback: env to 512 or `TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT`. Caution: do not combine sweep lanes with explicit `ENABLE_DECODE_GQA_SPLIT`/`*_VARIANT` overrides (arms the strict-failure rc −15 path).
+
+**P0b — Speculative submit (S).** Under `ignore_eos`, commit frame k+1 immediately after encode (before the wait on k); general path: speculative submit + discard-on-EOS (the KV speculation/truncation contract already exists via `appendGeneratedToken`/`cancel_pending`). Expected: −0.287/−0.340 ms/tok on **all four** workloads (+1.9–2.5%). Gates: exact-token sha256s; lifecycle-trace bubble <0.1 ms on a control lane; an EOS-terminating unit test on the discard path. Rollback env.
+
+**P1 — Boundary-cost calibration + byte census (S; information, prices P3/P4).** The two in-repo estimates of serial-encoder per-dispatch drain disagree 5× and llama.cpp's 686-barriers-at-9.2ms is counter-evidence to the high end. (a) `metal_q4_0_linear` sweep over `--ops-per-frame` {16..512} at fixed bytes → fit b_serial; (b) same sweep on a bench-only concurrent encoder + scoped barriers → b_concurrent; (c) one Instruments GPU-timeline capture of a production E2B frame (`TERMITE_METAL_FORCE_DIAGNOSTIC_COMMAND_BUFFERS=1`) — **MTLCounterSampling dispatch-boundary is now confirmed unsupported on this M4 Pro** (supported=0; §12's Air-only attribution was wrong), Instruments is the only per-dispatch instrument; (d) GGUF tensor-table byte census to settle streamed-bytes/token (in-repo accountings disagree: 1394 vs 1662 MB E2B). Decision rule: b_serial ≥4 µs ⇒ P3 carries ≥2 ms upside, proceed aggressively; ≤1.5 µs ⇒ cap P3 at ~0.5 ms and shift weight to P2. Also re-census FFN kernel GB/s at Gemma4 shapes on this box (Air census may not transfer; the 323 GB/s PLE datum says bulk streams are already near peak).
+
+**P1b — E4B pair-activation engagement + E2B AUTO sweep (S).** (a) Instrument the rc −2..−6 fallback (add the missing counter regardless of outcome), find why E4B never routes pair-activation, fix or record the reason; expected −0.6 to −1.0 ms/tok on both E4B workloads if engagement wins (byte-scaled from the measured E2B +2.77%). (b) Microbench E2B's six FFN/attention shapes across the portfolio, fold winners into AUTO (guarded ≤+2%; prior per-kernel e2e overrides were null). Gates: exact-token, route-profile floors (E4B pair dispatches ≈ 42×tokens in the candidate lane), interleaved A/B.
+
+**P2 — A3 scales-plane relayout, staged behind a replay gate (S spike → L core).** S0 (1–2 days, no runtime change): add a scales-plane-split variant kernel + pack fn to the existing bit-exact replay harness (`termite_metal_a4b_common_q4_replay`, `pack_q4_0_tile4` infra) and run at Gemma4 shapes on this box, co-running the M4 Pro baseline re-census from P1. Promotion floor ≥1.15× kernel-level (the tile4 row-interleave half alone measured only 1.02–1.03× — the unclaimed value is the scales-plane separation; the Q6_K tail's aligned interior planes at 82–98% are the in-repo evidence layout matters). If S0 passes: production mmv + pair variants on the split layout, per-slot layout tag (PLE-Q8 plumbing as template), staging-time repack, AUTO fold. Expected if it holds: −0.4 to −0.8 ms/tok E2B, −1.3 to −1.9 E4B — **the one lever sized to put E4B long past llama.cpp** (18.65 → ~16.8; llama 16.39). Honest null risk: the 323 GB/s marginal-rate datum argues the M4 Pro may already stream near peak; S0 decides for two days' work.
+
+**P3 — Concurrent planned dispatch + hazard-aware reorder, two-phase, watchdog-class (L; priced by P1).** All machinery exists: range-tracked per-dispatch read/write declarations + RAW/WAR/WAW counters, resource-scoped barrier emission forced-on under concurrent mode, a static DAG lowering with per-node `wave_index` that nothing consumes yet, and `TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH` (env alone can force the concurrent encoder; the DAG/reorder additionally needs the `configure_a4b_dag_scheduler`-equivalent wired for Gemma4 — today it gates on `qualified_a4b_model`, verified `metal_kernels.m:12485-12499`). Phase A (S-M): concurrent encoder + conservative range-tracked barriers, no reorder — cheap kill (the A4B precedent was net-negative 59.3 vs 60.9). Phase B: consume `wave_index` to cluster genuinely independent spans (QKV triple, q-rope‖k-rope, PLE-gate‖attention-input), merging ~150–300 of ~525 boundaries. Expected: 0.4–1.2 ms/tok central (both models, all contexts), capped by the llama.cpp counter-evidence; upside 2–3 ms only if P1 confirms the high boundary constant. **Full watchdog protocol** (`scripts/perf_watchdog_experiment.sh`, one experiment per boot, ≥300 s soak — metadata-only-barrier reset precedent stands). Exact-token gate catches any missed hazard deterministically.
+
+**P4 — Dispatch-count fusion (M; re-price after P3's verdict to avoid double-counting).** Q4_0 fused-QKV epilogue (today hard-gated Q8_0-only at `:15471-15480`, `:15553-15559`; −30/−48 dispatches incl. the 0.22 MB attn_k/v occupancy disasters), PLE gate+activation epilogue collapse (−35/−42; the Q4_0 proj+rms_add fused kernel already exists at `:37032-37060`), seed+v_norm+k-rope cluster (−15/−24). **Mandatory constraint from the sumsq post-mortem:** the −12% was a kernel-quality regression (scalar nibble unpack, no sumy folding, threadgroup-memory round trip), not a fusion refutation — every new epilogue builds on the production sumy-folded masked-FMA body (`:6244-6254`), never the scalar-unpack body (`:6236-6242`). This also un-blocks §12's B2 deferral on the same basis. Per-merge rollback envs + A/Bs (pair-fusion pattern).
+
+**P5 — Retire the floor entirely (M, after P0's sweep).** split_count==1 direct-write stage variant (skip the reduce at tiny KV; must be bit-identical to stage+reduce or it stays opt-in) so the split family serves KV=1 upward and `paged_1x` becomes pure fallback insurance; repair paged_1x's serial scan only if something blocks P0 (strictly dominated otherwise — but note the measured rollback cliff: split force-disabled = 24.8/20.7 tok/s at long context).
+
+**Stretch probes (cheap, unordered):** controlled A/B of the fast-prepared-frame path (one uncontrolled pair this round showed the descriptor path *faster*, 87.9 vs 78.4 at KV 600 — free tok/s if real); cold-first-run mechanism (10–20% first-run penalty on paged-heavy cells, absent on split cells — powermetrics co-capture); cache the ~5 uncached per-token `getenv` calls in the decode admission path (hidden today, surfaces as frames shorten).
+
+### 15.4 Projections and success criteria
+
+Composed medians (each stage assumes the prior lands at its central estimate; llama.cpp fixed at §14.4):
+
+| Stage | E2B short | E4B short | E2B long | E4B long |
+|---|---|---|---|---|
+| Today (§14.4) | 71.6 (65.9%) | 47.4 (75.3%) | 84.5 (81.1%) | 53.6 (87.9%) |
+| P0 + P0b | ~86–89 (79–82%) | ~55–56 (87–89%) | ~86.7 (83%) | ~54.6 (89%) |
+| + P1b(a) E4B pair | — | ~57–60 (91–95%) | — | ~56.5–57.8 (93–95%) |
+| + P2 A3 (if S0 passes) | ~89–93 (82–86%) | ~61–65 (97–103%) | ~90–93 (86–89%) | **~59–65 (97–106%)** |
+| + P3 (if P1 prices high) | ~93–105 (86–97%) | parity+ | ~93–105 (89–101%) | past |
+
+- **P0 exit:** short ≤ long ms/tok on both models (anomaly inverted); E2B short ≥ 84, E4B short ≥ 54; token IDs byte-identical; below-floor counter = 0 on benchmark lanes; long lanes within noise.
+- **Round exit (realistic):** E4B at/past llama.cpp on both contexts (needs P1b(a) + one of P2/P3); E2B ≥ 85% both contexts. E2B *parity* additionally requires P2 and P3 to land near their upper estimates — llama.cpp's 9.20 ms at 56% efficiency implies our 1394 MB/tok needs ~57% blended; we exit P0b at ~46%.
+- Every item: exact-token sha256 gates vs the four pinned campaign values, fresh-process interleaved A/B (`benchmark_metal_gemma4_ab.py` v5), route-counter floors proving engagement, rollback env verified in-campaign, watchdog protocol where flagged, ledger entry with machine identity.
+
+### 15.5 Process and ledger corrections (bind on the next round)
+
+1. **Stage-timing correction:** `MTLCounterSamplingPointAtDispatchBoundary` is unsupported on the M4 Pro reference box too (`supported=0`), not just the Air — §12/§13.4/§14.5's "M4 Pro dispatch census" plan must use Instruments or route-algebra A/Bs (this round's method: forced-route cells on a flat KV testbed).
+2. **Cross-session GPU mutex:** two independent agents ran GPU campaigns 24 s apart this round (no contamination, verified by timeline) — the one-GPU-job rule needs an enforced lock file, not convention.
+3. **E4B GGUF durability:** the reference E4B lives only at `/private/tmp/antfly-gemma4-e4b-qat-b064/` (sha `676c3507…`); it must be re-staged under `~/.antfly` before P0's E4B lanes (a reboot orphans the pinned comparison).
+4. **Doc drift:** `GEMMA4_METAL_PERFORMANCE.md` is referenced by METAL.md/GEMMA4.md/TODO.md but does not exist; METAL.md's trace-flag names `ANTFLY_INFERENCE_METAL_TRACE_FRAME`/`ANTFLY_INFERENCE_DEBUG_METAL_TIMING` are stale (source: `TERMITE_METAL_TRACE_FRAME`, `TERMITE_DEBUG_METAL_TIMING`); §11 of this file is a numbering skip, no lost round.
+5. **Ledger value corrections:** pair-activation fusion = +2.77% on the M4 Pro (not the Air's 0.5–1%); PLE Q8 staging = +1.10% E2B here; the §1(e) "3-pass kv_1x" description is one dispatch with three barrier-separated internal phases.
+6. **Telemetry gaps to close while touching these paths:** counter on the pair-activation rc −2..−6 fallback; counter on the split-GQA below-floor early-out; `TERMITE_METAL_TRACE_DISPATCH_PROFILE` appears inert on the planned-frame route.
+7. **Binary archival:** none of the four pinned ledger binaries is archived anywhere on disk; archive release-candidate binaries (or record source→binary reproducibility) alongside the evidence dir.
+8. **Trace perturbation warning:** `TERMITE_METAL_TRACE_FRAME_LIFECYCLE` distorts short-context runs badly (48.5 vs 84.6 tok/s median) — per-frame stderr lands on the critical path exactly when frames are cheap; never use it for absolute short-frame numbers, only for span structure.
+
+## 16. Round-4 implementation and correction: qualified short-KV split policy (2026-08-28, M4 Pro reference box, uncommitted)
+
+This round implemented the actionable part of §15, independently checked the two secondary claims, and hardened the benchmark contract. No commit or push was made.
+
+### 16.1 Finding disposition
+
+| §15 finding | Disposition | Production result |
+|---|---|---|
+| The fixed 512-token split-GQA floor causes the short-context anomaly | **Confirmed** | Replaced by a runtime-tunable, topology-qualified floor with route telemetry and rollback. |
+| A 32/64-token floor is token-identical on both models | **Partially refuted** | E4B is exact at 32. E2B floors at or below 160 change the established stream at generated token 169, so E2B ships at the fastest exact floor, 192. |
+| The generation loop leaves a 0.29/0.34 ms EOS-check submit bubble | **Refuted** | The runtime has already submitted the successor frame before control returns to the loop. The traced interval is the pipelined GPU wait; an added submit would duplicate an in-flight frame. No speculative-submit code or flag was retained. |
+| E4B pair-activation fusion never engages | **Refuted** | The external analyzer hard-coded E2B's `nr4-nsg4` counter and ignored E4B's qualified `nr4-nsg2` lane. Live E4B runs report 10,752 pair dispatches per 256-token sample and zero pair fallbacks. |
+
+### 16.2 Qualified policy and safety controls
+
+`TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV` is read once when the decode runtime is created. A valid positive integer overrides the model policy; an invalid or zero value warns and falls back. The selected threshold and the formerly silent below-threshold misses are exposed in the runtime snapshot, logs, and benchmark JSON. Existing `TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT` remains the full rollback.
+
+The qualified defaults are:
+
+- Gemma4 E2B (8 query heads / 1 KV head): **192 tokens**.
+- Gemma4 E4B (8 query heads / 2 KV heads): **32 tokens**.
+- Qualified A4B geometries: **32 tokens**, with `TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT` as the model-specific rollback.
+
+The C runtime now follows the same M4 pipelined-frame device default as Zig, and split-GQA frame scratch follows that policy. This removes a split-brain configuration in which Zig could pipeline while the C-side scratch/route policy remained opt-in.
+
+The full single-run crossover sweep was:
+
+| Floor | E2B tok/s | E2B established hash | E4B tok/s | E4B established hash |
+|---:|---:|:---:|---:|:---:|
+| 32 | 88.766 | no | 56.350 | yes |
+| 64 | 88.612 | no | 56.177 | yes |
+| 96 | 87.791 | no | 55.664 | yes |
+| 128 | 85.906 | no | 54.889 | yes |
+| 160 | 83.962 | no | 53.748 | yes |
+| 192 | 80.732 | yes | 52.352 | yes |
+| 224 | 78.359 | yes | 50.673 | yes |
+| 256 | 74.440 | yes | 48.818 | yes |
+| 320 | 72.419 | yes | 47.355 | yes |
+| 512 | 71.729 | yes | 47.434 | yes |
+
+The E2B quality boundary is real rather than a nondeterministic run: floors 32 through 160 share one alternate hash and first differ from the established 512 stream at generated token 169. A broader six-prompt × 256-token campaign was exact for E2B 192 versus 512 and E4B 32 versus 512 on all 12 paired cases; median throughput ratios were 1.1344 and 1.1886 respectively.
+
+### 16.3 Final strict performance result
+
+Protocol: 23 prompt tokens, 256 requested output tokens, greedy, F16 KV, EOS ignored, one warmup, six interleaved AB/BA fresh-process pairs, two-second cooldown. The strict metric is `(output_tokens - 1) / decode_inner_seconds`, matching llama.cpp's 255 decode evaluations; the harness now records this definition in schema v7.
+
+| Model | 512 floor tok/s | Qualified default tok/s | Gain vs 512 | CV | Fresh llama.cpp tok/s | Antfly / llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| E2B | 71.539 | **80.722** | **+12.84%** | 0.276% | 108.470 | **74.42%** |
+| E4B | 47.292 | **56.069** | **+18.56%** | 0.342% | 62.980 | **89.03%** |
+
+Both qualified lanes won 6/6 pairs and reproduced the established 256-token hashes (`94dd3a2a…` E2B, `0262c06e…` E4B). E2B 192 recorded 3,080 split calls, 5,880 below-floor calls, and zero prepared-frame/pair fallbacks per sample; E4B 32 recorded 10,416 split calls, 336 below-floor calls, 10,752 `nr4-nsg2` pair calls, and zero fallbacks. This closes most of the anomaly but deliberately does not claim §15's projected E2B 84–87 tok/s: the faster floors failed the pinned greedy-quality contract. E4B short is now faster per token than its pinned long lane; E2B short remains about 4.7% slower than its pinned 84.498 tok/s long lane because its exact-output floor stays at 192.
+
+The llama.cpp refresh used five fresh processes with the pinned v10342 (`38278078c`) binary: E2B median 108.470 tok/s at 0.241% CV and E4B median 62.980 at 0.213% CV. The earlier pinned long-context numbers were not rerun because both the 512 and qualified policies select split-GQA throughout KV≈2,334: Antfly/llama.cpp remain 84.498/104.190 E2B and 53.632/61.010 E4B from §14.4.
+
+### 16.4 Verification and evidence
+
+- Pinned Zig 0.16.0 ReleaseFast Metal build/link passed with `-j1`. Campaign binary SHA-256: `7567166aaffcf2a40ef838cd8d1cf54077c4563f58c14adddc69c30f5a55a598`; its pre-hardening exact-source rebuild was `1381c281d2cf47cba075a91c141b730adaaca18398b7c6ced357ea950c6c5e93`. Those two Mach-O layouts and 20,449,220-byte executable `__text` sections are byte-identical; their full-file difference is the test-source fingerprint, UUID/link metadata, and ad-hoc signature. The final hardened binary is `30ebf20777b57e2ba77ddda97d94d22956d9aed4206a0021185820b5a81b2cfb`; it adds only decimal validation in the once-per-runtime floor parser, so the decode throughput campaign remains representative.
+- The on-device split-GQA oracle passed 1,296 schedule-policy cases plus real tensor checks for E2B, E4B, and A4B, including KV 23, both qualified boundaries, all schedule variants, ragged pages, ring wrap, long context, explicit floors, invalid override fallback, and disable rollback. Maximum short-case absolute error was below `2.2e-5` against a `1e-2` limit.
+- Focused Zig policy and telemetry tests passed; the benchmark Python suite passed 19/19. The harness also fixes E2B/E4B's 23-token Q4 prefill expectation to `rows_9_64`, makes floor overrides independent of route profiles, and requires the selected floor and below-floor counters in both logs and JSON.
+- E2B final summary: `/private/tmp/gemma4-final-qualified-e2b-v2/summary.json`, SHA-256 `80ee499ed498c868afa6e0fa77cf51132d80cb6a80c8d725818db567348fab2b`.
+- E4B final summary: `/private/tmp/gemma4-final-qualified-e4b-v3/summary.json`, SHA-256 `5d873fa90686a202c43cf99864e4d0bd4a26fd49d7b806fbaf12aaa5139acc60`.
+- Floor sweeps: `/private/tmp/gemma4-split-floor-e2b-256-v1/` and `/private/tmp/gemma4-split-floor-e4b-256-v1/`; broader exact-output campaign: `/private/tmp/gemma4-split-floor-quality-v1/`; fresh llama.cpp logs: `/private/tmp/gemma4-final-llama-short-v1/`.
+
+These are strong PR diagnostics, not immutable release evidence: the final artifacts remain under `/private/tmp`, and the machine entered this round with existing swap allocation. The pristine-zero-swap and retained/hosted-evidence promotion gates from §14.5 remain open.
+
+### 16.5 Competitive next target
+
+P0 is ready for review. P0b and the proposed E4B pair-engagement work should be removed from the queue. The next bounded experiment remains §15 P1: Instruments boundary-cost calibration plus a model-byte census. That result should choose between the A3 scales-plane replay spike and watchdog-gated concurrent dispatch/reorder; neither should be promoted without the existing exact-output, route, thermal, and watchdog gates.

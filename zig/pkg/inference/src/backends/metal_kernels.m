@@ -63,7 +63,8 @@
 #define TERMITE_METAL_DECODE_GQA_SPLIT_STAGE_MEMORY_BYTES(head_dim) \
     (48u * (uint32_t)(head_dim) + 1984u)
 #define TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 2105344u
-#define TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS 512u
+#define TERMITE_METAL_DECODE_GQA_SPLIT_E2B_DEFAULT_MIN_KV_TOKENS 192u
+#define TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS 32u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_KEY_CHUNK 32u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_SHAPE_COUNT 2u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_COUNT 4u
@@ -993,6 +994,9 @@ typedef struct termite_metal_decode_runtime {
     id<MTLBuffer> attention_decode_gqa_split_scratch_buffer;
     id<MTLBuffer> attention_decode_gqa_split_scratch_buffer_alt;
     size_t attention_decode_gqa_split_scratch_capacity;
+    size_t decode_gqa_split_min_kv_tokens;
+    size_t decode_gqa_split_min_kv_override;
+    BOOL decode_gqa_split_min_kv_explicit;
     BOOL decode_gqa_split_frame_scratch_enabled;
     uint8_t active_frame_decode_gqa_split_scratch_slot;
     uint8_t submitted_frame_decode_gqa_split_scratch_slot;
@@ -1804,6 +1808,7 @@ typedef struct termite_metal_decode_runtime {
     uint64_t deberta_attention_gemm_fallbacks;
     uint64_t paged_attention_1x_calls;
     uint64_t decode_gqa_split_calls;
+    uint64_t decode_gqa_split_below_min_kv_calls;
     uint64_t decode_gqa_split_schedule_calls[TERMITE_METAL_DECODE_GQA_SPLIT_SHAPE_COUNT][TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_COUNT];
     uint64_t decode_gqa_split_schedule_fallback_calls;
     uint64_t decode_gqa_split_schedule_invalid_override_count;
@@ -2395,6 +2400,8 @@ typedef struct termite_metal_decode_runtime_memory_stats {
     uint64_t deberta_attention_gemm_fallbacks;
     uint64_t paged_attention_1x_calls;
     uint64_t decode_gqa_split_calls;
+    uint64_t decode_gqa_split_min_kv_tokens;
+    uint64_t decode_gqa_split_below_min_kv_calls;
     uint64_t generated_attention_decode_1x_calls;
     uint64_t generated_attention_flash_prefill_calls;
     uint64_t generated_attention_flash_prefill_hd512_calls;
@@ -11436,16 +11443,78 @@ static bool termite_metal_decode_gqa_split_environment_enabled(void) {
         !termite_metal_env_flag_enabled(getenv("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT"));
 }
 
+static size_t termite_metal_decode_gqa_split_min_kv_tokens_from_env(bool *explicit_out) {
+    if (explicit_out != NULL) *explicit_out = false;
+    const char *value = getenv("TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV");
+    if (value == NULL || value[0] == '\0') {
+        return 0u;
+    }
+    bool decimal_digits_only = true;
+    for (const char *cursor = value; *cursor != '\0'; cursor += 1) {
+        if (*cursor < '0' || *cursor > '9') {
+            decimal_digits_only = false;
+            break;
+        }
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long parsed = strtoull(value, &end, 10);
+    if (!decimal_digits_only || errno != 0 || end == value || *end != '\0' || parsed == 0u ||
+        parsed > (unsigned long long)SIZE_MAX)
+    {
+        fprintf(
+            stderr,
+            "metal-runtime-create: invalid TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV=%s; using model defaults e2b=%u e4b/a4b=%u\n",
+            value,
+            TERMITE_METAL_DECODE_GQA_SPLIT_E2B_DEFAULT_MIN_KV_TOKENS,
+            TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS);
+        return 0u;
+    }
+    if (explicit_out != NULL) *explicit_out = true;
+    return (size_t)parsed;
+}
+
+static size_t termite_metal_decode_gqa_split_default_min_kv_tokens(
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t sliding_window
+) {
+    const bool e2b_geometry = num_heads == 8u &&
+        num_kv_heads == 1u &&
+        ((head_dim == 256u && sliding_window == 512u) ||
+         (head_dim == 512u && sliding_window == 0u));
+    return e2b_geometry
+        ? TERMITE_METAL_DECODE_GQA_SPLIT_E2B_DEFAULT_MIN_KV_TOKENS
+        : TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS;
+}
+
+int termite_metal_pipelined_decode_frame_device_default(void);
+
 static bool termite_metal_pipelined_decode_frame_enabled(void) {
-    return termite_metal_a4b_high_memory_feature_enabled(
-        "TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME",
-        "TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME");
+    if (termite_metal_env_flag_truthy(
+            getenv("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"))) return false;
+    return termite_metal_env_flag_truthy(
+               getenv("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME")) ||
+        termite_metal_a4b_high_memory_fast_path_enabled() ||
+        termite_metal_pipelined_decode_frame_device_default() != 0;
 }
 
 static bool termite_metal_a4b_decode_gqa_split_frame_scratch_enabled(void) {
-    return termite_metal_a4b_high_memory_feature_enabled(
-        "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH",
-        "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH");
+    if (termite_metal_env_flag_truthy(
+            getenv("TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"))) return false;
+    return termite_metal_env_flag_truthy(
+               getenv("TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH")) ||
+        termite_metal_pipelined_decode_frame_enabled();
+}
+
+static bool termite_metal_a4b_decode_gqa_split_enabled(void) {
+    if (termite_metal_env_flag_truthy(
+            getenv("TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT"))) return false;
+    return termite_metal_env_flag_truthy(
+               getenv("TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT")) ||
+        termite_metal_a4b_high_memory_fast_path_enabled() ||
+        termite_metal_pipelined_decode_frame_device_default() != 0;
 }
 
 static void termite_metal_decode_runtime_reset_planned_compute_ranges(termite_metal_decode_runtime *runtime) {
@@ -19416,6 +19485,7 @@ static bool termite_metal_decode_gqa_split_scratch_bytes(
 // miss, while a negative result identifies malformed input or overflow.
 static int termite_metal_decode_gqa_split_select(
     termite_metal_decode_gqa_split_variant requested,
+    size_t min_kv_tokens,
     size_t q_len,
     size_t kv_tokens,
     size_t num_heads,
@@ -19424,7 +19494,7 @@ static int termite_metal_decode_gqa_split_select(
     size_t sliding_window,
     termite_metal_decode_gqa_split_launch *launch_out
 ) {
-    if (launch_out == NULL) return -1;
+    if (launch_out == NULL || min_kv_tokens == 0u) return -1;
     memset(launch_out, 0, sizeof(*launch_out));
     termite_metal_decode_gqa_split_schedule schedule;
     if (!termite_metal_decode_gqa_split_schedule_for_variant(requested, &schedule)) return -2;
@@ -19436,7 +19506,7 @@ static int termite_metal_decode_gqa_split_select(
     const bool a4b_geometry = num_heads == 16u &&
         ((num_kv_heads == 8u && head_dim == 256u && sliding_window == 1024u) ||
          (num_kv_heads == 2u && head_dim == 512u && sliding_window == 0u));
-    if (q_len == 0u || q_len > 2u || kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS ||
+    if (q_len == 0u || q_len > 2u || kv_tokens < min_kv_tokens ||
         (!legacy_geometry && !a4b_geometry) ||
         !termite_metal_decode_gqa_split_shape_classify(head_dim, sliding_window, &shape)) return 0;
     if (kv_tokens > SIZE_MAX - (schedule.key_chunk - 1u)) return -3;
@@ -19457,8 +19527,9 @@ static int termite_metal_decode_gqa_split_select(
     return 1;
 }
 
-int termite_metal_decode_gqa_split_policy_probe(
+static int termite_metal_decode_gqa_split_policy_probe_impl(
     uint32_t requested_variant,
+    size_t min_kv_tokens,
     size_t q_len,
     size_t kv_tokens,
     size_t num_heads,
@@ -19474,9 +19545,11 @@ int termite_metal_decode_gqa_split_policy_probe(
     *split_count_out = 0u;
     *scratch_bytes_out = 0u;
     if (requested_variant > TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_S32) return -2;
+    if (min_kv_tokens == 0u) return -3;
     termite_metal_decode_gqa_split_launch launch;
     const int selected = termite_metal_decode_gqa_split_select(
         (termite_metal_decode_gqa_split_variant)requested_variant,
+        min_kv_tokens,
         q_len,
         kv_tokens,
         num_heads,
@@ -19489,6 +19562,63 @@ int termite_metal_decode_gqa_split_policy_probe(
     *split_count_out = launch.params.split_count;
     *scratch_bytes_out = launch.scratch_bytes;
     return 1;
+}
+
+int termite_metal_decode_gqa_split_policy_probe(
+    uint32_t requested_variant,
+    size_t q_len,
+    size_t kv_tokens,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t sliding_window,
+    uint32_t *resolved_variant_out,
+    uint32_t *split_count_out,
+    size_t *scratch_bytes_out
+) {
+    return termite_metal_decode_gqa_split_policy_probe_impl(
+        requested_variant,
+        termite_metal_decode_gqa_split_default_min_kv_tokens(
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window),
+        q_len,
+        kv_tokens,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sliding_window,
+        resolved_variant_out,
+        split_count_out,
+        scratch_bytes_out);
+}
+
+int termite_metal_decode_gqa_split_policy_probe_with_min_kv(
+    uint32_t requested_variant,
+    size_t min_kv_tokens,
+    size_t q_len,
+    size_t kv_tokens,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t sliding_window,
+    uint32_t *resolved_variant_out,
+    uint32_t *split_count_out,
+    size_t *scratch_bytes_out
+) {
+    return termite_metal_decode_gqa_split_policy_probe_impl(
+        requested_variant,
+        min_kv_tokens,
+        q_len,
+        kv_tokens,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sliding_window,
+        resolved_variant_out,
+        split_count_out,
+        scratch_bytes_out);
 }
 
 static termite_metal_decode_gqa_split_variant termite_metal_decode_gqa_split_override_for_shape(
@@ -19579,10 +19709,7 @@ static bool termite_metal_decode_gqa_split_eligible(
     const bool a4b_geometry = num_heads == 16u &&
         ((num_kv_heads == 8u && head_dim == 256u && sliding_window == 1024u) ||
          (num_kv_heads == 2u && head_dim == 512u && sliding_window == 0u));
-    if (a4b_geometry &&
-        !termite_metal_a4b_high_memory_feature_enabled(
-            "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT",
-            "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT")) return false;
+    if (a4b_geometry && !termite_metal_a4b_decode_gqa_split_enabled()) return false;
     if (a4b_geometry && scratch_runtime != NULL &&
         scratch_runtime->decode_gqa_split_frame_scratch_enabled &&
         runtime->decode_gqa_split_frame_scratch_reported == 0u) {
@@ -19592,14 +19719,26 @@ static bool termite_metal_decode_gqa_split_eligible(
         runtime->decode_gqa_split_frame_scratch_reported = 1u;
     }
     if (format != 3u || sinks != NULL || softcap != 0.0f || q_len == 0u || q_len > 2u ||
-        kv_tokens < TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV_TOKENS ||
         (!legacy_geometry && !a4b_geometry) ||
         page_size == 0u || page_size % 8u != 0u) return false;
+    const size_t min_kv_tokens = runtime->decode_gqa_split_min_kv_explicit
+        ? runtime->decode_gqa_split_min_kv_override
+        : termite_metal_decode_gqa_split_default_min_kv_tokens(
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window);
+    runtime->decode_gqa_split_min_kv_tokens = min_kv_tokens;
+    if (kv_tokens < min_kv_tokens) {
+        runtime->decode_gqa_split_below_min_kv_calls += 1u;
+        return false;
+    }
     termite_metal_decode_gqa_split_shape shape;
     if (!termite_metal_decode_gqa_split_shape_classify(head_dim, sliding_window, &shape)) return false;
     termite_metal_decode_gqa_split_launch launch;
     const int selected = termite_metal_decode_gqa_split_select(
         termite_metal_decode_gqa_split_override_for_shape(runtime, shape),
+        min_kv_tokens,
         q_len,
         kv_tokens,
         num_heads,
@@ -22760,6 +22899,16 @@ termite_metal_decode_runtime *termite_metal_decode_runtime_create(void) {
         const char *decode_gqa_split_enable_value =
             getenv("TERMITE_METAL_ENABLE_DECODE_GQA_SPLIT");
         runtime->decode_gqa_split_enabled = termite_metal_decode_gqa_split_environment_enabled();
+        bool decode_gqa_split_min_kv_explicit = false;
+        runtime->decode_gqa_split_min_kv_override =
+            termite_metal_decode_gqa_split_min_kv_tokens_from_env(
+                &decode_gqa_split_min_kv_explicit);
+        runtime->decode_gqa_split_min_kv_explicit =
+            decode_gqa_split_min_kv_explicit;
+        runtime->decode_gqa_split_min_kv_tokens =
+            decode_gqa_split_min_kv_explicit
+                ? runtime->decode_gqa_split_min_kv_override
+                : TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS;
         runtime->decode_gqa_split_frame_scratch_enabled =
             termite_metal_a4b_decode_gqa_split_frame_scratch_enabled();
         runtime->trace_decode_gqa_split_schedule = termite_metal_env_flag_enabled(
@@ -56316,6 +56465,8 @@ int termite_metal_decode_runtime_memory_snapshot(
     snapshot->deberta_attention_gemm_fallbacks = runtime->deberta_attention_gemm_fallbacks;
     snapshot->paged_attention_1x_calls = runtime->paged_attention_1x_calls;
     snapshot->decode_gqa_split_calls = runtime->decode_gqa_split_calls;
+    snapshot->decode_gqa_split_min_kv_tokens = runtime->decode_gqa_split_min_kv_tokens;
+    snapshot->decode_gqa_split_below_min_kv_calls = runtime->decode_gqa_split_below_min_kv_calls;
     snapshot->generated_attention_decode_1x_calls = runtime->generated_attention_decode_1x_calls;
     snapshot->generated_attention_flash_prefill_calls = runtime->generated_attention_flash_prefill_calls;
     snapshot->generated_attention_flash_prefill_hd512_calls = runtime->generated_attention_flash_prefill_hd512_calls;

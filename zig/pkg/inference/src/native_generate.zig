@@ -3419,6 +3419,10 @@ fn metalStatsCompactJson(
         \\"prefill_paged_kv":{d},
         \\"generated_rms_norm":{d}
         \\}},
+        \\"decode_gqa_split_policy":{{
+        \\"min_kv":{d},
+        \\"below_min_kv":{d}
+        \\}},
         \\"prepared_frame":{{
         \\"fast_path":{d},
         \\"fallback":{d}
@@ -3433,6 +3437,8 @@ fn metalStatsCompactJson(
             provider.metal_runtime_attention_prefill_direct_kv_calls,
             provider.metal_runtime_attention_prefill_paged_kv_calls,
             provider.metal_runtime_generated_rms_norm_calls,
+            provider.metal_runtime_decode_gqa_split_min_kv_tokens,
+            provider.metal_runtime_decode_gqa_split_below_min_kv_calls,
             provider.metal_runtime_prepared_frame_fast_path_calls,
             provider.metal_runtime_prepared_frame_fallback_calls,
         },
@@ -5845,6 +5851,13 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
+        "metal_decode_gqa_split_policy: min_kv={d} below_min_kv={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_decode_gqa_split_min_kv_tokens,
+            metal_snapshot.provider.metal_runtime_decode_gqa_split_below_min_kv_calls,
+        },
+    );
+    print(
         "metal_prepared_frame: fast_path={d} fallback={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_prepared_frame_fast_path_calls,
@@ -8253,6 +8266,8 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_runtime_last_frame_planned_command_quant_dispatch_counts[2] = 3;
     snapshot.provider.metal_runtime_q8_0_linear_rows_2_8 = 4;
     snapshot.provider.metal_runtime_decode_gqa_split_calls = 31;
+    snapshot.provider.metal_runtime_decode_gqa_split_min_kv_tokens = 32;
+    snapshot.provider.metal_runtime_decode_gqa_split_below_min_kv_calls = 17;
     snapshot.provider.metal_runtime_generated_attention_flash_prefill_calls = 35;
     snapshot.provider.metal_runtime_generated_attention_flash_prefill_hd512_calls = 7;
     snapshot.provider.metal_runtime_attention_prefill_direct_kv_calls = 42;
@@ -8347,6 +8362,8 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 7), root.get("attention_dispatch").?.object.get("generated_flash_prefill_hd512").?.integer);
     try std.testing.expectEqual(@as(i64, 42), root.get("attention_dispatch").?.object.get("prefill_direct_kv").?.integer);
     try std.testing.expectEqual(@as(i64, 0), root.get("attention_dispatch").?.object.get("prefill_paged_kv").?.integer);
+    try std.testing.expectEqual(@as(i64, 32), root.get("decode_gqa_split_policy").?.object.get("min_kv").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), root.get("decode_gqa_split_policy").?.object.get("below_min_kv").?.integer);
     try std.testing.expectEqual(@as(i64, 29), root.get("prepared_frame").?.object.get("fast_path").?.integer);
     try std.testing.expectEqual(@as(i64, 2), root.get("prepared_frame").?.object.get("fallback").?.integer);
     const stage_timing = root.get("stage_timing_ns").?.object;

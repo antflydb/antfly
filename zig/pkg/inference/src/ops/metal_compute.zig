@@ -25756,6 +25756,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_deberta_attention_gemm_fallbacks = runtime_stats.deberta_attention_gemm_fallbacks;
         stats.metal_runtime_paged_attention_1x_calls = runtime_stats.paged_attention_1x_calls;
         stats.metal_runtime_decode_gqa_split_calls = runtime_stats.decode_gqa_split_calls;
+        stats.metal_runtime_decode_gqa_split_min_kv_tokens = runtime_stats.decode_gqa_split_min_kv_tokens;
+        stats.metal_runtime_decode_gqa_split_below_min_kv_calls = runtime_stats.decode_gqa_split_below_min_kv_calls;
         if (metal_runtime.decodeGqaSplitScheduleSnapshot(self.provider_impl.raw_decode_runtime)) |schedule_stats| {
             stats.metal_runtime_decode_gqa_split_fallback_calls = schedule_stats.fallback_calls;
         } else |_| {}

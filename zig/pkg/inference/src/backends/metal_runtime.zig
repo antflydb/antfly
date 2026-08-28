@@ -10414,6 +10414,8 @@ pub const RawRuntimeMemoryStats = extern struct {
     deberta_attention_gemm_fallbacks: u64 = 0,
     paged_attention_1x_calls: u64 = 0,
     decode_gqa_split_calls: u64 = 0,
+    decode_gqa_split_min_kv_tokens: u64 = 0,
+    decode_gqa_split_below_min_kv_calls: u64 = 0,
     generated_attention_decode_1x_calls: u64 = 0,
     generated_attention_flash_prefill_calls: u64 = 0,
     generated_attention_flash_prefill_hd512_calls: u64 = 0,
@@ -10835,6 +10837,8 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "submitted_frame_decode_gqa_split_scratch_slot ^ 1u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid ="));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid = 0u"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_device_default() != 0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_metal_pipelined_decode_frame_enabled();"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, source, 1, "scratch_runtime->submitted_frame_cb != nil || output_offset"));
 
     const variants = [_]struct {
@@ -10846,9 +10850,10 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
         .{ .variant = .s24_k32_r256, .cap = 24 },
         .{ .variant = .s32_k32_r256, .cap = 32 },
     };
-    const kv_boundaries = [_]usize{ 511, 512, 513, 1023, 1024, 2003, 4095, 4096, 8191 };
+    const kv_boundaries = [_]usize{ 31, 32, 33, 191, 192, 193, 511, 512, 513, 1024, 4096, 8191 };
     for (variants) |case| {
         for ([_]usize{ 1, 2 }) |num_kv_heads| {
+            const qualified_min_kv: usize = if (num_kv_heads == 1) 192 else 32;
             for (kv_boundaries) |kv_tokens| {
                 var resolved: c_uint = 99;
                 var split_count: c_uint = 99;
@@ -10865,7 +10870,7 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
                     &split_count,
                     &scratch_bytes,
                 );
-                if (kv_tokens < 512) {
+                if (kv_tokens < qualified_min_kv) {
                     try std.testing.expectEqual(@as(c_int, 0), rc);
                     try std.testing.expectEqual(@as(c_uint, @intFromEnum(DecodeGqaSplitVariant.auto)), resolved);
                     try std.testing.expectEqual(@as(c_uint, 0), split_count);
@@ -10881,6 +10886,37 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
                     scratch_bytes,
                 );
             }
+        }
+    }
+
+    // A4B shares E4B's measured 32-token floor; E2B retains its qualified 192
+    // floor. The production E4B 8Q/2KV shapes are covered by the matrix above.
+    for ([_]usize{ 31, 32, 33 }) |kv_tokens| {
+        var resolved: c_uint = 99;
+        var split_count: c_uint = 99;
+        var scratch_bytes: usize = 99;
+        const rc = termite_metal_decode_gqa_split_policy_probe(
+            @intFromEnum(DecodeGqaSplitVariant.auto),
+            1,
+            kv_tokens,
+            16,
+            2,
+            512,
+            0,
+            &resolved,
+            &split_count,
+            &scratch_bytes,
+        );
+        if (kv_tokens < 32) {
+            try std.testing.expectEqual(@as(c_int, 0), rc);
+            try std.testing.expectEqual(@as(c_uint, 0), split_count);
+            try std.testing.expectEqual(@as(usize, 0), scratch_bytes);
+        } else {
+            const expected_splits = (kv_tokens + 31) / 32;
+            try std.testing.expectEqual(@as(c_int, 1), rc);
+            try std.testing.expectEqual(@as(c_uint, @intFromEnum(DecodeGqaSplitVariant.s32_k32_r256)), resolved);
+            try std.testing.expectEqual(@as(c_uint, @intCast(expected_splits)), split_count);
+            try std.testing.expectEqual(@as(usize, 16 * expected_splits * (512 + 2) * @sizeOf(f32)), scratch_bytes);
         }
     }
 
