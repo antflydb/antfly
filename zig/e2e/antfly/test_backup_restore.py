@@ -776,22 +776,19 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
     before_status = backup_api.get_index(table_name, "semantic_chunked_idx")["status"]
     before_readiness_incarnation = before_status["readiness"]["incarnation"]
     before_coverage = {
-        key: before_status["coverage"].get(key)
+        key: before_status["coverage"][key]
         for key in (
-            "incarnation",
-            "config_hash",
+            "config_fingerprint",
             "source_total",
             "covered",
             "produced",
             "complete",
             "healthy",
         )
-        if key in before_status["coverage"]
     }
     before_counts = {
-        key: before_status.get(key)
+        key: before_status[key]
         for key in ("total_indexed", "doc_count", "query_visible_doc_count")
-        if key in before_status
     }
 
     with tempfile.TemporaryDirectory(

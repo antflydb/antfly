@@ -418,6 +418,46 @@ fn isPendingRestoreRuntimeRepairError(err: anyerror) bool {
         err == error.RestoreIndexAvailabilityIncomplete;
 }
 
+fn repairRestoredDbRuntimeStateUntilCompleteWithIo(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    io: Io,
+    group_id: u64,
+    open_attempts: usize,
+    cancellation: db_mod.types.CancellationToken,
+) !void {
+    var attempts: usize = 0;
+    std.log.info("restore asynchronous repair begin group_id={d}", .{group_id});
+    while (true) {
+        try cancellation.check();
+        if (!try db.restoreRuntimeRepairNeeded()) break;
+        attempts += 1;
+        const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| switch (err) {
+            error.RestoreRuntimeRepairIncomplete,
+            error.RestoreDenseArtifactRebuildIncomplete,
+            error.RestoreDenseConfigProofIncomplete,
+            error.RestoreDenseCounterProofIncomplete,
+            error.RestoreDenseIndexProofIncomplete,
+            error.RestoreDenseCoverageProofIncomplete,
+            error.RestoreDenseCheckpointIncomplete,
+            error.RestoreIndexAvailabilityIncomplete,
+            => {
+                io.sleep(Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
+                    error.Canceled => Io.recancel(io),
+                };
+                continue;
+            },
+            else => return err,
+        };
+        if (repaired) db.clearDenseHbcCaches();
+    }
+    std.log.info("restore asynchronous repair complete group_id={d} attempts={d} open_attempts={d}", .{
+        group_id,
+        attempts,
+        open_attempts,
+    });
+}
+
 const TestExecutionHook = struct {
     ptr: *anyopaque,
     run: *const fn (ptr: *anyopaque) void,
@@ -5134,9 +5174,8 @@ pub const BoundTableWriteSource = struct {
             alloc,
             snapshot_root,
             db_path,
-            plan.manifest.format,
             restored_open_options,
-            plan.io,
+            plan,
         ) catch |restore_err| {
             self.db.* = db_mod.DB.open(alloc, db_path, recovery_open_options) catch |reopen_err| {
                 std.log.err("bound restore recovery failed phase=reopen restore_class={s} reopen_class={s}", .{
@@ -5162,35 +5201,65 @@ pub const BoundTableWriteSource = struct {
         alloc: std.mem.Allocator,
         snapshot_root: []const u8,
         live_path: []const u8,
-        format: backups_api.BackupFormat,
         open_options: db_mod.OpenOptions,
-        shared_io: ?std.Io,
+        plan: backups_api.TableRestorePlan,
     ) !db_mod.generation_lifecycle.PublicationOutcome {
+        try plan.cancellation.check();
         var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(live_path, open_options.backend_runtime);
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
+        var owned_io: ?std.Io.Threaded = if (plan.io == null)
+            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        else
+            null;
+        defer if (owned_io) |*io_impl| io_impl.deinit();
+        const restore_io = plan.io orelse owned_io.?.io();
 
-        switch (format) {
+        switch (plan.manifest.format) {
             .portable => {
                 var staged_open_options = open_options;
                 staged_open_options.staged_generation = &staged;
                 var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                 defer restored.close();
-                try importPortableBackupFile(alloc, restored.core.store, snapshot_root, shared_io);
+                try importPortableBackupFile(alloc, restored.core.store, snapshot_root, plan.io);
+                try plan.cancellation.check();
                 _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
+                try plan.cancellation.check();
                 _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
+                try plan.cancellation.check();
                 try restored.rebuildGraphIndexesForTargetCoverage(alloc);
                 try restored.syncIndexes(true);
             },
-            .native => try db_mod.DB.restoreSnapshotToStagedGeneration(
-                &staged,
-                alloc,
-                snapshot_root,
-                staged.path(),
-                open_options,
-            ),
+            .native => {
+                const restored_native_generation = try db_mod.DB.restoreSnapshotToLocalDeferredRuntimeRepairWithIo(
+                    &staged,
+                    alloc,
+                    restore_io,
+                    snapshot_root,
+                    staged.path(),
+                    open_options,
+                );
+                if (!restored_native_generation) {
+                    // Legacy native backups contain only the primary store.
+                    // Complete their derived indexes in the restore job without
+                    // imposing a foreground deadline or inventing a Raft repair
+                    // identity for this process-local database.
+                    var staged_open_options = open_options;
+                    staged_open_options.staged_generation = &staged;
+                    var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
+                    defer restored.close();
+                    try plan.cancellation.check();
+                    _ = try restored.rebuildDenseIndexesForTargetCoverage(alloc);
+                    try plan.cancellation.check();
+                    _ = try restored.rebuildSparseIndexesForTargetCoverage(alloc);
+                    try plan.cancellation.check();
+                    try restored.rebuildGraphIndexesForTargetCoverage(alloc);
+                    try restored.syncIndexes(true);
+                }
+            },
         }
+        try plan.cancellation.check();
         return try staged.publish();
     }
 
@@ -12689,7 +12758,7 @@ pub const ProvisionedTableWriteSource = struct {
         return db;
     }
 
-    fn repairRestoredTableRuntimeStateBlocking(
+    fn repairRestoredTableRuntimeStateUntilComplete(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         path: []const u8,
@@ -12698,13 +12767,13 @@ pub const ProvisionedTableWriteSource = struct {
         indexes_json_override: ?[]const u8,
         schema_json_override: ?[]const u8,
         staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration,
+        cancellation: db_mod.types.CancellationToken,
     ) !void {
-        const open_retry_timeout_ns = 2 * std.time.ns_per_s;
-        const open_start_ns = platform_time.monotonicNs();
         var open_attempts: usize = 0;
         var logged_open_wait = false;
         var raft_apply_marker_reset = staged_generation == null;
         while (true) {
+            try cancellation.check();
             const runtime_repair_needed = try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
                 alloc,
                 self.table_activity_threaded.io(),
@@ -12729,10 +12798,9 @@ pub const ProvisionedTableWriteSource = struct {
                 staged_generation,
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err)) {
-                    if (platform_time.monotonicNs() -| open_start_ns >= open_retry_timeout_ns) return err;
                     if (!logged_open_wait) {
                         logged_open_wait = true;
-                        std.log.warn("restore foreground repair waiting for writer group_id={d} class={s}", .{
+                        std.log.warn("restore asynchronous repair waiting for writer group_id={d} class={s}", .{
                             group_id,
                             @errorName(err),
                         });
@@ -12758,66 +12826,41 @@ pub const ProvisionedTableWriteSource = struct {
                 try applyLocalTableSchemaJson(alloc, &db, schema_json);
             }
             if (runtime_repair_needed) {
-                try self.repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
+                try self.repairRestoredDbRuntimeStateUntilComplete(alloc, &db, group_id, open_attempts, cancellation);
             }
             return;
         }
     }
 
-    fn repairRestoredDbRuntimeStateBlocking(
+    fn repairRestoredDbRuntimeStateUntilComplete(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         db: *db_mod.DB,
         group_id: u64,
         open_attempts: usize,
+        cancellation: db_mod.types.CancellationToken,
     ) !void {
-        const timeout_ns = 30 * std.time.ns_per_s;
-        const start_ns = platform_time.monotonicNs();
-        var attempts: usize = 0;
-        std.log.info("restore foreground repair begin group_id={d}", .{group_id});
-        while (try db.restoreRuntimeRepairNeeded()) {
-            attempts += 1;
-            const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| switch (err) {
-                error.RestoreRuntimeRepairIncomplete,
-                error.RestoreDenseArtifactRebuildIncomplete,
-                error.RestoreDenseConfigProofIncomplete,
-                error.RestoreDenseCounterProofIncomplete,
-                error.RestoreDenseIndexProofIncomplete,
-                error.RestoreDenseCoverageProofIncomplete,
-                error.RestoreDenseCheckpointIncomplete,
-                error.RestoreIndexAvailabilityIncomplete,
-                => {
-                    if (platform_time.monotonicNs() -| start_ns >= timeout_ns)
-                        return error.TableVisibilityTimeout;
-                    self.table_activity_threaded.io().sleep(Io.Duration.fromMilliseconds(100), .awake) catch |sleep_err| switch (sleep_err) {
-                        error.Canceled => Io.recancel(self.table_activity_threaded.io()),
-                    };
-                    continue;
-                },
-                else => return err,
-            };
-            if (repaired) {
-                db.clearDenseHbcCaches();
-            }
-            if (platform_time.monotonicNs() -| start_ns >= timeout_ns) return error.TableVisibilityTimeout;
-        }
-        std.log.info("restore foreground repair complete group_id={d} attempts={d} open_attempts={d}", .{
+        return try repairRestoredDbRuntimeStateUntilCompleteWithIo(
+            alloc,
+            db,
+            self.table_activity_threaded.io(),
             group_id,
-            attempts,
             open_attempts,
-        });
+            cancellation,
+        );
     }
 
     /// Complete an idempotent restore retry through the authoritative cached
     /// writer when one is already open. Opening a second repair DB would
     /// contend with that writer and could make an exact-identity retry report
     /// success while the durable runtime-repair marker remained incomplete.
-    fn repairPublishedRestoreRuntimeStateBlocking(
+    fn repairPublishedRestoreRuntimeStateUntilComplete(
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         path: []const u8,
         group_id: u64,
         table_name: []const u8,
+        cancellation: db_mod.types.CancellationToken,
     ) !void {
         if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
 
@@ -12861,7 +12904,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .destination_authorizer = self.destination_authorizer,
                 },
             );
-            try self.repairRestoredDbRuntimeStateBlocking(alloc, cached.db, group_id, 0);
+            try self.repairRestoredDbRuntimeStateUntilComplete(alloc, cached.db, group_id, 0, cancellation);
 
             const entry = cached.entry orelse return error.StaleCachedDbLease;
             {
@@ -12877,7 +12920,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue);
             }
         } else {
-            try self.repairRestoredTableRuntimeStateBlocking(
+            try self.repairRestoredTableRuntimeStateUntilComplete(
                 alloc,
                 path,
                 group_id,
@@ -12885,6 +12928,7 @@ pub const ProvisionedTableWriteSource = struct {
                 indexes_json,
                 schema_json,
                 null,
+                cancellation,
             );
         }
 
@@ -15460,11 +15504,12 @@ pub const ProvisionedTableWriteSource = struct {
         }
         if (all_groups_already_admitted and plan.publication_hook == null) {
             if (plan.reconcile_only) return;
-            try self.repairPublishedRestoreRuntimeStateBlocking(
+            try self.repairPublishedRestoreRuntimeStateUntilComplete(
                 alloc,
                 path,
                 group_id,
                 table_name,
+                plan.cancellation,
             );
             return;
         }
@@ -15499,7 +15544,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
             // Import, derived rebuild, and validation run against the isolated
             // sibling while the current generation remains admitted.
-            if (prepared_generation) |*generation| try self.repairRestoredTableRuntimeStateBlocking(
+            if (prepared_generation) |*generation| try self.repairRestoredTableRuntimeStateUntilComplete(
                 alloc,
                 generation.path(),
                 group_id,
@@ -15507,6 +15552,7 @@ pub const ProvisionedTableWriteSource = struct {
                 plan.manifest.indexes_json,
                 plan.manifest.schema_json,
                 generation,
+                plan.cancellation,
             );
             if (prepared_generation) |*generation| try generation.seal();
             if (prepared_generation == null) {
@@ -15555,7 +15601,7 @@ pub const ProvisionedTableWriteSource = struct {
             // published generation. Keep that maintenance under exclusivity.
             var shard_transition = try transition.beginShardStorageTransition(path);
             defer shard_transition.deinit();
-            try self.repairRestoredTableRuntimeStateBlocking(
+            try self.repairRestoredTableRuntimeStateUntilComplete(
                 alloc,
                 path,
                 group_id,
@@ -15563,6 +15609,7 @@ pub const ProvisionedTableWriteSource = struct {
                 plan.manifest.indexes_json,
                 plan.manifest.schema_json,
                 null,
+                plan.cancellation,
             );
             if (plan.publication_hook) |hook| try hook.publish();
         }
@@ -25515,6 +25562,70 @@ test "bound table write source applies batch writes" {
     try std.testing.expect(std.mem.indexOf(u8, result.json, "\"alpha\"") != null);
 }
 
+test "bound native restore preserves the validated generated generation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-native-generation-db", .{tmp.sub_path});
+    defer alloc.free(path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-native-generation-backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+
+    var deterministic = db_embedder.DeterministicDenseEmbedder{};
+    var db = try db_mod.DB.open(alloc, path, .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .enrichment = .{
+            .owner_id = "bound-native-generation",
+            .dense_embedder = deterministic.interface(),
+        },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:native", .value = "{\"body\":\"native generation\"}" }},
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+    const source_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "semantic_idx");
+    const source_count = db.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count;
+    try std.testing.expect(source_count > 0);
+
+    var source = BoundTableWriteSource.init("docs", &db);
+    const shards = (try source.source().backupTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .backup_id = "bound-native",
+        .format = .native,
+    })).?;
+    defer freeBackupShards(alloc, shards);
+    const manifest = backups_api.TableBackupManifest{
+        .format = .native,
+        .backup_id = "bound-native",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = shards,
+    };
+    _ = (try source.source().restoreTable(alloc, "docs", .{
+        .backup_root = backup_root,
+        .manifest = &manifest,
+        .artifact_backup_id = "bound-native",
+        .source_location = "file://bound-native-generation-backup",
+    })).?;
+
+    try std.testing.expect(!(try db.restoreRuntimeRepairNeeded()));
+    const restored_checkpoint = try db.core.loadProjectionCheckpoint(alloc, "semantic_idx");
+    try std.testing.expectEqual(source_checkpoint.generation, restored_checkpoint.generation);
+    try std.testing.expectEqual(source_checkpoint.applied_sequence, restored_checkpoint.applied_sequence);
+    try std.testing.expectEqual(source_count, db.core.index_manager.denseIndex("semantic_idx").?.index.stats().active_count);
+}
+
 test "bound table sources inspect and reprocess document artifact manifests" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -27046,6 +27157,29 @@ test "provisioned restore repair source deinit cancels sleeping retry worker" {
     source.deinit();
     const deinit_elapsed_ns = platform_time.monotonicNs() -| deinit_start_ns;
     try std.testing.expect(deinit_elapsed_ns < 75 * std.time.ns_per_ms);
+}
+
+test "restore asynchronous repair observes cancellation before staged work" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-repair-cancellation", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    var cancelled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        repairRestoredDbRuntimeStateUntilCompleteWithIo(
+            alloc,
+            &db,
+            std.testing.io,
+            7001,
+            1,
+            db_mod.types.CancellationToken.fromAtomic(&cancelled),
+        ),
+    );
 }
 
 test "provisioned restore repair worker retries transient step failures to completion" {

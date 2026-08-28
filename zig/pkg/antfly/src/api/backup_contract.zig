@@ -8,6 +8,7 @@
 //! Remote-store implementations and backup algorithms stay in backups.zig.
 
 const std = @import("std");
+const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 
 pub const format_version: u32 = 2;
 pub const backup_fence_metadata_group_id_header = "X-Antfly-Backup-Metadata-Group-Id";
@@ -172,4 +173,8 @@ pub const TableRestorePlan = struct {
     replace_existing: bool = false,
     publication_hook: ?RestorePublicationHook = null,
     io: ?std.Io = null,
+    /// Cooperative cancellation for long-running staged repair. The token's
+    /// semantic callback is safe across compiled runtime boundaries and is
+    /// borrowed only for the synchronous restore callback.
+    cancellation: CancellationToken = .none,
 };

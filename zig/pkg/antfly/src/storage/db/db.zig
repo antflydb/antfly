@@ -15445,11 +15445,30 @@ pub const DB = struct {
         return try self.snapshotInternal(id, true);
     }
 
-    fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool) !u64 {
-        try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
-        if (include_generated) try self.flushAppliedSequencesForIdle();
+    const SnapshotFenceTestHook = struct {
+        ptr: *anyopaque,
+        before_apply_lock: *const fn (*anyopaque) void,
+    };
+    var test_snapshot_fence_hook: ?SnapshotFenceTestHook = null;
 
-        lockApply(self);
+    fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool) !u64 {
+        // Maintenance cannot run while the apply mutex is held, so converge
+        // optimistically and then fence the exact target. A writer that lands
+        // between convergence and lock acquisition advances the target and
+        // forces another round instead of producing a primary/index generation
+        // whose watermarks can never validate together.
+        while (true) {
+            const target_sequence = self.currentMaintenanceTargetSequence();
+            try self.runMaintenanceUntil(target_sequence, .{});
+            if (include_generated) try self.flushAppliedSequencesForIdle();
+            if (builtin.is_test) {
+                if (test_snapshot_fence_hook) |hook| hook.before_apply_lock(hook.ptr);
+            }
+
+            lockApply(self);
+            if (self.currentMaintenanceTargetSequence() == target_sequence) break;
+            self.core.unlockApply();
+        }
         defer self.core.unlockApply();
 
         try self.core.syncStore(true);
@@ -15481,6 +15500,12 @@ pub const DB = struct {
         const capture_target_sequence = self.core.nextDerivedSequence();
         for (configs, 0..) |cfg, i| {
             const checkpoint = try self.core.loadProjectionCheckpoint(self.alloc, cfg.name);
+            if (checkpoint.status != .clean or
+                checkpoint.config_hash != types.indexConfigHash(cfg) or
+                checkpoint.applied_sequence != capture_target_sequence)
+            {
+                return error.NativeBackupProjectionNotQuiescent;
+            }
             projections[i] = .{
                 .name = cfg.name,
                 .kind = @tagName(cfg.kind),
@@ -15634,7 +15659,7 @@ pub const DB = struct {
         if (comptime builtin.os.tag == .freestanding) return;
         var io_impl = threadedIo();
         defer io_impl.deinit();
-        try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io_impl.io(), snapshot_root, path, opts);
+        _ = try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io_impl.io(), snapshot_root, path, opts, true);
     }
 
     pub fn restoreSnapshotToDeferredRuntimeRepairWithIo(
@@ -15648,7 +15673,23 @@ pub const DB = struct {
     ) !void {
         try staged_generation.validatePath(path);
         try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io);
-        try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io, snapshot_root, path, opts);
+        _ = try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io, snapshot_root, path, opts, true);
+    }
+
+    /// Local bound databases do not have a non-zero Raft group identity. Return
+    /// whether a complete native generation was installed so the caller can
+    /// run the legacy logical fallback without manufacturing replica provenance.
+    pub fn restoreSnapshotToLocalDeferredRuntimeRepairWithIo(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+    ) !bool {
+        try staged_generation.validatePath(path);
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, null, io);
+        return try restoreNativeBackupGenerationIfPresent(staged_generation, alloc, io, snapshot_root, path, opts, false);
     }
 
     fn restoreNativeBackupGenerationIfPresent(
@@ -15658,8 +15699,9 @@ pub const DB = struct {
         snapshot_root: []const u8,
         path: []const u8,
         opts: OpenOptions,
-    ) !void {
-        var native_generation = (try native_backup.validateAndMaterialize(alloc, io, snapshot_root, path)) orelse return;
+        complete_runtime_repair: bool,
+    ) !bool {
+        var native_generation = (try native_backup.validateAndMaterialize(alloc, io, snapshot_root, path)) orelse return false;
         defer native_generation.deinit();
 
         // Repair identities are replica-local capabilities. The checkpoint is
@@ -15695,7 +15737,9 @@ pub const DB = struct {
         var restored = try DB.open(alloc, path, validation_opts);
         defer restored.close();
         try restored.validateNativeBackupGeneration(alloc, native_generation.value());
-        try markRestoreRuntimeRepairCompleteWithIo(alloc, io, path);
+        if (complete_runtime_repair)
+            try markRestoreRuntimeRepairCompleteWithIo(alloc, io, path);
+        return true;
     }
 
     fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, manifest: *const native_backup.Manifest) !void {
@@ -91853,6 +91897,101 @@ test "db native snapshot exports self-contained generation" {
     const generation_manifest_path = try std.fmt.allocPrint(alloc, "{s}.snapshots/snap1/{s}", .{ std.mem.span(path), native_backup.manifest_file_name });
     defer alloc.free(generation_manifest_path);
     try std.Io.Dir.accessAbsolute(io_impl.io(), generation_manifest_path, .{});
+}
+
+test "db native snapshot retries when a write advances the fenced revision" {
+    const alloc = std.heap.page_allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(path)})) |snapshots| {
+            var cleanup_io = threadedIo();
+            defer cleanup_io.deinit();
+            std.Io.Dir.cwd().deleteTree(cleanup_io.io(), snapshots) catch {};
+        } else |_| {}
+    }
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:before", .value = "{\"embedding\":[1,0,0]}" }},
+        .sync_level = .full_index,
+    });
+
+    const Fence = struct {
+        calls: std.atomic.Value(u32) = .init(0),
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+
+        fn beforeApplyLock(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    };
+    const SnapshotWorker = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            _ = self.db.snapshotNative("fenced-native") catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    var fence = Fence{};
+    DB.test_snapshot_fence_hook = .{ .ptr = &fence, .before_apply_lock = Fence.beforeApplyLock };
+    defer DB.test_snapshot_fence_hook = null;
+    var worker = SnapshotWorker{ .db = &db };
+    const snapshot_thread = try std.Thread.spawn(.{}, SnapshotWorker.run, .{&worker});
+    while (!fence.entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    // This write commits after the first maintenance pass but before the apply
+    // fence. A one-shot capture would pair this primary revision with the prior
+    // dense checkpoint and create a backup that only fails later at restore.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:during", .value = "{\"embedding\":[0,1,0]}" }},
+        .sync_level = .write,
+    });
+    fence.release.store(true, .release);
+    snapshot_thread.join();
+    if (worker.err) |err| return err;
+    try std.testing.expect(fence.calls.load(.acquire) >= 2);
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/fenced-native", .{std.mem.span(path)});
+    defer alloc.free(snapshot_root);
+    var destination_tmp = std.testing.tmpDir(.{});
+    defer destination_tmp.cleanup();
+    const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{destination_tmp.sub_path});
+    defer alloc.free(destination);
+    var loaded = (try native_backup.validateAndMaterialize(
+        alloc,
+        std.testing.io,
+        snapshot_root,
+        destination,
+    )).?;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.value().projections.len);
+    try std.testing.expectEqual(
+        loaded.value().capture_target_sequence,
+        loaded.value().projections[0].applied_sequence,
+    );
+    try std.testing.expectEqual(
+        loaded.value().projections[0].applied_sequence,
+        loaded.value().projections[0].target_sequence,
+    );
 }
 
 test "db snapshot exports logical store only for durable lsm primary backend" {
