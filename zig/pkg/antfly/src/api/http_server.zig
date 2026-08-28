@@ -5969,6 +5969,41 @@ pub const ApiHttpServer = struct {
         }
     }
 
+    pub const CommittedTableCreateLocalOutcome = enum {
+        applied,
+        delegated,
+        repair_required,
+        repair_unavailable,
+    };
+
+    /// Materialize a table definition that is already durably committed in
+    /// metadata. Once this boundary is entered, local failures are repair
+    /// debt—not replay-safe DDL failures—so hand them to the structural worker
+    /// and return an explicit committed outcome to every transport.
+    pub fn materializeCommittedTableCreate(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        request: tables_api.CreateTableRequest,
+    ) CommittedTableCreateLocalOutcome {
+        const writes = self.table_writes orelse return .delegated;
+        const handled = writes.createTable(alloc, table_name, request) catch |err| {
+            std.log.warn(
+                "table create committed with local materialization debt table={s} err={s}",
+                .{ table_name, @errorName(err) },
+            );
+            const scheduled = writes.requestTableStructuralReconcile(alloc, table_name) catch |schedule_err| {
+                std.log.err(
+                    "committed table create structural repair enqueue failed table={s} create_err={s} enqueue_err={s}",
+                    .{ table_name, @errorName(err), @errorName(schedule_err) },
+                );
+                return .repair_unavailable;
+            };
+            return if (scheduled != null) .repair_required else .repair_unavailable;
+        };
+        return if (handled != null) .applied else .delegated;
+    }
+
     pub fn probeTableStorageStatus(self: *ApiHttpServer, table_name: []const u8) !?tables_api.TableStorageStatus {
         const source = self.table_reads orelse return null;
         var result = (try source.scan(
@@ -12250,19 +12285,26 @@ pub const ApiHttpServer = struct {
             else
                 return err,
         };
-        const local_handled = if (self.table_writes) |writes|
-            (try writes.createTable(self.alloc, table_name, request)) != null
-        else
-            false;
+        const local_outcome = self.materializeCommittedTableCreate(self.alloc, table_name, request);
+        switch (local_outcome) {
+            .repair_required => return try contextualCommittedCreateOutcomeResponse(self.alloc, .repair_required),
+            .repair_unavailable => return try contextualCommittedCreateOutcomeResponse(self.alloc, .repair_unavailable),
+            .applied, .delegated => {},
+        }
+        const local_handled = local_outcome == .applied;
         if (local_handled) {
             self.waitForProjectedTablePresence(table_name) catch |err| switch (err) {
-                error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                else => return err,
+                else => {
+                    std.log.warn("MCP table create committed before projected presence was observable table={s} err={s}", .{ table_name, @errorName(err) });
+                    return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                },
             };
             if (!self.cfg.deployment_mode.isStandalone()) {
                 self.waitForProjectedTableWriteQuorum(table_name) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                    else => return err,
+                    else => {
+                        std.log.warn("MCP table create committed before write quorum was observable table={s} err={s}", .{ table_name, @errorName(err) });
+                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                    },
                 };
             }
         } else {
@@ -12270,24 +12312,30 @@ pub const ApiHttpServer = struct {
                 break :lifecycle switch (err) {
                     error.TableVisibilityTimeout => {
                         self.waitForProjectedTableCreateReadiness(table_name) catch |fallback_err| switch (fallback_err) {
-                            error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                            else => return fallback_err,
+                            else => {
+                                std.log.warn("MCP table create committed before projected readiness was observable table={s} err={s}", .{ table_name, @errorName(fallback_err) });
+                                return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                            },
                         };
                         break :lifecycle true;
                     },
-                    error.NotLeader => return err,
-                    else => return err,
+                    else => {
+                        std.log.warn("MCP table create committed with lifecycle observation failure table={s} err={s}", .{ table_name, @errorName(err) });
+                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                    },
                 };
             };
             if (!metadata_wait_handled) {
                 self.waitForTableVisibility(table_name, .present) catch |err| switch (err) {
-                    error.TableVisibilityTimeout => return try contextual_operations.textAlloc(self.alloc, 500, "table create did not converge"),
-                    else => return err,
+                    else => {
+                        std.log.warn("MCP table create committed before visibility was observable table={s} err={s}", .{ table_name, @errorName(err) });
+                        return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
+                    },
                 };
             }
         }
         const response_body = (try self.maybeEncodeTableStatus(table_name)) orelse
-            return try contextual_operations.textAlloc(self.alloc, 404, "not found");
+            return try contextualCommittedCreateOutcomeResponse(self.alloc, .visibility_pending);
         return contextual_operations.json(response_body, false);
     }
 
@@ -15658,6 +15706,32 @@ fn contextualMutationOutcomeUnknownTextResponse(
         .body = try alloc.dupe(u8, body),
         .headers = headers,
     };
+}
+
+const CommittedCreateOutcome = enum { visibility_pending, repair_required, repair_unavailable };
+
+fn contextualCommittedCreateOutcomeResponse(
+    alloc: std.mem.Allocator,
+    outcome: CommittedCreateOutcome,
+) !contextual_operations.OwnedResponse {
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .status = switch (outcome) {
+        .visibility_pending => "committed_visibility_pending",
+        .repair_required => "committed_repair_required",
+        .repair_unavailable => "committed_repair_unavailable",
+    } }, .{});
+    errdefer alloc.free(body);
+    var response = contextual_operations.jsonWithStatus(202, body, false);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(response.headers);
+    response.headers[0] = try ownedContextualHeader(
+        alloc,
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        switch (outcome) {
+            .visibility_pending => metadata_http_routes.Routes.raft_mutation_outcome_committed_visibility_pending,
+            .repair_required, .repair_unavailable => metadata_http_routes.Routes.raft_mutation_outcome_committed_repair_required,
+        },
+    );
+    return response;
 }
 
 fn contextualMutationOutcomeUnknownJsonResponse(
@@ -33353,18 +33427,31 @@ test "api http server create table with local writes waits for projected presenc
     };
 
     const FakeWrites = struct {
+        fail_create: bool = false,
+        reconcile_calls: u32 = 0,
+
         fn source(self: *@This()) table_writes.TableWriteSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
                     .create_table = createTable,
+                    .request_table_structural_reconcile = requestTableStructuralReconcile,
                     .local_runtime_statuses = localRuntimeStatuses,
                     .batch = batch,
                 },
             };
         }
 
-        fn createTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !?void {
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: tables_api.CreateTableRequest) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_create) return error.InjectedLocalCreateFailure;
+            return;
+        }
+
+        fn requestTableStructuralReconcile(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !?void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.reconcile_calls += 1;
             return;
         }
 
@@ -33403,6 +33490,26 @@ test "api http server create table with local writes waits for projected presenc
     defer resp.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expectEqual(@as(u32, 0), source.lifecycle_wait_calls.load(.monotonic));
+
+    // The metadata definition is already committed when local materialization
+    // runs. A local failure must hand off repair and return a non-replayable
+    // committed outcome instead of a generic 5xx.
+    source.created = false;
+    writes.fail_create = true;
+    var repair_resp = try executeHttpxTestRequest(&server, .{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = create_body,
+    });
+    defer repair_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 202), repair_resp.status);
+    try std.testing.expectEqual(@as(u32, 1), writes.reconcile_calls);
+    try std.testing.expect(std.mem.indexOf(u8, repair_resp.body, "committed_repair_required") != null);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_committed_repair_required,
+        repair_resp.header(metadata_http_routes.Routes.raft_mutation_outcome_header) orelse return error.MissingMutationOutcomeHeader,
+    );
 }
 
 test "api http server rejects oversized table definitions before parsing across public and MCP" {

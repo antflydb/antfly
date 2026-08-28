@@ -502,9 +502,7 @@ pub const MetadataServer = struct {
 
     fn runLifecycleReconcile(ptr: *anyopaque) !void {
         const self: *MetadataServer = @ptrCast(@alignCast(ptr));
-        try self.control_loop.stateRef().syncProjected(self.svc);
-        try self.control_loop.stateRef().seedDesiredFromProjected();
-        _ = try self.svc.reconcilePreparedIfLeaseHeld(&self.control_loop);
+        _ = try self.svc.reconcileSeededFromProjectedIfLeaseHeld(&self.control_loop);
     }
 };
 

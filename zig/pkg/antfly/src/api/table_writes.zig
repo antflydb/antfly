@@ -7405,6 +7405,18 @@ pub const ProvisionedTableWriteSource = struct {
         self.scheduleDroppedTableRecovery();
     }
 
+    /// Start the one-time recovery scan only after this source has reached a
+    /// stable owner address. `source()` is also used to publish short-lived
+    /// adapters (for example by metadata CDC workers), so it must remain a
+    /// side-effect-free ABI conversion and must never enqueue work that
+    /// captures the adapter's backing pointer.
+    pub fn startDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+        if (self.local_write_owner) |owner| return owner.startDroppedTableRecovery();
+        if (!self.dropped_table_recovery_started.swap(true, .acq_rel)) {
+            self.scheduleDroppedTableRecovery();
+        }
+    }
+
     fn runDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
         const alloc = std.heap.page_allocator;
         self.recoverDroppedTableRepairIntents(alloc) catch |err| {
@@ -14959,12 +14971,6 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
-        // The intent directory is the durable owner of post-commit table-drop
-        // repair. Scheduling on source publication covers startup and keeps
-        // retry work off latency-sensitive request paths when a runtime exists.
-        if (!self.dropped_table_recovery_started.swap(true, .acq_rel)) {
-            self.scheduleDroppedTableRecovery();
-        }
         return .{
             .ptr = self,
             .vtable = &.{
@@ -19103,7 +19109,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         // recovered even when no subsequent table drop happens.
         if (hostedManagedDbCacheForRoot(self.replica_root_dir)) |cache| {
             if (self.persistentDropCleanupSource(cache)) |cleanup| {
-                _ = cleanup.source();
+                cleanup.startDroppedTableRecovery();
             } else |err| {
                 std.log.warn(
                     "hosted dropped-table recovery owner unavailable root={s} err={s}",
@@ -19201,7 +19207,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         // request-scoped adapter it remains valid until the cache is closed.
         const cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         const cleanup = try self.persistentDropCleanupSource(cache);
-        // Publishing the source schedules the one-time startup recovery scan.
+        cleanup.startDroppedTableRecovery();
         // Later failures schedule additional runs through the same persistent
         // owner, and every run takes cache.mutex inside the cleanup path.
         return try cleanup.source().dropTable(alloc, table_name, contract);
@@ -47825,4 +47831,16 @@ test "median key lookup reuses startup writer instead of reopening its root" {
     try std.testing.expectEqualStrings("doc:m", median);
     try std.testing.expectEqual(@as(usize, 0), foreground_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), startup_cache.entries.items.len);
+}
+
+test "publishing a provisioned write adapter does not start pointer-capturing recovery work" {
+    var source = ProvisionedTableWriteSource.init(
+        ".zig-cache/tmp/source-publication-must-be-side-effect-free",
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+
+    _ = source.source();
+    try std.testing.expect(!source.dropped_table_recovery_started.load(.acquire));
+    try std.testing.expect(!source.dropped_table_recovery_scheduled.load(.acquire));
 }

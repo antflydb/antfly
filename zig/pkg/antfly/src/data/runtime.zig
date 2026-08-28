@@ -6540,6 +6540,10 @@ pub const DataServer = struct {
         _ = try self.ensureBackendRuntime();
         self.registerMetadataLocalProviders();
         try self.initApiServer();
+        // initApiServer finishes wiring the stable Raft-apply write owner and
+        // backend runtime. Start crash recovery here rather than as a side
+        // effect of publishing a request adapter, which may be stack-backed.
+        self.write_source.startDroppedTableRecovery();
         try self.http_server.?.resumeRestoreJobsOnce();
         if (self.data_raft) |raft| {
             try raft.start();

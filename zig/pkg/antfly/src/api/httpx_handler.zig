@@ -2272,6 +2272,22 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    const CommittedCreateOutcome = enum { visibility_pending, repair_required, repair_unavailable };
+
+    fn committedCreateOutcomeResponse(ctx: *httpx.Context, outcome: CommittedCreateOutcome) !httpx.Response {
+        const header_value = switch (outcome) {
+            .visibility_pending => metadata_http_routes.Routes.raft_mutation_outcome_committed_visibility_pending,
+            .repair_required, .repair_unavailable => metadata_http_routes.Routes.raft_mutation_outcome_committed_repair_required,
+        };
+        try ctx.setHeader(metadata_http_routes.Routes.raft_mutation_outcome_header, header_value);
+        _ = ctx.status(202);
+        return ctx.json(.{ .status = switch (outcome) {
+            .visibility_pending => "committed_visibility_pending",
+            .repair_required => "committed_repair_required",
+            .repair_unavailable => "committed_repair_unavailable",
+        } });
+    }
+
     fn queryOverloadedResponse(ctx: *httpx.Context) !httpx.Response {
         try ctx.setHeader("Retry-After", "1");
         // HTTP/2 has stream-local overload and forbids connection-specific
@@ -4225,68 +4241,60 @@ pub const AntflyApiHandler = struct {
             break;
         }
         std.log.info("public create table metadata done table={s}", .{decoded_table_name});
-        const local_create_handled = if (self.api_server.table_writes) |table_writes_source| blk: {
-            break :blk (table_writes_source.createTable(alloc, decoded_table_name, create_req) catch |err| switch (err) {
-                error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
-                    _ = ctx.status(400);
-                    return ctx.text("unsupported table index configuration");
-                },
-                error.EmbeddingProbeUnavailable => {
-                    _ = ctx.status(503);
-                    return ctx.text("table index validation probe unavailable");
-                },
-                else => {
-                    std.log.err("public create table local create failed table={s} err={}", .{ decoded_table_name, err });
-                    return err;
-                },
-            }) != null;
-        } else false;
+        const local_outcome = self.api_server.materializeCommittedTableCreate(alloc, decoded_table_name, create_req);
+        switch (local_outcome) {
+            .repair_required => return committedCreateOutcomeResponse(ctx, .repair_required),
+            .repair_unavailable => return committedCreateOutcomeResponse(ctx, .repair_unavailable),
+            .applied, .delegated => {},
+        }
+        const local_create_handled = local_outcome == .applied;
         if (local_create_handled) {
             std.log.info("public create table wait projected presence table={s}", .{decoded_table_name});
             self.api_server.waitForProjectedTablePresence(decoded_table_name) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
-                    std.log.err("public create table metadata visibility timed out table={s}", .{decoded_table_name});
-                    _ = ctx.status(500);
-                    return ctx.text("table create did not converge");
+                    std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
                 },
-                else => return err,
+                else => {
+                    std.log.warn("public create table committed with metadata visibility observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                },
             };
         } else {
             const metadata_wait_handled = self.api_server.source.waitTableLifecycle(decoded_table_name, .present) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
-                    std.log.err("public create table metadata lifecycle timed out table={s}", .{decoded_table_name});
-                    _ = ctx.status(500);
-                    return ctx.text("table create did not converge");
+                    std.log.warn("public create table committed before metadata lifecycle converged table={s}", .{decoded_table_name});
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
                 },
                 else => {
-                    std.log.err("public create table metadata lifecycle failed table={s} err={}", .{ decoded_table_name, err });
-                    return err;
+                    std.log.warn("public create table committed with metadata lifecycle observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                    return committedCreateOutcomeResponse(ctx, .visibility_pending);
                 },
             };
             if (!metadata_wait_handled) {
                 std.log.info("public create table wait metadata visibility table={s}", .{decoded_table_name});
                 self.api_server.waitForTableVisibility(decoded_table_name, .present) catch |err| switch (err) {
                     error.TableVisibilityTimeout => {
-                        std.log.err("public create table metadata visibility timed out table={s}", .{decoded_table_name});
-                        _ = ctx.status(500);
-                        return ctx.text("table create did not converge");
+                        std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
+                        return committedCreateOutcomeResponse(ctx, .visibility_pending);
                     },
-                    else => return err,
+                    else => {
+                        std.log.warn("public create table committed with metadata visibility observation failure table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                        return committedCreateOutcomeResponse(ctx, .visibility_pending);
+                    },
                 };
             }
         }
         std.log.info("public create table visible table={s}", .{decoded_table_name});
 
         var snapshot = (try self.api_server.source.adminSnapshot()) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
+            return committedCreateOutcomeResponse(ctx, .visibility_pending);
         };
         defer self.api_server.source.freeAdminSnapshot(&snapshot);
         var arena_impl = std.heap.ArenaAllocator.init(alloc);
         defer arena_impl.deinit();
         const response = (try tables_api.buildSingleTableStatusWithStorageStatuses(arena_impl.allocator(), &snapshot, decoded_table_name, null)) orelse {
-            _ = ctx.status(404);
-            return ctx.text("not found");
+            return committedCreateOutcomeResponse(ctx, .visibility_pending);
         };
         return ctx.json(response);
     }

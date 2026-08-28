@@ -2632,30 +2632,44 @@ pub const MetadataService = struct {
     }
 
     pub fn upsertNode(self: *MetadataService, record: metadata_table_manager.NodeRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .upsert_node = record });
     }
 
     pub fn registerNode(self: *MetadataService, record: metadata_table_manager.NodeRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .register_node = record });
     }
 
     pub fn requestNodeShutdown(self: *MetadataService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .request_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn cancelNodeShutdown(self: *MetadataService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .cancel_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn finalizeNodeShutdown(self: *MetadataService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .finalize_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn removeNode(self: *MetadataService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .remove_node = .{ .node_id = node_id } });
     }
 
     pub fn upsertStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
@@ -2679,6 +2693,8 @@ pub const MetadataService = struct {
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
@@ -2693,6 +2709,8 @@ pub const MetadataService = struct {
     }
 
     pub fn removeStore(self: *MetadataService, store_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .remove_store = .{ .store_id = store_id } });
     }
 
@@ -3054,6 +3072,11 @@ pub const MetadataService = struct {
         const barrier = try reallocationBarrierContract(incarnation, required_node_ids);
         const runtime = try self.ensureBackendRuntime();
         const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
+        // Serialize request publication with the node/store topology captured
+        // by reconciliation. This lock is intentionally acquired after the
+        // protocol probe and entropy work so slow admission never stalls DDL.
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
             .request_id = request_id,
             .requested_at_ms = requested_at_ms,
@@ -3188,6 +3211,12 @@ pub const MetadataService = struct {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
         return try loop.reconcilePrepared(self);
+    }
+
+    pub fn reconcileSeededFromProjectedIfLeaseHeld(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
+        const has_reconcile_lease = try self.ensureReconcileLease();
+        if (!has_reconcile_lease) return null;
+        return try loop.reconcileSeededFromProjected(self);
     }
 
     pub fn reconcileOnceEnsuringLease(self: *MetadataService, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
@@ -4642,30 +4671,44 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn upsertNode(self: *MetadataHttpService, record: metadata_table_manager.NodeRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .upsert_node = record });
     }
 
     pub fn registerNode(self: *MetadataHttpService, record: metadata_table_manager.NodeRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .register_node = record });
     }
 
     pub fn requestNodeShutdown(self: *MetadataHttpService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .request_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn cancelNodeShutdown(self: *MetadataHttpService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .cancel_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn finalizeNodeShutdown(self: *MetadataHttpService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .finalize_node_shutdown = .{ .node_id = node_id } });
     }
 
     pub fn removeNode(self: *MetadataHttpService, node_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .remove_node = .{ .node_id = node_id } });
     }
 
     pub fn upsertStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .upsert_store = record });
     }
 
@@ -4917,6 +4960,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn registerStore(self: *MetadataHttpService, record: metadata_table_manager.StoreRecord) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .register_store = record });
     }
 
@@ -4938,6 +4983,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn removeStore(self: *MetadataHttpService, store_id: u64) !void {
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .remove_store = .{ .store_id = store_id } });
     }
 
@@ -5300,6 +5347,10 @@ pub const MetadataHttpService = struct {
         const barrier = try self.ensureReallocationBarrierProtocolReady();
         const runtime = try self.ensureBackendRuntime();
         const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse std.Options.debug_io);
+        // Keep the replicated request causally ordered with node/store joins
+        // without holding the catalog lane during remote protocol probes.
+        self.lockCatalogMutation();
+        defer self.unlockCatalogMutation();
         try self.proposeTransitionCommand(.{ .upsert_reallocation_request = .{
             .request_id = request_id,
             .requested_at_ms = requested_at_ms,
@@ -5747,6 +5798,12 @@ pub const MetadataHttpService = struct {
         const has_reconcile_lease = try self.ensureReconcileLease();
         if (!has_reconcile_lease) return null;
         return try loop.reconcilePrepared(self);
+    }
+
+    pub fn reconcileSeededFromProjectedIfLeaseHeld(self: *MetadataHttpService, loop: *metadata_control_loop.MetadataControlLoop) !?metadata_control_loop.ReconcileSummary {
+        const has_reconcile_lease = try self.ensureReconcileLease();
+        if (!has_reconcile_lease) return null;
+        return try loop.reconcileSeededFromProjected(self);
     }
 
     pub fn reconcileOnceEnsuringLease(self: *MetadataHttpService, loop: *metadata_control_loop.MetadataControlLoop) !metadata_control_loop.ReconcileSummary {
