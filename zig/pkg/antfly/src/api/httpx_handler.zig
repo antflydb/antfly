@@ -73,6 +73,7 @@ const managed_embedder = @import("../inference/managed_embedder.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
+const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const platform_time = @import("antfly_platform").time;
@@ -4188,8 +4189,11 @@ pub const AntflyApiHandler = struct {
                     return ctx.text("metadata cluster upgrade in progress; retry later");
                 },
                 error.MetadataMutationOutcomeUnknown => {
-                    try ctx.setHeader("Retry-After", "1");
-                    _ = ctx.status(503);
+                    try ctx.setHeader(
+                        metadata_http_routes.Routes.raft_mutation_outcome_header,
+                        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+                    );
+                    _ = ctx.status(409);
                     return ctx.text("table mutation outcome is unknown; observe table state before retrying");
                 },
                 error.UnsupportedOperation => {
@@ -4320,8 +4324,11 @@ pub const AntflyApiHandler = struct {
                 return metadataNotLeaderResponse(ctx);
             },
             error.MetadataMutationOutcomeUnknown => {
-                try ctx.setHeader("Retry-After", "1");
-                _ = ctx.status(503);
+                try ctx.setHeader(
+                    metadata_http_routes.Routes.raft_mutation_outcome_header,
+                    metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+                );
+                _ = ctx.status(409);
                 return ctx.text("table mutation outcome is unknown; observe table state before retrying");
             },
             else => {

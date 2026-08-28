@@ -2219,6 +2219,22 @@ test "multi raft drainReady always makes progress on one oversized Ready" {
     try std.testing.expect(!host.group(257).?.hasReady());
 }
 
+test "multi raft empty drain remains allocation free after group admission" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var store = core.MemoryStorage.init(alloc);
+    defer store.deinit();
+    var host = runtime.MultiRaft.init(alloc, .{}, .{});
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 262, &store, false);
+    _ = try host.drainReady(8);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    const drained = try host.drainReady(8);
+    try std.testing.expectEqual(@as(usize, 0), drained.processed_ready_steps);
+}
+
 test "multi raft drainReady quarantines an impossible outbound Ready hard ceiling" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();

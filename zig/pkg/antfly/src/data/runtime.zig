@@ -5324,6 +5324,7 @@ pub const DataServer = struct {
         _ = try self.write_source.withHAWriteGate(ha_write_gate);
         _ = try self.write_source.withHAMirror(ha_primary_mirror);
         if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withReplicaRetirementOwnership(self.replicaRetirementOwnership());
             apply_sm.attachProvisionedStorage(&self.provisioned_storage);
             _ = apply_sm.write_source.withSecretStore(api_server_cfg.secret_store);
             _ = apply_sm.write_source.withDestinationAuthorization(.{
@@ -11736,12 +11737,59 @@ pub const DataServer = struct {
             return err;
         };
 
+        const retirement_source = if (reconcile.removals.len > 0)
+            if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else null
+        else
+            null;
+        var prepared_retirements = if (retirement_source) |source|
+            source.prepareReplicaRetirements(self.alloc, reconcile.removals) catch |err| {
+                lockAtomic(&self.data_raft_mutex);
+                defer self.data_raft_mutex.unlock();
+                reconcile.abortDurable() catch {};
+                return err;
+            }
+        else
+            null;
+        defer if (prepared_retirements) |*prepared| prepared.deinit();
+
+        var reconcile_commit_error: ?anyerror = null;
         {
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
-            _ = try reconcile.commit();
-            if (apply_group_transition) |*transition| transition.commit();
-            if (updates.items.len > 0) try raft.host.applyBatch(updates.items);
+            _ = reconcile.commit() catch |err| {
+                reconcile_commit_error = err;
+            };
+            if (reconcile_commit_error == null) {
+                if (apply_group_transition) |*transition| transition.commit();
+                if (updates.items.len > 0) raft.host.applyBatch(updates.items) catch |err| {
+                    reconcile_commit_error = err;
+                };
+            }
+        }
+        if (reconcile_commit_error) |err| {
+            if (prepared_retirements) |*prepared| {
+                const source = retirement_source.?;
+                if (reconcile.catalog_commit_complete) {
+                    source.requestReplicaRetirementRecovery();
+                } else {
+                    source.cancelPreparedReplicaRetirements(prepared);
+                }
+            }
+            return err;
+        }
+        if (prepared_retirements) |*prepared| {
+            retirement_source.?.completePreparedReplicaRetirements(
+                reconcile.removals,
+                prepared,
+            ) catch |err| {
+                // Replica admission is already durably removed. The sidecar
+                // intent and recovery worker own convergence; do not roll the
+                // metadata epoch back or hold consensus progress on deletion.
+                std.log.warn("local replica retirement deferred groups={d} err={s}", .{
+                    reconcile.removals.len,
+                    @errorName(err),
+                });
+            };
         }
         self.retainDataRaftProtocolActivationGroups(active_group_ids);
         const status_fingerprint = self.maintainDataRaftLeadership(snapshot, local_intents.items, registration.node_id);
@@ -11998,6 +12046,21 @@ pub const DataServer = struct {
     fn liveRuntimeWriteSource(self: *DataServer) *antfly.public_api.ProvisionedTableWriteSource {
         if (self.data_raft_apply) |apply_sm| return &apply_sm.write_source;
         return &self.write_source;
+    }
+
+    fn localDataRaftOwnsReplica(ptr: *anyopaque, group_id: u64) bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.data_raft_mutex);
+        defer self.data_raft_mutex.unlock();
+        const raft = self.data_raft orelse return false;
+        return raft.host.http_host.host.hasReplica(group_id);
+    }
+
+    fn replicaRetirementOwnership(self: *DataServer) antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership {
+        return .{
+            .ptr = self,
+            .is_owned = localDataRaftOwnsReplica,
+        };
     }
 
     fn snapshotManagedWriterGroupStatusBestEffort(

@@ -288,6 +288,11 @@ pub const PreparedReconcile = struct {
     removals: []u64,
     catalog_upserts: []catalog.ReplicaRecord,
     catalog_revision: ?u64,
+    /// Set immediately after the atomic replica-catalog batch is durable.
+    /// Callers that stage sidecar cleanup intents use this to distinguish a
+    /// retryable pre-commit failure from a committed removal whose live host
+    /// teardown still needs recovery.
+    catalog_commit_complete: bool = false,
     failed_ensure_index: ?usize = null,
     durability_complete: bool = false,
     committed: bool = false,
@@ -343,6 +348,7 @@ pub const PreparedReconcile = struct {
                 self.removals,
             );
         }
+        self.catalog_commit_complete = true;
         var result: ReconcileResult = .{};
         for (self.ensures) |*entry| {
             const intent = self.intents[entry.intent_index];

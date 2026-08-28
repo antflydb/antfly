@@ -3868,6 +3868,7 @@ pub fn build(b: *std.Build) void {
         "api http server create table with local writes waits for projected presence without lifecycle",
         "api http server rejects oversized table definitions before parsing across public and MCP",
         "api http server reports exhausted table mutation authority consistently",
+        "ambiguous mutation response is explicitly non-retryable",
         "api http server create index installs exact visible config and defers lagging projection",
         "status source reports an absent linearizable read capability without failing",
         "table read source distinguishes unavailable physical capability observation",
@@ -4094,6 +4095,7 @@ pub fn build(b: *std.Build) void {
             "multi raft drainReady continues async pipeline without starving peer",
             "multi raft drainReady does not retry a no-progress frontier",
             "multi raft drainReady reserves continuations for productive groups",
+            "multi raft empty drain remains allocation free after group admission",
             "multi raft backpressure rejects async ready before cloning messages",
         },
     });
@@ -6286,6 +6288,7 @@ pub fn build(b: *std.Build) void {
             "dropped table quarantine path keeps valid API names in one portable component",
             "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
             "provisioned table drop retains repair intent until catalog ownership clears",
+            "replica retirement recovery waits for durable ownership removal",
             "hosted source publication recovers durable dropped-table intent",
             "provisioned table write source drop table retires old publication authority",
             "provisioned table write source drop table does not hold local db mutex during background delete",

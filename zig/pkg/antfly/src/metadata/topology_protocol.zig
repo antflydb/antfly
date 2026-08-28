@@ -41,8 +41,10 @@ pub const max_legacy_drop_range_count: usize = max_transition_command_bytes / @s
 
 /// Exact post-commit cleanup contract returned to the node that originated a
 /// table drop. It is deliberately not embedded in the Raft command: the log
-/// carries the fixed-size membership proof while this owned result is routed
-/// only to the local storage owner.
+/// carries the fixed-size membership proof while this owned result accelerates
+/// cleanup on the request node. Every Raft replica owner independently stages
+/// a durable group-retirement intent at replica-catalog removal, so correctness
+/// does not depend on this response surviving a post-admission failure.
 pub const DropResult = struct {
     table_id: u64,
     expected_transition_generation: u64,

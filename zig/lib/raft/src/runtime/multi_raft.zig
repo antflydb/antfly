@@ -414,6 +414,10 @@ pub const MultiRaft = struct {
     next_group_incarnation: u64 = 1,
     pending_outbox: TransportOutbox = .{},
     pending_apply: std.ArrayListUnmanaged(PendingApplyTask) = .empty,
+    // Reused by every bounded Ready drain. Capacity is reserved when groups
+    // are admitted so the consensus hot path never allocates merely to record
+    // hard-limit quarantines.
+    oversized_ready_scratch: std.ArrayListUnmanaged(core.types.GroupId) = .empty,
     snapshot_candidates: std.AutoHashMapUnmanaged(core.types.GroupId, SnapshotCandidate) = .empty,
     next_snapshot_candidate_sequence: u64 = 1,
     snapshot_worker: ?*SnapshotBuildWorker = null,
@@ -447,6 +451,7 @@ pub const MultiRaft = struct {
         self.pending_outbox.deinit(self.alloc);
         for (self.pending_apply.items) |*task| task.deinit(self.alloc);
         self.pending_apply.deinit(self.alloc);
+        self.oversized_ready_scratch.deinit(self.alloc);
         var snapshot_candidates = self.snapshot_candidates.valueIterator();
         while (snapshot_candidates.next()) |candidate| candidate.deinit(self.alloc);
         self.snapshot_candidates.deinit(self.alloc);
@@ -457,6 +462,14 @@ pub const MultiRaft = struct {
     pub fn addGroup(self: *MultiRaft, cfg: group_mod.GroupConfig) !void {
         if (self.groups.count() >= self.cfg.max_groups) return error.MaxGroupsExceeded;
         if (self.groups.contains(cfg.group_id)) return error.GroupAlreadyExists;
+
+        // A drain can quarantine at most one entry per registered group. Pay
+        // this allocation on infrequent topology admission, not once per Raft
+        // round, and preserve the old group set if reservation fails.
+        try self.oversized_ready_scratch.ensureTotalCapacity(
+            self.alloc,
+            self.groups.count() + 1,
+        );
 
         var grp = try group_mod.Group.init(self.alloc, cfg);
         var grp_owned = true;
@@ -918,9 +931,9 @@ pub const MultiRaft = struct {
 
         var fair_attempts: usize = 0;
         const scan_limit = self.groups.count();
-        var oversized_ready_groups = std.ArrayListUnmanaged(core.types.GroupId).empty;
-        defer oversized_ready_groups.deinit(self.alloc);
-        try oversized_ready_groups.ensureTotalCapacity(self.alloc, scan_limit);
+        self.oversized_ready_scratch.clearRetainingCapacity();
+        std.debug.assert(self.oversized_ready_scratch.capacity >= scan_limit);
+        const oversized_ready_groups = &self.oversized_ready_scratch;
         var oversized_quarantine_cursor: usize = 0;
         const scan_start_ns = if (diagnostics != null) clock.monotonicNs() else 0;
         {
@@ -929,7 +942,7 @@ pub const MultiRaft = struct {
             while (fair_attempts < scan_limit) : (fair_attempts += 1) {
                 if (result.processed_ready_steps >= max_ready_steps) break;
                 const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
-                if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, &oversized_ready_groups)) {
+                if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, oversized_ready_groups)) {
                     result.processed_groups += 1;
                     result.processed_ready_steps += 1;
                 }
@@ -961,7 +974,7 @@ pub const MultiRaft = struct {
                     const group_id = self.scheduler.nextReadyGroup(&ready_pass) orelse break;
                     continuation_attempts += 1;
                     attempted_this_pass += 1;
-                    if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, &oversized_ready_groups)) {
+                    if (try self.processReadyCandidate(group_id, &outbox, batch, diagnostics, oversized_ready_groups)) {
                         result.processed_ready_steps += 1;
                         progressed_this_pass += 1;
                     }

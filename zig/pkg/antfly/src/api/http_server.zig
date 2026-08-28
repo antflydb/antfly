@@ -40,6 +40,7 @@ const internal_service_auth = @import("internal_service_auth.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_authority = @import("../metadata/authority.zig");
+const metadata_http_routes = @import("../metadata/http_routes.zig");
 const metadata_mod = @import("../metadata/domain.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
@@ -12242,7 +12243,7 @@ pub const ApiHttpServer = struct {
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
             error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
             error.TableTransitionActive, error.TableGenerationChanged, error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table topology changed; retry with the current table state"),
-            error.MetadataMutationOutcomeUnknown => try contextualRetryableTextResponse(self.alloc, 503, "table mutation outcome is unknown; observe table state before retrying"),
+            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => if (metadata_authority.isRetryableError(err))
                 try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
@@ -12298,7 +12299,7 @@ pub const ApiHttpServer = struct {
             error.TableTopologyProtocolUpgradeRequired => try contextualRetryableTextResponse(self.alloc, 503, "metadata cluster upgrade in progress; retry later"),
             error.NotLeader => try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later"),
             error.ExtensionOwnedObject => try contextual_operations.textAlloc(self.alloc, 409, "table is owned by an extension"),
-            error.MetadataMutationOutcomeUnknown => try contextualRetryableTextResponse(self.alloc, 503, "table mutation outcome is unknown; observe table state before retrying"),
+            error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownTextResponse(self.alloc, "table mutation outcome is unknown; observe table state before retrying"),
             error.UnsupportedOperation => try contextual_operations.textAlloc(self.alloc, 405, "method not allowed"),
             else => if (metadata_authority.isRetryableError(err))
                 try contextualRetryableTextResponse(self.alloc, 503, "metadata leader unavailable; retry later")
@@ -15637,6 +15638,66 @@ fn contextualRetryableTextResponse(alloc: std.mem.Allocator, status: u16, body: 
     };
 }
 
+fn contextualMutationOutcomeUnknownTextResponse(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+) !contextual_operations.OwnedResponse {
+    const headers = try alloc.alloc(contextual_operations.Header, 1);
+    errdefer alloc.free(headers);
+    headers[0] = try ownedContextualHeader(
+        alloc,
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+    );
+    errdefer headers[0].deinit(alloc);
+    return .{
+        // Conflict is deliberately non-retryable: the mutation may already be
+        // committed, and callers must observe its durable projection first.
+        .status = 409,
+        .content_type = "text/plain",
+        .body = try alloc.dupe(u8, body),
+        .headers = headers,
+    };
+}
+
+fn contextualMutationOutcomeUnknownJsonResponse(
+    alloc: std.mem.Allocator,
+    message: []const u8,
+) !contextual_operations.OwnedResponse {
+    var response = try contextualJsonErrorResponse(alloc, 409, message);
+    errdefer response.deinit(alloc);
+    response.headers = try alloc.alloc(contextual_operations.Header, 1);
+    response.headers[0] = ownedContextualHeader(
+        alloc,
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+    ) catch |err| {
+        alloc.free(response.headers);
+        response.headers = &.{};
+        return err;
+    };
+    return response;
+}
+
+test "ambiguous mutation response is explicitly non-retryable" {
+    var response = try contextualMutationOutcomeUnknownTextResponse(
+        std.testing.allocator,
+        "outcome unknown",
+    );
+    defer response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 409), response.status);
+    try std.testing.expectEqual(@as(usize, 1), response.headers.len);
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_header,
+        response.headers[0].name,
+    );
+    try std.testing.expectEqualStrings(
+        metadata_http_routes.Routes.raft_mutation_outcome_unknown,
+        response.headers[0].value,
+    );
+    try std.testing.expect(!std.ascii.eqlIgnoreCase(response.headers[0].name, "Retry-After"));
+}
+
 fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_operations.OwnedResponse {
     var response = try contextualJsonResponse(alloc, 503, connections_api.inferenceAdmissionFailure());
     errdefer response.deinit(alloc);
@@ -15655,7 +15716,7 @@ fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_ope
 
 fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
     return switch (err) {
-        error.MetadataMutationOutcomeUnknown => try contextualRetryableJsonErrorResponse(alloc, 503, "extension mutation outcome is unknown; observe extension state before retrying"),
+        error.MetadataMutationOutcomeUnknown => try contextualMutationOutcomeUnknownJsonResponse(alloc, "extension mutation outcome is unknown; observe extension state before retrying"),
         error.UnsupportedOperation => try contextualJsonErrorResponse(alloc, 405, "method not allowed"),
         error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try contextualJsonErrorResponse(alloc, 404, "not found"),
         error.ExtensionAlreadyInstalled => try contextualJsonErrorResponse(alloc, 409, "extension already installed"),
