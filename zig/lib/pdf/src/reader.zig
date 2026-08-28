@@ -411,6 +411,7 @@ fn pageFontsUsedOutlineFallback(fonts: []const PageFont) bool {
 
 const Type1Glyph = struct {
     code: u8,
+    encoded: bool = true,
     name: []u8,
     charstring: []u8,
     advance: f64,
@@ -438,7 +439,7 @@ const Type1Font = struct {
 
     fn glyphForCode(self: *const Type1Font, code: u8) ?*const Type1Glyph {
         for (self.glyphs) |*glyph| {
-            if (glyph.code == code) return glyph;
+            if (glyph.encoded and glyph.code == code) return glyph;
         }
         return null;
     }
@@ -785,6 +786,9 @@ pub const PatternRun = struct {
     kind: enum { fill, stroke },
     mode: enum { tiling, shading } = .tiling,
     paint_order: usize = 0,
+    /// Orders multiple paint phases emitted by one PDF operator. Text fill is
+    /// phase 0 and text stroke is phase 1, independent of backing paint type.
+    paint_phase: u8 = 0,
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
@@ -856,6 +860,7 @@ pub const BlendMode = enum {
 pub const ShapeRun = struct {
     kind: enum { fill, stroke },
     paint_order: usize = 0,
+    paint_phase: u8 = 0,
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
@@ -2327,8 +2332,7 @@ pub const Reader = struct {
         if (decoded_content.len > 0) {
             try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms);
         }
-        try appendVectorTextShapeRunsAlloc(self.alloc, &shape_out, fonts, text_out.items);
-        try appendVectorTextPatternRunsAlloc(self.alloc, &pattern_out, fonts, patterns, text_out.items);
+        try appendVectorTextRenderRunsAlloc(self.alloc, &shape_out, &pattern_out, fonts, patterns, text_out.items);
 
         result.text_runs = try text_out.toOwnedSlice(self.alloc);
         text_transferred = true;
@@ -2437,31 +2441,141 @@ pub const Reader = struct {
         text_runs: []const TextRun,
     ) !void {
         for (text_runs) |run| {
-            if (run.fill_pattern_name != null or run.stroke_pattern_name != null) continue;
-            const font_index = run.font_index orelse continue;
-            if (font_index >= fonts.len) continue;
-            if (fonts[font_index].type3) |type3| {
-                const raw = run.raw_text orelse continue;
-                try appendType3RunShapesAlloc(alloc, out, run, type3, raw);
+            var temp_shapes = std.ArrayList(ShapeRun).empty;
+            defer {
+                for (temp_shapes.items) |*shape| shape.deinit(alloc);
+                temp_shapes.deinit(alloc);
+            }
+            if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run)) continue;
+            try transferSolidTextShapesAlloc(alloc, out, &temp_shapes, run);
+        }
+    }
+
+    fn appendVectorTextRunShapesAlloc(
+        alloc: Allocator,
+        out: *std.ArrayList(ShapeRun),
+        fonts: []const PageFont,
+        run: TextRun,
+    ) !bool {
+        const font_index = run.font_index orelse return false;
+        if (font_index >= fonts.len) return false;
+        if (fonts[font_index].type3) |type3| {
+            const raw = run.raw_text orelse return false;
+            return try appendType3RunShapesAlloc(alloc, out, run, type3, raw);
+        }
+        if (fonts[font_index].type1) |type1| {
+            const raw = run.raw_text orelse return false;
+            return try appendType1RunShapesAlloc(alloc, out, run, type1, raw);
+        }
+        if (fonts[font_index].truetype) |truetype|
+            return try appendTrueTypeRunShapesAlloc(alloc, out, run, truetype, run.raw_text);
+        if (fonts[font_index].cff_otf) |cff_otf|
+            return try appendCffRunShapesAlloc(alloc, out, run, cff_otf);
+        if (fonts[font_index].cff) |cff| {
+            const raw = run.raw_text orelse return false;
+            return try appendEmbeddedCffRunShapesAlloc(alloc, out, run, cff, raw);
+        }
+        return false;
+    }
+
+    fn patternNameForTextShape(run: TextRun, shape: ShapeRun) ?[]const u8 {
+        return switch (shape.kind) {
+            .fill => run.fill_pattern_name,
+            .stroke => run.stroke_pattern_name,
+        };
+    }
+
+    fn transferSolidTextShapesAlloc(
+        alloc: Allocator,
+        out: *std.ArrayList(ShapeRun),
+        shapes: *std.ArrayList(ShapeRun),
+        run: TextRun,
+    ) !void {
+        var solid_count: usize = 0;
+        for (shapes.items) |shape| if (patternNameForTextShape(run, shape) == null) {
+            solid_count += 1;
+        };
+        try out.ensureUnusedCapacity(alloc, solid_count);
+
+        const original_len = shapes.items.len;
+        var retained_len: usize = 0;
+        for (shapes.items[0..original_len]) |shape| {
+            if (patternNameForTextShape(run, shape) == null) {
+                out.appendAssumeCapacity(shape);
+            } else {
+                shapes.items[retained_len] = shape;
+                retained_len += 1;
+            }
+        }
+        shapes.items.len = retained_len;
+    }
+
+    fn appendPatternTextShapesAlloc(
+        alloc: Allocator,
+        out: *std.ArrayList(PatternRun),
+        patterns: []const PagePattern,
+        shapes: []const ShapeRun,
+        run: TextRun,
+    ) !void {
+        for (shapes) |shape| {
+            const pattern_name = patternNameForTextShape(run, shape) orelse continue;
+            const pattern = findPagePattern(patterns, pattern_name) orelse return error.MissingPdfPattern;
+            try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunFromShapeAlloc(alloc, pattern, shape));
+        }
+    }
+
+    fn useTextRunRasterFallback(alloc: Allocator, run: *TextRun) void {
+        run.vectorizable = false;
+        if (run.fill_pattern_name) |name| alloc.free(name);
+        if (run.stroke_pattern_name) |name| alloc.free(name);
+        run.fill_pattern_name = null;
+        run.stroke_pattern_name = null;
+    }
+
+    fn appendVectorTextRenderRunsAlloc(
+        alloc: Allocator,
+        shape_out: *std.ArrayList(ShapeRun),
+        pattern_out: *std.ArrayList(PatternRun),
+        fonts: []const PageFont,
+        patterns: []const PagePattern,
+        text_runs: []TextRun,
+    ) !void {
+        for (text_runs) |*run| {
+            if (!run.vectorizable) continue;
+            var temp_shapes = std.ArrayList(ShapeRun).empty;
+            defer {
+                for (temp_shapes.items) |*shape| shape.deinit(alloc);
+                temp_shapes.deinit(alloc);
+            }
+            const complete = appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run.*) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    useTextRunRasterFallback(alloc, run);
+                    continue;
+                },
+            };
+            if (!complete) {
+                useTextRunRasterFallback(alloc, run);
                 continue;
             }
-            if (fonts[font_index].type1) |type1| {
-                const raw = run.raw_text orelse continue;
-                try appendType1RunShapesAlloc(alloc, out, run, type1, raw);
-                continue;
+
+            var temp_patterns = std.ArrayList(PatternRun).empty;
+            defer {
+                for (temp_patterns.items) |*pattern| pattern.deinit(alloc);
+                temp_patterns.deinit(alloc);
             }
-            if (fonts[font_index].truetype) |truetype| {
-                try appendTrueTypeRunShapesAlloc(alloc, out, run, truetype, run.raw_text);
-                continue;
-            }
-            if (fonts[font_index].cff_otf) |cff_otf| {
-                try appendCffRunShapesAlloc(alloc, out, run, cff_otf);
-                continue;
-            }
-            if (fonts[font_index].cff) |cff| {
-                const raw = run.raw_text orelse continue;
-                try appendEmbeddedCffRunShapesAlloc(alloc, out, run, cff, raw);
-            }
+            appendPatternTextShapesAlloc(alloc, &temp_patterns, patterns, temp_shapes.items, run.*) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => {
+                    useTextRunRasterFallback(alloc, run);
+                    continue;
+                },
+            };
+
+            try transferSolidTextShapesAlloc(alloc, shape_out, &temp_shapes, run.*);
+            try pattern_out.ensureUnusedCapacity(alloc, temp_patterns.items.len);
+            for (temp_patterns.items) |pattern| pattern_out.appendAssumeCapacity(pattern);
+            temp_patterns.clearRetainingCapacity();
         }
     }
 
@@ -2501,104 +2615,13 @@ pub const Reader = struct {
     ) anyerror!void {
         for (text_runs) |run| {
             if (run.fill_pattern_name == null and run.stroke_pattern_name == null) continue;
-            const font_index = run.font_index orelse continue;
-            if (font_index >= fonts.len) continue;
-
             var temp_shapes = std.ArrayList(ShapeRun).empty;
             defer {
                 for (temp_shapes.items) |*shape| shape.deinit(alloc);
                 temp_shapes.deinit(alloc);
             }
-
-            if (fonts[font_index].type3) |type3| {
-                const raw = run.raw_text orelse continue;
-                try appendType3RunShapesAlloc(alloc, &temp_shapes, run, type3, raw);
-            } else if (fonts[font_index].type1) |type1| {
-                const raw = run.raw_text orelse continue;
-                try appendType1RunShapesAlloc(alloc, &temp_shapes, run, type1, raw);
-            } else if (fonts[font_index].truetype) |truetype| {
-                try appendTrueTypeRunShapesAlloc(alloc, &temp_shapes, run, truetype, run.raw_text);
-            } else if (fonts[font_index].cff_otf) |cff_otf| {
-                try appendCffRunShapesAlloc(alloc, &temp_shapes, run, cff_otf);
-            } else if (fonts[font_index].cff) |cff| {
-                const raw = run.raw_text orelse continue;
-                try appendEmbeddedCffRunShapesAlloc(alloc, &temp_shapes, run, cff, raw);
-            }
-
-            for (temp_shapes.items) |shape| {
-                const pattern_name = switch (shape.kind) {
-                    .fill => run.fill_pattern_name,
-                    .stroke => run.stroke_pattern_name,
-                } orelse continue;
-                const pattern = findPagePattern(patterns, pattern_name) orelse continue;
-                if (pattern.kind == .shading) {
-                    try appendOwnedValue(PatternRun, alloc, out, try buildShadingPatternRunAlloc(
-                        alloc,
-                        pattern,
-                        .{
-                            .fill_color = shape.color,
-                            .stroke_color = shape.color,
-                            .fill_alpha = shape.color[3],
-                            .stroke_alpha = shape.color[3],
-                            .blend_mode = shape.blend_mode,
-                            .group_id = shape.group_id,
-                            .group_parent_id = shape.group_parent_id,
-                            .group_isolated = shape.group_isolated,
-                            .group_knockout = shape.group_knockout,
-                            .line_cap = shape.line_cap,
-                            .line_join = shape.line_join,
-                            .miter_limit = shape.miter_limit,
-                            .stroke_width = shape.stroke_width,
-                            .clip_box = shape.clip_box,
-                        },
-                        shape.points,
-                        switch (shape.kind) {
-                            .fill => .fill,
-                            .stroke => .stroke,
-                        },
-                        shape.closed,
-                        shape.fill_rule,
-                        if (shape.dash_array) |dash| dash else &.{},
-                        shape.dash_phase,
-                        if (shape.clip_points) |clip| clip else &.{},
-                        shape.clip_fill_rule,
-                        shape.paint_order,
-                    ));
-                } else {
-                    try appendOwnedValue(PatternRun, alloc, out, try buildPatternRunAlloc(
-                        alloc,
-                        pattern,
-                        .{
-                            .fill_color = shape.color,
-                            .stroke_color = shape.color,
-                            .fill_alpha = shape.color[3],
-                            .stroke_alpha = shape.color[3],
-                            .blend_mode = shape.blend_mode,
-                            .group_id = shape.group_id,
-                            .group_parent_id = shape.group_parent_id,
-                            .group_isolated = shape.group_isolated,
-                            .group_knockout = shape.group_knockout,
-                            .line_cap = shape.line_cap,
-                            .line_join = shape.line_join,
-                            .miter_limit = shape.miter_limit,
-                            .stroke_width = shape.stroke_width,
-                            .clip_box = shape.clip_box,
-                        },
-                        shape.points,
-                        switch (shape.kind) {
-                            .fill => .fill,
-                            .stroke => .stroke,
-                        },
-                        shape.closed,
-                        shape.fill_rule,
-                        if (shape.dash_array) |dash| dash else &.{},
-                        shape.dash_phase,
-                        if (shape.clip_points) |clip| clip else &.{},
-                        shape.clip_fill_rule,
-                        shape.paint_order,
-                    ));
-                }
-            }
+            if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run)) continue;
+            try appendPatternTextShapesAlloc(alloc, out, patterns, temp_shapes.items, run);
         }
     }
 
@@ -3070,11 +3093,13 @@ pub const Reader = struct {
         run: TextRun,
         type3: Type3Font,
         raw: []const u8,
-    ) !void {
+    ) !bool {
         var cursor_x: f64 = 0;
         var cursor_y: f64 = 0;
+        var complete = true;
         for (raw) |code| {
             const glyph = type3.glyphForCode(code) orelse {
+                complete = false;
                 cursor_x += estimateType3MissingAdvance(run);
                 continue;
             };
@@ -3094,6 +3119,7 @@ pub const Reader = struct {
             cursor_x += run.char_spacing;
             if (code == ' ') cursor_x += run.word_spacing;
         }
+        return complete;
     }
 
     fn transformType3ShapeRunAlloc(
@@ -3118,12 +3144,16 @@ pub const Reader = struct {
 
         return .{
             .paint_order = run.paint_order,
+            .paint_phase = if (shape.kind == .fill) 0 else 1,
             .blend_mode = run.blend_mode,
             .group_id = run.group_id,
             .group_parent_id = run.group_parent_id,
             .group_isolated = run.group_isolated,
             .group_knockout = run.group_knockout,
-            .kind = shape.kind,
+            .kind = switch (shape.kind) {
+                .fill => .fill,
+                .stroke => .stroke,
+            },
             .fill_rule = shape.fill_rule,
             .line_cap = shape.line_cap,
             .line_join = shape.line_join,
@@ -3164,6 +3194,7 @@ pub const Reader = struct {
         errdefer if (owned_subpath_starts) |starts| alloc.free(starts);
         try out.append(alloc, .{
             .paint_order = run.paint_order,
+            .paint_phase = if (kind == .fill) 0 else 1,
             .blend_mode = run.blend_mode,
             .group_id = run.group_id,
             .group_parent_id = run.group_parent_id,
@@ -3240,23 +3271,23 @@ pub const Reader = struct {
         run: TextRun,
         truetype: TrueTypeFont,
         raw: ?[]const u8,
-    ) !void {
-        if (run.text.len == 0) return;
+    ) !bool {
+        if (run.text.len == 0) return true;
         const mode = @mod(run.render_mode, 8);
-        if (mode == 3 or mode == 7) return;
+        if (mode == 3 or mode == 7) return true;
 
         const scale = if (truetype.units_per_em == 0) 1.0 else run.font_size / @as(f64, @floatFromInt(truetype.units_per_em));
         var cursor_x: f64 = 0;
         var raw_offset: usize = 0;
         var simple_raw_offset: usize = 0;
-        var view = std.unicode.Utf8View.init(run.text) catch return;
+        var view = std.unicode.Utf8View.init(run.text) catch return false;
         var iter = view.iterator();
         while (true) {
             var cp: u21 = 0xfffd;
             var simple_code: ?u8 = null;
             var cid_code: ?u16 = null;
             const glyph_index = (if (truetype.raw_code_bytes > 0) blk: {
-                const raw_bytes = raw orelse break;
+                const raw_bytes = raw orelse return false;
                 if (raw_offset >= raw_bytes.len) break;
                 const code_len = @min(truetype.raw_code_bytes, raw_bytes.len - raw_offset);
                 const cid = parseRawCode(raw_bytes[raw_offset .. raw_offset + code_len]);
@@ -3275,7 +3306,7 @@ pub const Reader = struct {
                     simple_code = raw_bytes[simple_raw_offset];
                     simple_raw_offset += 1;
                 };
-                break :blk truetype.font.cmapGlyphIndex(cp) catch return;
+                break :blk truetype.font.cmapGlyphIndex(cp) catch return false;
             }) orelse {
                 const missing_advance = if (cid_code != null and truetype.cid_widths != null)
                     truetype.cid_widths.?.width(cid_code.?) * run.font_size / 1000.0
@@ -3284,9 +3315,9 @@ pub const Reader = struct {
                 else
                     run.font_size * 0.6;
                 cursor_x += (missing_advance + run.char_spacing + if (cp == ' ') run.word_spacing else 0.0) * run.horizontal_scale;
-                continue;
+                return false;
             };
-            const advance_width = truetype.font.advanceWidth(glyph_index) catch return;
+            const advance_width = truetype.font.advanceWidth(glyph_index) catch return false;
             if (try truetype.font.glyphOutlineAlloc(alloc, glyph_index)) |outline_value| {
                 var outline = outline_value;
                 defer outline.deinit(alloc);
@@ -3311,6 +3342,7 @@ pub const Reader = struct {
             } else @as(f64, @floatFromInt(advance_width)) * scale;
             cursor_x += (glyph_advance + spacing) * run.horizontal_scale;
         }
+        return true;
     }
 
     fn appendType1RunShapesAlloc(
@@ -3319,22 +3351,27 @@ pub const Reader = struct {
         run: TextRun,
         type1: Type1Font,
         raw: []const u8,
-    ) !void {
-        if (raw.len == 0) return;
+    ) !bool {
+        if (raw.len == 0) return true;
         const mode = @mod(run.render_mode, 8);
-        if (mode == 3 or mode == 7) return;
+        if (mode == 3 or mode == 7) return true;
 
         const scale = run.font_size / 1000.0;
         var cursor_x: f64 = 0;
+        var complete = true;
         for (raw) |code| {
             const glyph = type1.glyphForCode(code) orelse {
+                complete = false;
                 cursor_x += estimateType1MissingAdvance(run);
                 continue;
             };
             const outline_value = font_lib.type1.glyphOutlineAlloc(alloc, glyph.charstring, type1.local_subrs) catch |err| blk: {
                 if (err != error.UnsupportedType1) return err;
                 if (font_lib.type1.seacComponentsAlloc(alloc, glyph.charstring, type1.local_subrs) catch null) |seac| {
-                    try appendType1SeacRunShapesAlloc(alloc, out, run, type1, cursor_x, scale, seac);
+                    if (!try appendType1SeacRunShapesAlloc(alloc, out, run, type1, cursor_x, scale, seac))
+                        complete = false;
+                } else {
+                    complete = false;
                 }
                 break :blk null;
             };
@@ -3346,6 +3383,7 @@ pub const Reader = struct {
             const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
             cursor_x += (glyph.advance * scale + spacing) * run.horizontal_scale;
         }
+        return complete;
     }
 
     fn appendType1SeacRunShapesAlloc(
@@ -3356,22 +3394,33 @@ pub const Reader = struct {
         cursor_x: f64,
         scale: f64,
         seac: font_lib.type1.SeacComponents,
-    ) !void {
+    ) !bool {
         const mode = @mod(run.render_mode, 8);
+        var complete = true;
         if (type1.glyphForStandardCode(seac.bchar)) |base_glyph| {
             if (try font_lib.type1.glyphOutlineAlloc(alloc, base_glyph.charstring, type1.local_subrs)) |outline| {
                 var owned_outline = outline;
                 defer owned_outline.deinit(alloc);
                 try appendType1OutlineShapesAlloc(alloc, out, run, cursor_x, scale, owned_outline, mode, 0);
-            }
-        }
+            } else complete = false;
+        } else complete = false;
         if (type1.glyphForStandardCode(seac.achar)) |accent_glyph| {
             if (try font_lib.type1.glyphOutlineAlloc(alloc, accent_glyph.charstring, type1.local_subrs)) |outline| {
                 var owned_outline = outline;
                 defer owned_outline.deinit(alloc);
-                try appendType1OutlineShapesAlloc(alloc, out, run, cursor_x + (seac.adx - seac.asb) * scale, scale, owned_outline, mode, seac.ady * scale);
-            }
-        }
+                try appendType1OutlineShapesAlloc(
+                    alloc,
+                    out,
+                    run,
+                    cursor_x + (seac.adx - seac.asb) * scale * run.horizontal_scale,
+                    scale,
+                    owned_outline,
+                    mode,
+                    seac.ady * scale,
+                );
+            } else complete = false;
+        } else complete = false;
+        return complete;
     }
 
     fn appendType1OutlineShapesAlloc(
@@ -3401,21 +3450,21 @@ pub const Reader = struct {
         out: *std.ArrayList(ShapeRun),
         run: TextRun,
         cff_otf: CffOpenTypeFont,
-    ) !void {
-        if (run.text.len == 0) return;
+    ) !bool {
+        if (run.text.len == 0) return true;
         const mode = @mod(run.render_mode, 8);
-        if (mode == 3 or mode == 7) return;
+        if (mode == 3 or mode == 7) return true;
 
         const scale = if (cff_otf.units_per_em == 0) 1.0 else run.font_size / @as(f64, @floatFromInt(cff_otf.units_per_em));
         var cursor_x: f64 = 0;
-        var view = std.unicode.Utf8View.init(run.text) catch return;
+        var view = std.unicode.Utf8View.init(run.text) catch return false;
         var iter = view.iterator();
         while (iter.nextCodepoint()) |cp| {
-            const glyph_index = (cff_otf.sfnt.cmapGlyphIndex(cp) catch return) orelse {
+            const glyph_index = (cff_otf.sfnt.cmapGlyphIndex(cp) catch return false) orelse {
                 cursor_x += estimateRenderedRunCodepointAdvance(run, cp);
-                continue;
+                return false;
             };
-            const advance_width = cff_otf.sfnt.advanceWidth(glyph_index) catch return;
+            const advance_width = cff_otf.sfnt.advanceWidth(glyph_index) catch return false;
             if (try cff_otf.cff.glyphOutlineAlloc(alloc, glyph_index)) |outline_value| {
                 var outline = outline_value;
                 defer outline.deinit(alloc);
@@ -3433,6 +3482,7 @@ pub const Reader = struct {
             const spacing = run.char_spacing + if (cp == ' ') run.word_spacing else 0.0;
             cursor_x += (@as(f64, @floatFromInt(advance_width)) * scale + spacing) * run.horizontal_scale;
         }
+        return true;
     }
 
     fn appendEmbeddedCffRunShapesAlloc(
@@ -3441,10 +3491,10 @@ pub const Reader = struct {
         run: TextRun,
         cff: EmbeddedCffFont,
         raw: []const u8,
-    ) !void {
-        if (raw.len == 0) return;
+    ) !bool {
+        if (raw.len == 0) return true;
         const mode = @mod(run.render_mode, 8);
-        if (mode == 3 or mode == 7) return;
+        if (mode == 3 or mode == 7) return true;
         const scale = run.font_size / 1000.0;
         var cursor_x: f64 = 0;
         var offset: usize = 0;
@@ -3454,7 +3504,7 @@ pub const Reader = struct {
             offset += code_len;
             const glyph = cff.glyphForCode(code) orelse {
                 cursor_x += estimateRenderedRunCodepointAdvance(run, 0xfffd);
-                continue;
+                return false;
             };
             if (try cff.font.glyphOutlineAlloc(alloc, glyph.glyph_index)) |outline_value| {
                 var outline = outline_value;
@@ -3471,6 +3521,7 @@ pub const Reader = struct {
             const spacing = cff.textSpacing(code, run.char_spacing, run.word_spacing);
             cursor_x += (glyph.advance * scale + spacing) * run.horizontal_scale;
         }
+        return true;
     }
 
     fn collectPageFontsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageFont {
@@ -7961,6 +8012,69 @@ fn parseType1GlyphsAlloc(
     return try parseType1GlyphsLexAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths);
 }
 
+fn type1GlyphNameIsEncoded(code_to_name: *const [256]?[]const u8, glyph_name: []const u8) bool {
+    for (code_to_name) |maybe_name| {
+        const name = maybe_name orelse continue;
+        if (std.mem.eql(u8, name, glyph_name)) return true;
+    }
+    return false;
+}
+
+fn appendType1GlyphAlloc(
+    alloc: Allocator,
+    glyphs: *std.ArrayList(Type1Glyph),
+    code: u8,
+    encoded: bool,
+    glyph_name: []const u8,
+    program: []const u8,
+    advance: f64,
+) !void {
+    var name: ?[]u8 = try alloc.dupe(u8, glyph_name);
+    errdefer if (name) |owned| alloc.free(owned);
+    var charstring: ?[]u8 = try alloc.dupe(u8, program);
+    errdefer if (charstring) |owned| alloc.free(owned);
+    try glyphs.append(alloc, .{
+        .code = code,
+        .encoded = encoded,
+        .name = name.?,
+        .charstring = charstring.?,
+        .advance = advance,
+    });
+    name = null;
+    charstring = null;
+}
+
+fn appendParsedType1Glyphs(
+    alloc: Allocator,
+    glyphs: *std.ArrayList(Type1Glyph),
+    code_to_name: *const [256]?[]const u8,
+    glyph_names: []const []u8,
+    glyph_programs: []const []u8,
+    first_char: usize,
+    widths: []const syntax.Object,
+) !void {
+    // Preserve encoded aliases exactly as the PDF declares them. Composite
+    // `seac` glyphs may also reference CharStrings that are deliberately not
+    // present in the PDF encoding, so retain those entries for name-based
+    // StandardEncoding lookup without making them addressable by byte code.
+    for (code_to_name, 0..) |maybe_name, code| {
+        const glyph_name = maybe_name orelse continue;
+        for (glyph_names, glyph_programs) |parsed_name, program| {
+            if (!std.mem.eql(u8, glyph_name, parsed_name)) continue;
+            const advance = if (code >= first_char and code - first_char < widths.len)
+                numericObjectValue(&widths[code - first_char]) orelse 1000.0
+            else
+                1000.0;
+            try appendType1GlyphAlloc(alloc, glyphs, @intCast(code), true, glyph_name, program, advance);
+            break;
+        }
+    }
+    for (glyph_names, glyph_programs) |glyph_name, program| {
+        if (type1GlyphNameIsEncoded(code_to_name, glyph_name)) continue;
+        try appendType1GlyphAlloc(alloc, glyphs, 0, false, glyph_name, program, 1000.0);
+    }
+}
+
 fn parseType1GlyphsLexAlloc(
     alloc: Allocator,
     bytes: []const u8,
@@ -8040,29 +8154,7 @@ fn parseType1GlyphsLexAlloc(
         for (glyphs.items) |*glyph| glyph.deinit(alloc);
         glyphs.deinit(alloc);
     }
-    for (code_to_name, 0..) |maybe_name, code| {
-        const glyph_name = maybe_name orelse continue;
-        for (glyph_names.items, glyph_programs.items) |parsed_name, program| {
-            if (!std.mem.eql(u8, glyph_name, parsed_name)) continue;
-            const advance = if (code >= first_char and code - first_char < widths.len)
-                numericObjectValue(&widths[code - first_char]) orelse 1000.0
-            else
-                1000.0;
-            var name: ?[]u8 = try alloc.dupe(u8, glyph_name);
-            errdefer if (name) |owned| alloc.free(owned);
-            var charstring: ?[]u8 = try alloc.dupe(u8, program);
-            errdefer if (charstring) |owned| alloc.free(owned);
-            try glyphs.append(alloc, .{
-                .code = @intCast(code),
-                .name = name.?,
-                .charstring = charstring.?,
-                .advance = advance,
-            });
-            name = null;
-            charstring = null;
-            break;
-        }
-    }
+    try appendParsedType1Glyphs(alloc, &glyphs, code_to_name, glyph_names.items, glyph_programs.items, first_char, widths);
 
     return try glyphs.toOwnedSlice(alloc);
 }
@@ -8195,29 +8287,7 @@ fn parseType1GlyphsRdAlloc(
         for (glyphs.items) |*glyph| glyph.deinit(alloc);
         glyphs.deinit(alloc);
     }
-    for (code_to_name, 0..) |maybe_name, code| {
-        const glyph_name = maybe_name orelse continue;
-        for (glyph_names.items, glyph_programs.items) |parsed_name, program| {
-            if (!std.mem.eql(u8, glyph_name, parsed_name)) continue;
-            const advance = if (code >= first_char and code - first_char < widths.len)
-                numericObjectValue(&widths[code - first_char]) orelse 1000.0
-            else
-                1000.0;
-            var owned_name: ?[]u8 = try alloc.dupe(u8, glyph_name);
-            errdefer if (owned_name) |owned| alloc.free(owned);
-            var charstring: ?[]u8 = try alloc.dupe(u8, program);
-            errdefer if (charstring) |owned| alloc.free(owned);
-            try glyphs.append(alloc, .{
-                .code = @intCast(code),
-                .name = owned_name.?,
-                .charstring = charstring.?,
-                .advance = advance,
-            });
-            owned_name = null;
-            charstring = null;
-            break;
-        }
-    }
+    try appendParsedType1Glyphs(alloc, &glyphs, code_to_name, glyph_names.items, glyph_programs.items, first_char, widths);
 
     return try glyphs.toOwnedSlice(alloc);
 }
@@ -11080,9 +11150,13 @@ fn buildPatternRunFromShapeAlloc(
         const owned_subpath_starts = if (shape.subpath_starts) |starts| try alloc.dupe(usize, starts) else null;
         errdefer if (owned_subpath_starts) |starts| alloc.free(starts);
         return .{
-            .kind = shape.kind,
+            .kind = switch (shape.kind) {
+                .fill => .fill,
+                .stroke => .stroke,
+            },
             .mode = .shading,
             .paint_order = shape.paint_order,
+            .paint_phase = shape.paint_phase,
             .blend_mode = shape.blend_mode,
             .group_id = shape.group_id,
             .group_parent_id = shape.group_parent_id,
@@ -11165,6 +11239,7 @@ fn buildPatternRunFromShapeAlloc(
         shape.paint_order,
     );
     errdefer run.deinit(alloc);
+    run.paint_phase = shape.paint_phase;
     if (shape.subpath_starts) |starts| run.subpath_starts = try alloc.dupe(usize, starts);
     return run;
 }
@@ -19084,6 +19159,155 @@ test "flattened glyph ownership transfer is allocation-failure safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "vector text preserves mixed pattern fill and solid stroke phases" {
+    const alloc = std.testing.allocator;
+    var glyph_name = [_]u8{'A'};
+    var glyph_program = [_]u8{
+        139, 139, 21, // 0 0 rmoveto
+        189, 139, 5, // 50 0 rlineto
+        139, 189, 5, // 0 50 rlineto
+        89, 139, 5, // -50 0 rlineto
+        14,
+    };
+    var glyphs = [_]Type1Glyph{.{
+        .code = 'A',
+        .name = &glyph_name,
+        .charstring = &glyph_program,
+        .advance = 600,
+    }};
+    var font_name = [_]u8{'F'};
+    var font_bytes: [0]u8 = .{};
+    var fonts = [_]PageFont{.{
+        .name = &font_name,
+        .decoder = .{},
+        .type1 = .{ .bytes = &font_bytes, .glyphs = &glyphs },
+    }};
+    var pattern_name = [_]u8{'P'};
+    var pattern_content: [0]u8 = .{};
+    var patterns = [_]PagePattern{.{
+        .name = &pattern_name,
+        .content = &pattern_content,
+        .bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .x_step = 1,
+        .y_step = 1,
+    }};
+
+    var run = TextRun{
+        .text = try alloc.dupe(u8, "A"),
+        .raw_text = try alloc.dupe(u8, "A"),
+        .font_index = 0,
+        .vectorizable = true,
+        .x = 0,
+        .y = 0,
+        .font_size = 12,
+        .render_mode = 2,
+        .fill_pattern_name = try alloc.dupe(u8, "P"),
+    };
+    defer run.deinit(alloc);
+    var shape_out = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (shape_out.items) |*shape| shape.deinit(alloc);
+        shape_out.deinit(alloc);
+    }
+    var pattern_out = std.ArrayList(PatternRun).empty;
+    defer {
+        for (pattern_out.items) |*pattern| pattern.deinit(alloc);
+        pattern_out.deinit(alloc);
+    }
+
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &patterns, (&run)[0..1]);
+    try std.testing.expect(run.vectorizable);
+    try std.testing.expectEqual(@as(usize, 1), pattern_out.items.len);
+    try std.testing.expectEqual(@as(@FieldType(PatternRun, "kind"), .fill), pattern_out.items[0].kind);
+    try std.testing.expectEqual(@as(u8, 0), pattern_out.items[0].paint_phase);
+    try std.testing.expectEqual(@as(usize, 1), shape_out.items.len);
+    try std.testing.expectEqual(@as(@FieldType(ShapeRun, "kind"), .stroke), shape_out.items[0].kind);
+    try std.testing.expectEqual(@as(u8, 1), shape_out.items[0].paint_phase);
+}
+
+test "vector text failure retains a visible raster fallback" {
+    const alloc = std.testing.allocator;
+    var glyph_name = [_]u8{'A'};
+    var invalid_program = [_]u8{ 12, 17, 14 }; // pop with no OtherSubr result
+    var glyphs = [_]Type1Glyph{.{
+        .code = 'A',
+        .name = &glyph_name,
+        .charstring = &invalid_program,
+        .advance = 600,
+    }};
+    var font_name = [_]u8{'F'};
+    var font_bytes: [0]u8 = .{};
+    var fonts = [_]PageFont{.{
+        .name = &font_name,
+        .decoder = .{},
+        .type1 = .{ .bytes = &font_bytes, .glyphs = &glyphs },
+    }};
+    var run = TextRun{
+        .text = try alloc.dupe(u8, "A"),
+        .raw_text = try alloc.dupe(u8, "A"),
+        .font_index = 0,
+        .vectorizable = true,
+        .x = 0,
+        .y = 0,
+        .font_size = 12,
+        .fill_pattern_name = try alloc.dupe(u8, "Missing"),
+    };
+    defer run.deinit(alloc);
+    var shape_out = std.ArrayList(ShapeRun).empty;
+    defer shape_out.deinit(alloc);
+    var pattern_out = std.ArrayList(PatternRun).empty;
+    defer pattern_out.deinit(alloc);
+
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &.{}, (&run)[0..1]);
+    try std.testing.expect(!run.vectorizable);
+    try std.testing.expect(run.fill_pattern_name == null);
+    try std.testing.expectEqual(@as(usize, 0), shape_out.items.len);
+    try std.testing.expectEqual(@as(usize, 0), pattern_out.items.len);
+}
+
+test "Type1 seac accent offset follows horizontal text scaling" {
+    const alloc = std.testing.allocator;
+    var base_name = [_]u8{'A'};
+    var accent_name = [_]u8{ 'p', 'e', 'r', 'i', 'o', 'd' };
+    var outline_program = [_]u8{
+        139, 139, 21,
+        189, 139, 5,
+        139, 189, 5,
+        89,  139, 5,
+        14,
+    };
+    var glyphs = [_]Type1Glyph{
+        .{ .code = 'A', .name = &base_name, .charstring = &outline_program, .advance = 600 },
+        .{ .code = '.', .name = &accent_name, .charstring = &outline_program, .advance = 600 },
+    };
+    var font_bytes: [0]u8 = .{};
+    const type1 = Type1Font{ .bytes = &font_bytes, .glyphs = &glyphs };
+    const run = TextRun{
+        .text = "",
+        .x = 0,
+        .y = 0,
+        .font_size = 1000,
+        .horizontal_scale = 0.5,
+    };
+    var out = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (out.items) |*shape| shape.deinit(alloc);
+        out.deinit(alloc);
+    }
+
+    try std.testing.expect(try Reader.appendType1SeacRunShapesAlloc(alloc, &out, run, type1, 0, 1, .{
+        .asb = 0,
+        .adx = 100,
+        .ady = 0,
+        .bchar = 65,
+        .achar = 46,
+    }));
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    var accent_min_x = std.math.inf(f64);
+    for (out.items[1].points) |point| accent_min_x = @min(accent_min_x, point[0]);
+    try std.testing.expectApproxEqAbs(@as(f64, 50), accent_min_x, 0.001);
+}
+
 test "reader vectorizes Type1C standard SID glyphs with StandardEncoding" {
     const alloc = std.testing.allocator;
     const cff_bytes = [_]u8{
@@ -19143,8 +19367,9 @@ test "type1 font parsing is allocation-failure safe" {
             const program =
                 "/Subrs 1 array\n" ++
                 "dup 0 3 RD abc NP\n" ++
-                "/CharStrings 1 dict dup begin\n" ++
+                "/CharStrings 2 dict dup begin\n" ++
                 "dup /A 3 RD xyz ND\n" ++
+                "dup /helper 3 RD def ND\n" ++
                 "end\n";
 
             const subrs = try parseType1LocalSubrsAlloc(alloc, program, -1);
@@ -19161,7 +19386,10 @@ test "type1 font parsing is allocation-failure safe" {
                 for (glyphs) |*glyph| glyph.deinit(alloc);
                 if (glyphs.len > 0) alloc.free(glyphs);
             }
-            try std.testing.expectEqual(@as(usize, 1), glyphs.len);
+            try std.testing.expectEqual(@as(usize, 2), glyphs.len);
+            try std.testing.expect(glyphs[0].encoded);
+            try std.testing.expect(!glyphs[1].encoded);
+            try std.testing.expectEqualStrings("helper", glyphs[1].name);
         }
     };
 

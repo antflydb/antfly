@@ -27,6 +27,53 @@ pub const Error = error{
 
 const ParseError = Error || std.mem.Allocator.Error;
 
+const FlexState = struct {
+    active: bool = false,
+    start: [2]f64 = .{ 0, 0 },
+    points: [7][2]f64 = undefined,
+    point_count: usize = 0,
+
+    fn begin(self: *FlexState, x: f64, y: f64) Error!void {
+        if (self.active or !std.math.isFinite(x) or !std.math.isFinite(y)) return error.InvalidType1;
+        self.* = .{
+            .active = true,
+            .start = .{ x, y },
+        };
+    }
+
+    fn record(self: *FlexState, x: f64, y: f64) Error!void {
+        if (!self.active or self.point_count >= self.points.len or !std.math.isFinite(x) or !std.math.isFinite(y))
+            return error.InvalidType1;
+        self.points[self.point_count] = .{ x, y };
+        self.point_count += 1;
+    }
+
+    fn finish(
+        self: *FlexState,
+        alloc: std.mem.Allocator,
+        current: *std.ArrayList(GlyphPoint),
+        x: *f64,
+        y: *f64,
+        arguments: []const f64,
+    ) ParseError!void {
+        if (!self.active or self.point_count != self.points.len or arguments.len != 3)
+            return error.InvalidType1;
+        for (arguments) |argument| if (!std.math.isFinite(argument)) return error.InvalidType1;
+        if (current.items.len == 0) {
+            try current.append(alloc, .{ .x = self.start[0], .y = self.start[1], .on_curve = true });
+        }
+        const current_point = current.items[current.items.len - 1];
+        if (!pointsAlmostEqual(current_point, .{ .x = self.start[0], .y = self.start[1], .on_curve = true }))
+            return error.InvalidType1;
+
+        try appendCubicFlattenedAlloc(alloc, current, self.start, self.points[1], self.points[2], self.points[3], 8);
+        try appendCubicFlattenedAlloc(alloc, current, self.points[3], self.points[4], self.points[5], self.points[6], 8);
+        x.* = arguments[1];
+        y.* = arguments[2];
+        self.* = .{};
+    }
+};
+
 fn exactIntFromFloat(comptime T: type, value: f64) Error!T {
     if (!std.math.isFinite(value) or
         @trunc(value) != value or
@@ -83,11 +130,12 @@ pub fn glyphOutlineAlloc(alloc: std.mem.Allocator, charstring: []const u8, local
     defer stack.deinit(alloc);
     var othersubr_results = std.ArrayList(f64).empty;
     defer othersubr_results.deinit(alloc);
+    var flex = FlexState{};
 
     var x: f64 = 0;
     var y: f64 = 0;
     var width_seen = false;
-    try executeCharStringAlloc(alloc, charstring, local_subrs, &stack, &othersubr_results, &current, &contours, &x, &y, &width_seen, null, 0);
+    try executeCharStringAlloc(alloc, charstring, local_subrs, &stack, &othersubr_results, &flex, &current, &contours, &x, &y, &width_seen, null, 0);
 
     if (contours.items.len == 0) return null;
     return .{
@@ -106,6 +154,7 @@ pub fn seacComponentsAlloc(alloc: std.mem.Allocator, charstring: []const u8, loc
     defer stack.deinit(alloc);
     var othersubr_results = std.ArrayList(f64).empty;
     defer othersubr_results.deinit(alloc);
+    var flex = FlexState{};
     var current = std.ArrayList(GlyphPoint).empty;
     defer current.deinit(alloc);
     var contours = std.ArrayList(GlyphContour).empty;
@@ -123,6 +172,7 @@ pub fn seacComponentsAlloc(alloc: std.mem.Allocator, charstring: []const u8, loc
         local_subrs,
         &stack,
         &othersubr_results,
+        &flex,
         &current,
         &contours,
         &x,
@@ -140,6 +190,7 @@ fn executeCharStringAlloc(
     local_subrs: ?[]const []const u8,
     stack: *std.ArrayList(f64),
     othersubr_results: *std.ArrayList(f64),
+    flex: *FlexState,
     current: *std.ArrayList(GlyphPoint),
     contours: *std.ArrayList(GlyphContour),
     x: *f64,
@@ -161,12 +212,15 @@ fn executeCharStringAlloc(
             4 => {
                 if (stack.items.len < 1) return error.InvalidType1;
                 y.* += stack.items[stack.items.len - 1];
-                if (current.items.len > 0) try flushContour(alloc, contours, current);
-                try current.append(alloc, .{ .x = x.*, .y = y.*, .on_curve = true });
+                if (!flex.active) {
+                    if (current.items.len > 0) try flushContour(alloc, contours, current);
+                    try current.append(alloc, .{ .x = x.*, .y = y.*, .on_curve = true });
+                }
                 stack.clearRetainingCapacity();
                 width_seen.* = true;
             },
             5 => {
+                if (flex.active) return error.InvalidType1;
                 if ((stack.items.len % 2) != 0) return error.InvalidType1;
                 var s: usize = 0;
                 while (s + 1 < stack.items.len) : (s += 2) {
@@ -177,10 +231,11 @@ fn executeCharStringAlloc(
                 stack.clearRetainingCapacity();
                 width_seen.* = true;
             },
-            6 => try executeAlternatingLines(alloc, stack, current, x, y, true),
-            7 => try executeAlternatingLines(alloc, stack, current, x, y, false),
-            8 => try executeRrcurveto(alloc, stack, current, x, y),
+            6 => if (flex.active) return error.InvalidType1 else try executeAlternatingLines(alloc, stack, current, x, y, true),
+            7 => if (flex.active) return error.InvalidType1 else try executeAlternatingLines(alloc, stack, current, x, y, false),
+            8 => if (flex.active) return error.InvalidType1 else try executeRrcurveto(alloc, stack, current, x, y),
             9 => {
+                if (flex.active) return error.InvalidType1;
                 if (current.items.len > 0) try flushContour(alloc, contours, current);
                 stack.clearRetainingCapacity();
             },
@@ -188,7 +243,7 @@ fn executeCharStringAlloc(
                 if (local_subrs == null or stack.items.len == 0) return error.UnsupportedType1;
                 const raw_idx = try exactIntFromFloat(i32, stack.pop().?);
                 if (raw_idx < 0 or raw_idx >= local_subrs.?.len) return error.InvalidSubroutine;
-                try executeCharStringAlloc(alloc, local_subrs.?[@intCast(raw_idx)], local_subrs, stack, othersubr_results, current, contours, x, y, width_seen, seac_out, depth + 1);
+                try executeCharStringAlloc(alloc, local_subrs.?[@intCast(raw_idx)], local_subrs, stack, othersubr_results, flex, current, contours, x, y, width_seen, seac_out, depth + 1);
             },
             11 => return,
             12 => {
@@ -251,20 +306,40 @@ fn executeCharStringAlloc(
                         }
                         const argument_count: usize = @intFromFloat(argument_count_f);
                         const first = stack.items.len - argument_count;
+                        const arguments = stack.items[first..];
+                        othersubr_results.clearRetainingCapacity();
                         switch (subr_number) {
-                            // Flex termination returns the final current point
-                            // to the customary `pop pop setcurrentpoint` tail.
-                            0 => try othersubr_results.appendSlice(alloc, &.{ y.*, x.* }),
-                            // Flex initialization and point collection do not
-                            // return values. The charstring's move operators
-                            // remain authoritative for outline geometry.
-                            1, 2 => {},
+                            // Flex termination emits the two source Beziers and
+                            // returns the absolute final point to the customary
+                            // `pop pop setcurrentpoint` tail.
+                            0 => {
+                                try flex.finish(alloc, current, x, y, arguments);
+                                try othersubr_results.appendSlice(alloc, &.{ arguments[2], arguments[1] });
+                            },
+                            1 => {
+                                if (argument_count != 0) return error.InvalidType1;
+                                try flex.begin(x.*, y.*);
+                            },
+                            2 => {
+                                if (argument_count != 0) return error.InvalidType1;
+                                try flex.record(x.*, y.*);
+                            },
                             // Hint replacement returns its sole argument.
-                            3 => if (argument_count > 0) try othersubr_results.append(alloc, stack.items[stack.items.len - 1]),
-                            // Custom OtherSubrs execute arbitrary PostScript.
-                            // Silently consuming them fabricates coordinates;
-                            // fail closed so the caller can use its fallback.
-                            else => return error.UnsupportedType1,
+                            3 => {
+                                if (argument_count != 1) return error.InvalidType1;
+                                try othersubr_results.append(alloc, arguments[0]);
+                            },
+                            // For an unrecognized OtherSubr, the Type 1 format
+                            // requires successive `pop`s to receive arg1,
+                            // arg2, ...; reverse the retained arguments because
+                            // `othersubr_results` is consumed as a stack.
+                            else => {
+                                var argument_index = arguments.len;
+                                while (argument_index > 0) {
+                                    argument_index -= 1;
+                                    try othersubr_results.append(alloc, arguments[argument_index]);
+                                }
+                            },
                         }
                         stack.shrinkRetainingCapacity(first);
                     },
@@ -273,6 +348,7 @@ fn executeCharStringAlloc(
                         try stack.append(alloc, value);
                     },
                     33 => {
+                        if (flex.active) return error.InvalidType1;
                         if (stack.items.len < 2) return error.InvalidType1;
                         x.* = stack.items[stack.items.len - 2];
                         y.* = stack.items[stack.items.len - 1];
@@ -293,6 +369,7 @@ fn executeCharStringAlloc(
                 width_seen.* = true;
             },
             14 => {
+                if (flex.active) return error.InvalidType1;
                 if (current.items.len > 0) try flushContour(alloc, contours, current);
                 return;
             },
@@ -300,21 +377,25 @@ fn executeCharStringAlloc(
                 if (stack.items.len < 2) return error.InvalidType1;
                 x.* += stack.items[stack.items.len - 2];
                 y.* += stack.items[stack.items.len - 1];
-                if (current.items.len > 0) try flushContour(alloc, contours, current);
-                try current.append(alloc, .{ .x = x.*, .y = y.*, .on_curve = true });
+                if (!flex.active) {
+                    if (current.items.len > 0) try flushContour(alloc, contours, current);
+                    try current.append(alloc, .{ .x = x.*, .y = y.*, .on_curve = true });
+                }
                 stack.clearRetainingCapacity();
                 width_seen.* = true;
             },
             22 => {
                 if (stack.items.len < 1) return error.InvalidType1;
                 x.* += stack.items[stack.items.len - 1];
-                if (current.items.len > 0) try flushContour(alloc, contours, current);
-                try current.append(alloc, .{ .x = x.*, .y = y.*, .on_curve = true });
+                if (!flex.active) {
+                    if (current.items.len > 0) try flushContour(alloc, contours, current);
+                    try current.append(alloc, .{ .x = x.*, .y = y.*, .on_curve = true });
+                }
                 stack.clearRetainingCapacity();
                 width_seen.* = true;
             },
-            30 => try executeVhcurveto(alloc, stack, current, x, y),
-            31 => try executeHvcurveto(alloc, stack, current, x, y),
+            30 => if (flex.active) return error.InvalidType1 else try executeVhcurveto(alloc, stack, current, x, y),
+            31 => if (flex.active) return error.InvalidType1 else try executeHvcurveto(alloc, stack, current, x, y),
             32...246 => try stack.append(alloc, @floatFromInt(@as(i32, b0) - 139)),
             247...250 => {
                 if (i >= program.len) return error.TruncatedType1;
@@ -548,17 +629,54 @@ test "type1 rejects non-integral and out-of-range othersubr operands" {
     try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &fractional_count, null));
 }
 
-test "type1 fails closed for custom OtherSubrs and empty pop" {
+test "type1 preserves custom OtherSubr compatibility results" {
     const alloc = std.testing.allocator;
     const custom_othersubr = [_]u8{
         139, 139, 21, // 0 0 rmoveto
-        139, 143, 12, 16, // 0 4 callothersubr
-        14,
+        149, 159, 141, 143, 12, 16, // 10 20 2 4 callothersubr
+        12, 17, 12, 17, 12, 33, // pop pop setcurrentpoint
+        139, 189, 5, 14, // 0 50 rlineto endchar
     };
-    try std.testing.expectError(error.UnsupportedType1, glyphOutlineAlloc(alloc, &custom_othersubr, null));
+    var outline = (try glyphOutlineAlloc(alloc, &custom_othersubr, null)).?;
+    defer outline.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), outline.contours.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), outline.contours[0].points[0].x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), outline.contours[0].points[0].y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 70), outline.contours[0].points[1].y, 0.001);
+}
 
+test "type1 rejects empty OtherSubr pop" {
+    const alloc = std.testing.allocator;
     const empty_pop = [_]u8{ 12, 17, 14 };
     try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &empty_pop, null));
+}
+
+test "type1 reconstructs standard Flex curves" {
+    const alloc = std.testing.allocator;
+    const charstring = [_]u8{
+        239, 129, 21, // 100 -10 rmoveto
+        139, 140, 12, 16, // 0 1 callothersubr
+        189, 139, 21, 139, 141, 12, 16, // 50 0 rmoveto; 0 2 callothersubr
+        104, 139, 21, 139, 141, 12, 16, // -35 0 rmoveto; record
+        149, 149, 21, 139, 141, 12, 16, // 10 10 rmoveto; record
+        164, 139, 21, 139, 141, 12, 16, // 25 0 rmoveto; record
+        164, 139, 21, 139, 141, 12, 16, // 25 0 rmoveto; record
+        149, 129, 21, 139, 141, 12, 16, // 10 -10 rmoveto; record
+        154, 139, 21, 139, 141, 12, 16, // 15 0 rmoveto; record
+        189, 247, 92, 129, 142, 139, 12, 16, // 50 200 -10 3 0 callothersubr
+        12, 17, 12, 17, 12, 33, // pop pop setcurrentpoint
+        14,
+    };
+
+    var outline = (try glyphOutlineAlloc(alloc, &charstring, null)).?;
+    defer outline.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), outline.contours.len);
+    try std.testing.expectEqual(@as(usize, 17), outline.contours[0].points.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 100), outline.contours[0].points[0].x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 150), outline.contours[0].points[8].x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), outline.contours[0].points[8].y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 200), outline.contours[0].points[16].x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, -10), outline.contours[0].points[16].y, 0.001);
 }
 
 test "type1 rejects unsafe subroutine and seac integer operands" {

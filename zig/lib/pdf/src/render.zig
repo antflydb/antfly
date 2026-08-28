@@ -276,6 +276,18 @@ fn renderChoiceIndex(choice: RenderChoice) usize {
     };
 }
 
+fn renderChoicePhase(
+    choice: RenderChoice,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+) u8 {
+    return switch (choice) {
+        .pattern => |idx| pattern_runs[idx].paint_phase,
+        .shape => |idx| shape_runs[idx].paint_phase,
+        else => 0,
+    };
+}
+
 const RenderChoiceSortContext = struct {
     text_runs: []const reader.TextRun,
     image_runs: []const reader.ImageRun,
@@ -288,6 +300,9 @@ const RenderChoiceSortContext = struct {
         const a_order = choiceOrder(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         const b_order = choiceOrder(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         if (a_order != b_order) return a_order < b_order;
+        const a_phase = renderChoicePhase(a, ctx.pattern_runs, ctx.shape_runs);
+        const b_phase = renderChoicePhase(b, ctx.pattern_runs, ctx.shape_runs);
+        if (a_phase != b_phase) return a_phase < b_phase;
         const a_kind = renderChoiceKindOrder(a);
         const b_kind = renderChoiceKindOrder(b);
         if (a_kind != b_kind) return a_kind < b_kind;
@@ -2829,4 +2844,36 @@ test "nonzero glyph paths preserve counter contours" {
     };
     try std.testing.expect(pointInShape(1, 1, run));
     try std.testing.expect(!pointInShape(5, 5, run));
+}
+
+test "render plan preserves text fill before stroke across backing kinds" {
+    var points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 } };
+    const patterns = [_]reader.PatternRun{.{
+        .kind = .stroke,
+        .paint_order = 4,
+        .paint_phase = 1,
+        .points = &points,
+        .pattern_bbox = .{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 },
+        .pattern_x_step = 1,
+        .pattern_y_step = 1,
+    }};
+    const shapes = [_]reader.ShapeRun{.{
+        .kind = .fill,
+        .paint_order = 4,
+        .paint_phase = 0,
+        .color = .{ 0, 0, 0, 255 },
+        .stroke_width = 0,
+        .closed = true,
+        .points = &points,
+    }};
+    const context = RenderChoiceSortContext{
+        .text_runs = &.{},
+        .image_runs = &.{},
+        .shading_runs = &.{},
+        .pattern_runs = &patterns,
+        .shape_runs = &shapes,
+        .groups = &.{},
+    };
+    try std.testing.expect(context.lessThan(.{ .shape = 0 }, .{ .pattern = 0 }));
+    try std.testing.expect(!context.lessThan(.{ .pattern = 0 }, .{ .shape = 0 }));
 }
