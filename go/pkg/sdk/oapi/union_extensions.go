@@ -105,8 +105,21 @@ func (t *GraphPathEndpoint) UnmarshalJSON(encoded []byte) error {
 type graphBindingNodeWire GraphBindingNode
 
 func (t *GraphBindingNode) UnmarshalJSON(encoded []byte) error {
+	presence := struct {
+		Document graphJSONObjectPresence `json:"document"`
+		Table    json.RawMessage         `json:"table"`
+	}{
+		Document: graphJSONObjectPresence{name: "graph binding document"},
+	}
+	if err := json.Unmarshal(encoded, &presence); err != nil {
+		return err
+	}
+	if err := rejectExplicitJSONNull(presence.Table, "graph node table must be omitted or non-null"); err != nil {
+		return err
+	}
+
 	var decoded graphBindingNodeWire
-	if err := decodeGraphIdentityJSON(encoded, &decoded); err != nil {
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
 		return err
 	}
 	*t = GraphBindingNode(decoded)
@@ -116,11 +129,46 @@ func (t *GraphBindingNode) UnmarshalJSON(encoded []byte) error {
 type graphResultNodeWire GraphResultNode
 
 func (t *GraphResultNode) UnmarshalJSON(encoded []byte) error {
+	presence := struct {
+		Document graphJSONObjectPresence `json:"document"`
+		Evidence graphJSONObjectPresence `json:"evidence"`
+		Table    json.RawMessage         `json:"table"`
+	}{
+		Document: graphJSONObjectPresence{name: "graph result document"},
+		Evidence: graphJSONObjectPresence{name: "graph result evidence"},
+	}
+	if err := json.Unmarshal(encoded, &presence); err != nil {
+		return err
+	}
+	if err := rejectExplicitJSONNull(presence.Table, "graph node table must be omitted or non-null"); err != nil {
+		return err
+	}
+
 	var decoded graphResultNodeWire
-	if err := decodeGraphIdentityJSON(encoded, &decoded); err != nil {
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
 		return err
 	}
 	*t = GraphResultNode(decoded)
+	return nil
+}
+
+type graphPathEdgeWire GraphPathEdge
+
+func (t *GraphPathEdge) UnmarshalJSON(encoded []byte) error {
+	presence := struct {
+		Metadata graphJSONObjectPresence `json:"metadata"`
+	}{
+		Metadata: graphJSONObjectPresence{name: "graph path edge metadata"},
+	}
+	if err := json.Unmarshal(encoded, &presence); err != nil {
+		return err
+	}
+
+	var decoded graphPathEdgeWire
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphPathEdge(decoded)
 	return nil
 }
 
@@ -131,8 +179,30 @@ func decodeGraphIdentityJSON(encoded []byte, value any) error {
 	if err := json.Unmarshal(encoded, &presence); err != nil {
 		return err
 	}
-	if len(presence.Table) != 0 && bytes.Equal(bytes.TrimSpace(presence.Table), []byte("null")) {
-		return errors.New("graph node table must be omitted or non-null")
+	if err := rejectExplicitJSONNull(presence.Table, "graph node table must be omitted or non-null"); err != nil {
+		return err
 	}
 	return decodeStrictJSON(encoded, value)
+}
+
+func rejectExplicitJSONNull(encoded json.RawMessage, message string) error {
+	if len(encoded) != 0 && bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
+		return errors.New(message)
+	}
+	return nil
+}
+
+// graphJSONObjectPresence validates an opaque JSON object's outer type without
+// retaining or copying its contents. The generated model performs the one
+// materializing decode after this presence check succeeds.
+type graphJSONObjectPresence struct {
+	name string
+}
+
+func (presence *graphJSONObjectPresence) UnmarshalJSON(encoded []byte) error {
+	trimmed := bytes.TrimSpace(encoded)
+	if len(trimmed) != 0 && trimmed[0] == '{' {
+		return nil
+	}
+	return errors.New(presence.name + " must be omitted or an object")
 }
