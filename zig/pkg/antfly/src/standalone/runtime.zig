@@ -440,22 +440,33 @@ const RuntimeLeaseWatchdog = struct {
             self.proof_mutex.unlock();
             return try self.applyDecision(alloc, io, data_server, failure);
         };
-        // `active` is capability evidence, not write authority. A standby
-        // reports active after validating the shared Lease while another node
-        // still holds it, allowing the controller to certify the exact process
-        // before an in-place promotion.
-        if (decision == .observed or decision == .pending_authority or decision == .authorized or decision == .grace) {
-            self.proof_transitions.store(self.watchdog.last_generation, .release);
-            self.proof_active.store(true, .release);
-            self.proof_capability_deadline_ns.store(observed_monotonic_ns +| self.watchdog.cfg.grace_ns, .release);
-        } else if (decision == .waiting) {
-            // In particular, an expired pre-transfer Lease must never refresh
-            // the standby's Active proof.
-            self.proof_active.store(false, .release);
-            self.proof_capability_deadline_ns.store(0, .release);
-        }
+        self.publishValidatedObservationLocked(decision, observed_monotonic_ns);
         self.proof_mutex.unlock();
         try self.applyDecision(alloc, io, data_server, decision);
+    }
+
+    // Called only after `Watchdog.observe` has validated the Lease response.
+    // `active` proves that this exact process is still monitoring and enforcing
+    // the authority gate; it is deliberately independent from whether the
+    // Lease currently grants authority. An expired pre-transfer Lease is thus
+    // fresh capability evidence for a self-fenced standby, while a latched
+    // process remains inactive.
+    fn publishValidatedObservationLocked(
+        self: *RuntimeLeaseWatchdog,
+        decision: antfly.ha.kubernetes_lease_watchdog.Decision,
+        observed_monotonic_ns: u64,
+    ) void {
+        switch (decision) {
+            .waiting, .observed, .pending_authority, .authorized, .grace => {
+                self.proof_transitions.store(self.watchdog.last_generation, .release);
+                self.proof_active.store(true, .release);
+                self.proof_capability_deadline_ns.store(observed_monotonic_ns +| self.watchdog.cfg.grace_ns, .release);
+            },
+            .fence => {
+                self.proof_active.store(false, .release);
+                self.proof_capability_deadline_ns.store(0, .release);
+            },
+        }
     }
 
     const ObservationFailureTransition = struct {
@@ -7842,6 +7853,52 @@ test "standalone unified server lifecycle propagates startup failure" {
         ),
     );
     try std.testing.expectEqual(error.AddressInUse, lifecycle.runtimeFailure().?);
+}
+
+test "runtime lease watchdog publishes active self-fenced proof from exact expired lease" {
+    const expired =
+        \\{"metadata":{"annotations":{"antfly.io/ha-fence-topology-id":"topology-7"}},"spec":{"holderIdentity":"primary-a","leaseDurationSeconds":30,"renewTime":"2026-07-15T12:00:00Z","leaseTransitions":3}}
+    ;
+    const after_expiry: u64 = 1_784_116_831 * std.time.ns_per_s;
+    var runtime_watchdog = RuntimeLeaseWatchdog{
+        .watchdog = try antfly.ha.kubernetes_lease_watchdog.Watchdog.init(.{
+            .scope = .{
+                .topology_id = "topology-7",
+                .node_id = "standby-a",
+                .data_generation = "initial",
+            },
+            .grace_ns = 10 * std.time.ns_per_s,
+            .sentinel_path = "/tmp/lease-fenced",
+        }, null, null),
+        .executor = undefined,
+        .uri = undefined,
+        .token_path = "",
+        .lease_name = "topology-ha-fence",
+        .lease_namespace = "default",
+        .stable_topology_id = "topology-7",
+        .node_id = "standby-a",
+        .pod_uid = "standby-pod-uid",
+        .process_boot_id = [_]u8{'a'} ** 64,
+    };
+    const observed_monotonic_ns = platform_time.authorityNs();
+    const decision = try runtime_watchdog.watchdog.observe(
+        std.testing.allocator,
+        expired,
+        after_expiry,
+        observed_monotonic_ns,
+    );
+    platform_sync.lockYielding(&runtime_watchdog.proof_mutex);
+    runtime_watchdog.publishValidatedObservationLocked(decision, observed_monotonic_ns);
+    runtime_watchdog.proof_mutex.unlock();
+
+    try std.testing.expectEqual(antfly.ha.kubernetes_lease_watchdog.Decision.waiting, decision);
+    const proof = (try RuntimeLeaseWatchdog.proofSnapshot(&runtime_watchdog, std.testing.allocator)).?;
+    defer std.testing.allocator.free(proof.observed_holder_node_id);
+    try std.testing.expect(proof.active);
+    try std.testing.expect(!proof.authority_granted);
+    try std.testing.expectEqual(@as(i64, 0), proof.authority_remaining_ms);
+    try std.testing.expectEqual(@as(i64, 3), proof.observed_lease_transitions);
+    try std.testing.expectEqualStrings("primary-a", proof.observed_holder_node_id);
 }
 
 test "runtime lease watchdog fetch and validation failures publish no bootstrap capability" {

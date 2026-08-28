@@ -7096,6 +7096,7 @@ pub fn build(b: *std.Build) void {
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
             "standalone unified server lifecycle propagates startup failure",
+            "runtime lease watchdog publishes active self-fenced proof from exact expired lease",
             "runtime lease watchdog fetch and validation failures publish no bootstrap capability",
             "runtime lease watchdog retains a bounded Kubernetes response budget",
             "runtime lease watchdog prefers a DNS-verified Kubernetes API host and retains the injected port",
