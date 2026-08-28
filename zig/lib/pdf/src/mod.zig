@@ -2359,6 +2359,9 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
 
     var parsed = try reader.Reader.init(alloc, out.items);
     defer parsed.deinit();
+    const extracted = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(extracted);
+    try std.testing.expectEqualStrings("Á\n", extracted);
     const runs = try parsed.extractPageVectorTextShapeRunsAlloc(1);
     defer {
         for (runs) |*run| run.deinit(alloc);

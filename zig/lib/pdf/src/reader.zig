@@ -275,11 +275,13 @@ const CodeSpaceRange = struct {
 const FontDecoder = struct {
     code_bytes: usize = 1,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
-    differences: [256]?u21 = [_]?u21{null} ** 256,
+    differences: [256]?[]u8 = [_]?[]u8{null} ** 256,
+    difference_defined: [256]bool = [_]bool{false} ** 256,
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
 
     fn deinit(self: *FontDecoder, alloc: Allocator) void {
+        for (self.differences) |mapping| if (mapping) |bytes| alloc.free(bytes);
         for (self.to_unicode) |entry| alloc.free(entry.dst);
         if (self.to_unicode.len > 0) alloc.free(self.to_unicode);
         if (self.codespace_ranges.len > 0) alloc.free(self.codespace_ranges);
@@ -293,18 +295,22 @@ const FontDecoder = struct {
 
         var out = std.ArrayList(u8).empty;
         defer out.deinit(alloc);
-        for (raw) |b| {
-            if (self.differences[b]) |cp| {
-                var buf: [4]u8 = undefined;
-                const encoded_len = try std.unicode.utf8Encode(cp, &buf);
-                try out.appendSlice(alloc, buf[0..encoded_len]);
-            } else {
-                const decoded = try text_encoding.decodeNamedAlloc(alloc, self.base_encoding, &.{b});
-                defer alloc.free(decoded);
-                try out.appendSlice(alloc, decoded);
-            }
-        }
+        for (raw) |b| try self.appendSingleByteFallback(alloc, &out, b);
         return try out.toOwnedSlice(alloc);
+    }
+
+    fn appendSingleByteFallback(self: *const FontDecoder, alloc: Allocator, out: *std.ArrayList(u8), b: u8) !void {
+        if (self.differences[b]) |mapping| {
+            try out.appendSlice(alloc, mapping);
+            return;
+        }
+        if (self.difference_defined[b]) {
+            try out.appendSlice(alloc, "�");
+            return;
+        }
+        const decoded = try text_encoding.decodeNamedAlloc(alloc, self.base_encoding, &.{b});
+        defer alloc.free(decoded);
+        try out.appendSlice(alloc, decoded);
     }
 
     fn decodeToUnicodeAlloc(self: *const FontDecoder, alloc: Allocator, raw: []const u8) ![]u8 {
@@ -325,16 +331,7 @@ const FontDecoder = struct {
             }
 
             if (step == 1) {
-                const b = raw[code_start];
-                if (self.differences[b]) |cp| {
-                    var buf: [4]u8 = undefined;
-                    const encoded_len = try std.unicode.utf8Encode(cp, &buf);
-                    try out.appendSlice(alloc, buf[0..encoded_len]);
-                } else {
-                    const fallback = try text_encoding.decodeNamedAlloc(alloc, self.base_encoding, raw[code_start .. code_start + 1]);
-                    defer alloc.free(fallback);
-                    try out.appendSlice(alloc, fallback);
-                }
+                try self.appendSingleByteFallback(alloc, &out, raw[code_start]);
             }
         }
 
@@ -415,16 +412,18 @@ const Type1Glyph = struct {
     name: []u8,
     charstring: []u8,
     advance: f64,
+    owns_data: bool = true,
 
     fn deinit(self: *Type1Glyph, alloc: Allocator) void {
-        alloc.free(self.name);
-        alloc.free(self.charstring);
+        if (self.owns_data) {
+            alloc.free(self.name);
+            alloc.free(self.charstring);
+        }
         self.* = undefined;
     }
 };
 
 const Type1Font = struct {
-    bytes: []u8,
     local_subrs: [][]u8 = &.{},
     glyphs: []Type1Glyph = &.{},
 
@@ -433,7 +432,6 @@ const Type1Font = struct {
         if (self.local_subrs.len > 0) alloc.free(self.local_subrs);
         for (self.glyphs) |*glyph| glyph.deinit(alloc);
         if (self.glyphs.len > 0) alloc.free(self.glyphs);
-        alloc.free(self.bytes);
         self.* = undefined;
     }
 
@@ -2440,15 +2438,42 @@ pub const Reader = struct {
         fonts: []const PageFont,
         text_runs: []const TextRun,
     ) !void {
+        var start: usize = 0;
+        while (start < text_runs.len) {
+            var end = start + 1;
+            while (end < text_runs.len and text_runs[end].paint_order == text_runs[start].paint_order) : (end += 1) {}
+
+            var group_shapes = std.ArrayList(ShapeRun).empty;
+            defer {
+                for (group_shapes.items) |*shape| shape.deinit(alloc);
+                group_shapes.deinit(alloc);
+            }
+            if (try appendVectorTextShapeGroupAlloc(alloc, &group_shapes, fonts, text_runs[start..end])) {
+                try out.ensureUnusedCapacity(alloc, group_shapes.items.len);
+                for (group_shapes.items) |shape| out.appendAssumeCapacity(shape);
+                group_shapes.clearRetainingCapacity();
+            }
+            start = end;
+        }
+    }
+
+    fn appendVectorTextShapeGroupAlloc(
+        alloc: Allocator,
+        out: *std.ArrayList(ShapeRun),
+        fonts: []const PageFont,
+        text_runs: []const TextRun,
+    ) !bool {
+        var type3_paint_phase: usize = 0;
         for (text_runs) |run| {
             var temp_shapes = std.ArrayList(ShapeRun).empty;
             defer {
                 for (temp_shapes.items) |*shape| shape.deinit(alloc);
                 temp_shapes.deinit(alloc);
             }
-            if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run)) continue;
+            if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run, &type3_paint_phase)) return false;
             try transferSolidTextShapesAlloc(alloc, out, &temp_shapes, run);
         }
+        return true;
     }
 
     fn appendVectorTextRunShapesAlloc(
@@ -2456,12 +2481,13 @@ pub const Reader = struct {
         out: *std.ArrayList(ShapeRun),
         fonts: []const PageFont,
         run: TextRun,
+        type3_paint_phase: *usize,
     ) !bool {
         const font_index = run.font_index orelse return false;
         if (font_index >= fonts.len) return false;
         if (fonts[font_index].type3) |type3| {
             const raw = run.raw_text orelse return false;
-            return try appendType3RunShapesAlloc(alloc, out, run, type3, raw);
+            return try appendType3RunShapesAlloc(alloc, out, run, type3, raw, type3_paint_phase);
         }
         if (fonts[font_index].type1) |type1| {
             const raw = run.raw_text orelse return false;
@@ -2540,43 +2566,66 @@ pub const Reader = struct {
         patterns: []const PagePattern,
         text_runs: []TextRun,
     ) !void {
-        for (text_runs) |*run| {
-            if (!run.vectorizable) continue;
+        var start: usize = 0;
+        while (start < text_runs.len) {
+            var end = start + 1;
+            while (end < text_runs.len and text_runs[end].paint_order == text_runs[start].paint_order) : (end += 1) {}
+
+            const complete = appendVectorTextRenderGroupAlloc(
+                alloc,
+                shape_out,
+                pattern_out,
+                fonts,
+                patterns,
+                text_runs[start..end],
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => false,
+            };
+            if (!complete) for (text_runs[start..end]) |*run| useTextRunRasterFallback(alloc, run);
+            start = end;
+        }
+    }
+
+    fn appendVectorTextRenderGroupAlloc(
+        alloc: Allocator,
+        shape_out: *std.ArrayList(ShapeRun),
+        pattern_out: *std.ArrayList(PatternRun),
+        fonts: []const PageFont,
+        patterns: []const PagePattern,
+        text_runs: []TextRun,
+    ) !bool {
+        var group_shapes = std.ArrayList(ShapeRun).empty;
+        defer {
+            for (group_shapes.items) |*shape| shape.deinit(alloc);
+            group_shapes.deinit(alloc);
+        }
+        var group_patterns = std.ArrayList(PatternRun).empty;
+        defer {
+            for (group_patterns.items) |*pattern| pattern.deinit(alloc);
+            group_patterns.deinit(alloc);
+        }
+
+        var type3_paint_phase: usize = 0;
+        for (text_runs) |run| {
+            if (!run.vectorizable) return false;
             var temp_shapes = std.ArrayList(ShapeRun).empty;
             defer {
                 for (temp_shapes.items) |*shape| shape.deinit(alloc);
                 temp_shapes.deinit(alloc);
             }
-            const complete = appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run.*) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    useTextRunRasterFallback(alloc, run);
-                    continue;
-                },
-            };
-            if (!complete) {
-                useTextRunRasterFallback(alloc, run);
-                continue;
-            }
-
-            var temp_patterns = std.ArrayList(PatternRun).empty;
-            defer {
-                for (temp_patterns.items) |*pattern| pattern.deinit(alloc);
-                temp_patterns.deinit(alloc);
-            }
-            appendPatternTextShapesAlloc(alloc, &temp_patterns, patterns, temp_shapes.items, run.*) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => {
-                    useTextRunRasterFallback(alloc, run);
-                    continue;
-                },
-            };
-
-            try transferSolidTextShapesAlloc(alloc, shape_out, &temp_shapes, run.*);
-            try pattern_out.ensureUnusedCapacity(alloc, temp_patterns.items.len);
-            for (temp_patterns.items) |pattern| pattern_out.appendAssumeCapacity(pattern);
-            temp_patterns.clearRetainingCapacity();
+            if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run, &type3_paint_phase)) return false;
+            try appendPatternTextShapesAlloc(alloc, &group_patterns, patterns, temp_shapes.items, run);
+            try transferSolidTextShapesAlloc(alloc, &group_shapes, &temp_shapes, run);
         }
+
+        try shape_out.ensureUnusedCapacity(alloc, group_shapes.items.len);
+        for (group_shapes.items) |shape| shape_out.appendAssumeCapacity(shape);
+        group_shapes.clearRetainingCapacity();
+        try pattern_out.ensureUnusedCapacity(alloc, group_patterns.items.len);
+        for (group_patterns.items) |pattern| pattern_out.appendAssumeCapacity(pattern);
+        group_patterns.clearRetainingCapacity();
+        return true;
     }
 
     pub fn extractPageVectorTextPatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
@@ -2613,15 +2662,48 @@ pub const Reader = struct {
         patterns: []const PagePattern,
         text_runs: []const TextRun,
     ) anyerror!void {
-        for (text_runs) |run| {
-            if (run.fill_pattern_name == null and run.stroke_pattern_name == null) continue;
-            var temp_shapes = std.ArrayList(ShapeRun).empty;
-            defer {
-                for (temp_shapes.items) |*shape| shape.deinit(alloc);
-                temp_shapes.deinit(alloc);
+        var start: usize = 0;
+        while (start < text_runs.len) {
+            var end = start + 1;
+            while (end < text_runs.len and text_runs[end].paint_order == text_runs[start].paint_order) : (end += 1) {}
+
+            var has_pattern = false;
+            for (text_runs[start..end]) |run| {
+                if (run.fill_pattern_name != null or run.stroke_pattern_name != null) {
+                    has_pattern = true;
+                    break;
+                }
             }
-            if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run)) continue;
-            try appendPatternTextShapesAlloc(alloc, out, patterns, temp_shapes.items, run);
+            if (!has_pattern) {
+                start = end;
+                continue;
+            }
+
+            var group_patterns = std.ArrayList(PatternRun).empty;
+            defer {
+                for (group_patterns.items) |*pattern| pattern.deinit(alloc);
+                group_patterns.deinit(alloc);
+            }
+            var complete = true;
+            var type3_paint_phase: usize = 0;
+            for (text_runs[start..end]) |run| {
+                var temp_shapes = std.ArrayList(ShapeRun).empty;
+                defer {
+                    for (temp_shapes.items) |*shape| shape.deinit(alloc);
+                    temp_shapes.deinit(alloc);
+                }
+                if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run, &type3_paint_phase)) {
+                    complete = false;
+                    break;
+                }
+                try appendPatternTextShapesAlloc(alloc, &group_patterns, patterns, temp_shapes.items, run);
+            }
+            if (complete) {
+                try out.ensureUnusedCapacity(alloc, group_patterns.items.len);
+                for (group_patterns.items) |pattern| out.appendAssumeCapacity(pattern);
+                group_patterns.clearRetainingCapacity();
+            }
+            start = end;
         }
     }
 
@@ -3093,10 +3175,10 @@ pub const Reader = struct {
         run: TextRun,
         type3: Type3Font,
         raw: []const u8,
+        paint_phase: *usize,
     ) !bool {
         var cursor_x: f64 = 0;
         var cursor_y: f64 = 0;
-        var paint_phase: usize = 0;
         var complete = true;
         for (raw) |code| {
             const glyph = type3.glyphForCode(code) orelse {
@@ -3112,8 +3194,8 @@ pub const Reader = struct {
             }
             try extractShapeRunsFromContentAppend(alloc, &glyph_shapes, glyph.content, &.{}, &.{});
             for (glyph_shapes.items) |shape| {
-                try appendOwnedValue(ShapeRun, alloc, out, try transformType3ShapeRunAlloc(alloc, shape, run, type3, cursor_x, cursor_y, paint_phase));
-                paint_phase += 1;
+                try appendOwnedValue(ShapeRun, alloc, out, try transformType3ShapeRunAlloc(alloc, shape, run, type3, cursor_x, cursor_y, paint_phase.*));
+                paint_phase.* += 1;
             }
 
             cursor_x += glyph.advance_x * run.font_size * run.horizontal_scale;
@@ -5734,6 +5816,7 @@ pub const Reader = struct {
 
     fn buildFontDecoder(self: *const Reader, font_obj: *const syntax.Object) !FontDecoder {
         var decoder = FontDecoder{};
+        errdefer decoder.deinit(self.alloc);
 
         if (font_obj.get("Encoding")) |encoding_obj| {
             var resolved_encoding = try self.resolveValue(encoding_obj);
@@ -5747,7 +5830,7 @@ pub const Reader = struct {
                         if (base_obj.asName()) |name| decoder.base_encoding = namedEncodingFromName(name);
                     }
                     if (resolved_encoding.get("Differences")) |diff_obj| {
-                        try applyEncodingDifferences(&decoder, diff_obj);
+                        try applyEncodingDifferences(self.alloc, &decoder, diff_obj);
                     }
                 },
                 else => {},
@@ -6196,10 +6279,24 @@ pub const Reader = struct {
     }
 
     fn buildType1Font(self: *const Reader, font_obj: *const syntax.Object) !?Type1Font {
+        // Font stream decoding, normalization, decrypted Subrs/CharStrings,
+        // and final lookup metadata share the same production working-set
+        // ceiling. Allocations returned by the scoped allocator remain owned by
+        // the Reader's backing allocator, matching the image decode contract.
+        var budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
+        var scoped_reader = self.*;
+        scoped_reader.alloc = budget.allocator();
+        return scoped_reader.buildType1FontBudgeted(font_obj) catch |err| {
+            if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
+            return err;
+        };
+    }
+
+    fn buildType1FontBudgeted(self: *const Reader, font_obj: *const syntax.Object) !?Type1Font {
         const raw_bytes = try self.readEmbeddedType1Alloc(font_obj) orelse return null;
         defer self.alloc.free(raw_bytes);
         const bytes = try normalizeType1ProgramAlloc(self.alloc, raw_bytes);
-        errdefer self.alloc.free(bytes);
+        defer self.alloc.free(bytes);
 
         const len_iv = try parseType1LenIV(self.alloc, bytes);
         const local_subrs = try parseType1LocalSubrsAlloc(self.alloc, bytes, len_iv);
@@ -6237,7 +6334,6 @@ pub const Reader = struct {
             if (glyphs.len > 0) self.alloc.free(glyphs);
         }
         return .{
-            .bytes = bytes,
             .local_subrs = local_subrs,
             .glyphs = glyphs,
         };
@@ -7729,7 +7825,7 @@ fn namedEncodingFromName(name: []const u8) text_encoding.NamedEncoding {
     return .pdf_doc;
 }
 
-fn applyEncodingDifferences(decoder: *FontDecoder, obj: *const syntax.Object) !void {
+fn applyEncodingDifferences(alloc: Allocator, decoder: *FontDecoder, obj: *const syntax.Object) !void {
     if (obj.* != .array) return;
     var current_code: ?usize = null;
     for (obj.array) |item| {
@@ -7740,8 +7836,15 @@ fn applyEncodingDifferences(decoder: *FontDecoder, obj: *const syntax.Object) !v
             },
             .name => |name| {
                 if (current_code) |code| {
-                    decoder.differences[code] = text_encoding.glyphNameToRune(name);
-                    current_code = code + 1;
+                    if (code >= decoder.differences.len) {
+                        current_code = null;
+                        continue;
+                    }
+                    if (decoder.differences[code]) |previous| alloc.free(previous);
+                    decoder.differences[code] = null;
+                    decoder.difference_defined[code] = true;
+                    decoder.differences[code] = try text_encoding.glyphNameToUtf8Alloc(alloc, name);
+                    current_code = if (code + 1 < decoder.differences.len) code + 1 else null;
                 }
             },
             else => {},
@@ -7760,8 +7863,12 @@ fn applyEncodingDifferenceNames(names: *[256]?[]const u8, obj: *const syntax.Obj
             },
             .name => |name| {
                 if (current_code) |code| {
+                    if (code >= names.len) {
+                        current_code = null;
+                        continue;
+                    }
                     names[code] = name;
-                    current_code = code + 1;
+                    current_code = if (code + 1 < names.len) code + 1 else null;
                 }
             },
             else => {},
@@ -8021,66 +8128,95 @@ fn parseType1GlyphsAlloc(
     return try parseType1GlyphsLexAlloc(alloc, bytes, len_iv, font_obj, code_to_name, first_char, widths);
 }
 
-fn type1GlyphNameIsEncoded(code_to_name: *const [256]?[]const u8, glyph_name: []const u8) bool {
-    for (code_to_name) |maybe_name| {
-        const name = maybe_name orelse continue;
+fn type1GlyphNameIsStandardComponent(glyph_name: []const u8) bool {
+    for (0..256) |code| {
+        const name = font_lib.cff.standardEncodingGlyphName(@intCast(code)) orelse continue;
         if (std.mem.eql(u8, name, glyph_name)) return true;
     }
     return false;
 }
 
-fn appendType1GlyphAlloc(
-    alloc: Allocator,
+fn appendOwnedType1Glyph(
     glyphs: *std.ArrayList(Type1Glyph),
+    alloc: Allocator,
     code: u8,
     encoded: bool,
-    glyph_name: []const u8,
-    program: []const u8,
+    glyph_name: []u8,
+    program: []u8,
     advance: f64,
 ) !void {
-    var name: ?[]u8 = try alloc.dupe(u8, glyph_name);
-    errdefer if (name) |owned| alloc.free(owned);
-    var charstring: ?[]u8 = try alloc.dupe(u8, program);
-    errdefer if (charstring) |owned| alloc.free(owned);
     try glyphs.append(alloc, .{
         .code = code,
         .encoded = encoded,
-        .name = name.?,
-        .charstring = charstring.?,
+        .name = glyph_name,
+        .charstring = program,
         .advance = advance,
     });
-    name = null;
-    charstring = null;
+}
+
+fn appendBorrowedType1Glyph(
+    glyphs: *std.ArrayList(Type1Glyph),
+    alloc: Allocator,
+    owner: Type1Glyph,
+    code: u8,
+    advance: f64,
+) !void {
+    try glyphs.append(alloc, .{
+        .code = code,
+        .encoded = true,
+        .name = owner.name,
+        .charstring = owner.charstring,
+        .advance = advance,
+        .owns_data = false,
+    });
 }
 
 fn appendParsedType1Glyphs(
     alloc: Allocator,
     glyphs: *std.ArrayList(Type1Glyph),
     code_to_name: *const [256]?[]const u8,
-    glyph_names: []const []u8,
-    glyph_programs: []const []u8,
+    glyph_names: [][]u8,
+    glyph_programs: [][]u8,
     first_char: usize,
     widths: []const syntax.Object,
 ) !void {
-    // Preserve encoded aliases exactly as the PDF declares them. Composite
-    // `seac` glyphs may also reference CharStrings that are deliberately not
-    // present in the PDF encoding, so retain those entries for name-based
-    // StandardEncoding lookup without making them addressable by byte code.
+    // Resolve each PDF code to one parsed CharString first. Encoded aliases
+    // then borrow the same immutable name/program instead of duplicating up to
+    // 256 copies of attacker-controlled font data.
+    var parsed_index_for_code = [_]?usize{null} ** 256;
     for (code_to_name, 0..) |maybe_name, code| {
-        const glyph_name = maybe_name orelse continue;
-        for (glyph_names, glyph_programs) |parsed_name, program| {
-            if (!std.mem.eql(u8, glyph_name, parsed_name)) continue;
+        const encoded_name = maybe_name orelse continue;
+        for (glyph_names, 0..) |parsed_name, parsed_index| {
+            if (std.mem.eql(u8, encoded_name, parsed_name)) {
+                parsed_index_for_code[code] = parsed_index;
+                break;
+            }
+        }
+    }
+
+    for (glyph_names, glyph_programs, 0..) |glyph_name, program, parsed_index| {
+        var owner_index: ?usize = null;
+        for (parsed_index_for_code, 0..) |maybe_index, code| {
+            if (maybe_index != parsed_index) continue;
             const advance = if (code >= first_char and code - first_char < widths.len)
                 numericObjectValue(&widths[code - first_char]) orelse 1000.0
             else
                 1000.0;
-            try appendType1GlyphAlloc(alloc, glyphs, @intCast(code), true, glyph_name, program, advance);
-            break;
+            if (owner_index) |index| {
+                // Copy the owner value before append potentially reallocates.
+                try appendBorrowedType1Glyph(glyphs, alloc, glyphs.items[index], @intCast(code), advance);
+            } else {
+                owner_index = glyphs.items.len;
+                try appendOwnedType1Glyph(glyphs, alloc, @intCast(code), true, glyph_name, program, advance);
+                glyph_names[parsed_index] = &.{};
+                glyph_programs[parsed_index] = &.{};
+            }
         }
-    }
-    for (glyph_names, glyph_programs) |glyph_name, program| {
-        if (type1GlyphNameIsEncoded(code_to_name, glyph_name)) continue;
-        try appendType1GlyphAlloc(alloc, glyphs, 0, false, glyph_name, program, 1000.0);
+        if (owner_index == null and type1GlyphNameIsStandardComponent(glyph_name)) {
+            try appendOwnedType1Glyph(glyphs, alloc, 0, false, glyph_name, program, 1000.0);
+            glyph_names[parsed_index] = &.{};
+            glyph_programs[parsed_index] = &.{};
+        }
     }
 }
 
@@ -8101,9 +8237,9 @@ fn parseType1GlyphsLexAlloc(
     var glyph_names = std.ArrayList([]u8).empty;
     var glyph_programs = std.ArrayList([]u8).empty;
     defer {
-        for (glyph_names.items) |name| alloc.free(name);
+        for (glyph_names.items) |name| if (name.len > 0) alloc.free(name);
         glyph_names.deinit(alloc);
-        for (glyph_programs.items) |program| alloc.free(program);
+        for (glyph_programs.items) |program| if (program.len > 0) alloc.free(program);
         glyph_programs.deinit(alloc);
     }
 
@@ -8236,9 +8372,9 @@ fn parseType1GlyphsRdAlloc(
     var glyph_names = std.ArrayList([]u8).empty;
     var glyph_programs = std.ArrayList([]u8).empty;
     defer {
-        for (glyph_names.items) |name| alloc.free(name);
+        for (glyph_names.items) |name| if (name.len > 0) alloc.free(name);
         glyph_names.deinit(alloc);
-        for (glyph_programs.items) |program| alloc.free(program);
+        for (glyph_programs.items) |program| if (program.len > 0) alloc.free(program);
         glyph_programs.deinit(alloc);
     }
 
@@ -14150,7 +14286,6 @@ test "reader measures type1 text run advance width" {
             .name = try alloc.dupe(u8, "F1"),
             .decoder = .{},
             .type1 = .{
-                .bytes = try alloc.dupe(u8, ""),
                 .local_subrs = try alloc.alloc([]u8, 0),
                 .glyphs = glyphs,
             },
@@ -19050,6 +19185,35 @@ test "type1 RD parser accepts compact charstrings without dup" {
     try std.testing.expectEqualStrings("abc", glyphs[1].charstring);
 }
 
+test "type1 aliases share programs and only seac-reachable helpers survive" {
+    const alloc = std.testing.allocator;
+    const program =
+        "/CharStrings 3 dict dup begin\n" ++
+        "/A 3 RD xyz ND\n" ++
+        "/acute 3 RD abc ND\n" ++
+        "/unreachable 3 RD def ND\n" ++
+        "end\n";
+
+    var code_to_name = [_]?[]const u8{null} ** 256;
+    code_to_name['A'] = "A";
+    code_to_name['B'] = "A";
+    code_to_name[194] = "different";
+    const empty_font = syntax.Object{ .dict = &.{} };
+    const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
+    defer {
+        for (glyphs) |*glyph| glyph.deinit(alloc);
+        if (glyphs.len > 0) alloc.free(glyphs);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), glyphs.len);
+    try std.testing.expect(glyphs[0].owns_data);
+    try std.testing.expect(!glyphs[1].owns_data);
+    try std.testing.expectEqual(glyphs[0].name.ptr, glyphs[1].name.ptr);
+    try std.testing.expectEqual(glyphs[0].charstring.ptr, glyphs[1].charstring.ptr);
+    try std.testing.expectEqualStrings("acute", glyphs[2].name);
+    try std.testing.expect(!glyphs[2].encoded);
+}
+
 test "content XObject discovery ignores unpainted resource names" {
     const alloc = std.testing.allocator;
     const content = "q /Used Do Q (literal /Unused Do) Tj /Form Do";
@@ -19185,11 +19349,10 @@ test "vector text preserves mixed pattern fill and solid stroke phases" {
         .advance = 600,
     }};
     var font_name = [_]u8{'F'};
-    var font_bytes: [0]u8 = .{};
     var fonts = [_]PageFont{.{
         .name = &font_name,
         .decoder = .{},
-        .type1 = .{ .bytes = &font_bytes, .glyphs = &glyphs },
+        .type1 = .{ .glyphs = &glyphs },
     }};
     var pattern_name = [_]u8{'P'};
     var pattern_content: [0]u8 = .{};
@@ -19257,12 +19420,59 @@ test "Type3 vector text preserves intrinsic CharProc paint order" {
         out.deinit(alloc);
     }
 
-    try std.testing.expect(try Reader.appendType3RunShapesAlloc(alloc, &out, run, type3, "A"));
+    var paint_phase: usize = 0;
+    try std.testing.expect(try Reader.appendType3RunShapesAlloc(alloc, &out, run, type3, "A", &paint_phase));
     try std.testing.expectEqual(@as(usize, 2), out.items.len);
     try std.testing.expectEqual(@as(@FieldType(ShapeRun, "kind"), .stroke), out.items[0].kind);
     try std.testing.expectEqual(@as(usize, 0), out.items[0].paint_phase);
     try std.testing.expectEqual(@as(@FieldType(ShapeRun, "kind"), .fill), out.items[1].kind);
     try std.testing.expectEqual(@as(usize, 1), out.items[1].paint_phase);
+}
+
+test "Type3 TJ fragments share paint phases and fall back atomically" {
+    const alloc = std.testing.allocator;
+    var a_name = [_]u8{'A'};
+    var b_name = [_]u8{'B'};
+    var glyph_content = [_]u8{
+        '0', ' ', '0', ' ', 'm', ' ', '1', '0', ' ', '0', ' ', 'l', ' ', 'S', ' ',
+        '0', ' ', '0', ' ', 'm', ' ', '1', '0', ' ', '0', ' ', 'l', ' ', '1', '0',
+        ' ', '1', '0', ' ', 'l', ' ', 'f',
+    };
+    var glyphs = [_]Type3Glyph{
+        .{ .code = 'A', .name = &a_name, .content = &glyph_content, .advance_x = 1, .advance_y = 0 },
+        .{ .code = 'B', .name = &b_name, .content = &glyph_content, .advance_x = 1, .advance_y = 0 },
+    };
+    var font_name = [_]u8{'F'};
+    var fonts = [_]PageFont{.{
+        .name = &font_name,
+        .decoder = .{},
+        .type3 = .{ .paint_type = 1, .font_matrix = .{ 1, 0, 0, 1, 0, 0 }, .glyphs = &glyphs },
+    }};
+    var runs = [_]TextRun{
+        .{ .text = "A", .raw_text = "A", .font_index = 0, .vectorizable = true, .x = 0, .y = 0, .font_size = 1, .paint_order = 7 },
+        .{ .text = "B", .raw_text = "B", .font_index = 0, .vectorizable = true, .x = 1, .y = 0, .font_size = 1, .paint_order = 7 },
+    };
+    var shape_out = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (shape_out.items) |*shape| shape.deinit(alloc);
+        shape_out.deinit(alloc);
+    }
+    var pattern_out = std.ArrayList(PatternRun).empty;
+    defer pattern_out.deinit(alloc);
+
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &.{}, &runs);
+    try std.testing.expectEqual(@as(usize, 4), shape_out.items.len);
+    for (shape_out.items, 0..) |shape, phase| try std.testing.expectEqual(phase, shape.paint_phase);
+
+    for (shape_out.items) |*shape| shape.deinit(alloc);
+    shape_out.clearRetainingCapacity();
+    runs[0].vectorizable = true;
+    runs[1].vectorizable = true;
+    runs[1].raw_text = "C";
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &.{}, &runs);
+    try std.testing.expect(!runs[0].vectorizable);
+    try std.testing.expect(!runs[1].vectorizable);
+    try std.testing.expectEqual(@as(usize, 0), shape_out.items.len);
 }
 
 test "vector text failure retains a visible raster fallback" {
@@ -19276,11 +19486,10 @@ test "vector text failure retains a visible raster fallback" {
         .advance = 600,
     }};
     var font_name = [_]u8{'F'};
-    var font_bytes: [0]u8 = .{};
     var fonts = [_]PageFont{.{
         .name = &font_name,
         .decoder = .{},
-        .type1 = .{ .bytes = &font_bytes, .glyphs = &glyphs },
+        .type1 = .{ .glyphs = &glyphs },
     }};
     var run = TextRun{
         .text = try alloc.dupe(u8, "A"),
@@ -19320,8 +19529,7 @@ test "Type1 seac accent offset follows horizontal text scaling" {
         .{ .code = 'A', .name = &base_name, .charstring = &outline_program, .advance = 600 },
         .{ .code = 194, .name = &accent_name, .charstring = &outline_program, .advance = 600 },
     };
-    var font_bytes: [0]u8 = .{};
-    const type1 = Type1Font{ .bytes = &font_bytes, .glyphs = &glyphs };
+    const type1 = Type1Font{ .glyphs = &glyphs };
     const run = TextRun{
         .text = "",
         .x = 0,
@@ -19409,7 +19617,7 @@ test "type1 font parsing is allocation-failure safe" {
                 "dup 0 3 RD abc NP\n" ++
                 "/CharStrings 2 dict dup begin\n" ++
                 "dup /A 3 RD xyz ND\n" ++
-                "dup /helper 3 RD def ND\n" ++
+                "dup /acute 3 RD def ND\n" ++
                 "end\n";
 
             const subrs = try parseType1LocalSubrsAlloc(alloc, program, -1);
@@ -19420,6 +19628,7 @@ test "type1 font parsing is allocation-failure safe" {
 
             var code_to_name = [_]?[]const u8{null} ** 256;
             code_to_name['A'] = "A";
+            code_to_name[194] = "different";
             const empty_font = syntax.Object{ .dict = &.{} };
             const glyphs = try parseType1GlyphsAlloc(alloc, program, -1, &empty_font, &code_to_name, 0, &.{});
             defer {
@@ -19429,9 +19638,46 @@ test "type1 font parsing is allocation-failure safe" {
             try std.testing.expectEqual(@as(usize, 2), glyphs.len);
             try std.testing.expect(glyphs[0].encoded);
             try std.testing.expect(!glyphs[1].encoded);
-            try std.testing.expectEqualStrings("helper", glyphs[1].name);
+            try std.testing.expectEqualStrings("acute", glyphs[1].name);
         }
     };
 
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "font Differences own replacements safely and stop at byte 255" {
+    const alloc = std.testing.allocator;
+    const entries = [_]syntax.Object{
+        .{ .integer = 65 },
+        .{ .name = @constCast("Aacute") },
+        .{ .integer = 66 },
+        .{ .name = @constCast("customGlyphWithoutUnicode") },
+        .{ .integer = 255 },
+        .{ .name = @constCast("fi") },
+        .{ .name = @constCast("mustNotOverflow") },
+    };
+    const differences = syntax.Object{ .array = @constCast(&entries) };
+    var decoder = FontDecoder{};
+    defer decoder.deinit(alloc);
+    try applyEncodingDifferences(alloc, &decoder, &differences);
+
+    const decoded = try decoder.decodeAlloc(alloc, &.{ 65, 66, 255 });
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("Á�ﬁ", decoded);
+
+    const Runner = struct {
+        fn run(failing_alloc: Allocator) !void {
+            const repeated_entries = [_]syntax.Object{
+                .{ .integer = 65 },
+                .{ .name = @constCast("Aacute") },
+                .{ .integer = 65 },
+                .{ .name = @constCast("dalethatafpatah") },
+            };
+            const repeated = syntax.Object{ .array = @constCast(&repeated_entries) };
+            var failing_decoder = FontDecoder{};
+            defer failing_decoder.deinit(failing_alloc);
+            try applyEncodingDifferences(failing_alloc, &failing_decoder, &repeated);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Runner.run, .{});
 }

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const agl_data = @import("agl_data.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -210,44 +211,86 @@ pub fn decodeTableAlloc(alloc: Allocator, table: *const [256]u21, bytes: []const
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn glyphNameToRune(name: []const u8) ?u21 {
-    if (name.len == 1) return name[0];
-    if (std.mem.eql(u8, name, "space")) return ' ';
-    if (std.mem.eql(u8, name, "period")) return '.';
-    if (std.mem.eql(u8, name, "comma")) return ',';
-    if (std.mem.eql(u8, name, "colon")) return ':';
-    if (std.mem.eql(u8, name, "semicolon")) return ';';
-    if (std.mem.eql(u8, name, "hyphen")) return '-';
-    if (std.mem.eql(u8, name, "endash")) return 0x2013;
-    if (std.mem.eql(u8, name, "emdash")) return 0x2014;
-    if (std.mem.eql(u8, name, "quotedbl")) return '"';
-    if (std.mem.eql(u8, name, "quotesingle")) return '\'';
-    if (std.mem.eql(u8, name, "parenleft")) return '(';
-    if (std.mem.eql(u8, name, "parenright")) return ')';
-    if (std.mem.eql(u8, name, "bracketleft")) return '[';
-    if (std.mem.eql(u8, name, "bracketright")) return ']';
-    if (std.mem.eql(u8, name, "braceleft")) return '{';
-    if (std.mem.eql(u8, name, "braceright")) return '}';
-    if (std.mem.eql(u8, name, "slash")) return '/';
-    if (std.mem.eql(u8, name, "backslash")) return '\\';
-    if (std.mem.eql(u8, name, "plus")) return '+';
-    if (std.mem.eql(u8, name, "equal")) return '=';
-    if (std.mem.eql(u8, name, "less")) return '<';
-    if (std.mem.eql(u8, name, "greater")) return '>';
-    if (std.mem.eql(u8, name, "question")) return '?';
-    if (std.mem.eql(u8, name, "exclam")) return '!';
-    if (std.mem.eql(u8, name, "numbersign")) return '#';
-    if (std.mem.eql(u8, name, "dollar")) return '$';
-    if (std.mem.eql(u8, name, "percent")) return '%';
-    if (std.mem.eql(u8, name, "ampersand")) return '&';
-    if (std.mem.eql(u8, name, "asterisk")) return '*';
-    if (std.mem.eql(u8, name, "at")) return '@';
-    if (std.mem.eql(u8, name, "underscore")) return '_';
-    if (std.mem.eql(u8, name, "bar")) return '|';
-    if (std.mem.eql(u8, name, "asciitilde")) return '~';
-    if (std.mem.eql(u8, name, "grave")) return '`';
-    if (std.mem.eql(u8, name, "Euro")) return 0x20ac;
+fn adobeGlyphCodepoints(name: []const u8) ?[]const u21 {
+    var low: usize = 0;
+    var high: usize = agl_data.entries.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const order = std.mem.order(u8, agl_data.entries[mid].name, name);
+        switch (order) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return agl_data.entries[mid].codepoints,
+        }
+    }
     return null;
+}
+
+fn parseUnicodeScalarHex(bytes: []const u8) ?u21 {
+    const value = std.fmt.parseInt(u21, bytes, 16) catch return null;
+    if (value > 0x10ffff or (value >= 0xd800 and value <= 0xdfff)) return null;
+    return value;
+}
+
+fn algorithmicGlyphCodepoint(name: []const u8) ?u21 {
+    if (std.mem.startsWith(u8, name, "uni") and name.len == 7)
+        return parseUnicodeScalarHex(name[3..]);
+    if (name.len >= 5 and name.len <= 7 and name[0] == 'u')
+        return parseUnicodeScalarHex(name[1..]);
+    return null;
+}
+
+fn appendUtf8Codepoint(out: *std.ArrayList(u8), alloc: Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const encoded_len = try std.unicode.utf8Encode(cp, &buf);
+    try out.appendSlice(alloc, buf[0..encoded_len]);
+}
+
+fn appendGlyphComponentUtf8(out: *std.ArrayList(u8), alloc: Allocator, component: []const u8) !bool {
+    if (adobeGlyphCodepoints(component)) |codepoints| {
+        for (codepoints) |cp| try appendUtf8Codepoint(out, alloc, cp);
+        return true;
+    }
+
+    if (std.mem.startsWith(u8, component, "uni") and component.len > 3 and (component.len - 3) % 4 == 0) {
+        var offset: usize = 3;
+        while (offset < component.len) : (offset += 4) {
+            const cp = parseUnicodeScalarHex(component[offset .. offset + 4]) orelse return false;
+            try appendUtf8Codepoint(out, alloc, cp);
+        }
+        return true;
+    }
+    if (algorithmicGlyphCodepoint(component)) |cp| {
+        try appendUtf8Codepoint(out, alloc, cp);
+        return true;
+    }
+    return false;
+}
+
+/// Resolve a PostScript glyph name according to Adobe's glyph-name algorithm.
+/// The returned UTF-8 slice is owned because AGL entries and underscore names
+/// may expand to multiple Unicode scalars.
+pub fn glyphNameToUtf8Alloc(alloc: Allocator, name: []const u8) !?[]u8 {
+    const canonical = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+    if (canonical.len == 0) return null;
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    var components = std.mem.splitScalar(u8, canonical, '_');
+    while (components.next()) |component| {
+        if (component.len == 0 or !try appendGlyphComponentUtf8(&out, alloc, component)) return null;
+    }
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(alloc);
+}
+
+/// Scalar-only compatibility helper for name-keyed font lookup paths.
+pub fn glyphNameToRune(name: []const u8) ?u21 {
+    const canonical = name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+    if (std.mem.indexOfScalar(u8, canonical, '_') != null) return null;
+    if (adobeGlyphCodepoints(canonical)) |codepoints|
+        return if (codepoints.len == 1) codepoints[0] else null;
+    return algorithmicGlyphCodepoint(canonical);
 }
 
 fn decodeUtf16Codepoint(units: []const u16) !struct { u21, usize } {
@@ -444,4 +487,27 @@ test "StandardEncoding is distinct from PDFDocEncoding" {
     try std.testing.expectEqual(@as(u21, 0x2014), standard_encoding[208]);
     try std.testing.expectEqual(@as(u21, 0x00c6), standard_encoding[225]);
     try std.testing.expect(standard_encoding[194] != pdf_doc_encoding[194]);
+}
+
+test "Adobe glyph names decode complete and algorithmic Unicode mappings" {
+    const alloc = std.testing.allocator;
+
+    const aacute = (try glyphNameToUtf8Alloc(alloc, "Aacute.swash")).?;
+    defer alloc.free(aacute);
+    try std.testing.expectEqualStrings("Á", aacute);
+
+    const hebrew = (try glyphNameToUtf8Alloc(alloc, "dalethatafpatah")).?;
+    defer alloc.free(hebrew);
+    try std.testing.expectEqualStrings("דֲ", hebrew);
+
+    const algorithmic = (try glyphNameToUtf8Alloc(alloc, "uni00410042.alt")).?;
+    defer alloc.free(algorithmic);
+    try std.testing.expectEqualStrings("AB", algorithmic);
+
+    const components = (try glyphNameToUtf8Alloc(alloc, "A_uni0301")).?;
+    defer alloc.free(components);
+    try std.testing.expectEqualStrings("Á", components);
+
+    try std.testing.expect((try glyphNameToUtf8Alloc(alloc, "uniD800")) == null);
+    try std.testing.expectEqual(@as(?u21, 0x00c1), glyphNameToRune("Aacute.alt"));
 }
