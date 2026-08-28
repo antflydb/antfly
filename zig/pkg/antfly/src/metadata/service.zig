@@ -67,6 +67,9 @@ const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
 const metadata_proposal_driver_wait_ns: u64 = std.time.ns_per_ms;
 const metadata_proposal_passive_wait_ns: u64 = 25 * std.time.ns_per_ms;
+const table_mutation_campaign_max_wait_ms: u32 = 500;
+const table_mutation_campaign_poll_ms: u64 = 5;
+const table_mutation_campaign_response_reserve_ms: u32 = 50;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
@@ -5654,6 +5657,55 @@ pub const MetadataHttpService = struct {
             self.raft.host.http_host.host.cfg.local_node_id,
         );
         return tableMutationRouteFromObservation(observation, self.reallocation_protocol_peers);
+    }
+
+    /// Give one request owner a bounded opportunity to recover a leaderless
+    /// metadata group. The mutable allowance makes campaign ownership
+    /// monotonic across rediscovery attempts, while normal randomized Raft
+    /// elections remain the fallback after the request budget expires.
+    pub fn resolveTableMutationRouteWithCampaign(
+        self: *MetadataHttpService,
+        campaign_allowed: *bool,
+        remaining_ms: u32,
+    ) !TableMutationRoute {
+        return self.resolveTableMutationRoute() catch |err| {
+            if (err != error.NotLeader or !campaign_allowed.*) return err;
+            if (remaining_ms <= table_mutation_campaign_response_reserve_ms) return error.NotLeader;
+            self.lockRuntime();
+            var runtime_locked = true;
+            defer if (runtime_locked) self.unlockRuntime();
+            const leader_known = if (self.raft.host.http_host.host.raftStatus(self.metadata_group_id)) |raft_status|
+                raft_status.soft.leader_id != null
+            else
+                false;
+            // A known but temporarily unroutable leader is not a leaderless
+            // group. Campaigning here would disrupt a healthy term merely
+            // because orchestration discovery is incomplete.
+            if (leader_known) return err;
+            campaign_allowed.* = false;
+            self.raft.host.http_host.campaignGroup(self.metadata_group_id) catch |campaign_err| {
+                std.log.warn("metadata request-owned campaign failed group_id={d} err={s}", .{
+                    self.metadata_group_id,
+                    @errorName(campaign_err),
+                });
+                return error.NotLeader;
+            };
+            self.unlockRuntime();
+            runtime_locked = false;
+
+            const wait_ms = @min(
+                table_mutation_campaign_max_wait_ms,
+                remaining_ms - table_mutation_campaign_response_reserve_ms,
+            );
+            const deadline_ns = platform_time.monotonicNs() +|
+                @as(u64, wait_ms) * std.time.ns_per_ms;
+            while (platform_time.monotonicNs() < deadline_ns) {
+                platform_clock.Clock.real().sleepMs(table_mutation_campaign_poll_ms);
+                const route = self.resolveTableMutationRoute() catch continue;
+                return route;
+            }
+            return error.NotLeader;
+        };
     }
 
     pub fn tableMutationForwardClient(self: *MetadataHttpService) metadata_http_client.MetadataHttpClient {

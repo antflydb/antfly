@@ -97,6 +97,7 @@ pub const AdminSource = struct {
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         preflight_table_mutation_authority: ?*const fn (ptr: *anyopaque) anyerror!void = null,
+        recover_table_mutation_authority: ?*const fn (ptr: *anyopaque, remaining_ms: u32) anyerror!void = null,
         create_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         create_table_with_context: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, request: operation.RequestContext, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void = null,
         replace_table_definition: ?*const fn (ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void = null,
@@ -188,6 +189,11 @@ pub const AdminSource = struct {
     pub fn preflightTableMutationAuthority(self: AdminSource) !void {
         const preflight = self.vtable.preflight_table_mutation_authority orelse return;
         try preflight(self.ptr);
+    }
+
+    pub fn recoverTableMutationAuthority(self: AdminSource, remaining_ms: u32) !void {
+        const recover = self.vtable.recover_table_mutation_authority orelse return error.NotLeader;
+        try recover(self.ptr, remaining_ms);
     }
 
     pub fn createTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -430,6 +436,7 @@ pub const AdminSource = struct {
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .preflight_table_mutation_authority = metadataHttpServicePreflightTableMutationAuthority,
+                .recover_table_mutation_authority = metadataHttpServiceRecoverTableMutationAuthority,
                 .create_table = metadataHttpServiceCreateTable,
                 .create_table_with_context = metadataHttpServiceCreateTableWithContext,
                 .replace_table_definition = metadataHttpServiceReplaceTableDefinition,
@@ -902,6 +909,15 @@ pub const AdminSource = struct {
     fn metadataHttpServicePreflightTableMutationAuthority(ptr: *anyopaque) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         try svc.ensureLocalTableMutationAuthority();
+    }
+
+    fn metadataHttpServiceRecoverTableMutationAuthority(ptr: *anyopaque, remaining_ms: u32) !void {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        var campaign_allowed = true;
+        switch (try svc.resolveTableMutationRouteWithCampaign(&campaign_allowed, remaining_ms)) {
+            .local => {},
+            .forward => return error.NotLeader,
+        }
     }
 
     fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
@@ -2008,7 +2024,12 @@ pub const MetadataHttpServer = struct {
             routes.Routes.raft_mutation_outcome_header,
             routes.Routes.raft_mutation_outcome_not_proposed,
         );
-        self.source.preflightTableMutationAuthority() catch |err| return metadataMutationError(ctx, err);
+        self.source.preflightTableMutationAuthority() catch |err| {
+            if (err != error.NotLeader or !forwarding.campaign_allowed)
+                return metadataMutationError(ctx, err);
+            self.source.recoverTableMutationAuthority(forwarding.remaining_ms) catch |recover_err|
+                return metadataMutationError(ctx, recover_err);
+        };
         const body = (try ctx.body()) orelse "";
         validateForwardedCreateTableBodySize(body.len) catch
             return ctx.status(413).text("table mutation request too large");
@@ -5509,6 +5530,80 @@ test "metadata http server returns retryable authority response when reconcile l
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
     try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, resp.headers.get(http_common.metadata_not_leader_header).?);
     try std.testing.expect(resp.headers.get(http_common.metadata_mutation_not_admitted_header) == null);
+}
+
+test "forwarded table mutation uses its single campaign allowance" {
+    const FakeSource = struct {
+        recovered: bool = false,
+        recover_calls: usize = 0,
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .preflight_table_mutation_authority = preflight,
+                .recover_table_mutation_authority = recover,
+                .create_table = createTable,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn preflight(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!self.recovered) return error.NotLeader;
+        }
+
+        fn recover(ptr: *anyopaque, remaining_ms: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(u32, 500), remaining_ms);
+            self.recover_calls += 1;
+            self.recovered = true;
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.create_calls += 1;
+        }
+    };
+
+    const body = try std.json.Stringify.valueAlloc(std.testing.allocator, routes.ForwardedTableMutation{
+        .kind = .create_table,
+        .table_name = "docs",
+        .definition_json = "{}",
+    }, .{ .emit_null_optional_fields = false });
+    defer std.testing.allocator.free(body);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_forwarded_table_mutation);
+    defer request.deinit();
+    try request.setHeader(routes.Routes.raft_mutation_remaining_ms_header, "500");
+    try request.setHeader(routes.Routes.raft_mutation_forwards_remaining_header, "1");
+    try request.setHeader(routes.Routes.raft_mutation_campaign_allowed_header, "true");
+    try request.setBody(body);
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var response = try server.metadataTableMutationForwarded(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 201), response.status.code);
+    try std.testing.expectEqual(@as(usize, 1), source.recover_calls);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+    try std.testing.expectEqualStrings(
+        routes.Routes.raft_mutation_outcome_committed,
+        response.headers.get(routes.Routes.raft_mutation_outcome_header).?,
+    );
 }
 
 test "metadata mutation pre-admission responses prove proposal was not admitted" {

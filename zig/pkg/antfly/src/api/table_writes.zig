@@ -7022,13 +7022,16 @@ pub const ProvisionedTableWriteSource = struct {
         // before the live Raft host is attached. Scan synchronously when the
         // fail-closed proof becomes available; merely scheduling could coalesce
         // with the proof-less scan and strand an intent until another event.
-        if (ownership != null) self.recoverReplicaRetirementIntents(std.heap.page_allocator) catch |err| {
-            std.log.warn("replica-retirement ownership attachment recovery deferred root={s} err={s}", .{
-                self.replica_root_dir,
-                @errorName(err),
-            });
-            self.scheduleDroppedTableRecovery();
-        };
+        if (ownership != null) {
+            const retry_required = self.recoverReplicaRetirementIntents(std.heap.page_allocator) catch |err| blk: {
+                std.log.warn("replica-retirement ownership attachment recovery deferred root={s} err={s}", .{
+                    self.replica_root_dir,
+                    @errorName(err),
+                });
+                break :blk true;
+            };
+            if (retry_required) self.scheduleDroppedTableRecoveryRetry();
+        }
         return self;
     }
 
@@ -7221,14 +7224,15 @@ pub const ProvisionedTableWriteSource = struct {
         try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
     }
 
-    fn recoverDroppedTableTrash(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !void {
+    fn recoverDroppedTableTrash(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
+        var retry_required = false;
         const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
         defer alloc.free(trash_dir_path);
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, trash_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => return false,
             else => return err,
         };
         defer dir.close(io);
@@ -7242,19 +7246,22 @@ pub const ProvisionedTableWriteSource = struct {
                 defer alloc.free(path);
                 DroppedTableDeleteWork.deletePath(path) catch |delete_err| {
                     std.log.warn("dropped-table trash recovery deferred path={s} err={s}", .{ path, @errorName(delete_err) });
+                    retry_required = true;
                 };
             }
         }
+        return retry_required;
     }
 
-    fn recoverDroppedTableRepairIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !void {
+    fn recoverDroppedTableRepairIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
+        var retry_required = false;
         const repair_dir_path = try droppedTableRepairDirPath(alloc, self.replica_root_dir);
         defer alloc.free(repair_dir_path);
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, repair_dir_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => return false,
             else => return err,
         };
         defer dir.close(io);
@@ -7274,12 +7281,15 @@ pub const ProvisionedTableWriteSource = struct {
                 .group_ids = intent.group_ids,
             }, true) catch |err| {
                 std.log.warn("dropped-table repair deferred table={s} path={s} err={s}", .{ intent.table_name, path, @errorName(err) });
+                retry_required = true;
                 continue;
             };
             removeDroppedTableRepairIntent(path) catch |err| {
                 std.log.warn("completed dropped-table repair intent retained path={s} err={s}", .{ path, @errorName(err) });
+                retry_required = true;
             };
         }
+        return retry_required;
     }
 
     fn executeReplicaRetirementCleanup(
@@ -7317,15 +7327,16 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn recoverReplicaRetirementIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !void {
-        const ownership = self.replicaRetirementOwnershipSnapshot() orelse return;
+    fn recoverReplicaRetirementIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
+        var retry_required = false;
+        const ownership = self.replicaRetirementOwnershipSnapshot() orelse return false;
         const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
         defer alloc.free(dir_path);
         var io_impl = std.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => return false,
             else => return err,
         };
         defer dir.close(io);
@@ -7340,15 +7351,21 @@ pub const ProvisionedTableWriteSource = struct {
             };
             // A crash can leave an intent whose replica-catalog transaction
             // never committed. Ownership is the fail-closed deletion fence.
-            if (ownership.owns(group_id)) continue;
+            if (ownership.owns(group_id)) {
+                retry_required = true;
+                continue;
+            }
             self.executeReplicaRetirementCleanup(alloc, group_id) catch |err| {
                 std.log.warn("replica retirement deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                retry_required = true;
                 continue;
             };
             removeDroppedTableRepairIntent(path) catch |err| {
                 std.log.warn("completed replica-retirement intent retained group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                retry_required = true;
             };
         }
+        return retry_required;
     }
 
     pub fn prepareReplicaRetirements(
@@ -7429,32 +7446,42 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn runDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+    fn runDroppedTableRecovery(self: *ProvisionedTableWriteSource) bool {
         const alloc = std.heap.page_allocator;
-        self.recoverDroppedTableRepairIntents(alloc) catch |err| {
+        var retry_required = self.recoverDroppedTableRepairIntents(alloc) catch |err| blk: {
             std.log.warn("dropped-table intent recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+            break :blk true;
         };
-        self.recoverDroppedTableTrash(alloc) catch |err| {
+        retry_required = (self.recoverDroppedTableTrash(alloc) catch |err| blk: {
             std.log.warn("dropped-table trash recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
-        };
-        self.recoverReplicaRetirementIntents(alloc) catch |err| {
+            break :blk true;
+        }) or retry_required;
+        retry_required = (self.recoverReplicaRetirementIntents(alloc) catch |err| blk: {
             std.log.warn("replica-retirement recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
-        };
+            break :blk true;
+        }) or retry_required;
         if (builtin.is_test) {
             if (test_dropped_table_recovery_pass_hook) |hook| hook.run(hook.ptr);
         }
+        return retry_required;
     }
 
     fn drainDroppedTableRecoveryRequests(self: *ProvisionedTableWriteSource) void {
         while (true) {
             const observed_epoch = self.dropped_table_recovery_requested.load(.acquire);
-            self.runDroppedTableRecovery();
+            const retry_required = self.runDroppedTableRecovery();
             if (self.dropped_table_recovery_requested.load(.acquire) != observed_epoch)
                 continue;
 
             self.dropped_table_recovery_scheduled.store(false, .release);
-            if (self.dropped_table_recovery_requested.load(.acquire) == observed_epoch)
+            if (self.dropped_table_recovery_requested.load(.acquire) == observed_epoch) {
+                if (retry_required) {
+                    self.scheduleDroppedTableRecoveryRetry();
+                } else {
+                    self.dropped_table_recovery_retry_failures.store(0, .release);
+                }
                 return;
+            }
             // A requester can race between the equality check and ownership
             // release. It either installed a successor or left the lane for
             // this worker to reclaim; both cases have exactly one owner.
@@ -43700,7 +43727,7 @@ test "provisioned table drop persists cleanup intent before filesystem failure a
     {
         var recovered = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
         defer recovered.deinit();
-        recovered.runDroppedTableRecovery();
+        _ = recovered.runDroppedTableRecovery();
     }
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), group_path, .{}));
 
@@ -43796,9 +43823,10 @@ test "provisioned table drop retains repair intent until catalog ownership clear
         }),
     );
     try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
+    try std.testing.expect(try source.recoverDroppedTableRepairIntents(alloc));
 
     catalog.active = false;
-    try source.recoverDroppedTableRepairIntents(alloc);
+    try std.testing.expect(!try source.recoverDroppedTableRepairIntents(alloc));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
     try std.testing.expect(!source.structuralStatusSnapshotOnlyBestEffort("docs"));
 
@@ -43853,7 +43881,7 @@ test "replica retirement recovery waits for durable ownership removal" {
     source.cancelPreparedReplicaRetirements(&duplicate);
     try std.Io.Dir.cwd().access(io_impl.io(), prepared.intents[0].path, .{});
 
-    try source.recoverReplicaRetirementIntents(alloc);
+    try std.testing.expect(try source.recoverReplicaRetirementIntents(alloc));
     try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
     try std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{});
     try std.Io.Dir.cwd().access(io_impl.io(), prepared.intents[0].path, .{});

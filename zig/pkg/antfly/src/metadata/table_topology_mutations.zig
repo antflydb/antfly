@@ -37,6 +37,20 @@ pub fn create(
     table_name: []const u8,
     req: tables_api.CreateTableRequest,
 ) !void {
+    // Schema-derived algebraic definitions are a public transport shape, not a
+    // durable catalog shape. Normalize at the transport-neutral admission
+    // boundary so embedded, HTTP-local, and forwarded callers cannot persist
+    // different definitions for the same request.
+    var normalized_req = req;
+    const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
+        alloc,
+        table_name,
+        req.indexes_json orelse tables_api.default_indexes_json,
+        tables_api.effectiveSchemaJson(req.schema_json),
+    );
+    defer alloc.free(expanded_indexes_json);
+    normalized_req.indexes_json = expanded_indexes_json;
+
     // Decoder capability probes perform remote I/O. Complete them before
     // entering the catalog lane, then revalidate their term/membership token
     // under the lane immediately before deriving the admission snapshot.
@@ -45,7 +59,7 @@ pub fn create(
     var catalog_locked = true;
     defer if (catalog_locked) svc.unlockCatalogMutation();
     try request.ensureActive();
-    const table = tables_api.deriveTableRecord(table_name, req);
+    const table = tables_api.deriveTableRecord(table_name, normalized_req);
     // Read the durable fence on the leader while holding the catalog mutation
     // lock. Its generation is both the apply precondition and the storage
     // incarnation salt, so a recreate cannot reuse paths owned by an earlier

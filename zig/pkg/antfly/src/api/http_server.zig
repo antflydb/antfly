@@ -1627,10 +1627,15 @@ fn runRoutedTableMutation(router: anytype, ops: anytype) !void {
         .forwards_remaining = raft_mutation_forwarding.max_forwards,
         .campaign_allowed = true,
     };
+    var campaign_allowed = true;
     var attempt_started_ns = platform_time.monotonicNs();
     while (true) {
         attempts += 1;
-        switch (try router.resolveTableMutationRoute()) {
+        const route = if (comptime @hasDecl(@TypeOf(router.*), "resolveTableMutationRouteWithCampaign"))
+            try router.resolveTableMutationRouteWithCampaign(&campaign_allowed, forwarding.remaining_ms)
+        else
+            try router.resolveTableMutationRoute();
+        switch (route) {
             .local => {
                 ops.local() catch |err| switch (err) {
                     error.NotLeader => {
@@ -1765,12 +1770,25 @@ test "routed table mutation surfaces resolution failure without mutating" {
     try std.testing.expectEqual(@as(usize, 0), script.forward_calls);
 }
 
+test "routed table mutation grants one bounded campaign owner" {
+    var script = RoutedTableMutationScript{
+        .routes = &.{},
+        .resolve_error = error.NotLeader,
+        .campaign_route = .local,
+    };
+    try runRoutedTableMutation(&script, RoutedTableMutationScript.Ops{ .script = &script });
+    try std.testing.expectEqual(@as(usize, 1), script.campaign_calls);
+    try std.testing.expectEqual(@as(usize, 1), script.local_calls);
+}
+
 const RoutedTableMutationScript = struct {
     routes: []const metadata_service.MetadataHttpService.TableMutationRoute,
     local_errors: []const anyerror = &.{},
     forward_errors: []const anyerror = &.{},
     resolve_error: ?anyerror = null,
+    campaign_route: ?metadata_service.MetadataHttpService.TableMutationRoute = null,
     route_resolutions: usize = 0,
+    campaign_calls: usize = 0,
     local_calls: usize = 0,
     forward_calls: usize = 0,
     last_forwarding: ?raft_mutation_forwarding.Context = null,
@@ -1780,6 +1798,21 @@ const RoutedTableMutationScript = struct {
         const index = @min(self.route_resolutions, self.routes.len - 1);
         self.route_resolutions += 1;
         return self.routes[index];
+    }
+
+    fn resolveTableMutationRouteWithCampaign(
+        self: *@This(),
+        campaign_allowed: *bool,
+        _: u32,
+    ) !metadata_service.MetadataHttpService.TableMutationRoute {
+        return self.resolveTableMutationRoute() catch |err| {
+            const campaign_route = self.campaign_route orelse return err;
+            if (err != error.NotLeader or !campaign_allowed.*) return err;
+            campaign_allowed.* = false;
+            self.campaign_calls += 1;
+            self.resolve_error = null;
+            return campaign_route;
+        };
     }
 
     const Ops = struct {
@@ -1805,15 +1838,6 @@ const RoutedTableMutationScript = struct {
     };
 };
 
-fn createTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
-    var normalized_req = req;
-    const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-    const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, table_name, indexes_json, tables_api.effectiveSchemaJson(req.schema_json));
-    defer alloc.free(expanded_indexes_json);
-    normalized_req.indexes_json = expanded_indexes_json;
-    try createNormalizedTableOnService(svc, alloc, table_name, normalized_req);
-}
-
 fn runPostMutationRound(svc: anytype) !void {
     // The production HTTP service has a dedicated Raft ticker, so this path
     // must not become a second clock owner. The in-process service used by
@@ -1824,19 +1848,6 @@ fn runPostMutationRound(svc: anytype) !void {
     } else {
         try svc.runRound();
     }
-}
-
-fn createNormalizedTableOnService(svc: anytype, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    const table = tables_api.deriveTableRecord(table_name, req);
-    const ranges = try tables_api.deriveInitialRanges(alloc, table);
-    defer {
-        for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
-        alloc.free(ranges);
-    }
-    _ = try workflow.createTableWithRanges(svc, table, ranges);
-    try runPostMutationRound(svc);
 }
 
 fn replaceTableDefinitionOnService(
@@ -35771,6 +35782,49 @@ test "api http server serves table metadata routes against real metadata service
     });
     try svc.campaignMetadataGroup();
     try svc.runRound();
+
+    const derived_schema_json =
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"customer":{"type":"keyword"},"amount":{"type":"number"},"created_at":{"type":"datetime"}}}}}}
+    ;
+    const derived_indexes_json =
+        \\{"sales_rollup":{"type":"algebraic","derive_from_schema":true}}
+    ;
+    const embedded_source = StatusSource.fromMetadataService(&svc);
+    const owned_derived_schema = try std.testing.allocator.dupe(u8, derived_schema_json);
+    const owned_derived_indexes = std.testing.allocator.dupe(u8, derived_indexes_json) catch |err| {
+        std.testing.allocator.free(owned_derived_schema);
+        return err;
+    };
+    var derived_request = tables_api.CreateTableRequest{
+        .schema_json = owned_derived_schema,
+        .indexes_json = owned_derived_indexes,
+    };
+    defer derived_request.deinit(std.testing.allocator);
+    var derived_create_attempt: usize = 0;
+    while (true) {
+        embedded_source.createTable(std.testing.allocator, "derived_orders", derived_request) catch |err| {
+            // A just-campaigned in-memory Raft group may advance its term while
+            // the protocol capability token is being captured. The shared
+            // mutation boundary proves this NotLeader outcome is pre-admission,
+            // so mirror the production router's bounded rediscovery retry.
+            if (err != error.NotLeader or derived_create_attempt == 7) return err;
+            derived_create_attempt += 1;
+            try svc.runRound();
+            continue;
+        };
+        break;
+    }
+    {
+        var derived_snapshot = try svc.adminSnapshot();
+        defer svc.freeAdminSnapshot(&derived_snapshot);
+        const derived_table = tables_api.findTableByName(&derived_snapshot, "derived_orders") orelse
+            return error.MissingDerivedTable;
+        try std.testing.expect(std.mem.indexOf(u8, derived_table.indexes_json, "\"derive_from_schema\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, derived_table.indexes_json, "\"capability_fingerprint\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, derived_table.indexes_json, "\"group_fields\"") != null);
+    }
+    var derived_drop = try embedded_source.dropTableExact(std.testing.allocator, "derived_orders");
+    derived_drop.deinit(std.testing.allocator);
 
     var server = ApiHttpServer.init(std.testing.allocator, .{}, testMetadataServiceSourceWithoutLifecycle(&svc), null, null);
 
