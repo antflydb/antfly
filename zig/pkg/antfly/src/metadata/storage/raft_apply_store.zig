@@ -785,6 +785,85 @@ test "table topology recreate is fenced by the durable transition generation" {
     try std.testing.expectEqual(replacement_range.group_id, projected_ranges[0].group_id);
 }
 
+test "table topology create rejects ranges orphaned by an interrupted legacy drop" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-table-legacy-drop-orphan",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const metadata_group_id: u64 = 21;
+    const table = metadata.TableRecord{ .table_id = 7, .name = "docs", .min_ranges = 1 };
+    const range = metadata.RangeRecord{
+        .group_id = 301,
+        .range_id = 301,
+        .table_id = table.table_id,
+        .start_key = "",
+    };
+    const table_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = table });
+    defer std.testing.allocator.free(table_upsert);
+    const range_upsert = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_range = range });
+    defer std.testing.allocator.free(range_upsert);
+    const seed_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_upsert },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = range_upsert },
+    });
+    defer std.testing.allocator.free(seed_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 2,
+        .entries_bytes = seed_entries,
+    });
+
+    const legacy_fence = try store.getTableTransitionFence(metadata_group_id, table.table_id);
+    const legacy_remove = try encodeTransitionCommand(std.testing.allocator, .{ .remove_table = .{
+        .table_id = table.table_id,
+        .expected_transition_generation = legacy_fence.generation,
+    } });
+    defer std.testing.allocator.free(legacy_remove);
+    const remove_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = legacy_remove },
+    });
+    defer std.testing.allocator.free(remove_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 3,
+        .entries_bytes = remove_entries,
+    });
+    try store.ensureDerivedCatalogIndexes(metadata_group_id);
+    try std.testing.expectError(
+        error.TableTransitionActive,
+        store.captureTableCreateGeneration(std.testing.allocator, metadata_group_id, table.table_id),
+    );
+
+    const unsafe_recreate = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .create = .{
+            .expected_transition_generation = legacy_fence.generation,
+            .table = table,
+            .ranges = &.{range},
+        } },
+    });
+    defer std.testing.allocator.free(unsafe_recreate);
+    const recreate_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 4, .entry_type = .normal, .data = unsafe_recreate },
+    });
+    defer std.testing.allocator.free(recreate_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 4,
+        .entries_bytes = recreate_entries,
+    });
+    try std.testing.expect((try store.getTable(std.testing.allocator, metadata_group_id, table.table_id)) == null);
+    const retained = (try store.getRange(std.testing.allocator, metadata_group_id, range.group_id)).?;
+    defer metadata_table_manager.freeRange(std.testing.allocator, retained);
+    try std.testing.expect(metadata_table_manager.rangeRecordsEqual(retained, range));
+}
+
 test "table topology mutation atomically creates and drops catalog ranges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2219,6 +2298,53 @@ pub const RaftApplyStore = struct {
         };
         defer self.alloc.free(encoded);
         return try decodeTableTransitionFence(encoded);
+    }
+
+    /// Captures the generation for a brand-new table incarnation from one
+    /// coherent projection snapshot. A missing table row is not sufficient:
+    /// legacy multi-entry drops removed the table before its ranges, so an
+    /// interrupted drop can leave the old membership and storage paths behind.
+    /// Reusing that generation would make a recreate adopt the dropped data.
+    pub fn captureTableCreateGeneration(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_id: u64,
+    ) !u64 {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+
+        var version_key_buf: [160]u8 = undefined;
+        const version = txn.get(try derivedCatalogIndexVersionKey(&version_key_buf, group_id)) catch |err| switch (err) {
+            error.NotFound => return error.InvalidDerivedCatalogIndex,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, version, derived_catalog_index_version))
+            return error.InvalidDerivedCatalogIndex;
+
+        var table_key_buf: [160]u8 = undefined;
+        const table_key = try tableKeyForGroup(&table_key_buf, group_id, table_id);
+        if (txn.get(table_key)) |_| {
+            return error.TableAlreadyExists;
+        } else |err| switch (err) {
+            error.NotFound => {},
+            else => return err,
+        }
+
+        const fence = try self.loadTableTransitionFenceTxn(&txn, group_id, table_id);
+        if (fence.active()) return error.TableTransitionActive;
+        const indexed_range_group_ids = try self.indexedTableRangeIdsTxn(alloc, &txn, group_id, table_id);
+        defer alloc.free(indexed_range_group_ids);
+        if (!try self.indexedRangeMembershipMatchesTxn(
+            &txn,
+            group_id,
+            table_id,
+            indexed_range_group_ids,
+            fence.membership(table_id),
+        )) return error.InvalidDerivedCatalogIndex;
+        if (indexed_range_group_ids.len != 0 or fence.range_membership.count != 0)
+            return error.TableTransitionActive;
+        return fence.generation;
     }
 
     pub fn listSchemaProgress(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.SchemaProgressRecord {
@@ -4190,6 +4316,12 @@ pub const RaftApplyStore = struct {
                     const existing = try decodeTableRecord(self.alloc, encoded);
                     defer metadata_table_manager.freeTable(self.alloc, existing);
                     if (!metadata_table_manager.tableDefinitionsEqual(existing, create.table)) return;
+                } else if (fence.range_membership.count != 0) {
+                    // Atomic creates can only encounter existing ranges when
+                    // replaying an already-created table. With no table row,
+                    // membership belongs to an interrupted legacy drop and
+                    // must never be adopted by a new incarnation.
+                    return;
                 }
 
                 var unique_groups = std.AutoHashMapUnmanaged(u64, void).empty;
@@ -4204,6 +4336,7 @@ pub const RaftApplyStore = struct {
                         error.NotFound => continue,
                         else => return err,
                     };
+                    if (encoded_table == null) return;
                     const existing = try decodeRangeRecord(self.alloc, encoded_range);
                     defer metadata_table_manager.freeRange(self.alloc, existing);
                     if (!metadata_table_manager.rangeRecordsEqual(existing, record)) return;

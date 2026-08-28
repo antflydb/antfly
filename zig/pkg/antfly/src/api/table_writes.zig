@@ -436,6 +436,7 @@ const TestRestoreRepairStepHook = struct {
 
 var test_before_batch_execution_hook: ?TestExecutionHook = null;
 var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
+var test_dropped_table_recovery_pass_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
 var test_before_native_backup_copy_hook: ?TestExecutionHook = null;
 var test_before_restore_work_hook: ?TestExecutionHook = null;
@@ -923,6 +924,7 @@ fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body
 
 const DroppedTableDeleteWork = struct {
     path: []u8,
+    recovery_source: ?*ProvisionedTableWriteSource = null,
 
     fn deletePath(path: []const u8) !void {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -950,7 +952,11 @@ const DroppedTableDeleteWork = struct {
                 self.path,
                 @errorName(err),
             });
+            if (self.recovery_source) |source| source.scheduleDroppedTableRecoveryRetry();
+            return;
         };
+        if (self.recovery_source) |source|
+            source.dropped_table_recovery_retry_failures.store(0, .release);
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -6296,6 +6302,12 @@ pub const ProvisionedTableWriteSource = struct {
     dropped_table_delete_owner_id: u64 = 0,
     dropped_table_recovery_started: std.atomic.Value(bool) = .init(false),
     dropped_table_recovery_scheduled: std.atomic.Value(bool) = .init(false),
+    // Every wake increments an epoch. The active scanner releases ownership
+    // only after observing the same epoch before and after clearing the
+    // scheduled bit, closing the classic coalesced-work lost-wakeup race.
+    dropped_table_recovery_requested: std.atomic.Value(u64) = .init(0),
+    dropped_table_recovery_retry_scheduled: std.atomic.Value(bool) = .init(false),
+    dropped_table_recovery_retry_failures: std.atomic.Value(u32) = .init(0),
     replica_retirement_ownership_mutex: std.atomic.Mutex = .unlocked,
     replica_retirement_ownership: ?ReplicaRetirementOwnership = null,
     // Protected by table_activity_mutex. A retirement is rare topology work;
@@ -7428,14 +7440,91 @@ pub const ProvisionedTableWriteSource = struct {
         self.recoverReplicaRetirementIntents(alloc) catch |err| {
             std.log.warn("replica-retirement recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
         };
+        if (builtin.is_test) {
+            if (test_dropped_table_recovery_pass_hook) |hook| hook.run(hook.ptr);
+        }
+    }
+
+    fn drainDroppedTableRecoveryRequests(self: *ProvisionedTableWriteSource) void {
+        while (true) {
+            const observed_epoch = self.dropped_table_recovery_requested.load(.acquire);
+            self.runDroppedTableRecovery();
+            if (self.dropped_table_recovery_requested.load(.acquire) != observed_epoch)
+                continue;
+
+            self.dropped_table_recovery_scheduled.store(false, .release);
+            if (self.dropped_table_recovery_requested.load(.acquire) == observed_epoch)
+                return;
+            // A requester can race between the equality check and ownership
+            // release. It either installed a successor or left the lane for
+            // this worker to reclaim; both cases have exactly one owner.
+            if (self.dropped_table_recovery_scheduled.swap(true, .acq_rel))
+                return;
+        }
+    }
+
+    fn scheduleDroppedTableRecoveryRetry(self: *ProvisionedTableWriteSource) void {
+        if (self.quiesced) return;
+        if (self.dropped_table_recovery_retry_scheduled.swap(true, .acq_rel)) return;
+        const runtime = self.backend_runtime orelse {
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            return;
+        };
+        // Manual runtimes execute durable submissions recursively on the
+        // caller's stack. A persistent filesystem failure must remain as
+        // durable trash for the next explicit poll/reopen instead of turning
+        // the retry chain into unbounded recursion.
+        if (runtime.durable_jobs.executesInline()) {
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            return;
+        }
+        const RetryWork = struct {
+            source: *ProvisionedTableWriteSource,
+
+            fn run(ptr: *anyopaque) !void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                const failure = work.source.dropped_table_recovery_retry_failures.fetchAdd(1, .acq_rel);
+                const shift: u5 = @intCast(@min(failure, 4));
+                const delay_ms: u64 = @as(u64, 100) << shift;
+                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer io_impl.deinit();
+                io_impl.io().sleep(.fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
+                work.source.dropped_table_recovery_retry_scheduled.store(false, .release);
+                work.source.scheduleDroppedTableRecovery();
+            }
+
+            fn deinit(ptr: *anyopaque) void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                std.heap.page_allocator.destroy(work);
+            }
+        };
+        const work = std.heap.page_allocator.create(RetryWork) catch {
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            return;
+        };
+        work.* = .{ .source = self };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.droppedTableDeleteOwnerId(runtime) catch {
+                std.heap.page_allocator.destroy(work);
+                self.dropped_table_recovery_retry_scheduled.store(false, .release);
+                return;
+            },
+            .class = .cleanup,
+            .ptr = work,
+            .run = RetryWork.run,
+            .deinit = RetryWork.deinit,
+        }) catch {
+            std.heap.page_allocator.destroy(work);
+            self.dropped_table_recovery_retry_scheduled.store(false, .release);
+        };
     }
 
     fn scheduleDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
         if (self.quiesced) return;
+        _ = self.dropped_table_recovery_requested.fetchAdd(1, .release);
         if (self.dropped_table_recovery_scheduled.swap(true, .acq_rel)) return;
         const runtime = self.backend_runtime orelse {
-            self.runDroppedTableRecovery();
-            self.dropped_table_recovery_scheduled.store(false, .release);
+            self.drainDroppedTableRecoveryRequests();
             return;
         };
         const Work = struct {
@@ -7443,12 +7532,11 @@ pub const ProvisionedTableWriteSource = struct {
 
             fn run(ptr: *anyopaque) !void {
                 const work: *@This() = @ptrCast(@alignCast(ptr));
-                work.source.runDroppedTableRecovery();
+                work.source.drainDroppedTableRecoveryRequests();
             }
 
             fn deinit(ptr: *anyopaque) void {
                 const work: *@This() = @ptrCast(@alignCast(ptr));
-                work.source.dropped_table_recovery_scheduled.store(false, .release);
                 std.heap.page_allocator.destroy(work);
             }
         };
@@ -7479,7 +7567,7 @@ pub const ProvisionedTableWriteSource = struct {
         errdefer std.heap.page_allocator.destroy(work);
         const owned_path = try std.heap.page_allocator.dupe(u8, path);
         errdefer std.heap.page_allocator.free(owned_path);
-        work.* = .{ .path = owned_path };
+        work.* = .{ .path = owned_path, .recovery_source = self };
         try runtime.durable_jobs.submit(.{
             .owner_id = try self.droppedTableDeleteOwnerId(runtime),
             .class = .cleanup,
@@ -43522,6 +43610,41 @@ test "dropped table quarantine path keeps valid API names in one portable compon
         try std.testing.expect(std.mem.startsWith(u8, basename, "table-"));
         try std.testing.expect(std.mem.indexOf(u8, basename, table_name) == null);
     }
+}
+
+test "dropped table recovery drains a wake coalesced during the active scan" {
+    const Probe = struct {
+        source: *ProvisionedTableWriteSource,
+        passes: usize = 0,
+
+        fn run(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.passes += 1;
+            if (self.passes == 1) self.source.scheduleDroppedTableRecovery();
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/drop-recovery-coalesced-wake",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(replica_root_dir);
+    var source = ProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    var probe = Probe{ .source = &source };
+    test_dropped_table_recovery_pass_hook = .{ .ptr = &probe, .run = Probe.run };
+    defer test_dropped_table_recovery_pass_hook = null;
+
+    source.scheduleDroppedTableRecovery();
+    try std.testing.expectEqual(@as(usize, 2), probe.passes);
+    try std.testing.expectEqual(@as(u64, 2), source.dropped_table_recovery_requested.load(.acquire));
+    try std.testing.expect(!source.dropped_table_recovery_scheduled.load(.acquire));
 }
 
 test "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart" {

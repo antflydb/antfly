@@ -37,17 +37,21 @@ pub fn create(
     table_name: []const u8,
     req: tables_api.CreateTableRequest,
 ) !void {
+    // Decoder capability probes perform remote I/O. Complete them before
+    // entering the catalog lane, then revalidate their term/membership token
+    // under the lane immediately before deriving the admission snapshot.
+    const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(request);
     svc.lockCatalogMutation();
     var catalog_locked = true;
     defer if (catalog_locked) svc.unlockCatalogMutation();
     try request.ensureActive();
-    try svc.ensureTableTopologyProtocolReadyWithContext(request);
     const table = tables_api.deriveTableRecord(table_name, req);
     // Read the durable fence on the leader while holding the catalog mutation
     // lock. Its generation is both the apply precondition and the storage
     // incarnation salt, so a recreate cannot reuse paths owned by an earlier
     // drop even when post-commit cleanup is delayed or the caller crashes.
     try svc.ensureLinearizableReadWithContext(request);
+    try svc.validateTableTopologyProtocolReadinessWithContext(request, protocol_readiness);
     const transition_generation = try svc.captureTableCreateGeneration(alloc, table.table_id);
     const ranges = try tables_api.deriveInitialRangesForGeneration(
         alloc,
@@ -90,12 +94,13 @@ pub fn drop(
     request: operation.RequestContext,
     table_name: []const u8,
 ) !DropResult {
+    const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(request);
     svc.lockCatalogMutation();
     var catalog_locked = true;
     defer if (catalog_locked) svc.unlockCatalogMutation();
     try request.ensureActive();
-    try svc.ensureTableTopologyProtocolReadyWithContext(request);
     try svc.ensureLinearizableReadWithContext(request);
+    try svc.validateTableTopologyProtocolReadinessWithContext(request, protocol_readiness);
     var admission = try svc.captureTableDropAdmission(alloc, table_name);
     defer admission.deinit(alloc);
 

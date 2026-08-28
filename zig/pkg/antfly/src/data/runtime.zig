@@ -15797,16 +15797,21 @@ const RemoteMetadataSource = struct {
     ) !T {
         const deadline_ns = platform_time.monotonicNs() +|
             @as(u64, antfly.public_api.raft_mutation_forwarding.max_remaining_ms) * std.time.ns_per_ms;
+        const discovery_budget = antfly.metadata_http_client.RequestBudget{ .deadline_ns = deadline_ns };
         var forwarding_hops_remaining = antfly.public_api.raft_mutation_forwarding.max_forwards;
         var last_pre_admission_err: anyerror = error.MissingMetadataApi;
         var mutation_attempted = false;
         for (0..self.base_uris.len) |attempt| {
+            if (platform_time.monotonicNs() >= deadline_ns)
+                return error.RaftMutationDeadlineExceeded;
             const index = self.metadataApiIndexForAttempt(attempt);
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const scratch = arena.allocator();
             var metadata_client = self.metadataClient(scratch);
-            const head = metadata_client.fetchHead(self.base_uris[index]) catch |err| {
+            const head = metadata_client.fetchHeadWithBudget(self.base_uris[index], discovery_budget) catch |err| {
+                if (platform_time.monotonicNs() >= deadline_ns)
+                    return error.RaftMutationDeadlineExceeded;
                 last_pre_admission_err = err;
                 continue;
             };

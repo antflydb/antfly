@@ -828,6 +828,51 @@ const ReallocationBarrierContract = struct {
     protected_metadata_membership_fingerprint: metadata_reallocation_request.MembershipFingerprint,
 };
 
+pub const TableTopologyProtocolReadiness = struct {
+    term: u64,
+    metadata_incarnation: ?metadata_mod.MetadataClusterIncarnation,
+    protected_member_count: u32,
+    protected_membership_fingerprint: metadata_reallocation_request.MembershipFingerprint,
+};
+
+fn tableTopologyProtocolReadiness(
+    term: u64,
+    metadata_incarnation: ?metadata_mod.MetadataClusterIncarnation,
+    sorted_node_ids: []const u64,
+) !TableTopologyProtocolReadiness {
+    if (term == 0 or sorted_node_ids.len == 0)
+        return error.TableTopologyProtocolUpgradeRequired;
+    return .{
+        .term = term,
+        .metadata_incarnation = metadata_incarnation,
+        .protected_member_count = std.math.cast(u32, sorted_node_ids.len) orelse
+            return error.TableTopologyProtocolUpgradeRequired,
+        .protected_membership_fingerprint = metadata_reallocation_request.membershipFingerprint(sorted_node_ids),
+    };
+}
+
+fn metadataIncarnationsEqual(
+    lhs: ?metadata_mod.MetadataClusterIncarnation,
+    rhs: ?metadata_mod.MetadataClusterIncarnation,
+) bool {
+    if (lhs == null or rhs == null) return lhs == null and rhs == null;
+    return std.mem.eql(u8, &lhs.?, &rhs.?);
+}
+
+fn tableTopologyReadinessEqual(
+    lhs: TableTopologyProtocolReadiness,
+    rhs: TableTopologyProtocolReadiness,
+) bool {
+    return lhs.term == rhs.term and
+        metadataIncarnationsEqual(lhs.metadata_incarnation, rhs.metadata_incarnation) and
+        lhs.protected_member_count == rhs.protected_member_count and
+        std.mem.eql(
+            u8,
+            &lhs.protected_membership_fingerprint,
+            &rhs.protected_membership_fingerprint,
+        );
+}
+
 fn reallocationBarrierContract(
     incarnation: metadata_mod.MetadataClusterIncarnation,
     sorted_node_ids: []const u64,
@@ -2387,8 +2432,9 @@ pub const MetadataService = struct {
     pub fn ensureTableTopologyProtocolReadyWithContext(
         self: *MetadataService,
         request: api_operation.RequestContext,
-    ) !void {
+    ) !TableTopologyProtocolReadiness {
         try request.ensureActive();
+        const incarnation = try self.metadataIncarnation();
         self.lockRuntime();
         defer self.unlockRuntime();
         const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
@@ -2397,6 +2443,46 @@ pub const MetadataService = struct {
         if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
             raft_status.soft.leader_id.? != local_node_id)
             return error.NotLeader;
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            &.{},
+        );
+        defer self.alloc.free(required_node_ids);
+        return try tableTopologyProtocolReadiness(
+            raft_status.hard.current_term,
+            incarnation,
+            required_node_ids,
+        );
+    }
+
+    pub fn validateTableTopologyProtocolReadinessWithContext(
+        self: *MetadataService,
+        request: api_operation.RequestContext,
+        expected: TableTopologyProtocolReadiness,
+    ) !void {
+        try request.ensureActive();
+        const incarnation = try self.metadataIncarnation();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        const local_node_id = self.raft.host.host.cfg.local_node_id;
+        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
+            raft_status.soft.leader_id.? != local_node_id)
+            return error.NotLeader;
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            &.{},
+        );
+        defer self.alloc.free(required_node_ids);
+        const current = try tableTopologyProtocolReadiness(
+            raft_status.hard.current_term,
+            incarnation,
+            required_node_ids,
+        );
+        if (!tableTopologyReadinessEqual(expected, current)) return error.NotLeader;
     }
 
     pub fn proposeTransitionCommand(self: *MetadataService, command: metadata_storage.TransitionCommand) !void {
@@ -2584,13 +2670,23 @@ pub const MetadataService = struct {
         table_id: u64,
     ) !u64 {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        if (try store.getTable(alloc, self.metadata_group_id, table_id)) |existing| {
-            metadata_table_manager.freeTable(alloc, existing);
-            return error.TableAlreadyExists;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) {
+                try store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            } else {
+                try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            }
+            return store.captureTableCreateGeneration(
+                alloc,
+                self.metadata_group_id,
+                table_id,
+            ) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
         }
-        const fence = try store.getTableTransitionFence(self.metadata_group_id, table_id);
-        if (fence.active()) return error.TableTransitionActive;
-        return fence.generation;
+        return error.InvalidDerivedCatalogIndex;
     }
 
     pub fn verifyTableCreateProjection(
@@ -5399,13 +5495,13 @@ pub const MetadataHttpService = struct {
     pub fn ensureTableTopologyProtocolReadyWithContext(
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
-    ) !void {
+    ) !TableTopologyProtocolReadiness {
         try request.ensureActive();
         const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
         // Status.conf_state borrows the Raft group's membership arrays. Copy
         // the required IDs while the runtime lock protects those arrays, then
         // release it before any network I/O.
-        const required_node_ids = locked: {
+        const observation = locked: {
             self.lockRuntime();
             defer self.unlockRuntime();
             const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
@@ -5413,12 +5509,16 @@ pub const MetadataHttpService = struct {
             if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
                 raft_status.soft.leader_id.? != local_node_id)
                 return error.NotLeader;
-            break :locked try collectReallocationBarrierNodeIds(
-                self.alloc,
-                raft_status.conf_state,
-                self.reallocation_protocol_peers,
-            );
+            break :locked .{
+                .term = raft_status.hard.current_term,
+                .required_node_ids = try collectReallocationBarrierNodeIds(
+                    self.alloc,
+                    raft_status.conf_state,
+                    self.reallocation_protocol_peers,
+                ),
+            };
         };
+        const required_node_ids = observation.required_node_ids;
         defer self.alloc.free(required_node_ids);
         const incarnation = (try self.metadataIncarnation()) orelse
             return error.TableTopologyProtocolUpgradeRequired;
@@ -5454,6 +5554,44 @@ pub const MetadataHttpService = struct {
                 return error.TableTopologyProtocolUpgradeRequired;
             }
         }
+        return try tableTopologyProtocolReadiness(
+            observation.term,
+            incarnation,
+            required_node_ids,
+        );
+    }
+
+    /// Revalidates the capability probe after the caller acquires the catalog
+    /// mutation lane. This is intentionally local and allocation-bounded: slow
+    /// peer HTTP calls must never hold the global DDL/reconciliation mutex.
+    pub fn validateTableTopologyProtocolReadinessWithContext(
+        self: *MetadataHttpService,
+        request: api_operation.RequestContext,
+        expected: TableTopologyProtocolReadiness,
+    ) !void {
+        try request.ensureActive();
+        const incarnation = (try self.metadataIncarnation()) orelse
+            return error.TableTopologyProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
+            raft_status.soft.leader_id.? != local_node_id)
+            return error.NotLeader;
+        const required_node_ids = try collectReallocationBarrierNodeIds(
+            self.alloc,
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+        );
+        defer self.alloc.free(required_node_ids);
+        const current = try tableTopologyProtocolReadiness(
+            raft_status.hard.current_term,
+            incarnation,
+            required_node_ids,
+        );
+        if (!tableTopologyReadinessEqual(expected, current)) return error.NotLeader;
     }
 
     fn requireReallocationBarrierPeer(
@@ -6476,13 +6614,23 @@ pub const MetadataHttpService = struct {
         table_id: u64,
     ) !u64 {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
-        if (try store.getTable(alloc, self.metadata_group_id, table_id)) |existing| {
-            metadata_table_manager.freeTable(alloc, existing);
-            return error.TableAlreadyExists;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) {
+                try store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            } else {
+                try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            }
+            return store.captureTableCreateGeneration(
+                alloc,
+                self.metadata_group_id,
+                table_id,
+            ) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            };
         }
-        const fence = try store.getTableTransitionFence(self.metadata_group_id, table_id);
-        if (fence.active()) return error.TableTransitionActive;
-        return fence.generation;
+        return error.InvalidDerivedCatalogIndex;
     }
 
     pub fn verifyTableCreateProjection(
