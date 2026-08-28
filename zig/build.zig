@@ -6286,6 +6286,8 @@ pub fn build(b: *std.Build) void {
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write source drop table cancels index repair before structural admission",
             "dropped table quarantine path keeps valid API names in one portable component",
+            "malformed recovery intent is durably removed from the active queue and counted",
+            "transient recovery intent read failure retains active work and retries successfully",
             "dropped table recovery drains a wake coalesced during the active scan",
             "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
             "provisioned table drop retains repair intent until catalog ownership clears",

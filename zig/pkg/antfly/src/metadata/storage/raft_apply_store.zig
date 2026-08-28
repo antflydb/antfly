@@ -51,6 +51,10 @@ pub const ExtensionDependencyKey = struct {
 };
 
 pub const ExtensionLifecycleDelta = struct {
+    /// Compact compare-and-set fence for every replacement table. Empty is
+    /// accepted only for rolling compatibility with lifecycle entries emitted
+    /// before this field existed.
+    expected_tables: []const ExtensionLifecycleTablePrecondition = &.{},
     upsert_tables: []const metadata.TableRecord = &.{},
     upsert_installed_extensions: []const extension_domain.InstalledExtension = &.{},
     remove_installed_extensions: []const []const u8 = &.{},
@@ -58,6 +62,11 @@ pub const ExtensionLifecycleDelta = struct {
     remove_extension_members: []const ExtensionMemberKey = &.{},
     upsert_extension_dependencies: []const extension_domain.ExtensionDependency = &.{},
     remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
+};
+
+pub const ExtensionLifecycleTablePrecondition = struct {
+    table_id: u64,
+    definition_fingerprint: metadata_table_manager.TableDefinitionFingerprint,
 };
 
 pub const TableTransitionFence = struct {
@@ -5160,6 +5169,24 @@ pub const RaftApplyStore = struct {
     }
 
     fn applyExtensionLifecycleDeltaTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, delta: ExtensionLifecycleDelta) !void {
+        if (delta.expected_tables.len != 0) {
+            if (delta.expected_tables.len != delta.upsert_tables.len) return;
+            for (delta.upsert_tables) |replacement| {
+                const expected = for (delta.expected_tables) |candidate| {
+                    if (candidate.table_id == replacement.table_id) break candidate;
+                } else return;
+                var key_buf: [160]u8 = undefined;
+                const key = try tableKeyForGroup(&key_buf, group_id, replacement.table_id);
+                const encoded = txn.get(key) catch |err| switch (err) {
+                    error.NotFound => return,
+                    else => return err,
+                };
+                const current = try decodeTableRecord(self.alloc, encoded);
+                defer metadata_table_manager.freeTable(self.alloc, current);
+                const current_fingerprint = metadata_table_manager.tableDefinitionFingerprint(current);
+                if (!std.mem.eql(u8, &current_fingerprint, &expected.definition_fingerprint)) return;
+            }
+        }
         // Extension lifecycle commands are atomic. Preflight every structural
         // table write before touching any extension row so an active range
         // transition rejects the whole delta rather than publishing half of it.
@@ -8359,6 +8386,7 @@ fn deinitExtensionJsonRecord(comptime T: type, alloc: std.mem.Allocator, value: 
 }
 
 fn freeExtensionLifecycleDelta(alloc: std.mem.Allocator, delta: ExtensionLifecycleDelta) void {
+    if (delta.expected_tables.len > 0) alloc.free(@constCast(delta.expected_tables));
     for (delta.upsert_tables) |record| metadata_table_manager.freeTable(alloc, record);
     if (delta.upsert_tables.len > 0) alloc.free(@constCast(delta.upsert_tables));
     for (delta.upsert_installed_extensions) |record| {
@@ -11864,8 +11892,17 @@ test "metadata reallocation request decoder accepts the legacy unfenced record" 
 }
 
 test "metadata extension lifecycle transition command round-trips" {
+    const original_table = metadata.TableRecord{
+        .table_id = 7,
+        .name = "memories",
+        .indexes_json = "{}",
+    };
     const command: TransitionCommand = .{
         .apply_extension_lifecycle = .{
+            .expected_tables = &.{.{
+                .table_id = original_table.table_id,
+                .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(original_table),
+            }},
             .upsert_tables = &.{.{
                 .table_id = 7,
                 .name = "memories",
@@ -11915,6 +11952,13 @@ test "metadata extension lifecycle transition command round-trips" {
     try std.testing.expect(decoded != null);
     try std.testing.expect(decoded.? == .apply_extension_lifecycle);
     const delta = decoded.?.apply_extension_lifecycle;
+    try std.testing.expectEqual(@as(usize, 1), delta.expected_tables.len);
+    try std.testing.expectEqual(original_table.table_id, delta.expected_tables[0].table_id);
+    try std.testing.expectEqualSlices(
+        u8,
+        &metadata_table_manager.tableDefinitionFingerprint(original_table),
+        &delta.expected_tables[0].definition_fingerprint,
+    );
     try std.testing.expectEqual(@as(usize, 1), delta.upsert_tables.len);
     try std.testing.expectEqualStrings("memories", delta.upsert_tables[0].name);
     try std.testing.expectEqual(@as(usize, 1), delta.upsert_installed_extensions.len);
@@ -11928,6 +11972,63 @@ test "metadata extension lifecycle transition command round-trips" {
     try std.testing.expectEqual(@as(usize, 1), delta.upsert_extension_dependencies.len);
     try std.testing.expectEqualStrings("antfly_core", delta.upsert_extension_dependencies[0].package_name);
     try std.testing.expectEqual(@as(usize, 1), delta.remove_extension_dependencies.len);
+}
+
+test "metadata extension lifecycle table precondition prevents stale replacement and partial rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-extension-lifecycle-cas",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const metadata_group_id: u64 = 21;
+    const original = metadata.TableRecord{ .table_id = 7, .name = "docs", .indexes_json = "{}" };
+    const concurrent = metadata.TableRecord{ .table_id = 7, .name = "docs", .indexes_json = "{\"search\":{\"type\":\"full_text\"}}" };
+    const stale_replacement = metadata.TableRecord{ .table_id = 7, .name = "docs", .indexes_json = "{\"extension_idx\":{\"type\":\"full_text\"}}" };
+
+    const seed = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = original });
+    defer std.testing.allocator.free(seed);
+    const concurrent_update = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = concurrent });
+    defer std.testing.allocator.free(concurrent_update);
+    const lifecycle = try encodeTransitionCommand(std.testing.allocator, .{ .apply_extension_lifecycle = .{
+        .expected_tables = &.{.{
+            .table_id = original.table_id,
+            .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(original),
+        }},
+        .upsert_tables = &.{stale_replacement},
+        .upsert_installed_extensions = &.{.{
+            .name = "docaf",
+            .package_name = "docaf",
+            .package_version = "1.0.0",
+            .package_digest = "sha256:abc",
+            .scope = .{ .kind = .table, .table_name = "docs" },
+            .status = .ready,
+        }},
+    } });
+    defer std.testing.allocator.free(lifecycle);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = seed },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = concurrent_update },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = lifecycle },
+    });
+    defer std.testing.allocator.free(entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = metadata_group_id,
+        .commit_index = 3,
+        .entries_bytes = entries,
+    });
+
+    const projected = (try store.getTable(std.testing.allocator, metadata_group_id, original.table_id)) orelse
+        return error.TestExpectedEqual;
+    defer metadata_table_manager.freeTable(std.testing.allocator, projected);
+    try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(projected, concurrent));
+    const installed = try store.listInstalledExtensions(std.testing.allocator, metadata_group_id);
+    defer store.freeInstalledExtensions(std.testing.allocator, installed);
+    try std.testing.expectEqual(@as(usize, 0), installed.len);
 }
 
 test "metadata raft apply store projects schema progress records from committed entries" {

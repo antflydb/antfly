@@ -1654,6 +1654,13 @@ pub const MetadataHttpServer = struct {
     }
 
     fn extensionError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        if (err == error.ExtensionLifecycleConflict) {
+            try ctx.setHeader(
+                routes.Routes.extension_lifecycle_error_header,
+                routes.Routes.extension_lifecycle_error_conflict,
+            );
+            return ctx.status(409).text("extension lifecycle conflicted with a concurrent catalog transition; retry after observing current state");
+        }
         return switch (err) {
             error.UnsupportedOperation => ctx.status(405).text("unsupported operation"),
             error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => ctx.status(404).text("not found"),

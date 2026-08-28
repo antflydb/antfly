@@ -15805,6 +15805,7 @@ fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror)
         error.UnsupportedOperation => try contextualJsonErrorResponse(alloc, 405, "method not allowed"),
         error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try contextualJsonErrorResponse(alloc, 404, "not found"),
         error.ExtensionAlreadyInstalled => try contextualJsonErrorResponse(alloc, 409, "extension already installed"),
+        error.ExtensionLifecycleConflict => try contextualJsonErrorResponse(alloc, 409, "extension lifecycle conflicted with a concurrent catalog transition; retry after observing current state"),
         error.DependentExtensionExists => try contextualJsonErrorResponse(alloc, 409, "dependent extension exists"),
         error.RequiredExtensionNotInstalled => try contextualJsonErrorResponse(alloc, 409, "required extension not installed"),
         error.UnsupportedManifestApiVersion,

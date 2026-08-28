@@ -72,6 +72,7 @@ const table_mutation_campaign_poll_ms: u64 = 5;
 const table_mutation_campaign_response_reserve_ms: u32 = 50;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const table_topology_protocol_probe_concurrency: usize = 8;
+const table_topology_protocol_probe_wait_ns: u64 = 25 * std.time.ns_per_ms;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
 const table_catalog_mutation_lane_count: usize = 64;
@@ -529,6 +530,55 @@ const MetadataProposalProgressDriver = struct {
     }
 };
 
+/// Serializes the expensive peer capability fanout and retains only a positive
+/// result. The readiness identity includes the leader term, incarnation, and
+/// complete protected membership, so membership or leadership changes
+/// invalidate the cache without a timer or a stale negative result.
+const TableTopologyProtocolProbeCoordinator = struct {
+    lane: std.atomic.Mutex = .unlocked,
+    wake_epoch: std.atomic.Value(u32) = .init(0),
+    cached: ?TableTopologyProtocolReadiness = null,
+
+    const Lease = struct {
+        coordinator: *TableTopologyProtocolProbeCoordinator,
+
+        fn deinit(self: *Lease) void {
+            self.coordinator.lane.unlock();
+            _ = self.coordinator.wake_epoch.fetchAdd(1, .release);
+            std.Io.futexWake(
+                std.Options.debug_io,
+                u32,
+                &self.coordinator.wake_epoch.raw,
+                std.math.maxInt(u32),
+            );
+            self.* = undefined;
+        }
+    };
+
+    fn tryAcquire(self: *@This()) ?Lease {
+        if (!self.lane.tryLock()) return null;
+        return .{ .coordinator = self };
+    }
+
+    fn currentEpoch(self: *const @This()) u32 {
+        return self.wake_epoch.load(.acquire);
+    }
+
+    fn waitForHandoff(self: *@This(), observed_epoch: u32, timeout_ns: u64) void {
+        if (self.wake_epoch.load(.acquire) != observed_epoch) return;
+        std.Io.futexWaitTimeout(
+            std.Options.debug_io,
+            u32,
+            &self.wake_epoch.raw,
+            observed_epoch,
+            .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromNanoseconds(@intCast(timeout_ns)),
+            } },
+        ) catch return;
+    }
+};
+
 test "metadata proposal receipt progress uses a single transferable driver" {
     var driver = MetadataProposalProgressDriver{};
     var first = driver.tryAcquire() orelse return error.TestExpectedEqual;
@@ -539,6 +589,29 @@ test "metadata proposal receipt progress uses a single transferable driver" {
 
     var next = driver.tryAcquire() orelse return error.TestExpectedEqual;
     next.deinit();
+}
+
+test "table topology protocol probes singleflight and retain only matching positive readiness" {
+    var coordinator = TableTopologyProtocolProbeCoordinator{};
+    var first = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
+    try std.testing.expect(coordinator.tryAcquire() == null);
+    const readiness = TableTopologyProtocolReadiness{
+        .term = 3,
+        .metadata_incarnation = null,
+        .protected_member_count = 2,
+        .protected_membership_fingerprint = [_]u8{7} ** std.crypto.hash.sha2.Sha256.digest_length,
+    };
+    coordinator.cached = readiness;
+    const observed = coordinator.currentEpoch();
+    first.deinit();
+    try std.testing.expect(coordinator.currentEpoch() != observed);
+
+    var second = coordinator.tryAcquire() orelse return error.TestExpectedEqual;
+    defer second.deinit();
+    try std.testing.expect(tableTopologyReadinessEqual(coordinator.cached.?, readiness));
+    var changed = readiness;
+    changed.term += 1;
+    try std.testing.expect(!tableTopologyReadinessEqual(coordinator.cached.?, changed));
 }
 
 const LifecycleSignal = struct {
@@ -4315,6 +4388,7 @@ pub const MetadataHttpService = struct {
     // metadata proposal. Other requests sleep on the driver's handoff signal,
     // avoiding a per-waiter Raft round and false lifecycle epoch changes.
     proposal_progress_driver: MetadataProposalProgressDriver = .{},
+    table_topology_protocol_probe: TableTopologyProtocolProbeCoordinator = .{},
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
@@ -5543,8 +5617,8 @@ pub const MetadataHttpService = struct {
 
     /// Atomic topology entries use a new Raft wire tag, so every current and
     /// configured metadata member must advertise decoder support before the
-    /// leader may append one. This is intentionally uncached: create/drop are
-    /// rare and membership may change between requests.
+    /// leader may append one. Successful probes are singleflight-cached by the
+    /// complete readiness identity; failures are never cached.
     pub fn ensureTableTopologyProtocolReadyWithContext(
         self: *MetadataHttpService,
         request: api_operation.RequestContext,
@@ -5575,11 +5649,32 @@ pub const MetadataHttpService = struct {
         defer self.alloc.free(required_node_ids);
         const incarnation = (try self.metadataIncarnation()) orelse
             return error.TableTopologyProtocolUpgradeRequired;
+        const expected_readiness = try tableTopologyProtocolReadiness(
+            observation.term,
+            incarnation,
+            required_node_ids,
+        );
+
+        var probe_lease = while (true) {
+            try request.ensureActive();
+            const observed_epoch = self.table_topology_protocol_probe.currentEpoch();
+            if (self.table_topology_protocol_probe.tryAcquire()) |lease| break lease;
+            self.table_topology_protocol_probe.waitForHandoff(
+                observed_epoch,
+                table_topology_protocol_probe_wait_ns,
+            );
+        };
+        defer probe_lease.deinit();
+        if (self.table_topology_protocol_probe.cached) |cached| {
+            if (tableTopologyReadinessEqual(cached, expected_readiness)) return expected_readiness;
+        }
 
         const now_ns = platform_time.monotonicNs();
         const request_deadline = request.deadline_ns orelse std.math.maxInt(u64);
+        var transport_cancellation = http_common.RequestCancellation.fromToken(request.cancellation);
         const probe_budget = metadata_http_client.RequestBudget{
             .deadline_ns = @min(now_ns +| reallocation_protocol_probe_timeout_ns, request_deadline),
+            .cancellation = &transport_cancellation,
         };
         const ProbeSlot = struct {
             node_id: u64 = 0,
@@ -5666,11 +5761,8 @@ pub const MetadataHttpService = struct {
                 return error.TableTopologyProtocolUpgradeRequired;
             }
         }
-        return try tableTopologyProtocolReadiness(
-            observation.term,
-            incarnation,
-            required_node_ids,
-        );
+        self.table_topology_protocol_probe.cached = expected_readiness;
+        return expected_readiness;
     }
 
     /// Revalidates the capability probe after the caller acquires the catalog

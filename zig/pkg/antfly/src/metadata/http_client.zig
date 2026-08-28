@@ -883,7 +883,7 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
-        try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
+        try mapResponseStatus(resp, bad_request_err, not_found_err, conflict_err);
     }
 
     fn requestJsonWithBody(
@@ -908,7 +908,7 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
-        try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
+        try mapResponseStatus(resp, bad_request_err, not_found_err, conflict_err);
         return try parseJson(T, self.alloc, resp.body);
     }
 
@@ -930,7 +930,7 @@ pub const MetadataHttpClient = struct {
             .timeout_ms = default_request_timeout_ms,
         });
         defer resp.deinit(self.alloc);
-        try mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
+        try mapResponseStatus(resp, bad_request_err, not_found_err, conflict_err);
     }
 
     fn executeWithRetry(self: *MetadataHttpClient, req: http_common.HttpRequest) !http_common.HttpResponse {
@@ -1102,6 +1102,19 @@ pub const MetadataHttpClient = struct {
         if (status == 409) return conflict_err orelse error.UnexpectedHttpStatus;
         if (status == 405) return error.UnsupportedOperation;
         return error.UnexpectedHttpStatus;
+    }
+
+    fn mapResponseStatus(resp: http_common.HttpResponse, bad_request_err: ?anyerror, not_found_err: ?anyerror, conflict_err: ?anyerror) !void {
+        if (resp.status == 409) {
+            for (resp.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, routes.Routes.extension_lifecycle_error_header) and
+                    std.mem.eql(u8, header.value, routes.Routes.extension_lifecycle_error_conflict))
+                {
+                    return error.ExtensionLifecycleConflict;
+                }
+            }
+        }
+        return mapStatus(resp.status, bad_request_err, not_found_err, conflict_err);
     }
 };
 
@@ -2074,6 +2087,26 @@ test "metadata http client preserves split merge doc identity conflicts" {
     );
     try std.testing.expectEqual(@as(usize, 1), executor.split_calls);
     try std.testing.expectEqual(@as(usize, 1), executor.merge_calls);
+}
+
+test "metadata http client preserves typed extension lifecycle conflicts" {
+    var headers = [_]http_common.Header{.{
+        .name = @constCast(routes.Routes.extension_lifecycle_error_header),
+        .value = @constCast(routes.Routes.extension_lifecycle_error_conflict),
+    }};
+    const response = http_common.HttpResponse{
+        .status = 409,
+        .headers = headers[0..],
+    };
+    try std.testing.expectError(
+        error.ExtensionLifecycleConflict,
+        MetadataHttpClient.mapResponseStatus(
+            response,
+            error.InvalidExtensionLifecycleRequest,
+            error.ExtensionNotInstalled,
+            error.ExtensionAlreadyInstalled,
+        ),
+    );
 }
 
 test "metadata http client percent-encodes artifact enrichment path components" {

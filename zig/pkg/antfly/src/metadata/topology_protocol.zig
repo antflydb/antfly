@@ -19,7 +19,9 @@ const std = @import("std");
 /// with a fixed-size membership contract. Version 3 fences create against the
 /// replicated transition generation so recreated tables receive fresh data
 /// group identities and stale drop cleanup cannot delete their storage.
-pub const current_version: u16 = 3;
+/// Version 4 adds compare-and-set table preconditions to extension lifecycle
+/// entries; leaders gate those entries on the same all-member capability.
+pub const current_version: u16 = 4;
 
 /// Creating thousands of Raft groups is an operational workflow, not one
 /// catalog request. Keep one create bounded in CPU, memory, and log growth.

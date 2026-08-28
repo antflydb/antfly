@@ -18,6 +18,7 @@ const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
+const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const platform_time = @import("antfly_platform").time;
 
@@ -57,6 +58,200 @@ fn proposeCatalogMutation(service: anytype, command: metadata_storage.Transition
         return;
     }
     try service.proposeTransitionCommand(command);
+}
+
+fn probeLifecycleProtocolReadiness(
+    service: anytype,
+    required: bool,
+) !?metadata_service.TableTopologyProtocolReadiness {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    // Lifecycle table preconditions change replicated apply semantics. Reuse
+    // the metadata-member decoder capability barrier so a rolling upgrade can
+    // never let an older follower ignore the compare-and-set fence.
+    if (required and @hasDecl(ServiceDeclType, "ensureTableTopologyProtocolReadyWithContext"))
+        return try service.ensureTableTopologyProtocolReadyWithContext(.{});
+    return null;
+}
+
+fn validateLifecycleProtocolReadiness(
+    service: anytype,
+    readiness: ?metadata_service.TableTopologyProtocolReadiness,
+) !void {
+    const expected = readiness orelse return;
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "validateTableTopologyProtocolReadinessWithContext"))
+        try service.validateTableTopologyProtocolReadinessWithContext(.{}, expected);
+}
+
+fn captureLifecycleSnapshot(service: anytype) !metadata_api.AdminSnapshot {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "ensureLinearizableReadWithContext") and
+        @hasDecl(ServiceDeclType, "adminSnapshotFence"))
+    {
+        return try metadata_service.coherentLinearizableAdminSnapshot(ServiceDeclType, service, .{});
+    }
+    return try service.adminSnapshot();
+}
+
+fn scopeEqual(lhs: extension_domain.ExtensionScope, rhs: extension_domain.ExtensionScope) bool {
+    return lhs.kind == rhs.kind and std.mem.eql(u8, lhs.table_name, rhs.table_name);
+}
+
+fn capabilitiesEqual(lhs: []const extension_domain.Capability, rhs: []const extension_domain.Capability) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.mem.eql(u8, left.name, right.name) or !std.mem.eql(u8, left.scope, right.scope)) return false;
+    }
+    return true;
+}
+
+fn installedEqual(lhs: extension_domain.InstalledExtension, rhs: extension_domain.InstalledExtension) bool {
+    return std.mem.eql(u8, lhs.name, rhs.name) and
+        std.mem.eql(u8, lhs.package_name, rhs.package_name) and
+        std.mem.eql(u8, lhs.package_version, rhs.package_version) and
+        std.mem.eql(u8, lhs.package_digest, rhs.package_digest) and
+        scopeEqual(lhs.scope, rhs.scope) and
+        std.mem.eql(u8, lhs.config_json, rhs.config_json) and
+        capabilitiesEqual(lhs.granted_capabilities, rhs.granted_capabilities) and
+        lhs.installed_at_epoch_ms == rhs.installed_at_epoch_ms and
+        lhs.status == rhs.status;
+}
+
+fn memberEqual(lhs: extension_domain.ExtensionMember, rhs: extension_domain.ExtensionMember) bool {
+    return std.mem.eql(u8, lhs.extension_name, rhs.extension_name) and
+        scopeEqual(lhs.scope, rhs.scope) and
+        lhs.object_kind == rhs.object_kind and
+        std.mem.eql(u8, lhs.object_name, rhs.object_name) and
+        std.mem.eql(u8, lhs.table_name, rhs.table_name) and
+        lhs.shape_kind == rhs.shape_kind and
+        std.mem.eql(u8, lhs.shape_name, rhs.shape_name) and
+        std.mem.eql(u8, lhs.shape_version, rhs.shape_version) and
+        std.mem.eql(u8, lhs.owner_metadata_json, rhs.owner_metadata_json);
+}
+
+fn dependencyEqual(lhs: extension_domain.ExtensionDependency, rhs: extension_domain.ExtensionDependency) bool {
+    return std.mem.eql(u8, lhs.extension_name, rhs.extension_name) and
+        std.mem.eql(u8, lhs.required_extension_name, rhs.required_extension_name) and
+        std.mem.eql(u8, lhs.package_name, rhs.package_name) and
+        std.mem.eql(u8, lhs.version_requirement, rhs.version_requirement);
+}
+
+fn lifecycleDeltaApplied(snapshot: *const metadata_api.AdminSnapshot, delta: metadata_storage.ExtensionLifecycleDelta) bool {
+    for (delta.upsert_tables) |expected| {
+        var found = false;
+        for (snapshot.tables) |actual| {
+            if (actual.table_id != expected.table_id) continue;
+            found = metadata_table_manager.tableDefinitionsEqual(actual, expected);
+            break;
+        }
+        if (!found) return false;
+    }
+    for (delta.upsert_installed_extensions) |expected| {
+        var found = false;
+        for (snapshot.installed_extensions) |actual| {
+            if (!std.mem.eql(u8, actual.name, expected.name)) continue;
+            found = installedEqual(actual, expected);
+            break;
+        }
+        if (!found) return false;
+    }
+    for (delta.remove_installed_extensions) |name| {
+        for (snapshot.installed_extensions) |actual| {
+            if (std.mem.eql(u8, actual.name, name)) return false;
+        }
+    }
+    for (delta.upsert_extension_members) |expected| {
+        var found = false;
+        for (snapshot.extension_members) |actual| {
+            if (memberEqual(actual, expected)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    for (delta.remove_extension_members) |key| {
+        const replaced = for (delta.upsert_extension_members) |upsert| {
+            if (std.mem.eql(u8, upsert.extension_name, key.extension_name) and
+                upsert.object_kind == key.object_kind and
+                std.mem.eql(u8, upsert.object_name, key.object_name)) break true;
+        } else false;
+        if (replaced) continue;
+        for (snapshot.extension_members) |actual| {
+            if (std.mem.eql(u8, actual.extension_name, key.extension_name) and
+                actual.object_kind == key.object_kind and
+                std.mem.eql(u8, actual.object_name, key.object_name)) return false;
+        }
+    }
+    for (delta.upsert_extension_dependencies) |expected| {
+        var found = false;
+        for (snapshot.extension_dependencies) |actual| {
+            if (dependencyEqual(actual, expected)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+    }
+    for (delta.remove_extension_dependencies) |key| {
+        const replaced = for (delta.upsert_extension_dependencies) |upsert| {
+            if (std.mem.eql(u8, upsert.extension_name, key.extension_name) and
+                std.mem.eql(u8, upsert.required_extension_name, key.required_extension_name) and
+                std.mem.eql(u8, upsert.package_name, key.package_name)) break true;
+        } else false;
+        if (replaced) continue;
+        for (snapshot.extension_dependencies) |actual| {
+            if (std.mem.eql(u8, actual.extension_name, key.extension_name) and
+                std.mem.eql(u8, actual.required_extension_name, key.required_extension_name) and
+                std.mem.eql(u8, actual.package_name, key.package_name)) return false;
+        }
+    }
+    return true;
+}
+
+fn proposeLifecycleMutation(
+    service: anytype,
+    readiness: ?metadata_service.TableTopologyProtocolReadiness,
+    delta: metadata_storage.ExtensionLifecycleDelta,
+) !void {
+    // The remote probe intentionally runs outside the catalog lane. Fence its
+    // term and exact membership under the lane immediately before admission.
+    try validateLifecycleProtocolReadiness(service, readiness);
+    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = delta });
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    if (!lifecycleDeltaApplied(&snapshot, delta)) return error.ExtensionLifecycleConflict;
+}
+
+fn lifecycleTablePreconditionsAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    replacements: []const metadata_table_manager.TableRecord,
+) ![]metadata_storage.ExtensionLifecycleTablePrecondition {
+    const out = try alloc.alloc(metadata_storage.ExtensionLifecycleTablePrecondition, replacements.len);
+    errdefer alloc.free(out);
+    for (replacements, out) |replacement, *expected| {
+        const current = for (snapshot.tables) |table| {
+            if (table.table_id == replacement.table_id) break table;
+        } else return error.TableNotFound;
+        expected.* = .{
+            .table_id = current.table_id,
+            .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(current),
+        };
+    }
+    return out;
 }
 
 test "extension lifecycle proposal holds serialization through exact apply receipt" {
@@ -121,9 +316,10 @@ pub fn installOnService(
     extension_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
+    const protocol_readiness = try probeLifecycleProtocolReadiness(service, !request.dry_run);
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
-    var snapshot = try service.adminSnapshot();
+    var snapshot = try captureLifecycleSnapshot(service);
     defer service.freeAdminSnapshot(&snapshot);
 
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
@@ -143,13 +339,16 @@ pub fn installOnService(
         defer catalog.freeDependencies(alloc, dependencies);
         const table_upserts = try planStorageMemberDeltaAlloc(alloc, &snapshot, &.{}, members);
         defer freeLifecycleTables(alloc, table_upserts);
+        const expected_tables = try lifecycleTablePreconditionsAlloc(alloc, &snapshot, table_upserts);
+        defer alloc.free(expected_tables);
 
-        try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
+        try proposeLifecycleMutation(service, protocol_readiness, .{
+            .expected_tables = expected_tables,
             .upsert_tables = table_upserts,
             .upsert_installed_extensions = &.{installed},
             .upsert_extension_dependencies = dependencies,
             .upsert_extension_members = members,
-        } });
+        });
     }
 
     return installed;
@@ -161,9 +360,10 @@ pub fn updateOnService(
     extension_name: []const u8,
     request: extension_domain.UpdateExtensionRequest,
 ) !extension_domain.InstalledExtension {
+    const protocol_readiness = try probeLifecycleProtocolReadiness(service, !request.dry_run);
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
-    var snapshot = try service.adminSnapshot();
+    var snapshot = try captureLifecycleSnapshot(service);
     defer service.freeAdminSnapshot(&snapshot);
 
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
@@ -186,19 +386,22 @@ pub fn updateOnService(
         defer catalog.freeDependencies(alloc, new_dependencies);
         const table_upserts = try planStorageMemberDeltaAlloc(alloc, &snapshot, old_members, new_members);
         defer freeLifecycleTables(alloc, table_upserts);
+        const expected_tables = try lifecycleTablePreconditionsAlloc(alloc, &snapshot, table_upserts);
+        defer alloc.free(expected_tables);
         const remove_dependency_keys = try dependencyRemoveKeysAlloc(alloc, old_dependencies);
         defer freeDependencyRemoveKeys(alloc, remove_dependency_keys);
         const remove_member_keys = try memberRemoveKeysAlloc(alloc, old_members);
         defer freeMemberRemoveKeys(alloc, remove_member_keys);
 
-        try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
+        try proposeLifecycleMutation(service, protocol_readiness, .{
+            .expected_tables = expected_tables,
             .upsert_tables = table_upserts,
             .remove_extension_dependencies = remove_dependency_keys,
             .remove_extension_members = remove_member_keys,
             .upsert_installed_extensions = &.{installed},
             .upsert_extension_dependencies = new_dependencies,
             .upsert_extension_members = new_members,
-        } });
+        });
     }
 
     return installed;
@@ -210,9 +413,10 @@ pub fn dropOnService(
     extension_name: []const u8,
     request: extension_domain.DropExtensionRequest,
 ) !void {
+    const protocol_readiness = try probeLifecycleProtocolReadiness(service, !request.dry_run);
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
-    var snapshot = try service.adminSnapshot();
+    var snapshot = try captureLifecycleSnapshot(service);
     defer service.freeAdminSnapshot(&snapshot);
 
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
@@ -232,6 +436,8 @@ pub fn dropOnService(
     defer catalog.freeDependencies(alloc, remaining_dependencies);
     const table_upserts = try planRemovedStorageMembersAlloc(alloc, &snapshot, remaining_members);
     defer freeLifecycleTables(alloc, table_upserts);
+    const expected_tables = try lifecycleTablePreconditionsAlloc(alloc, &snapshot, table_upserts);
+    defer alloc.free(expected_tables);
     const remove_dependency_keys = try missingDependencyKeysAlloc(alloc, snapshot.extension_dependencies, remaining_dependencies);
     defer freeDependencyRemoveKeys(alloc, remove_dependency_keys);
     const remove_member_keys = try missingMemberKeysAlloc(alloc, snapshot.extension_members, remaining_members);
@@ -239,18 +445,19 @@ pub fn dropOnService(
     const remove_installed_names = try missingInstalledNamesAlloc(alloc, snapshot.installed_extensions, remaining_installed);
     defer freeInstalledRemoveNames(alloc, remove_installed_names);
 
-    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
+    try proposeLifecycleMutation(service, protocol_readiness, .{
+        .expected_tables = expected_tables,
         .upsert_tables = table_upserts,
         .remove_extension_dependencies = remove_dependency_keys,
         .remove_extension_members = remove_member_keys,
         .remove_installed_extensions = remove_installed_names,
-    } });
+    });
 }
 
 pub fn enableOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
-    var snapshot = try service.adminSnapshot();
+    var snapshot = try captureLifecycleSnapshot(service);
     defer service.freeAdminSnapshot(&snapshot);
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
     defer catalog.deinit();
@@ -258,16 +465,16 @@ pub fn enableOnService(service: anytype, alloc: std.mem.Allocator, extension_nam
     try catalog.enableInstalled(extension_name);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
+    try proposeLifecycleMutation(service, null, .{
         .upsert_installed_extensions = &.{installed},
-    } });
+    });
     return installed;
 }
 
 pub fn disableOnService(service: anytype, alloc: std.mem.Allocator, extension_name: []const u8) !extension_domain.InstalledExtension {
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
-    var snapshot = try service.adminSnapshot();
+    var snapshot = try captureLifecycleSnapshot(service);
     defer service.freeAdminSnapshot(&snapshot);
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
     defer catalog.deinit();
@@ -275,9 +482,9 @@ pub fn disableOnService(service: anytype, alloc: std.mem.Allocator, extension_na
     try catalog.disableInstalled(extension_name);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
+    try proposeLifecycleMutation(service, null, .{
         .upsert_installed_extensions = &.{installed},
-    } });
+    });
     return installed;
 }
 
@@ -289,7 +496,7 @@ pub fn configureOnService(
 ) !extension_domain.InstalledExtension {
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
-    var snapshot = try service.adminSnapshot();
+    var snapshot = try captureLifecycleSnapshot(service);
     defer service.freeAdminSnapshot(&snapshot);
     var catalog = extension_domain.ExtensionCatalog.init(alloc);
     defer catalog.deinit();
@@ -297,9 +504,9 @@ pub fn configureOnService(
     try catalog.configureInstalled(extension_name, request);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
+    try proposeLifecycleMutation(service, null, .{
         .upsert_installed_extensions = &.{installed},
-    } });
+    });
     return installed;
 }
 
@@ -664,4 +871,68 @@ test "extension lifecycle allows cascading artifact enrichment removal in one de
     try std.testing.expectEqual(@as(usize, 1), updates.len);
     try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_units_v1") == null);
     try std.testing.expect(std.mem.indexOf(u8, updates[0].indexes_json, "document_chunks_v1") == null);
+}
+
+test "extension lifecycle verification rejects a committed no-op and accepts the exact projection" {
+    const installed = extension_domain.InstalledExtension{
+        .name = "docaf",
+        .package_name = "docaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:abc",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .status = .ready,
+    };
+    const delta = metadata_storage.ExtensionLifecycleDelta{
+        .upsert_installed_extensions = &.{installed},
+    };
+    var missing = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+    };
+    try std.testing.expect(!lifecycleDeltaApplied(&missing, delta));
+
+    var projected = [_]extension_domain.InstalledExtension{installed};
+    var exact = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .installed_extensions = projected[0..],
+    };
+    try std.testing.expect(lifecycleDeltaApplied(&exact, delta));
+
+    projected[0].package_version = "2.0.0";
+    try std.testing.expect(!lifecycleDeltaApplied(&exact, delta));
+
+    const member = extension_domain.ExtensionMember{
+        .extension_name = "docaf",
+        .scope = .{ .kind = .table, .table_name = "docs" },
+        .object_kind = .index,
+        .object_name = "search",
+        .table_name = "docs",
+    };
+    const dependency = extension_domain.ExtensionDependency{
+        .extension_name = "docaf",
+        .required_extension_name = "core",
+        .package_name = "core",
+        .version_requirement = "^1",
+    };
+    const replacement_delta = metadata_storage.ExtensionLifecycleDelta{
+        .upsert_extension_members = &.{member},
+        .remove_extension_members = &.{.{
+            .extension_name = member.extension_name,
+            .object_kind = member.object_kind,
+            .object_name = member.object_name,
+        }},
+        .upsert_extension_dependencies = &.{dependency},
+        .remove_extension_dependencies = &.{.{
+            .extension_name = dependency.extension_name,
+            .required_extension_name = dependency.required_extension_name,
+            .package_name = dependency.package_name,
+        }},
+    };
+    var members = [_]extension_domain.ExtensionMember{member};
+    var dependencies = [_]extension_domain.ExtensionDependency{dependency};
+    var replaced = metadata_api.AdminSnapshot{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .extension_members = members[0..],
+        .extension_dependencies = dependencies[0..],
+    };
+    try std.testing.expect(lifecycleDeltaApplied(&replaced, replacement_delta));
 }

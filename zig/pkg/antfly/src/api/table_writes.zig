@@ -447,6 +447,25 @@ var test_after_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_before_post_create_runtime_status_publish_hook: ?TestExecutionHook = null;
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
+var test_recovery_intent_read_failures_remaining: std.atomic.Value(u32) = .init(0);
+
+fn consumeTestRecoveryIntentReadFailure() bool {
+    if (!builtin.is_test) return false;
+    var remaining = test_recovery_intent_read_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_recovery_intent_read_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |observed| {
+            remaining = observed;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
 
 fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
     if (!builtin.is_test) return false;
@@ -469,6 +488,7 @@ fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 const dropped_table_repair_dir_name = ".antfly-drop-repair";
 const replica_retirement_dir_name = ".antfly-replica-retirement";
+const recovery_quarantine_dir_name = ".antfly-recovery-quarantine";
 const dropped_table_repair_magic_v1 = "AFDROP1\x00";
 const dropped_table_repair_magic = "AFDROP2\x00";
 const replica_retirement_magic_v1 = "AFRTRM1\x00";
@@ -979,6 +999,55 @@ fn replicaRetirementDirPath(alloc: std.mem.Allocator, replica_root_dir: []const 
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, replica_retirement_dir_name });
 }
 
+fn recoveryQuarantineDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, recovery_quarantine_dir_name });
+}
+
+fn quarantineRecoveryIntent(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    replica_root_dir: []const u8,
+    path: []const u8,
+    kind: []const u8,
+) !void {
+    const quarantine_dir = try recoveryQuarantineDirPath(alloc, replica_root_dir);
+    defer alloc.free(quarantine_dir);
+    try fs_paths.createDirPathPortable(io, quarantine_dir);
+    const destination = try std.fmt.allocPrint(
+        alloc,
+        "{s}/{s}-{d}-{s}",
+        .{ quarantine_dir, kind, platform_time.monotonicNs(), std.fs.path.basename(path) },
+    );
+    defer alloc.free(destination);
+    std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), destination, io) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    // Persist removal from the active queue and insertion into quarantine
+    // before allowing the scanner to report the malformed record as handled.
+    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse replica_root_dir);
+    try fs_paths.syncDirPortable(io, quarantine_dir);
+}
+
+fn countRecoveryQuarantineIntents(alloc: std.mem.Allocator, replica_root_dir: []const u8) !u64 {
+    const quarantine_dir = try recoveryQuarantineDirPath(alloc, replica_root_dir);
+    defer alloc.free(quarantine_dir);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var dir = std.Io.Dir.cwd().openDir(io, quarantine_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close(io);
+    var count: u64 = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind == .file) count +|= 1;
+    }
+    return count;
+}
+
 fn replicaRetirementIntentPath(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
@@ -1099,11 +1168,15 @@ fn persistReplicaRetirementIntent(
 }
 
 fn loadReplicaRetirementIntent(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedReplicaRetirementIntent {
+    if (consumeTestRecoveryIntentReadFailure()) return error.InputOutput;
     const encoded_len_v1 = replica_retirement_magic_v1.len + @sizeOf(u64) + std.crypto.hash.sha2.Sha256.digest_length;
     const encoded_len = replica_retirement_magic.len + @sizeOf(u64) + @sizeOf(u8) + std.crypto.hash.sha2.Sha256.digest_length;
     // readFileAlloc's limit is an EOF-detection ceiling, so leave one byte of
     // headroom and reject both truncated and oversized records below.
-    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(encoded_len + 1));
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(encoded_len + 1)) catch |err| switch (err) {
+        error.StreamTooLong => return error.InvalidReplicaRetirementIntent,
+        else => return err,
+    };
     defer alloc.free(encoded);
     const legacy = encoded.len == encoded_len_v1 and
         std.mem.eql(u8, encoded[0..replica_retirement_magic_v1.len], replica_retirement_magic_v1);
@@ -1246,7 +1319,11 @@ fn loadDroppedTableRepairIntent(
     io: std.Io,
     path: []const u8,
 ) !DroppedTableRepairIntent {
-    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_dropped_table_repair_bytes));
+    if (consumeTestRecoveryIntentReadFailure()) return error.InputOutput;
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_dropped_table_repair_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => return error.InvalidDropRepairIntent,
+        else => return err,
+    };
     defer alloc.free(encoded);
     const checksum_len = std.crypto.hash.sha2.Sha256.digest_length;
     if (encoded.len < 20 + checksum_len) return error.InvalidDropRepairIntent;
@@ -4098,6 +4175,8 @@ pub const HostedManagedDbCacheDiagnostics = struct {
     lsm_active_readers: u64 = 0,
     lsm_obsolete_paths: u64 = 0,
     lsm_bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
+    quarantined_recovery_intents: u64 = 0,
+    recovery_retry_failures: u64 = 0,
 };
 
 var hosted_managed_db_cache_registry_mutex: std.atomic.Mutex = .unlocked;
@@ -4190,6 +4269,14 @@ pub fn hostedManagedDbCacheDiagnosticsForRoot(replica_root_dir: []const u8) Host
             .lsm_active_readers = write_cache.lsm_active_readers,
             .lsm_obsolete_paths = write_cache.lsm_obsolete_paths,
             .lsm_bulk_ingest_current_scan_clone_active_bytes = write_cache.lsm_bulk_ingest_current_scan_clone_active_bytes,
+            .quarantined_recovery_intents = if (selected.drop_cleanup_source) |source|
+                source.quarantined_recovery_intents.load(.acquire)
+            else
+                0,
+            .recovery_retry_failures = if (selected.drop_cleanup_source) |source|
+                source.dropped_table_recovery_retry_failures.load(.acquire)
+            else
+                0,
         };
     }
     return .{ .cached_roots = cached_roots };
@@ -6386,6 +6473,7 @@ pub const ProvisionedTableWriteSource = struct {
     dropped_table_recovery_requested: std.atomic.Value(u64) = .init(0),
     dropped_table_recovery_retry_scheduled: std.atomic.Value(bool) = .init(false),
     dropped_table_recovery_retry_failures: std.atomic.Value(u32) = .init(0),
+    quarantined_recovery_intents: std.atomic.Value(u64) = .init(0),
     replica_retirement_ownership_mutex: std.atomic.Mutex = .unlocked,
     replica_retirement_ownership: ?ReplicaRetirementOwnership = null,
     // Serializes journal publication/recovery and tracks in-flight plans so a
@@ -7357,7 +7445,17 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ repair_dir_path, entry.name });
             defer alloc.free(path);
             var intent = loadDroppedTableRepairIntent(alloc, io, path) catch |err| {
-                std.log.err("invalid dropped-table repair intent retained path={s} err={s}", .{ path, @errorName(err) });
+                if (err == error.InvalidDropRepairIntent) {
+                    quarantineRecoveryIntent(alloc, io, self.replica_root_dir, path, "drop-repair") catch |quarantine_err| {
+                        std.log.err("invalid dropped-table repair intent quarantine deferred path={s} err={s}", .{ path, @errorName(quarantine_err) });
+                        retry_required = true;
+                        continue;
+                    };
+                    std.log.err("invalid dropped-table repair intent quarantined path={s}", .{path});
+                    continue;
+                }
+                std.log.warn("dropped-table repair intent read deferred path={s} err={s}", .{ path, @errorName(err) });
+                retry_required = true;
                 continue;
             };
             defer intent.deinit(alloc);
@@ -7434,7 +7532,17 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name });
             defer alloc.free(path);
             const intent = loadReplicaRetirementIntent(alloc, io, path) catch |err| {
-                std.log.err("invalid replica-retirement intent retained path={s} err={s}", .{ path, @errorName(err) });
+                if (err == error.InvalidReplicaRetirementIntent) {
+                    quarantineRecoveryIntent(alloc, io, self.replica_root_dir, path, "replica-retirement") catch |quarantine_err| {
+                        std.log.err("invalid replica-retirement intent quarantine deferred path={s} err={s}", .{ path, @errorName(quarantine_err) });
+                        retry_required = true;
+                        continue;
+                    };
+                    std.log.err("invalid replica-retirement intent quarantined path={s}", .{path});
+                    continue;
+                }
+                std.log.warn("replica-retirement intent read deferred path={s} err={s}", .{ path, @errorName(err) });
+                retry_required = true;
                 continue;
             };
             const group_id = intent.group_id;
@@ -7676,6 +7784,12 @@ pub const ProvisionedTableWriteSource = struct {
             std.log.warn("replica-retirement recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
             break :blk true;
         }) or retry_required;
+        const quarantined = countRecoveryQuarantineIntents(alloc, self.replica_root_dir) catch |err| blk: {
+            std.log.warn("recovery quarantine scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+            retry_required = true;
+            break :blk self.quarantined_recovery_intents.load(.acquire);
+        };
+        self.quarantined_recovery_intents.store(quarantined, .release);
         if (builtin.is_test) {
             if (test_dropped_table_recovery_pass_hook) |hook| hook.run(hook.ptr);
         }
@@ -43853,6 +43967,75 @@ test "dropped table quarantine path keeps valid API names in one portable compon
         try std.testing.expect(std.mem.startsWith(u8, basename, "table-"));
         try std.testing.expect(std.mem.indexOf(u8, basename, table_name) == null);
     }
+}
+
+test "malformed recovery intent is durably removed from the active queue and counted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/recovery-intent-quarantine",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const repair_dir = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir);
+    const intent_path = try std.fmt.allocPrint(alloc, "{s}/invalid.bin", .{repair_dir});
+    defer alloc.free(intent_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, repair_dir);
+    {
+        var file = try fs_paths.createFilePortable(io, intent_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [32]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writer.interface.writeAll("malformed");
+        try writer.end();
+        try file.sync(io);
+    }
+    try fs_paths.syncDirPortable(io, repair_dir);
+
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    try std.testing.expect(!source.runDroppedTableRecovery());
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, intent_path, .{}));
+    try std.testing.expectEqual(@as(u64, 1), source.quarantined_recovery_intents.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 1), try countRecoveryQuarantineIntents(alloc, replica_root_dir));
+}
+
+test "transient recovery intent read failure retains active work and retries successfully" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/recovery-intent-transient-read",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const intent_path = try persistDroppedTableRepairIntent(
+        alloc,
+        replica_root_dir,
+        "docs",
+        .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{} },
+    );
+    defer alloc.free(intent_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+
+    test_recovery_intent_read_failures_remaining.store(1, .release);
+    defer test_recovery_intent_read_failures_remaining.store(0, .release);
+    try std.testing.expect(try source.recoverDroppedTableRepairIntents(alloc));
+    try std.Io.Dir.cwd().access(io, intent_path, .{});
+
+    try std.testing.expect(!try source.recoverDroppedTableRepairIntents(alloc));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, intent_path, .{}));
 }
 
 test "dropped table recovery drains a wake coalesced during the active scan" {

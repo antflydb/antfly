@@ -50,6 +50,39 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         lhs.min_ranges == rhs.min_ranges;
 }
 
+pub const TableDefinitionFingerprint = [std.crypto.hash.sha2.Sha256.digest_length]u8;
+
+fn hashTableDefinitionPart(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    var encoded_len: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, @intCast(value.len), .little);
+    hasher.update(&encoded_len);
+    hasher.update(value);
+}
+
+pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerprint {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-table-definition-v1");
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, table.table_id, .little);
+    hasher.update(&encoded);
+    hashTableDefinitionPart(&hasher, table.name);
+    hashTableDefinitionPart(&hasher, table.description);
+    hashTableDefinitionPart(&hasher, table.schema_json);
+    hashTableDefinitionPart(&hasher, table.read_schema_json);
+    hashTableDefinitionPart(&hasher, table.indexes_json);
+    hashTableDefinitionPart(&hasher, table.replication_sources_json);
+    hashTableDefinitionPart(&hasher, table.placement_role);
+    hashTableDefinitionPart(&hasher, table.restore_backup_id);
+    hashTableDefinitionPart(&hasher, table.restore_location);
+    std.mem.writeInt(u32, encoded[0..4], table.desired_replica_count, .little);
+    hasher.update(encoded[0..4]);
+    std.mem.writeInt(u32, encoded[0..4], table.min_ranges, .little);
+    hasher.update(encoded[0..4]);
+    var fingerprint: TableDefinitionFingerprint = undefined;
+    hasher.final(&fingerprint);
+    return fingerprint;
+}
+
 pub const TableMigrationState = topology_records.TableMigrationState;
 pub const TableIndexCatalog = topology_records.TableIndexCatalog;
 pub const RangeRecord = topology_records.RangeRecord;
