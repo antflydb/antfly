@@ -6480,6 +6480,10 @@ pub const ProvisionedTableWriteSource = struct {
     // scanner cannot classify a just-prepared record before its catalog CAS.
     replica_retirement_intent_mutex: std.atomic.Mutex = .unlocked,
     active_replica_retirement_intents: std.AutoHashMapUnmanaged(u64, usize) = .empty,
+    // A recovery lease is group-scoped. Directory scans and ownership probes
+    // never hold the intent mutex, so a slow replica cannot convoy unrelated
+    // topology commits while duplicate recovery of the same group is fenced.
+    recovering_replica_retirement_intents: std.AutoHashMapUnmanaged(u64, void) = .empty,
     // Protected by table_activity_mutex. A retirement is rare topology work;
     // this set fences new group activity while current leases drain.
     retiring_replica_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -7249,6 +7253,8 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.replica_retirement_intent_mutex);
         self.active_replica_retirement_intents.deinit(std.heap.page_allocator);
         self.active_replica_retirement_intents = .empty;
+        self.recovering_replica_retirement_intents.deinit(std.heap.page_allocator);
+        self.recovering_replica_retirement_intents = .empty;
         self.replica_retirement_intent_mutex.unlock();
         self.quiesced = true;
     }
@@ -7514,8 +7520,6 @@ pub const ProvisionedTableWriteSource = struct {
     fn recoverReplicaRetirementIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
         var retry_required = false;
         const ownership = self.replicaRetirementOwnershipSnapshot() orelse return false;
-        lockAtomic(&self.replica_retirement_intent_mutex);
-        defer self.replica_retirement_intent_mutex.unlock();
         const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
         defer alloc.free(dir_path);
         var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -7546,7 +7550,31 @@ pub const ProvisionedTableWriteSource = struct {
                 continue;
             };
             const group_id = intent.group_id;
-            if (self.active_replica_retirement_intents.contains(group_id)) continue;
+            lockAtomic(&self.replica_retirement_intent_mutex);
+            const recovery_claimed = claimed: {
+                if (self.active_replica_retirement_intents.contains(group_id) or
+                    self.recovering_replica_retirement_intents.contains(group_id))
+                {
+                    break :claimed false;
+                }
+                self.recovering_replica_retirement_intents.put(
+                    std.heap.page_allocator,
+                    group_id,
+                    {},
+                ) catch |err| {
+                    self.replica_retirement_intent_mutex.unlock();
+                    return err;
+                };
+                break :claimed true;
+            };
+            self.replica_retirement_intent_mutex.unlock();
+            if (!recovery_claimed) continue;
+            defer {
+                lockAtomic(&self.replica_retirement_intent_mutex);
+                const removed = self.recovering_replica_retirement_intents.remove(group_id);
+                std.debug.assert(removed);
+                self.replica_retirement_intent_mutex.unlock();
+            }
             const state = ownership.state(group_id) catch |err| {
                 std.log.warn("replica-retirement ownership classification deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
                 retry_required = true;
@@ -7594,6 +7622,10 @@ pub const ProvisionedTableWriteSource = struct {
     ) !PreparedReplicaRetirements {
         lockAtomic(&self.replica_retirement_intent_mutex);
         defer self.replica_retirement_intent_mutex.unlock();
+        for (group_ids) |group_id| {
+            if (self.recovering_replica_retirement_intents.contains(group_id))
+                return error.ReplicaRetirementRecoveryInProgress;
+        }
         try self.active_replica_retirement_intents.ensureUnusedCapacity(
             std.heap.page_allocator,
             std.math.cast(u32, group_ids.len) orelse return error.ReplicaRetirementBatchTooLarge,
@@ -9309,6 +9341,57 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.write_cache) |cache| cache.drainPendingClosesForGroupTable(group_id, table_name);
             if (self.startup_write_cache) |cache| cache.drainPendingClosesForGroupTable(group_id, table_name);
         }
+    }
+
+    fn drainWriteCachePendingClosesForGroupsWithOpenFence(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+        open_fence: ?*std.atomic.Mutex,
+    ) void {
+        for (group_ids) |group_id| {
+            if (self.write_cache) |cache| {
+                if (open_fence != null and open_fence.? == &cache.open_mutex)
+                    cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name)
+                else
+                    cache.drainPendingClosesForGroupTable(group_id, table_name);
+            }
+            if (self.startup_write_cache) |cache| {
+                if (self.write_cache != null and cache == self.write_cache.?) continue;
+                if (open_fence != null and open_fence.? == &cache.open_mutex)
+                    cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name)
+                else
+                    cache.drainPendingClosesForGroupTable(group_id, table_name);
+            }
+        }
+    }
+
+    fn finishDroppedTableCleanupMutation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+        open_fence: ?*std.atomic.Mutex,
+    ) void {
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateReadCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
+        self.endStructuralTableActivity(table_name);
+    }
+
+    fn abortDroppedTableCleanupMutation(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_ids: []const u64,
+        open_fence: ?*std.atomic.Mutex,
+    ) void {
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
+        self.endStructuralTableActivity(table_name);
     }
 
     fn drainWriteCachePendingClosesForGroup(self: *ProvisionedTableWriteSource, group_id: u64) void {
@@ -15913,8 +15996,9 @@ pub const ProvisionedTableWriteSource = struct {
         contract: metadata_topology_protocol.DropCleanupContract,
         retire_publication_authority: bool,
     ) !void {
-        if (self.dropped_table_cleanup_outer_mutex) |outer_mutex| lockAtomic(outer_mutex);
-        defer if (self.dropped_table_cleanup_outer_mutex) |outer_mutex| outer_mutex.unlock();
+        const open_fence = self.dropped_table_cleanup_outer_mutex;
+        if (open_fence) |mutex| lockAtomic(mutex);
+        defer if (open_fence) |mutex| mutex.unlock();
         const group_ids = contract.group_ids;
         // A durable index repair owns group admission while it advances one
         // bounded build slice. Publish cancellation before waiting for the
@@ -15927,37 +16011,59 @@ pub const ProvisionedTableWriteSource = struct {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         };
 
-        self.beginLocalStructuralMutation(table_name);
+        self.beginStructuralTableActivity(table_name);
         var structural_mutation_active = true;
-        var local_db_mutex_held = true;
         errdefer if (structural_mutation_active) {
-            if (local_db_mutex_held) {
-                self.abortLocalStructuralMutation(table_name);
-            } else {
-                self.abortLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
-            }
+            self.abortDroppedTableCleanupMutation(table_name, group_ids, open_fence);
         };
-        // A restore may intentionally republish historical group ids, and an
-        // older binary may have created a same-name table without incarnation
-        // salting. Once local structural admission is exclusive, snapshot the
-        // current catalog and fence every currently-owned group from cleanup.
-        // If publication races after this read, its local provisioning waits
-        // on the same barrier and therefore starts only after old paths move.
-        var current_catalog = try self.catalog.adminSnapshot();
-        defer self.catalog.freeAdminSnapshot(&current_catalog);
-        var owned_groups = std.AutoHashMapUnmanaged(u64, void).empty;
-        defer owned_groups.deinit(alloc);
-        try owned_groups.ensureTotalCapacity(alloc, @intCast(current_catalog.ranges.len));
-        for (current_catalog.ranges) |range| owned_groups.putAssumeCapacity(range.group_id, {});
-        for (group_ids) |group_id| {
-            if (!owned_groups.contains(group_id)) continue;
+        // Ask the metadata leader for an exact linearizable ownership proof.
+        // The destructive decision must never depend on a process-local
+        // snapshot cache: a restored table may intentionally reclaim a
+        // historical group id while that cache is still within its TTL.
+        const validation = if (self.catalog.vtable.requires_linearizable_publication_fence) exact_validation: {
+            const identity = try self.catalog.catalogIdentity();
+            break :exact_validation try self.catalog.validateGroupRetirement(.{
+                .metadata_group_id = identity.metadata_group_id,
+                .metadata_incarnation = identity.metadata_incarnation,
+                .table_name = table_name,
+                .group_ids = group_ids,
+            });
+        } else local_validation: {
+            // Lightweight embedded/test catalog adapters are synchronous and
+            // non-caching. Preserve their local exact scan without imposing a
+            // production transport capability on embedders.
+            var current_catalog = try self.catalog.adminSnapshot();
+            defer self.catalog.freeAdminSnapshot(&current_catalog);
+            if (current_catalog.status.metadata_incarnation) |metadata_incarnation| {
+                const exact = self.catalog.validateGroupRetirement(.{
+                    .metadata_group_id = current_catalog.status.metadata_group_id,
+                    .metadata_incarnation = metadata_incarnation,
+                    .table_name = table_name,
+                    .group_ids = group_ids,
+                }) catch |err| {
+                    if (err != error.CatalogPublicationFenceUnavailable) return err;
+                    break :local_validation localCatalogGroupRetirementValidation(
+                        &current_catalog,
+                        table_name,
+                        group_ids,
+                    );
+                };
+                break :local_validation exact;
+            }
+            break :local_validation localCatalogGroupRetirementValidation(
+                &current_catalog,
+                table_name,
+                group_ids,
+            );
+        };
+        if (!validation.group_ids_unowned) {
             // Catalog ownership is a safety fence, not a successful cleanup.
             // In particular, a follower may not have applied the drop yet.
             // Retain the durable intent and retry after its projection catches
             // up instead of silently converting a stale read into leaked data.
             std.log.info(
-                "dropped-table cleanup deferred by current catalog ownership table={s} table_id={d} generation={d} group_id={d}",
-                .{ table_name, contract.table_id, contract.expected_transition_generation, group_id },
+                "dropped-table cleanup deferred by linearizable catalog ownership table={s} table_id={d} generation={d}",
+                .{ table_name, contract.table_id, contract.expected_transition_generation },
             );
             for (group_ids) |owned_group_id| {
                 self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .clear_cancel);
@@ -15968,18 +16074,27 @@ pub const ProvisionedTableWriteSource = struct {
         // Publication handoffs are name-scoped process state. Retire them only
         // while the committed catalog still confirms absence; a delayed
         // initial cleanup must not revoke authority from a replacement table.
-        if (retire_publication_authority and
-            tables_api.findTableByName(&current_catalog, table_name) == null)
-        {
+        if (retire_publication_authority and validation.table_name_absent) {
             self.retireDroppedTablePublicationAuthority(table_name);
         }
-        var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
+
+        // Keep the hosted cache-open fence across invalidation, lease drain,
+        // and rename, but acquire its state mutex only for cache publication.
+        // Existing leases continue serving during the metadata round trip;
+        // new opens cannot race the filesystem transition.
+        lockAtomic(&self.local_db_mutex);
+        self.invalidateWriteCache(table_name);
+        self.invalidateReadCache(table_name);
+        self.invalidateRuntimeStatusCache(table_name);
+        var read_cache_exclusive = self.beginReadCacheExclusive(table_name) catch |err| {
+            self.local_db_mutex.unlock();
+            return err;
+        };
         defer {
             if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         }
         self.local_db_mutex.unlock();
-        local_db_mutex_held = false;
-        self.drainWriteCachePendingClosesForGroups(table_name, group_ids);
+        self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
 
         var moved_any_group = false;
         for (group_ids) |group_id| {
@@ -16002,7 +16117,7 @@ pub const ProvisionedTableWriteSource = struct {
             // per range while preserving crash recovery.
             try fs_paths.syncDirPortable(io_impl.io(), trash_dir_path);
         }
-        self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
+        self.finishDroppedTableCleanupMutation(table_name, group_ids, open_fence);
         structural_mutation_active = false;
         for (group_ids) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
@@ -19287,6 +19402,12 @@ pub const HostedProvisionedTableWriteSource = struct {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(cache.write_cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = identity_namespace;
         if (mode == .status_only) {
+            // Status-only handles are intentionally uncached, but their open
+            // still participates in the publication fence. Take the same
+            // open->state order as every structural cache transition so a
+            // dropped path cannot be reopened between invalidation and rename.
+            lockAtomic(&cache.write_cache.open_mutex);
+            defer cache.write_cache.open_mutex.unlock();
             while (true) {
                 lockAtomic(&cache.mutex);
                 var cached = cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only) catch |err| switch (err) {
@@ -19296,7 +19417,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                             return err;
                         }
                         cache.mutex.unlock();
-                        cache.write_cache.drainPendingClosesForGroupTable(group_id, table_name);
+                        cache.write_cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
                         continue;
                     },
                     else => {
@@ -19627,7 +19748,8 @@ pub const HostedProvisionedTableWriteSource = struct {
             cleanup.* = ProvisionedTableWriteSource.init(self.replica_root_dir, self.catalog);
             cleanup.write_cache = &cache.write_cache;
             cleanup.runtime_status_cache = &cache.runtime_status_cache;
-            cleanup.dropped_table_cleanup_outer_mutex = &cache.mutex;
+            cleanup.local_db_mutex.bind(&cache.mutex);
+            cleanup.dropped_table_cleanup_outer_mutex = &cache.write_cache.open_mutex;
             cleanup.backend_runtime = self.backend_runtime;
             cache.drop_cleanup_source = cleanup;
         } else if (self.backend_runtime) |runtime| {
@@ -25962,6 +26084,25 @@ fn sleepNs(duration_ns: u64) void {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
+    };
+}
+
+fn localCatalogGroupRetirementValidation(
+    snapshot: *const metadata_api.AdminSnapshot,
+    table_name: []const u8,
+    group_ids: []const u64,
+) metadata_api.CatalogGroupRetirementValidation {
+    for (snapshot.ranges) |range| {
+        for (group_ids) |group_id| {
+            if (range.group_id == group_id) return .{
+                .group_ids_unowned = false,
+                .table_name_absent = tables_api.findTableByName(snapshot, table_name) == null,
+            };
+        }
+    }
+    return .{
+        .group_ids_unowned = true,
+        .table_name_absent = tables_api.findTableByName(snapshot, table_name) == null,
     };
 }
 
@@ -44258,10 +44399,17 @@ test "replica retirement journal distinguishes active retained and committed rem
 
     const Ownership = struct {
         state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retained,
+        source: ?*ProvisionedTableWriteSource = null,
 
         fn classify(ptr: *anyopaque, group_id: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.debug.assert(group_id == 7001);
+            // Ownership may involve a remote metadata read. Recovery must not
+            // hold the process-wide intent lock across that callback.
+            if (self.source) |source| {
+                try std.testing.expect(source.replica_retirement_intent_mutex.tryLock());
+                source.replica_retirement_intent_mutex.unlock();
+            }
             return self.state;
         }
     };
@@ -44269,6 +44417,7 @@ test "replica retirement journal distinguishes active retained and committed rem
     var ownership = Ownership{};
     var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
     defer source.deinit();
+    ownership.source = &source;
     _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
     var prepared = try source.prepareReplicaRetirements(alloc, &.{7001});
     defer prepared.deinit();

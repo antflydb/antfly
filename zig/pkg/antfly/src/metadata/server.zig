@@ -479,12 +479,23 @@ pub const MetadataServer = struct {
         return try self.svc.adminSnapshot();
     }
 
+    pub fn catalogIdentity(self: *MetadataServer) !@import("api.zig").CatalogIdentity {
+        return try self.svc.catalogIdentity();
+    }
+
     pub fn validatePublication(self: *MetadataServer, contract: @import("api.zig").CatalogPublicationContract) !bool {
         return try self.svc.validatePublication(contract);
     }
 
     pub fn validateTablePublication(self: *MetadataServer, contract: @import("api.zig").CatalogTablePublicationContract) !bool {
         return try self.svc.validateTablePublication(contract);
+    }
+
+    pub fn validateGroupRetirement(
+        self: *MetadataServer,
+        contract: @import("api.zig").CatalogGroupRetirementContract,
+    ) !@import("api.zig").CatalogGroupRetirementValidation {
+        return try self.svc.validateGroupRetirement(contract);
     }
 
     pub fn freeAdminSnapshot(self: *MetadataServer, snapshot: *@import("api.zig").AdminSnapshot) void {

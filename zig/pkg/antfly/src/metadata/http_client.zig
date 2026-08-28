@@ -241,6 +241,27 @@ pub const MetadataHttpClient = struct {
         return true;
     }
 
+    pub fn validateCatalogGroupRetirement(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, contract, .{});
+        defer self.alloc.free(body);
+        var parsed = try self.requestJsonWithBody(
+            metadata_api.CatalogGroupRetirementValidation,
+            base_uri,
+            .POST,
+            routes.Routes.internal_catalog_group_retirement_check,
+            body,
+            error.InvalidArgument,
+            null,
+            null,
+        );
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub fn listTableRanges(self: *MetadataHttpClient, base_uri: []const u8, table_id: u64) !std.json.Parsed([]metadata_table_manager.RangeRecord) {
         const path = try std.fmt.allocPrint(self.alloc, "{s}{d}{s}", .{
             routes.Routes.table_ranges_prefix,

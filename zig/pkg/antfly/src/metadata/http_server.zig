@@ -95,6 +95,10 @@ pub const AdminSource = struct {
         admin_snapshot: *const fn (ptr: *anyopaque) anyerror!metadata_api.AdminSnapshot,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
         validate_table_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) anyerror!bool = null,
+        validate_group_retirement: ?*const fn (
+            ptr: *anyopaque,
+            contract: metadata_api.CatalogGroupRetirementContract,
+        ) anyerror!metadata_api.CatalogGroupRetirementValidation = null,
         free_admin_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void,
         preflight_table_mutation_authority: ?*const fn (ptr: *anyopaque) anyerror!void = null,
         recover_table_mutation_authority: ?*const fn (ptr: *anyopaque, remaining_ms: u32) anyerror!void = null,
@@ -179,6 +183,14 @@ pub const AdminSource = struct {
 
     pub fn validateTablePublication(self: AdminSource, contract: metadata_api.CatalogTablePublicationContract) !bool {
         const validate = self.vtable.validate_table_publication orelse return error.UnsupportedOperation;
+        return try validate(self.ptr, contract);
+    }
+
+    pub fn validateGroupRetirement(
+        self: AdminSource,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        const validate = self.vtable.validate_group_retirement orelse return error.UnsupportedOperation;
         return try validate(self.ptr, contract);
     }
 
@@ -388,6 +400,7 @@ pub const AdminSource = struct {
                 .admin_snapshot = metadataServiceAdminSnapshot,
                 .validate_publication = metadataServiceValidatePublication,
                 .validate_table_publication = metadataServiceValidateTablePublication,
+                .validate_group_retirement = metadataServiceValidateGroupRetirement,
                 .free_admin_snapshot = metadataServiceFreeAdminSnapshot,
                 .preflight_table_mutation_authority = metadataServicePreflightTableMutationAuthority,
                 .create_table = metadataServiceCreateTable,
@@ -434,6 +447,7 @@ pub const AdminSource = struct {
                 .admin_snapshot = metadataHttpServiceAdminSnapshot,
                 .validate_publication = metadataHttpServiceValidatePublication,
                 .validate_table_publication = metadataHttpServiceValidateTablePublication,
+                .validate_group_retirement = metadataHttpServiceValidateGroupRetirement,
                 .free_admin_snapshot = metadataHttpServiceFreeAdminSnapshot,
                 .preflight_table_mutation_authority = metadataHttpServicePreflightTableMutationAuthority,
                 .recover_table_mutation_authority = metadataHttpServiceRecoverTableMutationAuthority,
@@ -528,6 +542,14 @@ pub const AdminSource = struct {
     fn metadataServiceValidateTablePublication(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
         return try svc.validateTablePublication(contract);
+    }
+
+    fn metadataServiceValidateGroupRetirement(
+        ptr: *anyopaque,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        return try svc.validateGroupRetirement(contract);
     }
 
     fn metadataServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -896,6 +918,14 @@ pub const AdminSource = struct {
         return try svc.validateTablePublication(contract);
     }
 
+    fn metadataHttpServiceValidateGroupRetirement(
+        ptr: *anyopaque,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        return try svc.validateGroupRetirement(contract);
+    }
+
     fn metadataHttpServiceFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         svc.freeAdminSnapshot(snapshot);
@@ -1259,6 +1289,7 @@ pub const MetadataHttpServer = struct {
         try server.post(node_path ++ routes.Routes.internal_node_status_suffix, httpx.Handler.bind(self, metadataReportNodeStatus));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
+        try server.post(routes.Routes.internal_catalog_group_retirement_check, httpx.Handler.bind(self, metadataCatalogGroupRetirementCheck));
         try server.post(routes.Routes.internal_reallocate, httpx.Handler.bind(self, metadataTriggerReallocate));
         try server.post(routes.Routes.internal_schema_progress, httpx.Handler.bind(self, metadataUpsertSchemaProgress));
         try server.post(routes.Routes.internal_extension_restore, httpx.Handler.bind(self, metadataRestoreExtensions));
@@ -1493,6 +1524,7 @@ pub const MetadataHttpServer = struct {
             .vtable = &.{
                 .validate_publication = validatePublicationOperation,
                 .validate_table_publication = validateTablePublicationOperation,
+                .validate_group_retirement = validateGroupRetirementOperation,
                 .trigger_reallocate = triggerReallocateOperation,
                 .upsert_schema_progress = upsertSchemaProgressOperation,
             },
@@ -1507,6 +1539,14 @@ pub const MetadataHttpServer = struct {
     fn validateTablePublicationOperation(ptr: *anyopaque, contract: metadata_api.CatalogTablePublicationContract) !bool {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
         return self.source.validateTablePublication(contract);
+    }
+
+    fn validateGroupRetirementOperation(
+        ptr: *anyopaque,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
+        return self.source.validateGroupRetirement(contract);
     }
 
     fn triggerReallocateOperation(ptr: *anyopaque) !void {
@@ -1582,6 +1622,20 @@ pub const MetadataHttpServer = struct {
         const valid = self.mutationOperations().validateTablePublication(requestContext(ctx), parsed.value) catch |err|
             return metadataMutationError(ctx, err);
         return ctx.status(if (valid) 204 else 409).text("");
+    }
+
+    fn metadataCatalogGroupRetirementCheck(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        const body = (try ctx.body()) orelse "";
+        var parsed = std.json.parseFromSlice(metadata_api.CatalogGroupRetirementContract, ctx.allocator, body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return ctx.status(400).text("invalid catalog group-retirement contract");
+        defer parsed.deinit();
+        const validation = self.mutationOperations().validateGroupRetirement(
+            requestContext(ctx),
+            parsed.value,
+        ) catch |err| return metadataMutationError(ctx, err);
+        return self.trackedJson(ctx, validation);
     }
 
     fn metadataTriggerReallocate(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

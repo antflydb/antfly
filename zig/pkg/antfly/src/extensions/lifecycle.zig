@@ -95,6 +95,44 @@ fn validateLifecycleProtocolReadiness(
         try service.validateTableTopologyProtocolReadinessWithContext(.{}, expected);
 }
 
+fn lifecycleMutationReadiness(
+    service: anytype,
+    table_precondition_count: usize,
+    readiness: ?metadata_service.TableTopologyProtocolReadiness,
+) !?metadata_service.TableTopologyProtocolReadiness {
+    if (table_precondition_count == 0) return null;
+    if (readiness) |ready| return ready;
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "ensureTableTopologyProtocolReadyWithContext"))
+        return error.ExtensionLifecycleProtocolReadinessRequired;
+    return null;
+}
+
+test "extension lifecycle protocol readiness is required only for table CAS" {
+    const LegacyService = struct {};
+    const ProtocolService = struct {
+        pub fn ensureTableTopologyProtocolReadyWithContext(
+            _: *@This(),
+            _: anytype,
+            _: u16,
+        ) !metadata_service.TableTopologyProtocolReadiness {
+            unreachable;
+        }
+    };
+    var legacy = LegacyService{};
+    var protocol = ProtocolService{};
+    try std.testing.expect((try lifecycleMutationReadiness(&protocol, 0, null)) == null);
+    try std.testing.expect((try lifecycleMutationReadiness(&legacy, 1, null)) == null);
+    try std.testing.expectError(
+        error.ExtensionLifecycleProtocolReadinessRequired,
+        lifecycleMutationReadiness(&protocol, 1, null),
+    );
+}
+
 fn captureLifecycleSnapshot(service: anytype) !metadata_api.AdminSnapshot {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
@@ -334,7 +372,34 @@ pub fn installOnService(
     extension_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    const protocol_readiness = try probeLifecycleProtocolReadiness(service, !request.dry_run);
+    var protocol_readiness: ?metadata_service.TableTopologyProtocolReadiness = null;
+    while (true) {
+        return installOnServiceAttempt(
+            service,
+            alloc,
+            extension_name,
+            request,
+            protocol_readiness,
+        ) catch |err| switch (err) {
+            error.ExtensionLifecycleProtocolReadinessRequired => {
+                // The attempt has released the catalog lane and all projected
+                // state. Probe remotely, then re-plan from a fresh snapshot;
+                // no network fanout runs while unrelated catalog work waits.
+                protocol_readiness = try probeLifecycleProtocolReadiness(service, true);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn installOnServiceAttempt(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.InstallExtensionRequest,
+    protocol_readiness: ?metadata_service.TableTopologyProtocolReadiness,
+) !extension_domain.InstalledExtension {
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try captureLifecycleSnapshot(service);
@@ -359,8 +424,9 @@ pub fn installOnService(
         defer freeLifecycleTables(alloc, table_upserts);
         const expected_tables = try lifecycleTablePreconditionsAlloc(alloc, &snapshot, table_upserts);
         defer alloc.free(expected_tables);
+        const mutation_readiness = try lifecycleMutationReadiness(service, expected_tables.len, protocol_readiness);
 
-        try proposeLifecycleMutation(service, protocol_readiness, .{
+        try proposeLifecycleMutation(service, mutation_readiness, .{
             .expected_tables = expected_tables,
             .upsert_tables = table_upserts,
             .upsert_installed_extensions = &.{installed},
@@ -378,7 +444,31 @@ pub fn updateOnService(
     extension_name: []const u8,
     request: extension_domain.UpdateExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    const protocol_readiness = try probeLifecycleProtocolReadiness(service, !request.dry_run);
+    var protocol_readiness: ?metadata_service.TableTopologyProtocolReadiness = null;
+    while (true) {
+        return updateOnServiceAttempt(
+            service,
+            alloc,
+            extension_name,
+            request,
+            protocol_readiness,
+        ) catch |err| switch (err) {
+            error.ExtensionLifecycleProtocolReadinessRequired => {
+                protocol_readiness = try probeLifecycleProtocolReadiness(service, true);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn updateOnServiceAttempt(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.UpdateExtensionRequest,
+    protocol_readiness: ?metadata_service.TableTopologyProtocolReadiness,
+) !extension_domain.InstalledExtension {
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try captureLifecycleSnapshot(service);
@@ -406,12 +496,13 @@ pub fn updateOnService(
         defer freeLifecycleTables(alloc, table_upserts);
         const expected_tables = try lifecycleTablePreconditionsAlloc(alloc, &snapshot, table_upserts);
         defer alloc.free(expected_tables);
+        const mutation_readiness = try lifecycleMutationReadiness(service, expected_tables.len, protocol_readiness);
         const remove_dependency_keys = try dependencyRemoveKeysAlloc(alloc, old_dependencies);
         defer freeDependencyRemoveKeys(alloc, remove_dependency_keys);
         const remove_member_keys = try memberRemoveKeysAlloc(alloc, old_members);
         defer freeMemberRemoveKeys(alloc, remove_member_keys);
 
-        try proposeLifecycleMutation(service, protocol_readiness, .{
+        try proposeLifecycleMutation(service, mutation_readiness, .{
             .expected_tables = expected_tables,
             .upsert_tables = table_upserts,
             .remove_extension_dependencies = remove_dependency_keys,
@@ -431,7 +522,31 @@ pub fn dropOnService(
     extension_name: []const u8,
     request: extension_domain.DropExtensionRequest,
 ) !void {
-    const protocol_readiness = try probeLifecycleProtocolReadiness(service, !request.dry_run);
+    var protocol_readiness: ?metadata_service.TableTopologyProtocolReadiness = null;
+    while (true) {
+        return dropOnServiceAttempt(
+            service,
+            alloc,
+            extension_name,
+            request,
+            protocol_readiness,
+        ) catch |err| switch (err) {
+            error.ExtensionLifecycleProtocolReadinessRequired => {
+                protocol_readiness = try probeLifecycleProtocolReadiness(service, true);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
+fn dropOnServiceAttempt(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    request: extension_domain.DropExtensionRequest,
+    protocol_readiness: ?metadata_service.TableTopologyProtocolReadiness,
+) !void {
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
     var snapshot = try captureLifecycleSnapshot(service);
@@ -456,6 +571,7 @@ pub fn dropOnService(
     defer freeLifecycleTables(alloc, table_upserts);
     const expected_tables = try lifecycleTablePreconditionsAlloc(alloc, &snapshot, table_upserts);
     defer alloc.free(expected_tables);
+    const mutation_readiness = try lifecycleMutationReadiness(service, expected_tables.len, protocol_readiness);
     const remove_dependency_keys = try missingDependencyKeysAlloc(alloc, snapshot.extension_dependencies, remaining_dependencies);
     defer freeDependencyRemoveKeys(alloc, remove_dependency_keys);
     const remove_member_keys = try missingMemberKeysAlloc(alloc, snapshot.extension_members, remaining_members);
@@ -463,7 +579,7 @@ pub fn dropOnService(
     const remove_installed_names = try missingInstalledNamesAlloc(alloc, snapshot.installed_extensions, remaining_installed);
     defer freeInstalledRemoveNames(alloc, remove_installed_names);
 
-    try proposeLifecycleMutation(service, protocol_readiness, .{
+    try proposeLifecycleMutation(service, mutation_readiness, .{
         .expected_tables = expected_tables,
         .upsert_tables = table_upserts,
         .remove_extension_dependencies = remove_dependency_keys,

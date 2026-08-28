@@ -15732,9 +15732,11 @@ const RemoteMetadataSource = struct {
             .vtable = &.{
                 .admin_snapshot = remoteAdminSnapshot,
                 .free_admin_snapshot = remoteFreeAdminSnapshot,
+                .catalog_identity = remoteCatalogIdentity,
                 .requires_linearizable_publication_fence = true,
                 .validate_publication = remoteValidateCatalogPublication,
                 .validate_table_publication = remoteValidateCatalogTablePublication,
+                .validate_group_retirement = remoteValidateCatalogGroupRetirement,
             },
         };
     }
@@ -16069,6 +16071,26 @@ const RemoteMetadataSource = struct {
         return try self.fetchSnapshot();
     }
 
+    fn remoteCatalogIdentity(ptr: *anyopaque) !antfly.metadata_api.CatalogIdentity {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.cache_mutex);
+        if (self.metadata_group_id != null and self.metadata_incarnation != null) {
+            const identity = antfly.metadata_api.CatalogIdentity{
+                .metadata_group_id = self.metadata_group_id.?,
+                .metadata_incarnation = self.metadata_incarnation.?,
+            };
+            self.cache_mutex.unlock();
+            return identity;
+        }
+        self.cache_mutex.unlock();
+        const head = try self.fetchHead();
+        return .{
+            .metadata_group_id = head.metadata_group_id,
+            .metadata_incarnation = head.metadata_incarnation orelse
+                return error.MetadataIncarnationUnavailable,
+        };
+    }
+
     fn remoteCachedAdminSnapshot(ptr: *anyopaque) !?antfly.metadata_api.AdminSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.cachedSnapshot();
@@ -16117,6 +16139,30 @@ const RemoteMetadataSource = struct {
                 continue;
             };
             return valid;
+        }
+        return last_err;
+    }
+
+    fn remoteValidateCatalogGroupRetirement(
+        ptr: *anyopaque,
+        contract: antfly.metadata_api.CatalogGroupRetirementContract,
+    ) !antfly.metadata_api.CatalogGroupRetirementValidation {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        var last_err: anyerror = error.NotLeader;
+        for (0..self.base_uris.len) |attempt| {
+            const index = self.metadataApiIndexForAttempt(attempt);
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var metadata_client = self.metadataClient(scratch);
+            const validation = metadata_client.validateCatalogGroupRetirement(
+                self.base_uris[index],
+                contract,
+            ) catch |err| {
+                last_err = err;
+                continue;
+            };
+            return validation;
         }
         return last_err;
     }

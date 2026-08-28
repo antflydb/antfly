@@ -3564,6 +3564,14 @@ pub const MetadataService = struct {
         };
     }
 
+    pub fn catalogIdentity(self: *MetadataService) !metadata_api.CatalogIdentity {
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = (try self.metadataIncarnation()) orelse
+                return error.MetadataIncarnationUnavailable,
+        };
+    }
+
     pub fn runtimeTopology(self: *MetadataService) !metadata_api.MetadataRuntimeTopology {
         return metadataRuntimeTopology(
             self.metadata_group_id,
@@ -3622,6 +3630,22 @@ pub const MetadataService = struct {
         const incarnation = try self.metadataIncarnation();
         const snapshot = try self.catalogValidationSnapshotLocked();
         return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+    }
+
+    pub fn validateGroupRetirement(
+        self: *MetadataService,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        try self.ensureLinearizableRead();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        const incarnation = try self.metadataIncarnation();
+        const snapshot = try self.catalogValidationSnapshotLocked();
+        return snapshot.index.validateGroupRetirement(
+            contract,
+            self.metadata_group_id,
+            incarnation,
+        );
     }
 
     fn captureCatalogValidationSnapshot(self: *MetadataService) !CatalogValidationSnapshot {
@@ -6337,6 +6361,14 @@ pub const MetadataHttpService = struct {
         };
     }
 
+    pub fn catalogIdentity(self: *MetadataHttpService) !metadata_api.CatalogIdentity {
+        return .{
+            .metadata_group_id = self.metadata_group_id,
+            .metadata_incarnation = (try self.metadataIncarnation()) orelse
+                return error.MetadataIncarnationUnavailable,
+        };
+    }
+
     pub fn runtimeTopology(self: *MetadataHttpService) !metadata_api.MetadataRuntimeTopology {
         return metadataRuntimeTopology(
             self.metadata_group_id,
@@ -6832,6 +6864,25 @@ pub const MetadataHttpService = struct {
         const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
         const snapshot = try self.catalogValidationSnapshotLocked();
         return snapshot.index.matchesTablePublication(contract, self.metadata_group_id, incarnation, snapshot.tables);
+    }
+
+    pub fn validateGroupRetirement(
+        self: *MetadataHttpService,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        try self.ensureLinearizableRead();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        self.catalog_validation_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.catalog_validation_mutex.unlock(std.Options.debug_io);
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const incarnation = try store.getMetadataIncarnation(self.metadata_group_id);
+        const snapshot = try self.catalogValidationSnapshotLocked();
+        return snapshot.index.validateGroupRetirement(
+            contract,
+            self.metadata_group_id,
+            incarnation,
+        );
     }
 
     /// Called with both the catalog-validation mutex and the Raft runtime lock

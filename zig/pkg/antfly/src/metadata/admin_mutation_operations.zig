@@ -17,6 +17,10 @@ pub const Source = struct {
     pub const VTable = struct {
         validate_publication: *const fn (*anyopaque, metadata_api.CatalogPublicationContract) anyerror!bool,
         validate_table_publication: *const fn (*anyopaque, metadata_api.CatalogTablePublicationContract) anyerror!bool,
+        validate_group_retirement: *const fn (
+            *anyopaque,
+            metadata_api.CatalogGroupRetirementContract,
+        ) anyerror!metadata_api.CatalogGroupRetirementValidation,
         trigger_reallocate: *const fn (*anyopaque) anyerror!void,
         upsert_schema_progress: *const fn (*anyopaque, std.mem.Allocator, metadata_table_manager.SchemaProgressRecord) anyerror!void,
     };
@@ -41,6 +45,15 @@ pub const Operations = struct {
     ) !bool {
         try request.ensureActive();
         return self.source.vtable.validate_table_publication(self.source.ptr, contract);
+    }
+
+    pub fn validateGroupRetirement(
+        self: Operations,
+        request: operation.RequestContext,
+        contract: metadata_api.CatalogGroupRetirementContract,
+    ) !metadata_api.CatalogGroupRetirementValidation {
+        try request.ensureActive();
+        return self.source.vtable.validate_group_retirement(self.source.ptr, contract);
     }
 
     pub fn triggerReallocate(self: Operations, request: operation.RequestContext) !void {
@@ -75,6 +88,15 @@ test "metadata admin mutations reject canceled work before reaching their source
             return true;
         }
 
+        fn validateGroupRetirement(
+            ptr: *anyopaque,
+            _: metadata_api.CatalogGroupRetirementContract,
+        ) !metadata_api.CatalogGroupRetirementValidation {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{ .group_ids_unowned = true, .table_name_absent = true };
+        }
+
         fn triggerReallocate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
@@ -92,6 +114,7 @@ test "metadata admin mutations reject canceled work before reaching their source
         .vtable = &.{
             .validate_publication = FakeSource.validatePublication,
             .validate_table_publication = FakeSource.validateTablePublication,
+            .validate_group_retirement = FakeSource.validateGroupRetirement,
             .trigger_reallocate = FakeSource.triggerReallocate,
             .upsert_schema_progress = FakeSource.upsertSchemaProgress,
         },
