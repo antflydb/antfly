@@ -929,11 +929,37 @@ pub const StagedGeneration = struct {
             .had_live_generation = self.had_live_generation,
         });
         if (self.publication_outcome.? == .durable) {
-            _ = clearPublicationMarker(self.alloc, io, self.live_path);
             if (self.had_live_generation) {
-                scheduleRetiredGenerationCleanup(self.cleanup_scheduler, self.staging_path, parent) catch |err| {
-                    std.log.warn("retired generation cleanup scheduling deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
-                };
+                if (self.cleanup_scheduler != null) {
+                    scheduleRetiredGenerationCleanupAfterPublication(
+                        self.cleanup_scheduler,
+                        self.staging_path,
+                        parent,
+                        self.live_path,
+                    ) catch |err| {
+                        // The committed marker deliberately remains durable.
+                        // A later read admission can rediscover and retire the
+                        // old generation without resetting validated state.
+                        std.log.warn("retired generation cleanup scheduling deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
+                    };
+                } else {
+                    deleteRetiredGenerationPaths(
+                        self.alloc,
+                        io,
+                        &.{self.staging_path},
+                        parent,
+                    ) catch |err| {
+                        // Keep the committed marker and generated stage name
+                        // as durable reconciliation debt if synchronous
+                        // standalone cleanup cannot complete.
+                        std.log.warn("retired generation cleanup deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
+                        self.publication_committed = true;
+                        return;
+                    };
+                    _ = clearPublicationMarker(self.alloc, io, self.live_path);
+                }
+            } else {
+                _ = clearPublicationMarker(self.alloc, io, self.live_path);
             }
         } else if (self.had_live_generation) {
             std.log.warn("retaining previous generation after uncertain publication path={s}", .{self.staging_path});
@@ -1102,6 +1128,7 @@ const RetiredGenerationCleanupBatch = struct {
     io: std.Io,
     paths: [][]u8,
     parent: []u8,
+    publication_root: ?[]u8,
 
     fn run(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1110,6 +1137,10 @@ const RetiredGenerationCleanupBatch = struct {
             while (test_block_retired_cleanup.load(.acquire)) platform.time.yieldBriefly();
         }
         try deleteRetiredGenerationPaths(self.alloc, self.io, self.paths, self.parent);
+        if (self.publication_root) |root| {
+            if (!clearPublicationMarker(self.alloc, self.io, root))
+                return error.GenerationPublicationMarkerCleanupDeferred;
+        }
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -1118,6 +1149,7 @@ const RetiredGenerationCleanupBatch = struct {
         for (self.paths) |path| alloc.free(path);
         alloc.free(self.paths);
         alloc.free(self.parent);
+        if (self.publication_root) |root| alloc.free(root);
         alloc.destroy(self);
     }
 };
@@ -1155,11 +1187,21 @@ fn deleteRetiredGenerationPaths(alloc: Allocator, io: std.Io, paths: []const []c
     if (first_error) |err| return err;
 }
 
-fn scheduleRetiredGenerationCleanup(scheduler: ?CleanupScheduler, path: []const u8, parent: []const u8) !void {
-    return try scheduleRetiredGenerationCleanupBatch(scheduler, &.{path}, parent);
+fn scheduleRetiredGenerationCleanupAfterPublication(
+    scheduler: ?CleanupScheduler,
+    path: []const u8,
+    parent: []const u8,
+    publication_root: []const u8,
+) !void {
+    return try scheduleRetiredGenerationCleanupBatch(scheduler, &.{path}, parent, publication_root);
 }
 
-fn scheduleRetiredGenerationCleanupBatch(scheduler: ?CleanupScheduler, paths: []const []const u8, parent: []const u8) !void {
+fn scheduleRetiredGenerationCleanupBatch(
+    scheduler: ?CleanupScheduler,
+    paths: []const []const u8,
+    parent: []const u8,
+    publication_root: ?[]const u8,
+) !void {
     const active = scheduler orelse return;
     if (paths.len == 0) return;
     const work = try active.alloc.create(RetiredGenerationCleanupBatch);
@@ -1179,8 +1221,10 @@ fn scheduleRetiredGenerationCleanupBatch(scheduler: ?CleanupScheduler, paths: []
         .io = active.io,
         .paths = owned_paths,
         .parent = try active.alloc.dupe(u8, parent),
+        .publication_root = if (publication_root) |root| try active.alloc.dupe(u8, root) else null,
     };
     errdefer active.alloc.free(work.parent);
+    errdefer if (work.publication_root) |root| active.alloc.free(root);
     try active.lane.submit(.{
         .owner_id = active.owner_id,
         .class = .cleanup,
@@ -1293,7 +1337,7 @@ fn cleanupStagedGenerations(
         stale_path_owned = false;
     }
     if (scheduler != null) {
-        scheduleRetiredGenerationCleanupBatch(scheduler, stale_paths.items, parent) catch |err| {
+        scheduleRetiredGenerationCleanupBatch(scheduler, stale_paths.items, parent, null) catch |err| {
             std.log.warn("stale generation cleanup batch scheduling deferred path={s} count={} err={s}", .{ live_path, stale_paths.items.len, @errorName(err) });
         };
     } else {
@@ -2034,6 +2078,9 @@ test "durable publication retires the previous generation through the cleanup ru
     while (!test_retired_cleanup_started.load(.acquire) and attempts < 10_000) : (attempts += 1) platform.time.yieldBriefly();
     try std.testing.expect(test_retired_cleanup_started.load(.acquire));
     try std.testing.expect(pathExists(std.testing.io, staged.path()));
+    const marker_path = try publicationMarkerPathAlloc(alloc, live_path);
+    defer alloc.free(marker_path);
+    try std.testing.expect(pathExists(std.testing.io, marker_path));
     const current = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(current);
     try std.testing.expectEqualStrings("current", current);
@@ -2042,9 +2089,10 @@ test "durable publication retires the previous generation through the cleanup ru
     const scheduler = staged.cleanup_scheduler orelse return error.TestUnexpectedResult;
     scheduler.lane.drainOwner(scheduler.owner_id);
     try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(std.testing.io, marker_path));
 }
 
-test "generation reconciliation reclaims stale roots after read admission without a cleanup runtime" {
+test "generation publication reclaims retired roots synchronously without a cleanup runtime" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2063,7 +2111,7 @@ test "generation reconciliation reclaims stale roots after read admission withou
     defer alloc.free(new_value_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = new_value_path, .data = "current" });
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
-    try std.testing.expect(pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
     transition.deinit();
 
     var lease = (try acquirePublishedGenerationRead(alloc, live_path)) orelse return error.TestUnexpectedResult;

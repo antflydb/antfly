@@ -9977,6 +9977,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
 
         var summary: metadata_table_provisioner.ProvisionSummary = .{};
+        const active_backend_runtime = backend_runtime orelse self.backend_runtime;
         for (hosted_group_ids) |group_id| {
             if (group_id == metadata_group_id) continue;
             const range = findRangeRecord(ranges, group_id) orelse continue;
@@ -9986,16 +9987,23 @@ pub const ProvisionedTableWriteSource = struct {
             const path = try metadata_table_provisioner.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
-            defer io_impl.deinit();
-            try fs_paths.createDirPathPortable(io_impl.io(), path);
-            try metadata_table_provisioner.applyRestoreIntentIfNeededWithOptions(
+            var provision_io_impl: ?std.Io.Threaded = null;
+            defer if (provision_io_impl) |*owned| owned.deinit();
+            const provision_io = if (active_backend_runtime) |runtime|
+                runtime.io() orelse return error.BackendRuntimeIoUnavailable
+            else blk: {
+                provision_io_impl = std.Io.Threaded.init(alloc, .{});
+                break :blk provision_io_impl.?.io();
+            };
+            try fs_paths.createDirPathPortable(provision_io, path);
+            try metadata_table_provisioner.applyRestoreIntentIfNeededWithRuntime(
                 alloc,
                 path,
                 group_id,
                 table,
                 range,
                 self.restore_open_options,
+                active_backend_runtime,
             );
 
             const lsm_root_generation = self.visibleRootGeneration(group_id);
@@ -15856,6 +15864,7 @@ pub const ProvisionedTableWriteSource = struct {
             .expected_native_manifest_size_bytes = source_shard.native_manifest_size_bytes,
             .expected_native_manifest_sha256 = source_shard.native_manifest_sha256,
             .manifest = plan.manifest,
+            .backend_runtime = self.backend_runtime,
             .io = restore_io,
             .cancellation = plan.cancellation,
         };

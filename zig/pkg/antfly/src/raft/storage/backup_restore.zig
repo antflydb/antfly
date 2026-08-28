@@ -40,6 +40,9 @@ pub const RestoreSource = struct {
     expected_native_manifest_size_bytes: u64 = 0,
     expected_native_manifest_sha256: []const u8 = "",
     manifest: ?*const backups_api.TableBackupManifest = null,
+    /// Server restore admission, generation publication, and cleanup must use
+    /// the same bounded runtime that owns the database backend.
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     io: ?std.Io = null,
     cancellation: CancellationToken = .none,
     open_options: backups_api.OpenOptions = .{},
@@ -51,6 +54,10 @@ const RestoreIoScope = struct {
     owned: ?*std.Io.Threaded = null,
 
     fn init(alloc: std.mem.Allocator, restore: RestoreSource) !RestoreIoScope {
+        if (restore.backend_runtime) |runtime| {
+            const runtime_io = runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+            return .{ .alloc = alloc, .io_value = runtime_io };
+        }
         if (restore.open_options.io orelse restore.io) |shared_io| {
             return .{ .alloc = alloc, .io_value = shared_io };
         }
@@ -167,7 +174,10 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
-    var transition = try db_mod.generation_lifecycle.beginProcessExclusive(path);
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(
+        path,
+        restore.backend_runtime,
+    );
     defer transition.deinit();
     try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
 }
@@ -219,6 +229,7 @@ fn repairPreparedRestoreUntilComplete(
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .start_optional_runtime_workers = false,
+        .backend_runtime = restore.backend_runtime,
     };
     var restored = try db_mod.DB.open(alloc, prepared.path(), open_options);
     defer restored.close();
@@ -530,6 +541,24 @@ fn prepareRestoreSnapshot(
         .native => {},
     }
 
+    if (shard.native_manifest_size_bytes != 0) {
+        try applyManifestNativeRestore(
+            &staged_generation,
+            alloc,
+            io,
+            group_id,
+            restore,
+            &location,
+            shard,
+            options,
+        );
+        std.log.info("native restore staged generation phase=prepared", .{});
+        return staged_generation;
+    }
+
+    // v0.2.0 native snapshots predate the generation manifest. Preserve their
+    // released compatibility path, including whole-tree integrity validation;
+    // unreleased intermediate manifest schemas are never inferred here.
     const snapshot_root = try stageRestoreSnapshot(alloc, io, path, &location, snapshot_path, restore.cancellation);
     defer {
         destroyPathIfExistsWithIo(io, snapshot_root);
@@ -547,6 +576,7 @@ fn prepareRestoreSnapshot(
     std.log.info("native restore staged generation phase=materialization", .{});
     try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIoAndCancellation(&staged_generation, alloc, io, snapshot_root, staged_path, .{
         .identity_namespace = options.expected_identity_namespace,
+        .backend_runtime = restore.backend_runtime,
     }, .{
         .backup_id = restore.backup_id,
         .location = restoreIdentityLocation(restore),
@@ -558,6 +588,134 @@ fn prepareRestoreSnapshot(
     }, restore.cancellation);
     std.log.info("native restore staged generation phase=prepared", .{});
     return staged_generation;
+}
+
+fn applyManifestNativeRestore(
+    staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    group_id: u64,
+    restore: RestoreSource,
+    location: *backups_api.BackupLocation,
+    shard: *const backups_api.ShardSnapshot,
+    options: RestoreOptions,
+) !void {
+    if (shard.native_manifest_size_bytes > db_mod.native_backup.max_manifest_bytes)
+        return error.InvalidNativeBackupManifest;
+    const manifest_source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+        shard.snapshot_path,
+        db_mod.native_backup.manifest_file_name,
+    });
+    defer alloc.free(manifest_source_path);
+    const raw = try backups_api.readFileFromLocationUsingIoLimited(
+        alloc,
+        io,
+        location,
+        manifest_source_path,
+        db_mod.native_backup.max_manifest_bytes,
+    );
+    defer alloc.free(raw);
+    if (raw.len != shard.native_manifest_size_bytes or
+        !sha256Matches(raw, shard.native_manifest_sha256))
+    {
+        return error.BackupArtifactIntegrityMismatch;
+    }
+
+    var generation = try db_mod.native_backup.parseManifestBytes(alloc, raw);
+    defer generation.deinit();
+    if (try db_mod.native_backup.declaredGenerationBytes(
+        generation.value(),
+        @intCast(raw.len),
+    ) != shard.artifact_size_bytes) {
+        return error.BackupArtifactIntegrityMismatch;
+    }
+
+    const staged_path = staged_generation.path();
+    const logical_primary_root = try std.fmt.allocPrint(alloc, "{s}/.native-primary-import", .{staged_path});
+    defer alloc.free(logical_primary_root);
+    defer destroyPathIfExistsWithIo(io, logical_primary_root);
+    const physical_primary = std.mem.eql(
+        u8,
+        generation.value().primary.artifact_format,
+        "antfly-lsm-checkpoint",
+    );
+
+    for (generation.value().artifacts) |artifact| {
+        try restore.cancellation.check();
+        const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+            shard.snapshot_path,
+            artifact.path,
+        });
+        defer alloc.free(source_path);
+        const materialized_path = if (artifact.role == .primary and physical_primary)
+            artifact.path["primary-lsm/".len..]
+        else
+            artifact.path;
+        const destination_root = if (artifact.role == .primary and !physical_primary)
+            logical_primary_root
+        else
+            staged_path;
+        const destination_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
+            destination_root,
+            materialized_path,
+        });
+        defer alloc.free(destination_path);
+        backups_api.copyFileFromLocationVerifiedUsingIo(
+            alloc,
+            io,
+            location,
+            source_path,
+            destination_path,
+            artifact.size_bytes,
+            artifact.sha256,
+            restore.cancellation,
+        ) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (artifact.role != .projection) return error.NativeBackupArtifactMissing;
+                try generation.invalidateProjection(artifact.projection_name, .missing_artifact);
+                continue;
+            },
+            error.BackupArtifactIntegrityMismatch => {
+                if (artifact.role != .projection) return error.NativeBackupArtifactIntegrityMismatch;
+                try generation.invalidateProjection(artifact.projection_name, .integrity_mismatch);
+                continue;
+            },
+            else => return err,
+        };
+    }
+    try generation.discardInvalidProjectionArtifacts(io, staged_path);
+
+    std.log.info("native restore staged generation phase=materialization", .{});
+    try db_mod.DB.restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(
+        staged_generation,
+        alloc,
+        io,
+        if (physical_primary) staged_path else logical_primary_root,
+        staged_path,
+        .{
+            .identity_namespace = options.expected_identity_namespace,
+            .backend_runtime = restore.backend_runtime,
+        },
+        .{
+            .backup_id = restore.backup_id,
+            .location = restoreIdentityLocation(restore),
+            .artifact_sha256 = shard.artifact_sha256,
+            .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+            .native_manifest_sha256 = shard.native_manifest_sha256,
+            .snapshot_path = shard.snapshot_path,
+            .group_id = group_id,
+        },
+        &generation,
+        restore.cancellation,
+    );
+}
+
+fn sha256Matches(bytes: []const u8, expected: []const u8) bool {
+    if (expected.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const actual = std.fmt.bytesToHex(digest, .lower);
+    return std.mem.eql(u8, &actual, expected);
 }
 
 fn applyPortableRestore(
@@ -585,6 +743,7 @@ fn applyPortableRestore(
         .identity_namespace = options.expected_identity_namespace,
         .start_index_workers = false,
         .staged_generation = staged_generation,
+        .backend_runtime = restore.backend_runtime,
     });
     var db_closed = false;
     defer if (!db_closed) db.close();

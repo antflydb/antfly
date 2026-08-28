@@ -6490,6 +6490,7 @@ pub fn build(b: *std.Build) void {
             "restore source identities are bounded and canonical",
             "portable backup integrity rejects changed staged bytes",
             "native artifact copy observes cancellation between io chunks",
+            "native backup directory copy preserves nested files",
             "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
             "db incomplete deferred restore import recovers before runtime repair",
             "db restore state uses strict structured content identity markers",

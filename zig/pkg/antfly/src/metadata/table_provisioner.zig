@@ -222,16 +222,23 @@ pub fn reconcileReplicaRootWithOptions(
         const path = try groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(path);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        try fs_paths.createDirPathPortable(io_impl.io(), path);
-        try applyRestoreIntentIfNeededWithOptions(
+        var io_impl: ?std.Io.Threaded = null;
+        defer if (io_impl) |*owned| owned.deinit();
+        const io = if (options.backend_runtime) |runtime|
+            runtime.io() orelse return error.BackendRuntimeIoUnavailable
+        else blk: {
+            io_impl = std.Io.Threaded.init(alloc, .{});
+            break :blk io_impl.?.io();
+        };
+        try fs_paths.createDirPathPortable(io, path);
+        try applyRestoreIntentIfNeededWithRuntime(
             alloc,
             path,
             group_id,
             table,
             range,
             options.restore_open_options,
+            options.backend_runtime,
         );
 
         const runtime_schema = try runtimeTableSchemaFromJson(alloc, table.schema_json);
@@ -860,6 +867,26 @@ pub fn applyRestoreIntentIfNeededWithOptions(
     range: table_manager.RangeRecord,
     open_options: backups_api.OpenOptions,
 ) !void {
+    return try applyRestoreIntentIfNeededWithRuntime(
+        alloc,
+        path,
+        group_id,
+        table,
+        range,
+        open_options,
+        null,
+    );
+}
+
+pub fn applyRestoreIntentIfNeededWithRuntime(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    group_id: u64,
+    table: table_manager.TableRecord,
+    range: table_manager.RangeRecord,
+    open_options: backups_api.OpenOptions,
+    backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+) !void {
     const restore = resolveRestoreIntent(range, table) orelse return;
     try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
         .backup_id = restore.backup_id,
@@ -872,6 +899,7 @@ pub fn applyRestoreIntentIfNeededWithOptions(
         .expected_native_manifest_size_bytes = restore.native_manifest_size_bytes,
         .expected_native_manifest_sha256 = restore.native_manifest_sha256,
         .open_options = open_options,
+        .backend_runtime = backend_runtime,
     }, .{
         .expected_table_name = table.name,
         .expected_identity_namespace = doc_identity.Namespace{

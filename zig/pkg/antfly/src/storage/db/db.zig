@@ -16026,20 +16026,56 @@ pub const DB = struct {
             cancellation,
         );
         defer if (native_generation) |*generation| generation.deinit();
-        if (native_generation) |*generation|
-            try classifyAndDiscardIncompatibleNativeProjections(generation, io, path, opts);
+        if (native_generation) |*generation| return try restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            snapshot_root,
+            path,
+            opts,
+            identity,
+            generation,
+            cancellation,
+        );
+        try restoreSnapshotStoreTo(alloc, snapshot_root, path, opts, identity, io, cancellation, null);
+    }
+
+    /// Installs a generation whose declared files were already authenticated
+    /// and copied directly into the unpublished destination. This is the
+    /// manifest-first remote restore path; it deliberately performs no source
+    /// tree enumeration or second corpus-sized validation pass.
+    pub fn restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        primary_snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+        native_generation: *native_backup.LoadedManifest,
+        cancellation: types.CancellationToken,
+    ) !void {
+        try staged_generation.validatePath(path);
+        try classifyAndDiscardIncompatibleNativeProjections(native_generation, io, path, opts);
         try restoreSnapshotStoreTo(
             alloc,
-            snapshot_root,
+            primary_snapshot_root,
             path,
             opts,
             identity,
             io,
             cancellation,
-            if (native_generation) |*generation| generation.value() else null,
+            native_generation.value(),
         );
-        if (native_generation) |*generation|
-            try validateInstalledNativeBackupGeneration(staged_generation, alloc, io, path, opts, generation, true);
+        try validateInstalledNativeBackupGeneration(
+            staged_generation,
+            alloc,
+            io,
+            path,
+            opts,
+            native_generation,
+            true,
+        );
     }
 
     /// Local bound databases do not have a non-zero Raft group identity. Return
@@ -16196,27 +16232,33 @@ pub const DB = struct {
         }
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
+        var configs_by_name = std.StringHashMapUnmanaged(*const types.IndexConfig).empty;
+        defer configs_by_name.deinit(alloc);
+        try configs_by_name.ensureTotalCapacity(alloc, @intCast(configs.len));
+        for (configs) |*cfg| {
+            const entry = configs_by_name.getOrPutAssumeCapacity(cfg.name);
+            if (entry.found_existing) return error.InvalidIndexCatalog;
+            entry.value_ptr.* = cfg;
+        }
+        var manifest_projection_names = std.StringHashMapUnmanaged(void).empty;
+        defer manifest_projection_names.deinit(alloc);
+        try manifest_projection_names.ensureTotalCapacity(alloc, @intCast(manifest.projections.len));
+        for (manifest.projections) |projection| {
+            const entry = manifest_projection_names.getOrPutAssumeCapacity(projection.name);
+            if (entry.found_existing) return error.InvalidNativeBackupManifest;
+        }
 
         // A catalog projection omitted from the physical generation is local
         // repair debt, not permission to reject an otherwise valid primary
         // snapshot. It will receive a durable repair intent below.
         for (configs) |cfg| {
-            var found = false;
-            for (manifest.projections) |projection| {
-                if (std.mem.eql(u8, projection.name, cfg.name)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) try native_generation.invalidateProjection(cfg.name, .missing_artifact);
+            if (!manifest_projection_names.contains(cfg.name))
+                try native_generation.invalidateProjection(cfg.name, .missing_artifact);
         }
 
         for (manifest.projections) |projection| {
             if (native_generation.projectionInvalid(projection.name)) continue;
-            const cfg = blk: {
-                for (configs) |*candidate| {
-                    if (std.mem.eql(u8, projection.name, candidate.name)) break :blk candidate;
-                }
+            const cfg = configs_by_name.get(projection.name) orelse {
                 try native_generation.invalidateProjection(projection.name, .config_mismatch);
                 continue;
             };
@@ -16312,7 +16354,6 @@ pub const DB = struct {
         path: []const u8,
         opts: OpenOptions,
     ) !void {
-        if (generation.value().format_version < 3) return;
         for (generation.value().projections) |projection| {
             const kind = std.meta.stringToEnum(types.IndexKind, projection.kind) orelse
                 return error.InvalidNativeBackupManifest;

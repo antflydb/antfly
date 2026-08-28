@@ -1549,6 +1549,61 @@ const RemoteBackupStore = struct {
         try self.client.getFileWithIo(self.io, self.bucket, key, dest_path, .{});
     }
 
+    fn copyFileVerified(
+        self: *RemoteBackupStore,
+        alloc: std.mem.Allocator,
+        suffix: []const u8,
+        destination_path: []const u8,
+        expected_size: u64,
+        expected_sha256: []const u8,
+        cancellation: CancellationToken,
+    ) !void {
+        const key = try self.keyAlloc(alloc, suffix);
+        defer alloc.free(key);
+        var metadata = try self.client.statObject(self.bucket, key);
+        defer metadata.deinit(alloc);
+        if (metadata.content_length != expected_size)
+            return error.BackupArtifactIntegrityMismatch;
+        const etag = metadata.etag orelse return error.RestoreArtifactIdentityMissing;
+        if (std.fs.path.dirname(destination_path)) |parent|
+            try ensureDirPathWithIo(self.io, parent);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, destination_path) catch {};
+        var destination = try fs_paths.createFilePortable(self.io, destination_path, .{ .truncate = true });
+        defer destination.close(self.io);
+
+        const object_cancellation = object_storage.CancellationToken.fromCallback(
+            cancellation.ptr,
+            cancellation.is_cancelled_fn,
+        );
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        var offset: u64 = 0;
+        while (offset < expected_size) {
+            try cancellation.check();
+            const wanted = @min(expected_size - offset, backup_integrity_read_chunk_bytes);
+            var result = self.client.getObject(self.bucket, key, .{
+                .range = .{ .offset = offset, .length = wanted },
+                .if_match_etag = etag,
+                .skip_metadata_probe = true,
+                .max_response_bytes = @intCast(wanted),
+                .cancellation = object_cancellation,
+            }) catch |err| switch (err) {
+                error.PreconditionFailed => return error.SourceFileChanged,
+                else => return err,
+            };
+            defer result.deinit(alloc);
+            if (result.body.len != wanted) return error.SourceFileChanged;
+            hasher.update(result.body);
+            try destination.writePositionalAll(self.io, result.body, offset);
+            offset += wanted;
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &actual, expected_sha256))
+            return error.BackupArtifactIntegrityMismatch;
+        try destination.sync(self.io);
+    }
+
     fn listObjectsPage(
         self: *RemoteBackupStore,
         alloc: std.mem.Allocator,
@@ -11045,6 +11100,97 @@ pub fn copyFileFromLocationUsingIo(
     }
 }
 
+/// Reads one authenticated control file without enumerating or buffering the
+/// artifact generation that contains it. Restore uses this for the native
+/// generation manifest before admitting any corpus-sized bytes.
+pub fn readFileFromLocationUsingIoLimited(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    relative_path: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    try validateArtifactRelativePath(relative_path);
+    return switch (location.*) {
+        .file => |backup_root| blk: {
+            const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, relative_path });
+            defer alloc.free(source_path);
+            if (max_bytes == std.math.maxInt(usize)) return error.InvalidBackupManifestLimit;
+            var source = if (std.fs.path.isAbsolute(source_path))
+                try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+            else
+                try std.Io.Dir.cwd().openFile(io, source_path, .{});
+            defer source.close(io);
+            const stat = try source.stat(io);
+            if (stat.size > max_bytes) return error.BackupManifestTooLarge;
+            break :blk try readFileAbsoluteAllocWithIo(alloc, io, source_path, max_bytes + 1);
+        },
+        .remote => |*store| try store.readBytesAllocLimited(
+            alloc,
+            trimLeftSlash(relative_path),
+            max_bytes,
+        ),
+    };
+}
+
+/// Copies exactly one manifest-declared artifact directly into an unpublished
+/// generation. Size and digest are checked against the bytes written, and a
+/// remote object's immutable identity is pinned across bounded range reads.
+pub fn copyFileFromLocationVerifiedUsingIo(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    location: *BackupLocation,
+    relative_path: []const u8,
+    destination_path: []const u8,
+    expected_size: u64,
+    expected_sha256: []const u8,
+    cancellation: CancellationToken,
+) !void {
+    try cancellation.check();
+    try validateArtifactRelativePath(relative_path);
+    if (!isLowerSha256Hex(expected_sha256)) return error.BackupIntegrityMissing;
+    switch (location.*) {
+        .file => |backup_root| {
+            const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, relative_path });
+            defer alloc.free(source_path);
+            var source = if (std.fs.path.isAbsolute(source_path))
+                try std.Io.Dir.openFileAbsolute(io, source_path, .{})
+            else
+                try std.Io.Dir.cwd().openFile(io, source_path, .{});
+            const source_stat = source.stat(io) catch |err| {
+                source.close(io);
+                return err;
+            };
+            source.close(io);
+            if (source_stat.size != expected_size)
+                return error.BackupArtifactIntegrityMismatch;
+            errdefer std.Io.Dir.cwd().deleteFile(io, destination_path) catch {};
+            var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+            try copyFileAndHashCancellable(
+                io,
+                source_path,
+                destination_path,
+                source_stat,
+                &hasher,
+                cancellation,
+            );
+            var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+            hasher.final(&digest);
+            const actual = std.fmt.bytesToHex(digest, .lower);
+            if (!std.mem.eql(u8, &actual, expected_sha256))
+                return error.BackupArtifactIntegrityMismatch;
+        },
+        .remote => |*store| try store.copyFileVerified(
+            alloc,
+            trimLeftSlash(relative_path),
+            destination_path,
+            expected_size,
+            expected_sha256,
+            cancellation,
+        ),
+    }
+}
+
 pub fn copyFileToLocation(
     alloc: std.mem.Allocator,
     location: *BackupLocation,
@@ -17527,6 +17673,34 @@ test "native backup directory copy preserves nested files" {
     );
     try std.testing.expectEqualSlices(u8, &local_exact_receipt, &local_probe_receipt);
 
+    const bounded_top = try readFileFromLocationUsingIoLimited(
+        alloc,
+        io,
+        &local_location,
+        "copy-src/top.sst",
+        3,
+    );
+    defer alloc.free(bounded_top);
+    try std.testing.expectEqualStrings("top", bounded_top);
+    var top_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("top", &top_digest, .{});
+    const top_sha256 = std.fmt.bytesToHex(top_digest, .lower);
+    const verified_top_path = try std.fmt.allocPrint(alloc, "{s}/verified/top.sst", .{root});
+    defer alloc.free(verified_top_path);
+    try copyFileFromLocationVerifiedUsingIo(
+        alloc,
+        io,
+        &local_location,
+        "copy-src/top.sst",
+        verified_top_path,
+        3,
+        &top_sha256,
+        .none,
+    );
+    const verified_top = try readFileAbsoluteAllocWithIo(alloc, io, verified_top_path, 4);
+    defer alloc.free(verified_top);
+    try std.testing.expectEqualStrings("top", verified_top);
+
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
     var remote_location: BackupLocation = .{
@@ -17539,6 +17713,21 @@ test "native backup directory copy preserves nested files" {
     };
     defer remote_location.deinit(alloc);
     try remote_location.remote.uploadDirectoryRecursive(alloc, src, expected.snapshot_path);
+    const remote_verified_top_path = try std.fmt.allocPrint(alloc, "{s}/verified/remote-top.sst", .{root});
+    defer alloc.free(remote_verified_top_path);
+    try copyFileFromLocationVerifiedUsingIo(
+        alloc,
+        io,
+        &remote_location,
+        "snap/groups/7/top.sst",
+        remote_verified_top_path,
+        3,
+        &top_sha256,
+        .none,
+    );
+    const remote_verified_top = try readFileAbsoluteAllocWithIo(alloc, io, remote_verified_top_path, 4);
+    defer alloc.free(remote_verified_top);
+    try std.testing.expectEqualStrings("top", remote_verified_top);
     var remote_exact_hasher = artifactVerificationCacheKeyHasher(
         &remote_location,
         .native,
