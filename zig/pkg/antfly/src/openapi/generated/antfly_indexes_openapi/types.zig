@@ -13,6 +13,27 @@ const antfly_sort_openapi = @import("antfly_sort_openapi");
 pub const AlgebraicIndexConfig = struct {
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "derive_from_schema",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "derive_from_schema",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.derive_from_schema) |value| {
+            try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Discriminator for the index stats variant.
@@ -133,6 +154,431 @@ pub const AlgebraicIndexStats = struct {
     resolution: ?std.json.Value = null,
     /// Artifact promotion replay diagnostics.
     promotion: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "active_progress_lifecycle",
+            "active_progress_rows_processed",
+            "active_progress_target_rows",
+            "adaptive_backfilling_count",
+            "adaptive_cleanup_recommended_count",
+            "adaptive_progress_count",
+            "adaptive_ready_count",
+            "adaptive_stale_count",
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "capability_lifecycle_status",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "disk_usage",
+            "doc_count",
+            "edge_count",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "healthy",
+            "last_error_reason",
+            "missing_groups",
+            "node_count",
+            "parse_error_count",
+            "planner_fallback_count",
+            "planner_last_decision",
+            "planner_last_estimated_result_buckets",
+            "planner_last_estimated_scan_rows",
+            "planner_last_fallback_reason",
+            "planner_lifecycle_blocking_reason",
+            "planner_lifecycle_ready",
+            "planner_selected",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "readiness",
+            "rebuilding",
+            "recommendation_count",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "resolver_replay",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "schema_version",
+            "source_artifact",
+            "stale_groups",
+            "term_count",
+            "total_indexed",
+            "unknown_remote_groups",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "active_progress_lifecycle",
+            "active_progress_rows_processed",
+            "active_progress_target_rows",
+            "adaptive_backfilling_count",
+            "adaptive_cleanup_recommended_count",
+            "adaptive_progress_count",
+            "adaptive_ready_count",
+            "adaptive_stale_count",
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "capability_lifecycle_status",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "disk_usage",
+            "doc_count",
+            "edge_count",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "healthy",
+            "last_error_reason",
+            "missing_groups",
+            "node_count",
+            "parse_error_count",
+            "planner_fallback_count",
+            "planner_last_decision",
+            "planner_last_estimated_result_buckets",
+            "planner_last_estimated_scan_rows",
+            "planner_last_fallback_reason",
+            "planner_lifecycle_blocking_reason",
+            "planner_lifecycle_ready",
+            "planner_selected",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "readiness",
+            "rebuilding",
+            "recommendation_count",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "resolver_replay",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "schema_version",
+            "source_artifact",
+            "stale_groups",
+            "term_count",
+            "total_indexed",
+            "unknown_remote_groups",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index_type");
+        try jw.write(self.index_type);
+        if (self.readiness) |value| {
+            try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.total_indexed) |value| {
+            try jw.objectField("total_indexed");
+            try jw.write(value);
+        }
+        if (self.disk_usage) |value| {
+            try jw.objectField("disk_usage");
+            try jw.write(value);
+        }
+        if (self.rebuilding) |value| {
+            try jw.objectField("rebuilding");
+            try jw.write(value);
+        }
+        if (self.repair) |value| {
+            try jw.objectField("repair");
+            try jw.write(value);
+        }
+        if (self.backfill_active) |value| {
+            try jw.objectField("backfill_active");
+            try jw.write(value);
+        }
+        if (self.backfill_progress) |value| {
+            try jw.objectField("backfill_progress");
+            try jw.write(value);
+        }
+        if (self.backfill_items_processed) |value| {
+            try jw.objectField("backfill_items_processed");
+            try jw.write(value);
+        }
+        if (self.backfill_state) |value| {
+            try jw.objectField("backfill_state");
+            try jw.write(value);
+        }
+        if (self.doc_count) |value| {
+            try jw.objectField("doc_count");
+            try jw.write(value);
+        }
+        if (self.term_count) |value| {
+            try jw.objectField("term_count");
+            try jw.write(value);
+        }
+        if (self.replay_applied_sequence) |value| {
+            try jw.objectField("replay_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_target_sequence) |value| {
+            try jw.objectField("replay_target_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_catch_up_required) |value| {
+            try jw.objectField("replay_catch_up_required");
+            try jw.write(value);
+        }
+        if (self.runtime_present) |value| {
+            try jw.objectField("runtime_present");
+            try jw.write(value);
+        }
+        if (self.runtime_fresh) |value| {
+            try jw.objectField("runtime_fresh");
+            try jw.write(value);
+        }
+        if (self.runtime_source) |value| {
+            try jw.objectField("runtime_source");
+            try jw.write(value);
+        }
+        if (self.runtime_freshness) |value| {
+            try jw.objectField("runtime_freshness");
+            try jw.write(value);
+        }
+        if (self.catch_up_active) |value| {
+            try jw.objectField("catch_up_active");
+            try jw.write(value);
+        }
+        if (self.catch_up_phase) |value| {
+            try jw.objectField("catch_up_phase");
+            try jw.write(value);
+        }
+        if (self.catch_up_applied_sequence) |value| {
+            try jw.objectField("catch_up_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.catch_up_target_sequence) |value| {
+            try jw.objectField("catch_up_target_sequence");
+            try jw.write(value);
+        }
+        if (self.async_indexing) |value| {
+            try jw.objectField("async_indexing");
+            try jw.write(value);
+        }
+        if (self.healthy) |value| {
+            try jw.objectField("healthy");
+            try jw.write(value);
+        }
+        if (self.parse_error_count) |value| {
+            try jw.objectField("parse_error_count");
+            try jw.write(value);
+        }
+        if (self.schema_version) |value| {
+            try jw.objectField("schema_version");
+            try jw.write(value);
+        }
+        if (self.capability_lifecycle_status) |value| {
+            try jw.objectField("capability_lifecycle_status");
+            try jw.write(value);
+        }
+        if (self.planner_selected) |value| {
+            try jw.objectField("planner_selected");
+            try jw.write(value);
+        }
+        if (self.planner_fallback_count) |value| {
+            try jw.objectField("planner_fallback_count");
+            try jw.write(value);
+        }
+        if (self.planner_last_decision) |value| {
+            try jw.objectField("planner_last_decision");
+            try jw.write(value);
+        }
+        if (self.planner_last_fallback_reason) |value| {
+            try jw.objectField("planner_last_fallback_reason");
+            try jw.write(value);
+        }
+        if (self.planner_last_estimated_scan_rows) |value| {
+            try jw.objectField("planner_last_estimated_scan_rows");
+            try jw.write(value);
+        }
+        if (self.planner_last_estimated_result_buckets) |value| {
+            try jw.objectField("planner_last_estimated_result_buckets");
+            try jw.write(value);
+        }
+        if (self.planner_lifecycle_ready) |value| {
+            try jw.objectField("planner_lifecycle_ready");
+            try jw.write(value);
+        }
+        if (self.planner_lifecycle_blocking_reason) |value| {
+            try jw.objectField("planner_lifecycle_blocking_reason");
+            try jw.write(value);
+        }
+        if (self.adaptive_progress_count) |value| {
+            try jw.objectField("adaptive_progress_count");
+            try jw.write(value);
+        }
+        if (self.recommendation_count) |value| {
+            try jw.objectField("recommendation_count");
+            try jw.write(value);
+        }
+        if (self.adaptive_backfilling_count) |value| {
+            try jw.objectField("adaptive_backfilling_count");
+            try jw.write(value);
+        }
+        if (self.adaptive_ready_count) |value| {
+            try jw.objectField("adaptive_ready_count");
+            try jw.write(value);
+        }
+        if (self.adaptive_stale_count) |value| {
+            try jw.objectField("adaptive_stale_count");
+            try jw.write(value);
+        }
+        if (self.adaptive_cleanup_recommended_count) |value| {
+            try jw.objectField("adaptive_cleanup_recommended_count");
+            try jw.write(value);
+        }
+        if (self.last_error_reason) |value| {
+            try jw.objectField("last_error_reason");
+            try jw.write(value);
+        }
+        if (self.active_progress_lifecycle) |value| {
+            try jw.objectField("active_progress_lifecycle");
+            try jw.write(value);
+        }
+        if (self.active_progress_rows_processed) |value| {
+            try jw.objectField("active_progress_rows_processed");
+            try jw.write(value);
+        }
+        if (self.active_progress_target_rows) |value| {
+            try jw.objectField("active_progress_target_rows");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_status) |value| {
+            try jw.objectField("projection_checkpoint_status");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_applied_sequence) |value| {
+            try jw.objectField("projection_checkpoint_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_generation) |value| {
+            try jw.objectField("projection_checkpoint_generation");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_config_fingerprint) |value| {
+            try jw.objectField("projection_checkpoint_config_fingerprint");
+            try jw.write(value);
+        }
+        if (self.checkpoint_replay_tail_sequence_count) |value| {
+            try jw.objectField("checkpoint_replay_tail_sequence_count");
+            try jw.write(value);
+        }
+        if (self.repair_scan_issue_count) |value| {
+            try jw.objectField("repair_scan_issue_count");
+            try jw.write(value);
+        }
+        if (self.edge_count) |value| {
+            try jw.objectField("edge_count");
+            try jw.write(value);
+        }
+        if (self.node_count) |value| {
+            try jw.objectField("node_count");
+            try jw.write(value);
+        }
+        if (self.repair_degraded) |value| {
+            try jw.objectField("repair_degraded");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count) |value| {
+            try jw.objectField("repair_issue_count");
+            try jw.write(value);
+        }
+        if (self.repair_summary_ready) |value| {
+            try jw.objectField("repair_summary_ready");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count_estimated) |value| {
+            try jw.objectField("repair_issue_count_estimated");
+            try jw.write(value);
+        }
+        if (self.expected_groups) |value| {
+            try jw.objectField("expected_groups");
+            try jw.write(value);
+        }
+        if (self.reported_groups) |value| {
+            try jw.objectField("reported_groups");
+            try jw.write(value);
+        }
+        if (self.fresh_groups) |value| {
+            try jw.objectField("fresh_groups");
+            try jw.write(value);
+        }
+        if (self.stale_groups) |value| {
+            try jw.objectField("stale_groups");
+            try jw.write(value);
+        }
+        if (self.missing_groups) |value| {
+            try jw.objectField("missing_groups");
+            try jw.write(value);
+        }
+        if (self.unknown_remote_groups) |value| {
+            try jw.objectField("unknown_remote_groups");
+            try jw.write(value);
+        }
+        if (self.source_artifact) |value| {
+            try jw.objectField("source_artifact");
+            try jw.write(value);
+        }
+        if (self.resolver_replay) |value| {
+            try jw.objectField("resolver_replay");
+            try jw.write(value);
+        }
+        if (self.resolution) |value| {
+            try jw.objectField("resolution");
+            try jw.write(value);
+        }
+        if (self.promotion) |value| {
+            try jw.objectField("promotion");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AntflyType = enum {
@@ -201,6 +647,47 @@ pub const CreateAlgebraicIndexRequest = struct {
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "derive_from_schema",
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "derive_from_schema",
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.derive_from_schema) |value| {
+            try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Create a dense or sparse embeddings index.
@@ -246,6 +733,152 @@ pub const CreateEmbeddingsIndexRequest = struct {
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "description",
+            "dimension",
+            "distance_metric",
+            "embedding_name",
+            "enrichments",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "template",
+            "top_k",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "description",
+            "dimension",
+            "distance_metric",
+            "embedding_name",
+            "enrichments",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "template",
+            "top_k",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.publication_policy) |value| {
+            try jw.objectField("publication_policy");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
+            try jw.write(value);
+        }
+        if (self.external) |value| {
+            try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.embedding_name) |value| {
+            try jw.objectField("embedding_name");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.distance_metric) |value| {
+            try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("embedder");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("summarizer");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Create a full-text index.
@@ -263,6 +896,59 @@ pub const CreateFullTextIndexRequest = struct {
     /// Generated artifact stream indexed as text. Use with matching inline enrichments.
     artifact_name: ?[]const u8 = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_name",
+            "description",
+            "enrichments",
+            "field",
+            "mem_only",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_name",
+            "description",
+            "enrichments",
+            "field",
+            "mem_only",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.artifact_name) |value| {
+            try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Create a graph index.
@@ -289,6 +975,108 @@ pub const CreateGraphIndexRequest = struct {
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "description",
+            "edge",
+            "edge_types",
+            "enrichments",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "template",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "description",
+            "edge",
+            "edge_types",
+            "enrichments",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "template",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("summarizer");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_document) |value| {
+            try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.edge) |value| {
+            try jw.objectField("edge");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.algebraic_planning) |value| {
+            try jw.objectField("algebraic_planning");
+            try jw.write(value);
+        }
+        if (self.resolvers) |value| {
+            try jw.objectField("resolvers");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Fields shared by every create-index variant. The index name is owned by the request path.
@@ -299,6 +1087,39 @@ pub const CreateIndexCommon = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Type-safe configuration for a new index. The index name is owned by the request path.
@@ -393,6 +1214,49 @@ pub const CreatedAlgebraicIndex = struct {
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "derive_from_schema",
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "derive_from_schema",
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.derive_from_schema) |value| {
+            try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Normalized effective dense or sparse embeddings index configuration returned after creation.
@@ -424,6 +1288,152 @@ pub const CreatedEmbeddingsIndex = struct {
     chunk_size: ?i64 = null,
     execution: ?IndexExecutionConfig = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "description",
+            "dimension",
+            "distance_metric",
+            "embedder",
+            "embedding_name",
+            "enrichments",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "summarizer",
+            "template",
+            "top_k",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "description",
+            "dimension",
+            "distance_metric",
+            "embedder",
+            "embedding_name",
+            "enrichments",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "summarizer",
+            "template",
+            "top_k",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.publication_policy) |value| {
+            try jw.objectField("publication_policy");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
+            try jw.write(value);
+        }
+        if (self.external) |value| {
+            try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.embedding_name) |value| {
+            try jw.objectField("embedding_name");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.distance_metric) |value| {
+            try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Credential-free normalized embeddings configuration returned after creation.
@@ -446,6 +1456,130 @@ pub const CreatedEmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     chunk_size: ?i64 = null,
     execution: ?IndexExecutionConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "dimension",
+            "distance_metric",
+            "embedder",
+            "embedding_name",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "summarizer",
+            "template",
+            "top_k",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "dimension",
+            "distance_metric",
+            "embedder",
+            "embedding_name",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "summarizer",
+            "template",
+            "top_k",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.publication_policy) |value| {
+            try jw.objectField("publication_policy");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
+            try jw.write(value);
+        }
+        if (self.external) |value| {
+            try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.embedding_name) |value| {
+            try jw.objectField("embedding_name");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.distance_metric) |value| {
+            try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Credential-free normalized enrichment configuration returned after index creation.
@@ -462,6 +1596,85 @@ pub const CreatedEnrichmentConfig = struct {
     full_text_index: ?bool = null,
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_overlap",
+            "chunk_size",
+            "chunker_json",
+            "content_type",
+            "execution",
+            "expected_dims",
+            "field",
+            "full_text_index",
+            "source_artifact_name",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_overlap",
+            "chunk_size",
+            "chunker_json",
+            "content_type",
+            "execution",
+            "expected_dims",
+            "field",
+            "full_text_index",
+            "source_artifact_name",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.expected_dims) |value| {
+            try jw.objectField("expected_dims");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.chunk_overlap) |value| {
+            try jw.objectField("chunk_overlap");
+            try jw.write(value);
+        }
+        if (self.chunker_json) |value| {
+            try jw.objectField("chunker_json");
+            try jw.write(value);
+        }
+        if (self.full_text_index) |value| {
+            try jw.objectField("full_text_index");
+            try jw.write(value);
+        }
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Normalized effective full-text index configuration returned after creation.
@@ -481,6 +1694,61 @@ pub const CreatedFullTextIndex = struct {
     /// Generated artifact stream indexed as text. Use with matching inline enrichments.
     artifact_name: ?[]const u8 = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_name",
+            "description",
+            "enrichments",
+            "field",
+            "mem_only",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_name",
+            "description",
+            "enrichments",
+            "field",
+            "mem_only",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.artifact_name) |value| {
+            try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Credential-free graph artifact producer configuration returned after creation.
@@ -490,6 +1758,39 @@ pub const CreatedGraphArtifactProducerConfig = struct {
     source: GraphArtifactProducerSourceConfig,
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "content_type",
+            "execution",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "content_type",
+            "execution",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Normalized effective graph index configuration returned after creation.
@@ -514,6 +1815,109 @@ pub const CreatedGraphIndex = struct {
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
     type: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "description",
+            "edge",
+            "edge_types",
+            "enrichments",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "summarizer",
+            "template",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "description",
+            "edge",
+            "edge_types",
+            "enrichments",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "summarizer",
+            "template",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_document) |value| {
+            try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.edge) |value| {
+            try jw.objectField("edge");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.algebraic_planning) |value| {
+            try jw.objectField("algebraic_planning");
+            try jw.write(value);
+        }
+        if (self.resolvers) |value| {
+            try jw.objectField("resolvers");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.endObject();
+    }
 };
 
 /// Credential-free normalized graph configuration returned after creation.
@@ -529,6 +1933,87 @@ pub const CreatedGraphIndexConfig = struct {
     context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "edge",
+            "edge_types",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "summarizer",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "edge",
+            "edge_types",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "summarizer",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_document) |value| {
+            try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.edge) |value| {
+            try jw.objectField("edge");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.algebraic_planning) |value| {
+            try jw.objectField("algebraic_planning");
+            try jw.write(value);
+        }
+        if (self.resolvers) |value| {
+            try jw.objectField("resolvers");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Discriminated normalized configuration returned after an index is created.
@@ -620,6 +2105,41 @@ pub const CreatedIndexCommon = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "description",
+            "enrichments",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.version) |value| {
+            try jw.objectField("version");
+            try jw.write(value);
+        }
+        if (self.enrichments) |value| {
+            try jw.objectField("enrichments");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Credential-free provider configuration returned after index creation. Only non-secret provider settings are represented.
@@ -647,6 +2167,143 @@ pub const CreatedProviderConfig = struct {
     frequency_penalty: ?f32 = null,
     presence_penalty: ?f32 = null,
     timeout: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "api_url",
+            "batch_size",
+            "dimension",
+            "dimensions",
+            "frequency_penalty",
+            "input_type",
+            "location",
+            "max_tokens",
+            "model",
+            "models",
+            "presence_penalty",
+            "project_id",
+            "region",
+            "strip_new_lines",
+            "temperature",
+            "timeout",
+            "top_k",
+            "top_p",
+            "truncate",
+            "url",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "api_url",
+            "batch_size",
+            "dimension",
+            "dimensions",
+            "frequency_penalty",
+            "input_type",
+            "location",
+            "max_tokens",
+            "model",
+            "models",
+            "presence_penalty",
+            "project_id",
+            "region",
+            "strip_new_lines",
+            "temperature",
+            "timeout",
+            "top_k",
+            "top_p",
+            "truncate",
+            "url",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.models) |value| {
+            try jw.objectField("models");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.input_type) |value| {
+            try jw.objectField("input_type");
+            try jw.write(value);
+        }
+        if (self.truncate) |value| {
+            try jw.objectField("truncate");
+            try jw.write(value);
+        }
+        if (self.strip_new_lines) |value| {
+            try jw.objectField("strip_new_lines");
+            try jw.write(value);
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        if (self.temperature) |value| {
+            try jw.objectField("temperature");
+            try jw.write(value);
+        }
+        if (self.max_tokens) |value| {
+            try jw.objectField("max_tokens");
+            try jw.write(value);
+        }
+        if (self.top_p) |value| {
+            try jw.objectField("top_p");
+            try jw.write(value);
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.frequency_penalty) |value| {
+            try jw.objectField("frequency_penalty");
+            try jw.write(value);
+        }
+        if (self.presence_penalty) |value| {
+            try jw.objectField("presence_penalty");
+            try jw.write(value);
+        }
+        if (self.timeout) |value| {
+            try jw.objectField("timeout");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A structured reason why the coverage projection cannot be treated as globally complete.
@@ -872,6 +2529,47 @@ pub const Edge = struct {
     updated_at: ?[]const u8 = null,
     /// Optional edge metadata
     metadata: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "created_at",
+            "metadata",
+            "updated_at",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "created_at",
+            "metadata",
+            "updated_at",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.objectField("target");
+        try jw.write(self.target);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("weight");
+        try jw.write(self.weight);
+        if (self.created_at) |value| {
+            try jw.objectField("created_at");
+            try jw.write(value);
+        }
+        if (self.updated_at) |value| {
+            try jw.objectField("updated_at");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Direction of edges to query: - out: Outgoing edges from the node - in: Incoming edges to the node - both: Both outgoing and incoming edges
@@ -918,6 +2616,59 @@ pub const EdgeTypeConfig = struct {
     allow_self_loops: ?bool = null,
     /// Required metadata fields for this edge type
     required_metadata: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "allow_self_loops",
+            "field",
+            "max_weight",
+            "min_weight",
+            "required_metadata",
+            "topology",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "allow_self_loops",
+            "field",
+            "max_weight",
+            "min_weight",
+            "required_metadata",
+            "topology",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.topology) |value| {
+            try jw.objectField("topology");
+            try jw.write(value);
+        }
+        if (self.max_weight) |value| {
+            try jw.objectField("max_weight");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.allow_self_loops) |value| {
+            try jw.objectField("allow_self_loops");
+            try jw.write(value);
+        }
+        if (self.required_metadata) |value| {
+            try jw.objectField("required_metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
@@ -956,6 +2707,132 @@ pub const EmbeddingsIndexConfig = struct {
     chunk_size: ?i64 = null,
     /// Non-semantic execution policy for shorthand-created chunking or embedding producers.
     execution: ?IndexExecutionConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "dimension",
+            "distance_metric",
+            "embedding_name",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "template",
+            "top_k",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_size",
+            "coverage_policy",
+            "dimension",
+            "distance_metric",
+            "embedding_name",
+            "execution",
+            "external",
+            "field",
+            "mem_only",
+            "min_weight",
+            "publication_policy",
+            "source_artifact_name",
+            "sparse",
+            "template",
+            "top_k",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.publication_policy) |value| {
+            try jw.objectField("publication_policy");
+            try jw.write(value);
+        }
+        if (self.coverage_policy) |value| {
+            try jw.objectField("coverage_policy");
+            try jw.write(value);
+        }
+        if (self.external) |value| {
+            try jw.objectField("external");
+            try jw.write(value);
+        }
+        if (self.sparse) |value| {
+            try jw.objectField("sparse");
+            try jw.write(value);
+        }
+        if (self.dimension) |value| {
+            try jw.objectField("dimension");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.embedding_name) |value| {
+            try jw.objectField("embedding_name");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.distance_metric) |value| {
+            try jw.objectField("distance_metric");
+            try jw.write(value);
+        }
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.embedder) |value| {
+            try jw.objectField("embedder");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("embedder");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("summarizer");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.chunker) |value| {
+            try jw.objectField("chunker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("chunker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.top_k) |value| {
+            try jw.objectField("top_k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Discriminator for the index stats variant.
@@ -1067,6 +2944,377 @@ pub const EmbeddingsIndexStats = struct {
     resolution: ?std.json.Value = null,
     /// Artifact promotion replay diagnostics.
     promotion: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "coverage",
+            "dense_publish_pending",
+            "dense_replay_applied_sequence",
+            "dense_replay_target_sequence",
+            "disk_usage",
+            "doc_count",
+            "edge_count",
+            "enrichment_runtime",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "hbc_cache",
+            "hbc_posting",
+            "missing_groups",
+            "node_count",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "published_doc_count",
+            "published_node_count",
+            "published_root_node",
+            "query_visible_doc_count",
+            "readiness",
+            "rebuilding",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "root_node",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "stale_groups",
+            "term_count",
+            "total_indexed",
+            "total_nodes",
+            "total_terms",
+            "unknown_remote_groups",
+            "wal_backlog",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "coverage",
+            "dense_publish_pending",
+            "dense_replay_applied_sequence",
+            "dense_replay_target_sequence",
+            "disk_usage",
+            "doc_count",
+            "edge_count",
+            "enrichment_runtime",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "hbc_cache",
+            "hbc_posting",
+            "missing_groups",
+            "node_count",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "published_doc_count",
+            "published_node_count",
+            "published_root_node",
+            "query_visible_doc_count",
+            "readiness",
+            "rebuilding",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "root_node",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "stale_groups",
+            "term_count",
+            "total_indexed",
+            "total_nodes",
+            "total_terms",
+            "unknown_remote_groups",
+            "wal_backlog",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index_type");
+        try jw.write(self.index_type);
+        if (self.readiness) |value| {
+            try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.total_indexed) |value| {
+            try jw.objectField("total_indexed");
+            try jw.write(value);
+        }
+        if (self.disk_usage) |value| {
+            try jw.objectField("disk_usage");
+            try jw.write(value);
+        }
+        if (self.total_nodes) |value| {
+            try jw.objectField("total_nodes");
+            try jw.write(value);
+        }
+        if (self.total_terms) |value| {
+            try jw.objectField("total_terms");
+            try jw.write(value);
+        }
+        if (self.rebuilding) |value| {
+            try jw.objectField("rebuilding");
+            try jw.write(value);
+        }
+        if (self.repair) |value| {
+            try jw.objectField("repair");
+            try jw.write(value);
+        }
+        if (self.wal_backlog) |value| {
+            try jw.objectField("wal_backlog");
+            try jw.write(value);
+        }
+        if (self.backfill_active) |value| {
+            try jw.objectField("backfill_active");
+            try jw.write(value);
+        }
+        if (self.backfill_progress) |value| {
+            try jw.objectField("backfill_progress");
+            try jw.write(value);
+        }
+        if (self.backfill_items_processed) |value| {
+            try jw.objectField("backfill_items_processed");
+            try jw.write(value);
+        }
+        if (self.backfill_state) |value| {
+            try jw.objectField("backfill_state");
+            try jw.write(value);
+        }
+        if (self.doc_count) |value| {
+            try jw.objectField("doc_count");
+            try jw.write(value);
+        }
+        if (self.coverage) |value| {
+            try jw.objectField("coverage");
+            try jw.write(value);
+        }
+        if (self.query_visible_doc_count) |value| {
+            try jw.objectField("query_visible_doc_count");
+            try jw.write(value);
+        }
+        if (self.published_doc_count) |value| {
+            try jw.objectField("published_doc_count");
+            try jw.write(value);
+        }
+        if (self.published_node_count) |value| {
+            try jw.objectField("published_node_count");
+            try jw.write(value);
+        }
+        if (self.root_node) |value| {
+            try jw.objectField("root_node");
+            try jw.write(value);
+        }
+        if (self.published_root_node) |value| {
+            try jw.objectField("published_root_node");
+            try jw.write(value);
+        }
+        if (self.dense_replay_applied_sequence) |value| {
+            try jw.objectField("dense_replay_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.dense_replay_target_sequence) |value| {
+            try jw.objectField("dense_replay_target_sequence");
+            try jw.write(value);
+        }
+        if (self.dense_publish_pending) |value| {
+            try jw.objectField("dense_publish_pending");
+            try jw.write(value);
+        }
+        if (self.replay_applied_sequence) |value| {
+            try jw.objectField("replay_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_target_sequence) |value| {
+            try jw.objectField("replay_target_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_catch_up_required) |value| {
+            try jw.objectField("replay_catch_up_required");
+            try jw.write(value);
+        }
+        if (self.runtime_present) |value| {
+            try jw.objectField("runtime_present");
+            try jw.write(value);
+        }
+        if (self.runtime_fresh) |value| {
+            try jw.objectField("runtime_fresh");
+            try jw.write(value);
+        }
+        if (self.runtime_source) |value| {
+            try jw.objectField("runtime_source");
+            try jw.write(value);
+        }
+        if (self.runtime_freshness) |value| {
+            try jw.objectField("runtime_freshness");
+            try jw.write(value);
+        }
+        if (self.catch_up_active) |value| {
+            try jw.objectField("catch_up_active");
+            try jw.write(value);
+        }
+        if (self.catch_up_phase) |value| {
+            try jw.objectField("catch_up_phase");
+            try jw.write(value);
+        }
+        if (self.catch_up_applied_sequence) |value| {
+            try jw.objectField("catch_up_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.catch_up_target_sequence) |value| {
+            try jw.objectField("catch_up_target_sequence");
+            try jw.write(value);
+        }
+        if (self.enrichment_runtime) |value| {
+            try jw.objectField("enrichment_runtime");
+            try jw.write(value);
+        }
+        if (self.hbc_cache) |value| {
+            try jw.objectField("hbc_cache");
+            try jw.write(value);
+        }
+        if (self.hbc_posting) |value| {
+            try jw.objectField("hbc_posting");
+            try jw.write(value);
+        }
+        if (self.async_indexing) |value| {
+            try jw.objectField("async_indexing");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_status) |value| {
+            try jw.objectField("projection_checkpoint_status");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_applied_sequence) |value| {
+            try jw.objectField("projection_checkpoint_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_generation) |value| {
+            try jw.objectField("projection_checkpoint_generation");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_config_fingerprint) |value| {
+            try jw.objectField("projection_checkpoint_config_fingerprint");
+            try jw.write(value);
+        }
+        if (self.checkpoint_replay_tail_sequence_count) |value| {
+            try jw.objectField("checkpoint_replay_tail_sequence_count");
+            try jw.write(value);
+        }
+        if (self.repair_scan_issue_count) |value| {
+            try jw.objectField("repair_scan_issue_count");
+            try jw.write(value);
+        }
+        if (self.term_count) |value| {
+            try jw.objectField("term_count");
+            try jw.write(value);
+        }
+        if (self.edge_count) |value| {
+            try jw.objectField("edge_count");
+            try jw.write(value);
+        }
+        if (self.node_count) |value| {
+            try jw.objectField("node_count");
+            try jw.write(value);
+        }
+        if (self.repair_degraded) |value| {
+            try jw.objectField("repair_degraded");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count) |value| {
+            try jw.objectField("repair_issue_count");
+            try jw.write(value);
+        }
+        if (self.repair_summary_ready) |value| {
+            try jw.objectField("repair_summary_ready");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count_estimated) |value| {
+            try jw.objectField("repair_issue_count_estimated");
+            try jw.write(value);
+        }
+        if (self.expected_groups) |value| {
+            try jw.objectField("expected_groups");
+            try jw.write(value);
+        }
+        if (self.reported_groups) |value| {
+            try jw.objectField("reported_groups");
+            try jw.write(value);
+        }
+        if (self.fresh_groups) |value| {
+            try jw.objectField("fresh_groups");
+            try jw.write(value);
+        }
+        if (self.stale_groups) |value| {
+            try jw.objectField("stale_groups");
+            try jw.write(value);
+        }
+        if (self.missing_groups) |value| {
+            try jw.objectField("missing_groups");
+            try jw.write(value);
+        }
+        if (self.unknown_remote_groups) |value| {
+            try jw.objectField("unknown_remote_groups");
+            try jw.write(value);
+        }
+        if (self.resolution) |value| {
+            try jw.objectField("resolution");
+            try jw.write(value);
+        }
+        if (self.promotion) |value| {
+            try jw.objectField("promotion");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
@@ -1096,6 +3344,91 @@ pub const EnrichmentConfig = struct {
     producer_json: ?[]const u8 = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_overlap",
+            "chunk_size",
+            "chunker_json",
+            "content_type",
+            "execution",
+            "expected_dims",
+            "field",
+            "full_text_index",
+            "producer_json",
+            "source_artifact_name",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_overlap",
+            "chunk_size",
+            "chunker_json",
+            "content_type",
+            "execution",
+            "expected_dims",
+            "field",
+            "full_text_index",
+            "producer_json",
+            "source_artifact_name",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.source_artifact_name) |value| {
+            try jw.objectField("source_artifact_name");
+            try jw.write(value);
+        }
+        if (self.expected_dims) |value| {
+            try jw.objectField("expected_dims");
+            try jw.write(value);
+        }
+        if (self.chunk_size) |value| {
+            try jw.objectField("chunk_size");
+            try jw.write(value);
+        }
+        if (self.chunk_overlap) |value| {
+            try jw.objectField("chunk_overlap");
+            try jw.write(value);
+        }
+        if (self.chunker_json) |value| {
+            try jw.objectField("chunker_json");
+            try jw.write(value);
+        }
+        if (self.full_text_index) |value| {
+            try jw.objectField("full_text_index");
+            try jw.write(value);
+        }
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.producer_json) |value| {
+            try jw.objectField("producer_json");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Managed generated artifact kind.
@@ -1181,6 +3514,33 @@ pub const ExecutionPolicy = struct {
     batch_items: ?i64 = null,
     /// Approximate maximum source bytes to process in one batch for this operation.
     batch_bytes: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "batch_bytes",
+            "batch_items",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "batch_bytes",
+            "batch_items",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.batch_items) |value| {
+            try jw.objectField("batch_items");
+            try jw.write(value);
+        }
+        if (self.batch_bytes) |value| {
+            try jw.objectField("batch_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const FullTextIndexConfig = struct {
@@ -1190,6 +3550,39 @@ pub const FullTextIndexConfig = struct {
     field: ?[]const u8 = null,
     /// Generated artifact stream indexed as text. Use with matching inline enrichments.
     artifact_name: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_name",
+            "field",
+            "mem_only",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_name",
+            "field",
+            "mem_only",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mem_only) |value| {
+            try jw.objectField("mem_only");
+            try jw.write(value);
+        }
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.artifact_name) |value| {
+            try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Discriminator for the index stats variant.
@@ -1286,6 +3679,293 @@ pub const FullTextIndexStats = struct {
     resolution: ?std.json.Value = null,
     /// Artifact promotion replay diagnostics.
     promotion: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "disk_usage",
+            "doc_count",
+            "edge_count",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "missing_groups",
+            "node_count",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "readiness",
+            "rebuilding",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "stale_groups",
+            "term_count",
+            "text_merge",
+            "total_indexed",
+            "unknown_remote_groups",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "disk_usage",
+            "doc_count",
+            "edge_count",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "missing_groups",
+            "node_count",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "readiness",
+            "rebuilding",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "stale_groups",
+            "term_count",
+            "text_merge",
+            "total_indexed",
+            "unknown_remote_groups",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index_type");
+        try jw.write(self.index_type);
+        if (self.readiness) |value| {
+            try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.total_indexed) |value| {
+            try jw.objectField("total_indexed");
+            try jw.write(value);
+        }
+        if (self.disk_usage) |value| {
+            try jw.objectField("disk_usage");
+            try jw.write(value);
+        }
+        if (self.rebuilding) |value| {
+            try jw.objectField("rebuilding");
+            try jw.write(value);
+        }
+        if (self.repair) |value| {
+            try jw.objectField("repair");
+            try jw.write(value);
+        }
+        if (self.backfill_active) |value| {
+            try jw.objectField("backfill_active");
+            try jw.write(value);
+        }
+        if (self.backfill_progress) |value| {
+            try jw.objectField("backfill_progress");
+            try jw.write(value);
+        }
+        if (self.backfill_items_processed) |value| {
+            try jw.objectField("backfill_items_processed");
+            try jw.write(value);
+        }
+        if (self.backfill_state) |value| {
+            try jw.objectField("backfill_state");
+            try jw.write(value);
+        }
+        if (self.doc_count) |value| {
+            try jw.objectField("doc_count");
+            try jw.write(value);
+        }
+        if (self.term_count) |value| {
+            try jw.objectField("term_count");
+            try jw.write(value);
+        }
+        if (self.replay_applied_sequence) |value| {
+            try jw.objectField("replay_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_target_sequence) |value| {
+            try jw.objectField("replay_target_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_catch_up_required) |value| {
+            try jw.objectField("replay_catch_up_required");
+            try jw.write(value);
+        }
+        if (self.runtime_present) |value| {
+            try jw.objectField("runtime_present");
+            try jw.write(value);
+        }
+        if (self.runtime_fresh) |value| {
+            try jw.objectField("runtime_fresh");
+            try jw.write(value);
+        }
+        if (self.runtime_source) |value| {
+            try jw.objectField("runtime_source");
+            try jw.write(value);
+        }
+        if (self.runtime_freshness) |value| {
+            try jw.objectField("runtime_freshness");
+            try jw.write(value);
+        }
+        if (self.catch_up_active) |value| {
+            try jw.objectField("catch_up_active");
+            try jw.write(value);
+        }
+        if (self.catch_up_phase) |value| {
+            try jw.objectField("catch_up_phase");
+            try jw.write(value);
+        }
+        if (self.catch_up_applied_sequence) |value| {
+            try jw.objectField("catch_up_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.catch_up_target_sequence) |value| {
+            try jw.objectField("catch_up_target_sequence");
+            try jw.write(value);
+        }
+        if (self.text_merge) |value| {
+            try jw.objectField("text_merge");
+            try jw.write(value);
+        }
+        if (self.async_indexing) |value| {
+            try jw.objectField("async_indexing");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_status) |value| {
+            try jw.objectField("projection_checkpoint_status");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_applied_sequence) |value| {
+            try jw.objectField("projection_checkpoint_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_generation) |value| {
+            try jw.objectField("projection_checkpoint_generation");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_config_fingerprint) |value| {
+            try jw.objectField("projection_checkpoint_config_fingerprint");
+            try jw.write(value);
+        }
+        if (self.checkpoint_replay_tail_sequence_count) |value| {
+            try jw.objectField("checkpoint_replay_tail_sequence_count");
+            try jw.write(value);
+        }
+        if (self.repair_scan_issue_count) |value| {
+            try jw.objectField("repair_scan_issue_count");
+            try jw.write(value);
+        }
+        if (self.edge_count) |value| {
+            try jw.objectField("edge_count");
+            try jw.write(value);
+        }
+        if (self.node_count) |value| {
+            try jw.objectField("node_count");
+            try jw.write(value);
+        }
+        if (self.repair_degraded) |value| {
+            try jw.objectField("repair_degraded");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count) |value| {
+            try jw.objectField("repair_issue_count");
+            try jw.write(value);
+        }
+        if (self.repair_summary_ready) |value| {
+            try jw.objectField("repair_summary_ready");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count_estimated) |value| {
+            try jw.objectField("repair_issue_count_estimated");
+            try jw.write(value);
+        }
+        if (self.expected_groups) |value| {
+            try jw.objectField("expected_groups");
+            try jw.write(value);
+        }
+        if (self.reported_groups) |value| {
+            try jw.objectField("reported_groups");
+            try jw.write(value);
+        }
+        if (self.fresh_groups) |value| {
+            try jw.objectField("fresh_groups");
+            try jw.write(value);
+        }
+        if (self.stale_groups) |value| {
+            try jw.objectField("stale_groups");
+            try jw.write(value);
+        }
+        if (self.missing_groups) |value| {
+            try jw.objectField("missing_groups");
+            try jw.write(value);
+        }
+        if (self.unknown_remote_groups) |value| {
+            try jw.objectField("unknown_remote_groups");
+            try jw.write(value);
+        }
+        if (self.resolution) |value| {
+            try jw.objectField("resolution");
+            try jw.write(value);
+        }
+        if (self.promotion) |value| {
+            try jw.objectField("promotion");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphAggregateValue = struct {
@@ -1311,6 +3991,27 @@ pub const GraphAggregatesReturn = struct {
 /// Optional algebraic planning features for graph traversal.
 pub const GraphAlgebraicPlanningConfig = struct {
     bounded_traversal: ?GraphBoundedTraversalConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "bounded_traversal",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "bounded_traversal",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.bounded_traversal) |value| {
+            try jw.objectField("bounded_traversal");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphAliasCountAggregate = struct {
@@ -1319,6 +4020,18 @@ pub const GraphAliasCountAggregate = struct {
     /// Count exact table-qualified identities. Exact distinct sets share a request memory budget and fail with `graph_distinct_budget_exceeded` instead of returning a partial count.
     distinct: ?bool = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "distinct",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "distinct",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("count");
@@ -1326,9 +4039,6 @@ pub const GraphAliasCountAggregate = struct {
         if (self.distinct) |value| {
             try jw.objectField("distinct");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("distinct");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -1348,6 +4058,27 @@ pub const GraphAliasOperand = struct {
 /// Document fields made available to graph mapping templates through `_doc.value`.
 pub const GraphArtifactContextConfig = struct {
     doc_fields: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "doc_fields",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "doc_fields",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.doc_fields) |value| {
+            try jw.objectField("doc_fields");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Maps each artifact item to an edge type, weight, and public metadata.
@@ -1356,6 +4087,39 @@ pub const GraphArtifactEdgeMappingConfig = struct {
     weight: ?GraphTemplateValue = null,
     /// JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses.
     metadata: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "metadata",
+            "type",
+            "weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "metadata",
+            "type",
+            "weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.weight) |value| {
+            try jw.objectField("weight");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Maps each artifact item to graph node identifiers.
@@ -1363,6 +4127,39 @@ pub const GraphArtifactNodeMappingConfig = struct {
     model: ?[]const u8 = null,
     source: ?GraphTemplateValue = null,
     target: ?GraphTemplateValue = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "model",
+            "source",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "model",
+            "source",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.target) |value| {
+            try jw.objectField("target");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Asset producer used by an artifact-backed graph index.
@@ -1374,6 +4171,45 @@ pub const GraphArtifactProducerConfig = struct {
     execution: ?ExecutionPolicy = null,
     /// Write-only producer configuration; it may contain credentials and is never returned.
     producer_json: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "content_type",
+            "execution",
+            "producer_json",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "content_type",
+            "execution",
+            "producer_json",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.content_type) |value| {
+            try jw.objectField("content_type");
+            try jw.write(value);
+        }
+        if (self.execution) |value| {
+            try jw.objectField("execution");
+            try jw.write(value);
+        }
+        if (self.producer_json) |value| {
+            try jw.objectField("producer_json");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Document input used by an artifact producer. Field sources read one document field; template sources render a Handlebars template.
@@ -1389,6 +4225,43 @@ pub const GraphArtifactSourceConfig = struct {
     path: ?[]const u8 = null,
     format: ?[]const u8 = null,
     mention_edge_type: ?GraphEdgeType = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "format",
+            "mention_edge_type",
+            "path",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "format",
+            "mention_edge_type",
+            "path",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("artifact");
+        try jw.write(self.artifact);
+        if (self.path) |value| {
+            try jw.objectField("path");
+            try jw.write(value);
+        }
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.mention_edge_type) |value| {
+            try jw.objectField("mention_edge_type");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// One exact node identity projected from a MATCH binding. Conjunctive bindings deliberately do not expose traversal depth, distance, or path: those values are not uniquely defined for branched patterns and may depend on execution order.
@@ -1399,6 +4272,35 @@ pub const GraphBindingNode = struct {
     table: ?[]const u8 = null,
     /// Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted.
     document: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "document",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "document",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
@@ -1416,6 +4318,41 @@ pub const GraphBindingsReturn = struct {
     include_documents: ?bool = null,
     /// Document fields to hydrate. Requires include_documents=true; omit to include all fields.
     fields: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "fields",
+            "include_documents",
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "fields",
+            "include_documents",
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("bindings");
+        try jw.write(self.bindings);
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.include_documents) |value| {
+            try jw.objectField("include_documents");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Algebraic law used to combine bounded graph traversal provenance.
@@ -1499,6 +4436,47 @@ pub const GraphDocumentDateRangeBody = struct {
     end: ?[]const u8 = null,
     inclusive_start: ?bool = null,
     inclusive_end: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "end",
+            "inclusive_end",
+            "inclusive_start",
+            "start",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "end",
+            "inclusive_end",
+            "inclusive_start",
+            "start",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("path");
+        try jw.write(self.path);
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        }
+        if (self.end) |value| {
+            try jw.objectField("end");
+            try jw.write(value);
+        }
+        if (self.inclusive_start) |value| {
+            try jw.objectField("inclusive_start");
+            try jw.write(value);
+        }
+        if (self.inclusive_end) |value| {
+            try jw.objectField("inclusive_end");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphDocumentDateRangeFilter = struct {
@@ -1663,6 +4641,45 @@ pub const GraphDocumentFilterBoolean = struct {
     should: ?GraphDocumentFilterDisjunction = null,
     must_not: ?GraphDocumentFilterDisjunction = null,
     filter: ?GraphDocumentFilter = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "filter",
+            "must",
+            "must_not",
+            "should",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "filter",
+            "must",
+            "must_not",
+            "should",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.must) |value| {
+            try jw.objectField("must");
+            try jw.write(value);
+        }
+        if (self.should) |value| {
+            try jw.objectField("should");
+            try jw.write(value);
+        }
+        if (self.must_not) |value| {
+            try jw.objectField("must_not");
+            try jw.write(value);
+        }
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphDocumentFilterConjunction = struct {
@@ -1673,6 +4690,29 @@ pub const GraphDocumentFilterDisjunction = struct {
     disjuncts: []const GraphDocumentFilter,
     /// Minimum number of disjuncts that must match. Omit for conventional context-sensitive disjunction semantics; set to 0 to impose no matching-clause requirement. Under `must_not`, the complete thresholded disjunction is negated as one group.
     min: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("disjuncts");
+        try jw.write(self.disjuncts);
+        if (self.min) |value| {
+            try jw.objectField("min");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphDocumentFuzzyFilter = struct {
@@ -1682,6 +4722,18 @@ pub const GraphDocumentFuzzyFilter = struct {
     /// Required so fuzzy and exact term predicates remain structurally distinct.
     fuzziness: antfly_query_openapi.Fuzziness,
     prefix_length: ?i32 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "prefix_length",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "prefix_length",
+        }, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -1694,9 +4746,6 @@ pub const GraphDocumentFuzzyFilter = struct {
         if (self.prefix_length) |value| {
             try jw.objectField("prefix_length");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("prefix_length");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -1722,6 +4771,47 @@ pub const GraphDocumentNumericRangeBody = struct {
     max: ?f64 = null,
     inclusive_min: ?bool = null,
     inclusive_max: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "inclusive_max",
+            "inclusive_min",
+            "max",
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "inclusive_max",
+            "inclusive_min",
+            "max",
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("path");
+        try jw.write(self.path);
+        if (self.min) |value| {
+            try jw.objectField("min");
+            try jw.write(value);
+        }
+        if (self.max) |value| {
+            try jw.objectField("max");
+            try jw.write(value);
+        }
+        if (self.inclusive_min) |value| {
+            try jw.objectField("inclusive_min");
+            try jw.write(value);
+        }
+        if (self.inclusive_max) |value| {
+            try jw.objectField("inclusive_max");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphDocumentNumericRangeFilter = struct {
@@ -1754,6 +4844,47 @@ pub const GraphDocumentTermRangeBody = struct {
     max: ?[]const u8 = null,
     inclusive_min: ?bool = null,
     inclusive_max: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "inclusive_max",
+            "inclusive_min",
+            "max",
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "inclusive_max",
+            "inclusive_min",
+            "max",
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("path");
+        try jw.write(self.path);
+        if (self.min) |value| {
+            try jw.objectField("min");
+            try jw.write(value);
+        }
+        if (self.max) |value| {
+            try jw.objectField("max");
+            try jw.write(value);
+        }
+        if (self.inclusive_min) |value| {
+            try jw.objectField("inclusive_min");
+            try jw.write(value);
+        }
+        if (self.inclusive_max) |value| {
+            try jw.objectField("inclusive_max");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphDocumentTermRangeFilter = struct {
@@ -1773,6 +4904,33 @@ pub const GraphEdgeType = []const u8;
 pub const GraphEdgeWeightRange = struct {
     min: ?f64 = null,
     max: ?f64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "max",
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "max",
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min) |value| {
+            try jw.objectField("min");
+            try jw.write(value);
+        }
+        if (self.max) |value| {
+            try jw.objectField("max");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphIdentityNodeSelector = struct {
@@ -1797,6 +4955,88 @@ pub const GraphIndexConfig = struct {
     context: ?GraphArtifactContextConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "edge",
+            "edge_types",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "context",
+            "edge",
+            "edge_types",
+            "max_edges_per_document",
+            "nodes",
+            "resolvers",
+            "source",
+            "template",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.summarizer) |value| {
+            try jw.objectField("summarizer");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("summarizer");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.template) |value| {
+            try jw.objectField("template");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_edges_per_document) |value| {
+            try jw.objectField("max_edges_per_document");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.edge) |value| {
+            try jw.objectField("edge");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.algebraic_planning) |value| {
+            try jw.objectField("algebraic_planning");
+            try jw.write(value);
+        }
+        if (self.resolvers) |value| {
+            try jw.objectField("resolvers");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Discriminator for the index stats variant.
@@ -1895,6 +5135,305 @@ pub const GraphIndexStats = struct {
     promotion: ?std.json.Value = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algebraic_graph",
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "doc_count",
+            "edge_count",
+            "edge_types",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "missing_groups",
+            "node_count",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "readiness",
+            "rebuilding",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "resolver_replay",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "source_artifact",
+            "stale_groups",
+            "term_count",
+            "total_edges",
+            "unknown_remote_groups",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algebraic_graph",
+            "async_indexing",
+            "backfill_active",
+            "backfill_items_processed",
+            "backfill_progress",
+            "backfill_state",
+            "catch_up_active",
+            "catch_up_applied_sequence",
+            "catch_up_phase",
+            "catch_up_target_sequence",
+            "checkpoint_replay_tail_sequence_count",
+            "doc_count",
+            "edge_count",
+            "edge_types",
+            "error",
+            "expected_groups",
+            "fresh_groups",
+            "missing_groups",
+            "node_count",
+            "projection_checkpoint_applied_sequence",
+            "projection_checkpoint_config_fingerprint",
+            "projection_checkpoint_generation",
+            "projection_checkpoint_status",
+            "promotion",
+            "readiness",
+            "rebuilding",
+            "repair",
+            "repair_degraded",
+            "repair_issue_count",
+            "repair_issue_count_estimated",
+            "repair_scan_issue_count",
+            "repair_summary_ready",
+            "replay_applied_sequence",
+            "replay_catch_up_required",
+            "replay_target_sequence",
+            "reported_groups",
+            "resolution",
+            "resolver_replay",
+            "runtime_fresh",
+            "runtime_freshness",
+            "runtime_present",
+            "runtime_source",
+            "source_artifact",
+            "stale_groups",
+            "term_count",
+            "total_edges",
+            "unknown_remote_groups",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index_type");
+        try jw.write(self.index_type);
+        if (self.readiness) |value| {
+            try jw.objectField("readiness");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.total_edges) |value| {
+            try jw.objectField("total_edges");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.rebuilding) |value| {
+            try jw.objectField("rebuilding");
+            try jw.write(value);
+        }
+        if (self.repair) |value| {
+            try jw.objectField("repair");
+            try jw.write(value);
+        }
+        if (self.backfill_active) |value| {
+            try jw.objectField("backfill_active");
+            try jw.write(value);
+        }
+        if (self.backfill_progress) |value| {
+            try jw.objectField("backfill_progress");
+            try jw.write(value);
+        }
+        if (self.backfill_items_processed) |value| {
+            try jw.objectField("backfill_items_processed");
+            try jw.write(value);
+        }
+        if (self.backfill_state) |value| {
+            try jw.objectField("backfill_state");
+            try jw.write(value);
+        }
+        if (self.doc_count) |value| {
+            try jw.objectField("doc_count");
+            try jw.write(value);
+        }
+        if (self.edge_count) |value| {
+            try jw.objectField("edge_count");
+            try jw.write(value);
+        }
+        if (self.node_count) |value| {
+            try jw.objectField("node_count");
+            try jw.write(value);
+        }
+        if (self.replay_applied_sequence) |value| {
+            try jw.objectField("replay_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_target_sequence) |value| {
+            try jw.objectField("replay_target_sequence");
+            try jw.write(value);
+        }
+        if (self.replay_catch_up_required) |value| {
+            try jw.objectField("replay_catch_up_required");
+            try jw.write(value);
+        }
+        if (self.runtime_present) |value| {
+            try jw.objectField("runtime_present");
+            try jw.write(value);
+        }
+        if (self.runtime_fresh) |value| {
+            try jw.objectField("runtime_fresh");
+            try jw.write(value);
+        }
+        if (self.runtime_source) |value| {
+            try jw.objectField("runtime_source");
+            try jw.write(value);
+        }
+        if (self.runtime_freshness) |value| {
+            try jw.objectField("runtime_freshness");
+            try jw.write(value);
+        }
+        if (self.catch_up_active) |value| {
+            try jw.objectField("catch_up_active");
+            try jw.write(value);
+        }
+        if (self.catch_up_phase) |value| {
+            try jw.objectField("catch_up_phase");
+            try jw.write(value);
+        }
+        if (self.catch_up_applied_sequence) |value| {
+            try jw.objectField("catch_up_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.catch_up_target_sequence) |value| {
+            try jw.objectField("catch_up_target_sequence");
+            try jw.write(value);
+        }
+        if (self.source_artifact) |value| {
+            try jw.objectField("source_artifact");
+            try jw.write(value);
+        }
+        if (self.resolver_replay) |value| {
+            try jw.objectField("resolver_replay");
+            try jw.write(value);
+        }
+        if (self.async_indexing) |value| {
+            try jw.objectField("async_indexing");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_status) |value| {
+            try jw.objectField("projection_checkpoint_status");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_applied_sequence) |value| {
+            try jw.objectField("projection_checkpoint_applied_sequence");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_generation) |value| {
+            try jw.objectField("projection_checkpoint_generation");
+            try jw.write(value);
+        }
+        if (self.projection_checkpoint_config_fingerprint) |value| {
+            try jw.objectField("projection_checkpoint_config_fingerprint");
+            try jw.write(value);
+        }
+        if (self.checkpoint_replay_tail_sequence_count) |value| {
+            try jw.objectField("checkpoint_replay_tail_sequence_count");
+            try jw.write(value);
+        }
+        if (self.repair_scan_issue_count) |value| {
+            try jw.objectField("repair_scan_issue_count");
+            try jw.write(value);
+        }
+        if (self.term_count) |value| {
+            try jw.objectField("term_count");
+            try jw.write(value);
+        }
+        if (self.repair_degraded) |value| {
+            try jw.objectField("repair_degraded");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count) |value| {
+            try jw.objectField("repair_issue_count");
+            try jw.write(value);
+        }
+        if (self.repair_summary_ready) |value| {
+            try jw.objectField("repair_summary_ready");
+            try jw.write(value);
+        }
+        if (self.repair_issue_count_estimated) |value| {
+            try jw.objectField("repair_issue_count_estimated");
+            try jw.write(value);
+        }
+        if (self.expected_groups) |value| {
+            try jw.objectField("expected_groups");
+            try jw.write(value);
+        }
+        if (self.reported_groups) |value| {
+            try jw.objectField("reported_groups");
+            try jw.write(value);
+        }
+        if (self.fresh_groups) |value| {
+            try jw.objectField("fresh_groups");
+            try jw.write(value);
+        }
+        if (self.stale_groups) |value| {
+            try jw.objectField("stale_groups");
+            try jw.write(value);
+        }
+        if (self.missing_groups) |value| {
+            try jw.objectField("missing_groups");
+            try jw.write(value);
+        }
+        if (self.unknown_remote_groups) |value| {
+            try jw.objectField("unknown_remote_groups");
+            try jw.write(value);
+        }
+        if (self.resolution) |value| {
+            try jw.objectField("resolution");
+            try jw.write(value);
+        }
+        if (self.promotion) |value| {
+            try jw.objectField("promotion");
+            try jw.write(value);
+        }
+        if (self.algebraic_graph) |value| {
+            try jw.objectField("algebraic_graph");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction.
@@ -1915,6 +5454,75 @@ pub const GraphKShortestPaths = struct {
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "direction",
+            "edge_types",
+            "edge_weight",
+            "fields",
+            "filter",
+            "include_documents",
+            "max_depth",
+            "objective",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "direction",
+            "edge_types",
+            "edge_weight",
+            "fields",
+            "filter",
+            "include_documents",
+            "max_depth",
+            "objective",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("from");
+        try jw.write(self.from);
+        try jw.objectField("to");
+        try jw.write(self.to);
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        try jw.objectField("k");
+        try jw.write(self.k);
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.edge_weight) |value| {
+            try jw.objectField("edge_weight");
+            try jw.write(value);
+        }
+        if (self.objective) |value| {
+            try jw.objectField("objective");
+            try jw.write(value);
+        }
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        }
+        if (self.include_documents) |value| {
+            try jw.objectField("include_documents");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphKShortestPathsQuery = struct {
@@ -1937,6 +5545,20 @@ pub const GraphMatch = struct {
     /// Ordered correlated left-outer patterns. Aliases introduced by an earlier item are visible to later items, including as null.
     optional: ?[]const GraphOptionalMatch = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "optional",
+            "where",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "optional",
+            "where",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("anchor");
@@ -1948,16 +5570,10 @@ pub const GraphMatch = struct {
         if (self.where) |value| {
             try jw.objectField("where");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("where");
-            try jw.write(@as(?u8, null));
         }
         if (self.optional) |value| {
             try jw.objectField("optional");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("optional");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -1975,6 +5591,26 @@ pub const GraphMatchEdge = struct {
     max_hops: ?i64 = null,
     edge_weight: ?GraphEdgeWeightRange = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "direction",
+            "edge_weight",
+            "max_hops",
+            "min_hops",
+            "types",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "direction",
+            "edge_weight",
+            "max_hops",
+            "min_hops",
+            "types",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("from");
@@ -1984,37 +5620,22 @@ pub const GraphMatchEdge = struct {
         if (self.direction) |value| {
             try jw.objectField("direction");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("direction");
-            try jw.write(@as(?u8, null));
         }
         if (self.types) |value| {
             try jw.objectField("types");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("types");
-            try jw.write(@as(?u8, null));
         }
         if (self.min_hops) |value| {
             try jw.objectField("min_hops");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("min_hops");
-            try jw.write(@as(?u8, null));
         }
         if (self.max_hops) |value| {
             try jw.objectField("max_hops");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("max_hops");
-            try jw.write(@as(?u8, null));
         }
         if (self.edge_weight) |value| {
             try jw.objectField("edge_weight");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("edge_weight");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -2026,6 +5647,33 @@ pub const GraphMatchNode = struct {
     table: ?[]const u8 = null,
     /// Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`.
     filter: ?GraphDocumentFilter = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "filter",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "filter",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Conjunctive graph match over the complete authorized source universe. Top-level retrieval queries and filters do not scope that universe; put source constraints on the node named by match.anchor. Results are exact or the request fails; execution never labels a partial aggregate exact. Source anchors are streamed in stable snapshot-pinned pages and charged to the request-wide `scanned_anchors` work dimension; transient expansion state remains bounded, and execution observes request deadlines, cancellation, and server resource admission. Exact distinct identity sets are also bounded and fail closed when their request-scoped memory budget is exhausted.
@@ -2121,6 +5769,35 @@ pub const GraphOptionalMatch = struct {
     nodes: ?std.json.ArrayHashMap(GraphMatchNode) = null,
     edges: []const GraphMatchEdge,
     where: ?GraphWhereExpression = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "nodes",
+            "where",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "nodes",
+            "where",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        try jw.objectField("edges");
+        try jw.write(self.edges);
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// An ordered canonical graph path with table-qualified node identities and a self-describing ranking score.
@@ -2146,6 +5823,37 @@ pub const GraphPathEdge = struct {
     /// Finite durable edge weight. max_weight_product paths further require values in [0,1].
     weight: f64,
     metadata: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "metadata",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "metadata",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("from");
+        try jw.write(self.from);
+        try jw.objectField("to");
+        try jw.write(self.to);
+        try jw.objectField("direction");
+        try jw.write(self.direction);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("weight");
+        try jw.write(self.weight);
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Physical stored-edge orientation relative to this path edge's `from` endpoint. `out` means the stored relationship points from `from` to `to`; `in` means the path traversed a relationship stored from `to` to `from`. This keeps paths lossless when a `both` query encounters reciprocal relationships.
@@ -2178,6 +5886,29 @@ pub const GraphPathEndpoint = struct {
     key: []const u8,
     /// Optional table qualifier for an exact cross-table node identity. Omit for the query table.
     table: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Objective used to rank graph paths: - min_hops: Minimize the number of edges. - min_weight_sum: Minimize the sum of finite non-negative edge weights. - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
@@ -2293,6 +6024,99 @@ pub const GraphQueryParams = struct {
     node_filter: ?NodeFilter = null,
     algorithm: ?[]const u8 = null,
     algorithm_params: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algorithm",
+            "algorithm_params",
+            "deduplicate_nodes",
+            "direction",
+            "edge_types",
+            "include_paths",
+            "k",
+            "max_depth",
+            "max_results",
+            "max_weight",
+            "min_weight",
+            "node_filter",
+            "weight_mode",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algorithm",
+            "algorithm_params",
+            "deduplicate_nodes",
+            "direction",
+            "edge_types",
+            "include_paths",
+            "k",
+            "max_depth",
+            "max_results",
+            "max_weight",
+            "min_weight",
+            "node_filter",
+            "weight_mode",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.max_weight) |value| {
+            try jw.objectField("max_weight");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.deduplicate_nodes) |value| {
+            try jw.objectField("deduplicate_nodes");
+            try jw.write(value);
+        }
+        if (self.include_paths) |value| {
+            try jw.objectField("include_paths");
+            try jw.write(value);
+        }
+        if (self.weight_mode) |value| {
+            try jw.objectField("weight_mode");
+            try jw.write(value);
+        }
+        if (self.k) |value| {
+            try jw.objectField("k");
+            try jw.write(value);
+        }
+        if (self.node_filter) |value| {
+            try jw.objectField("node_filter");
+            try jw.write(value);
+        }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.algorithm_params) |value| {
+            try jw.objectField("algorithm_params");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators.
@@ -2450,6 +6274,109 @@ pub const GraphResolverConfig = struct {
     fusion_prior: ?f64 = null,
     fusion_prior_weight: ?f64 = null,
     config_generation: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "candidate_ann_index",
+            "candidate_limit",
+            "candidate_search",
+            "config_generation",
+            "fusion_combine",
+            "fusion_prior",
+            "fusion_prior_weight",
+            "fusion_trust",
+            "name_embedding",
+            "name_embedding_dims",
+            "scorer_json",
+            "source_artifact_kind",
+            "type_must_match",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "candidate_ann_index",
+            "candidate_limit",
+            "candidate_search",
+            "config_generation",
+            "fusion_combine",
+            "fusion_prior",
+            "fusion_prior_weight",
+            "fusion_trust",
+            "name_embedding",
+            "name_embedding_dims",
+            "scorer_json",
+            "source_artifact_kind",
+            "type_must_match",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("source_artifact");
+        try jw.write(self.source_artifact);
+        if (self.source_artifact_kind) |value| {
+            try jw.objectField("source_artifact_kind");
+            try jw.write(value);
+        }
+        try jw.objectField("resolution_artifact");
+        try jw.write(self.resolution_artifact);
+        try jw.objectField("key_template");
+        try jw.write(self.key_template);
+        if (self.type_must_match) |value| {
+            try jw.objectField("type_must_match");
+            try jw.write(value);
+        }
+        if (self.scorer_json) |value| {
+            try jw.objectField("scorer_json");
+            try jw.write(value);
+        }
+        if (self.candidate_search) |value| {
+            try jw.objectField("candidate_search");
+            try jw.write(value);
+        }
+        if (self.candidate_ann_index) |value| {
+            try jw.objectField("candidate_ann_index");
+            try jw.write(value);
+        }
+        if (self.candidate_limit) |value| {
+            try jw.objectField("candidate_limit");
+            try jw.write(value);
+        }
+        if (self.name_embedding) |value| {
+            try jw.objectField("name_embedding");
+            try jw.write(value);
+        }
+        if (self.name_embedding_dims) |value| {
+            try jw.objectField("name_embedding_dims");
+            try jw.write(value);
+        }
+        if (self.fusion_combine) |value| {
+            try jw.objectField("fusion_combine");
+            try jw.write(value);
+        }
+        if (self.fusion_trust) |value| {
+            try jw.objectField("fusion_trust");
+            try jw.write(value);
+        }
+        if (self.fusion_prior) |value| {
+            try jw.objectField("fusion_prior");
+            try jw.write(value);
+        }
+        if (self.fusion_prior_weight) |value| {
+            try jw.objectField("fusion_prior_weight");
+            try jw.write(value);
+        }
+        if (self.config_generation) |value| {
+            try jw.objectField("config_generation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result value stored in QueryResult.graph_results. Canonical graph_queries results are GraphQueryResult variants; the deprecated legacy shape remains accepted only for graph_searches during its compatibility window.
@@ -2573,6 +6500,61 @@ pub const GraphResultNode = struct {
     provenance: ?[]const []const u8 = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
     evidence: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "document",
+            "evidence",
+            "path",
+            "path_edges",
+            "provenance",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "document",
+            "evidence",
+            "path",
+            "path_edges",
+            "provenance",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.objectField("depth");
+        try jw.write(self.depth);
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.path) |value| {
+            try jw.objectField("path");
+            try jw.write(value);
+        }
+        if (self.path_edges) |value| {
+            try jw.objectField("path_edges");
+            try jw.write(value);
+        }
+        if (self.provenance) |value| {
+            try jw.objectField("provenance");
+            try jw.write(value);
+        }
+        if (self.evidence) |value| {
+            try jw.objectField("evidence");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Select nodes from a prior graph result. `binding` is valid only when `result_ref` names a prior MATCH result; traversal and path results select their returned or endpoint nodes and prohibit `binding`.
@@ -2582,6 +6564,36 @@ pub const GraphResultRefNodeSelector = struct {
     binding: ?antfly_graph_identifier_openapi.GraphIdentifier = null,
     /// Maximum referenced results to use. Omit only when the referenced result is complete.
     limit: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("result_ref");
+        try jw.write(self.result_ref);
+        if (self.binding) |value| {
+            try jw.objectField("binding");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("binding");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphResultRow = std.json.ArrayHashMap(GraphResultBinding);
@@ -2683,6 +6695,73 @@ pub const GraphShortestPath = struct {
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "direction",
+            "edge_types",
+            "edge_weight",
+            "fields",
+            "filter",
+            "include_documents",
+            "max_depth",
+            "objective",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "direction",
+            "edge_types",
+            "edge_weight",
+            "fields",
+            "filter",
+            "include_documents",
+            "max_depth",
+            "objective",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("from");
+        try jw.write(self.from);
+        try jw.objectField("to");
+        try jw.write(self.to);
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.edge_weight) |value| {
+            try jw.objectField("edge_weight");
+            try jw.write(value);
+        }
+        if (self.objective) |value| {
+            try jw.objectField("objective");
+            try jw.write(value);
+        }
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        }
+        if (self.include_documents) |value| {
+            try jw.objectField("include_documents");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphShortestPathQuery = struct {
@@ -2711,6 +6790,77 @@ pub const GraphTraversal = struct {
     fields: ?[]const []const u8 = null,
     /// Non-scoring structured stored-document predicate for reached nodes.
     filter: ?GraphDocumentFilter = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "direction",
+            "edge_types",
+            "edge_weight",
+            "fields",
+            "filter",
+            "include_documents",
+            "include_paths",
+            "limit",
+            "max_depth",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "direction",
+            "edge_types",
+            "edge_weight",
+            "fields",
+            "filter",
+            "include_documents",
+            "include_paths",
+            "limit",
+            "max_depth",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("start");
+        try jw.write(self.start);
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.edge_weight) |value| {
+            try jw.objectField("edge_weight");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.include_paths) |value| {
+            try jw.objectField("include_paths");
+            try jw.write(value);
+        }
+        if (self.include_documents) |value| {
+            try jw.objectField("include_documents");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.filter) |value| {
+            try jw.objectField("filter");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphTraverseQuery = struct {
@@ -2846,6 +6996,74 @@ pub const IndexConfig = struct {
     resolvers: ?[]const GraphResolverConfig = null,
     /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
     derive_from_schema: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "artifact_name",
+            "chunk_size",
+            "context",
+            "coverage_policy",
+            "derive_from_schema",
+            "description",
+            "dimension",
+            "distance_metric",
+            "edge",
+            "edge_types",
+            "embedding_name",
+            "enrichments",
+            "execution",
+            "external",
+            "field",
+            "max_edges_per_document",
+            "mem_only",
+            "min_weight",
+            "nodes",
+            "publication_policy",
+            "resolvers",
+            "source",
+            "source_artifact_name",
+            "sparse",
+            "template",
+            "top_k",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algebraic_planning",
+            "artifact",
+            "artifact_name",
+            "chunk_size",
+            "context",
+            "coverage_policy",
+            "derive_from_schema",
+            "description",
+            "dimension",
+            "distance_metric",
+            "edge",
+            "edge_types",
+            "embedding_name",
+            "enrichments",
+            "execution",
+            "external",
+            "field",
+            "max_edges_per_document",
+            "mem_only",
+            "min_weight",
+            "nodes",
+            "publication_policy",
+            "resolvers",
+            "source",
+            "source_artifact_name",
+            "sparse",
+            "template",
+            "top_k",
+            "version",
+        }, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -2991,6 +7209,33 @@ pub const IndexExecutionConfig = struct {
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunking",
+            "embedding",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunking",
+            "embedding",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.chunking) |value| {
+            try jw.objectField("chunking");
+            try jw.write(value);
+        }
+        if (self.embedding) |value| {
+            try jw.objectField("embedding");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.
@@ -3065,6 +7310,47 @@ pub const IndexReadinessStatus = struct {
     published_revision: ?i64 = null,
     /// Stable, machine-readable blockers. Empty when state is ready.
     pending_reasons: []const []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "incarnation",
+            "published_revision",
+            "target_revision",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "incarnation",
+            "published_revision",
+            "target_revision",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("queryable");
+        try jw.write(self.queryable);
+        try jw.objectField("complete");
+        try jw.write(self.complete);
+        if (self.incarnation) |value| {
+            try jw.objectField("incarnation");
+            try jw.write(value);
+        }
+        if (self.target_revision) |value| {
+            try jw.objectField("target_revision");
+            try jw.write(value);
+        }
+        if (self.published_revision) |value| {
+            try jw.objectField("published_revision");
+            try jw.write(value);
+        }
+        try jw.objectField("pending_reasons");
+        try jw.write(self.pending_reasons);
+        try jw.endObject();
+    }
 };
 
 /// Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics.
@@ -3201,6 +7487,51 @@ pub const LegacyGraphNodeSelector = struct {
     limit: ?i64 = null,
     /// Filter which nodes to use as start/target
     node_filter: ?NodeFilter = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "identities",
+            "keys",
+            "limit",
+            "node_filter",
+            "result_ref",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "identities",
+            "keys",
+            "limit",
+            "node_filter",
+            "result_ref",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.keys) |value| {
+            try jw.objectField("keys");
+            try jw.write(value);
+        }
+        if (self.identities) |value| {
+            try jw.objectField("identities");
+            try jw.write(value);
+        }
+        if (self.result_ref) |value| {
+            try jw.objectField("result_ref");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.node_filter) |value| {
+            try jw.objectField("node_filter");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Deprecated graph_searches request. Use the operation-keyed GraphQuery DSL.
@@ -3215,6 +7546,73 @@ pub const LegacyGraphQuery = struct {
     include_documents: ?bool = null,
     include_edges: ?bool = null,
     fields: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "fields",
+            "include_documents",
+            "include_edges",
+            "params",
+            "pattern",
+            "return_aliases",
+            "start_nodes",
+            "target_nodes",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "fields",
+            "include_documents",
+            "include_edges",
+            "params",
+            "pattern",
+            "return_aliases",
+            "start_nodes",
+            "target_nodes",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("index_name");
+        try jw.write(self.index_name);
+        if (self.start_nodes) |value| {
+            try jw.objectField("start_nodes");
+            try jw.write(value);
+        }
+        if (self.target_nodes) |value| {
+            try jw.objectField("target_nodes");
+            try jw.write(value);
+        }
+        if (self.params) |value| {
+            try jw.objectField("params");
+            try jw.write(value);
+        }
+        if (self.pattern) |value| {
+            try jw.objectField("pattern");
+            try jw.write(value);
+        }
+        if (self.return_aliases) |value| {
+            try jw.objectField("return_aliases");
+            try jw.write(value);
+        }
+        if (self.include_documents) |value| {
+            try jw.objectField("include_documents");
+            try jw.write(value);
+        }
+        if (self.include_edges) |value| {
+            try jw.objectField("include_edges");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Deprecated graph_searches response envelope.
@@ -3232,6 +7630,55 @@ pub const LegacyGraphQueryResult = struct {
     total: i64,
     /// Whole-query execution time in milliseconds; optional for compatibility with v0.2 responses. Use the parent query result's took field.
     took: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "kind",
+            "matches",
+            "nodes",
+            "paths",
+            "took",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "kind",
+            "matches",
+            "nodes",
+            "paths",
+            "took",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.paths) |value| {
+            try jw.objectField("paths");
+            try jw.write(value);
+        }
+        if (self.matches) |value| {
+            try jw.objectField("matches");
+            try jw.write(value);
+        }
+        try jw.objectField("total");
+        try jw.write(self.total);
+        if (self.took) |value| {
+            try jw.objectField("took");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Deprecated graph_searches node response with an unqualified string path.
@@ -3256,6 +7703,77 @@ pub const LegacyGraphResultNode = struct {
     evidence: ?std.json.Value = null,
     /// Connected edges when supplied by the graph executor.
     edges: ?[]const Edge = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "depth",
+            "distance",
+            "document",
+            "edges",
+            "evidence",
+            "path",
+            "path_edges",
+            "provenance",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "depth",
+            "distance",
+            "document",
+            "edges",
+            "evidence",
+            "path",
+            "path_edges",
+            "provenance",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.depth) |value| {
+            try jw.objectField("depth");
+            try jw.write(value);
+        }
+        if (self.distance) |value| {
+            try jw.objectField("distance");
+            try jw.write(value);
+        }
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.path) |value| {
+            try jw.objectField("path");
+            try jw.write(value);
+        }
+        if (self.path_edges) |value| {
+            try jw.objectField("path_edges");
+            try jw.write(value);
+        }
+        if (self.provenance) |value| {
+            try jw.objectField("provenance");
+            try jw.write(value);
+        }
+        if (self.evidence) |value| {
+            try jw.objectField("evidence");
+            try jw.write(value);
+        }
+        if (self.edges) |value| {
+            try jw.objectField("edges");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for result fusion when combining multiple search indexes.
@@ -3267,6 +7785,45 @@ pub const MergeConfig = struct {
     window_size: ?i64 = null,
     /// RRF k constant (1/(k+rank)). Defaults to 60.0.
     rank_constant: ?f64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "rank_constant",
+            "strategy",
+            "weights",
+            "window_size",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "rank_constant",
+            "strategy",
+            "weights",
+            "window_size",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.strategy) |value| {
+            try jw.objectField("strategy");
+            try jw.write(value);
+        }
+        if (self.weights) |value| {
+            try jw.objectField("weights");
+            try jw.write(value);
+        }
+        if (self.window_size) |value| {
+            try jw.objectField("window_size");
+            try jw.write(value);
+        }
+        if (self.rank_constant) |value| {
+            try jw.objectField("rank_constant");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Merge strategy for combining results from the semantic_search and full_text_search. rrf: Reciprocal Rank Fusion - combines scores using reciprocal rank formula rsf: Relative Score Fusion - normalizes scores by min/max within a window and combines weighted scores failover: Use full_text_search if embedding generation fails
@@ -3304,6 +7861,33 @@ pub const NodeFilter = struct {
     filter_query: ?LegacyGraphDocumentQuery = null,
     /// Filter by key prefix
     filter_prefix: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "filter_prefix",
+            "filter_query",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "filter_prefix",
+            "filter_query",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.filter_prefix) |value| {
+            try jw.objectField("filter_prefix");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Path = struct {
@@ -3313,6 +7897,45 @@ pub const Path = struct {
     /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: ?f64 = null,
     length: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "edges",
+            "length",
+            "nodes",
+            "total_weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "edges",
+            "length",
+            "nodes",
+            "total_weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.edges) |value| {
+            try jw.objectField("edges");
+            try jw.write(value);
+        }
+        if (self.total_weight) |value| {
+            try jw.objectField("total_weight");
+            try jw.write(value);
+        }
+        if (self.length) |value| {
+            try jw.objectField("length");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const PathEdge = struct {
@@ -3321,6 +7944,51 @@ pub const PathEdge = struct {
     type: ?[]const u8 = null,
     weight: ?f64 = null,
     metadata: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "metadata",
+            "source",
+            "target",
+            "type",
+            "weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "metadata",
+            "source",
+            "target",
+            "type",
+            "weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.target) |value| {
+            try jw.objectField("target");
+            try jw.write(value);
+        }
+        if (self.type) |value| {
+            try jw.objectField("type");
+            try jw.write(value);
+        }
+        if (self.weight) |value| {
+            try jw.objectField("weight");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const PathFindRequest = struct {
@@ -3336,6 +8004,67 @@ pub const PathFindRequest = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     direction: ?EdgeDirection = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "direction",
+            "edge_types",
+            "k",
+            "max_depth",
+            "max_weight",
+            "min_weight",
+            "weight_mode",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "direction",
+            "edge_types",
+            "k",
+            "max_depth",
+            "max_weight",
+            "min_weight",
+            "weight_mode",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("source");
+        try jw.write(self.source);
+        try jw.objectField("target");
+        try jw.write(self.target);
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.weight_mode) |value| {
+            try jw.objectField("weight_mode");
+            try jw.write(value);
+        }
+        if (self.k) |value| {
+            try jw.objectField("k");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.max_weight) |value| {
+            try jw.objectField("max_weight");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const PathFindResult = struct {
@@ -3345,6 +8074,57 @@ pub const PathFindResult = struct {
     weight_mode: ?PathFindWeightMode = null,
     paths_found: ?i64 = null,
     search_time_ms: ?f64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "paths",
+            "paths_found",
+            "search_time_ms",
+            "source",
+            "target",
+            "weight_mode",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "paths",
+            "paths_found",
+            "search_time_ms",
+            "source",
+            "target",
+            "weight_mode",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.paths) |value| {
+            try jw.objectField("paths");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.target) |value| {
+            try jw.objectField("target");
+            try jw.write(value);
+        }
+        if (self.weight_mode) |value| {
+            try jw.objectField("weight_mode");
+            try jw.write(value);
+        }
+        if (self.paths_found) |value| {
+            try jw.objectField("paths_found");
+            try jw.write(value);
+        }
+        if (self.search_time_ms) |value| {
+            try jw.objectField("search_time_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Algorithm for path finding: - min_hops: Shortest path by hop count (breadth-first search, ignores weights) - max_weight: Path with maximum product of edge weights (strongest connection chain) - min_weight: Path with minimum sum of edge weights (lowest cost route)
@@ -3414,12 +8194,90 @@ pub const PatternEdgeStep = struct {
     max_hops: ?i64 = null,
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "direction",
+            "max_hops",
+            "max_weight",
+            "min_hops",
+            "min_weight",
+            "types",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "direction",
+            "max_hops",
+            "max_weight",
+            "min_hops",
+            "min_weight",
+            "types",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.types) |value| {
+            try jw.objectField("types");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.min_hops) |value| {
+            try jw.objectField("min_hops");
+            try jw.write(value);
+        }
+        if (self.max_hops) |value| {
+            try jw.objectField("max_hops");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.max_weight) |value| {
+            try jw.objectField("max_weight");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Deprecated graph_searches pattern response row.
 pub const PatternMatch = struct {
     bindings: ?std.json.ArrayHashMap(LegacyGraphResultNode) = null,
     path: ?[]const PathEdge = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "bindings",
+            "path",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "bindings",
+            "path",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.bindings) |value| {
+            try jw.objectField("bindings");
+            try jw.write(value);
+        }
+        if (self.path) |value| {
+            try jw.objectField("path");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Deprecated linear graph_searches pattern step.
@@ -3427,6 +8285,39 @@ pub const PatternStep = struct {
     alias: ?[]const u8 = null,
     node_filter: ?NodeFilter = null,
     edge: ?PatternEdgeStep = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "alias",
+            "edge",
+            "node_filter",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "alias",
+            "edge",
+            "node_filter",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.alias) |value| {
+            try jw.objectField("alias");
+            try jw.write(value);
+        }
+        if (self.node_filter) |value| {
+            try jw.objectField("node_filter");
+            try jw.write(value);
+        }
+        if (self.edge) |value| {
+            try jw.objectField("edge");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.
@@ -3441,6 +8332,51 @@ pub const Pruner = struct {
     require_multi_index: ?bool = null,
     /// Keep results within N standard deviations below the mean score. For example, 1.0 keeps results with score >= mean - 1*stddev. Useful for statistical outlier detection in result sets.
     std_dev_threshold: ?f64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "max_score_gap_percent",
+            "min_absolute_score",
+            "min_score_ratio",
+            "require_multi_index",
+            "std_dev_threshold",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "max_score_gap_percent",
+            "min_absolute_score",
+            "min_score_ratio",
+            "require_multi_index",
+            "std_dev_threshold",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min_score_ratio) |value| {
+            try jw.objectField("min_score_ratio");
+            try jw.write(value);
+        }
+        if (self.max_score_gap_percent) |value| {
+            try jw.objectField("max_score_gap_percent");
+            try jw.write(value);
+        }
+        if (self.min_absolute_score) |value| {
+            try jw.objectField("min_absolute_score");
+            try jw.write(value);
+        }
+        if (self.require_multi_index) |value| {
+            try jw.objectField("require_multi_index");
+            try jw.write(value);
+        }
+        if (self.std_dev_threshold) |value| {
+            try jw.objectField("std_dev_threshold");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SortDirection = antfly_sort_openapi.SortDirection;
@@ -3461,6 +8397,49 @@ pub const TraversalResult = struct {
     path_edges: ?[]const Edge = null,
     /// Sum of raw edge weights along the path. Path ordering still follows the selected weight mode.
     total_weight: ?f64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "document",
+            "path",
+            "path_edges",
+            "total_weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "document",
+            "path",
+            "path_edges",
+            "total_weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        try jw.objectField("depth");
+        try jw.write(self.depth);
+        if (self.path) |value| {
+            try jw.objectField("path");
+            try jw.write(value);
+        }
+        if (self.path_edges) |value| {
+            try jw.objectField("path_edges");
+            try jw.write(value);
+        }
+        if (self.total_weight) |value| {
+            try jw.objectField("total_weight");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Rules for graph traversal
@@ -3480,4 +8459,169 @@ pub const TraversalRules = struct {
     include_paths: ?bool = null,
     /// Visit each node only once
     deduplicate_nodes: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "deduplicate_nodes",
+            "direction",
+            "edge_types",
+            "include_paths",
+            "max_depth",
+            "max_results",
+            "max_weight",
+            "min_weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "deduplicate_nodes",
+            "direction",
+            "edge_types",
+            "include_paths",
+            "max_depth",
+            "max_results",
+            "max_weight",
+            "min_weight",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.edge_types) |value| {
+            try jw.objectField("edge_types");
+            try jw.write(value);
+        }
+        if (self.min_weight) |value| {
+            try jw.objectField("min_weight");
+            try jw.write(value);
+        }
+        if (self.max_weight) |value| {
+            try jw.objectField("max_weight");
+            try jw.write(value);
+        }
+        if (self.direction) |value| {
+            try jw.objectField("direction");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.include_paths) |value| {
+            try jw.objectField("include_paths");
+            try jw.write(value);
+        }
+        if (self.deduplicate_nodes) |value| {
+            try jw.objectField("deduplicate_nodes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);
+
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {
+    inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;
+    return false;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
+}

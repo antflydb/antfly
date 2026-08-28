@@ -1149,19 +1149,6 @@ pub const HttpHandler = struct {
         }
         try self.resolveSemanticQueryRequest(table_name, &plan, cancellation);
 
-        var profile_requested = false;
-        var public_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
-            .ignore_unknown_fields = true,
-            .allocate = .alloc_always,
-        }) catch |err| switch (err) {
-            error.UnexpectedToken,
-            error.UnknownField,
-            error.InvalidEnumTag,
-            => return error.InvalidQueryRequest,
-            else => return err,
-        };
-        defer public_request.deinit();
-        profile_requested = public_request.value.profile orelse false;
         var session = try self.query.openHeadSession(namespace);
         errdefer session.deinit();
         session.setCancellation(cancellation);
@@ -1179,7 +1166,7 @@ pub const HttpHandler = struct {
             .execution_stats = execution_stats,
             .requested_offset = requested_offset,
             .requested_limit = requested_limit,
-            .profile_requested = profile_requested,
+            .profile_requested = plan.profile_requested,
         };
     }
 
@@ -1190,6 +1177,14 @@ pub const HttpHandler = struct {
         defer raw_request.deinit();
         if (raw_request.value != .object) return error.InvalidQueryRequest;
         try query_contract.validatePublicQueryEnvelopeValueAlloc(self.alloc, raw_request.value);
+
+        // Serverless exposes only the current graph contract. Preserve the
+        // OpenAPI distinction between omission and explicit null before feature
+        // routing can let another request mode claim the envelope.
+        if (raw_request.value.object.get("graph_queries")) |value|
+            if (value == .null) return error.InvalidQueryRequest;
+        if (raw_request.value.object.get("graph_searches")) |value|
+            if (value == .null) return error.InvalidQueryRequest;
 
         if (public_search_request.hasNonNullField(raw_request.value.object, "graph_searches")) {
             graph_query_diagnostic.record(
@@ -2706,9 +2701,8 @@ pub const HttpHandler = struct {
     ) !?HttpResponse {
         try cancellation.check();
         if (raw_request != .object) return error.InvalidQueryRequest;
-        const has_legacy_graph_request =
-            public_search_request.hasNonNullField(raw_request.object, "graph_searches");
-        if (has_legacy_graph_request) {
+        if (raw_request.object.get("graph_searches")) |legacy_graph_request| {
+            if (legacy_graph_request == .null) return error.InvalidQueryRequest;
             graph_query_diagnostic.record(
                 "$request",
                 "graph_searches",
@@ -2716,9 +2710,8 @@ pub const HttpHandler = struct {
             );
             return error.UnsupportedQueryRequest;
         }
-        const has_graph_request =
-            public_search_request.hasNonNullField(raw_request.object, "graph_queries");
-        if (!has_graph_request) return null;
+        const graph_request = raw_request.object.get("graph_queries") orelse return null;
+        if (graph_request == .null) return error.InvalidQueryRequest;
 
         const unsupported_controls = [_][]const u8{
             "aggregations",
@@ -2755,7 +2748,7 @@ pub const HttpHandler = struct {
             return error.InvalidQueryRequest;
 
         const started_ns = platform_time.monotonicNs();
-        const graph_queries = public_graph_query.parseSupportedGraphQueriesAlloc(self.alloc, request) catch |err| {
+        const graph_queries = public_graph_query.parseCanonicalGraphQueriesAlloc(self.alloc, request) catch |err| {
             std.log.warn("serverless public graph request admission failed table={s} err={}", .{ table_name, err });
             return err;
         };
@@ -11956,14 +11949,29 @@ test "serverless public graph query rejects exact sort controls" {
         legacy_diagnostic.reason,
     );
 
-    // Generated clients may serialize nullable optional fields explicitly.
-    // Null remains equivalent to omission and must not select the graph path.
-    try std.testing.expect((try handler.handleTablePublicGraphQueryRequest(
+    // Serverless implements only the current non-nullable graph contract; a
+    // legacy field remains invalid even when its value is null.
+    try std.testing.expectError(error.InvalidQueryRequest, handler.handleTablePublicGraphQueryRequest(
         "docs",
         "docs",
         "{\"graph_searches\":null}",
         .none,
-    )) == null);
+    ));
+
+    const null_graph_options = [_][]const u8{
+        "{\"graph_queries\":null}",
+        "{\"graph_queries\":{\"path\":{\"index\":\"graph_idx\",\"shortest_path\":{\"from\":{\"key\":\"doc:1\"},\"to\":{\"key\":\"doc:2\"},\"objective\":null}}}}",
+        "{\"graph_queries\":{\"path\":{\"index\":\"graph_idx\",\"shortest_path\":{\"from\":{\"key\":\"doc:1\"},\"to\":{\"key\":\"doc:2\"},\"edge_weight\":null}}}}",
+        "{\"graph_queries\":{\"walk\":{\"index\":\"graph_idx\",\"traverse\":{\"start\":{\"keys\":[\"doc:1\"]},\"edge_weight\":{\"min\":null,\"max\":1}}}}}",
+    };
+    for (null_graph_options) |body| {
+        try std.testing.expectError(error.InvalidQueryRequest, handler.handleTablePublicGraphQueryRequest(
+            "docs",
+            "docs",
+            body,
+            .none,
+        ));
+    }
 
     var typed_plain_request = try ant_json.parseFromSlice(
         metadata_openapi.QueryRequest,

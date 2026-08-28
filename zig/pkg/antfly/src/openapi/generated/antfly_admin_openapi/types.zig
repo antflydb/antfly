@@ -23,6 +23,55 @@ pub const CommitAppendRequest = struct {
     table_id: ?i64 = null,
     commit_timestamp_ns: ?i64 = null,
     sync_policy: HASyncPolicy,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "commit_timestamp_ns",
+            "kind",
+            "payload_codec",
+            "shard_id",
+            "table_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "commit_timestamp_ns",
+            "kind",
+            "payload_codec",
+            "shard_id",
+            "table_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("payload");
+        try jw.write(self.payload);
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.payload_codec) |value| {
+            try jw.objectField("payload_codec");
+            try jw.write(value);
+        }
+        if (self.shard_id) |value| {
+            try jw.objectField("shard_id");
+            try jw.write(value);
+        }
+        if (self.table_id) |value| {
+            try jw.objectField("table_id");
+            try jw.write(value);
+        }
+        if (self.commit_timestamp_ns) |value| {
+            try jw.objectField("commit_timestamp_ns");
+            try jw.write(value);
+        }
+        try jw.objectField("sync_policy");
+        try jw.write(self.sync_policy);
+        try jw.endObject();
+    }
 };
 
 pub const CommitCheckRequest = struct {
@@ -40,6 +89,43 @@ pub const FenceAcquireRequest = struct {
     observed_lsn: i64,
     force: bool,
     reason: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "reason",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "reason",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("old_primary_id");
+        try jw.write(self.old_primary_id);
+        try jw.objectField("promoted_node_id");
+        try jw.write(self.promoted_node_id);
+        try jw.objectField("new_timeline_id");
+        try jw.write(self.new_timeline_id);
+        try jw.objectField("new_epoch");
+        try jw.write(self.new_epoch);
+        try jw.objectField("required_lsn");
+        try jw.write(self.required_lsn);
+        try jw.objectField("observed_lsn");
+        try jw.write(self.observed_lsn);
+        try jw.objectField("force");
+        try jw.write(self.force);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAActionReceipt = struct {
@@ -98,6 +184,31 @@ pub const HACurrentFenceResponse = struct {
     schema_version: i64,
     held: bool,
     receipt: ?HAFenceReceipt = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "receipt",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "receipt",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("held");
+        try jw.write(self.held);
+        if (self.receipt) |value| {
+            try jw.objectField("receipt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HADurabilityDecision = struct {
@@ -184,6 +295,39 @@ pub const HAOwnerJobDecision = struct {
     durable_lsn: i64,
     next_lsn: i64,
     promotion_handoff: ?HAPromotionHandoff = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "promotion_handoff",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "promotion_handoff",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("durable_lsn");
+        try jw.write(self.durable_lsn);
+        try jw.objectField("next_lsn");
+        try jw.write(self.next_lsn);
+        if (self.promotion_handoff) |value| {
+            try jw.objectField("promotion_handoff");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAPrimarySnapshot = struct {
@@ -196,6 +340,45 @@ pub const HAPrimarySnapshot = struct {
     retention: HARetentionSnapshot,
     durability: ?HADurabilityDecision = null,
     lease_watchdog: ?HALeaseWatchdogProof = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "durability",
+            "lease_watchdog",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "durability",
+            "lease_watchdog",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("node_id");
+        try jw.write(self.node_id);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("current_lsn");
+        try jw.write(self.current_lsn);
+        try jw.objectField("slots");
+        try jw.write(self.slots);
+        try jw.objectField("retention");
+        try jw.write(self.retention);
+        if (self.durability) |value| {
+            try jw.objectField("durability");
+            try jw.write(value);
+        }
+        if (self.lease_watchdog) |value| {
+            try jw.objectField("lease_watchdog");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAPrimaryStatusResponse = struct {
@@ -342,6 +525,39 @@ pub const HARejoinAssessResponse = struct {
     rewind: ?HARejoinRewindResult = null,
     /// Present when `/ha/rejoin/reseed` marked the former-primary slot for base-backup reseed.
     reseed: ?HARejoinReseedResult = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "reseed",
+            "rewind",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "reseed",
+            "rewind",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("schema_version");
+        try jw.write(self.schema_version);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("assessment");
+        try jw.write(self.assessment);
+        if (self.rewind) |value| {
+            try jw.objectField("rewind");
+            try jw.write(value);
+        }
+        if (self.reseed) |value| {
+            try jw.objectField("reseed");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HARejoinAssessment = struct {
@@ -726,6 +942,18 @@ pub const HAStandbySnapshot = struct {
     can_serve_safe_reads: bool,
     lease_watchdog: ?HALeaseWatchdogProof = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "lease_watchdog",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "lease_watchdog",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("role");
@@ -837,9 +1065,6 @@ pub const HAStandbySnapshot = struct {
         if (self.lease_watchdog) |value| {
             try jw.objectField("lease_watchdog");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("lease_watchdog");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -861,6 +1086,47 @@ pub const HASyncPolicy = struct {
     standby_names: ?[]const HASlotName = null,
     /// Caller-visible action when synchronous durability is not currently satisfied.
     failure_policy: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "failure_policy",
+            "required",
+            "selection",
+            "standby_names",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "failure_policy",
+            "required",
+            "selection",
+            "standby_names",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.selection) |value| {
+            try jw.objectField("selection");
+            try jw.write(value);
+        }
+        if (self.required) |value| {
+            try jw.objectField("required");
+            try jw.write(value);
+        }
+        if (self.standby_names) |value| {
+            try jw.objectField("standby_names");
+            try jw.write(value);
+        }
+        if (self.failure_policy) |value| {
+            try jw.objectField("failure_policy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HAWatchdogProofResponse = struct {
@@ -880,12 +1146,68 @@ pub const HAWriteDecision = struct {
     durable_lsn: i64,
     next_lsn: i64,
     promotion_handoff: ?HAPromotionHandoff = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "promotion_handoff",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "promotion_handoff",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("durable_lsn");
+        try jw.write(self.durable_lsn);
+        try jw.objectField("next_lsn");
+        try jw.write(self.next_lsn);
+        if (self.promotion_handoff) |value| {
+            try jw.objectField("promotion_handoff");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const OwnerJobCheckRequest = struct {
     role: []const u8,
     kind: []const u8,
     expected_identity: ?HAIdentity = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "expected_identity",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "expected_identity",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.expected_identity) |value| {
+            try jw.objectField("expected_identity");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const PromotionAssessRequest = struct {
@@ -914,14 +1236,23 @@ pub const ReadCheckRequest = struct {
     required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
     metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "consistency",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "consistency",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         if (self.consistency) |value| {
             try jw.objectField("consistency");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("consistency");
-            try jw.write(@as(?u8, null));
         }
         switch (self.required_lsn) {
             .absent => {},
@@ -971,6 +1302,37 @@ pub const RejoinAssessRequest = struct {
     allow_rewind_after_forced_promotion: bool,
     /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     receipt: ?HAFenceReceipt = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "receipt",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "receipt",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("node_id");
+        try jw.write(self.node_id);
+        try jw.objectField("identity");
+        try jw.write(self.identity);
+        try jw.objectField("last_lsn");
+        try jw.write(self.last_lsn);
+        try jw.objectField("retained_from_lsn");
+        try jw.write(self.retained_from_lsn);
+        try jw.objectField("allow_rewind_after_forced_promotion");
+        try jw.write(self.allow_rewind_after_forced_promotion);
+        if (self.receipt) |value| {
+            try jw.objectField("receipt");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ReplicationSlotCreateRequest = struct {
@@ -1055,6 +1417,53 @@ pub const StorageMaintenanceJob = struct {
     completed_at_ms: ?i64 = null,
     result: ?StorageMaintenanceResult = null,
     @"error": ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "completed_at_ms",
+            "error",
+            "result",
+            "started_at_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "completed_at_ms",
+            "error",
+            "result",
+            "started_at_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("job_id");
+        try jw.write(self.job_id);
+        try jw.objectField("operation");
+        try jw.write(self.operation);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("created_at_ms");
+        try jw.write(self.created_at_ms);
+        if (self.started_at_ms) |value| {
+            try jw.objectField("started_at_ms");
+            try jw.write(value);
+        }
+        if (self.completed_at_ms) |value| {
+            try jw.objectField("completed_at_ms");
+            try jw.write(value);
+        }
+        if (self.result) |value| {
+            try jw.objectField("result");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const StorageMaintenanceOperation = enum {
@@ -1096,6 +1505,81 @@ pub const StorageMaintenanceResult = struct {
     reclaimed_bytes: ?i64 = null,
     live_file_count: ?i64 = null,
     live_bytes: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "after_size",
+            "before_size",
+            "file_size",
+            "issue",
+            "live_bytes",
+            "live_file_count",
+            "reclaimable_bytes",
+            "reclaimed_bytes",
+            "valid",
+            "valid_prefix_size",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "after_size",
+            "before_size",
+            "file_size",
+            "issue",
+            "live_bytes",
+            "live_file_count",
+            "reclaimable_bytes",
+            "reclaimed_bytes",
+            "valid",
+            "valid_prefix_size",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.valid) |value| {
+            try jw.objectField("valid");
+            try jw.write(value);
+        }
+        if (self.issue) |value| {
+            try jw.objectField("issue");
+            try jw.write(value);
+        }
+        if (self.file_size) |value| {
+            try jw.objectField("file_size");
+            try jw.write(value);
+        }
+        if (self.valid_prefix_size) |value| {
+            try jw.objectField("valid_prefix_size");
+            try jw.write(value);
+        }
+        if (self.reclaimable_bytes) |value| {
+            try jw.objectField("reclaimable_bytes");
+            try jw.write(value);
+        }
+        if (self.before_size) |value| {
+            try jw.objectField("before_size");
+            try jw.write(value);
+        }
+        if (self.after_size) |value| {
+            try jw.objectField("after_size");
+            try jw.write(value);
+        }
+        if (self.reclaimed_bytes) |value| {
+            try jw.objectField("reclaimed_bytes");
+            try jw.write(value);
+        }
+        if (self.live_file_count) |value| {
+            try jw.objectField("live_file_count");
+            try jw.write(value);
+        }
+        if (self.live_bytes) |value| {
+            try jw.objectField("live_bytes");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const StorageMaintenanceState = enum {
@@ -1135,6 +1619,29 @@ pub const StorageMaintenanceState = enum {
 pub const WriteCheckRequest = struct {
     role: []const u8,
     expected_identity: ?HAIdentity = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "expected_identity",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "expected_identity",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("role");
+        try jw.write(self.role);
+        if (self.expected_identity) |value| {
+            try jw.objectField("expected_identity");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
@@ -1180,4 +1687,106 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
             }
         }
     };
+}
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);
+
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {
+    inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;
+    return false;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
 }

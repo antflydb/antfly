@@ -14,6 +14,46 @@ pub const EvalConfig = struct {
     ground_truth: ?GroundTruth = null,
     /// Evaluation options (k, thresholds, etc.)
     options: ?EvalOptions = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "evaluators",
+            "ground_truth",
+            "options",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "evaluators",
+            "ground_truth",
+            "options",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.evaluators) |value| {
+            try jw.objectField("evaluators");
+            try jw.write(value);
+        }
+        if (self.judge) |value| {
+            try jw.objectField("judge");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("judge");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.ground_truth) |value| {
+            try jw.objectField("ground_truth");
+            try jw.write(value);
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Options for evaluation behavior
@@ -24,6 +64,39 @@ pub const EvalOptions = struct {
     pass_threshold: ?f32 = null,
     /// Timeout for evaluation in seconds
     timeout_seconds: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "k",
+            "pass_threshold",
+            "timeout_seconds",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "k",
+            "pass_threshold",
+            "timeout_seconds",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.k) |value| {
+            try jw.objectField("k");
+            try jw.write(value);
+        }
+        if (self.pass_threshold) |value| {
+            try jw.objectField("pass_threshold");
+            try jw.write(value);
+        }
+        if (self.timeout_seconds) |value| {
+            try jw.objectField("timeout_seconds");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Standalone evaluation request for POST /eval endpoint. Useful for testing evaluators without running a query.
@@ -44,6 +117,66 @@ pub const EvalRequest = struct {
     context: ?[]const std.json.Value = null,
     /// IDs of retrieved documents (for retrieval metrics)
     retrieved_ids: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "context",
+            "ground_truth",
+            "options",
+            "output",
+            "query",
+            "retrieved_ids",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "context",
+            "ground_truth",
+            "options",
+            "output",
+            "query",
+            "retrieved_ids",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("evaluators");
+        try jw.write(self.evaluators);
+        if (self.judge) |value| {
+            try jw.objectField("judge");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("judge");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.ground_truth) |value| {
+            try jw.objectField("ground_truth");
+            try jw.write(value);
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.context) |value| {
+            try jw.objectField("context");
+            try jw.write(value);
+        }
+        if (self.retrieved_ids) |value| {
+            try jw.objectField("retrieved_ids");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Complete evaluation result
@@ -54,6 +187,39 @@ pub const EvalResult = struct {
     summary: ?EvalSummary = null,
     /// Total evaluation duration in milliseconds
     duration_ms: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "duration_ms",
+            "scores",
+            "summary",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "duration_ms",
+            "scores",
+            "summary",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.scores) |value| {
+            try jw.objectField("scores");
+            try jw.write(value);
+        }
+        if (self.summary) |value| {
+            try jw.objectField("summary");
+            try jw.write(value);
+        }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Scores organized by category
@@ -62,6 +228,33 @@ pub const EvalScores = struct {
     retrieval: ?std.json.ArrayHashMap(EvaluatorScore) = null,
     /// Generation quality scores (faithfulness, relevance, etc.)
     generation: ?std.json.ArrayHashMap(EvaluatorScore) = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "generation",
+            "retrieval",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "generation",
+            "retrieval",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
+            try jw.write(value);
+        }
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Aggregate statistics across all evaluators
@@ -74,6 +267,45 @@ pub const EvalSummary = struct {
     failed: ?i64 = null,
     /// Total number of evaluators run
     total: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "average_score",
+            "failed",
+            "passed",
+            "total",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "average_score",
+            "failed",
+            "passed",
+            "total",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.average_score) |value| {
+            try jw.objectField("average_score");
+            try jw.write(value);
+        }
+        if (self.passed) |value| {
+            try jw.objectField("passed");
+            try jw.write(value);
+        }
+        if (self.failed) |value| {
+            try jw.objectField("failed");
+            try jw.write(value);
+        }
+        if (self.total) |value| {
+            try jw.objectField("total");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Available evaluator types: **Retrieval metrics** (require ground_truth.relevant_ids): - recall: Recall@k - fraction of relevant docs retrieved - precision: Precision@k - fraction of retrieved docs that are relevant - ndcg: Normalized Discounted Cumulative Gain - mrr: Mean Reciprocal Rank - map: Mean Average Precision **LLM-as-judge metrics** (require judge config): - relevance: Is output relevant to query? (works on retrieval-only too) - faithfulness: Is output grounded in context? - completeness: Does output fully address query? - coherence: Is output well-structured? - safety: Is output safe/appropriate? - helpfulness: Is output useful? - correctness: Is output factually correct? (uses expectations) - citation_quality: Are citations accurate?
@@ -145,6 +377,45 @@ pub const EvaluatorScore = struct {
     reason: ?[]const u8 = null,
     /// Additional evaluator-specific data
     metadata: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "metadata",
+            "pass",
+            "reason",
+            "score",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "metadata",
+            "pass",
+            "reason",
+            "score",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.score) |value| {
+            try jw.objectField("score");
+            try jw.write(value);
+        }
+        if (self.pass) |value| {
+            try jw.objectField("pass");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.metadata) |value| {
+            try jw.objectField("metadata");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Ground truth data for evaluation
@@ -153,4 +424,133 @@ pub const GroundTruth = struct {
     relevant_ids: ?[]const []const u8 = null,
     /// Context for evaluators about what to expect in the response. Provides guidance for LLM judges (e.g., "Should mention pricing tiers").
     expectations: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "expectations",
+            "relevant_ids",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "expectations",
+            "relevant_ids",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.relevant_ids) |value| {
+            try jw.objectField("relevant_ids");
+            try jw.write(value);
+        }
+        if (self.expectations) |value| {
+            try jw.objectField("expectations");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);
+
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {
+    inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;
+    return false;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
+}

@@ -158,6 +158,7 @@ assert_contains "$GEN_DIR/petstore31/types.zig" "required_raw: NullableRaw," "re
 assert_contains "$GEN_DIR/petstore31/types.zig" "optional_raw: OpenApiOptionalNullable(NullableRaw) = .absent," "optional raw JSON field tracks absence separately"
 assert_contains "$GEN_DIR/petstore31/types.zig" "required_inline_raw: std.json.Value," "inline raw JSON override uses intrinsic null representation"
 assert_contains "$GEN_DIR/petstore31/types.zig" "optional_inline_raw: OpenApiOptionalNullable(std.json.Value) = .absent," "optional inline raw JSON tracks absence separately"
+assert_contains "$GEN_DIR/petstore31/types.zig" "fn openApiParseObject(" "optional non-nullable fields use the schema-faithful streaming parser"
 assert_contains "$GEN_DIR/petstore31/server.zig" "ServerRouter" "3.1 server generated"
 
 # Compile the generated standalone types as a final representation check. Text

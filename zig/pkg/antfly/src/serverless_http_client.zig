@@ -360,6 +360,16 @@ pub const ServerlessHttpClient = struct {
         return .{ .client = self };
     }
 
+    /// Encode request DTOs with absent Zig optionals omitted. API nullability
+    /// is defined by the DTO's `jsonStringify` implementation (generated DTOs
+    /// preserve explicit nullable states themselves), never by a client-wide
+    /// request writer default.
+    fn stringifyRequestAlloc(self: *ServerlessHttpClient, value: anytype) ![]u8 {
+        return try std.json.Stringify.valueAlloc(self.alloc, value, .{
+            .emit_null_optional_fields = false,
+        });
+    }
+
     fn ensureNamespace(
         self: *ServerlessHttpClient,
         base_uri: []const u8,
@@ -380,7 +390,7 @@ pub const ServerlessHttpClient = struct {
         const path = try namespacePath(self.alloc, namespace);
         defer self.alloc.free(path);
 
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
 
         return try self.requestJsonValue(EnsureNamespaceResult, .PUT, base_uri, path, body);
@@ -406,7 +416,7 @@ pub const ServerlessHttpClient = struct {
         const path = try tablePath(self.alloc, table_name);
         defer self.alloc.free(path);
 
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
 
         return try self.requestJsonValue(EnsureTableResult, .PUT, base_uri, path, body);
@@ -432,7 +442,7 @@ pub const ServerlessHttpClient = struct {
     ) !serverless.NamespacePolicyResult {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/policy", .{namespace});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJsonValue(serverless.NamespacePolicyResult, .PUT, base_uri, path, body);
     }
@@ -445,7 +455,7 @@ pub const ServerlessHttpClient = struct {
     ) !TablePolicyResult {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/tables/{s}/policy", .{table_name});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJsonValue(TablePolicyResult, .PUT, base_uri, path, body);
     }
@@ -459,7 +469,7 @@ pub const ServerlessHttpClient = struct {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/head", .{namespace});
         defer self.alloc.free(path);
 
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJsonValueAllowConflict(serverless.HeadPublishResult, .PUT, base_uri, path, body);
     }
@@ -655,7 +665,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(QuerySearchResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/query/search", .{namespace});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(QuerySearchResponse, .POST, base_uri, path, body);
     }
@@ -668,7 +678,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(TableQuerySearchResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/query/search", .{table_name});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(TableQuerySearchResponse, .POST, base_uri, path, body);
     }
@@ -681,7 +691,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(GraphNeighborsResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/query/graph/neighbors", .{namespace});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(GraphNeighborsResponse, .POST, base_uri, path, body);
     }
@@ -694,7 +704,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(TableGraphNeighborsResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/query/graph/neighbors", .{table_name});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(TableGraphNeighborsResponse, .POST, base_uri, path, body);
     }
@@ -708,7 +718,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(GraphNeighborsResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/query/versions/{d}/graph/neighbors", .{ namespace, version });
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(GraphNeighborsResponse, .POST, base_uri, path, body);
     }
@@ -721,7 +731,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(GraphTraverseResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/query/graph/traverse", .{namespace});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(GraphTraverseResponse, .POST, base_uri, path, body);
     }
@@ -734,7 +744,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(TableGraphTraverseResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/query/graph/traverse", .{table_name});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(TableGraphTraverseResponse, .POST, base_uri, path, body);
     }
@@ -748,7 +758,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(GraphTraverseResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/query/versions/{d}/graph/traverse", .{ namespace, version });
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(GraphTraverseResponse, .POST, base_uri, path, body);
     }
@@ -761,7 +771,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(GraphShortestPathResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/query/graph/shortest-path", .{namespace});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(GraphShortestPathResponse, .POST, base_uri, path, body);
     }
@@ -774,7 +784,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(TableGraphShortestPathResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/tables/{s}/query/graph/shortest-path", .{table_name});
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(TableGraphShortestPathResponse, .POST, base_uri, path, body);
     }
@@ -788,7 +798,7 @@ pub const ServerlessHttpClient = struct {
     ) !std.json.Parsed(GraphShortestPathResponse) {
         const path = try std.fmt.allocPrint(self.alloc, "/internal/v1/namespaces/{s}/query/versions/{d}/graph/shortest-path", .{ namespace, version });
         defer self.alloc.free(path);
-        const body = try std.json.Stringify.valueAlloc(self.alloc, req, .{});
+        const body = try self.stringifyRequestAlloc(req);
         defer self.alloc.free(body);
         return try self.requestJson(GraphShortestPathResponse, .POST, base_uri, path, body);
     }
@@ -1894,7 +1904,7 @@ test "serverless http client round-trips semantic search with embedding_template
         .embedding_template = @constCast("{{remoteText url=this}}"),
         .indexes = search_indexes[0..],
         .limit = 5,
-    }, .{});
+    }, .{ .emit_null_optional_fields = false });
     defer alloc.free(raw_search_body);
     var raw_search = try server.executor().execute(alloc, .{
         .method = .POST,

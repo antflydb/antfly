@@ -23,6 +23,7 @@ const public_search_request_mod = @import("../../api/public_search_request.zig")
 pub const SearchPlan = struct {
     request: request.QueryRequest,
     sources: search_sources.ResolvedSearchSources,
+    profile_requested: bool = false,
 
     pub fn deinit(self: *SearchPlan, alloc: Allocator) void {
         self.request.deinit(alloc);
@@ -74,7 +75,8 @@ pub fn parseSearchPlanAlloc(
 
     if (public_search_request_mod.looksLikePublicSearchRequest(parsed.value)) {
         try validateSupportedPublicSearchFields(parsed.value.object);
-        var public_parsed = parseOwnedPublicQueryRequestAlloc(alloc, body) catch return error.InvalidQueryRequest;
+        var public_parsed = parseOwnedPublicQueryRequestAlloc(alloc, body) catch
+            return error.InvalidQueryRequest;
         defer public_parsed.deinit();
         return try parsePublicSearchPlanAlloc(alloc, public_parsed.value, published_search_sources);
     }
@@ -85,8 +87,8 @@ pub fn parseSearchPlanAlloc(
 /// Serverless published-segment search implements a deliberately smaller
 /// QueryRequest surface than the canonical DB executor. Keep this allowlist
 /// fail-closed so adding a generated API field can never make serverless
-/// silently accept and ignore it. Null optionals are treated as absent for SDK
-/// compatibility.
+/// silently accept and ignore it. The generated contract parser separately
+/// enforces nullability for supported and unsupported canonical fields.
 fn validateSupportedPublicSearchFields(object: std.json.ObjectMap) !void {
     var it = object.iterator();
     while (it.next()) |entry| {
@@ -257,6 +259,7 @@ fn parsePublicSearchPlanAlloc(
     return .{
         .request = req,
         .sources = sources,
+        .profile_requested = query_request.profile orelse false,
     };
 }
 
@@ -646,14 +649,13 @@ test "serverless search plan fails closed for unsupported public fields" {
         sources,
     ));
 
-    // SDKs may serialize unset optionals as null; those remain equivalent to
-    // omission even when the non-null feature is unsupported by serverless.
-    var plan = try parseSearchPlanAlloc(
+    // Serverless is unreleased and supports only the canonical wire contract:
+    // an explicit null is not omission for a non-nullable optional property.
+    try std.testing.expectError(error.InvalidQueryRequest, parseSearchPlanAlloc(
         alloc,
         "{\"full_text_search\":{\"query\":\"body:alpha\"},\"hierarchy\":null}",
         sources,
-    );
-    defer plan.deinit(alloc);
+    ));
 }
 
 test "serverless graph plans reject internal doc identity controls" {

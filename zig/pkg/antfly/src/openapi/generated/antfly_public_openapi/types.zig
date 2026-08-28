@@ -17,6 +17,35 @@ pub const AgentDecision = struct {
     answer: ?std.json.Value = null,
     /// Used for confirm/review steps where the draft may be accepted as-is
     approved: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "answer",
+            "approved",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "answer",
+            "approved",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("question_id");
+        try jw.write(self.question_id);
+        if (self.answer) |value| {
+            try jw.objectField("answer");
+            try jw.write(value);
+        }
+        if (self.approved) |value| {
+            try jw.objectField("approved");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AgentQuestion = struct {
@@ -33,6 +62,51 @@ pub const AgentQuestion = struct {
     default_answer: ?[]const u8 = null,
     /// High-level result areas affected by this decision
     affects: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "affects",
+            "default_answer",
+            "options",
+            "reason",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "affects",
+            "default_answer",
+            "options",
+            "reason",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("question");
+        try jw.write(self.question);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.options) |value| {
+            try jw.objectField("options");
+            try jw.write(value);
+        }
+        if (self.default_answer) |value| {
+            try jw.objectField("default_answer");
+            try jw.write(value);
+        }
+        if (self.affects) |value| {
+            try jw.objectField("affects");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// UI rendering/answer handling hint for a bounded agent question
@@ -121,6 +195,61 @@ pub const AgentStep = struct {
     duration_ms: ?i64 = null,
     /// Additional details about the step
     details: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "details",
+            "duration_ms",
+            "error_message",
+            "id",
+            "kind",
+            "status",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "details",
+            "duration_ms",
+            "error_message",
+            "id",
+            "kind",
+            "status",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.error_message) |value| {
+            try jw.objectField("error_message");
+            try jw.write(value);
+        }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        if (self.details) |value| {
+            try jw.objectField("details");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Shared bounded-agent step category
@@ -211,6 +340,73 @@ pub const AggregationBucket = struct {
     bg_count: ?i64 = null,
     /// Results of nested sub-aggregations
     sub_aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "bg_count",
+            "from",
+            "from_as_string",
+            "key_as_string",
+            "score",
+            "sub_aggregations",
+            "to",
+            "to_as_string",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "bg_count",
+            "from",
+            "from_as_string",
+            "key_as_string",
+            "score",
+            "sub_aggregations",
+            "to",
+            "to_as_string",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        if (self.key_as_string) |value| {
+            try jw.objectField("key_as_string");
+            try jw.write(value);
+        }
+        try jw.objectField("doc_count");
+        try jw.write(self.doc_count);
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        if (self.from_as_string) |value| {
+            try jw.objectField("from_as_string");
+            try jw.write(value);
+        }
+        if (self.to_as_string) |value| {
+            try jw.objectField("to_as_string");
+            try jw.write(value);
+        }
+        if (self.score) |value| {
+            try jw.objectField("score");
+            try jw.write(value);
+        }
+        if (self.bg_count) |value| {
+            try jw.objectField("bg_count");
+            try jw.write(value);
+        }
+        if (self.sub_aggregations) |value| {
+            try jw.objectField("sub_aggregations");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AggregationDateRange = struct {
@@ -220,6 +416,35 @@ pub const AggregationDateRange = struct {
     from: ?[]const u8 = null,
     /// End date (ISO 8601 or relative like "now")
     to: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AggregationRange = struct {
@@ -229,6 +454,35 @@ pub const AggregationRange = struct {
     from: ?f32 = null,
     /// Upper bound (exclusive)
     to: ?f32 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AggregationRequest = struct {
@@ -267,6 +521,125 @@ pub const AggregationRequest = struct {
     algebraic_join: ?AlgebraicAggregationJoin = null,
     /// Nested sub-aggregations
     sub_aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "algebraic_join",
+            "algorithm",
+            "background_filter",
+            "calendar_interval",
+            "date_ranges",
+            "distance_ranges",
+            "field",
+            "fields",
+            "interval",
+            "min_doc_count",
+            "mode",
+            "origin",
+            "precision",
+            "ranges",
+            "size",
+            "sub_aggregations",
+            "unit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "algebraic_join",
+            "algorithm",
+            "background_filter",
+            "calendar_interval",
+            "date_ranges",
+            "distance_ranges",
+            "field",
+            "fields",
+            "interval",
+            "min_doc_count",
+            "mode",
+            "origin",
+            "precision",
+            "ranges",
+            "size",
+            "sub_aggregations",
+            "unit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.field) |value| {
+            try jw.objectField("field");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.size) |value| {
+            try jw.objectField("size");
+            try jw.write(value);
+        }
+        if (self.ranges) |value| {
+            try jw.objectField("ranges");
+            try jw.write(value);
+        }
+        if (self.date_ranges) |value| {
+            try jw.objectField("date_ranges");
+            try jw.write(value);
+        }
+        if (self.interval) |value| {
+            try jw.objectField("interval");
+            try jw.write(value);
+        }
+        if (self.calendar_interval) |value| {
+            try jw.objectField("calendar_interval");
+            try jw.write(value);
+        }
+        if (self.origin) |value| {
+            try jw.objectField("origin");
+            try jw.write(value);
+        }
+        if (self.precision) |value| {
+            try jw.objectField("precision");
+            try jw.write(value);
+        }
+        if (self.distance_ranges) |value| {
+            try jw.objectField("distance_ranges");
+            try jw.write(value);
+        }
+        if (self.unit) |value| {
+            try jw.objectField("unit");
+            try jw.write(value);
+        }
+        if (self.min_doc_count) |value| {
+            try jw.objectField("min_doc_count");
+            try jw.write(value);
+        }
+        if (self.background_filter) |value| {
+            try jw.objectField("background_filter");
+            try jw.write(value);
+        }
+        if (self.algorithm) |value| {
+            try jw.objectField("algorithm");
+            try jw.write(value);
+        }
+        if (self.algebraic_join) |value| {
+            try jw.objectField("algebraic_join");
+            try jw.write(value);
+        }
+        if (self.sub_aggregations) |value| {
+            try jw.objectField("sub_aggregations");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AggregationResult = struct {
@@ -294,6 +667,93 @@ pub const AggregationResult = struct {
     variance: ?f32 = null,
     /// Buckets for bucketing aggregations (terms, range, histogram, etc.)
     buckets: ?[]const AggregationBucket = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "approximate",
+            "avg",
+            "buckets",
+            "count",
+            "max",
+            "min",
+            "relative_error",
+            "std_deviation",
+            "sum",
+            "sum_of_squares",
+            "value",
+            "variance",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "approximate",
+            "avg",
+            "buckets",
+            "count",
+            "max",
+            "min",
+            "relative_error",
+            "std_deviation",
+            "sum",
+            "sum_of_squares",
+            "value",
+            "variance",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.approximate) |value| {
+            try jw.objectField("approximate");
+            try jw.write(value);
+        }
+        if (self.relative_error) |value| {
+            try jw.objectField("relative_error");
+            try jw.write(value);
+        }
+        if (self.count) |value| {
+            try jw.objectField("count");
+            try jw.write(value);
+        }
+        if (self.min) |value| {
+            try jw.objectField("min");
+            try jw.write(value);
+        }
+        if (self.max) |value| {
+            try jw.objectField("max");
+            try jw.write(value);
+        }
+        if (self.sum) |value| {
+            try jw.objectField("sum");
+            try jw.write(value);
+        }
+        if (self.sum_of_squares) |value| {
+            try jw.objectField("sum_of_squares");
+            try jw.write(value);
+        }
+        if (self.avg) |value| {
+            try jw.objectField("avg");
+            try jw.write(value);
+        }
+        if (self.std_deviation) |value| {
+            try jw.objectField("std_deviation");
+            try jw.write(value);
+        }
+        if (self.variance) |value| {
+            try jw.objectField("variance");
+            try jw.write(value);
+        }
+        if (self.buckets) |value| {
+            try jw.objectField("buckets");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Type of aggregation to compute: - Metrics: sum, avg, min, max, count, sumsquares, stats, cardinality - Bucketing: terms, range, date_range, histogram, date_histogram - Geo: geohash_grid, geo_distance - Analytics: significant_terms
@@ -373,16 +833,97 @@ pub const AlgebraicAggregationJoin = struct {
     group_side: []const u8,
     /// Join side that supplies metric values
     measure_side: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "kind",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "kind",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        try jw.objectField("group_side");
+        try jw.write(self.group_side);
+        try jw.objectField("measure_side");
+        try jw.write(self.measure_side);
+        try jw.endObject();
+    }
 };
 
 pub const Analyses = struct {
     pca: ?bool = null,
     tsne: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "pca",
+            "tsne",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "pca",
+            "tsne",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.pca) |value| {
+            try jw.objectField("pca");
+            try jw.write(value);
+        }
+        if (self.tsne) |value| {
+            try jw.objectField("tsne");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const AnalysesResult = struct {
     pca: ?[]const f32 = null,
     tsne: ?[]const f32 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "pca",
+            "tsne",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "pca",
+            "tsne",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.pca) |value| {
+            try jw.objectField("pca");
+            try jw.write(value);
+        }
+        if (self.tsne) |value| {
+            try jw.objectField("tsne");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// DEPRECATED: Use RetrievalAgentRequest instead. Request for the answer agent. Accepts the old request format and internally delegates to the retrieval agent.
@@ -409,6 +950,81 @@ pub const AnswerAgentRequest = struct {
     eval: ?antfly_eval_openapi.EvalConfig = null,
     /// DEPRECATED: Omit steps.generation on RetrievalAgentRequest instead. If true, skip the generation step.
     without_generation: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "agent_knowledge",
+            "chain",
+            "max_context_tokens",
+            "reserve_tokens",
+            "steps",
+            "with_streaming",
+            "without_generation",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "agent_knowledge",
+            "chain",
+            "max_context_tokens",
+            "reserve_tokens",
+            "steps",
+            "with_streaming",
+            "without_generation",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(self.query);
+        try jw.objectField("queries");
+        try jw.write(self.queries);
+        if (self.with_streaming) |value| {
+            try jw.objectField("with_streaming");
+            try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generator");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.chain) |value| {
+            try jw.objectField("chain");
+            try jw.write(value);
+        }
+        if (self.agent_knowledge) |value| {
+            try jw.objectField("agent_knowledge");
+            try jw.write(value);
+        }
+        if (self.max_context_tokens) |value| {
+            try jw.objectField("max_context_tokens");
+            try jw.write(value);
+        }
+        if (self.reserve_tokens) |value| {
+            try jw.objectField("reserve_tokens");
+            try jw.write(value);
+        }
+        if (self.steps) |value| {
+            try jw.objectField("steps");
+            try jw.write(value);
+        }
+        if (self.eval) |value| {
+            try jw.objectField("eval");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("eval");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.without_generation) |value| {
+            try jw.objectField("without_generation");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// DEPRECATED: Use RetrievalAgentResult instead. Result from the answer agent.
@@ -427,6 +1043,65 @@ pub const AnswerAgentResult = struct {
     followup_questions: ?[]const []const u8 = null,
     /// Evaluation results
     eval_result: ?antfly_eval_openapi.EvalResult = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "answer",
+            "answer_confidence",
+            "context_relevance",
+            "followup_questions",
+            "query_results",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "answer",
+            "answer_confidence",
+            "context_relevance",
+            "followup_questions",
+            "query_results",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.answer) |value| {
+            try jw.objectField("answer");
+            try jw.write(value);
+        }
+        if (self.answer_confidence) |value| {
+            try jw.objectField("answer_confidence");
+            try jw.write(value);
+        }
+        if (self.context_relevance) |value| {
+            try jw.objectField("context_relevance");
+            try jw.write(value);
+        }
+        if (self.classification_transformation) |value| {
+            try jw.objectField("classification_transformation");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("classification_transformation");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.query_results) |value| {
+            try jw.objectField("query_results");
+            try jw.write(value);
+        }
+        if (self.followup_questions) |value| {
+            try jw.objectField("followup_questions");
+            try jw.write(value);
+        }
+        if (self.eval_result) |value| {
+            try jw.objectField("eval_result");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("eval_result");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// DEPRECATED: Use RetrievalAgentSteps instead. Configuration for the answer agent's pipeline steps.
@@ -677,6 +1352,41 @@ pub const BackupInfo = struct {
     antfly_version: ?[]const u8 = null,
     /// Backup format used
     format: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "antfly_version",
+            "format",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "antfly_version",
+            "format",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        try jw.objectField("timestamp");
+        try jw.write(self.timestamp);
+        try jw.objectField("tables");
+        try jw.write(self.tables);
+        try jw.objectField("location");
+        try jw.write(self.location);
+        if (self.antfly_version) |value| {
+            try jw.objectField("antfly_version");
+            try jw.write(value);
+        }
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const BackupListResponse = struct {
@@ -684,6 +1394,29 @@ pub const BackupListResponse = struct {
     backups: []const BackupInfo,
     /// Opaque continuation cursor. Omitted when no additional backups remain.
     next_cursor: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "next_cursor",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "next_cursor",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("backups");
+        try jw.write(self.backups);
+        if (self.next_cursor) |value| {
+            try jw.objectField("next_cursor");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A retryable metadata-availability failure reported before backup side effects begin.
@@ -759,6 +1492,37 @@ pub const BackupOutcomeAmbiguousConflict = struct {
     backup_id: []const u8,
     /// Opaque artifact generation retained by an ambiguous attempt. This is for reconciliation, not as a replacement logical backup ID.
     artifact_backup_id: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_backup_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_backup_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("code");
+        try jw.write(self.code);
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        if (self.artifact_backup_id) |value| {
+            try jw.objectField("artifact_backup_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const BackupRequest = struct {
@@ -770,6 +1534,33 @@ pub const BackupRequest = struct {
     connection: []const u8,
     /// Backup format to use: - `native`: Engine-specific physical snapshot (fast backup and restore, same-backend only) - `portable`: Cross-backend logical backup in AFB format (slower restore due to index rebuild, but can be restored by any Antfly backend) On restore, the format is auto-detected from file magic bytes.
     format: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "format",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "format",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        try jw.objectField("location");
+        try jw.write(self.location);
+        try jw.objectField("connection");
+        try jw.write(self.connection);
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
@@ -781,6 +1572,45 @@ pub const BatchRequest = struct {
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "deletes",
+            "inserts",
+            "sync_level",
+            "transforms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "deletes",
+            "inserts",
+            "sync_level",
+            "transforms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.inserts) |value| {
+            try jw.objectField("inserts");
+            try jw.write(value);
+        }
+        if (self.deletes) |value| {
+            try jw.objectField("deletes");
+            try jw.write(value);
+        }
+        if (self.transforms) |value| {
+            try jw.objectField("transforms");
+            try jw.write(value);
+        }
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const BatchResponse = struct {
@@ -792,6 +1622,45 @@ pub const BatchResponse = struct {
     deleted: ?i64 = null,
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "deleted",
+            "inserted",
+            "status",
+            "transformed",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "deleted",
+            "inserted",
+            "status",
+            "transformed",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.inserted) |value| {
+            try jw.objectField("inserted");
+            try jw.write(value);
+        }
+        if (self.deleted) |value| {
+            try jw.objectField("deleted");
+            try jw.write(value);
+        }
+        if (self.transformed) |value| {
+            try jw.objectField("transformed");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ByteRange = []const []const u8;
@@ -891,6 +1760,81 @@ pub const CdcConnection = struct {
     last_change_applied_at_ms: ?i64 = null,
     /// Wall-clock timestamp when this CDC status was last updated, in milliseconds.
     updated_at_ms: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "external_table",
+            "lag_millis",
+            "lag_records",
+            "last_change_applied_at_ms",
+            "last_success_at_ms",
+            "phase",
+            "publication_name",
+            "slot_name",
+            "updated_at_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "external_table",
+            "lag_millis",
+            "lag_records",
+            "last_change_applied_at_ms",
+            "last_success_at_ms",
+            "phase",
+            "publication_name",
+            "slot_name",
+            "updated_at_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        try jw.objectField("table_name");
+        try jw.write(self.table_name);
+        try jw.objectField("source_ordinal");
+        try jw.write(self.source_ordinal);
+        if (self.external_table) |value| {
+            try jw.objectField("external_table");
+            try jw.write(value);
+        }
+        if (self.slot_name) |value| {
+            try jw.objectField("slot_name");
+            try jw.write(value);
+        }
+        if (self.publication_name) |value| {
+            try jw.objectField("publication_name");
+            try jw.write(value);
+        }
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        if (self.lag_records) |value| {
+            try jw.objectField("lag_records");
+            try jw.write(value);
+        }
+        if (self.lag_millis) |value| {
+            try jw.objectField("lag_millis");
+            try jw.write(value);
+        }
+        if (self.last_success_at_ms) |value| {
+            try jw.objectField("last_success_at_ms");
+            try jw.write(value);
+        }
+        if (self.last_change_applied_at_ms) |value| {
+            try jw.objectField("last_change_applied_at_ms");
+            try jw.write(value);
+        }
+        if (self.updated_at_ms) |value| {
+            try jw.objectField("updated_at_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ClusterBackupRequest = struct {
@@ -904,6 +1848,39 @@ pub const ClusterBackupRequest = struct {
     format: ?[]const u8 = null,
     /// Optional list of tables to backup. If omitted, all tables are backed up, up to the cluster backup limit of 4096 tables. Requests above that limit fail before any table backup is created.
     table_names: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "format",
+            "table_names",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "format",
+            "table_names",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        try jw.objectField("location");
+        try jw.write(self.location);
+        try jw.objectField("connection");
+        try jw.write(self.connection);
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.table_names) |value| {
+            try jw.objectField("table_names");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ClusterBackupResponse = struct {
@@ -933,6 +1910,44 @@ pub const ClusterDataGroupStatus = struct {
     disk_bytes: ?i64 = null,
     empty: ?bool = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "cutover_ready",
+            "disk_bytes",
+            "doc_count",
+            "doc_identity_lifecycle",
+            "empty",
+            "healthy_voter_reports",
+            "joint_consensus",
+            "leader_known",
+            "reads_ready_after_cutover",
+            "replay_caught_up",
+            "replay_required",
+            "transition_pending",
+            "voter_count",
+            "voter_count_known",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "cutover_ready",
+            "disk_bytes",
+            "doc_count",
+            "doc_identity_lifecycle",
+            "empty",
+            "healthy_voter_reports",
+            "joint_consensus",
+            "leader_known",
+            "reads_ready_after_cutover",
+            "replay_caught_up",
+            "replay_required",
+            "transition_pending",
+            "voter_count",
+            "voter_count_known",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("group_id");
@@ -940,9 +1955,6 @@ pub const ClusterDataGroupStatus = struct {
         if (self.leader_known) |value| {
             try jw.objectField("leader_known");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("leader_known");
-            try jw.write(@as(?u8, null));
         }
         switch (self.leader_data_id) {
             .absent => {},
@@ -958,93 +1970,54 @@ pub const ClusterDataGroupStatus = struct {
         if (self.voter_count_known) |value| {
             try jw.objectField("voter_count_known");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("voter_count_known");
-            try jw.write(@as(?u8, null));
         }
         if (self.voter_count) |value| {
             try jw.objectField("voter_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("voter_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.healthy_voter_reports) |value| {
             try jw.objectField("healthy_voter_reports");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("healthy_voter_reports");
-            try jw.write(@as(?u8, null));
         }
         if (self.joint_consensus) |value| {
             try jw.objectField("joint_consensus");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("joint_consensus");
-            try jw.write(@as(?u8, null));
         }
         if (self.transition_pending) |value| {
             try jw.objectField("transition_pending");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("transition_pending");
-            try jw.write(@as(?u8, null));
         }
         if (self.replay_required) |value| {
             try jw.objectField("replay_required");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("replay_required");
-            try jw.write(@as(?u8, null));
         }
         if (self.replay_caught_up) |value| {
             try jw.objectField("replay_caught_up");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("replay_caught_up");
-            try jw.write(@as(?u8, null));
         }
         if (self.cutover_ready) |value| {
             try jw.objectField("cutover_ready");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("cutover_ready");
-            try jw.write(@as(?u8, null));
         }
         if (self.reads_ready_after_cutover) |value| {
             try jw.objectField("reads_ready_after_cutover");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("reads_ready_after_cutover");
-            try jw.write(@as(?u8, null));
         }
         if (self.doc_identity_lifecycle) |value| {
             try jw.objectField("doc_identity_lifecycle");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("doc_identity_lifecycle");
-            try jw.write(@as(?u8, null));
         }
         if (self.doc_count) |value| {
             try jw.objectField("doc_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("doc_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.disk_bytes) |value| {
             try jw.objectField("disk_bytes");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("disk_bytes");
-            try jw.write(@as(?u8, null));
         }
         if (self.empty) |value| {
             try jw.objectField("empty");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("empty");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -1067,6 +2040,109 @@ pub const ClusterDataNodeStatus = struct {
     read_load: ?i64 = null,
     write_load: ?i64 = null,
     active_backfills: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "active_backfills",
+            "api_url",
+            "available_bytes",
+            "capacity_bytes",
+            "drain_requested",
+            "failure_domain",
+            "health_class",
+            "lease_pressure",
+            "live",
+            "raft_url",
+            "read_load",
+            "role",
+            "state",
+            "write_load",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "active_backfills",
+            "api_url",
+            "available_bytes",
+            "capacity_bytes",
+            "drain_requested",
+            "failure_domain",
+            "health_class",
+            "lease_pressure",
+            "live",
+            "raft_url",
+            "read_load",
+            "role",
+            "state",
+            "write_load",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("data_id");
+        try jw.write(self.data_id);
+        try jw.objectField("node_id");
+        try jw.write(self.node_id);
+        if (self.api_url) |value| {
+            try jw.objectField("api_url");
+            try jw.write(value);
+        }
+        if (self.raft_url) |value| {
+            try jw.objectField("raft_url");
+            try jw.write(value);
+        }
+        if (self.role) |value| {
+            try jw.objectField("role");
+            try jw.write(value);
+        }
+        if (self.state) |value| {
+            try jw.objectField("state");
+            try jw.write(value);
+        }
+        if (self.health_class) |value| {
+            try jw.objectField("health_class");
+            try jw.write(value);
+        }
+        if (self.failure_domain) |value| {
+            try jw.objectField("failure_domain");
+            try jw.write(value);
+        }
+        if (self.live) |value| {
+            try jw.objectField("live");
+            try jw.write(value);
+        }
+        if (self.drain_requested) |value| {
+            try jw.objectField("drain_requested");
+            try jw.write(value);
+        }
+        if (self.capacity_bytes) |value| {
+            try jw.objectField("capacity_bytes");
+            try jw.write(value);
+        }
+        if (self.available_bytes) |value| {
+            try jw.objectField("available_bytes");
+            try jw.write(value);
+        }
+        if (self.lease_pressure) |value| {
+            try jw.objectField("lease_pressure");
+            try jw.write(value);
+        }
+        if (self.read_load) |value| {
+            try jw.objectField("read_load");
+            try jw.write(value);
+        }
+        if (self.write_load) |value| {
+            try jw.objectField("write_load");
+            try jw.write(value);
+        }
+        if (self.active_backfills) |value| {
+            try jw.objectField("active_backfills");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ClusterDataRangeStatus = struct {
@@ -1085,6 +2161,34 @@ pub const ClusterDataRangeStatus = struct {
     disk_bytes: ?i64 = null,
     empty: ?bool = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "disk_bytes",
+            "doc_count",
+            "doc_identity_range_id",
+            "doc_identity_shard_id",
+            "empty",
+            "start_key",
+            "state",
+            "table_name",
+            "voter_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "disk_bytes",
+            "doc_count",
+            "doc_identity_range_id",
+            "doc_identity_shard_id",
+            "empty",
+            "start_key",
+            "state",
+            "table_name",
+            "voter_count",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("group_id");
@@ -1096,16 +2200,10 @@ pub const ClusterDataRangeStatus = struct {
         if (self.table_name) |value| {
             try jw.objectField("table_name");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("table_name");
-            try jw.write(@as(?u8, null));
         }
         if (self.start_key) |value| {
             try jw.objectField("start_key");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("start_key");
-            try jw.write(@as(?u8, null));
         }
         switch (self.end_key) {
             .absent => {},
@@ -1121,23 +2219,14 @@ pub const ClusterDataRangeStatus = struct {
         if (self.doc_identity_shard_id) |value| {
             try jw.objectField("doc_identity_shard_id");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("doc_identity_shard_id");
-            try jw.write(@as(?u8, null));
         }
         if (self.doc_identity_range_id) |value| {
             try jw.objectField("doc_identity_range_id");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("doc_identity_range_id");
-            try jw.write(@as(?u8, null));
         }
         if (self.state) |value| {
             try jw.objectField("state");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("state");
-            try jw.write(@as(?u8, null));
         }
         switch (self.leader_data_id) {
             .absent => {},
@@ -1153,30 +2242,18 @@ pub const ClusterDataRangeStatus = struct {
         if (self.voter_count) |value| {
             try jw.objectField("voter_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("voter_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.doc_count) |value| {
             try jw.objectField("doc_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("doc_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.disk_bytes) |value| {
             try jw.objectField("disk_bytes");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("disk_bytes");
-            try jw.write(@as(?u8, null));
         }
         if (self.empty) |value| {
             try jw.objectField("empty");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("empty");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -1188,6 +2265,35 @@ pub const ClusterDataReplicaStatus = struct {
     node_id: i64,
     replica_id: i64,
     peer_node_ids: ?[]const i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "peer_node_ids",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "peer_node_ids",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("group_id");
+        try jw.write(self.group_id);
+        try jw.objectField("data_id");
+        try jw.write(self.data_id);
+        try jw.objectField("node_id");
+        try jw.write(self.node_id);
+        try jw.objectField("replica_id");
+        try jw.write(self.replica_id);
+        if (self.peer_node_ids) |value| {
+            try jw.objectField("peer_node_ids");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Typed Zig status view for table data topology and range placement.
@@ -1196,6 +2302,45 @@ pub const ClusterDataStatus = struct {
     ranges: ?[]const ClusterDataRangeStatus = null,
     replicas: ?[]const ClusterDataReplicaStatus = null,
     groups: ?[]const ClusterDataGroupStatus = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "groups",
+            "nodes",
+            "ranges",
+            "replicas",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "groups",
+            "nodes",
+            "ranges",
+            "replicas",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.nodes) |value| {
+            try jw.objectField("nodes");
+            try jw.write(value);
+        }
+        if (self.ranges) |value| {
+            try jw.objectField("ranges");
+            try jw.write(value);
+        }
+        if (self.replicas) |value| {
+            try jw.objectField("replicas");
+            try jw.write(value);
+        }
+        if (self.groups) |value| {
+            try jw.objectField("groups");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Overall health status of the cluster
@@ -1244,6 +2389,39 @@ pub const ClusterRestoreRequest = struct {
     table_names: ?[]const []const u8 = null,
     /// How to handle existing tables: - `fail_if_exists`: Abort if any table already exists (default) - `skip_if_exists`: Skip existing tables, restore others - `overwrite`: Atomically replace existing table generations after staging and validation
     restore_mode: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "restore_mode",
+            "table_names",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "restore_mode",
+            "table_names",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        try jw.objectField("location");
+        try jw.write(self.location);
+        try jw.objectField("connection");
+        try jw.write(self.connection);
+        if (self.table_names) |value| {
+            try jw.objectField("table_names");
+            try jw.write(value);
+        }
+        if (self.restore_mode) |value| {
+            try jw.objectField("restore_mode");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ClusterRestoreResponse = struct {
@@ -1264,6 +2442,59 @@ pub const ClusterStatus = struct {
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "auth_enabled",
+            "deployment_mode",
+            "message",
+            "runtime_config",
+            "secret_store",
+            "storage",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "auth_enabled",
+            "deployment_mode",
+            "message",
+            "runtime_config",
+            "secret_store",
+            "storage",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("health");
+        try jw.write(self.health);
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.auth_enabled) |value| {
+            try jw.objectField("auth_enabled");
+            try jw.write(value);
+        }
+        if (self.deployment_mode) |value| {
+            try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.secret_store) |value| {
+            try jw.objectField("secret_store");
+            try jw.write(value);
+        }
+        if (self.runtime_config) |value| {
+            try jw.objectField("runtime_config");
+            try jw.write(value);
+        }
+        if (self.storage) |value| {
+            try jw.objectField("storage");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ClusterTopology = struct {
@@ -1278,6 +2509,61 @@ pub const ClusterTopology = struct {
     runtime_config: ?RuntimeConfigStatus = null,
     storage: ?StorageRuntimeStatus = null,
     data: ClusterDataStatus,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "auth_enabled",
+            "deployment_mode",
+            "message",
+            "runtime_config",
+            "secret_store",
+            "storage",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "auth_enabled",
+            "deployment_mode",
+            "message",
+            "runtime_config",
+            "secret_store",
+            "storage",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("health");
+        try jw.write(self.health);
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.auth_enabled) |value| {
+            try jw.objectField("auth_enabled");
+            try jw.write(value);
+        }
+        if (self.deployment_mode) |value| {
+            try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.secret_store) |value| {
+            try jw.objectField("secret_store");
+            try jw.write(value);
+        }
+        if (self.runtime_config) |value| {
+            try jw.objectField("runtime_config");
+            try jw.write(value);
+        }
+        if (self.storage) |value| {
+            try jw.objectField("storage");
+            try jw.write(value);
+        }
+        try jw.objectField("data");
+        try jw.write(self.data);
+        try jw.endObject();
+    }
 };
 
 pub const ConnectedModel = struct {
@@ -1289,6 +2575,41 @@ pub const ConnectedModel = struct {
     dimensions: ?i64 = null,
     /// True when this model is referenced by a configured embedder, generator, reranker, or chunker.
     configured: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "configured",
+            "dimensions",
+            "display_name",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "configured",
+            "dimensions",
+            "display_name",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.display_name) |value| {
+            try jw.objectField("display_name");
+            try jw.write(value);
+        }
+        if (self.dimensions) |value| {
+            try jw.objectField("dimensions");
+            try jw.write(value);
+        }
+        if (self.configured) |value| {
+            try jw.objectField("configured");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Model task type. Mirrors the inference registry taxonomy; "other" is used for models whose task type the provider's listing API does not classify.
@@ -1362,6 +2683,79 @@ pub const Connection = struct {
     web_search: ?WebSearchConnection = null,
     external_io: ?ExternalIoConnection = null,
     cdc: ?CdcConnection = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "cdc",
+            "display_name",
+            "error",
+            "external_io",
+            "inference",
+            "provider",
+            "sources",
+            "web_search",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "cdc",
+            "display_name",
+            "error",
+            "external_io",
+            "inference",
+            "provider",
+            "sources",
+            "web_search",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.display_name) |value| {
+            try jw.objectField("display_name");
+            try jw.write(value);
+        }
+        if (self.provider) |value| {
+            try jw.objectField("provider");
+            try jw.write(value);
+        }
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.objectField("capabilities");
+        try jw.write(self.capabilities);
+        if (self.sources) |value| {
+            try jw.objectField("sources");
+            try jw.write(value);
+        }
+        if (self.inference) |value| {
+            try jw.objectField("inference");
+            try jw.write(value);
+        }
+        if (self.web_search) |value| {
+            try jw.objectField("web_search");
+            try jw.write(value);
+        }
+        if (self.external_io) |value| {
+            try jw.objectField("external_io");
+            try jw.write(value);
+        }
+        if (self.cdc) |value| {
+            try jw.objectField("cdc");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Kind of external connection configured on this node.
@@ -1443,6 +2837,18 @@ pub const CreateApiKeyRequest = struct {
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "expires_in",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "expires_in",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("name");
@@ -1450,9 +2856,6 @@ pub const CreateApiKeyRequest = struct {
         if (self.expires_in) |value| {
             try jw.objectField("expires_in");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("expires_in");
-            try jw.write(@as(?u8, null));
         }
         switch (self.permissions) {
             .absent => {},
@@ -1491,6 +2894,52 @@ pub const CreateTableRequest = struct {
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     replication_sources: ?[]const ReplicationSource = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "description",
+            "indexes",
+            "num_shards",
+            "replication_sources",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "description",
+            "indexes",
+            "num_shards",
+            "replication_sources",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.num_shards) |value| {
+            try jw.objectField("num_shards");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        if (self.indexes) |value| {
+            try jw.objectField("indexes");
+            try jw.write(value);
+        }
+        if (self.schema) |value| {
+            try jw.objectField("schema");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("schema");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.replication_sources) |value| {
+            try jw.objectField("replication_sources");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const CreateUserRequest = struct {
@@ -1502,14 +2951,23 @@ pub const CreateUserRequest = struct {
     /// Auth metadata available to stored row-filter policies.
     metadata: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "username",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "username",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         if (self.username) |value| {
             try jw.objectField("username");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("username");
-            try jw.write(@as(?u8, null));
         }
         try jw.objectField("password");
         try jw.write(self.password);
@@ -1555,6 +3013,35 @@ pub const DistanceRange = struct {
     from: ?f32 = null,
     /// Maximum distance (exclusive)
     to: ?f32 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Distance unit for geo aggregations: - m: meters - km: kilometers - mi: miles - ft: feet - yd: yards
@@ -1763,6 +3250,30 @@ pub const DocumentArtifactManifest = struct {
     /// Optional opaque JSON state for incremental processing. Present only for raw detail responses.
     state_json: OpenApiOptionalNullable([]const u8) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "manifest_json",
+            "ocr_attempted_count",
+            "ocr_failed_count",
+            "ocr_failed_page_numbers",
+            "ocr_failed_pages_truncated",
+            "ocr_retained_embedded_count",
+            "ocr_selected_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "manifest_json",
+            "ocr_attempted_count",
+            "ocr_failed_count",
+            "ocr_failed_page_numbers",
+            "ocr_failed_pages_truncated",
+            "ocr_retained_embedded_count",
+            "ocr_selected_count",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("document_id");
@@ -1801,44 +3312,26 @@ pub const DocumentArtifactManifest = struct {
         if (self.ocr_attempted_count) |value| {
             try jw.objectField("ocr_attempted_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("ocr_attempted_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.ocr_selected_count) |value| {
             try jw.objectField("ocr_selected_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("ocr_selected_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.ocr_retained_embedded_count) |value| {
             try jw.objectField("ocr_retained_embedded_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("ocr_retained_embedded_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.ocr_failed_count) |value| {
             try jw.objectField("ocr_failed_count");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("ocr_failed_count");
-            try jw.write(@as(?u8, null));
         }
         if (self.ocr_failed_page_numbers) |value| {
             try jw.objectField("ocr_failed_page_numbers");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("ocr_failed_page_numbers");
-            try jw.write(@as(?u8, null));
         }
         if (self.ocr_failed_pages_truncated) |value| {
             try jw.objectField("ocr_failed_pages_truncated");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("ocr_failed_pages_truncated");
-            try jw.write(@as(?u8, null));
         }
         try jw.objectField("child_ranges");
         try jw.write(self.child_ranges);
@@ -1879,9 +3372,6 @@ pub const DocumentArtifactManifest = struct {
         if (self.manifest_json) |value| {
             try jw.objectField("manifest_json");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("manifest_json");
-            try jw.write(@as(?u8, null));
         }
         switch (self.state_json) {
             .absent => {},
@@ -2036,6 +3526,45 @@ pub const DocumentArtifactReprocessJobStartRequest = struct {
     limit: ?i64 = null,
     /// When true, immediately runs the first bounded pass before returning the job state.
     advance: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "advance",
+            "from_key",
+            "limit",
+            "to_key",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "advance",
+            "from_key",
+            "limit",
+            "to_key",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.from_key) |value| {
+            try jw.objectField("from_key");
+            try jw.write(value);
+        }
+        if (self.to_key) |value| {
+            try jw.objectField("to_key");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.advance) |value| {
+            try jw.objectField("advance");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessResponse = struct {
@@ -2098,6 +3627,45 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     limit: ?i64 = null,
     /// Per-shard continuation cursors returned by a prior response. When present, distributed repair resumes exactly these shard-local cursors instead of resolving a fresh global key span.
     shard_cursors: ?[]const DocumentArtifactReprocessShardCursor = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "from_key",
+            "limit",
+            "shard_cursors",
+            "to_key",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "from_key",
+            "limit",
+            "shard_cursors",
+            "to_key",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.from_key) |value| {
+            try jw.objectField("from_key");
+            try jw.write(value);
+        }
+        if (self.to_key) |value| {
+            try jw.objectField("to_key");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.shard_cursors) |value| {
+            try jw.objectField("shard_cursors");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const DocumentArtifactTableReprocessResponse = struct {
@@ -2172,6 +3740,33 @@ pub const EdgesResponse = struct {
     edges: ?[]const Edge = null,
     /// Total number of edges returned
     count: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "count",
+            "edges",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "count",
+            "edges",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.edges) |value| {
+            try jw.objectField("edges");
+            try jw.write(value);
+        }
+        if (self.count) |value| {
+            try jw.objectField("count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Embedding = std.json.Value;
@@ -2187,6 +3782,47 @@ pub const Error = struct {
     retryable: ?bool = null,
     /// Suggested minimum retry delay in milliseconds.
     retry_after_ms: ?i32 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "code",
+            "message",
+            "retry_after_ms",
+            "retryable",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "code",
+            "message",
+            "retry_after_ms",
+            "retryable",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.code) |value| {
+            try jw.objectField("code");
+            try jw.write(value);
+        }
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.retryable) |value| {
+            try jw.objectField("retryable");
+            try jw.write(value);
+        }
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ExactSortError = struct {
@@ -2205,6 +3841,41 @@ pub const ExactSortError = struct {
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: []const u8,
     status: i32,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "budget_rejection_reason",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "budget_rejection_reason",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("error");
+        try jw.write(self.@"error");
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("reason");
+        try jw.write(self.reason);
+        try jw.objectField("sort_rejection_reason");
+        try jw.write(self.sort_rejection_reason);
+        if (self.budget_rejection_reason) |value| {
+            try jw.objectField("budget_rejection_reason");
+            try jw.write(value);
+        }
+        try jw.objectField("sort_rejection_detail");
+        try jw.write(self.sort_rejection_detail);
+        try jw.objectField("sort_rejection_field");
+        try jw.write(self.sort_rejection_field);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.endObject();
+    }
 };
 
 pub const ExternalIoConnection = struct {
@@ -2217,6 +3888,47 @@ pub const ExternalIoConnection = struct {
     prefix: ?[]const u8 = null,
     /// Hosts or base URLs this connection applies to.
     hosts: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "buckets",
+            "endpoint",
+            "hosts",
+            "prefix",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "buckets",
+            "endpoint",
+            "hosts",
+            "prefix",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("protocol");
+        try jw.write(self.protocol);
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.buckets) |value| {
+            try jw.objectField("buckets");
+            try jw.write(value);
+        }
+        if (self.prefix) |value| {
+            try jw.objectField("prefix");
+            try jw.write(value);
+        }
+        if (self.hosts) |value| {
+            try jw.objectField("hosts");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// External IO transport protocol.
@@ -2255,6 +3967,39 @@ pub const FailedOperation = struct {
     id: ?[]const u8 = null,
     operation: ?[]const u8 = null,
     @"error": ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "error",
+            "id",
+            "operation",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "error",
+            "id",
+            "operation",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.operation) |value| {
+            try jw.objectField("operation");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Public field capability derived from Antfly schema mappings and observed dynamic field metadata.
@@ -2291,56 +4036,65 @@ pub const FieldCapability = struct {
     /// Sort direction in the table index_sort tuple when this field participates.
     index_sort_order: ?[]const u8 = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "analyzer",
+            "document_schema",
+            "emitted_name",
+            "field",
+            "field_pattern",
+            "index_sort_order",
+            "index_sort_position",
+            "match_mapping_type",
+            "name",
+            "path_pattern",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "analyzer",
+            "document_schema",
+            "emitted_name",
+            "field",
+            "field_pattern",
+            "index_sort_order",
+            "index_sort_position",
+            "match_mapping_type",
+            "name",
+            "path_pattern",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         if (self.name) |value| {
             try jw.objectField("name");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("name");
-            try jw.write(@as(?u8, null));
         }
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         if (self.path_pattern) |value| {
             try jw.objectField("path_pattern");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("path_pattern");
-            try jw.write(@as(?u8, null));
         }
         if (self.field_pattern) |value| {
             try jw.objectField("field_pattern");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field_pattern");
-            try jw.write(@as(?u8, null));
         }
         if (self.match_mapping_type) |value| {
             try jw.objectField("match_mapping_type");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("match_mapping_type");
-            try jw.write(@as(?u8, null));
         }
         if (self.emitted_name) |value| {
             try jw.objectField("emitted_name");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("emitted_name");
-            try jw.write(@as(?u8, null));
         }
         if (self.document_schema) |value| {
             try jw.objectField("document_schema");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("document_schema");
-            try jw.write(@as(?u8, null));
         }
         try jw.objectField("type");
         try jw.write(self.type);
@@ -2357,23 +4111,14 @@ pub const FieldCapability = struct {
         if (self.analyzer) |value| {
             try jw.objectField("analyzer");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("analyzer");
-            try jw.write(@as(?u8, null));
         }
         if (self.index_sort_position) |value| {
             try jw.objectField("index_sort_position");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("index_sort_position");
-            try jw.write(@as(?u8, null));
         }
         if (self.index_sort_order) |value| {
             try jw.objectField("index_sort_order");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("index_sort_order");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -2391,6 +4136,51 @@ pub const FieldStatistics = struct {
     max_value: ?std.json.Value = null,
     /// Average size in bytes for variable-length fields.
     avg_size: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "avg_size",
+            "cardinality",
+            "max_value",
+            "min_value",
+            "null_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "avg_size",
+            "cardinality",
+            "max_value",
+            "min_value",
+            "null_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.cardinality) |value| {
+            try jw.objectField("cardinality");
+            try jw.write(value);
+        }
+        if (self.null_count) |value| {
+            try jw.objectField("null_count");
+            try jw.write(value);
+        }
+        if (self.min_value) |value| {
+            try jw.objectField("min_value");
+            try jw.write(value);
+        }
+        if (self.max_value) |value| {
+            try jw.objectField("max_value");
+            try jw.write(value);
+        }
+        if (self.avg_size) |value| {
+            try jw.objectField("avg_size");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ForeignColumn = struct {
@@ -2400,6 +4190,31 @@ pub const ForeignColumn = struct {
     type: []const u8,
     /// Whether the column allows NULL values.
     nullable: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "nullable",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "nullable",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("type");
+        try jw.write(self.type);
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ForeignSource = struct {
@@ -2411,6 +4226,33 @@ pub const ForeignSource = struct {
     postgres_table: []const u8,
     /// Optional column definitions for the foreign table. If omitted, columns are auto-discovered from `information_schema.columns` on first query.
     columns: ?[]const ForeignColumn = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "columns",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "columns",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("dsn");
+        try jw.write(self.dsn);
+        try jw.objectField("postgres_table");
+        try jw.write(self.postgres_table);
+        if (self.columns) |value| {
+            try jw.objectField("columns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const GraphAnchorFilterRequiresIndexError = struct {
@@ -2493,11 +4335,89 @@ pub const HierarchyAncestor = struct {
     artifact_name: ?[]const u8 = null,
     source_field: ?[]const u8 = null,
     provenance: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_name",
+            "document",
+            "id",
+            "key",
+            "provenance",
+            "source_field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_name",
+            "document",
+            "id",
+            "key",
+            "provenance",
+            "source_field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.document) |value| {
+            try jw.objectField("document");
+            try jw.write(value);
+        }
+        if (self.key) |value| {
+            try jw.objectField("key");
+            try jw.write(value);
+        }
+        if (self.artifact_name) |value| {
+            try jw.objectField("artifact_name");
+            try jw.write(value);
+        }
+        if (self.source_field) |value| {
+            try jw.objectField("source_field");
+            try jw.write(value);
+        }
+        if (self.provenance) |value| {
+            try jw.objectField("provenance");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyAncestors = struct {
     source: ?HierarchyProjection = null,
     unit: ?HierarchyProjection = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "source",
+            "unit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "source",
+            "unit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.unit) |value| {
+            try jw.objectField("unit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyArtifact = struct {
@@ -2506,6 +4426,43 @@ pub const HierarchyArtifact = struct {
     chunk_id: ?i64 = null,
     unit_id: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_id",
+            "source",
+            "unit_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_id",
+            "source",
+            "unit_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.chunk_id) |value| {
+            try jw.objectField("chunk_id");
+            try jw.write(value);
+        }
+        if (self.unit_id) |value| {
+            try jw.objectField("unit_id");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyArtifactSource = struct {
@@ -2513,6 +4470,37 @@ pub const HierarchyArtifactSource = struct {
     kind: []const u8,
     chunk_id: ?i64 = null,
     unit_id: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "chunk_id",
+            "unit_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "chunk_id",
+            "unit_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        if (self.chunk_id) |value| {
+            try jw.objectField("chunk_id");
+            try jw.write(value);
+        }
+        if (self.unit_id) |value| {
+            try jw.objectField("unit_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyChildParent = struct {
@@ -2559,12 +4547,116 @@ pub const HierarchyEvidence = struct {
     resolver_table: ?[]const u8 = null,
     mention: ?std.json.Value = null,
     canonical: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "canonical",
+            "confidence",
+            "decision",
+            "local_id",
+            "mention",
+            "resolution_artifact",
+            "resolution_artifact_key",
+            "resolver",
+            "resolver_table",
+            "source_artifact",
+            "source_artifact_key",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "canonical",
+            "confidence",
+            "decision",
+            "local_id",
+            "mention",
+            "resolution_artifact",
+            "resolution_artifact_key",
+            "resolver",
+            "resolver_table",
+            "source_artifact",
+            "source_artifact_key",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.local_id) |value| {
+            try jw.objectField("local_id");
+            try jw.write(value);
+        }
+        if (self.decision) |value| {
+            try jw.objectField("decision");
+            try jw.write(value);
+        }
+        if (self.confidence) |value| {
+            try jw.objectField("confidence");
+            try jw.write(value);
+        }
+        if (self.source_artifact) |value| {
+            try jw.objectField("source_artifact");
+            try jw.write(value);
+        }
+        if (self.source_artifact_key) |value| {
+            try jw.objectField("source_artifact_key");
+            try jw.write(value);
+        }
+        if (self.resolution_artifact) |value| {
+            try jw.objectField("resolution_artifact");
+            try jw.write(value);
+        }
+        if (self.resolution_artifact_key) |value| {
+            try jw.objectField("resolution_artifact_key");
+            try jw.write(value);
+        }
+        if (self.resolver) |value| {
+            try jw.objectField("resolver");
+            try jw.write(value);
+        }
+        if (self.resolver_table) |value| {
+            try jw.objectField("resolver_table");
+            try jw.write(value);
+        }
+        if (self.mention) |value| {
+            try jw.objectField("mention");
+            try jw.write(value);
+        }
+        if (self.canonical) |value| {
+            try jw.objectField("canonical");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyGroupBy = struct {
     /// Hierarchy level used to group the records matched by the targeted index. Unit groups are relevance-ranked and do not accept `order_by`, `search_after`, or `search_before`; use `hierarchy.children` for sequential, cursor-paginated unit traversal.
     level: []const u8,
     matches: ?HierarchyMatches = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "matches",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "matches",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.matches) |value| {
+            try jw.objectField("matches");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyMatchContext = struct {
@@ -2573,6 +4665,51 @@ pub const HierarchyMatchContext = struct {
     parent_unit_id: ?[]const u8 = null,
     artifact: ?HierarchyArtifact = null,
     ancestors: ?QueryHitHierarchyAncestors = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "ancestors",
+            "artifact",
+            "level",
+            "parent_doc_key",
+            "parent_unit_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "ancestors",
+            "artifact",
+            "level",
+            "parent_doc_key",
+            "parent_unit_id",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.level) |value| {
+            try jw.objectField("level");
+            try jw.write(value);
+        }
+        if (self.parent_doc_key) |value| {
+            try jw.objectField("parent_doc_key");
+            try jw.write(value);
+        }
+        if (self.parent_unit_id) |value| {
+            try jw.objectField("parent_unit_id");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.ancestors) |value| {
+            try jw.objectField("ancestors");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyMatchHit = struct {
@@ -2583,6 +4720,43 @@ pub const HierarchyMatchHit = struct {
     _distance: ?f32 = null,
     _source: ?std.json.Value = null,
     hierarchy: ?HierarchyMatchContext = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "_distance",
+            "_source",
+            "hierarchy",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "_distance",
+            "_source",
+            "hierarchy",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("_id");
+        try jw.write(self._id);
+        try jw.objectField("_score");
+        try jw.write(self._score);
+        if (self._distance) |value| {
+            try jw.objectField("_distance");
+            try jw.write(value);
+        }
+        if (self._source) |value| {
+            try jw.objectField("_source");
+            try jw.write(value);
+        }
+        if (self.hierarchy) |value| {
+            try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyMatches = struct {
@@ -2590,6 +4764,29 @@ pub const HierarchyMatches = struct {
     limit: ?i64 = null,
     /// Fields to include in each nested match. This projection is required because grouped and matching records commonly have different schemas. Use an empty array to return match identity and hierarchy metadata without stored fields.
     fields: []const []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.objectField("fields");
+        try jw.write(self.fields);
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyProjection = struct {
@@ -2650,6 +4847,65 @@ pub const InferenceConnection = struct {
     configured_model_types: ?[]const ConnectedModelType = null,
     /// Models reported by the provider, grouped by model type. Keys are pluralized ConnectedModelType values ("embedders", "generators", "rerankers", "chunkers", "classifiers", "rewriters", "readers", "transcribers", "extractors") plus "other" for models the provider's listing API does not classify by task. Populated only when the request includes the "models" expansion.
     models: ?std.json.ArrayHashMap([]const ConnectedModel) = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "configured_model_types",
+            "location",
+            "models",
+            "names",
+            "project_id",
+            "region",
+            "url",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "configured_model_types",
+            "location",
+            "models",
+            "names",
+            "project_id",
+            "region",
+            "url",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.names) |value| {
+            try jw.objectField("names");
+            try jw.write(value);
+        }
+        if (self.configured_model_types) |value| {
+            try jw.objectField("configured_model_types");
+            try jw.write(value);
+        }
+        if (self.models) |value| {
+            try jw.objectField("models");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Inference provider type for a connection.
@@ -2719,6 +4975,24 @@ pub const JoinClause = struct {
     /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
     nested_join: OpenApiOptionalNullable(std.json.Value) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "join_type",
+            "right_fields",
+            "right_filters",
+            "strategy_hint",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "join_type",
+            "right_fields",
+            "right_filters",
+            "strategy_hint",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("right_table");
@@ -2726,32 +5000,20 @@ pub const JoinClause = struct {
         if (self.join_type) |value| {
             try jw.objectField("join_type");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("join_type");
-            try jw.write(@as(?u8, null));
         }
         try jw.objectField("on");
         try jw.write(self.on);
         if (self.right_filters) |value| {
             try jw.objectField("right_filters");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("right_filters");
-            try jw.write(@as(?u8, null));
         }
         if (self.right_fields) |value| {
             try jw.objectField("right_fields");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("right_fields");
-            try jw.write(@as(?u8, null));
         }
         if (self.strategy_hint) |value| {
             try jw.objectField("strategy_hint");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("strategy_hint");
-            try jw.write(@as(?u8, null));
         }
         switch (self.nested_join) {
             .absent => {},
@@ -2776,6 +5038,31 @@ pub const JoinCondition = struct {
     right_field: []const u8,
     /// Comparison operator. Defaults to "eq" (equality).
     operator: ?JoinOperator = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "operator",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "operator",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("left_field");
+        try jw.write(self.left_field);
+        try jw.objectField("right_field");
+        try jw.write(self.right_field);
+        if (self.operator) |value| {
+            try jw.objectField("operator");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Filters to apply to a table before joining.
@@ -2786,6 +5073,39 @@ pub const JoinFilters = struct {
     filter_prefix: ?[]const u8 = null,
     /// Maximum number of rows to include from this table.
     limit: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "filter_prefix",
+            "filter_query",
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "filter_prefix",
+            "filter_query",
+            "limit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.filter_prefix) |value| {
+            try jw.objectField("filter_prefix");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Comparison operator for join condition: - `eq`: Equal (default) - `neq`: Not equal - `lt`: Less than - `lte`: Less than or equal - `gt`: Greater than - `gte`: Greater than or equal
@@ -2842,6 +5162,63 @@ pub const JoinProfile = struct {
     rows_unmatched_right: ?i64 = null,
     /// Time spent executing the join in milliseconds.
     duration_ms: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "duration_ms",
+            "left_rows_scanned",
+            "right_rows_scanned",
+            "rows_matched",
+            "rows_unmatched_left",
+            "rows_unmatched_right",
+            "strategy_used",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "duration_ms",
+            "left_rows_scanned",
+            "right_rows_scanned",
+            "rows_matched",
+            "rows_unmatched_left",
+            "rows_unmatched_right",
+            "strategy_used",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.strategy_used) |value| {
+            try jw.objectField("strategy_used");
+            try jw.write(value);
+        }
+        if (self.left_rows_scanned) |value| {
+            try jw.objectField("left_rows_scanned");
+            try jw.write(value);
+        }
+        if (self.right_rows_scanned) |value| {
+            try jw.objectField("right_rows_scanned");
+            try jw.write(value);
+        }
+        if (self.rows_matched) |value| {
+            try jw.objectField("rows_matched");
+            try jw.write(value);
+        }
+        if (self.rows_unmatched_left) |value| {
+            try jw.objectField("rows_unmatched_left");
+            try jw.write(value);
+        }
+        if (self.rows_unmatched_right) |value| {
+            try jw.objectField("rows_unmatched_right");
+            try jw.write(value);
+        }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Strategy for executing the join: - `broadcast`: Broadcast small table to all shards of large table. Best for dimension tables < 10MB. O(small_table) memory per shard. - `index_lookup`: Use batch key lookups via indexes. Best for selective joins with indexed join keys. Low memory overhead. - `shuffle`: Hash-partition both tables by join key. Best for large-large table joins. Requires data movement.
@@ -2906,6 +5283,33 @@ pub const JoinType = enum {
 pub const KeyRange = struct {
     from: ?[]const u8 = null,
     to: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "from",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
@@ -2946,6 +5350,41 @@ pub const LinearMergeRequest = struct {
     /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
     dry_run: ?bool = null,
     sync_level: ?SyncLevel = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "dry_run",
+            "last_merged_id",
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "dry_run",
+            "last_merged_id",
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("records");
+        try jw.write(self.records);
+        if (self.last_merged_id) |value| {
+            try jw.objectField("last_merged_id");
+            try jw.write(value);
+        }
+        if (self.dry_run) |value| {
+            try jw.objectField("dry_run");
+            try jw.write(value);
+        }
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const LinearMergeResult = struct {
@@ -2967,6 +5406,67 @@ pub const LinearMergeResult = struct {
     /// Additional information (e.g., "stopped at shard boundary", "dry run - no changes made")
     message: ?[]const u8 = null,
     took: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "deleted_ids",
+            "failed",
+            "key_range",
+            "keys_scanned",
+            "message",
+            "took",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "deleted_ids",
+            "failed",
+            "key_range",
+            "keys_scanned",
+            "message",
+            "took",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        try jw.objectField("upserted");
+        try jw.write(self.upserted);
+        try jw.objectField("skipped");
+        try jw.write(self.skipped);
+        try jw.objectField("deleted");
+        try jw.write(self.deleted);
+        if (self.deleted_ids) |value| {
+            try jw.objectField("deleted_ids");
+            try jw.write(value);
+        }
+        if (self.failed) |value| {
+            try jw.objectField("failed");
+            try jw.write(value);
+        }
+        try jw.objectField("next_cursor");
+        try jw.write(self.next_cursor);
+        if (self.key_range) |value| {
+            try jw.objectField("key_range");
+            try jw.write(value);
+        }
+        if (self.keys_scanned) |value| {
+            try jw.objectField("keys_scanned");
+            try jw.write(value);
+        }
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        if (self.took) |value| {
+            try jw.objectField("took");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
@@ -3073,6 +5573,585 @@ pub const LsmStorageStatus = struct {
     direct_bulk_ingest_fallback_unsupported_count: ?i64 = null,
     direct_bulk_ingest_fallback_backend_mutable_count: ?i64 = null,
     direct_bulk_ingest_fallback_below_threshold_count: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "active_bulk_ingest_batches",
+            "active_immutable_logical_bytes",
+            "active_readers",
+            "active_readers_bound_read_txn",
+            "active_readers_compaction",
+            "active_readers_current_scan",
+            "active_readers_namespace_read_txn",
+            "active_readers_other",
+            "active_readers_probe_txn",
+            "active_readers_write_txn",
+            "bulk_append_attempt_count",
+            "bulk_append_direct_entry_count",
+            "bulk_append_direct_success_count",
+            "bulk_append_entry_count",
+            "bulk_append_fallback_backend_pending_count",
+            "bulk_append_fallback_below_threshold_count",
+            "bulk_append_fallback_duplicate_key_count",
+            "bulk_append_fallback_to_mutable_entry_count",
+            "compactable_l0_run_count",
+            "compaction_backlog_bytes",
+            "current_manifest_bytes",
+            "direct_bulk_ingest_attempt_count",
+            "direct_bulk_ingest_direct_entry_count",
+            "direct_bulk_ingest_entry_count",
+            "direct_bulk_ingest_fallback_backend_mutable_count",
+            "direct_bulk_ingest_fallback_below_threshold_count",
+            "direct_bulk_ingest_fallback_unsupported_count",
+            "direct_bulk_ingest_success_count",
+            "flush_count",
+            "flush_output_bytes",
+            "flush_output_run_count",
+            "hard_limit_l0_bytes",
+            "hard_limit_l0_run_count",
+            "immutable_bytes",
+            "immutable_entry_count",
+            "immutable_flush_count",
+            "immutable_memtable_count",
+            "immutable_rotation_count",
+            "l0_bytes",
+            "l0_run_count",
+            "level_overflow_bytes",
+            "level_overflow_run_count",
+            "lower_level_bytes",
+            "lower_level_run_count",
+            "maintenance_debt_hint",
+            "maintenance_score",
+            "manifest_bytes",
+            "manifest_dirty",
+            "manifest_write_count",
+            "max_level",
+            "mutable_bytes",
+            "mutable_entry_count",
+            "mutable_snapshot_clone_bytes",
+            "mutable_snapshot_clone_count",
+            "mutable_snapshot_clone_peak_bytes",
+            "obsolete_delete_failures",
+            "obsolete_delete_retries",
+            "obsolete_manifest_dirty",
+            "obsolete_path_count",
+            "obsolete_paths_pinned_by_reader_bound_read_txn",
+            "obsolete_paths_pinned_by_reader_compaction",
+            "obsolete_paths_pinned_by_reader_current_scan",
+            "obsolete_paths_pinned_by_reader_namespace_read_txn",
+            "obsolete_paths_pinned_by_reader_other",
+            "obsolete_paths_pinned_by_reader_probe_txn",
+            "obsolete_paths_pinned_by_reader_write_txn",
+            "obsolete_paths_pinned_by_readers",
+            "obsolete_paths_pinned_by_versions",
+            "obsolete_paths_reclaimable",
+            "obsolete_paths_waiting_for_retry",
+            "overlapping_l0_run_count",
+            "read_snapshot_mutable_rotation_bytes",
+            "read_snapshot_mutable_rotation_count",
+            "run_bytes",
+            "run_count",
+            "soft_limit_l0_bytes",
+            "soft_limit_l0_run_count",
+            "sorted_ingest_bytes",
+            "sorted_ingest_run_count",
+            "unpublished_wal_logical_bytes",
+            "unpublished_wal_max_batch_logical_bytes",
+            "wal_checkpoint_pending",
+            "wal_checkpoint_retry_attempts",
+            "wal_checkpoint_retry_delay_ns",
+            "wal_checkpoint_retry_reason",
+            "wal_pressure_blocked",
+            "wal_retained_bytes",
+            "write_pressure_compaction_count",
+            "write_pressure_compaction_step_count",
+            "write_pressure_event_count",
+            "write_pressure_overload_count",
+            "write_pressure_overload_l0_run_debt",
+            "write_stall_l0_byte_debt",
+            "write_stall_l0_run_debt",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "active_bulk_ingest_batches",
+            "active_immutable_logical_bytes",
+            "active_readers",
+            "active_readers_bound_read_txn",
+            "active_readers_compaction",
+            "active_readers_current_scan",
+            "active_readers_namespace_read_txn",
+            "active_readers_other",
+            "active_readers_probe_txn",
+            "active_readers_write_txn",
+            "bulk_append_attempt_count",
+            "bulk_append_direct_entry_count",
+            "bulk_append_direct_success_count",
+            "bulk_append_entry_count",
+            "bulk_append_fallback_backend_pending_count",
+            "bulk_append_fallback_below_threshold_count",
+            "bulk_append_fallback_duplicate_key_count",
+            "bulk_append_fallback_to_mutable_entry_count",
+            "compactable_l0_run_count",
+            "compaction_backlog_bytes",
+            "current_manifest_bytes",
+            "direct_bulk_ingest_attempt_count",
+            "direct_bulk_ingest_direct_entry_count",
+            "direct_bulk_ingest_entry_count",
+            "direct_bulk_ingest_fallback_backend_mutable_count",
+            "direct_bulk_ingest_fallback_below_threshold_count",
+            "direct_bulk_ingest_fallback_unsupported_count",
+            "direct_bulk_ingest_success_count",
+            "flush_count",
+            "flush_output_bytes",
+            "flush_output_run_count",
+            "hard_limit_l0_bytes",
+            "hard_limit_l0_run_count",
+            "immutable_bytes",
+            "immutable_entry_count",
+            "immutable_flush_count",
+            "immutable_memtable_count",
+            "immutable_rotation_count",
+            "l0_bytes",
+            "l0_run_count",
+            "level_overflow_bytes",
+            "level_overflow_run_count",
+            "lower_level_bytes",
+            "lower_level_run_count",
+            "maintenance_debt_hint",
+            "maintenance_score",
+            "manifest_bytes",
+            "manifest_dirty",
+            "manifest_write_count",
+            "max_level",
+            "mutable_bytes",
+            "mutable_entry_count",
+            "mutable_snapshot_clone_bytes",
+            "mutable_snapshot_clone_count",
+            "mutable_snapshot_clone_peak_bytes",
+            "obsolete_delete_failures",
+            "obsolete_delete_retries",
+            "obsolete_manifest_dirty",
+            "obsolete_path_count",
+            "obsolete_paths_pinned_by_reader_bound_read_txn",
+            "obsolete_paths_pinned_by_reader_compaction",
+            "obsolete_paths_pinned_by_reader_current_scan",
+            "obsolete_paths_pinned_by_reader_namespace_read_txn",
+            "obsolete_paths_pinned_by_reader_other",
+            "obsolete_paths_pinned_by_reader_probe_txn",
+            "obsolete_paths_pinned_by_reader_write_txn",
+            "obsolete_paths_pinned_by_readers",
+            "obsolete_paths_pinned_by_versions",
+            "obsolete_paths_reclaimable",
+            "obsolete_paths_waiting_for_retry",
+            "overlapping_l0_run_count",
+            "read_snapshot_mutable_rotation_bytes",
+            "read_snapshot_mutable_rotation_count",
+            "run_bytes",
+            "run_count",
+            "soft_limit_l0_bytes",
+            "soft_limit_l0_run_count",
+            "sorted_ingest_bytes",
+            "sorted_ingest_run_count",
+            "unpublished_wal_logical_bytes",
+            "unpublished_wal_max_batch_logical_bytes",
+            "wal_checkpoint_pending",
+            "wal_checkpoint_retry_attempts",
+            "wal_checkpoint_retry_delay_ns",
+            "wal_checkpoint_retry_reason",
+            "wal_pressure_blocked",
+            "wal_retained_bytes",
+            "write_pressure_compaction_count",
+            "write_pressure_compaction_step_count",
+            "write_pressure_event_count",
+            "write_pressure_overload_count",
+            "write_pressure_overload_l0_run_debt",
+            "write_stall_l0_byte_debt",
+            "write_stall_l0_run_debt",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.run_count) |value| {
+            try jw.objectField("run_count");
+            try jw.write(value);
+        }
+        if (self.run_bytes) |value| {
+            try jw.objectField("run_bytes");
+            try jw.write(value);
+        }
+        if (self.l0_run_count) |value| {
+            try jw.objectField("l0_run_count");
+            try jw.write(value);
+        }
+        if (self.l0_bytes) |value| {
+            try jw.objectField("l0_bytes");
+            try jw.write(value);
+        }
+        if (self.lower_level_run_count) |value| {
+            try jw.objectField("lower_level_run_count");
+            try jw.write(value);
+        }
+        if (self.lower_level_bytes) |value| {
+            try jw.objectField("lower_level_bytes");
+            try jw.write(value);
+        }
+        if (self.max_level) |value| {
+            try jw.objectField("max_level");
+            try jw.write(value);
+        }
+        if (self.compactable_l0_run_count) |value| {
+            try jw.objectField("compactable_l0_run_count");
+            try jw.write(value);
+        }
+        if (self.overlapping_l0_run_count) |value| {
+            try jw.objectField("overlapping_l0_run_count");
+            try jw.write(value);
+        }
+        if (self.soft_limit_l0_run_count) |value| {
+            try jw.objectField("soft_limit_l0_run_count");
+            try jw.write(value);
+        }
+        if (self.hard_limit_l0_run_count) |value| {
+            try jw.objectField("hard_limit_l0_run_count");
+            try jw.write(value);
+        }
+        if (self.write_stall_l0_run_debt) |value| {
+            try jw.objectField("write_stall_l0_run_debt");
+            try jw.write(value);
+        }
+        if (self.soft_limit_l0_bytes) |value| {
+            try jw.objectField("soft_limit_l0_bytes");
+            try jw.write(value);
+        }
+        if (self.hard_limit_l0_bytes) |value| {
+            try jw.objectField("hard_limit_l0_bytes");
+            try jw.write(value);
+        }
+        if (self.write_stall_l0_byte_debt) |value| {
+            try jw.objectField("write_stall_l0_byte_debt");
+            try jw.write(value);
+        }
+        if (self.level_overflow_run_count) |value| {
+            try jw.objectField("level_overflow_run_count");
+            try jw.write(value);
+        }
+        if (self.level_overflow_bytes) |value| {
+            try jw.objectField("level_overflow_bytes");
+            try jw.write(value);
+        }
+        if (self.obsolete_path_count) |value| {
+            try jw.objectField("obsolete_path_count");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_readers) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_readers");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_versions) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_versions");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_waiting_for_retry) |value| {
+            try jw.objectField("obsolete_paths_waiting_for_retry");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_reclaimable) |value| {
+            try jw.objectField("obsolete_paths_reclaimable");
+            try jw.write(value);
+        }
+        if (self.obsolete_delete_failures) |value| {
+            try jw.objectField("obsolete_delete_failures");
+            try jw.write(value);
+        }
+        if (self.obsolete_delete_retries) |value| {
+            try jw.objectField("obsolete_delete_retries");
+            try jw.write(value);
+        }
+        if (self.current_manifest_bytes) |value| {
+            try jw.objectField("current_manifest_bytes");
+            try jw.write(value);
+        }
+        if (self.mutable_entry_count) |value| {
+            try jw.objectField("mutable_entry_count");
+            try jw.write(value);
+        }
+        if (self.mutable_bytes) |value| {
+            try jw.objectField("mutable_bytes");
+            try jw.write(value);
+        }
+        if (self.immutable_memtable_count) |value| {
+            try jw.objectField("immutable_memtable_count");
+            try jw.write(value);
+        }
+        if (self.immutable_entry_count) |value| {
+            try jw.objectField("immutable_entry_count");
+            try jw.write(value);
+        }
+        if (self.immutable_bytes) |value| {
+            try jw.objectField("immutable_bytes");
+            try jw.write(value);
+        }
+        if (self.mutable_snapshot_clone_count) |value| {
+            try jw.objectField("mutable_snapshot_clone_count");
+            try jw.write(value);
+        }
+        if (self.mutable_snapshot_clone_bytes) |value| {
+            try jw.objectField("mutable_snapshot_clone_bytes");
+            try jw.write(value);
+        }
+        if (self.mutable_snapshot_clone_peak_bytes) |value| {
+            try jw.objectField("mutable_snapshot_clone_peak_bytes");
+            try jw.write(value);
+        }
+        if (self.read_snapshot_mutable_rotation_count) |value| {
+            try jw.objectField("read_snapshot_mutable_rotation_count");
+            try jw.write(value);
+        }
+        if (self.read_snapshot_mutable_rotation_bytes) |value| {
+            try jw.objectField("read_snapshot_mutable_rotation_bytes");
+            try jw.write(value);
+        }
+        if (self.wal_retained_bytes) |value| {
+            try jw.objectField("wal_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.wal_checkpoint_pending) |value| {
+            try jw.objectField("wal_checkpoint_pending");
+            try jw.write(value);
+        }
+        if (self.wal_pressure_blocked) |value| {
+            try jw.objectField("wal_pressure_blocked");
+            try jw.write(value);
+        }
+        if (self.wal_checkpoint_retry_reason) |value| {
+            try jw.objectField("wal_checkpoint_retry_reason");
+            try jw.write(value);
+        }
+        if (self.wal_checkpoint_retry_attempts) |value| {
+            try jw.objectField("wal_checkpoint_retry_attempts");
+            try jw.write(value);
+        }
+        if (self.wal_checkpoint_retry_delay_ns) |value| {
+            try jw.objectField("wal_checkpoint_retry_delay_ns");
+            try jw.write(value);
+        }
+        if (self.active_immutable_logical_bytes) |value| {
+            try jw.objectField("active_immutable_logical_bytes");
+            try jw.write(value);
+        }
+        if (self.unpublished_wal_logical_bytes) |value| {
+            try jw.objectField("unpublished_wal_logical_bytes");
+            try jw.write(value);
+        }
+        if (self.unpublished_wal_max_batch_logical_bytes) |value| {
+            try jw.objectField("unpublished_wal_max_batch_logical_bytes");
+            try jw.write(value);
+        }
+        if (self.compaction_backlog_bytes) |value| {
+            try jw.objectField("compaction_backlog_bytes");
+            try jw.write(value);
+        }
+        if (self.active_readers) |value| {
+            try jw.objectField("active_readers");
+            try jw.write(value);
+        }
+        if (self.active_readers_bound_read_txn) |value| {
+            try jw.objectField("active_readers_bound_read_txn");
+            try jw.write(value);
+        }
+        if (self.active_readers_namespace_read_txn) |value| {
+            try jw.objectField("active_readers_namespace_read_txn");
+            try jw.write(value);
+        }
+        if (self.active_readers_probe_txn) |value| {
+            try jw.objectField("active_readers_probe_txn");
+            try jw.write(value);
+        }
+        if (self.active_readers_current_scan) |value| {
+            try jw.objectField("active_readers_current_scan");
+            try jw.write(value);
+        }
+        if (self.active_readers_write_txn) |value| {
+            try jw.objectField("active_readers_write_txn");
+            try jw.write(value);
+        }
+        if (self.active_readers_compaction) |value| {
+            try jw.objectField("active_readers_compaction");
+            try jw.write(value);
+        }
+        if (self.active_readers_other) |value| {
+            try jw.objectField("active_readers_other");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_reader_bound_read_txn) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_reader_bound_read_txn");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_reader_namespace_read_txn) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_reader_namespace_read_txn");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_reader_probe_txn) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_reader_probe_txn");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_reader_current_scan) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_reader_current_scan");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_reader_write_txn) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_reader_write_txn");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_reader_compaction) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_reader_compaction");
+            try jw.write(value);
+        }
+        if (self.obsolete_paths_pinned_by_reader_other) |value| {
+            try jw.objectField("obsolete_paths_pinned_by_reader_other");
+            try jw.write(value);
+        }
+        if (self.active_bulk_ingest_batches) |value| {
+            try jw.objectField("active_bulk_ingest_batches");
+            try jw.write(value);
+        }
+        if (self.manifest_dirty) |value| {
+            try jw.objectField("manifest_dirty");
+            try jw.write(value);
+        }
+        if (self.obsolete_manifest_dirty) |value| {
+            try jw.objectField("obsolete_manifest_dirty");
+            try jw.write(value);
+        }
+        if (self.maintenance_score) |value| {
+            try jw.objectField("maintenance_score");
+            try jw.write(value);
+        }
+        if (self.maintenance_debt_hint) |value| {
+            try jw.objectField("maintenance_debt_hint");
+            try jw.write(value);
+        }
+        if (self.flush_count) |value| {
+            try jw.objectField("flush_count");
+            try jw.write(value);
+        }
+        if (self.flush_output_run_count) |value| {
+            try jw.objectField("flush_output_run_count");
+            try jw.write(value);
+        }
+        if (self.flush_output_bytes) |value| {
+            try jw.objectField("flush_output_bytes");
+            try jw.write(value);
+        }
+        if (self.sorted_ingest_run_count) |value| {
+            try jw.objectField("sorted_ingest_run_count");
+            try jw.write(value);
+        }
+        if (self.sorted_ingest_bytes) |value| {
+            try jw.objectField("sorted_ingest_bytes");
+            try jw.write(value);
+        }
+        if (self.manifest_write_count) |value| {
+            try jw.objectField("manifest_write_count");
+            try jw.write(value);
+        }
+        if (self.manifest_bytes) |value| {
+            try jw.objectField("manifest_bytes");
+            try jw.write(value);
+        }
+        if (self.write_pressure_event_count) |value| {
+            try jw.objectField("write_pressure_event_count");
+            try jw.write(value);
+        }
+        if (self.write_pressure_compaction_count) |value| {
+            try jw.objectField("write_pressure_compaction_count");
+            try jw.write(value);
+        }
+        if (self.write_pressure_compaction_step_count) |value| {
+            try jw.objectField("write_pressure_compaction_step_count");
+            try jw.write(value);
+        }
+        if (self.write_pressure_overload_count) |value| {
+            try jw.objectField("write_pressure_overload_count");
+            try jw.write(value);
+        }
+        if (self.write_pressure_overload_l0_run_debt) |value| {
+            try jw.objectField("write_pressure_overload_l0_run_debt");
+            try jw.write(value);
+        }
+        if (self.immutable_rotation_count) |value| {
+            try jw.objectField("immutable_rotation_count");
+            try jw.write(value);
+        }
+        if (self.immutable_flush_count) |value| {
+            try jw.objectField("immutable_flush_count");
+            try jw.write(value);
+        }
+        if (self.direct_bulk_ingest_attempt_count) |value| {
+            try jw.objectField("direct_bulk_ingest_attempt_count");
+            try jw.write(value);
+        }
+        if (self.direct_bulk_ingest_success_count) |value| {
+            try jw.objectField("direct_bulk_ingest_success_count");
+            try jw.write(value);
+        }
+        if (self.direct_bulk_ingest_entry_count) |value| {
+            try jw.objectField("direct_bulk_ingest_entry_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_attempt_count) |value| {
+            try jw.objectField("bulk_append_attempt_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_entry_count) |value| {
+            try jw.objectField("bulk_append_entry_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_direct_success_count) |value| {
+            try jw.objectField("bulk_append_direct_success_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_direct_entry_count) |value| {
+            try jw.objectField("bulk_append_direct_entry_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_fallback_backend_pending_count) |value| {
+            try jw.objectField("bulk_append_fallback_backend_pending_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_fallback_below_threshold_count) |value| {
+            try jw.objectField("bulk_append_fallback_below_threshold_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_fallback_duplicate_key_count) |value| {
+            try jw.objectField("bulk_append_fallback_duplicate_key_count");
+            try jw.write(value);
+        }
+        if (self.bulk_append_fallback_to_mutable_entry_count) |value| {
+            try jw.objectField("bulk_append_fallback_to_mutable_entry_count");
+            try jw.write(value);
+        }
+        if (self.direct_bulk_ingest_direct_entry_count) |value| {
+            try jw.objectField("direct_bulk_ingest_direct_entry_count");
+            try jw.write(value);
+        }
+        if (self.direct_bulk_ingest_fallback_unsupported_count) |value| {
+            try jw.objectField("direct_bulk_ingest_fallback_unsupported_count");
+            try jw.write(value);
+        }
+        if (self.direct_bulk_ingest_fallback_backend_mutable_count) |value| {
+            try jw.objectField("direct_bulk_ingest_fallback_backend_mutable_count");
+            try jw.write(value);
+        }
+        if (self.direct_bulk_ingest_fallback_below_threshold_count) |value| {
+            try jw.objectField("direct_bulk_ingest_fallback_below_threshold_count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result merge statistics for hybrid search.
@@ -3085,6 +6164,46 @@ pub const MergeProfile = struct {
     semantic_hits: ?i64 = null,
     /// Time spent merging results in milliseconds.
     duration_ms: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "duration_ms",
+            "full_text_hits",
+            "semantic_hits",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "duration_ms",
+            "full_text_hits",
+            "semantic_hits",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.strategy) |value| {
+            try jw.objectField("strategy");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("strategy");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.full_text_hits) |value| {
+            try jw.objectField("full_text_hits");
+            try jw.write(value);
+        }
+        if (self.semantic_hits) |value| {
+            try jw.objectField("semantic_hits");
+            try jw.write(value);
+        }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The metadata service does not yet provide the consistency capability required by backup.
@@ -3113,6 +6232,29 @@ pub const MultiBatchRequest = struct {
     /// Map of table names to batch operations for that table. Each entry follows the same format as a single-table BatchRequest.
     tables: std.json.ArrayHashMap(BatchRequest),
     sync_level: ?SyncLevel = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("tables");
+        try jw.write(self.tables);
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Response for a cross-table batch operation. Contains per-table results.
@@ -3121,6 +6263,33 @@ pub const MultiBatchResponse = struct {
     status: ?[]const u8 = null,
     /// Per-table batch results
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "status",
+            "tables",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "status",
+            "tables",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Path = antfly_indexes_openapi.Path;
@@ -3179,6 +6348,45 @@ pub const PruneStats = struct {
     tokens_kept: ?i64 = null,
     /// Estimated tokens in pruned resources
     tokens_pruned: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "resources_kept",
+            "resources_pruned",
+            "tokens_kept",
+            "tokens_pruned",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "resources_kept",
+            "resources_pruned",
+            "tokens_kept",
+            "tokens_pruned",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.resources_kept) |value| {
+            try jw.objectField("resources_kept");
+            try jw.write(value);
+        }
+        if (self.resources_pruned) |value| {
+            try jw.objectField("resources_pruned");
+            try jw.write(value);
+        }
+        if (self.tokens_kept) |value| {
+            try jw.objectField("tokens_kept");
+            try jw.write(value);
+        }
+        if (self.tokens_pruned) |value| {
+            try jw.objectField("tokens_pruned");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const QueryBuilderRequest = struct {
@@ -3209,6 +6417,102 @@ pub const QueryBuilderRequest = struct {
     /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
     constraints: ?std.json.Value = null,
     generator: ?antfly_generating_openapi.GeneratorConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "constraints",
+            "decisions",
+            "example_documents",
+            "interactive",
+            "max_internal_iterations",
+            "max_user_clarifications",
+            "mode",
+            "output",
+            "require_decision_after",
+            "schema_fields",
+            "session_id",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "constraints",
+            "decisions",
+            "example_documents",
+            "interactive",
+            "max_internal_iterations",
+            "max_user_clarifications",
+            "mode",
+            "output",
+            "require_decision_after",
+            "schema_fields",
+            "session_id",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        if (self.decisions) |value| {
+            try jw.objectField("decisions");
+            try jw.write(value);
+        }
+        if (self.interactive) |value| {
+            try jw.objectField("interactive");
+            try jw.write(value);
+        }
+        if (self.max_internal_iterations) |value| {
+            try jw.objectField("max_internal_iterations");
+            try jw.write(value);
+        }
+        if (self.max_user_clarifications) |value| {
+            try jw.objectField("max_user_clarifications");
+            try jw.write(value);
+        }
+        if (self.require_decision_after) |value| {
+            try jw.objectField("require_decision_after");
+            try jw.write(value);
+        }
+        if (self.example_documents) |value| {
+            try jw.objectField("example_documents");
+            try jw.write(value);
+        }
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.objectField("intent");
+        try jw.write(self.intent);
+        if (self.schema_fields) |value| {
+            try jw.objectField("schema_fields");
+            try jw.write(value);
+        }
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.output) |value| {
+            try jw.objectField("output");
+            try jw.write(value);
+        }
+        if (self.constraints) |value| {
+            try jw.objectField("constraints");
+            try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generator");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 pub const QueryBuilderResult = struct {
@@ -3244,6 +6548,113 @@ pub const QueryBuilderResult = struct {
     confidence: ?f64 = null,
     /// Any issues, limitations, or assumptions made when generating the query
     warnings: ?[]const []const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "clarification_count",
+            "confidence",
+            "explanation",
+            "iteration",
+            "plan",
+            "query_request",
+            "questions",
+            "remaining_internal_iterations",
+            "remaining_user_clarifications",
+            "retrieval_query_request",
+            "session_id",
+            "specialist",
+            "status",
+            "steps",
+            "warnings",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "clarification_count",
+            "confidence",
+            "explanation",
+            "iteration",
+            "plan",
+            "query_request",
+            "questions",
+            "remaining_internal_iterations",
+            "remaining_user_clarifications",
+            "retrieval_query_request",
+            "session_id",
+            "specialist",
+            "status",
+            "steps",
+            "warnings",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        if (self.iteration) |value| {
+            try jw.objectField("iteration");
+            try jw.write(value);
+        }
+        if (self.clarification_count) |value| {
+            try jw.objectField("clarification_count");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.steps) |value| {
+            try jw.objectField("steps");
+            try jw.write(value);
+        }
+        if (self.remaining_internal_iterations) |value| {
+            try jw.objectField("remaining_internal_iterations");
+            try jw.write(value);
+        }
+        if (self.remaining_user_clarifications) |value| {
+            try jw.objectField("remaining_user_clarifications");
+            try jw.write(value);
+        }
+        if (self.questions) |value| {
+            try jw.objectField("questions");
+            try jw.write(value);
+        }
+        try jw.objectField("query");
+        try jw.write(self.query);
+        if (self.query_request) |value| {
+            try jw.objectField("query_request");
+            try jw.write(value);
+        }
+        if (self.retrieval_query_request) |value| {
+            try jw.objectField("retrieval_query_request");
+            try jw.write(value);
+        }
+        if (self.specialist) |value| {
+            try jw.objectField("specialist");
+            try jw.write(value);
+        }
+        if (self.plan) |value| {
+            try jw.objectField("plan");
+            try jw.write(value);
+        }
+        if (self.explanation) |value| {
+            try jw.objectField("explanation");
+            try jw.write(value);
+        }
+        if (self.confidence) |value| {
+            try jw.objectField("confidence");
+            try jw.write(value);
+        }
+        if (self.warnings) |value| {
+            try jw.objectField("warnings");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const QueryCandidateBudgetExceededError = struct {
@@ -3324,6 +6735,39 @@ pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
     children: ?HierarchyChildren = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "ancestors",
+            "children",
+            "group_by",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "ancestors",
+            "children",
+            "group_by",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.group_by) |value| {
+            try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.ancestors) |value| {
+            try jw.objectField("ancestors");
+            try jw.write(value);
+        }
+        if (self.children) |value| {
+            try jw.objectField("children");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A single query result hit
@@ -3341,6 +6785,55 @@ pub const QueryHit = struct {
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
     _sort: ?[]const std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "_distance",
+            "_index_scores",
+            "_sort",
+            "_source",
+            "hierarchy",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "_distance",
+            "_index_scores",
+            "_sort",
+            "_source",
+            "hierarchy",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("_id");
+        try jw.write(self._id);
+        try jw.objectField("_score");
+        try jw.write(self._score);
+        if (self._distance) |value| {
+            try jw.objectField("_distance");
+            try jw.write(value);
+        }
+        if (self._index_scores) |value| {
+            try jw.objectField("_index_scores");
+            try jw.write(value);
+        }
+        if (self._source) |value| {
+            try jw.objectField("_source");
+            try jw.write(value);
+        }
+        if (self.hierarchy) |value| {
+            try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self._sort) |value| {
+            try jw.objectField("_sort");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const QueryHitHierarchy = struct {
@@ -3361,11 +6854,109 @@ pub const QueryHitHierarchy = struct {
     revision: ?[]const u8 = null,
     /// Legacy child chunk hits included for source-level rollups.
     chunks: ?[]const HierarchyMatchHit = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "ancestors",
+            "artifact",
+            "chunks",
+            "evidence",
+            "level",
+            "matches",
+            "parent_doc_key",
+            "parent_unit_id",
+            "position",
+            "revision",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "ancestors",
+            "artifact",
+            "chunks",
+            "evidence",
+            "level",
+            "matches",
+            "parent_doc_key",
+            "parent_unit_id",
+            "position",
+            "revision",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.level) |value| {
+            try jw.objectField("level");
+            try jw.write(value);
+        }
+        if (self.parent_doc_key) |value| {
+            try jw.objectField("parent_doc_key");
+            try jw.write(value);
+        }
+        if (self.parent_unit_id) |value| {
+            try jw.objectField("parent_unit_id");
+            try jw.write(value);
+        }
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        if (self.ancestors) |value| {
+            try jw.objectField("ancestors");
+            try jw.write(value);
+        }
+        if (self.evidence) |value| {
+            try jw.objectField("evidence");
+            try jw.write(value);
+        }
+        if (self.matches) |value| {
+            try jw.objectField("matches");
+            try jw.write(value);
+        }
+        if (self.position) |value| {
+            try jw.objectField("position");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        if (self.chunks) |value| {
+            try jw.objectField("chunks");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const QueryHitHierarchyAncestors = struct {
     source: HierarchyAncestor,
     unit: ?HierarchyAncestor = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "unit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "unit",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("source");
+        try jw.write(self.source);
+        if (self.unit) |value| {
+            try jw.objectField("unit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const QueryHitHierarchyLevel = enum {
@@ -3412,6 +7003,39 @@ pub const QueryHits = struct {
     hits: ?[]const QueryHit = null,
     /// Best relevance score among the returned results. Scores are always higher-is-better.
     max_score: ?f32 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "hits",
+            "max_score",
+            "total",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "hits",
+            "max_score",
+            "total",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.total) |value| {
+            try jw.objectField("total");
+            try jw.write(value);
+        }
+        if (self.hits) |value| {
+            try jw.objectField("hits");
+            try jw.write(value);
+        }
+        if (self.max_score) |value| {
+            try jw.objectField("max_score");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Total hit count metadata.
@@ -3434,6 +7058,51 @@ pub const QueryProfile = struct {
     merge: ?MergeProfile = null,
     /// Sort execution statistics (present when the query used ordered page options and profiling was enabled).
     sort: ?SortProfile = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "join",
+            "merge",
+            "reranker",
+            "shards",
+            "sort",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "join",
+            "merge",
+            "reranker",
+            "shards",
+            "sort",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.shards) |value| {
+            try jw.objectField("shards");
+            try jw.write(value);
+        }
+        if (self.join) |value| {
+            try jw.objectField("join");
+            try jw.write(value);
+        }
+        if (self.reranker) |value| {
+            try jw.objectField("reranker");
+            try jw.write(value);
+        }
+        if (self.merge) |value| {
+            try jw.objectField("merge");
+            try jw.write(value);
+        }
+        if (self.sort) |value| {
+            try jw.objectField("sort");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const QueryRequest = struct {
@@ -3503,11 +7172,254 @@ pub const QueryRequest = struct {
     join: ?JoinClause = null,
     /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_queries, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "aggregations",
+            "analyses",
+            "count",
+            "distance_over",
+            "distance_under",
+            "document_renderer",
+            "embedding_template",
+            "embeddings",
+            "exclusion_query",
+            "expand_strategy",
+            "fields",
+            "filter_prefix",
+            "filter_query",
+            "foreign_sources",
+            "full_text_search",
+            "graph_queries",
+            "graph_searches",
+            "hierarchy",
+            "indexes",
+            "join",
+            "limit",
+            "offset",
+            "order_by",
+            "profile",
+            "query",
+            "search_after",
+            "search_before",
+            "search_effort",
+            "semantic_search",
+            "table",
+            "timeout_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "aggregations",
+            "analyses",
+            "count",
+            "distance_over",
+            "distance_under",
+            "document_renderer",
+            "embedding_template",
+            "embeddings",
+            "exclusion_query",
+            "expand_strategy",
+            "fields",
+            "filter_prefix",
+            "filter_query",
+            "foreign_sources",
+            "full_text_search",
+            "graph_queries",
+            "graph_searches",
+            "hierarchy",
+            "indexes",
+            "join",
+            "limit",
+            "offset",
+            "order_by",
+            "profile",
+            "query",
+            "search_after",
+            "search_before",
+            "search_effort",
+            "semantic_search",
+            "table",
+            "timeout_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.full_text_search) |value| {
+            try jw.objectField("full_text_search");
+            try jw.write(value);
+        }
+        if (self.semantic_search) |value| {
+            try jw.objectField("semantic_search");
+            try jw.write(value);
+        }
+        if (self.embedding_template) |value| {
+            try jw.objectField("embedding_template");
+            try jw.write(value);
+        }
+        if (self.indexes) |value| {
+            try jw.objectField("indexes");
+            try jw.write(value);
+        }
+        if (self.filter_prefix) |value| {
+            try jw.objectField("filter_prefix");
+            try jw.write(value);
+        }
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.exclusion_query) |value| {
+            try jw.objectField("exclusion_query");
+            try jw.write(value);
+        }
+        if (self.aggregations) |value| {
+            try jw.objectField("aggregations");
+            try jw.write(value);
+        }
+        if (self.embeddings) |value| {
+            try jw.objectField("embeddings");
+            try jw.write(value);
+        }
+        if (self.search_effort) |value| {
+            try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.hierarchy) |value| {
+            try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.offset) |value| {
+            try jw.objectField("offset");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.search_after) |value| {
+            try jw.objectField("search_after");
+            try jw.write(value);
+        }
+        if (self.search_before) |value| {
+            try jw.objectField("search_before");
+            try jw.write(value);
+        }
+        if (self.distance_under) |value| {
+            try jw.objectField("distance_under");
+            try jw.write(value);
+        }
+        if (self.distance_over) |value| {
+            try jw.objectField("distance_over");
+            try jw.write(value);
+        }
+        if (self.merge_config) |value| {
+            try jw.objectField("merge_config");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("merge_config");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.count) |value| {
+            try jw.objectField("count");
+            try jw.write(value);
+        }
+        if (self.profile) |value| {
+            try jw.objectField("profile");
+            try jw.write(value);
+        }
+        if (self.reranker) |value| {
+            try jw.objectField("reranker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("reranker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.analyses) |value| {
+            try jw.objectField("analyses");
+            try jw.write(value);
+        }
+        if (self.graph_queries) |value| {
+            try jw.objectField("graph_queries");
+            try jw.write(value);
+        }
+        if (self.graph_searches) |value| {
+            try jw.objectField("graph_searches");
+            try jw.write(value);
+        }
+        if (self.expand_strategy) |value| {
+            try jw.objectField("expand_strategy");
+            try jw.write(value);
+        }
+        if (self.document_renderer) |value| {
+            try jw.objectField("document_renderer");
+            try jw.write(value);
+        }
+        if (self.pruner) |value| {
+            try jw.objectField("pruner");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("pruner");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.join) |value| {
+            try jw.objectField("join");
+            try jw.write(value);
+        }
+        if (self.foreign_sources) |value| {
+            try jw.objectField("foreign_sources");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Responses from multiple query operations.
 pub const QueryResponses = struct {
     responses: ?[]const QueryResult = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "responses",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "responses",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.responses) |value| {
+            try jw.objectField("responses");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result of a query operation as an array of results and a count.
@@ -3529,6 +7441,67 @@ pub const QueryResult = struct {
     @"error": ?[]const u8 = null,
     /// Which table this result came from
     table: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "aggregations",
+            "analyses",
+            "error",
+            "graph_results",
+            "hits",
+            "profile",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "aggregations",
+            "analyses",
+            "error",
+            "graph_results",
+            "hits",
+            "profile",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.hits) |value| {
+            try jw.objectField("hits");
+            try jw.write(value);
+        }
+        if (self.aggregations) |value| {
+            try jw.objectField("aggregations");
+            try jw.write(value);
+        }
+        if (self.analyses) |value| {
+            try jw.objectField("analyses");
+            try jw.write(value);
+        }
+        if (self.graph_results) |value| {
+            try jw.objectField("graph_results");
+            try jw.write(value);
+        }
+        if (self.profile) |value| {
+            try jw.objectField("profile");
+            try jw.write(value);
+        }
+        try jw.objectField("took");
+        try jw.write(self.took);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A transient query dependency or read-availability failure that is safe to retry.
@@ -3665,6 +7638,51 @@ pub const RepairIssueListRequest = struct {
     cursor: ?[]const u8 = null,
     /// Maximum repair records to return.
     limit: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "cursor",
+            "index",
+            "kind",
+            "limit",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "cursor",
+            "index",
+            "kind",
+            "limit",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.target) |value| {
+            try jw.objectField("target");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.index) |value| {
+            try jw.objectField("index");
+            try jw.write(value);
+        }
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Bounded request to run a table repair pass.
@@ -3683,6 +7701,69 @@ pub const RepairRunRequest = struct {
     repair_id: ?[]const u8 = null,
     /// Maximum artifact repair records to attempt. For target=index, any positive value permits one named index repair.
     limit: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "control",
+            "cursor",
+            "force",
+            "index",
+            "kind",
+            "limit",
+            "repair_id",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "control",
+            "cursor",
+            "force",
+            "index",
+            "kind",
+            "limit",
+            "repair_id",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.target) |value| {
+            try jw.objectField("target");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.index) |value| {
+            try jw.objectField("index");
+            try jw.write(value);
+        }
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.force) |value| {
+            try jw.objectField("force");
+            try jw.write(value);
+        }
+        if (self.control) |value| {
+            try jw.objectField("control");
+            try jw.write(value);
+        }
+        if (self.repair_id) |value| {
+            try jw.objectField("repair_id");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Repair subsystem to inspect or run.
@@ -3722,6 +7803,47 @@ pub const ReplicationRoute = struct {
     on_update: ?[]const ReplicationTransformOp = null,
     /// Transform operations for DELETE events on this route. If omitted, auto-derives from this route's `on_update` paths.
     on_delete: ?[]const ReplicationTransformOp = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "key_template",
+            "on_delete",
+            "on_update",
+            "where",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "key_template",
+            "on_delete",
+            "on_update",
+            "where",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("target_table");
+        try jw.write(self.target_table);
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.key_template) |value| {
+            try jw.objectField("key_template");
+            try jw.write(value);
+        }
+        if (self.on_update) |value| {
+            try jw.objectField("on_update");
+            try jw.write(value);
+        }
+        if (self.on_delete) |value| {
+            try jw.objectField("on_delete");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ReplicationSource = struct {
@@ -3749,6 +7871,87 @@ pub const ReplicationSource = struct {
     require_exact_cutover: ?bool = null,
     status: ?ReplicationSourceStatus = null,
     action_hint: ?ReplicationSourceActionHint = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "action_hint",
+            "key_template",
+            "on_delete",
+            "on_update",
+            "publication_filter",
+            "publication_name",
+            "require_exact_cutover",
+            "routes",
+            "slot_name",
+            "status",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "action_hint",
+            "key_template",
+            "on_delete",
+            "on_update",
+            "publication_filter",
+            "publication_name",
+            "require_exact_cutover",
+            "routes",
+            "slot_name",
+            "status",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("dsn");
+        try jw.write(self.dsn);
+        try jw.objectField("postgres_table");
+        try jw.write(self.postgres_table);
+        if (self.key_template) |value| {
+            try jw.objectField("key_template");
+            try jw.write(value);
+        }
+        if (self.slot_name) |value| {
+            try jw.objectField("slot_name");
+            try jw.write(value);
+        }
+        if (self.publication_name) |value| {
+            try jw.objectField("publication_name");
+            try jw.write(value);
+        }
+        if (self.on_update) |value| {
+            try jw.objectField("on_update");
+            try jw.write(value);
+        }
+        if (self.on_delete) |value| {
+            try jw.objectField("on_delete");
+            try jw.write(value);
+        }
+        if (self.publication_filter) |value| {
+            try jw.objectField("publication_filter");
+            try jw.write(value);
+        }
+        if (self.routes) |value| {
+            try jw.objectField("routes");
+            try jw.write(value);
+        }
+        if (self.require_exact_cutover) |value| {
+            try jw.objectField("require_exact_cutover");
+            try jw.write(value);
+        }
+        if (self.status) |value| {
+            try jw.objectField("status");
+            try jw.write(value);
+        }
+        if (self.action_hint) |value| {
+            try jw.objectField("action_hint");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Action hint for this replication source when remediation is recommended. Present only in GET table detail responses.
@@ -3759,6 +7962,39 @@ pub const ReplicationSourceActionHint = struct {
     reason: ?[]const u8 = null,
     /// API path to trigger a reseed exact cutover, if applicable.
     reseed_exact_cutover_path: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "action",
+            "reason",
+            "reseed_exact_cutover_path",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "action",
+            "reason",
+            "reseed_exact_cutover_path",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.action) |value| {
+            try jw.objectField("action");
+            try jw.write(value);
+        }
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        if (self.reseed_exact_cutover_path) |value| {
+            try jw.objectField("reseed_exact_cutover_path");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Runtime status of this replication source. Present only in GET table detail responses, not in create/update requests.
@@ -3782,6 +8018,135 @@ pub const ReplicationSourceStatus = struct {
     last_success_at_ms: ?i64 = null,
     last_change_applied_at_ms: ?i64 = null,
     updated_at_ms: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "checkpoint",
+            "consecutive_failures",
+            "cutover_mode",
+            "external_table",
+            "failure_class",
+            "lag_millis",
+            "lag_records",
+            "last_change_applied_at_ms",
+            "last_error",
+            "last_source_commit_at_ms",
+            "last_success_at_ms",
+            "phase",
+            "prepared_checkpoint",
+            "publication_name",
+            "slot_name",
+            "snapshot_offset",
+            "source_kind",
+            "stream_checkpoint",
+            "updated_at_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "checkpoint",
+            "consecutive_failures",
+            "cutover_mode",
+            "external_table",
+            "failure_class",
+            "lag_millis",
+            "lag_records",
+            "last_change_applied_at_ms",
+            "last_error",
+            "last_source_commit_at_ms",
+            "last_success_at_ms",
+            "phase",
+            "prepared_checkpoint",
+            "publication_name",
+            "slot_name",
+            "snapshot_offset",
+            "source_kind",
+            "stream_checkpoint",
+            "updated_at_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.source_kind) |value| {
+            try jw.objectField("source_kind");
+            try jw.write(value);
+        }
+        if (self.external_table) |value| {
+            try jw.objectField("external_table");
+            try jw.write(value);
+        }
+        if (self.cutover_mode) |value| {
+            try jw.objectField("cutover_mode");
+            try jw.write(value);
+        }
+        if (self.slot_name) |value| {
+            try jw.objectField("slot_name");
+            try jw.write(value);
+        }
+        if (self.publication_name) |value| {
+            try jw.objectField("publication_name");
+            try jw.write(value);
+        }
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        if (self.checkpoint) |value| {
+            try jw.objectField("checkpoint");
+            try jw.write(value);
+        }
+        if (self.snapshot_offset) |value| {
+            try jw.objectField("snapshot_offset");
+            try jw.write(value);
+        }
+        if (self.prepared_checkpoint) |value| {
+            try jw.objectField("prepared_checkpoint");
+            try jw.write(value);
+        }
+        if (self.stream_checkpoint) |value| {
+            try jw.objectField("stream_checkpoint");
+            try jw.write(value);
+        }
+        if (self.last_error) |value| {
+            try jw.objectField("last_error");
+            try jw.write(value);
+        }
+        if (self.failure_class) |value| {
+            try jw.objectField("failure_class");
+            try jw.write(value);
+        }
+        if (self.lag_records) |value| {
+            try jw.objectField("lag_records");
+            try jw.write(value);
+        }
+        if (self.lag_millis) |value| {
+            try jw.objectField("lag_millis");
+            try jw.write(value);
+        }
+        if (self.consecutive_failures) |value| {
+            try jw.objectField("consecutive_failures");
+            try jw.write(value);
+        }
+        if (self.last_source_commit_at_ms) |value| {
+            try jw.objectField("last_source_commit_at_ms");
+            try jw.write(value);
+        }
+        if (self.last_success_at_ms) |value| {
+            try jw.objectField("last_success_at_ms");
+            try jw.write(value);
+        }
+        if (self.last_change_applied_at_ms) |value| {
+            try jw.objectField("last_change_applied_at_ms");
+            try jw.write(value);
+        }
+        if (self.updated_at_ms) |value| {
+            try jw.objectField("updated_at_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const ReplicationTransformOp = struct {
@@ -3791,6 +8156,35 @@ pub const ReplicationTransformOp = struct {
     path: ?[]const u8 = null,
     /// Value for the operation. Can be a literal (string, number, boolean) or a `{{column}}` reference to a PG column value. Use `{{col.key}}` to navigate into decoded JSONB columns.
     value: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "path",
+            "value",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "path",
+            "value",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.path) |value| {
+            try jw.objectField("path");
+            try jw.write(value);
+        }
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Reranking execution statistics.
@@ -3801,6 +8195,39 @@ pub const RerankerProfile = struct {
     documents_reranked: ?i64 = null,
     /// Time spent reranking in milliseconds.
     duration_ms: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "documents_reranked",
+            "duration_ms",
+            "model",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "documents_reranked",
+            "duration_ms",
+            "model",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.documents_reranked) |value| {
+            try jw.objectField("documents_reranked");
+            try jw.write(value);
+        }
+        if (self.duration_ms) |value| {
+            try jw.objectField("duration_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Type of resource: table, user, inference, or global ('*'). Use inference with resource '*' to grant access to unified inference routes.
@@ -3859,12 +8286,102 @@ pub const RestoreJob = struct {
     updated_at_ms: i64,
     /// Unix epoch milliseconds after which this terminal job record and its idempotency key may be removed. Omitted while the job is nonterminal.
     expires_at_ms: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "error",
+            "expires_at_ms",
+            "result",
+            "table_name",
+            "total_table_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "error",
+            "expires_at_ms",
+            "result",
+            "table_name",
+            "total_table_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("job_id");
+        try jw.write(self.job_id);
+        try jw.objectField("attempt_id");
+        try jw.write(self.attempt_id);
+        try jw.objectField("scope");
+        try jw.write(self.scope);
+        if (self.table_name) |value| {
+            try jw.objectField("table_name");
+            try jw.write(value);
+        }
+        try jw.objectField("backup_id");
+        try jw.write(self.backup_id);
+        try jw.objectField("phase");
+        try jw.write(self.phase);
+        try jw.objectField("cancel_requested");
+        try jw.write(self.cancel_requested);
+        try jw.objectField("durability_pending_table_count");
+        try jw.write(self.durability_pending_table_count);
+        try jw.objectField("published_table_count");
+        try jw.write(self.published_table_count);
+        try jw.objectField("completed_table_count");
+        try jw.write(self.completed_table_count);
+        if (self.total_table_count) |value| {
+            try jw.objectField("total_table_count");
+            try jw.write(value);
+        }
+        if (self.result) |value| {
+            try jw.objectField("result");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.objectField("created_at_ms");
+        try jw.write(self.created_at_ms);
+        try jw.objectField("updated_at_ms");
+        try jw.write(self.updated_at_ms);
+        if (self.expires_at_ms) |value| {
+            try jw.objectField("expires_at_ms");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RestoreJobList = struct {
     jobs: []const RestoreJob,
     /// Opaque newest-first continuation cursor. A page can be empty and still include a cursor when authorization or filters exclude a bounded scan window. Omitted when the retained scan is exhausted.
     next_cursor: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "next_cursor",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "next_cursor",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("jobs");
+        try jw.write(self.jobs);
+        if (self.next_cursor) |value| {
+            try jw.objectField("next_cursor");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const RestoreRequest = struct {
@@ -3916,6 +8433,129 @@ pub const RetrievalAgentRequest = struct {
     steps: ?RetrievalAgentSteps = null,
     /// Handlebars template for rendering documents in the generation prompt. Default uses TOON format for token efficiency. Requires steps.generation to be set.
     document_renderer: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "accumulated_filters",
+            "agent_knowledge",
+            "chain",
+            "decisions",
+            "document_renderer",
+            "interactive",
+            "max_context_tokens",
+            "max_internal_iterations",
+            "max_user_clarifications",
+            "messages",
+            "require_decision_after",
+            "reserve_tokens",
+            "session_id",
+            "steps",
+            "stream",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "accumulated_filters",
+            "agent_knowledge",
+            "chain",
+            "decisions",
+            "document_renderer",
+            "interactive",
+            "max_context_tokens",
+            "max_internal_iterations",
+            "max_user_clarifications",
+            "messages",
+            "require_decision_after",
+            "reserve_tokens",
+            "session_id",
+            "steps",
+            "stream",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("query");
+        try jw.write(self.query);
+        try jw.objectField("queries");
+        try jw.write(self.queries);
+        if (self.messages) |value| {
+            try jw.objectField("messages");
+            try jw.write(value);
+        }
+        if (self.agent_knowledge) |value| {
+            try jw.objectField("agent_knowledge");
+            try jw.write(value);
+        }
+        if (self.accumulated_filters) |value| {
+            try jw.objectField("accumulated_filters");
+            try jw.write(value);
+        }
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        if (self.decisions) |value| {
+            try jw.objectField("decisions");
+            try jw.write(value);
+        }
+        if (self.interactive) |value| {
+            try jw.objectField("interactive");
+            try jw.write(value);
+        }
+        if (self.max_internal_iterations) |value| {
+            try jw.objectField("max_internal_iterations");
+            try jw.write(value);
+        }
+        if (self.max_user_clarifications) |value| {
+            try jw.objectField("max_user_clarifications");
+            try jw.write(value);
+        }
+        if (self.require_decision_after) |value| {
+            try jw.objectField("require_decision_after");
+            try jw.write(value);
+        }
+        if (self.max_context_tokens) |value| {
+            try jw.objectField("max_context_tokens");
+            try jw.write(value);
+        }
+        if (self.reserve_tokens) |value| {
+            try jw.objectField("reserve_tokens");
+            try jw.write(value);
+        }
+        if (self.stream) |value| {
+            try jw.objectField("stream");
+            try jw.write(value);
+        }
+        if (self.generator) |value| {
+            try jw.objectField("generator");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generator");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.chain) |value| {
+            try jw.objectField("chain");
+            try jw.write(value);
+        }
+        if (self.tools) |value| {
+            try jw.objectField("tools");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("tools");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.steps) |value| {
+            try jw.objectField("steps");
+            try jw.write(value);
+        }
+        if (self.document_renderer) |value| {
+            try jw.objectField("document_renderer");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result from the retrieval agent
@@ -3968,6 +8608,159 @@ pub const RetrievalAgentResult = struct {
     followup_questions: ?[]const []const u8 = null,
     /// Evaluation results when steps.eval was configured
     eval_result: ?antfly_eval_openapi.EvalResult = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "applied_filters",
+            "clarification_count",
+            "context_relevance",
+            "created_at",
+            "followup_questions",
+            "generation",
+            "generation_confidence",
+            "id",
+            "incomplete_details",
+            "iteration",
+            "messages",
+            "model",
+            "questions",
+            "remaining_internal_iterations",
+            "remaining_user_clarifications",
+            "session_id",
+            "steps",
+            "strategy_used",
+            "tool_calls_made",
+            "usage",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "applied_filters",
+            "clarification_count",
+            "context_relevance",
+            "created_at",
+            "followup_questions",
+            "generation",
+            "generation_confidence",
+            "id",
+            "incomplete_details",
+            "iteration",
+            "messages",
+            "model",
+            "questions",
+            "remaining_internal_iterations",
+            "remaining_user_clarifications",
+            "session_id",
+            "steps",
+            "strategy_used",
+            "tool_calls_made",
+            "usage",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.created_at) |value| {
+            try jw.objectField("created_at");
+            try jw.write(value);
+        }
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.incomplete_details) |value| {
+            try jw.objectField("incomplete_details");
+            try jw.write(value);
+        }
+        if (self.usage) |value| {
+            try jw.objectField("usage");
+            try jw.write(value);
+        }
+        try jw.objectField("hits");
+        try jw.write(self.hits);
+        if (self.steps) |value| {
+            try jw.objectField("steps");
+            try jw.write(value);
+        }
+        if (self.strategy_used) |value| {
+            try jw.objectField("strategy_used");
+            try jw.write(value);
+        }
+        if (self.session_id) |value| {
+            try jw.objectField("session_id");
+            try jw.write(value);
+        }
+        if (self.iteration) |value| {
+            try jw.objectField("iteration");
+            try jw.write(value);
+        }
+        if (self.clarification_count) |value| {
+            try jw.objectField("clarification_count");
+            try jw.write(value);
+        }
+        if (self.remaining_internal_iterations) |value| {
+            try jw.objectField("remaining_internal_iterations");
+            try jw.write(value);
+        }
+        if (self.remaining_user_clarifications) |value| {
+            try jw.objectField("remaining_user_clarifications");
+            try jw.write(value);
+        }
+        if (self.questions) |value| {
+            try jw.objectField("questions");
+            try jw.write(value);
+        }
+        if (self.applied_filters) |value| {
+            try jw.objectField("applied_filters");
+            try jw.write(value);
+        }
+        if (self.tool_calls_made) |value| {
+            try jw.objectField("tool_calls_made");
+            try jw.write(value);
+        }
+        if (self.messages) |value| {
+            try jw.objectField("messages");
+            try jw.write(value);
+        }
+        if (self.classification) |value| {
+            try jw.objectField("classification");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("classification");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        }
+        if (self.generation_confidence) |value| {
+            try jw.objectField("generation_confidence");
+            try jw.write(value);
+        }
+        if (self.context_relevance) |value| {
+            try jw.objectField("context_relevance");
+            try jw.write(value);
+        }
+        if (self.followup_questions) |value| {
+            try jw.objectField("followup_questions");
+            try jw.write(value);
+        }
+        if (self.eval_result) |value| {
+            try jw.objectField("eval_result");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("eval_result");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
@@ -3984,6 +8777,62 @@ pub const RetrievalAgentSteps = struct {
     confidence: ?antfly_generating_api_openapi.ConfidenceStepConfig = null,
     /// Configuration for inline evaluation. Runs evaluators on retrieved documents and/or generated response. Requires steps.generation for generation-quality evaluators (faithfulness, completeness, etc.).
     eval: ?antfly_eval_openapi.EvalConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "retrieval",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "retrieval",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.classification) |value| {
+            try jw.objectField("classification");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("classification");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.retrieval) |value| {
+            try jw.objectField("retrieval");
+            try jw.write(value);
+        }
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("generation");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.followup) |value| {
+            try jw.objectField("followup");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("followup");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.confidence) |value| {
+            try jw.objectField("confidence");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("confidence");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.eval) |value| {
+            try jw.objectField("eval");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("eval");
+            try jw.write(@as(?u8, null));
+        }
+        try jw.endObject();
+    }
 };
 
 /// Token usage and resource statistics from the retrieval agent execution
@@ -4002,6 +8851,63 @@ pub const RetrievalAgentUsage = struct {
     resources_retrieved: ?i64 = null,
     /// Token pruning statistics, present when max_context_tokens was configured
     prune_stats: ?PruneStats = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "cached_input_tokens",
+            "input_tokens",
+            "llm_calls",
+            "output_tokens",
+            "prune_stats",
+            "resources_retrieved",
+            "total_tokens",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "cached_input_tokens",
+            "input_tokens",
+            "llm_calls",
+            "output_tokens",
+            "prune_stats",
+            "resources_retrieved",
+            "total_tokens",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.input_tokens) |value| {
+            try jw.objectField("input_tokens");
+            try jw.write(value);
+        }
+        if (self.output_tokens) |value| {
+            try jw.objectField("output_tokens");
+            try jw.write(value);
+        }
+        if (self.total_tokens) |value| {
+            try jw.objectField("total_tokens");
+            try jw.write(value);
+        }
+        if (self.cached_input_tokens) |value| {
+            try jw.objectField("cached_input_tokens");
+            try jw.write(value);
+        }
+        if (self.llm_calls) |value| {
+            try jw.objectField("llm_calls");
+            try jw.write(value);
+        }
+        if (self.resources_retrieved) |value| {
+            try jw.objectField("resources_retrieved");
+            try jw.write(value);
+        }
+        if (self.prune_stats) |value| {
+            try jw.objectField("prune_stats");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A query in the retrieval pipeline. Extends QueryRequest with an optional tree search configuration. Each query specifies its own table. When both search fields (semantic_search, full_text_search) and tree_search are provided, the search results are used as start nodes for tree navigation.
@@ -4074,6 +8980,234 @@ pub const RetrievalQueryRequest = struct {
     foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
     /// Optional tree search configuration
     tree_search: ?TreeSearchConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "aggregations",
+            "analyses",
+            "count",
+            "distance_over",
+            "distance_under",
+            "document_renderer",
+            "embedding_template",
+            "embeddings",
+            "exclusion_query",
+            "expand_strategy",
+            "fields",
+            "filter_prefix",
+            "filter_query",
+            "foreign_sources",
+            "full_text_search",
+            "graph_queries",
+            "graph_searches",
+            "hierarchy",
+            "indexes",
+            "join",
+            "limit",
+            "offset",
+            "order_by",
+            "profile",
+            "query",
+            "search_after",
+            "search_before",
+            "search_effort",
+            "semantic_search",
+            "table",
+            "timeout_ms",
+            "tree_search",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "aggregations",
+            "analyses",
+            "count",
+            "distance_over",
+            "distance_under",
+            "document_renderer",
+            "embedding_template",
+            "embeddings",
+            "exclusion_query",
+            "expand_strategy",
+            "fields",
+            "filter_prefix",
+            "filter_query",
+            "foreign_sources",
+            "full_text_search",
+            "graph_queries",
+            "graph_searches",
+            "hierarchy",
+            "indexes",
+            "join",
+            "limit",
+            "offset",
+            "order_by",
+            "profile",
+            "query",
+            "search_after",
+            "search_before",
+            "search_effort",
+            "semantic_search",
+            "table",
+            "timeout_ms",
+            "tree_search",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.query) |value| {
+            try jw.objectField("query");
+            try jw.write(value);
+        }
+        if (self.full_text_search) |value| {
+            try jw.objectField("full_text_search");
+            try jw.write(value);
+        }
+        if (self.semantic_search) |value| {
+            try jw.objectField("semantic_search");
+            try jw.write(value);
+        }
+        if (self.embedding_template) |value| {
+            try jw.objectField("embedding_template");
+            try jw.write(value);
+        }
+        if (self.indexes) |value| {
+            try jw.objectField("indexes");
+            try jw.write(value);
+        }
+        if (self.filter_prefix) |value| {
+            try jw.objectField("filter_prefix");
+            try jw.write(value);
+        }
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.exclusion_query) |value| {
+            try jw.objectField("exclusion_query");
+            try jw.write(value);
+        }
+        if (self.aggregations) |value| {
+            try jw.objectField("aggregations");
+            try jw.write(value);
+        }
+        if (self.embeddings) |value| {
+            try jw.objectField("embeddings");
+            try jw.write(value);
+        }
+        if (self.search_effort) |value| {
+            try jw.objectField("search_effort");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.hierarchy) |value| {
+            try jw.objectField("hierarchy");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.offset) |value| {
+            try jw.objectField("offset");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.search_after) |value| {
+            try jw.objectField("search_after");
+            try jw.write(value);
+        }
+        if (self.search_before) |value| {
+            try jw.objectField("search_before");
+            try jw.write(value);
+        }
+        if (self.distance_under) |value| {
+            try jw.objectField("distance_under");
+            try jw.write(value);
+        }
+        if (self.distance_over) |value| {
+            try jw.objectField("distance_over");
+            try jw.write(value);
+        }
+        if (self.merge_config) |value| {
+            try jw.objectField("merge_config");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("merge_config");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.count) |value| {
+            try jw.objectField("count");
+            try jw.write(value);
+        }
+        if (self.profile) |value| {
+            try jw.objectField("profile");
+            try jw.write(value);
+        }
+        if (self.reranker) |value| {
+            try jw.objectField("reranker");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("reranker");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.analyses) |value| {
+            try jw.objectField("analyses");
+            try jw.write(value);
+        }
+        if (self.graph_queries) |value| {
+            try jw.objectField("graph_queries");
+            try jw.write(value);
+        }
+        if (self.graph_searches) |value| {
+            try jw.objectField("graph_searches");
+            try jw.write(value);
+        }
+        if (self.expand_strategy) |value| {
+            try jw.objectField("expand_strategy");
+            try jw.write(value);
+        }
+        if (self.document_renderer) |value| {
+            try jw.objectField("document_renderer");
+            try jw.write(value);
+        }
+        if (self.pruner) |value| {
+            try jw.objectField("pruner");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("pruner");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.join) |value| {
+            try jw.objectField("join");
+            try jw.write(value);
+        }
+        if (self.foreign_sources) |value| {
+            try jw.objectField("foreign_sources");
+            try jw.write(value);
+        }
+        if (self.tree_search) |value| {
+            try jw.objectField("tree_search");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
@@ -4145,6 +9279,57 @@ pub const RuntimeConfigStatus = struct {
     stale: ?bool = null,
     reload_successes: ?i64 = null,
     reload_failures: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "generation",
+            "hash",
+            "last_reload_failed",
+            "reload_failures",
+            "reload_successes",
+            "stale",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "generation",
+            "hash",
+            "last_reload_failed",
+            "reload_failures",
+            "reload_successes",
+            "stale",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.generation) |value| {
+            try jw.objectField("generation");
+            try jw.write(value);
+        }
+        if (self.hash) |value| {
+            try jw.objectField("hash");
+            try jw.write(value);
+        }
+        if (self.last_reload_failed) |value| {
+            try jw.objectField("last_reload_failed");
+            try jw.write(value);
+        }
+        if (self.stale) |value| {
+            try jw.objectField("stale");
+            try jw.write(value);
+        }
+        if (self.reload_successes) |value| {
+            try jw.objectField("reload_successes");
+            try jw.write(value);
+        }
+        if (self.reload_failures) |value| {
+            try jw.objectField("reload_failures");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Emitted when an error occurs during retrieval
@@ -4226,6 +9411,33 @@ pub const SSEStepStarted = struct {
     name: []const u8,
     /// Human-readable description of the action being taken
     action: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "kind",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "kind",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("id");
+        try jw.write(self.id);
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("action");
+        try jw.write(self.action);
+        try jw.endObject();
+    }
 };
 
 /// Emitted when the agent selects a tool-calling mode
@@ -4234,6 +9446,29 @@ pub const SSEToolMode = struct {
     mode: []const u8,
     /// Number of tools available (present for native mode)
     tools_count: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "tools_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "tools_count",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.tools_count) |value| {
+            try jw.objectField("tools_count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Request to scan keys in a table within a key range. If no range is specified, scans all keys in the table.
@@ -4252,6 +9487,63 @@ pub const ScanKeysRequest = struct {
     filter_query: ?RawQuery = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "exclusive_to",
+            "fields",
+            "filter_query",
+            "from",
+            "inclusive_from",
+            "limit",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "exclusive_to",
+            "fields",
+            "filter_query",
+            "from",
+            "inclusive_from",
+            "limit",
+            "to",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.from) |value| {
+            try jw.objectField("from");
+            try jw.write(value);
+        }
+        if (self.to) |value| {
+            try jw.objectField("to");
+            try jw.write(value);
+        }
+        if (self.inclusive_from) |value| {
+            try jw.objectField("inclusive_from");
+            try jw.write(value);
+        }
+        if (self.exclusive_to) |value| {
+            try jw.objectField("exclusive_to");
+            try jw.write(value);
+        }
+        if (self.fields) |value| {
+            try jw.objectField("fields");
+            try jw.write(value);
+        }
+        if (self.filter_query) |value| {
+            try jw.objectField("filter_query");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SecretEntry = struct {
@@ -4262,6 +9554,43 @@ pub const SecretEntry = struct {
     env_var: ?[]const u8 = null,
     created_at: ?[]const u8 = null,
     updated_at: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "created_at",
+            "env_var",
+            "updated_at",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "created_at",
+            "env_var",
+            "updated_at",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.env_var) |value| {
+            try jw.objectField("env_var");
+            try jw.write(value);
+        }
+        if (self.created_at) |value| {
+            try jw.objectField("created_at");
+            try jw.write(value);
+        }
+        if (self.updated_at) |value| {
+            try jw.objectField("updated_at");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SecretList = struct {
@@ -4312,21 +9641,37 @@ pub const SecretStoreStatus = struct {
     reload_successes: ?i64 = null,
     reload_failures: ?i64 = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "generation",
+            "last_reload_failed",
+            "reload_failures",
+            "reload_successes",
+            "stale",
+            "supports_source_generation",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "generation",
+            "last_reload_failed",
+            "reload_failures",
+            "reload_successes",
+            "stale",
+            "supports_source_generation",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         if (self.generation) |value| {
             try jw.objectField("generation");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generation");
-            try jw.write(@as(?u8, null));
         }
         if (self.supports_source_generation) |value| {
             try jw.objectField("supports_source_generation");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("supports_source_generation");
-            try jw.write(@as(?u8, null));
         }
         switch (self.source_generation) {
             .absent => {},
@@ -4342,30 +9687,18 @@ pub const SecretStoreStatus = struct {
         if (self.last_reload_failed) |value| {
             try jw.objectField("last_reload_failed");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("last_reload_failed");
-            try jw.write(@as(?u8, null));
         }
         if (self.stale) |value| {
             try jw.objectField("stale");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("stale");
-            try jw.write(@as(?u8, null));
         }
         if (self.reload_successes) |value| {
             try jw.objectField("reload_successes");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("reload_successes");
-            try jw.write(@as(?u8, null));
         }
         if (self.reload_failures) |value| {
             try jw.objectField("reload_failures");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("reload_failures");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -4388,6 +9721,39 @@ pub const ShardsProfile = struct {
     successful: ?i64 = null,
     /// Shards that failed during execution.
     failed: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "failed",
+            "successful",
+            "total",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "failed",
+            "successful",
+            "total",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.total) |value| {
+            try jw.objectField("total");
+            try jw.write(value);
+        }
+        if (self.successful) |value| {
+            try jw.objectField("successful");
+            try jw.write(value);
+        }
+        if (self.failed) |value| {
+            try jw.objectField("failed");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Algorithm for computing term significance: - jlh: JLH algorithm (default) - mutual_information: Mutual Information - chi_squared: Chi-squared test - percentage: Simple percentage comparison
@@ -4472,6 +9838,153 @@ pub const SortProfile = struct {
     sort_rejection_detail: ?[]const u8 = null,
     /// Sort field associated with the rejection when safe to expose.
     sort_rejection_field: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "budget_rejection_reason",
+            "candidate_count",
+            "candidate_source",
+            "cursor",
+            "cursor_rejected_count",
+            "cursor_support",
+            "distributed_behavior",
+            "distributed_shard_count",
+            "exactness",
+            "index_sort_coverage",
+            "order_by",
+            "plan",
+            "require_native",
+            "selected_count",
+            "selection_reason",
+            "sort_lifecycle_state",
+            "sort_rejection_detail",
+            "sort_rejection_field",
+            "sort_rejection_reason",
+            "source",
+            "source_load",
+            "total_us",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "budget_rejection_reason",
+            "candidate_count",
+            "candidate_source",
+            "cursor",
+            "cursor_rejected_count",
+            "cursor_support",
+            "distributed_behavior",
+            "distributed_shard_count",
+            "exactness",
+            "index_sort_coverage",
+            "order_by",
+            "plan",
+            "require_native",
+            "selected_count",
+            "selection_reason",
+            "sort_lifecycle_state",
+            "sort_rejection_detail",
+            "sort_rejection_field",
+            "sort_rejection_reason",
+            "source",
+            "source_load",
+            "total_us",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.plan) |value| {
+            try jw.objectField("plan");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.exactness) |value| {
+            try jw.objectField("exactness");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
+            try jw.write(value);
+        }
+        if (self.candidate_source) |value| {
+            try jw.objectField("candidate_source");
+            try jw.write(value);
+        }
+        if (self.cursor_support) |value| {
+            try jw.objectField("cursor_support");
+            try jw.write(value);
+        }
+        if (self.source_load) |value| {
+            try jw.objectField("source_load");
+            try jw.write(value);
+        }
+        if (self.distributed_behavior) |value| {
+            try jw.objectField("distributed_behavior");
+            try jw.write(value);
+        }
+        if (self.selection_reason) |value| {
+            try jw.objectField("selection_reason");
+            try jw.write(value);
+        }
+        if (self.require_native) |value| {
+            try jw.objectField("require_native");
+            try jw.write(value);
+        }
+        if (self.sort_lifecycle_state) |value| {
+            try jw.objectField("sort_lifecycle_state");
+            try jw.write(value);
+        }
+        if (self.index_sort_coverage) |value| {
+            try jw.objectField("index_sort_coverage");
+            try jw.write(value);
+        }
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.cursor_rejected_count) |value| {
+            try jw.objectField("cursor_rejected_count");
+            try jw.write(value);
+        }
+        if (self.selected_count) |value| {
+            try jw.objectField("selected_count");
+            try jw.write(value);
+        }
+        if (self.total_us) |value| {
+            try jw.objectField("total_us");
+            try jw.write(value);
+        }
+        if (self.distributed_shard_count) |value| {
+            try jw.objectField("distributed_shard_count");
+            try jw.write(value);
+        }
+        if (self.budget_rejection_reason) |value| {
+            try jw.objectField("budget_rejection_reason");
+            try jw.write(value);
+        }
+        if (self.sort_rejection_reason) |value| {
+            try jw.objectField("sort_rejection_reason");
+            try jw.write(value);
+        }
+        if (self.sort_rejection_detail) |value| {
+            try jw.objectField("sort_rejection_detail");
+            try jw.write(value);
+        }
+        if (self.sort_rejection_field) |value| {
+            try jw.objectField("sort_rejection_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const StorageMaintenanceCapabilities = struct {
@@ -4496,6 +10009,37 @@ pub const StorageRuntimeStatus = struct {
     format: ?[]const u8 = null,
     fsync: ?bool = null,
     maintenance: StorageMaintenanceCapabilities,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "format",
+            "fsync",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "format",
+            "fsync",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("engine");
+        try jw.write(self.engine);
+        if (self.format) |value| {
+            try jw.objectField("format");
+            try jw.write(value);
+        }
+        if (self.fsync) |value| {
+            try jw.objectField("fsync");
+            try jw.write(value);
+        }
+        try jw.objectField("maintenance");
+        try jw.write(self.maintenance);
+        try jw.endObject();
+    }
 };
 
 pub const StorageStatus = struct {
@@ -4504,10 +10048,64 @@ pub const StorageStatus = struct {
     /// Whether the table has received data.
     empty: ?bool = null,
     lsm: ?LsmStorageStatus = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "disk_usage",
+            "empty",
+            "lsm",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "disk_usage",
+            "empty",
+            "lsm",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.disk_usage) |value| {
+            try jw.objectField("disk_usage");
+            try jw.write(value);
+        }
+        if (self.empty) |value| {
+            try jw.objectField("empty");
+            try jw.write(value);
+        }
+        if (self.lsm) |value| {
+            try jw.objectField("lsm");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const SuccessMessage = struct {
     message: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "message",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "message",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.message) |value| {
+            try jw.objectField("message");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Precompute enrichments before committing the document. A synchronous producer failure rejects the write; post-commit worker failures retain the document and may return `committed_repair_required`. - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
@@ -4558,6 +10156,58 @@ pub const Table = struct {
     replication_sources: ?[]const ReplicationSource = null,
     /// Effective runtime field capabilities for this table. Clients can use this to discover concrete field variants and their supported query modes, such as full_text, exact, range, geo, and autocomplete. Public exact field sort is supported only for `_id` or scalar fields marked sortable whose sort lifecycle is queryable or accelerated.
     field_capabilities: ?[]const FieldCapability = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "description",
+            "field_capabilities",
+            "migration",
+            "replication_sources",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "description",
+            "field_capabilities",
+            "migration",
+            "replication_sources",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("indexes");
+        try jw.write(self.indexes);
+        try jw.objectField("shards");
+        try jw.write(self.shards);
+        if (self.schema) |value| {
+            try jw.objectField("schema");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("schema");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.migration) |value| {
+            try jw.objectField("migration");
+            try jw.write(value);
+        }
+        if (self.replication_sources) |value| {
+            try jw.objectField("replication_sources");
+            try jw.write(value);
+        }
+        if (self.field_capabilities) |value| {
+            try jw.objectField("field_capabilities");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Table-level generated artifact enrichments configured for a table.
@@ -4653,6 +10303,55 @@ pub const TableBackupStatus = struct {
     backup_id: ?[]const u8 = null,
     /// Opaque artifact generation retained by an ambiguous cluster attempt.
     artifact_backup_id: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_backup_id",
+            "backup_id",
+            "code",
+            "error",
+            "retryable",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_backup_id",
+            "backup_id",
+            "code",
+            "error",
+            "retryable",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        if (self.code) |value| {
+            try jw.objectField("code");
+            try jw.write(value);
+        }
+        if (self.retryable) |value| {
+            try jw.objectField("retryable");
+            try jw.write(value);
+        }
+        if (self.backup_id) |value| {
+            try jw.objectField("backup_id");
+            try jw.write(value);
+        }
+        if (self.artifact_backup_id) |value| {
+            try jw.objectField("artifact_backup_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TableCatalogChangedConflict = struct {
@@ -4717,6 +10416,30 @@ pub const TableRepairIssue = struct {
     /// Last stable repair error code, when a repair attempt failed.
     last_error: ?[]const u8 = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_key",
+            "generation_error",
+            "last_error",
+            "parent_doc_key",
+            "source_artifact_name",
+            "unit_id",
+            "unsupported_reason",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_key",
+            "generation_error",
+            "last_error",
+            "parent_doc_key",
+            "source_artifact_name",
+            "unit_id",
+            "unsupported_reason",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("artifact_kind");
@@ -4728,32 +10451,20 @@ pub const TableRepairIssue = struct {
         if (self.parent_doc_key) |value| {
             try jw.objectField("parent_doc_key");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("parent_doc_key");
-            try jw.write(@as(?u8, null));
         }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("unit_id");
-            try jw.write(@as(?u8, null));
         }
         if (self.source_artifact_name) |value| {
             try jw.objectField("source_artifact_name");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("source_artifact_name");
-            try jw.write(@as(?u8, null));
         }
         try jw.objectField("artifact_name");
         try jw.write(self.artifact_name);
         if (self.artifact_key) |value| {
             try jw.objectField("artifact_key");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("artifact_key");
-            try jw.write(@as(?u8, null));
         }
         switch (self.chunk_id) {
             .absent => {},
@@ -4771,9 +10482,6 @@ pub const TableRepairIssue = struct {
         if (self.unsupported_reason) |value| {
             try jw.objectField("unsupported_reason");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("unsupported_reason");
-            try jw.write(@as(?u8, null));
         }
         try jw.objectField("sequence");
         try jw.write(self.sequence);
@@ -4784,9 +10492,6 @@ pub const TableRepairIssue = struct {
         if (self.generation_error) |value| {
             try jw.objectField("generation_error");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("generation_error");
-            try jw.write(@as(?u8, null));
         }
         try jw.objectField("attempts");
         try jw.write(self.attempts);
@@ -4797,9 +10502,6 @@ pub const TableRepairIssue = struct {
         if (self.last_error) |value| {
             try jw.objectField("last_error");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("last_error");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -4887,6 +10589,20 @@ pub const TableRepairJob = struct {
     /// Unix epoch milliseconds when the job is eligible for cleanup.
     expires_at_millis: i64,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "index",
+            "kind",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "index",
+            "kind",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("job_id");
@@ -4904,16 +10620,10 @@ pub const TableRepairJob = struct {
         if (self.kind) |value| {
             try jw.objectField("kind");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("kind");
-            try jw.write(@as(?u8, null));
         }
         if (self.index) |value| {
             try jw.objectField("index");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("index");
-            try jw.write(@as(?u8, null));
         }
         switch (self.cursor) {
             .absent => {},
@@ -4969,6 +10679,63 @@ pub const TableRepairJobStartRequest = struct {
     limit: ?i64 = null,
     /// When true, the server immediately attempts the first bounded repair pass before returning the job.
     advance: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "advance",
+            "cursor",
+            "force",
+            "index",
+            "kind",
+            "limit",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "advance",
+            "cursor",
+            "force",
+            "index",
+            "kind",
+            "limit",
+            "target",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.target) |value| {
+            try jw.objectField("target");
+            try jw.write(value);
+        }
+        if (self.kind) |value| {
+            try jw.objectField("kind");
+            try jw.write(value);
+        }
+        if (self.index) |value| {
+            try jw.objectField("index");
+            try jw.write(value);
+        }
+        if (self.cursor) |value| {
+            try jw.objectField("cursor");
+            try jw.write(value);
+        }
+        if (self.force) |value| {
+            try jw.objectField("force");
+            try jw.write(value);
+        }
+        if (self.limit) |value| {
+            try jw.objectField("limit");
+            try jw.write(value);
+        }
+        if (self.advance) |value| {
+            try jw.objectField("advance");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Response for a bounded table repair pass.
@@ -5074,6 +10841,31 @@ pub const TableRestoreStatus = struct {
     status: []const u8,
     /// Error message if restore failed
     @"error": ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "error",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "error",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Statistics about a table used for query planning.
@@ -5086,6 +10878,45 @@ pub const TableStatistics = struct {
     field_stats: ?std.json.ArrayHashMap(FieldStatistics) = null,
     /// When these statistics were last computed.
     last_updated: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field_stats",
+            "last_updated",
+            "row_count",
+            "size_bytes",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field_stats",
+            "last_updated",
+            "row_count",
+            "size_bytes",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.row_count) |value| {
+            try jw.objectField("row_count");
+            try jw.write(value);
+        }
+        if (self.size_bytes) |value| {
+            try jw.objectField("size_bytes");
+            try jw.write(value);
+        }
+        if (self.field_stats) |value| {
+            try jw.objectField("field_stats");
+            try jw.write(value);
+        }
+        if (self.last_updated) |value| {
+            try jw.objectField("last_updated");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TableStatus = struct {
@@ -5104,6 +10935,66 @@ pub const TableStatus = struct {
     storage_status: StorageStatus,
     /// Table-level generated artifact enrichments registered outside a specific index.
     artifact_enrichments: ?[]const antfly_indexes_openapi.EnrichmentConfig = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "artifact_enrichments",
+            "description",
+            "field_capabilities",
+            "migration",
+            "replication_sources",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "artifact_enrichments",
+            "description",
+            "field_capabilities",
+            "migration",
+            "replication_sources",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.objectField("indexes");
+        try jw.write(self.indexes);
+        try jw.objectField("shards");
+        try jw.write(self.shards);
+        if (self.schema) |value| {
+            try jw.objectField("schema");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("schema");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.migration) |value| {
+            try jw.objectField("migration");
+            try jw.write(value);
+        }
+        if (self.replication_sources) |value| {
+            try jw.objectField("replication_sources");
+            try jw.write(value);
+        }
+        if (self.field_capabilities) |value| {
+            try jw.objectField("field_capabilities");
+            try jw.write(value);
+        }
+        try jw.objectField("storage_status");
+        try jw.write(self.storage_status);
+        if (self.artifact_enrichments) |value| {
+            try jw.objectField("artifact_enrichments");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A non-retryable table-storage integrity or format failure.
@@ -5133,6 +11024,27 @@ pub const TopologyChangedError = struct {
 
 pub const TransactionBeginRequest = struct {
     sync_level: ?SyncLevel = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TransactionBeginResponse = struct {
@@ -5148,6 +11060,31 @@ pub const TransactionCommitRequest = struct {
     /// Write set: map of table names to batch operations, same format as MultiBatchRequest.tables.
     tables: std.json.ArrayHashMap(BatchRequest),
     sync_level: ?SyncLevel = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "sync_level",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("read_set");
+        try jw.write(self.read_set);
+        try jw.objectField("tables");
+        try jw.write(self.tables);
+        if (self.sync_level) |value| {
+            try jw.objectField("sync_level");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Result of an OCC transaction commit attempt.
@@ -5158,6 +11095,35 @@ pub const TransactionCommitResponse = struct {
     conflict: ?TransactionConflict = null,
     /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "conflict",
+            "tables",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "conflict",
+            "tables",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.conflict) |value| {
+            try jw.objectField("conflict");
+            try jw.write(value);
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Structured details for an aborted transaction attempt.
@@ -5181,6 +11147,61 @@ pub const TransactionConflict = struct {
     /// Version observed while validating the transaction predicate.
     current_version: ?i64 = null,
     participant: ?TransactionConflictParticipant = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "current_version",
+            "expected_version",
+            "participant",
+            "retry_after_ms",
+            "retry_scope",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "current_version",
+            "expected_version",
+            "participant",
+            "retry_after_ms",
+            "retry_scope",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("table");
+        try jw.write(self.table);
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("message");
+        try jw.write(self.message);
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("retryable");
+        try jw.write(self.retryable);
+        if (self.retry_after_ms) |value| {
+            try jw.objectField("retry_after_ms");
+            try jw.write(value);
+        }
+        if (self.retry_scope) |value| {
+            try jw.objectField("retry_scope");
+            try jw.write(value);
+        }
+        if (self.expected_version) |value| {
+            try jw.objectField("expected_version");
+            try jw.write(value);
+        }
+        if (self.current_version) |value| {
+            try jw.objectField("current_version");
+            try jw.write(value);
+        }
+        if (self.participant) |value| {
+            try jw.objectField("participant");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Participant location and 2PC phase where the conflict occurred.
@@ -5189,6 +11210,33 @@ pub const TransactionConflictParticipant = struct {
     group_id: ?i64 = null,
     /// 2PC participant phase that reported the conflict.
     phase: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "group_id",
+            "phase",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "group_id",
+            "phase",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.group_id) |value| {
+            try jw.objectField("group_id");
+            try jw.write(value);
+        }
+        if (self.phase) |value| {
+            try jw.objectField("phase");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
@@ -5210,6 +11258,33 @@ pub const TransactionSavepointResponse = struct {
 pub const TransactionSessionCleanupResponse = struct {
     removed: ?i64 = null,
     cutoff_ns: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "cutoff_ns",
+            "removed",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "cutoff_ns",
+            "removed",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.removed) |value| {
+            try jw.objectField("removed");
+            try jw.write(value);
+        }
+        if (self.cutoff_ns) |value| {
+            try jw.objectField("cutoff_ns");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSessionCommitResponse = struct {
@@ -5220,6 +11295,37 @@ pub const TransactionSessionCommitResponse = struct {
     /// Per-table batch results (present for every committed status)
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
     transaction_id: []const u8,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "conflict",
+            "tables",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "conflict",
+            "tables",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.conflict) |value| {
+            try jw.objectField("conflict");
+            try jw.write(value);
+        }
+        if (self.tables) |value| {
+            try jw.objectField("tables");
+            try jw.write(value);
+        }
+        try jw.objectField("transaction_id");
+        try jw.write(self.transaction_id);
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSessionDetailsResponse = struct {
@@ -5242,6 +11348,22 @@ pub const TransactionSessionDetailsResponse = struct {
     tables: ?[]const TransactionSessionTableDetail = null,
     read_snapshots: ?[]const TransactionSessionReadSnapshot = null,
     savepoint_ids: ?[]const i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "read_snapshots",
+            "savepoint_ids",
+            "tables",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "read_snapshots",
+            "savepoint_ids",
+            "tables",
+        }, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -5298,23 +11420,14 @@ pub const TransactionSessionDetailsResponse = struct {
         if (self.tables) |value| {
             try jw.objectField("tables");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("tables");
-            try jw.write(@as(?u8, null));
         }
         if (self.read_snapshots) |value| {
             try jw.objectField("read_snapshots");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("read_snapshots");
-            try jw.write(@as(?u8, null));
         }
         if (self.savepoint_ids) |value| {
             try jw.objectField("savepoint_ids");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("savepoint_ids");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -5325,6 +11438,45 @@ pub const TransactionSessionListResponse = struct {
     lease_held_count: ?i64 = null,
     lease_expired_count: ?i64 = null,
     sessions: ?[]const TransactionSessionStatus = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "lease_expired_count",
+            "lease_held_count",
+            "session_count",
+            "sessions",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "lease_expired_count",
+            "lease_held_count",
+            "session_count",
+            "sessions",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.session_count) |value| {
+            try jw.objectField("session_count");
+            try jw.write(value);
+        }
+        if (self.lease_held_count) |value| {
+            try jw.objectField("lease_held_count");
+            try jw.write(value);
+        }
+        if (self.lease_expired_count) |value| {
+            try jw.objectField("lease_expired_count");
+            try jw.write(value);
+        }
+        if (self.sessions) |value| {
+            try jw.objectField("sessions");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TransactionSessionReadSnapshot = struct {
@@ -5333,28 +11485,35 @@ pub const TransactionSessionReadSnapshot = struct {
     version: ?i64 = null,
     document: OpenApiOptionalNullable(std.json.Value) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "key",
+            "table",
+            "version",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "key",
+            "table",
+            "version",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         if (self.table) |value| {
             try jw.objectField("table");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("table");
-            try jw.write(@as(?u8, null));
         }
         if (self.key) |value| {
             try jw.objectField("key");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("key");
-            try jw.write(@as(?u8, null));
         }
         if (self.version) |value| {
             try jw.objectField("version");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("version");
-            try jw.write(@as(?u8, null));
         }
         switch (self.document) {
             .absent => {},
@@ -5451,6 +11610,51 @@ pub const TransactionSessionTableDetail = struct {
     staged_write_count: ?i64 = null,
     staged_delete_count: ?i64 = null,
     staged_predicate_count: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "staged_delete_count",
+            "staged_predicate_count",
+            "staged_read_count",
+            "staged_write_count",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "staged_delete_count",
+            "staged_predicate_count",
+            "staged_read_count",
+            "staged_write_count",
+            "table",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.table) |value| {
+            try jw.objectField("table");
+            try jw.write(value);
+        }
+        if (self.staged_read_count) |value| {
+            try jw.objectField("staged_read_count");
+            try jw.write(value);
+        }
+        if (self.staged_write_count) |value| {
+            try jw.objectField("staged_write_count");
+            try jw.write(value);
+        }
+        if (self.staged_delete_count) |value| {
+            try jw.objectField("staged_delete_count");
+            try jw.write(value);
+        }
+        if (self.staged_predicate_count) |value| {
+            try jw.objectField("staged_predicate_count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TransactionStageDeleteRequest = struct {
@@ -5509,6 +11713,31 @@ pub const Transform = struct {
     operations: []const TransformOp,
     /// If true, create document if it doesn't exist (like MongoDB upsert)
     upsert: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "upsert",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "upsert",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try jw.write(self.key);
+        try jw.objectField("operations");
+        try jw.write(self.operations);
+        if (self.upsert) |value| {
+            try jw.objectField("upsert");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const TransformOp = struct {
@@ -5517,6 +11746,31 @@ pub const TransformOp = struct {
     path: []const u8,
     /// Value for operation (not required for $unset). Type depends on the supported operator. `$pull` removes every array element exactly equal to this JSON value; projected graph-edge values identify the relationship by `target`.
     value: ?std.json.Value = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "value",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "value",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("op");
+        try jw.write(self.op);
+        try jw.objectField("path");
+        try jw.write(self.path);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// MongoDB-style update operator
@@ -5574,6 +11828,33 @@ pub const TraverseResponse = struct {
     results: ?[]const TraversalResult = null,
     /// Total number of results
     count: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "count",
+            "results",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "count",
+            "results",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.results) |value| {
+            try jw.objectField("results");
+            try jw.write(value);
+        }
+        if (self.count) |value| {
+            try jw.objectField("count");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Configuration for tree search strategy. Tree search navigates hierarchical document structures by evaluating summaries at each level.
@@ -5586,6 +11867,41 @@ pub const TreeSearchConfig = struct {
     max_depth: ?i64 = null,
     /// Number of branches to explore at each level
     beam_width: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "beam_width",
+            "max_depth",
+            "start_nodes",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "beam_width",
+            "max_depth",
+            "start_nodes",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("index");
+        try jw.write(self.index);
+        if (self.start_nodes) |value| {
+            try jw.objectField("start_nodes");
+            try jw.write(value);
+        }
+        if (self.max_depth) |value| {
+            try jw.objectField("max_depth");
+            try jw.write(value);
+        }
+        if (self.beam_width) |value| {
+            try jw.objectField("beam_width");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const UpdatePasswordRequest = struct {
@@ -5653,6 +11969,117 @@ pub const WebSearchConnection = struct {
     exclude_domains: ?[]const []const u8 = null,
     /// True when required credentials/config are present. Secret values are never returned.
     configured: ?bool = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "configured",
+            "data_store",
+            "endpoint",
+            "exclude_domains",
+            "include_content",
+            "include_domains",
+            "include_highlights",
+            "language",
+            "location",
+            "max_results",
+            "project_id",
+            "region",
+            "safe_search",
+            "service",
+            "serving_config",
+            "timeout_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "configured",
+            "data_store",
+            "endpoint",
+            "exclude_domains",
+            "include_content",
+            "include_domains",
+            "include_highlights",
+            "language",
+            "location",
+            "max_results",
+            "project_id",
+            "region",
+            "safe_search",
+            "service",
+            "serving_config",
+            "timeout_ms",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.service) |value| {
+            try jw.objectField("service");
+            try jw.write(value);
+        }
+        if (self.max_results) |value| {
+            try jw.objectField("max_results");
+            try jw.write(value);
+        }
+        if (self.timeout_ms) |value| {
+            try jw.objectField("timeout_ms");
+            try jw.write(value);
+        }
+        if (self.safe_search) |value| {
+            try jw.objectField("safe_search");
+            try jw.write(value);
+        }
+        if (self.language) |value| {
+            try jw.objectField("language");
+            try jw.write(value);
+        }
+        if (self.region) |value| {
+            try jw.objectField("region");
+            try jw.write(value);
+        }
+        if (self.include_content) |value| {
+            try jw.objectField("include_content");
+            try jw.write(value);
+        }
+        if (self.include_highlights) |value| {
+            try jw.objectField("include_highlights");
+            try jw.write(value);
+        }
+        if (self.endpoint) |value| {
+            try jw.objectField("endpoint");
+            try jw.write(value);
+        }
+        if (self.project_id) |value| {
+            try jw.objectField("project_id");
+            try jw.write(value);
+        }
+        if (self.location) |value| {
+            try jw.objectField("location");
+            try jw.write(value);
+        }
+        if (self.data_store) |value| {
+            try jw.objectField("data_store");
+            try jw.write(value);
+        }
+        if (self.serving_config) |value| {
+            try jw.objectField("serving_config");
+            try jw.write(value);
+        }
+        if (self.include_domains) |value| {
+            try jw.objectField("include_domains");
+            try jw.write(value);
+        }
+        if (self.exclude_domains) |value| {
+            try jw.objectField("exclude_domains");
+            try jw.write(value);
+        }
+        if (self.configured) |value| {
+            try jw.objectField("configured");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
@@ -5698,4 +12125,106 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
             }
         }
     };
+}
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);
+
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {
+    inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;
+    return false;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
 }

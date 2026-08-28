@@ -28,23 +28,19 @@ pub fn rejectInternalDocIdentityFields(alloc: std.mem.Allocator, body: []const u
     try query_contract.validatePublicQueryEnvelopeValueAlloc(alloc, parsed.value);
 }
 
-pub fn parseSupportedGraphQueriesAlloc(
+/// Parse the canonical graph-query surface used by serverless runtimes. Legacy
+/// compatibility belongs exclusively to the stateful Antfly ingress adapter.
+pub fn parseCanonicalGraphQueriesAlloc(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryRequest,
 ) ![]const db_mod.types.NamedGraphQuery {
-    if (request.graph_queries != null and request.graph_searches != null)
-        return error.InvalidQueryRequest;
+    if (request.graph_searches != null) return error.UnsupportedQueryRequest;
     // Canonical graph results may contain table-qualified identities, while
-    // the retrieval hit envelope is scoped to the queried table. Keep the
-    // legacy merge adapter from erasing that provenance.
+    // the retrieval hit envelope is scoped to the queried table. Reject the
+    // legacy retrieval merge control instead of erasing that provenance.
     if (request.graph_queries != null and request.expand_strategy != null)
         return error.InvalidQueryRequest;
-    const query_count = if (request.graph_queries) |queries|
-        queries.map.count()
-    else if (request.graph_searches) |queries|
-        queries.map.count()
-    else
-        0;
+    const query_count = if (request.graph_queries) |queries| queries.map.count() else 0;
     if (query_count > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
 
     var items = std.ArrayListUnmanaged(db_mod.types.NamedGraphQuery).empty;
@@ -58,19 +54,6 @@ pub fn parseSupportedGraphQueriesAlloc(
             var name_owned = true;
             errdefer if (name_owned) alloc.free(name);
             const query = try parseSupportedGraphQuery(alloc, entry.value_ptr.*);
-            var query_owned = true;
-            errdefer if (query_owned) freeGraphQuery(alloc, query);
-            try items.append(alloc, .{ .name = name, .query = query });
-            name_owned = false;
-            query_owned = false;
-        }
-    } else if (request.graph_searches) |graph_searches| {
-        var it = graph_searches.map.iterator();
-        while (it.next()) |entry| {
-            const name = try alloc.dupe(u8, entry.key_ptr.*);
-            var name_owned = true;
-            errdefer if (name_owned) alloc.free(name);
-            const query = try query_contract.parseLegacyGraphQuery(alloc, entry.value_ptr.*);
             var query_owned = true;
             errdefer if (query_owned) freeGraphQuery(alloc, query);
             try items.append(alloc, .{ .name = name, .query = query });
@@ -94,7 +77,7 @@ test "canonical graph queries reject the legacy expand strategy" {
 
     try std.testing.expectError(
         error.InvalidQueryRequest,
-        parseSupportedGraphQueriesAlloc(alloc, parsed.value),
+        parseCanonicalGraphQueriesAlloc(alloc, parsed.value),
     );
 }
 
@@ -542,7 +525,7 @@ test "parse supported graph queries alloc clones edge types and keys" {
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
@@ -563,41 +546,17 @@ test "parse supported graph queries alloc clones edge types and keys" {
     );
 }
 
-test "parse supported graph queries accepts deprecated graph searches" {
+test "canonical graph parser rejects deprecated graph searches" {
     const alloc = std.testing.allocator;
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
         \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":7}}}}
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
-    defer freeNamedGraphQueries(alloc, items);
-
-    try std.testing.expectEqual(@as(usize, 1), items.len);
-    try std.testing.expect(items[0].query.start_nodes == .keys);
-    try std.testing.expectEqual(graph_query_mod.QueryType.neighbors, items[0].query.query_type);
-    try std.testing.expectEqualStrings("graph_idx", items[0].query.index_name);
-    try std.testing.expectEqual(@as(u32, 7), items[0].query.params.max_results);
-}
-
-test "deprecated graph searches preserve opaque legacy operation names" {
-    const alloc = std.testing.allocator;
-    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
-        \\{"graph_searches":{"":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]}},"$legacy":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-b"]}}}}
-    , .{});
-    defer parsed.deinit();
-
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
-    defer freeNamedGraphQueries(alloc, items);
-    try std.testing.expectEqual(@as(usize, 2), items.len);
-    var saw_empty = false;
-    var saw_reserved = false;
-    for (items) |item| {
-        if (item.name.len == 0) saw_empty = true;
-        if (std.mem.eql(u8, item.name, "$legacy")) saw_reserved = true;
-    }
-    try std.testing.expect(saw_empty);
-    try std.testing.expect(saw_reserved);
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseCanonicalGraphQueriesAlloc(alloc, parsed.value),
+    );
 }
 
 test "graph operation names cannot shadow reserved result namespaces" {
@@ -607,7 +566,7 @@ test "graph operation names cannot shadow reserved result namespaces" {
     , .{});
     defer parsed.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, parsed.value));
 
     const ResultSet = struct { name: []const u8 };
     const sets = [_]ResultSet{.{ .name = "walk" }};
@@ -622,22 +581,22 @@ test "canonical graph edge filters and document projections are explicit" {
         \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"edge_types":["cites","cites"]}}}}
     , .{});
     defer duplicate_types.deinit();
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, duplicate_types.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, duplicate_types.value));
 
     var traversal_fields = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
         \\{"graph_queries":{"walk":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"fields":["title"]}}}}
     , .{});
     defer traversal_fields.deinit();
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, traversal_fields.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, traversal_fields.value));
 
     var path_fields = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
         \\{"graph_queries":{"path":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-b"},"fields":["title"]}}}}
     , .{});
     defer path_fields.deinit();
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, path_fields.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, path_fields.value));
 }
 
-test "parse supported graph queries rejects canonical and legacy fields together" {
+test "canonical graph parser rejects canonical and legacy fields together" {
     const alloc = std.testing.allocator;
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
         \\{
@@ -647,26 +606,7 @@ test "parse supported graph queries rejects canonical and legacy fields together
     , .{});
     defer parsed.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
-}
-
-test "legacy graph result refs preserve their retrieval lane" {
-    const alloc = std.testing.allocator;
-    var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc,
-        \\{
-        \\  "graph_searches": {
-        \\    "legacy": {
-        \\      "type": "neighbors",
-        \\      "index_name": "graph_idx",
-        \\      "start_nodes": {"result_ref": "$full_text_results", "limit": 2}
-        \\    }
-        \\  }
-        \\}
-    , .{});
-    defer parsed.deinit();
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
-    defer freeNamedGraphQueries(alloc, items);
-    try std.testing.expectEqualStrings("$full_text_results", items[0].query.start_nodes.result_ref.ref);
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "parse supported graph queries reject unbounded traversal limits" {
@@ -677,7 +617,7 @@ test "parse supported graph queries reject unbounded traversal limits" {
     defer parsed.deinit();
     try std.testing.expectError(
         error.InvalidQueryRequest,
-        parseSupportedGraphQueriesAlloc(alloc, parsed.value),
+        parseCanonicalGraphQueriesAlloc(alloc, parsed.value),
     );
 }
 
@@ -695,7 +635,7 @@ test "parse supported graph queries rejects unsupported result refs" {
     , .{});
     defer parsed.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "parse supported graph queries accepts graph result refs" {
@@ -712,7 +652,7 @@ test "parse supported graph queries accepts graph result refs" {
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqualStrings("$graph_results.first_hop", items[0].query.start_nodes.result_ref.ref);
@@ -733,7 +673,7 @@ test "parse supported graph queries accepts ranked query result refs" {
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqualStrings("$query_results", items[0].query.start_nodes.result_ref.ref);
@@ -758,7 +698,7 @@ test "parse supported graph queries accepts ranked query refs for traversal" {
     });
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
@@ -781,7 +721,7 @@ test "parse supported graph queries accepts ranked query refs for vector retriev
     , .{});
     defer embeddings_parsed.deinit();
 
-    const embeddings_items = try parseSupportedGraphQueriesAlloc(alloc, embeddings_parsed.value);
+    const embeddings_items = try parseCanonicalGraphQueriesAlloc(alloc, embeddings_parsed.value);
     defer freeNamedGraphQueries(alloc, embeddings_items);
     try std.testing.expectEqualStrings("$query_results", embeddings_items[0].query.start_nodes.result_ref.ref);
     try std.testing.expectEqual(@as(u32, 2), embeddings_items[0].query.start_nodes.result_ref.limit);
@@ -843,7 +783,7 @@ test "parse supported graph queries accepts pattern requests" {
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
@@ -876,7 +816,7 @@ test "graph query dependencies require compatible explicit outputs" {
         \\}
     , .{});
     defer parsed.deinit();
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
     const order = try sortQueriesByDependencies(alloc, items);
     defer alloc.free(order);
@@ -932,7 +872,7 @@ test "parse supported graph queries accepts pattern node filter queries" {
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
     try std.testing.expectEqual(@as(usize, 1), items.len);
@@ -963,7 +903,7 @@ test "parse supported graph queries accepts pattern node filter queries" {
     defer malformed_path.deinit();
     try std.testing.expectError(
         error.InvalidQueryRequest,
-        parseSupportedGraphQueriesAlloc(alloc, malformed_path.value),
+        parseCanonicalGraphQueriesAlloc(alloc, malformed_path.value),
     );
 }
 
@@ -988,7 +928,7 @@ test "graph document filters preserve explicit boolean thresholds" {
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
 
     var optional_should = try ant_json.parseFromSlice(
@@ -1027,7 +967,7 @@ fn expectInvalidGraphDocumentFilter(filter_json: []const u8) !void {
     defer alloc.free(body);
     var parsed = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{});
     defer parsed.deinit();
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "graph document filter admission enforces generated schema constraints" {
@@ -1052,7 +992,7 @@ test "graph match edges preserve explicit direction" {
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
     const edges = items[0].query.match_pattern.?.edges;
     try std.testing.expectEqual(graph_mod.EdgeDirection.out, edges[0].step.direction);
@@ -1146,7 +1086,7 @@ test "parse supported graph queries require document hydration for projected fie
     , .{});
     defer parsed.deinit();
 
-    try std.testing.expectError(error.InvalidQueryRequest, parseSupportedGraphQueriesAlloc(alloc, parsed.value));
+    try std.testing.expectError(error.InvalidQueryRequest, parseCanonicalGraphQueriesAlloc(alloc, parsed.value));
 }
 
 test "parse supported graph queries accepts branches predicates optional groups and counts" {
@@ -1179,7 +1119,7 @@ test "parse supported graph queries accepts branches predicates optional groups 
     , .{});
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
     const pattern = items[0].query.match_pattern.?;
     try std.testing.expectEqual(@as(usize, 2), pattern.edges.len);
@@ -1210,7 +1150,7 @@ test "parse supported graph queries rejects distinct field on count all" {
 
     try std.testing.expectError(
         error.InvalidQueryRequest,
-        parseSupportedGraphQueriesAlloc(alloc, parsed.value),
+        parseCanonicalGraphQueriesAlloc(alloc, parsed.value),
     );
 }
 
@@ -1259,7 +1199,7 @@ test "parse supported graph queries accepts sibling bindings and exact aggregate
     });
     defer parsed.deinit();
 
-    const items = try parseSupportedGraphQueriesAlloc(alloc, parsed.value);
+    const items = try parseCanonicalGraphQueriesAlloc(alloc, parsed.value);
     defer freeNamedGraphQueries(alloc, items);
     try std.testing.expectEqual(@as(usize, 2), items.len);
 }

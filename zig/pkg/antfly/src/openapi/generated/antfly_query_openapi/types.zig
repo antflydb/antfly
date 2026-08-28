@@ -8,6 +8,18 @@ pub const BoolFieldQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("bool");
@@ -15,9 +27,6 @@ pub const BoolFieldQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -41,35 +50,41 @@ pub const BooleanQuery = struct {
     filter: ?Query = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "filter",
+            "must",
+            "must_not",
+            "should",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "filter",
+            "must",
+            "must_not",
+            "should",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         if (self.must) |value| {
             try jw.objectField("must");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("must");
-            try jw.write(@as(?u8, null));
         }
         if (self.should) |value| {
             try jw.objectField("should");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("should");
-            try jw.write(@as(?u8, null));
         }
         if (self.must_not) |value| {
             try jw.objectField("must_not");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("must_not");
-            try jw.write(@as(?u8, null));
         }
         if (self.filter) |value| {
             try jw.objectField("filter");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("filter");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -123,21 +138,33 @@ pub const DateRangeStringQuery = struct {
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     datetime_parser: ?[]const u8 = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "datetime_parser",
+            "end",
+            "field",
+            "start",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "datetime_parser",
+            "end",
+            "field",
+            "start",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         if (self.start) |value| {
             try jw.objectField("start");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("start");
-            try jw.write(@as(?u8, null));
         }
         if (self.end) |value| {
             try jw.objectField("end");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("end");
-            try jw.write(@as(?u8, null));
         }
         switch (self.inclusive_start) {
             .absent => {},
@@ -164,9 +191,6 @@ pub const DateRangeStringQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -182,9 +206,6 @@ pub const DateRangeStringQuery = struct {
         if (self.datetime_parser) |value| {
             try jw.objectField("datetime_parser");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("datetime_parser");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -195,6 +216,18 @@ pub const DisjunctionQuery = struct {
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     /// Minimum number of disjuncts that must match. Omit for conventional disjunction semantics; set to 0 to make a pure disjunction optional.
     min: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "min",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "min",
+        }, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -214,9 +247,6 @@ pub const DisjunctionQuery = struct {
         if (self.min) |value| {
             try jw.objectField("min");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("min");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -255,6 +285,22 @@ pub const FuzzyQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+            "fuzziness",
+            "prefix_length",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+            "fuzziness",
+            "prefix_length",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("term");
@@ -262,23 +308,14 @@ pub const FuzzyQuery = struct {
         if (self.prefix_length) |value| {
             try jw.objectField("prefix_length");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("prefix_length");
-            try jw.write(@as(?u8, null));
         }
         if (self.fuzziness) |value| {
             try jw.objectField("fuzziness");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("fuzziness");
-            try jw.write(@as(?u8, null));
         }
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -341,6 +378,18 @@ pub const GeoBoundingPolygonQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("polygon_points");
@@ -348,9 +397,6 @@ pub const GeoBoundingPolygonQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -374,6 +420,18 @@ pub const GeoDistanceQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("location");
@@ -383,9 +441,6 @@ pub const GeoDistanceQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -405,6 +460,33 @@ pub const GeoDistanceQuery = struct {
 pub const GeoPoint = struct {
     lon: ?f64 = null,
     lat: ?f64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "lat",
+            "lon",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "lat",
+            "lon",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.lon) |value| {
+            try jw.objectField("lon");
+            try jw.write(value);
+        }
+        if (self.lat) |value| {
+            try jw.objectField("lat");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// A GeoJSON shape object. This is a simplified representation.
@@ -423,6 +505,18 @@ pub const GeoShapeQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("geometry");
@@ -430,9 +524,6 @@ pub const GeoShapeQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -454,6 +545,18 @@ pub const IPRangeQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("cidr");
@@ -461,9 +564,6 @@ pub const IPRangeQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -533,6 +633,22 @@ pub const MatchPhraseQuery = struct {
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     fuzziness: ?Fuzziness = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "analyzer",
+            "field",
+            "fuzziness",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "analyzer",
+            "field",
+            "fuzziness",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("match_phrase");
@@ -540,16 +656,10 @@ pub const MatchPhraseQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         if (self.analyzer) |value| {
             try jw.objectField("analyzer");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("analyzer");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -565,9 +675,6 @@ pub const MatchPhraseQuery = struct {
         if (self.fuzziness) |value| {
             try jw.objectField("fuzziness");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("fuzziness");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -579,6 +686,20 @@ pub const MatchQuery = struct {
     analyzer: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "analyzer",
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "analyzer",
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("match");
@@ -586,16 +707,10 @@ pub const MatchQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         if (self.analyzer) |value| {
             try jw.objectField("analyzer");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("analyzer");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -651,6 +766,20 @@ pub const MultiPhraseQuery = struct {
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     fuzziness: ?Fuzziness = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+            "fuzziness",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+            "fuzziness",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("terms");
@@ -658,9 +787,6 @@ pub const MultiPhraseQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -676,9 +802,6 @@ pub const MultiPhraseQuery = struct {
         if (self.fuzziness) |value| {
             try jw.objectField("fuzziness");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("fuzziness");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -691,6 +814,18 @@ pub const NumericRangeQuery = struct {
     inclusive_max: OpenApiOptionalNullable(bool) = .absent,
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -741,9 +876,6 @@ pub const NumericRangeQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -766,6 +898,20 @@ pub const PhraseQuery = struct {
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
     fuzziness: ?Fuzziness = null,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+            "fuzziness",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+            "fuzziness",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("terms");
@@ -773,9 +919,6 @@ pub const PhraseQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -791,9 +934,6 @@ pub const PhraseQuery = struct {
         if (self.fuzziness) |value| {
             try jw.objectField("fuzziness");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("fuzziness");
-            try jw.write(@as(?u8, null));
         }
         try jw.endObject();
     }
@@ -804,6 +944,18 @@ pub const PrefixQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("prefix");
@@ -811,9 +963,6 @@ pub const PrefixQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -1100,6 +1249,18 @@ pub const RegexpQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("regexp");
@@ -1107,9 +1268,6 @@ pub const RegexpQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -1131,6 +1289,18 @@ pub const TermQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("term");
@@ -1138,9 +1308,6 @@ pub const TermQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -1164,6 +1331,18 @@ pub const TermRangeQuery = struct {
     inclusive_max: OpenApiOptionalNullable(bool) = .absent,
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -1214,9 +1393,6 @@ pub const TermRangeQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -1238,6 +1414,18 @@ pub const WildcardQuery = struct {
     field: ?[]const u8 = null,
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            "field",
+        }, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("wildcard");
@@ -1245,9 +1433,6 @@ pub const WildcardQuery = struct {
         if (self.field) |value| {
             try jw.objectField("field");
             try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("field");
-            try jw.write(@as(?u8, null));
         }
         switch (self.boost) {
             .absent => {},
@@ -1307,4 +1492,106 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
             }
         }
     };
+}
+
+/// Parse an OpenAPI object without materializing a second JSON tree while
+/// rejecting explicit null for optional properties whose schemas are non-nullable.
+fn openApiParseObject(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: anytype,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (.object_begin != try source.next()) return error.UnexpectedToken;
+
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    while (true) {
+        var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
+        const field_name = switch (name_token.?) {
+            inline .string, .allocated_string => |slice| slice,
+            .object_end => break,
+            else => return error.UnexpectedToken,
+        };
+        const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);
+
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                openApiFreeAllocatedToken(allocator, name_token.?);
+                name_token = null;
+                if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (fields_seen[i]) {
+                    switch (options.duplicate_field_behavior) {
+                        .use_first => {
+                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            break;
+                        },
+                        .@"error" => return error.DuplicateField,
+                        .use_last => {},
+                    }
+                }
+                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else {
+            openApiFreeAllocatedToken(allocator, name_token.?);
+            if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
+        }
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiParseObjectFromValue(
+    comptime T: type,
+    comptime non_nullable_optional_fields: []const []const u8,
+    allocator: std.mem.Allocator,
+    source: std.json.Value,
+    options: std.json.ParseOptions,
+) !T {
+    const struct_info = @typeInfo(T).@"struct";
+    if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (source != .object) return error.UnexpectedToken;
+    var result: T = undefined;
+    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var it = source.object.iterator();
+    while (it.next()) |entry| {
+        const field_name = entry.key_ptr.*;
+        if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;
+        inline for (struct_info.fields, 0..) |field, i| {
+            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
+            if (std.mem.eql(u8, field.name, field_name)) {
+                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                fields_seen[i] = true;
+                break;
+            }
+        } else if (!options.ignore_unknown_fields) return error.UnknownField;
+    }
+    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    return result;
+}
+
+fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {
+    inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;
+    return false;
+}
+
+fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+        if (!fields_seen[i]) {
+            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+        }
+    }
+}
+
+fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {
+    switch (token) {
+        .allocated_number, .allocated_string => |slice| allocator.free(slice),
+        else => {},
+    }
 }

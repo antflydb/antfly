@@ -73,3 +73,56 @@ test "optional nullable properties round-trip all three wire states" {
     const null_from_value = try std.json.parseFromValueLeaky(types.Pet, alloc, null_tree, .{});
     try std.testing.expect(null_from_value.tag == .null_value);
 }
+
+test "optional non-nullable properties reject explicit null without losing omission ergonomics" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const omitted = try std.json.parseFromSliceLeaky(
+        types.Pet,
+        alloc,
+        \\{"id":1,"name":"Mochi"}
+    ,
+        .{},
+    );
+    try std.testing.expect(omitted.status == null);
+    try std.testing.expect(omitted.metadata == null);
+
+    // Generated serializers preserve the schema's absence/null distinction
+    // even when the caller requests null emission for ordinary Zig optionals.
+    const omitted_json = try std.json.Stringify.valueAlloc(
+        alloc,
+        omitted,
+        .{ .emit_null_optional_fields = true },
+    );
+    try std.testing.expect(std.mem.indexOf(u8, omitted_json, "\"status\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, omitted_json, "\"metadata\"") == null);
+
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(
+        types.Pet,
+        alloc,
+        \\{"id":1,"name":"Mochi","status":null}
+    ,
+        .{},
+    ));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(
+        types.Pet,
+        alloc,
+        \\{"id":1,"name":"Mochi","metadata":null}
+    ,
+        .{},
+    ));
+
+    const null_tree = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        \\{"id":1,"name":"Mochi","status":null}
+    ,
+        .{},
+    );
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        std.json.parseFromValueLeaky(types.Pet, alloc, null_tree, .{}),
+    );
+}

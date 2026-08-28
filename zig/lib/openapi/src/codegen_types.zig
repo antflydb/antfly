@@ -39,6 +39,7 @@ pub const TypeGenerator = struct {
     auxiliary_type_names: std.StringHashMapUnmanaged([]const u8) = .empty,
     optional_nullable_type_name: ?[]const u8 = null,
     uses_optional_nullable: bool = false,
+    uses_strict_optional_object: bool = false,
     type_names_initialized: bool = false,
 
     pub fn init(arena: Allocator, w: *SourceWriter, resolver: *Resolver) TypeGenerator {
@@ -80,6 +81,10 @@ pub const TypeGenerator = struct {
         }
         if (self.uses_optional_nullable) {
             try self.emitOptionalNullableType(optional_nullable_type_name);
+            try self.w.blank();
+        }
+        if (self.uses_strict_optional_object) {
+            try self.emitStrictOptionalObjectHelpers();
             try self.w.blank();
         }
     }
@@ -149,6 +154,154 @@ pub const TypeGenerator = struct {
         try self.w.line("}}", .{});
         self.w.dedent();
         try self.w.line("}};", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+    }
+
+    fn emitStrictOptionalObjectHelpers(self: *TypeGenerator) !void {
+        try self.w.line("/// Parse an OpenAPI object without materializing a second JSON tree while", .{});
+        try self.w.line("/// rejecting explicit null for optional properties whose schemas are non-nullable.", .{});
+        try self.w.line("fn openApiParseObject(", .{});
+        self.w.indent();
+        try self.w.line("comptime T: type,", .{});
+        try self.w.line("comptime non_nullable_optional_fields: []const []const u8,", .{});
+        try self.w.line("allocator: std.mem.Allocator,", .{});
+        try self.w.line("source: anytype,", .{});
+        try self.w.line("options: std.json.ParseOptions,", .{});
+        self.w.dedent();
+        try self.w.line(") !T {{", .{});
+        self.w.indent();
+        try self.w.line("const struct_info = @typeInfo(T).@\"struct\";", .{});
+        try self.w.line("if (struct_info.is_tuple) @compileError(\"OpenAPI object parser does not accept tuples\");", .{});
+        try self.w.line("if (.object_begin != try source.next()) return error.UnexpectedToken;", .{});
+        try self.w.blank();
+        try self.w.line("var result: T = undefined;", .{});
+        try self.w.line("var fields_seen = [_]bool{{false}} ** struct_info.fields.len;", .{});
+        try self.w.line("while (true) {{", .{});
+        self.w.indent();
+        try self.w.line("var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);", .{});
+        try self.w.line("const field_name = switch (name_token.?) {{", .{});
+        self.w.indent();
+        try self.w.line("inline .string, .allocated_string => |slice| slice,", .{});
+        try self.w.line(".object_end => break,", .{});
+        try self.w.line("else => return error.UnexpectedToken,", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.line("const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);", .{});
+        try self.w.blank();
+        try self.w.line("inline for (struct_info.fields, 0..) |field, i| {{", .{});
+        self.w.indent();
+        try self.w.line("if (field.is_comptime) @compileError(\"comptime fields are not supported: \" ++ @typeName(T) ++ \".\" ++ field.name);", .{});
+        try self.w.line("if (std.mem.eql(u8, field.name, field_name)) {{", .{});
+        self.w.indent();
+        try self.w.line("openApiFreeAllocatedToken(allocator, name_token.?);", .{});
+        try self.w.line("name_token = null;", .{});
+        try self.w.line("if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;", .{});
+        try self.w.line("if (fields_seen[i]) {{", .{});
+        self.w.indent();
+        try self.w.line("switch (options.duplicate_field_behavior) {{", .{});
+        self.w.indent();
+        try self.w.line(".use_first => {{", .{});
+        self.w.indent();
+        try self.w.line("_ = try std.json.innerParse(field.type, allocator, source, options);", .{});
+        try self.w.line("break;", .{});
+        self.w.dedent();
+        try self.w.line("}},", .{});
+        try self.w.line(".@\"error\" => return error.DuplicateField,", .{});
+        try self.w.line(".use_last => {{}},", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.line("@field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);", .{});
+        try self.w.line("fields_seen[i] = true;", .{});
+        try self.w.line("break;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}} else {{", .{});
+        self.w.indent();
+        try self.w.line("openApiFreeAllocatedToken(allocator, name_token.?);", .{});
+        try self.w.line("if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.line("try openApiFillDefaultStructValues(T, &result, &fields_seen);", .{});
+        try self.w.line("return result;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+
+        try self.w.line("fn openApiParseObjectFromValue(", .{});
+        self.w.indent();
+        try self.w.line("comptime T: type,", .{});
+        try self.w.line("comptime non_nullable_optional_fields: []const []const u8,", .{});
+        try self.w.line("allocator: std.mem.Allocator,", .{});
+        try self.w.line("source: std.json.Value,", .{});
+        try self.w.line("options: std.json.ParseOptions,", .{});
+        self.w.dedent();
+        try self.w.line(") !T {{", .{});
+        self.w.indent();
+        try self.w.line("const struct_info = @typeInfo(T).@\"struct\";", .{});
+        try self.w.line("if (struct_info.is_tuple) @compileError(\"OpenAPI object parser does not accept tuples\");", .{});
+        try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
+        try self.w.line("var result: T = undefined;", .{});
+        try self.w.line("var fields_seen = [_]bool{{false}} ** struct_info.fields.len;", .{});
+        try self.w.line("var it = source.object.iterator();", .{});
+        try self.w.line("while (it.next()) |entry| {{", .{});
+        self.w.indent();
+        try self.w.line("const field_name = entry.key_ptr.*;", .{});
+        try self.w.line("if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;", .{});
+        try self.w.line("inline for (struct_info.fields, 0..) |field, i| {{", .{});
+        self.w.indent();
+        try self.w.line("if (field.is_comptime) @compileError(\"comptime fields are not supported: \" ++ @typeName(T) ++ \".\" ++ field.name);", .{});
+        try self.w.line("if (std.mem.eql(u8, field.name, field_name)) {{", .{});
+        self.w.indent();
+        try self.w.line("@field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);", .{});
+        try self.w.line("fields_seen[i] = true;", .{});
+        try self.w.line("break;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}} else if (!options.ignore_unknown_fields) return error.UnknownField;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.line("try openApiFillDefaultStructValues(T, &result, &fields_seen);", .{});
+        try self.w.line("return result;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+
+        try self.w.line("fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {{", .{});
+        self.w.indent();
+        try self.w.line("inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;", .{});
+        try self.w.line("return false;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@\"struct\".fields.len]bool) !void {{", .{});
+        self.w.indent();
+        try self.w.line("inline for (@typeInfo(T).@\"struct\".fields, 0..) |field, i| {{", .{});
+        self.w.indent();
+        try self.w.line("if (!fields_seen[i]) {{", .{});
+        self.w.indent();
+        try self.w.line("if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("fn openApiFreeAllocatedToken(allocator: std.mem.Allocator, token: std.json.Token) void {{", .{});
+        self.w.indent();
+        try self.w.line("switch (token) {{", .{});
+        self.w.indent();
+        try self.w.line(".allocated_number, .allocated_string => |slice| allocator.free(slice),", .{});
+        try self.w.line("else => {{}},", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
     }
@@ -445,11 +598,17 @@ pub const TypeGenerator = struct {
             try self.emitStructField(type_name, prop_name, prop_sor, required_set.contains(prop_name));
         }
 
+        var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
+        try self.collectNonNullableOptionalFields(schema, &required_set, true, &strict_optional_fields);
+        try self.emitStrictOptionalObjectParsers(strict_optional_fields.keys());
+
         // Request serialization normally omits null optional fields. Generate a
         // required-aware serializer when a required field permits null or its
         // nullability belongs to an external schema we cannot inspect. Presence
         // remains part of the containing object's wire contract either way.
-        if (self.schemaNeedsRequiredFieldSerializer(schema, &required_set, true)) {
+        if (strict_optional_fields.count() > 0 or
+            self.schemaNeedsRequiredFieldSerializer(schema, &required_set, true))
+        {
             try self.w.blank();
             try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
             self.w.indent();
@@ -607,7 +766,13 @@ pub const TypeGenerator = struct {
         // Also include any direct properties on the schema itself
         try self.emitFlattenedSchemaProperties(type_name, schema, &emitted_props, &all_required, true);
 
-        if (self.schemaNeedsRequiredFieldSerializer(schema, &all_required, true)) {
+        var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
+        try self.collectNonNullableOptionalFields(schema, &all_required, true, &strict_optional_fields);
+        try self.emitStrictOptionalObjectParsers(strict_optional_fields.keys());
+
+        if (strict_optional_fields.count() > 0 or
+            self.schemaNeedsRequiredFieldSerializer(schema, &all_required, true))
+        {
             try self.w.blank();
             try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
             self.w.indent();
@@ -642,6 +807,10 @@ pub const TypeGenerator = struct {
         var emitted_props = std.StringArrayHashMapUnmanaged(void){};
         try self.emitFlattenedSchemaProperties(type_name, schema, &emitted_props, &all_required, true);
 
+        var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
+        try self.collectNonNullableOptionalFields(schema, &all_required, true, &strict_optional_fields);
+        try self.emitStrictOptionalObjectParsers(strict_optional_fields.keys());
+
         try self.w.blank();
         try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
         self.w.indent();
@@ -654,6 +823,60 @@ pub const TypeGenerator = struct {
 
         self.w.dedent();
         try self.w.line("}};", .{});
+    }
+
+    fn collectNonNullableOptionalFields(
+        self: *TypeGenerator,
+        schema: types.Schema,
+        required_fields: *const std.StringArrayHashMapUnmanaged(void),
+        allow_required: bool,
+        fields: *std.StringArrayHashMapUnmanaged(void),
+    ) !void {
+        for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
+            const is_required = allow_required and required_fields.contains(prop_name);
+            if (!is_required and self.schemaOrRefRepresentation(prop_sor).nullability == .non_nullable) {
+                try fields.put(self.arena, prop_name, {});
+            }
+        }
+        for (schema.all_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            try self.collectNonNullableOptionalFields(resolved, required_fields, allow_required, fields);
+        }
+        for (schema.one_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            try self.collectNonNullableOptionalFields(resolved, required_fields, false, fields);
+        }
+        for (schema.any_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            try self.collectNonNullableOptionalFields(resolved, required_fields, false, fields);
+        }
+    }
+
+    fn emitStrictOptionalObjectParsers(self: *TypeGenerator, field_names: []const []const u8) !void {
+        if (field_names.len == 0) return;
+        self.uses_strict_optional_object = true;
+        const sorted = try sortedStringKeys(self.arena, field_names);
+
+        try self.w.blank();
+        try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("return try openApiParseObject(@This(), &.{{", .{});
+        self.w.indent();
+        for (sorted) |field_name| try self.w.line("\"{f}\",", .{std.zig.fmtString(field_name)});
+        self.w.dedent();
+        try self.w.line("}}, allocator, source, options);", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
+        try self.w.blank();
+        try self.w.line("pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {{", .{});
+        self.w.indent();
+        try self.w.line("return try openApiParseObjectFromValue(@This(), &.{{", .{});
+        self.w.indent();
+        for (sorted) |field_name| try self.w.line("\"{f}\",", .{std.zig.fmtString(field_name)});
+        self.w.dedent();
+        try self.w.line("}}, allocator, source, options);", .{});
+        self.w.dedent();
+        try self.w.line("}}", .{});
     }
 
     fn emitFlattenedSchemaProperties(
@@ -729,7 +952,11 @@ pub const TypeGenerator = struct {
                 try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
                 try self.w.line("try jw.write(value);", .{});
                 self.w.dedent();
-                if (optional_nulls_follow_writer) {
+                // The writer option is a presentation choice, not permission
+                // to violate a schema which distinguishes omission from JSON
+                // null. Only fields whose nullability is unknown may inherit
+                // that option; non-nullable optionals are always omitted.
+                if (optional_nulls_follow_writer and representation.nullability == .unknown) {
                     try self.w.line("}} else if (jw.options.emit_null_optional_fields) {{", .{});
                     self.w.indent();
                     try self.w.line("try jw.objectField(\"{s}\");", .{prop_name});
@@ -1996,7 +2223,9 @@ test "required + nullable field codegen" {
     try std.testing.expect(std.mem.indexOf(u8, output, "if (self.note) |value|") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "switch (self.optional_legacy_referenced_tag)") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, ".null_value => {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "else if (jw.options.emit_null_optional_fields)") != null);
+    // `note` is non-nullable, so writer presentation options cannot turn its
+    // absent state into an invalid explicit null on the wire.
+    try std.testing.expect(std.mem.indexOf(u8, output, "else if (jw.options.emit_null_optional_fields)") == null);
 }
 
 test "component schema emission order is lexical" {

@@ -365,6 +365,11 @@ test "generate 3.1 types with nullable and ref siblings" {
 
     // Optional $ref field: `?PetStatus = null`
     try std.testing.expect(std.mem.indexOf(u8, out, "status: ?PetStatus = null,") != null);
+    // Optional non-nullable properties keep ergonomic `?T` fields while their
+    // generated object parser rejects explicit JSON null according to OpenAPI.
+    try std.testing.expect(std.mem.indexOf(u8, out, "return try openApiParseObject(@This(), &.{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"status\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "fn openApiParseObject(") != null);
 }
 
 test "generate extractors only" {
