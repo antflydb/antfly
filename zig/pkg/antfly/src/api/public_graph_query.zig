@@ -32,14 +32,19 @@ pub fn rejectInternalDocIdentityFields(alloc: std.mem.Allocator, body: []const u
 /// compatibility belongs exclusively to the stateful Antfly ingress adapter.
 pub fn parseCanonicalGraphQueriesAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) ![]const db_mod.types.NamedGraphQuery {
-    if (request.graph_searches != null) return error.UnsupportedQueryRequest;
-    // Canonical graph results may contain table-qualified identities, while
-    // the retrieval hit envelope is scoped to the queried table. Reject the
-    // legacy retrieval merge control instead of erasing that provenance.
-    if (request.graph_queries != null and request.expand_strategy != null)
-        return error.InvalidQueryRequest;
+    const Request = @TypeOf(request);
+    if (comptime @hasField(Request, "graph_searches")) {
+        if (request.graph_searches != null) return error.UnsupportedQueryRequest;
+    }
+    if (comptime @hasField(Request, "expand_strategy")) {
+        // Canonical graph results may contain table-qualified identities, while
+        // the retrieval hit envelope is scoped to the queried table. Reject the
+        // legacy retrieval merge control instead of erasing that provenance.
+        if (request.graph_queries != null and request.expand_strategy != null)
+            return error.InvalidQueryRequest;
+    }
     const query_count = if (request.graph_queries) |queries| queries.map.count() else 0;
     if (query_count > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
 

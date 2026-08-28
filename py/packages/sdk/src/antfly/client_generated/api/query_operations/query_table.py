@@ -272,7 +272,9 @@ def sync_detailed(
 
     Args:
         table_name (str):
-        body (QueryRequest):
+        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
+            deprecated graph_searches is retained only at the stateful public transport boundary for
+            the v0.2 transition window.
         body (File):
 
     Raises:
@@ -322,7 +324,9 @@ def sync(
 
     Args:
         table_name (str):
-        body (QueryRequest):
+        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
+            deprecated graph_searches is retained only at the stateful public transport boundary for
+            the v0.2 transition window.
         body (File):
 
     Raises:
@@ -366,7 +370,9 @@ async def asyncio_detailed(
 
     Args:
         table_name (str):
-        body (QueryRequest):
+        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
+            deprecated graph_searches is retained only at the stateful public transport boundary for
+            the v0.2 transition window.
         body (File):
 
     Raises:
@@ -414,7 +420,9 @@ async def asyncio(
 
     Args:
         table_name (str):
-        body (QueryRequest):
+        body (QueryRequest): Stateful Antfly query request. Canonical clients use graph_queries;
+            deprecated graph_searches is retained only at the stateful public transport boundary for
+            the v0.2 transition window.
         body (File):
 
     Raises:

@@ -451,33 +451,42 @@ func TestGraphOpaqueUnionValidationRejectsUnknownMembers(t *testing.T) {
 	})
 	t.Run("query cross variant return", func(t *testing.T) {
 		var query GraphQuery
-		if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}},"return":null}`), &query); err != nil {
+		if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}},"return":{"bindings":["a"]}}`), &query); err != nil {
 			t.Fatal(err)
 		}
 		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "return is only valid") {
 			t.Fatalf("expected cross-variant return member error, got %v", err)
 		}
 	})
-	t.Run("query explicit null operation counts as present", func(t *testing.T) {
+	t.Run("query null text remains valid", func(t *testing.T) {
 		var query GraphQuery
-		if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}},"match":null}`), &query); err != nil {
+		if err := json.Unmarshal([]byte(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{"filter":{"term":"null","path":"/title"}}},"edges":[]},"return":{"bindings":["a"]}}`), &query); err != nil {
 			t.Fatal(err)
 		}
-		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "exactly one operation") {
-			t.Fatalf("expected explicit null operation to conflict with traversal, got %v", err)
+		if err := validateGraphQuery(query); err != nil {
+			t.Fatalf("expected JSON string containing null to remain valid, got %v", err)
 		}
 	})
 	for name, encoded := range map[string]string{
-		"null edge weight":       `{"index":"graph","traverse":{"start":{"keys":["a"]},"edge_weight":null}}`,
-		"null edge weight bound": `{"index":"graph","traverse":{"start":{"keys":["a"]},"edge_weight":{"min":null,"max":1}}}`,
-		"null objective":         `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"objective":null}}`,
+		"operation":             `{"index":"graph","traverse":{"start":{"keys":["a"]}},"match":null}`,
+		"edge weight":           `{"index":"graph","traverse":{"start":{"keys":["a"]},"edge_weight":null}}`,
+		"edge weight bound":     `{"index":"graph","traverse":{"start":{"keys":["a"]},"edge_weight":{"min":null,"max":1}}}`,
+		"objective":             `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"objective":null}}`,
+		"traversal filter":      `{"index":"graph","traverse":{"start":{"keys":["a"]},"filter":null}}`,
+		"traversal scalar":      `{"index":"graph","traverse":{"start":{"keys":["a"]},"include_documents":null}}`,
+		"match where":           `{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[],"where":null},"return":{"bindings":["a"]}}`,
+		"match node filter":     `{"index":"graph","match":{"anchor":"a","nodes":{"a":{"filter":null}},"edges":[]},"return":{"bindings":["a"]}}`,
+		"match node table":      `{"index":"graph","match":{"anchor":"a","nodes":{"a":{"table":null}},"edges":[]},"return":{"bindings":["a"]}}`,
+		"document range bound":  `{"index":"graph","match":{"anchor":"a","nodes":{"a":{"filter":{"numeric_range":{"path":"/score","min":null,"max":1}}}},"edges":[]},"return":{"bindings":["a"]}}`,
+		"optional where":        `{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[],"optional":[{"nodes":{"b":{}},"edges":[{"from":"a","to":"b"}],"where":null}]},"return":{"bindings":["a"]}}`,
+		"binding return fields": `{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"bindings":["a"],"fields":null}}`,
 	} {
 		t.Run("query "+name, func(t *testing.T) {
 			var query GraphQuery
 			if err := json.Unmarshal([]byte(encoded), &query); err != nil {
 				t.Fatal(err)
 			}
-			if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "must be omitted or non-null") {
+			if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "do not accept explicit null") {
 				t.Fatalf("expected explicit null option to fail, got %v", err)
 			}
 		})

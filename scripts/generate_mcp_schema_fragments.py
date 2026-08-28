@@ -85,7 +85,6 @@ QUERY_REQUEST_PROPERTIES = (
     "reranker",
     "aggregations",
     "graph_queries",
-    "expand_strategy",
     "document_renderer",
     "pruner",
     "join",
@@ -299,13 +298,14 @@ def generated_content(fragment: Fragment, schemas: dict[str, Any]) -> str:
 
 
 def compact_query_request_schema(schemas: dict[str, Any]) -> dict[str, Any]:
-    """Build the bounded MCP discovery view of the public QueryRequest.
+    """Build the bounded MCP discovery view of CanonicalQueryRequest.
 
     Property validation and cross-field constraints come from OpenAPI. Large
     recursive query subtrees stay open so this view remains safe for MCP
-    clients with small tools/list budgets.
+    clients with small tools/list budgets. MCP is canonical-only; deprecated
+    stateful graph_searches compatibility must not enter its generated shape.
     """
-    component = schemas["QueryRequest"]
+    component = schemas["CanonicalQueryRequest"]
     source_properties = component["properties"]
     properties: dict[str, Any] = {}
     for name in QUERY_REQUEST_PROPERTIES:
@@ -328,7 +328,7 @@ def compact_query_request_schema(schemas: dict[str, Any]) -> dict[str, Any]:
         "type": "object",
         "additionalProperties": True,
         "description": (
-            "Raw Antfly QueryRequest body for POST /tables/{tableName}/query. "
+            "Raw canonical Antfly query body for POST /tables/{tableName}/query. "
             "Use this to access the full OpenAPI query contract. Mutually exclusive "
             "with query shorthand arguments."
         ),

@@ -2,9 +2,41 @@
 package query
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"time"
 )
+
+// DecodeInto decodes the retained Query JSON directly into value. Query is a
+// generated structural union, so package consumers should use this extension
+// instead of marshaling the union only to decode it again.
+func (q Query) DecodeInto(value any) error {
+	return json.Unmarshal(q.union, value)
+}
+
+// DecodeStrictInto decodes the retained Query JSON into one selected concrete
+// query type and rejects members that are not part of that type.
+func (q Query) DecodeStrictInto(value any) error {
+	return decodeStrictJSON(q.union, value)
+}
+
+func decodeStrictJSON(encoded []byte, value any) error {
+	decoder := json.NewDecoder(bytes.NewReader(encoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
+}
 
 // Builder helpers for creating Antfly queries with convenience functions
 

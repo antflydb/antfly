@@ -1229,7 +1229,7 @@ pub const HttpHandler = struct {
         if (!public_search_request.hasNonNullField(raw_request.object, "foreign_sources"))
             return null;
 
-        var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+        var parsed_request = ant_json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
@@ -1264,7 +1264,7 @@ pub const HttpHandler = struct {
     fn encodeForeignPublicTableQueryResponseJsonAlloc(
         self: *HttpHandler,
         table_name: []const u8,
-        request: metadata_openapi.QueryRequest,
+        request: metadata_openapi.CanonicalQueryRequest,
         foreign_source: foreign_mod.PostgresConfig,
         cancellation: CancellationToken,
     ) anyerror![]u8 {
@@ -1371,7 +1371,7 @@ pub const HttpHandler = struct {
         cancellation: CancellationToken,
     ) anyerror![]u8 {
         try cancellation.check();
-        var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+        var contract_request = std.json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
@@ -1383,7 +1383,7 @@ pub const HttpHandler = struct {
         const primary_body = rewrite.body;
         defer self.alloc.free(primary_body);
 
-        var primary_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, primary_body, .{
+        var primary_request = std.json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, self.alloc, primary_body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
         defer primary_request.deinit();
@@ -1476,7 +1476,7 @@ pub const HttpHandler = struct {
         return stringifyJsonValueAlloc(self.alloc, owned_response) catch error.InternalQueryFailure;
     }
 
-    fn validateSupportedForeignPublicQueryRequest(request: metadata_openapi.QueryRequest) !void {
+    fn validateSupportedForeignPublicQueryRequest(request: metadata_openapi.CanonicalQueryRequest) !void {
         if (request.full_text_search != null) return error.UnsupportedQueryRequest;
         if (request.semantic_search != null) return error.UnsupportedQueryRequest;
         if (request.embedding_template != null) return error.UnsupportedQueryRequest;
@@ -1488,8 +1488,7 @@ pub const HttpHandler = struct {
         if (request.merge_config != null) return error.UnsupportedQueryRequest;
         if (request.reranker != null) return error.UnsupportedQueryRequest;
         if (request.analyses != null) return error.UnsupportedQueryRequest;
-        if (request.graph_queries != null or request.graph_searches != null) return error.UnsupportedQueryRequest;
-        if (request.expand_strategy != null) return error.UnsupportedQueryRequest;
+        if (request.graph_queries != null) return error.UnsupportedQueryRequest;
         if (request.document_renderer != null) return error.UnsupportedQueryRequest;
         if (request.pruner != null) return error.UnsupportedQueryRequest;
         if (request.search_after != null) return error.UnsupportedQueryRequest;
@@ -1690,7 +1689,7 @@ pub const HttpHandler = struct {
     }
 
     fn parsePublicAggregationsJsonAlloc(alloc: Allocator, body: []const u8) !?[]u8 {
-        var public_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{
+        var public_request = std.json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
@@ -2238,7 +2237,7 @@ pub const HttpHandler = struct {
         cancellation: CancellationToken,
     ) anyerror![]u8 {
         try cancellation.check();
-        var contract_request = std.json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+        var contract_request = std.json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, self.alloc, body, .{
             .ignore_unknown_fields = true,
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
@@ -2739,12 +2738,12 @@ pub const HttpHandler = struct {
                 return error.UnsupportedQueryRequest;
             }
         }
-        var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
+        var parsed_request = ant_json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = parsed_request.value;
-        if (request.graph_queries == null or request.graph_searches != null)
+        if (request.graph_queries == null)
             return error.InvalidQueryRequest;
 
         const started_ns = platform_time.monotonicNs();
@@ -2786,7 +2785,6 @@ pub const HttpHandler = struct {
         if (requestHasSearchInputs(request)) {
             var search_request = request;
             search_request.graph_queries = null;
-            search_request.graph_searches = null;
             const search_body = try std.json.Stringify.valueAlloc(self.alloc, search_request, .{});
             defer self.alloc.free(search_body);
 
@@ -6642,7 +6640,7 @@ fn freeOwnedGraphEdge(alloc: Allocator, edge: graph_mod.Edge) void {
     if (edge.metadata.len > 0) alloc.free(edge.metadata);
 }
 
-fn requestHasSearchInputs(request: metadata_openapi.QueryRequest) bool {
+fn requestHasSearchInputs(request: metadata_openapi.CanonicalQueryRequest) bool {
     return request.full_text_search != null or
         request.embeddings != null or
         request.semantic_search != null or
@@ -7087,7 +7085,7 @@ fn parseEnsureNamespaceRequest(alloc: Allocator, body: []const u8) !api_types.En
 
 fn allocRequestedFieldsFromRequest(
     alloc: Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: metadata_openapi.CanonicalQueryRequest,
 ) ![]std.json.Value {
     const fields = request.fields orelse return try alloc.alloc(std.json.Value, 0);
     const out = try alloc.alloc(std.json.Value, fields.len);
@@ -11571,7 +11569,7 @@ test "http handler serves published graph query endpoints" {
         \\{"graph_queries":{"two_hop":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{"filter":{"term":"beta","path":"/title"}},"c":{"filter":{"prefix":"ga","path":"/title"}}},"edges":[{"from":"a","to":"b","types":["cites"]},{"from":"b","to":"c","types":["cites"]}]},"return":{"bindings":["a","b","c"],"limit":10}}},"limit":10}
     ;
     var typed_pattern_request = try ant_json.parseFromSlice(
-        metadata_openapi.QueryRequest,
+        metadata_openapi.CanonicalQueryRequest,
         alloc,
         pattern_request_json,
         .{ .allocate = .alloc_always },
@@ -11974,7 +11972,7 @@ test "serverless public graph query rejects exact sort controls" {
     }
 
     var typed_plain_request = try ant_json.parseFromSlice(
-        metadata_openapi.QueryRequest,
+        metadata_openapi.CanonicalQueryRequest,
         alloc,
         "{\"order_by\":[{\"field\":\"_id\"}],\"limit\":10}",
         .{ .allocate = .alloc_always },

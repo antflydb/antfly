@@ -1181,6 +1181,91 @@ func decodeLegacyGraphQueryResult(result GraphResult, envelope graphQueryResultE
 	return legacy, nil
 }
 
+type graphQueryMemberProbe struct {
+	present bool
+	null    bool
+	kind    byte
+}
+
+func (p *graphQueryMemberProbe) UnmarshalJSON(encoded []byte) error {
+	p.present = true
+	trimmed := bytes.TrimSpace(encoded)
+	p.null = bytes.Equal(trimmed, []byte("null"))
+	if len(trimmed) != 0 {
+		p.kind = trimmed[0]
+	}
+	return nil
+}
+
+type graphQueryProbe struct {
+	Term           graphQueryMemberProbe `json:"term"`
+	Fuzziness      graphQueryMemberProbe `json:"fuzziness"`
+	Prefix         graphQueryMemberProbe `json:"prefix"`
+	Regexp         graphQueryMemberProbe `json:"regexp"`
+	Wildcard       graphQueryMemberProbe `json:"wildcard"`
+	Min            graphQueryMemberProbe `json:"min"`
+	Max            graphQueryMemberProbe `json:"max"`
+	Start          graphQueryMemberProbe `json:"start"`
+	End            graphQueryMemberProbe `json:"end"`
+	IDs            graphQueryMemberProbe `json:"ids"`
+	Bool           graphQueryMemberProbe `json:"bool"`
+	MatchAll       graphQueryMemberProbe `json:"match_all"`
+	MatchNone      graphQueryMemberProbe `json:"match_none"`
+	Conjuncts      graphQueryMemberProbe `json:"conjuncts"`
+	Disjuncts      graphQueryMemberProbe `json:"disjuncts"`
+	Must           graphQueryMemberProbe `json:"must"`
+	Should         graphQueryMemberProbe `json:"should"`
+	MustNot        graphQueryMemberProbe `json:"must_not"`
+	Filter         graphQueryMemberProbe `json:"filter"`
+	Field          graphQueryMemberProbe `json:"field"`
+	PrefixLength   graphQueryMemberProbe `json:"prefix_length"`
+	InclusiveMin   graphQueryMemberProbe `json:"inclusive_min"`
+	InclusiveMax   graphQueryMemberProbe `json:"inclusive_max"`
+	InclusiveStart graphQueryMemberProbe `json:"inclusive_start"`
+	InclusiveEnd   graphQueryMemberProbe `json:"inclusive_end"`
+	Boost          graphQueryMemberProbe `json:"boost"`
+	DatetimeParser graphQueryMemberProbe `json:"datetime_parser"`
+}
+
+func inspectGraphQuery(filter querydsl.Query) (graphQueryProbe, error) {
+	var probe graphQueryProbe
+	if err := filter.DecodeInto(&probe); err != nil {
+		return graphQueryProbe{}, err
+	}
+	for _, candidate := range [...]struct {
+		name   string
+		member graphQueryMemberProbe
+	}{
+		{name: "term", member: probe.Term}, {name: "fuzziness", member: probe.Fuzziness},
+		{name: "prefix", member: probe.Prefix}, {name: "regexp", member: probe.Regexp},
+		{name: "wildcard", member: probe.Wildcard}, {name: "min", member: probe.Min},
+		{name: "max", member: probe.Max}, {name: "start", member: probe.Start},
+		{name: "end", member: probe.End}, {name: "ids", member: probe.IDs},
+		{name: "bool", member: probe.Bool}, {name: "match_all", member: probe.MatchAll},
+		{name: "match_none", member: probe.MatchNone}, {name: "conjuncts", member: probe.Conjuncts},
+		{name: "disjuncts", member: probe.Disjuncts}, {name: "must", member: probe.Must},
+		{name: "should", member: probe.Should}, {name: "must_not", member: probe.MustNot},
+		{name: "filter", member: probe.Filter}, {name: "field", member: probe.Field},
+		{name: "prefix_length", member: probe.PrefixLength},
+		{name: "inclusive_min", member: probe.InclusiveMin},
+		{name: "inclusive_max", member: probe.InclusiveMax},
+		{name: "inclusive_start", member: probe.InclusiveStart},
+		{name: "inclusive_end", member: probe.InclusiveEnd},
+	} {
+		name, member := candidate.name, candidate.member
+		if member.present && member.null {
+			return graphQueryProbe{}, fmt.Errorf("antfly: graph document filter member %q must not be null", name)
+		}
+	}
+	if probe.Boost.present {
+		return graphQueryProbe{}, fmt.Errorf("antfly: graph document filters do not support query option %q", "boost")
+	}
+	if probe.DatetimeParser.present {
+		return graphQueryProbe{}, fmt.Errorf("antfly: graph document filters do not support query option %q", "datetime_parser")
+	}
+	return probe, nil
+}
+
 // convertGraphDocumentFilter is a closed-world adapter. It classifies only the
 // explicitly supported query variants, converts them to graph-specific wire
 // types, and recursively rejects every scoring or index-only option. This
@@ -1191,23 +1276,19 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 	if depth > 64 || *visited > 16_384 {
 		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph document filter exceeds the query complexity budget")
 	}
-	encoded, err := json.Marshal(filter)
+	probe, err := inspectGraphQuery(filter)
 	if err != nil {
 		return GraphDocumentFilter{}, err
 	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &members); err != nil || len(members) == 0 {
+	if probe == (graphQueryProbe{}) {
 		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph document filter must be a query object")
 	}
 
 	switch {
-	case graphQueryMemberPresent(members, "term"):
-		if graphQueryMemberPresent(members, "fuzziness") {
-			if err := requireGraphQueryMembers(members, "term", "field", "fuzziness", "prefix_length"); err != nil {
-				return GraphDocumentFilter{}, err
-			}
-			value, err := filter.AsFuzzyQuery()
-			if err != nil {
+	case probe.Term.present:
+		if probe.Fuzziness.present {
+			var value querydsl.FuzzyQuery
+			if err := filter.DecodeStrictInto(&value); err != nil {
 				return GraphDocumentFilter{}, err
 			}
 			path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1224,11 +1305,8 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 			})
 			return out, err
 		}
-		if err := requireGraphQueryMembers(members, "term", "field"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsTermQuery()
-		if err != nil {
+		var value querydsl.TermQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1238,12 +1316,9 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentTermFilter(oapi.GraphDocumentTermFilter{Term: value.Term, Path: path})
 		return out, err
-	case graphQueryMemberPresent(members, "prefix"):
-		if err := requireGraphQueryMembers(members, "prefix", "field"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsPrefixQuery()
-		if err != nil {
+	case probe.Prefix.present:
+		var value querydsl.PrefixQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1253,12 +1328,9 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentPrefixFilter(oapi.GraphDocumentPrefixFilter{Prefix: value.Prefix, Path: path})
 		return out, err
-	case graphQueryMemberPresent(members, "regexp"):
-		if err := requireGraphQueryMembers(members, "regexp", "field"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsRegexpQuery()
-		if err != nil {
+	case probe.Regexp.present:
+		var value querydsl.RegexpQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1268,12 +1340,9 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentRegexpFilter(oapi.GraphDocumentRegexpFilter{Regexp: value.Regexp, Path: path})
 		return out, err
-	case graphQueryMemberPresent(members, "wildcard"):
-		if err := requireGraphQueryMembers(members, "wildcard", "field"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsWildcardQuery()
-		if err != nil {
+	case probe.Wildcard.present:
+		var value querydsl.WildcardQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1283,14 +1352,11 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentWildcardFilter(oapi.GraphDocumentWildcardFilter{Wildcard: value.Wildcard, Path: path})
 		return out, err
-	case graphQueryMemberPresent(members, "min") || graphQueryMemberPresent(members, "max"):
-		return convertGraphRangeFilter(filter, members)
-	case graphQueryMemberPresent(members, "start") || graphQueryMemberPresent(members, "end"):
-		if err := requireGraphQueryMembers(members, "start", "end", "inclusive_start", "inclusive_end", "field"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsDateRangeStringQuery()
-		if err != nil {
+	case probe.Min.present || probe.Max.present:
+		return convertGraphRangeFilter(filter, probe)
+	case probe.Start.present || probe.End.present:
+		var value querydsl.DateRangeStringQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		if value.Start == nil && value.End == nil {
@@ -1316,12 +1382,9 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 			},
 		})
 		return out, err
-	case graphQueryMemberPresent(members, "ids"):
-		if err := requireGraphQueryMembers(members, "ids"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsDocIdQuery()
-		if err != nil {
+	case probe.IDs.present:
+		var value querydsl.DocIdQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		if len(value.Ids) == 0 || len(value.Ids) > 10_000 {
@@ -1333,12 +1396,9 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentIdsFilter(oapi.GraphDocumentIdsFilter{Ids: value.Ids})
 		return out, err
-	case graphQueryMemberPresent(members, "bool"):
-		if err := requireGraphQueryMembers(members, "bool", "field"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsBoolFieldQuery()
-		if err != nil {
+	case probe.Bool.present:
+		var value querydsl.BoolFieldQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1350,34 +1410,25 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 			BoolField: oapi.GraphDocumentBoolFieldBody{Path: path, Value: value.Bool},
 		})
 		return out, err
-	case graphQueryMemberPresent(members, "match_all"):
-		if err := requireGraphQueryMembers(members, "match_all"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsMatchAllQuery()
-		if err != nil || len(value.MatchAll) != 0 {
+	case probe.MatchAll.present:
+		var value querydsl.MatchAllQuery
+		if err := filter.DecodeStrictInto(&value); err != nil || len(value.MatchAll) != 0 {
 			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph match_all body must be empty")
 		}
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentMatchAllFilter(oapi.GraphDocumentMatchAllFilter{MatchAll: value.MatchAll})
 		return out, err
-	case graphQueryMemberPresent(members, "match_none"):
-		if err := requireGraphQueryMembers(members, "match_none"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsMatchNoneQuery()
-		if err != nil || len(value.MatchNone) != 0 {
+	case probe.MatchNone.present:
+		var value querydsl.MatchNoneQuery
+		if err := filter.DecodeStrictInto(&value); err != nil || len(value.MatchNone) != 0 {
 			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph match_none body must be empty")
 		}
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentMatchNoneFilter(oapi.GraphDocumentMatchNoneFilter{MatchNone: value.MatchNone})
 		return out, err
-	case graphQueryMemberPresent(members, "conjuncts"):
-		if err := requireGraphQueryMembers(members, "conjuncts"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsConjunctionQuery()
-		if err != nil {
+	case probe.Conjuncts.present:
+		var value querydsl.ConjunctionQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		items, err := convertGraphFilterItems(value.Conjuncts, depth, visited)
@@ -1387,12 +1438,9 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentFilterConjunction(oapi.GraphDocumentFilterConjunction{Conjuncts: items})
 		return out, err
-	case graphQueryMemberPresent(members, "disjuncts"):
-		if err := requireGraphQueryMembers(members, "disjuncts", "min"); err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		value, err := filter.AsDisjunctionQuery()
-		if err != nil {
+	case probe.Disjuncts.present:
+		var value querydsl.DisjunctionQuery
+		if err := filter.DecodeStrictInto(&value); err != nil {
 			return GraphDocumentFilter{}, err
 		}
 		items, err := convertGraphFilterItems(value.Disjuncts, depth, visited)
@@ -1405,42 +1453,26 @@ func convertGraphDocumentFilter(filter querydsl.Query, depth int, visited *int) 
 		var out GraphDocumentFilter
 		err = out.FromGraphDocumentFilterDisjunction(oapi.GraphDocumentFilterDisjunction{Disjuncts: items, Min: value.Min})
 		return out, err
-	case graphQueryMemberPresent(members, "must") || graphQueryMemberPresent(members, "should") ||
-		graphQueryMemberPresent(members, "must_not") || graphQueryMemberPresent(members, "filter"):
-		return convertGraphBooleanFilter(members, depth, visited)
+	case probe.Must.present || probe.Should.present || probe.MustNot.present || probe.Filter.present:
+		return convertGraphBooleanFilter(filter, probe, depth, visited)
 	default:
 		return GraphDocumentFilter{}, fmt.Errorf("antfly: query variant is not supported by graph document filters")
 	}
 }
 
-func graphQueryMemberPresent(members map[string]json.RawMessage, name string) bool {
-	raw, ok := members[name]
-	return ok && string(raw) != "null"
-}
-
-func requireGraphQueryMembers(members map[string]json.RawMessage, allowed ...string) error {
-	allowedSet := make(map[string]struct{}, len(allowed))
-	for _, name := range allowed {
-		allowedSet[name] = struct{}{}
-	}
-	for name := range members {
-		if _, ok := allowedSet[name]; !ok {
-			return fmt.Errorf("antfly: graph document filters do not support query option %q", name)
-		}
-	}
-	return nil
-}
-
 func graphDocumentFuzziness(value querydsl.Fuzziness) (oapi.Fuzziness, error) {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return oapi.Fuzziness{}, err
-	}
 	var out oapi.Fuzziness
-	if err := json.Unmarshal(encoded, &out); err != nil {
-		return oapi.Fuzziness{}, err
+	if numeric, err := value.AsFuzziness0(); err == nil {
+		if numeric < 0 || numeric > 2 {
+			return oapi.Fuzziness{}, fmt.Errorf("antfly: graph fuzziness must be between 0 and 2")
+		}
+		return out, out.FromFuzziness0(numeric)
 	}
-	return out, nil
+	text, err := value.AsFuzziness1()
+	if err != nil || text != querydsl.Fuzziness1("auto") {
+		return oapi.Fuzziness{}, fmt.Errorf("antfly: graph fuzziness must be 0, 1, 2, or auto")
+	}
+	return out, out.FromFuzziness1(oapi.Fuzziness1(text))
 }
 
 func normalizeGraphDateBound(value *time.Time, name string) (*time.Time, error) {
@@ -1459,20 +1491,17 @@ func normalizeGraphDateBound(value *time.Time, name string) (*time.Time, error) 
 	return &normalized, nil
 }
 
-func convertGraphRangeFilter(filter querydsl.Query, members map[string]json.RawMessage) (GraphDocumentFilter, error) {
-	if err := requireGraphQueryMembers(members, "min", "max", "inclusive_min", "inclusive_max", "field"); err != nil {
-		return GraphDocumentFilter{}, err
+func convertGraphRangeFilter(filter querydsl.Query, probe graphQueryProbe) (GraphDocumentFilter, error) {
+	bound := probe.Min
+	if !bound.present {
+		bound = probe.Max
 	}
-	bound := members["min"]
-	if !graphQueryMemberPresent(members, "min") {
-		bound = members["max"]
-	}
-	if len(bound) == 0 {
+	if !bound.present {
 		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph range requires min or max")
 	}
-	if bound[0] == '"' {
-		value, err := filter.AsTermRangeQuery()
-		if err != nil || value.Min == nil && value.Max == nil {
+	if bound.kind == '"' {
+		var value querydsl.TermRangeQuery
+		if err := filter.DecodeStrictInto(&value); err != nil || value.Min == nil && value.Max == nil {
 			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph term range requires min or max")
 		}
 		path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1486,8 +1515,8 @@ func convertGraphRangeFilter(filter querydsl.Query, members map[string]json.RawM
 		}})
 		return out, err
 	}
-	value, err := filter.AsNumericRangeQuery()
-	if err != nil || value.Min == nil && value.Max == nil {
+	var value querydsl.NumericRangeQuery
+	if err := filter.DecodeStrictInto(&value); err != nil || value.Min == nil && value.Max == nil {
 		return GraphDocumentFilter{}, fmt.Errorf("antfly: graph numeric range requires min or max")
 	}
 	path, err := graphDocumentPathFromQueryField(value.Field)
@@ -1517,66 +1546,46 @@ func convertGraphFilterItems(items []querydsl.Query, depth int, visited *int) ([
 	return out, nil
 }
 
-func graphQueryFromRaw(raw json.RawMessage) (querydsl.Query, error) {
-	var query querydsl.Query
-	if err := json.Unmarshal(raw, &query); err != nil {
-		return querydsl.Query{}, err
-	}
-	return query, nil
-}
-
-func convertGraphBooleanFilter(members map[string]json.RawMessage, depth int, visited *int) (GraphDocumentFilter, error) {
-	if err := requireGraphQueryMembers(members, "must", "should", "must_not", "filter"); err != nil {
+func convertGraphBooleanFilter(filter querydsl.Query, probe graphQueryProbe, depth int, visited *int) (GraphDocumentFilter, error) {
+	var value querydsl.BooleanQuery
+	if err := filter.DecodeStrictInto(&value); err != nil {
 		return GraphDocumentFilter{}, err
 	}
 	var body oapi.GraphDocumentFilterBoolean
-	if raw, ok := members["filter"]; ok && string(raw) != "null" {
-		query, err := graphQueryFromRaw(raw)
-		if err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		body.Filter, err = convertGraphDocumentFilter(query, depth+1, visited)
+	if probe.Filter.present {
+		converted, err := convertGraphDocumentFilter(value.Filter, depth+1, visited)
 		if err != nil {
 			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph bool filter: %w", err)
 		}
+		body.Filter = converted
 	}
 	for _, clause := range []struct {
 		name        string
+		present     bool
+		value       querydsl.DisjunctionQuery
 		destination *oapi.GraphDocumentFilterDisjunction
 	}{
-		{name: "should", destination: &body.Should},
-		{name: "must_not", destination: &body.MustNot},
+		{name: "should", present: probe.Should.present, value: value.Should, destination: &body.Should},
+		{name: "must_not", present: probe.MustNot.present, value: value.MustNot, destination: &body.MustNot},
 	} {
-		raw, ok := members[clause.name]
-		if !ok || string(raw) == "null" {
+		if !clause.present {
 			continue
 		}
-		query, err := graphQueryFromRaw(raw)
-		if err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		converted, err := convertGraphDocumentFilter(query, depth+1, visited)
+		items, err := convertGraphFilterItems(clause.value.Disjuncts, depth, visited)
 		if err != nil {
 			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph bool %s: %w", clause.name, err)
 		}
-		*clause.destination, err = converted.AsGraphDocumentFilterDisjunction()
-		if err != nil {
-			return GraphDocumentFilter{}, err
+		if clause.value.Min != nil && *clause.value.Min > uint32(len(items)) {
+			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph boolean threshold exceeds its number of clauses")
 		}
+		*clause.destination = oapi.GraphDocumentFilterDisjunction{Disjuncts: items, Min: clause.value.Min}
 	}
-	if raw, ok := members["must"]; ok && string(raw) != "null" {
-		query, err := graphQueryFromRaw(raw)
-		if err != nil {
-			return GraphDocumentFilter{}, err
-		}
-		converted, err := convertGraphDocumentFilter(query, depth+1, visited)
+	if probe.Must.present {
+		items, err := convertGraphFilterItems(value.Must.Conjuncts, depth, visited)
 		if err != nil {
 			return GraphDocumentFilter{}, fmt.Errorf("antfly: graph bool must: %w", err)
 		}
-		body.Must, err = converted.AsGraphDocumentFilterConjunction()
-		if err != nil {
-			return GraphDocumentFilter{}, err
-		}
+		body.Must = oapi.GraphDocumentFilterConjunction{Conjuncts: items}
 	}
 	var out GraphDocumentFilter
 	err := out.FromGraphDocumentFilterBoolean(body)

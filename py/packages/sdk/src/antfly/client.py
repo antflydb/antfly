@@ -18,6 +18,7 @@ from antfly.client_generated.client import AuthenticatedClient
 from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
+    CanonicalQueryRequestGraphQueries,
     CreateAlgebraicIndexRequest,
     CreatedAlgebraicIndex,
     CreatedEmbeddingsIndex,
@@ -36,7 +37,6 @@ from antfly.client_generated.models import (
     InferenceGenerateChunk,
     InferenceGenerateRequest,
     InferenceGenerateResponse,
-    QueryRequestGraphQueries,
     QueryResponses,
 )
 from antfly.client_generated.types import UNSET
@@ -61,7 +61,7 @@ CreateIndexRequest: TypeAlias = (
 )
 CreatedIndex: TypeAlias = CreatedFullTextIndex | CreatedEmbeddingsIndex | CreatedGraphIndex | CreatedAlgebraicIndex
 GraphQueryInput: TypeAlias = GraphMatchQuery | GraphTraverseQuery | GraphShortestPathQuery | GraphKShortestPathsQuery
-GraphQueriesInput: TypeAlias = QueryRequestGraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
+GraphQueriesInput: TypeAlias = CanonicalQueryRequestGraphQueries | Mapping[str, GraphQueryInput | Mapping[str, Any]]
 _CREATE_INDEX_REQUEST_TYPES = (
     CreateFullTextIndexRequest,
     CreateEmbeddingsIndexRequest,
@@ -223,7 +223,9 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
 
 def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]:
     """Serialize typed canonical graph operations while preserving raw-map compatibility."""
-    operations = graph_queries.to_dict() if isinstance(graph_queries, QueryRequestGraphQueries) else graph_queries
+    operations = (
+        graph_queries.to_dict() if isinstance(graph_queries, CanonicalQueryRequestGraphQueries) else graph_queries
+    )
     if len(operations) > 64:
         raise AntflyException("graph_queries accepts at most 64 named operations")
 
@@ -841,7 +843,7 @@ class AntflyClient:
             reranker: Reranker configuration
             analyses: Analysis configuration
             graph_queries: Named canonical graph operations. Accepts generated graph query models,
-                ``QueryRequestGraphQueries``, or raw mappings.
+                ``CanonicalQueryRequestGraphQueries``, or raw mappings.
             graph_searches: Deprecated v0.2 graph query configuration. Use
                 ``graph_queries``; this compatibility argument will be removed
                 in the next major release.

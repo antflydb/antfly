@@ -13,7 +13,6 @@
 // limitations.
 
 const std = @import("std");
-const metadata_openapi = @import("antfly_metadata_openapi");
 const public_embedding_query_mod = @import("public_embedding_query.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 
@@ -87,7 +86,7 @@ pub fn looksLikePublicSearchRequest(value: std.json.Value) bool {
 
 pub fn parseTextClausesAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !ParsedTextClauses {
     return .{
         .full_text = if (request.full_text_search) |value|
@@ -107,7 +106,7 @@ pub fn parseTextClausesAlloc(
 
 pub fn parseEmbeddingsAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     default_k: u32,
 ) !ParsedEmbeddings {
     const embeddings = request.embeddings orelse return .{};
@@ -131,7 +130,7 @@ pub fn parseEmbeddingsAlloc(
 
 pub fn cloneRequestedIndexesAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     parsed_embeddings: ParsedEmbeddings,
 ) !?[][]u8 {
     if (request.indexes) |indexes| {
@@ -154,7 +153,7 @@ pub fn cloneRequestedIndexesAlloc(
 
 pub fn cloneRequestedFieldsAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
 ) !?[][]u8 {
     const fields = request.fields orelse return null;
     return try cloneFieldNamesAlloc(alloc, fields);

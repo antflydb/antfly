@@ -10,11 +10,11 @@ if TYPE_CHECKING:
     from ..models.aggregation_request import AggregationRequest
 
 
-T = TypeVar("T", bound="QueryRequestAggregations")
+T = TypeVar("T", bound="CanonicalQueryRequestAggregations")
 
 
 @_attrs_define
-class QueryRequestAggregations:
+class CanonicalQueryRequestAggregations:
     """Aggregation requests for computing metrics and bucketing results.
     Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration.
 
@@ -58,7 +58,7 @@ class QueryRequestAggregations:
         from ..models.aggregation_request import AggregationRequest
 
         d = dict(src_dict)
-        query_request_aggregations = cls()
+        canonical_query_request_aggregations = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -66,8 +66,8 @@ class QueryRequestAggregations:
 
             additional_properties[prop_name] = additional_property
 
-        query_request_aggregations.additional_properties = additional_properties
-        return query_request_aggregations
+        canonical_query_request_aggregations.additional_properties = additional_properties
+        return canonical_query_request_aggregations
 
     @property
     def additional_keys(self) -> list[str]:

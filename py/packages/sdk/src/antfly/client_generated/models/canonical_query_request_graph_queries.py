@@ -13,11 +13,11 @@ if TYPE_CHECKING:
     from ..models.graph_traverse_query import GraphTraverseQuery
 
 
-T = TypeVar("T", bound="QueryRequestGraphQueries")
+T = TypeVar("T", bound="CanonicalQueryRequestGraphQueries")
 
 
 @_attrs_define
-class QueryRequestGraphQueries:
+class CanonicalQueryRequestGraphQueries:
     """Declarative graph matching, traversal, and path queries. A nested node
     `filter` is a typed, non-scoring stored-document predicate. It shares
     familiar scalar syntax with document queries but deliberately excludes
@@ -60,7 +60,7 @@ class QueryRequestGraphQueries:
         from ..models.graph_traverse_query import GraphTraverseQuery
 
         d = dict(src_dict)
-        query_request_graph_queries = cls()
+        canonical_query_request_graph_queries = cls()
 
         additional_properties = {}
         for prop_name, prop_dict in d.items():
@@ -102,8 +102,8 @@ class QueryRequestGraphQueries:
 
             additional_properties[prop_name] = additional_property
 
-        query_request_graph_queries.additional_properties = additional_properties
-        return query_request_graph_queries
+        canonical_query_request_graph_queries.additional_properties = additional_properties
+        return canonical_query_request_graph_queries
 
     @property
     def additional_keys(self) -> list[str]:

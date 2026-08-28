@@ -92,8 +92,10 @@ pub fn parseSearchPlanAlloc(
 fn validateSupportedPublicSearchFields(object: std.json.ObjectMap) !void {
     var it = object.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.* == .null) continue;
         const key = entry.key_ptr.*;
+        if (std.mem.eql(u8, key, "graph_searches") or std.mem.eql(u8, key, "expand_strategy"))
+            return error.UnsupportedQueryRequest;
+        if (entry.value_ptr.* == .null) continue;
         const supported = std.mem.eql(u8, key, "table") or
             std.mem.eql(u8, key, "query") or
             std.mem.eql(u8, key, "full_text_search") or
@@ -135,8 +137,8 @@ fn rejectForbiddenDocIdentityControlFieldsAlloc(alloc: Allocator, body: []const 
 fn parseOwnedPublicQueryRequestAlloc(
     alloc: Allocator,
     body: []const u8,
-) !std.json.Parsed(metadata_openapi.QueryRequest) {
-    return std.json.parseFromSlice(metadata_openapi.QueryRequest, alloc, body, .{
+) !std.json.Parsed(metadata_openapi.CanonicalQueryRequest) {
+    return std.json.parseFromSlice(metadata_openapi.CanonicalQueryRequest, alloc, body, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     });
@@ -144,7 +146,7 @@ fn parseOwnedPublicQueryRequestAlloc(
 
 fn parsePublicSearchPlanAlloc(
     alloc: Allocator,
-    query_request: metadata_openapi.QueryRequest,
+    query_request: metadata_openapi.CanonicalQueryRequest,
     published_search_sources: search_sources.PublishedSearchSources,
 ) !SearchPlan {
     var text_clauses = try public_search_request_mod.parseTextClausesAlloc(alloc, query_request);
@@ -646,6 +648,16 @@ test "serverless search plan fails closed for unsupported public fields" {
     try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
         alloc,
         "{\"full_text_search\":{\"query\":\"body:alpha\"},\"future_query_option\":true}",
+        sources,
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"graph_searches\":null}",
+        sources,
+    ));
+    try std.testing.expectError(error.UnsupportedQueryRequest, parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_search\":{\"query\":\"body:alpha\"},\"expand_strategy\":\"union\"}",
         sources,
     ));
 

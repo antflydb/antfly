@@ -108,7 +108,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
         with generator.SPEC.open(encoding="utf-8") as handle:
             schemas = yaml.safe_load(handle)["components"]["schemas"]
 
-        query_schema = schemas["QueryRequest"]
+        query_schema = schemas["CanonicalQueryRequest"]
         child_mode_rejection = next(
             branch
             for branch in query_schema["not"]["anyOf"]
@@ -130,7 +130,7 @@ class McpSchemaFragmentTests(unittest.TestCase):
         self.assertEqual(
             set(query_schema["properties"]),
             allowed_child_fields | rejected_child_fields,
-            "every QueryRequest property must be explicitly allowed or rejected for hierarchy.children",
+            "every canonical query property must be explicitly allowed or rejected for hierarchy.children",
         )
 
         validator = Draft202012Validator(generator.compact_query_request_schema(schemas))

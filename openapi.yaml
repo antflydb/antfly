@@ -13144,16 +13144,18 @@ components:
           description: Number of branches to explore at each level
     RetrievalQueryRequest:
       description: >
-        A query in the retrieval pipeline. Extends QueryRequest with an optional
+        A canonical query in the retrieval pipeline with an optional tree search
 
-        tree search configuration. Each query specifies its own table.
+        configuration. Each query specifies its own table. Deprecated stateful
+
+        graph_searches compatibility is intentionally unavailable here.
 
 
         When both search fields (semantic_search, full_text_search) and tree_search
 
         are provided, the search results are used as start nodes for tree navigation.
       allOf:
-        - $ref: '#/components/schemas/QueryRequest'
+        - $ref: '#/components/schemas/CanonicalQueryRequest'
         - type: object
           properties:
             tree_search:
@@ -14143,19 +14145,10 @@ components:
         children:
           $ref: '#/components/schemas/HierarchyChildren'
           x-go-type-skip-optional-pointer: false
-    QueryRequest:
+    CanonicalQueryRequest:
       type: object
       not:
         anyOf:
-          - description: Use graph_queries or deprecated graph_searches, never both.
-            required:
-              - graph_queries
-              - graph_searches
-          - description: Canonical graph_queries return typed results and cannot use the legacy hit expansion
-              adapter.
-            required:
-              - graph_queries
-              - expand_strategy
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required:
@@ -14300,10 +14293,6 @@ components:
                       - aggregations
                   - required:
                       - graph_queries
-                  - required:
-                      - graph_searches
-                  - required:
-                      - expand_strategy
                   - required:
                       - document_renderer
                   - required:
@@ -14865,43 +14854,6 @@ components:
             Put multiple counts over one pattern in the same `match` return
 
             object so they share one complete anchor scan.
-        graph_searches:
-          deprecated: true
-          type: object
-          maxProperties: 64
-          additionalProperties:
-            $ref: '#/components/schemas/LegacyGraphQuery'
-          description: >
-            Deprecated compatibility alias for the v0.2 graph query contract.
-
-            Use `graph_queries`; requests containing both fields are rejected.
-
-            Legacy operation names remain opaque and byte-for-byte compatible;
-
-            canonical GraphIdentifier rules apply only to `graph_queries`.
-
-            The request-wide limit of 64 operations also applies here to bound
-
-            execution work during the compatibility window.
-        expand_strategy:
-          deprecated: true
-          type: string
-          enum:
-            - union
-            - intersection
-          description: >
-            Deprecated compatibility behavior for `graph_searches`. Canonical
-
-            `graph_queries` return independently typed, potentially table-qualified
-
-            identities and cannot be combined with this field.
-
-
-            Strategy for merging legacy graph results with search results:
-
-            - union: Include nodes from both search and graph results
-
-            - intersection: Only include nodes appearing in both
         document_renderer:
           type: string
           description: >
@@ -15119,6 +15071,74 @@ components:
             }
 
             ```
+    QueryRequest:
+      description: Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches
+        is retained only at the stateful public transport boundary for the v0.2 transition window.
+      allOf:
+        - $ref: '#/components/schemas/CanonicalQueryRequest'
+        - type: object
+          not:
+            anyOf:
+              - description: Use graph_queries or deprecated graph_searches, never both.
+                required:
+                  - graph_queries
+                  - graph_searches
+              - description: Canonical graph_queries return typed results and cannot use the legacy hit
+                  expansion adapter.
+                required:
+                  - graph_queries
+                  - expand_strategy
+              - description: Hierarchy child traversal cannot use the legacy graph hit expansion adapter.
+                allOf:
+                  - required:
+                      - hierarchy
+                    properties:
+                      hierarchy:
+                        required:
+                          - children
+                  - anyOf:
+                      - required:
+                          - graph_searches
+                      - required:
+                          - expand_strategy
+          properties:
+            graph_searches:
+              deprecated: true
+              type: object
+              maxProperties: 64
+              additionalProperties:
+                $ref: '#/components/schemas/LegacyGraphQuery'
+              description: >
+                Deprecated compatibility alias for the v0.2 graph query contract.
+
+                Use `graph_queries`; requests containing both fields are rejected.
+
+                Legacy operation names remain opaque and byte-for-byte compatible;
+
+                canonical GraphIdentifier rules apply only to `graph_queries`.
+
+                The request-wide limit of 64 operations also applies here to bound
+
+                execution work during the compatibility window.
+            expand_strategy:
+              deprecated: true
+              type: string
+              enum:
+                - union
+                - intersection
+              description: >
+                Deprecated compatibility behavior for `graph_searches`. Canonical
+
+                `graph_queries` return independently typed, potentially table-qualified
+
+                identities and cannot be combined with this field.
+
+
+                Strategy for merging legacy graph results with search results:
+
+                - union: Include nodes from both search and graph results
+
+                - intersection: Only include nodes appearing in both
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -23561,6 +23581,69 @@ components:
         - $ref: '#/components/schemas/GraphTraverseQuery'
         - $ref: '#/components/schemas/GraphShortestPathQuery'
         - $ref: '#/components/schemas/GraphKShortestPathsQuery'
+    Pruner:
+      type: object
+      description: >
+        Configuration for pruning search results based on score quality.
+
+        Helps filter out low-relevance results in RAG pipelines by detecting
+
+        score gaps or deviations from top results.
+      properties:
+        min_score_ratio:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: >
+            Keep only results with score >= max_score * min_score_ratio.
+
+            For example, 0.5 keeps results scoring at least half of the top result.
+
+            Applied after fusion scoring.
+          example: 0.5
+        max_score_gap_percent:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: >
+            Stop returning results when the gap between consecutive scores
+
+            exceeds this percentage of the total score range (max - min).
+
+            Detects "elbows" in score distributions regardless of score scale.
+
+            For example, 30.0 stops when a gap spans 30% of the score range.
+          example: 30.0
+        min_absolute_score:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: >
+            Hard minimum score threshold. Results with scores below this value
+
+            are excluded regardless of other pruning settings.
+          example: 0.01
+        require_multi_index:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: >
+            Only keep results that appear in multiple indexes (both full-text
+
+            and vector search). Useful for increasing precision by requiring
+
+            agreement between different retrieval methods.
+          default: false
+        std_dev_threshold:
+          x-go-type-skip-optional-pointer: true
+          type: number
+          format: double
+          description: >
+            Keep results within N standard deviations below the mean score.
+
+            For example, 1.0 keeps results with score >= mean - 1*stddev.
+
+            Useful for statistical outlier detection in result sets.
+          example: 1.5
     GraphQueryType:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -23788,69 +23871,6 @@ components:
           type: array
           items:
             type: string
-    Pruner:
-      type: object
-      description: >
-        Configuration for pruning search results based on score quality.
-
-        Helps filter out low-relevance results in RAG pipelines by detecting
-
-        score gaps or deviations from top results.
-      properties:
-        min_score_ratio:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: >
-            Keep only results with score >= max_score * min_score_ratio.
-
-            For example, 0.5 keeps results scoring at least half of the top result.
-
-            Applied after fusion scoring.
-          example: 0.5
-        max_score_gap_percent:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: >
-            Stop returning results when the gap between consecutive scores
-
-            exceeds this percentage of the total score range (max - min).
-
-            Detects "elbows" in score distributions regardless of score scale.
-
-            For example, 30.0 stops when a gap spans 30% of the score range.
-          example: 30.0
-        min_absolute_score:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: >
-            Hard minimum score threshold. Results with scores below this value
-
-            are excluded regardless of other pruning settings.
-          example: 0.01
-        require_multi_index:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          description: >
-            Only keep results that appear in multiple indexes (both full-text
-
-            and vector search). Useful for increasing precision by requiring
-
-            agreement between different retrieval methods.
-          default: false
-        std_dev_threshold:
-          x-go-type-skip-optional-pointer: true
-          type: number
-          format: double
-          description: >
-            Keep results within N standard deviations below the mean score.
-
-            For example, 1.0 keeps results with score >= mean - 1*stddev.
-
-            Useful for statistical outlier detection in result sets.
-          example: 1.5
     GraphBindingNode:
       type: object
       additionalProperties: false

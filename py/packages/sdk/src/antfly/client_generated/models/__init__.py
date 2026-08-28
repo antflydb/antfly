@@ -69,6 +69,12 @@ from .boolean_query import BooleanQuery
 from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
+from .canonical_query_request import CanonicalQueryRequest
+from .canonical_query_request_aggregations import CanonicalQueryRequestAggregations
+from .canonical_query_request_embeddings import CanonicalQueryRequestEmbeddings
+from .canonical_query_request_foreign_sources import CanonicalQueryRequestForeignSources
+from .canonical_query_request_graph_queries import CanonicalQueryRequestGraphQueries
+from .canonical_query_request_query import CanonicalQueryRequestQuery
 from .capability import Capability
 from .cardinality_mode import CardinalityMode
 from .cdc_connection import CdcConnection
@@ -745,13 +751,8 @@ from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
 from .query_request import QueryRequest
-from .query_request_aggregations import QueryRequestAggregations
-from .query_request_embeddings import QueryRequestEmbeddings
 from .query_request_expand_strategy import QueryRequestExpandStrategy
-from .query_request_foreign_sources import QueryRequestForeignSources
-from .query_request_graph_queries import QueryRequestGraphQueries
 from .query_request_graph_searches import QueryRequestGraphSearches
-from .query_request_query import QueryRequestQuery
 from .query_responses import QueryResponses
 from .query_result import QueryResult
 from .query_result_aggregations import QueryResultAggregations
@@ -1006,6 +1007,12 @@ __all__ = (
     "BraveSearchConfig",
     "BraveSearchConfigFreshness",
     "CalendarInterval",
+    "CanonicalQueryRequest",
+    "CanonicalQueryRequestAggregations",
+    "CanonicalQueryRequestEmbeddings",
+    "CanonicalQueryRequestForeignSources",
+    "CanonicalQueryRequestGraphQueries",
+    "CanonicalQueryRequestQuery",
     "Capability",
     "CardinalityMode",
     "CdcConnection",
@@ -1676,13 +1683,8 @@ __all__ = (
     "QueryHitsTotalRelation",
     "QueryProfile",
     "QueryRequest",
-    "QueryRequestAggregations",
-    "QueryRequestEmbeddings",
     "QueryRequestExpandStrategy",
-    "QueryRequestForeignSources",
-    "QueryRequestGraphQueries",
     "QueryRequestGraphSearches",
-    "QueryRequestQuery",
     "QueryResponses",
     "QueryResult",
     "QueryResultAggregations",

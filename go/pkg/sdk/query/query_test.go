@@ -2,9 +2,40 @@ package query
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestQueryRetainedDecodeExtensions(t *testing.T) {
+	query := TermQuery{Term: "published", Field: "status"}.ToQuery()
+	var probe struct {
+		Term  string `json:"term"`
+		Field string `json:"field"`
+	}
+	if err := query.DecodeInto(&probe); err != nil {
+		t.Fatal(err)
+	}
+	if probe.Term != "published" || probe.Field != "status" {
+		t.Fatalf("probe = %#v", probe)
+	}
+
+	var strict TermQuery
+	if err := query.DecodeStrictInto(&strict); err != nil {
+		t.Fatal(err)
+	}
+	if strict.Term != "published" || strict.Field != "status" {
+		t.Fatalf("strict = %#v", strict)
+	}
+
+	var malformed Query
+	if err := json.Unmarshal([]byte(`{"term":"published","field":"status","unexpected":true}`), &malformed); err != nil {
+		t.Fatal(err)
+	}
+	if err := malformed.DecodeStrictInto(&strict); err == nil || !strings.Contains(err.Error(), "unexpected") {
+		t.Fatalf("expected strict decode to reject unknown member, got %v", err)
+	}
+}
 
 func TestNewDisjunctionDistinguishesOmittedAndExplicitZero(t *testing.T) {
 	clauses := []Query{NewTerm("draft", "status"), NewTerm("pending", "status")}

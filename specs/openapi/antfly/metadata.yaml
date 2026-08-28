@@ -6020,13 +6020,14 @@ components:
 
     RetrievalQueryRequest:
       description: |
-        A query in the retrieval pipeline. Extends QueryRequest with an optional
-        tree search configuration. Each query specifies its own table.
+        A canonical query in the retrieval pipeline with an optional tree search
+        configuration. Each query specifies its own table. Deprecated stateful
+        graph_searches compatibility is intentionally unavailable here.
 
         When both search fields (semantic_search, full_text_search) and tree_search
         are provided, the search results are used as start nodes for tree navigation.
       allOf:
-        - $ref: "#/components/schemas/QueryRequest"
+        - $ref: "#/components/schemas/CanonicalQueryRequest"
         - type: object
           properties:
             tree_search:
@@ -6938,14 +6939,10 @@ components:
         children:
           $ref: "#/components/schemas/HierarchyChildren"
           x-go-type-skip-optional-pointer: false
-    QueryRequest: # Based on remoteindex.Query
+    CanonicalQueryRequest: # Based on remoteindex.Query
       type: object
       not:
         anyOf:
-          - description: Use graph_queries or deprecated graph_searches, never both.
-            required: [graph_queries, graph_searches]
-          - description: Canonical graph_queries return typed results and cannot use the legacy hit expansion adapter.
-            required: [graph_queries, expand_strategy]
           - description: Hierarchy grouping requires an explicit top-level field projection.
             allOf:
               - required: [hierarchy]
@@ -7041,8 +7038,6 @@ components:
                   - required: [analyses]
                   - required: [aggregations]
                   - required: [graph_queries]
-                  - required: [graph_searches]
-                  - required: [expand_strategy]
                   - required: [document_renderer]
                   - required: [pruner]
                   - required: [join]
@@ -7431,33 +7426,6 @@ components:
             versioned policy published in the GraphIdentifier schema.
             Put multiple counts over one pattern in the same `match` return
             object so they share one complete anchor scan.
-        graph_searches:
-          deprecated: true
-          type: object
-          maxProperties: 64
-          additionalProperties:
-            $ref: "indexes.yaml#/components/schemas/LegacyGraphQuery"
-          description: |
-            Deprecated compatibility alias for the v0.2 graph query contract.
-            Use `graph_queries`; requests containing both fields are rejected.
-            Legacy operation names remain opaque and byte-for-byte compatible;
-            canonical GraphIdentifier rules apply only to `graph_queries`.
-            The request-wide limit of 64 operations also applies here to bound
-            execution work during the compatibility window.
-        expand_strategy:
-          deprecated: true
-          type: string
-          enum:
-            - union
-            - intersection
-          description: |
-            Deprecated compatibility behavior for `graph_searches`. Canonical
-            `graph_queries` return independently typed, potentially table-qualified
-            identities and cannot be combined with this field.
-
-            Strategy for merging legacy graph results with search results:
-            - union: Include nodes from both search and graph results
-            - intersection: Only include nodes appearing in both
         document_renderer:
           type: string
           description: |
@@ -7608,6 +7576,57 @@ components:
               }
             }
             ```
+    QueryRequest:
+      description: >-
+        Stateful Antfly query request. Canonical clients use graph_queries;
+        deprecated graph_searches is retained only at the stateful public
+        transport boundary for the v0.2 transition window.
+      allOf:
+        - $ref: '#/components/schemas/CanonicalQueryRequest'
+        - type: object
+          not:
+            anyOf:
+              - description: Use graph_queries or deprecated graph_searches, never both.
+                required: [graph_queries, graph_searches]
+              - description: Canonical graph_queries return typed results and cannot use the legacy hit expansion adapter.
+                required: [graph_queries, expand_strategy]
+              - description: Hierarchy child traversal cannot use the legacy graph hit expansion adapter.
+                allOf:
+                  - required: [hierarchy]
+                    properties:
+                      hierarchy:
+                        required: [children]
+                  - anyOf:
+                      - required: [graph_searches]
+                      - required: [expand_strategy]
+          properties:
+            graph_searches:
+              deprecated: true
+              type: object
+              maxProperties: 64
+              additionalProperties:
+                $ref: "indexes.yaml#/components/schemas/LegacyGraphQuery"
+              description: |
+                Deprecated compatibility alias for the v0.2 graph query contract.
+                Use `graph_queries`; requests containing both fields are rejected.
+                Legacy operation names remain opaque and byte-for-byte compatible;
+                canonical GraphIdentifier rules apply only to `graph_queries`.
+                The request-wide limit of 64 operations also applies here to bound
+                execution work during the compatibility window.
+            expand_strategy:
+              deprecated: true
+              type: string
+              enum:
+                - union
+                - intersection
+              description: |
+                Deprecated compatibility behavior for `graph_searches`. Canonical
+                `graph_queries` return independently typed, potentially table-qualified
+                identities and cannot be combined with this field.
+
+                Strategy for merging legacy graph results with search results:
+                - union: Include nodes from both search and graph results
+                - intersection: Only include nodes appearing in both
     Analyses:
       x-go-type-skip-optional-pointer: false
       type: object

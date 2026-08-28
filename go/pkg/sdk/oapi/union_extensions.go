@@ -117,6 +117,41 @@ func retainedUnionIsNull(encoded []byte) bool {
 	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
+// rejectCanonicalGraphNulls enforces the canonical graph request invariant at
+// its retained root union. Canonical graph request schemas are deliberately
+// non-nullable throughout: optional members are omitted and every present
+// member has a concrete value. Scanning once here prevents generated Go value
+// fields from collapsing an explicit nested null into the same zero value as
+// omission, without materializing a second recursive JSON tree.
+func rejectCanonicalGraphNulls(encoded []byte) error {
+	inString := false
+	escaped := false
+	for index, value := range encoded {
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			switch value {
+			case '\\':
+				escaped = true
+			case '"':
+				inString = false
+			}
+			continue
+		}
+		if value == '"' {
+			inString = true
+			continue
+		}
+		if value == 'n' && len(encoded)-index >= len("null") &&
+			bytes.Equal(encoded[index:index+len("null")], []byte("null")) {
+			return errors.New("canonical graph queries do not accept explicit null; omit optional members")
+		}
+	}
+	return nil
+}
+
 func (p *strictPresent[T]) UnmarshalJSON(encoded []byte) error {
 	p.present = true
 	if bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
@@ -160,6 +195,9 @@ type graphQueryStrictEnvelope struct {
 // members remain present and are rejected instead of being mistaken for
 // omission.
 func (t GraphQuery) DecodeStrictVariant() (DecodedGraphQuery, error) {
+	if err := rejectCanonicalGraphNulls(t.union); err != nil {
+		return DecodedGraphQuery{}, err
+	}
 	var envelope graphQueryStrictEnvelope
 	if err := decodeStrictJSON(t.union, &envelope); err != nil {
 		return DecodedGraphQuery{}, err

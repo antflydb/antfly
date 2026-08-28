@@ -4286,7 +4286,7 @@ fn supportedJoinFiltersFromOpenApi(
 
 pub fn rewriteJoinedBaseQueryBodyAlloc(
     alloc: std.mem.Allocator,
-    request: metadata_openapi.QueryRequest,
+    request: anytype,
     join_left_field: []const u8,
 ) !JoinedBaseQueryRewrite {
     var effective_fields = try maybeAppendRequestedFieldAlloc(alloc, request.fields, join_left_field);

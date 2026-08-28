@@ -55,6 +55,7 @@ pub const Boost = types.Boost;
 pub const BraveSearchConfig = types.BraveSearchConfig;
 pub const ByteRange = types.ByteRange;
 pub const CalendarInterval = types.CalendarInterval;
+pub const CanonicalQueryRequest = types.CanonicalQueryRequest;
 pub const Capability = types.Capability;
 pub const CapabilityName = types.CapabilityName;
 pub const CardinalityMode = types.CardinalityMode;

@@ -84,7 +84,7 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
         )
         self.assertEqual(
             identifier_ref,
-            metadata["QueryRequest"]["properties"]["graph_queries"][
+            metadata["CanonicalQueryRequest"]["properties"]["graph_queries"][
                 "x-antfly-property-name-schema"
             ],
         )

@@ -89,6 +89,17 @@ func TestCanonicalGraphOpaqueObjectsAcceptObjectOrOmission(t *testing.T) {
 	}
 }
 
+func TestCanonicalGraphNullScanDoesNotAllocate(t *testing.T) {
+	encoded := []byte(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{"filter":{"term":"null","path":"/title"}}},"edges":[]},"return":{"bindings":["a"]}}`)
+	if allocations := testing.AllocsPerRun(1000, func() {
+		if err := rejectCanonicalGraphNulls(encoded); err != nil {
+			panic(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("canonical graph null scan allocated %v objects per call", allocations)
+	}
+}
+
 func TestGraphRequestUnionExtensionsSelectStrictArms(t *testing.T) {
 	t.Run("selector", func(t *testing.T) {
 		var selector GraphNodeSelector

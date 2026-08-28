@@ -31,7 +31,7 @@ const AgentQuestion = metadata_openapi.AgentQuestion;
 const AgentStatus = metadata_openapi.AgentStatus;
 const AgentStep = metadata_openapi.AgentStep;
 const QueryHit = metadata_openapi.QueryHit;
-const QueryRequest = metadata_openapi.QueryRequest;
+const QueryRequest = metadata_openapi.CanonicalQueryRequest;
 const QueryResponses = metadata_openapi.QueryResponses;
 const GraphPath = indexes_openapi.GraphPath;
 const RetrievalAgentRequest = metadata_openapi.RetrievalAgentRequest;
@@ -2293,9 +2293,6 @@ fn hasAggregationRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
 fn hasGraphRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
     if (retrieval_query.graph_queries) |graph_queries| {
         if (graph_queries.map.count() > 0) return true;
-    }
-    if (retrieval_query.graph_searches) |graph_searches| {
-        if (graph_searches.map.count() > 0) return true;
     }
     return false;
 }
@@ -5456,6 +5453,11 @@ fn encodeQueryValueForRetrievalQuery(
     retrieval_query_index: usize,
     refinement_pass: QueryRefinementPass,
 ) ![]u8 {
+    if (value != .object or
+        value.object.get("graph_searches") != null or
+        value.object.get("expand_strategy") != null)
+        return error.UnsupportedRetrievalAgentRequest;
+
     const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
     defer alloc.free(encoded);
 
@@ -5476,7 +5478,7 @@ fn encodeQueryValueForRetrievalQuery(
     query_request.filter_query = mandatory_predicates.filter_query;
     query_request.exclusion_query = mandatory_predicates.exclusion_query;
     if (retrieval_query.tree_search) |tree_search| {
-        if (query_request.graph_queries != null or query_request.graph_searches != null)
+        if (query_request.graph_queries != null)
             return error.UnsupportedRetrievalAgentRequest;
         query_request.graph_queries = try buildTreeGraphSearches(
             arena,

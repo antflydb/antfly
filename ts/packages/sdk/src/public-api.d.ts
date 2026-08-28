@@ -5908,13 +5908,14 @@ export interface components {
             beam_width?: number;
         };
         /**
-         * @description A query in the retrieval pipeline. Extends QueryRequest with an optional
-         *     tree search configuration. Each query specifies its own table.
+         * @description A canonical query in the retrieval pipeline with an optional tree search
+         *     configuration. Each query specifies its own table. Deprecated stateful
+         *     graph_searches compatibility is intentionally unavailable here.
          *
          *     When both search fields (semantic_search, full_text_search) and tree_search
          *     are provided, the search results are used as start nodes for tree navigation.
          */
-        RetrievalQueryRequest: components["schemas"]["QueryRequest"] & {
+        RetrievalQueryRequest: components["schemas"]["CanonicalQueryRequest"] & {
             /** @description Optional tree search configuration */
             tree_search?: components["schemas"]["TreeSearchConfig"];
         };
@@ -6519,7 +6520,7 @@ export interface components {
             ancestors?: components["schemas"]["HierarchyAncestors"];
             children?: components["schemas"]["HierarchyChildren"];
         } & (unknown & unknown & unknown);
-        QueryRequest: {
+        CanonicalQueryRequest: {
             /**
              * @description Name of the table to query. Optional for global queries.
              * @example wikipedia
@@ -6912,30 +6913,6 @@ export interface components {
                 [key: string]: components["schemas"]["GraphQuery"];
             };
             /**
-             * @deprecated
-             * @description Deprecated compatibility alias for the v0.2 graph query contract.
-             *     Use `graph_queries`; requests containing both fields are rejected.
-             *     Legacy operation names remain opaque and byte-for-byte compatible;
-             *     canonical GraphIdentifier rules apply only to `graph_queries`.
-             *     The request-wide limit of 64 operations also applies here to bound
-             *     execution work during the compatibility window.
-             */
-            graph_searches?: {
-                [key: string]: components["schemas"]["LegacyGraphQuery"];
-            };
-            /**
-             * @deprecated
-             * @description Deprecated compatibility behavior for `graph_searches`. Canonical
-             *     `graph_queries` return independently typed, potentially table-qualified
-             *     identities and cannot be combined with this field.
-             *
-             *     Strategy for merging legacy graph results with search results:
-             *     - union: Include nodes from both search and graph results
-             *     - intersection: Only include nodes appearing in both
-             * @enum {string}
-             */
-            expand_strategy?: "union" | "intersection";
-            /**
              * @description Optional Handlebars template string for rendering document content in RAG queries.
              *     Template has access to document fields via `{{this.fields.fieldName}}`.
              *
@@ -7085,6 +7062,33 @@ export interface components {
             foreign_sources?: {
                 [key: string]: components["schemas"]["ForeignSource"];
             };
+        };
+        /** @description Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window. */
+        QueryRequest: components["schemas"]["CanonicalQueryRequest"] & {
+            /**
+             * @deprecated
+             * @description Deprecated compatibility alias for the v0.2 graph query contract.
+             *     Use `graph_queries`; requests containing both fields are rejected.
+             *     Legacy operation names remain opaque and byte-for-byte compatible;
+             *     canonical GraphIdentifier rules apply only to `graph_queries`.
+             *     The request-wide limit of 64 operations also applies here to bound
+             *     execution work during the compatibility window.
+             */
+            graph_searches?: {
+                [key: string]: components["schemas"]["LegacyGraphQuery"];
+            };
+            /**
+             * @deprecated
+             * @description Deprecated compatibility behavior for `graph_searches`. Canonical
+             *     `graph_queries` return independently typed, potentially table-qualified
+             *     identities and cannot be combined with this field.
+             *
+             *     Strategy for merging legacy graph results with search results:
+             *     - union: Include nodes from both search and graph results
+             *     - intersection: Only include nodes appearing in both
+             * @enum {string}
+             */
+            expand_strategy?: "union" | "intersection";
         };
         Analyses: {
             pca?: boolean;
@@ -12281,6 +12285,52 @@ export interface components {
         };
         GraphQuery: components["schemas"]["GraphMatchQuery"] | components["schemas"]["GraphTraverseQuery"] | components["schemas"]["GraphShortestPathQuery"] | components["schemas"]["GraphKShortestPathsQuery"];
         /**
+         * @description Configuration for pruning search results based on score quality.
+         *     Helps filter out low-relevance results in RAG pipelines by detecting
+         *     score gaps or deviations from top results.
+         */
+        Pruner: {
+            /**
+             * Format: double
+             * @description Keep only results with score >= max_score * min_score_ratio.
+             *     For example, 0.5 keeps results scoring at least half of the top result.
+             *     Applied after fusion scoring.
+             * @example 0.5
+             */
+            min_score_ratio?: number;
+            /**
+             * Format: double
+             * @description Stop returning results when the gap between consecutive scores
+             *     exceeds this percentage of the total score range (max - min).
+             *     Detects "elbows" in score distributions regardless of score scale.
+             *     For example, 30.0 stops when a gap spans 30% of the score range.
+             * @example 30
+             */
+            max_score_gap_percent?: number;
+            /**
+             * Format: double
+             * @description Hard minimum score threshold. Results with scores below this value
+             *     are excluded regardless of other pruning settings.
+             * @example 0.01
+             */
+            min_absolute_score?: number;
+            /**
+             * @description Only keep results that appear in multiple indexes (both full-text
+             *     and vector search). Useful for increasing precision by requiring
+             *     agreement between different retrieval methods.
+             * @default false
+             */
+            require_multi_index?: boolean;
+            /**
+             * Format: double
+             * @description Keep results within N standard deviations below the mean score.
+             *     For example, 1.0 keeps results with score >= mean - 1*stddev.
+             *     Useful for statistical outlier detection in result sets.
+             * @example 1.5
+             */
+            std_dev_threshold?: number;
+        };
+        /**
          * @description Deprecated discriminator used by LegacyGraphQuery.
          * @enum {string}
          */
@@ -12391,52 +12441,6 @@ export interface components {
             include_documents?: boolean;
             include_edges?: boolean;
             fields?: string[];
-        };
-        /**
-         * @description Configuration for pruning search results based on score quality.
-         *     Helps filter out low-relevance results in RAG pipelines by detecting
-         *     score gaps or deviations from top results.
-         */
-        Pruner: {
-            /**
-             * Format: double
-             * @description Keep only results with score >= max_score * min_score_ratio.
-             *     For example, 0.5 keeps results scoring at least half of the top result.
-             *     Applied after fusion scoring.
-             * @example 0.5
-             */
-            min_score_ratio?: number;
-            /**
-             * Format: double
-             * @description Stop returning results when the gap between consecutive scores
-             *     exceeds this percentage of the total score range (max - min).
-             *     Detects "elbows" in score distributions regardless of score scale.
-             *     For example, 30.0 stops when a gap spans 30% of the score range.
-             * @example 30
-             */
-            max_score_gap_percent?: number;
-            /**
-             * Format: double
-             * @description Hard minimum score threshold. Results with scores below this value
-             *     are excluded regardless of other pruning settings.
-             * @example 0.01
-             */
-            min_absolute_score?: number;
-            /**
-             * @description Only keep results that appear in multiple indexes (both full-text
-             *     and vector search). Useful for increasing precision by requiring
-             *     agreement between different retrieval methods.
-             * @default false
-             */
-            require_multi_index?: boolean;
-            /**
-             * Format: double
-             * @description Keep results within N standard deviations below the mean score.
-             *     For example, 1.0 keeps results with score >= mean - 1*stddev.
-             *     Useful for statistical outlier detection in result sets.
-             * @example 1.5
-             */
-            std_dev_threshold?: number;
         };
         /** @description One exact node identity projected from a MATCH binding. Conjunctive bindings deliberately do not expose traversal depth, distance, or path: those values are not uniquely defined for branched patterns and may depend on execution order. */
         GraphBindingNode: {
