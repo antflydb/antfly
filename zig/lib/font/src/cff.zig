@@ -13,6 +13,9 @@
 // limitations under the License.
 
 const std = @import("std");
+const cff_data = @import("cff_data.zig");
+
+const missing_glyph = std.math.maxInt(u16);
 
 pub const Error = error{
     InvalidCff,
@@ -50,6 +53,7 @@ pub const Font = struct {
     bytes: []const u8,
     charstrings: Index,
     charset: []u16,
+    encoding: [256]u16 = [_]u16{missing_glyph} ** 256,
     string_index: Index = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
     global_subrs: Index,
     local_subrs: ?Index,
@@ -74,6 +78,7 @@ pub const Font = struct {
         const top_dict = try top_dict_index.getObject(bytes, 0);
         const charstrings_offset = try parseTopDictOffset(top_dict, .{ .primary = 17 });
         const charset_offset = parseTopDictOffset(top_dict, .{ .primary = 15 }) catch 0;
+        const encoding_offset = parseTopDictOffset(top_dict, .{ .primary = 16 }) catch 0;
         const private = parseTopDictPrivate(top_dict) catch null;
         const fd_array_offset = parseTopDictOffset(top_dict, .{ .primary = 12, .escaped = 36 }) catch 0;
         const fd_select_offset = parseTopDictOffset(top_dict, .{ .primary = 12, .escaped = 37 }) catch 0;
@@ -83,6 +88,7 @@ pub const Font = struct {
         const glyph_count = charstrings.count;
         const charset = try parseCharsetAlloc(alloc, bytes, charset_offset, glyph_count);
         errdefer alloc.free(charset);
+        const encoding = try parseEncoding(bytes, encoding_offset, charset, glyph_count);
 
         const local_subrs = if (private) |priv|
             try parseLocalSubrs(bytes, priv.size, priv.offset)
@@ -103,6 +109,7 @@ pub const Font = struct {
             .bytes = bytes,
             .charstrings = charstrings,
             .charset = charset,
+            .encoding = encoding,
             .string_index = string_index,
             .global_subrs = global_subrs,
             .local_subrs = local_subrs,
@@ -163,16 +170,32 @@ pub const Font = struct {
         return null;
     }
 
-    /// Resolve names introduced in the CFF String INDEX. PDF subset fonts
-    /// commonly use generated names (G21, G35, ...), all of which live there.
-    pub fn glyphIndexForCustomName(self: Font, name: []const u8) ?u16 {
-        if (std.mem.eql(u8, name, ".notdef")) return 0;
+    pub fn glyphIndexForName(self: Font, name: []const u8) ?u16 {
         for (self.charset, 0..) |sid, glyph_index| {
-            if (sid < 391) continue;
-            const object = self.string_index.getObject(self.bytes, sid - 391) catch continue;
-            if (std.mem.eql(u8, object, name)) return @intCast(glyph_index);
+            const glyph_name = self.stringForSid(sid) orelse continue;
+            if (std.mem.eql(u8, glyph_name, name)) return @intCast(glyph_index);
         }
         return null;
+    }
+
+    pub fn glyphIndexForCustomName(self: Font, name: []const u8) ?u16 {
+        return self.glyphIndexForName(name);
+    }
+
+    pub fn glyphIndexForEmbeddedCode(self: Font, code: u8) ?u16 {
+        const glyph_index = self.encoding[code];
+        return if (glyph_index == missing_glyph) null else glyph_index;
+    }
+
+    pub fn glyphIndexForPredefinedCode(self: Font, code: u8, expert: bool) ?u16 {
+        const sid = if (expert) cff_data.expert_encoding[code] else cff_data.standard_encoding[code];
+        if (sid == 0) return null;
+        return self.glyphIndexForCharsetValue(sid);
+    }
+
+    fn stringForSid(self: Font, sid: u16) ?[]const u8 {
+        if (sid < cff_data.standard_strings.len) return cff_data.standard_strings[sid];
+        return self.string_index.getObject(self.bytes, sid - cff_data.standard_strings.len) catch null;
     }
 
     fn executeCharStringAlloc(
@@ -932,9 +955,19 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
     errdefer alloc.free(out);
     out[0] = 0;
     if (glyph_count == 1) return out;
-    if (charset_offset == 0) {
+    if (charset_offset <= 2) {
+        const predefined: []const u16 = switch (charset_offset) {
+            0 => &.{},
+            1 => &cff_data.expert_charset,
+            2 => &cff_data.expert_subset_charset,
+            else => unreachable,
+        };
+        if ((charset_offset == 0 and glyph_count > 229) or
+            (charset_offset != 0 and glyph_count > predefined.len)) return error.InvalidCff;
         var i: usize = 1;
-        while (i < glyph_count) : (i += 1) out[i] = @intCast(i);
+        while (i < glyph_count) : (i += 1) {
+            out[i] = if (charset_offset == 0) @intCast(i) else predefined[i];
+        }
         return out;
     }
     if (charset_offset >= bytes.len) return error.TruncatedCff;
@@ -980,6 +1013,80 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
             if (i != glyph_count) return error.InvalidCff;
         },
         else => return error.UnsupportedCff,
+    }
+    return out;
+}
+
+fn parseEncoding(bytes: []const u8, encoding_offset: usize, charset: []const u16, glyph_count: u16) ParseError![256]u16 {
+    var out = [_]u16{missing_glyph} ** 256;
+    if (encoding_offset <= 1) {
+        const predefined = if (encoding_offset == 0) &cff_data.standard_encoding else &cff_data.expert_encoding;
+        for (predefined, 0..) |sid, code| {
+            if (sid == 0) continue;
+            for (charset, 0..) |glyph_sid, glyph_index| {
+                if (glyph_sid == sid) {
+                    out[code] = @intCast(glyph_index);
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+    if (encoding_offset >= bytes.len) return error.TruncatedCff;
+    const raw_format = bytes[encoding_offset];
+    const has_supplements = (raw_format & 0x80) != 0;
+    const format = raw_format & 0x7f;
+    var cursor = encoding_offset + 1;
+    var glyph_index: u16 = 1;
+    switch (format) {
+        0 => {
+            if (cursor >= bytes.len) return error.TruncatedCff;
+            const code_count = bytes[cursor];
+            cursor += 1;
+            if (cursor + code_count > bytes.len or @as(usize, code_count) + 1 > glyph_count) return error.TruncatedCff;
+            for (bytes[cursor .. cursor + code_count]) |code| {
+                out[code] = glyph_index;
+                glyph_index += 1;
+            }
+            cursor += code_count;
+        },
+        1 => {
+            if (cursor >= bytes.len) return error.TruncatedCff;
+            const range_count = bytes[cursor];
+            cursor += 1;
+            var range_index: usize = 0;
+            while (range_index < range_count) : (range_index += 1) {
+                if (cursor + 2 > bytes.len) return error.TruncatedCff;
+                const first = bytes[cursor];
+                const left = bytes[cursor + 1];
+                cursor += 2;
+                var delta: usize = 0;
+                while (delta <= left) : (delta += 1) {
+                    const code = @as(usize, first) + delta;
+                    if (code > 255 or glyph_index >= glyph_count) return error.InvalidCff;
+                    out[code] = glyph_index;
+                    glyph_index += 1;
+                }
+            }
+        },
+        else => return error.UnsupportedCff,
+    }
+    if (!has_supplements) return out;
+    if (cursor >= bytes.len) return error.TruncatedCff;
+    const supplement_count = bytes[cursor];
+    cursor += 1;
+    var supplement_index: usize = 0;
+    while (supplement_index < supplement_count) : (supplement_index += 1) {
+        if (cursor + 3 > bytes.len) return error.TruncatedCff;
+        const code = bytes[cursor];
+        const sid = readU16(bytes, cursor + 1);
+        cursor += 3;
+        for (charset, 0..) |glyph_sid, index| {
+            if (glyph_sid == sid) {
+                out[code] = @intCast(index);
+                break;
+            }
+        }
     }
     return out;
 }
@@ -1375,16 +1482,12 @@ test "cff parses charset format 1" {
     const alloc = std.testing.allocator;
     const bytes =
         [_]u8{
-            0,
-            1,
-            0,
-            10,
-            1,
-            0,
-            20,
+            0, 0, 0,
+            1, 0, 10,
+            1, 0, 20,
             0,
         };
-    const charset = try parseCharsetAlloc(alloc, &bytes, 1, 4);
+    const charset = try parseCharsetAlloc(alloc, &bytes, 3, 4);
     defer alloc.free(charset);
     try std.testing.expectEqualSlices(u16, &.{ 0, 10, 11, 20 }, charset);
 }
@@ -1393,20 +1496,44 @@ test "cff parses charset format 2" {
     const alloc = std.testing.allocator;
     const bytes =
         [_]u8{
-            0,
-            2,
-            0,
-            30,
-            0,
-            2,
-            0,
-            40,
-            0,
-            0,
+            0,  0, 0,
+            2,  0, 30,
+            0,  2, 0,
+            40, 0, 0,
         };
-    const charset = try parseCharsetAlloc(alloc, &bytes, 1, 5);
+    const charset = try parseCharsetAlloc(alloc, &bytes, 3, 5);
     defer alloc.free(charset);
     try std.testing.expectEqualSlices(u16, &.{ 0, 30, 31, 32, 40 }, charset);
+}
+
+test "cff resolves standard SID names and predefined encodings" {
+    var charset = [_]u16{ 0, 34, 35 };
+    const font = Font{
+        .bytes = &.{},
+        .charstrings = .{ .count = 3, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .charset = &charset,
+        .global_subrs = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .local_subrs = null,
+        .fd_array = null,
+        .fd_select = null,
+    };
+    try std.testing.expectEqual(@as(?u16, 1), font.glyphIndexForName("A"));
+    try std.testing.expectEqual(@as(?u16, 2), font.glyphIndexForPredefinedCode('B', false));
+    try std.testing.expectEqual(@as(?u16, null), font.glyphIndexForName("G21"));
+}
+
+test "cff parses custom encoding with supplements" {
+    const bytes = [_]u8{
+        0, 0, 0,
+        0x80, 2, 65, 66, // format 0: A->GID1, B->GID2
+        1, 67, 0, 35, // supplement: C->SID35/GID2
+    };
+    const charset = [_]u16{ 0, 34, 35 };
+    const encoding = try parseEncoding(&bytes, 3, &charset, 3);
+    try std.testing.expectEqual(@as(u16, 1), encoding['A']);
+    try std.testing.expectEqual(@as(u16, 2), encoding['B']);
+    try std.testing.expectEqual(@as(u16, 2), encoding['C']);
+    try std.testing.expectEqual(missing_glyph, encoding['D']);
 }
 
 test "cff parses fdselect format 0" {

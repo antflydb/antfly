@@ -460,13 +460,58 @@ const TrueTypeFont = struct {
     raw_code_bytes: usize = 0,
     cid_to_gid: ?[]u16 = null,
     pdf_widths: ?[]f64 = null,
+    cid_widths: ?CidWidths = null,
 
     fn deinit(self: *TrueTypeFont, alloc: Allocator) void {
         self.font.deinit(alloc);
         if (self.cid_to_gid) |map| if (map.len > 0) alloc.free(map);
         if (self.pdf_widths) |widths| alloc.free(widths);
+        if (self.cid_widths) |*widths| widths.deinit(alloc);
         alloc.free(self.bytes);
         self.* = undefined;
+    }
+};
+
+const CidWidthRange = struct {
+    first: u16,
+    last: u16,
+    uniform_width: ?f64 = null,
+    widths: []f64 = &.{},
+
+    fn deinit(self: *CidWidthRange, alloc: Allocator) void {
+        if (self.widths.len > 0) alloc.free(self.widths);
+        self.* = undefined;
+    }
+
+    fn width(self: CidWidthRange, cid: u16) ?f64 {
+        if (cid < self.first or cid > self.last) return null;
+        if (self.uniform_width) |value| return value;
+        return self.widths[cid - self.first];
+    }
+};
+
+const CidWidths = struct {
+    default_width: f64 = 1000,
+    ranges: []CidWidthRange = &.{},
+
+    fn deinit(self: *CidWidths, alloc: Allocator) void {
+        for (self.ranges) |*range| range.deinit(alloc);
+        if (self.ranges.len > 0) alloc.free(self.ranges);
+        self.* = undefined;
+    }
+
+    fn width(self: CidWidths, cid: u16) f64 {
+        // Conforming W arrays are ordered and non-overlapping. Sorting during
+        // construction keeps lookup logarithmic even for adversarially large
+        // CID fonts.
+        var low: usize = 0;
+        var high = self.ranges.len;
+        while (low < high) {
+            const mid = low + (high - low) / 2;
+            if (self.ranges[mid].first <= cid) low = mid + 1 else high = mid;
+        }
+        if (low > 0) if (self.ranges[low - 1].width(cid)) |value| return value;
+        return self.default_width;
     }
 };
 
@@ -520,6 +565,26 @@ const EmbeddedCffFont = struct {
         return null;
     }
 };
+
+const SimpleCffBaseEncoding = enum { embedded, standard, expert, win_ansi, mac_roman };
+
+fn simpleCffBaseEncodingFromName(name: []const u8) SimpleCffBaseEncoding {
+    if (std.mem.eql(u8, name, "StandardEncoding")) return .standard;
+    if (std.mem.eql(u8, name, "MacExpertEncoding")) return .expert;
+    if (std.mem.eql(u8, name, "WinAnsiEncoding")) return .win_ansi;
+    if (std.mem.eql(u8, name, "MacRomanEncoding")) return .mac_roman;
+    return .embedded;
+}
+
+fn cffGlyphIndexForBaseEncoding(cff: font_lib.cff.Font, encoding: SimpleCffBaseEncoding, code: u8) ?u16 {
+    return switch (encoding) {
+        .embedded => cff.glyphIndexForEmbeddedCode(code),
+        .standard => cff.glyphIndexForPredefinedCode(code, false),
+        .expert => cff.glyphIndexForPredefinedCode(code, true),
+        .win_ansi => cff.glyphIndexForName(text_encoding.win_ansi_glyph_names[code]),
+        .mac_roman => cff.glyphIndexForName(text_encoding.mac_roman_glyph_names[code]),
+    };
+}
 
 const Type3Glyph = struct {
     code: u8,
@@ -3165,6 +3230,7 @@ pub const Reader = struct {
         while (true) {
             var cp: u21 = 0xfffd;
             var simple_code: ?u8 = null;
+            var cid_code: ?u16 = null;
             const glyph_index = (if (truetype.raw_code_bytes > 0) blk: {
                 const raw_bytes = raw orelse break;
                 if (raw_offset >= raw_bytes.len) break;
@@ -3172,6 +3238,7 @@ pub const Reader = struct {
                 const cid = parseRawCode(raw_bytes[raw_offset .. raw_offset + code_len]);
                 raw_offset += code_len;
                 if (cid > std.math.maxInt(u16)) break :blk null;
+                cid_code = @intCast(cid);
                 if (truetype.cid_to_gid) |map| {
                     if (map.len == 0) break :blk @as(?u16, @intCast(cid));
                     if (cid >= map.len) break :blk null;
@@ -3186,7 +3253,9 @@ pub const Reader = struct {
                 };
                 break :blk truetype.font.cmapGlyphIndex(cp) catch return;
             }) orelse {
-                const missing_advance = if (simple_code != null and truetype.pdf_widths != null and truetype.pdf_widths.?[simple_code.?] >= 0)
+                const missing_advance = if (cid_code != null and truetype.cid_widths != null)
+                    truetype.cid_widths.?.width(cid_code.?) * run.font_size / 1000.0
+                else if (simple_code != null and truetype.pdf_widths != null and truetype.pdf_widths.?[simple_code.?] >= 0)
                     truetype.pdf_widths.?[simple_code.?] * run.font_size / 1000.0
                 else
                     run.font_size * 0.6;
@@ -3209,7 +3278,9 @@ pub const Reader = struct {
                 }
             }
             const spacing = run.char_spacing + if (cp == ' ') run.word_spacing else 0.0;
-            const glyph_advance = if (simple_code != null and truetype.pdf_widths != null) blk: {
+            const glyph_advance = if (cid_code != null and truetype.cid_widths != null)
+                truetype.cid_widths.?.width(cid_code.?) * run.font_size / 1000.0
+            else if (simple_code != null and truetype.pdf_widths != null) blk: {
                 const width = truetype.pdf_widths.?[simple_code.?];
                 if (width >= 0) break :blk width * run.font_size / 1000.0;
                 break :blk @as(f64, @floatFromInt(advance_width)) * scale;
@@ -3389,21 +3460,9 @@ pub const Reader = struct {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageImage, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        const contents = page.get("Contents") orelse return try self.alloc.alloc(PageImage, 0);
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        var content = std.ArrayList(u8).empty;
-        defer content.deinit(self.alloc);
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
-            try content.appendSlice(self.alloc, decoded);
-            try content.append(self.alloc, '\n');
-        }
-        return try self.collectImagesFromResourcesAlloc(&resources.?, content.items);
+        const content = try self.collectPageContentAlloc(page);
+        defer self.alloc.free(content);
+        return try self.collectImagesFromResourcesAlloc(&resources.?, content);
     }
 
     fn collectPageShadingsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageShading {
@@ -3417,7 +3476,9 @@ pub const Reader = struct {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PagePattern, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0);
+        const content = try self.collectPageContentAlloc(page);
+        defer self.alloc.free(content);
+        return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
     }
 
     fn collectPageExtGStatesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageExtGState {
@@ -3431,14 +3492,36 @@ pub const Reader = struct {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageForm, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0);
+        const content = try self.collectPageContentAlloc(page);
+        defer self.alloc.free(content);
+        return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
     }
 
     fn collectPageTextFormsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageForm {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageForm, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0);
+        const content = try self.collectPageContentAlloc(page);
+        defer self.alloc.free(content);
+        return try self.collectTextFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+    }
+
+    fn collectPageContentAlloc(self: *const Reader, page: *const syntax.Object) ![]u8 {
+        const contents = page.get("Contents") orelse return try self.alloc.alloc(u8, 0);
+        const streams = try self.collectContentStreamsAlloc(contents);
+        defer {
+            for (streams) |*stream| stream.deinit(self.alloc);
+            self.alloc.free(streams);
+        }
+        var content = std.ArrayList(u8).empty;
+        defer content.deinit(self.alloc);
+        for (streams) |*stream| {
+            const decoded = try self.readDecodedStreamData(stream);
+            defer self.alloc.free(decoded);
+            try content.appendSlice(self.alloc, decoded);
+            try content.append(self.alloc, '\n');
+        }
+        return try content.toOwnedSlice(self.alloc);
     }
 
     fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageFont {
@@ -3493,6 +3576,8 @@ pub const Reader = struct {
         var resolved_xobjects = try self.resolveValue(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageImage, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"Do"});
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageImage).empty;
         errdefer {
@@ -3500,7 +3585,7 @@ pub const Reader = struct {
             out.deinit(self.alloc);
         }
         for (resolved_xobjects.dict) |entry| {
-            if (!try contentReferencesXObjectNameAlloc(self.alloc, content, entry.key)) continue;
+            if (!references.contains(entry.key)) continue;
             var xobj = try self.resolveValue(&entry.value);
             defer xobj.deinit(self.alloc);
             if (xobj != .stream) continue;
@@ -3573,17 +3658,20 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectPatternsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8) anyerror![]PagePattern {
+    fn collectPatternsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8) anyerror![]PagePattern {
         if (depth > 1) return try self.alloc.alloc(PagePattern, 0);
         const pattern_obj = resources.get("Pattern") orelse return try self.alloc.alloc(PagePattern, 0);
         var resolved_patterns = try self.resolveValue(pattern_obj);
         defer resolved_patterns.deinit(self.alloc);
         if (resolved_patterns != .dict) return try self.alloc.alloc(PagePattern, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{ "scn", "SCN" });
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PagePattern).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*pattern| pattern.deinit(self.alloc);
         for (resolved_patterns.dict) |entry| {
+            if (!references.contains(entry.key)) continue;
             var pat = try self.resolveValue(&entry.value);
             defer pat.deinit(self.alloc);
             const pattern_type = pat.get("PatternType") orelse continue;
@@ -3667,7 +3755,7 @@ pub const Reader = struct {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
             }
-            const patterns = if (resolved_pattern_resources) |*pattern_resources| try self.collectPatternsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1) else try self.alloc.alloc(PagePattern, 0);
+            const patterns = if (resolved_pattern_resources) |*pattern_resources| try self.collectPatternsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content) else try self.alloc.alloc(PagePattern, 0);
             errdefer {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
@@ -3677,7 +3765,7 @@ pub const Reader = struct {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
             }
-            const forms = if (resolved_pattern_resources) |*pattern_resources| try self.collectFormsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1) else try self.alloc.alloc(PageForm, 0);
+            const forms = if (resolved_pattern_resources) |*pattern_resources| try self.collectFormsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content) else try self.alloc.alloc(PageForm, 0);
             errdefer {
                 for (forms) |*form| form.deinit(self.alloc);
                 if (forms.len > 0) self.alloc.free(forms);
@@ -3705,17 +3793,20 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectFormsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8) anyerror![]PageForm {
+    fn collectFormsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8) anyerror![]PageForm {
         if (depth > 1) return try self.alloc.alloc(PageForm, 0);
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
         var resolved_xobjects = try self.resolveValue(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{"Do"});
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageForm).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*form| form.deinit(self.alloc);
         for (resolved_xobjects.dict) |entry| {
+            if (!references.contains(entry.key)) continue;
             var xobj = try self.resolveValue(&entry.value);
             defer xobj.deinit(self.alloc);
             if (xobj != .stream) continue;
@@ -3748,7 +3839,7 @@ pub const Reader = struct {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
             }
-            const patterns = if (resolved_form_resources) |*form_resources| try self.collectPatternsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1) else try self.alloc.alloc(PagePattern, 0);
+            const patterns = if (resolved_form_resources) |*form_resources| try self.collectPatternsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content) else try self.alloc.alloc(PagePattern, 0);
             errdefer {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
@@ -3758,7 +3849,7 @@ pub const Reader = struct {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
             }
-            const forms = if (resolved_form_resources) |*form_resources| try self.collectFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1) else try self.alloc.alloc(PageForm, 0);
+            const forms = if (resolved_form_resources) |*form_resources| try self.collectFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content) else try self.alloc.alloc(PageForm, 0);
             errdefer {
                 for (forms) |*form| form.deinit(self.alloc);
                 if (forms.len > 0) self.alloc.free(forms);
@@ -3829,17 +3920,21 @@ pub const Reader = struct {
         resources: *const syntax.Object,
         fallback_resources: ?*const syntax.Object,
         depth: u8,
+        parent_content: []const u8,
     ) anyerror![]PageForm {
         if (depth > 1) return try self.alloc.alloc(PageForm, 0);
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
         var resolved_xobjects = try self.resolveValue(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
+        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{"Do"});
+        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageForm).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*form| form.deinit(self.alloc);
         for (resolved_xobjects.dict) |entry| {
+            if (!references.contains(entry.key)) continue;
             var xobj = try self.resolveValue(&entry.value);
             defer xobj.deinit(self.alloc);
             if (xobj != .stream) continue;
@@ -3865,7 +3960,7 @@ pub const Reader = struct {
                 if (owned.len > 0) self.alloc.free(owned);
             };
             var forms: ?[]PageForm = if (resolved_form_resources) |*form_resources|
-                try self.collectTextFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1)
+                try self.collectTextFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content.?)
             else
                 try self.alloc.alloc(PageForm, 0);
             errdefer if (forms) |owned| {
@@ -5696,10 +5791,15 @@ pub const Reader = struct {
         var raw_code_bytes: usize = 0;
         var cid_to_gid: ?[]u16 = null;
         var pdf_widths: ?[]f64 = null;
+        var cid_widths: ?CidWidths = null;
         errdefer if (cid_to_gid) |map| if (map.len > 0) self.alloc.free(map);
         errdefer if (pdf_widths) |widths| self.alloc.free(widths);
+        errdefer if (cid_widths) |*widths| widths.deinit(self.alloc);
         if (font_obj.get("Subtype")) |subtype| if (std.mem.eql(u8, subtype.asName() orelse "", "Type0")) {
-            const encoding_name = if (font_obj.get("Encoding")) |encoding| encoding.asName() orelse "" else "";
+            var resolved_encoding: ?syntax.Object = null;
+            defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
+            if (font_obj.get("Encoding")) |encoding| resolved_encoding = try self.resolveValue(encoding);
+            const encoding_name = if (resolved_encoding) |*encoding| encoding.asName() orelse "" else "";
             const identity_encoding = std.mem.eql(u8, encoding_name, "Identity-H");
             const descendants_obj = font_obj.get("DescendantFonts") orelse return error.UnsupportedPdfRendering;
             var resolved_descendants = try self.resolveValue(descendants_obj);
@@ -5707,26 +5807,32 @@ pub const Reader = struct {
             if (resolved_descendants != .array or resolved_descendants.array.len == 0) return error.UnsupportedPdfRendering;
             var descendant = try self.resolveValue(&resolved_descendants.array[0]);
             defer descendant.deinit(self.alloc);
-            if (identity_encoding) if (descendant.get("CIDToGIDMap")) |mapping_obj| {
-                var mapping = try self.resolveValue(mapping_obj);
-                defer mapping.deinit(self.alloc);
-                if (mapping == .name and std.mem.eql(u8, mapping.name, "Identity")) {
+            if (identity_encoding) {
+                cid_widths = self.parseCidWidthsAlloc(&descendant) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => CidWidths{ .default_width = cidDefaultWidth(&descendant) },
+                };
+                if (descendant.get("CIDToGIDMap")) |mapping_obj| {
+                    var mapping = try self.resolveValue(mapping_obj);
+                    defer mapping.deinit(self.alloc);
+                    if (mapping == .name and std.mem.eql(u8, mapping.name, "Identity")) {
+                        cid_to_gid = try self.alloc.alloc(u16, 0);
+                        raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
+                    } else if (mapping == .stream) {
+                        const mapping_bytes = try self.readDecodedStreamData(&mapping);
+                        defer self.alloc.free(mapping_bytes);
+                        const count = mapping_bytes.len / 2;
+                        const map = try self.alloc.alloc(u16, count);
+                        for (map, 0..) |*gid, i| gid.* = (@as(u16, mapping_bytes[i * 2]) << 8) | mapping_bytes[i * 2 + 1];
+                        cid_to_gid = map;
+                        raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
+                    }
+                } else {
+                    // CIDFontType2 defaults to an identity CID-to-GID mapping.
                     cid_to_gid = try self.alloc.alloc(u16, 0);
                     raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
-                } else if (mapping == .stream) {
-                    const mapping_bytes = try self.readDecodedStreamData(&mapping);
-                    defer self.alloc.free(mapping_bytes);
-                    const count = mapping_bytes.len / 2;
-                    const map = try self.alloc.alloc(u16, count);
-                    for (map, 0..) |*gid, i| gid.* = (@as(u16, mapping_bytes[i * 2]) << 8) | mapping_bytes[i * 2 + 1];
-                    cid_to_gid = map;
-                    raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
                 }
-            } else {
-                // CIDFontType2 defaults to an identity CID-to-GID mapping.
-                cid_to_gid = try self.alloc.alloc(u16, 0);
-                raw_code_bytes = @max(@as(usize, 2), decoder_code_bytes);
-            };
+            }
         };
 
         if (font_obj.get("Widths")) |widths_obj| {
@@ -5752,6 +5858,7 @@ pub const Reader = struct {
             .raw_code_bytes = raw_code_bytes,
             .cid_to_gid = cid_to_gid,
             .pdf_widths = pdf_widths,
+            .cid_widths = cid_widths,
         };
     }
 
@@ -5803,7 +5910,10 @@ pub const Reader = struct {
         const subtype = font_obj.get("Subtype") orelse return null;
         const composite = std.mem.eql(u8, subtype.asName() orelse "", "Type0");
         if (composite) {
-            const encoding_name = if (font_obj.get("Encoding")) |encoding| encoding.asName() orelse "" else "";
+            const encoding_obj = font_obj.get("Encoding") orelse return null;
+            var resolved_encoding = try self.resolveValue(encoding_obj);
+            defer resolved_encoding.deinit(self.alloc);
+            const encoding_name = resolved_encoding.asName() orelse "";
             if (!std.mem.eql(u8, encoding_name, "Identity-H")) return null;
         }
 
@@ -5839,23 +5949,38 @@ pub const Reader = struct {
         defer glyphs.deinit(self.alloc);
 
         if (composite) {
+            var cid_widths = self.parseCidWidthsAlloc(descriptor_owner) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => CidWidths{ .default_width = cidDefaultWidth(descriptor_owner) },
+            };
+            defer cid_widths.deinit(self.alloc);
             var glyph_index: usize = 0;
             while (glyph_index < cff.glyphCount()) : (glyph_index += 1) {
                 const cid = cff.charset[glyph_index];
                 try glyphs.append(self.alloc, .{
                     .code = cid,
                     .glyph_index = @intCast(glyph_index),
-                    .advance = try self.cidFontWidth(descriptor_owner, cid),
+                    .advance = cid_widths.width(cid),
                 });
             }
         } else {
+            var base_encoding = SimpleCffBaseEncoding.embedded;
             var code_to_name = [_]?[]const u8{null} ** 256;
             var resolved_encoding: ?syntax.Object = null;
             defer if (resolved_encoding) |*encoding| encoding.deinit(self.alloc);
             if (font_obj.get("Encoding")) |encoding_obj| {
                 resolved_encoding = try self.resolveValue(encoding_obj);
-                if (resolved_encoding) |*encoding| if (encoding.* == .dict) {
-                    if (encoding.get("Differences")) |differences| try applyEncodingDifferenceNames(&code_to_name, differences);
+                if (resolved_encoding) |*encoding| switch (encoding.*) {
+                    .name => |name| base_encoding = simpleCffBaseEncodingFromName(name),
+                    .dict => {
+                        if (encoding.get("BaseEncoding")) |base_obj| {
+                            var resolved_base = try self.resolveValue(base_obj);
+                            defer resolved_base.deinit(self.alloc);
+                            if (resolved_base.asName()) |name| base_encoding = simpleCffBaseEncodingFromName(name);
+                        }
+                        if (encoding.get("Differences")) |differences| try applyEncodingDifferenceNames(&code_to_name, differences);
+                    },
+                    else => {},
                 };
             }
             const first_char: usize = if (font_obj.get("FirstChar")) |obj|
@@ -5867,8 +5992,10 @@ pub const Reader = struct {
             if (font_obj.get("Widths")) |obj| resolved_widths = try self.resolveValue(obj);
             const widths = if (resolved_widths) |*obj| if (obj.* == .array) obj.array else &[_]syntax.Object{} else &[_]syntax.Object{};
             for (code_to_name, 0..) |maybe_name, code| {
-                const name = maybe_name orelse continue;
-                const glyph_index = cff.glyphIndexForCustomName(name) orelse continue;
+                const glyph_index = (if (maybe_name) |name|
+                    cff.glyphIndexForName(name)
+                else
+                    cffGlyphIndexForBaseEncoding(cff, base_encoding, @intCast(code))) orelse continue;
                 const width_index = if (code >= first_char) code - first_char else widths.len;
                 const advance = if (width_index < widths.len) numericObjectValue(&widths[width_index]) orelse 1000 else 1000;
                 try glyphs.append(self.alloc, .{ .code = @intCast(code), .glyph_index = glyph_index, .advance = advance });
@@ -5888,39 +6015,63 @@ pub const Reader = struct {
         };
     }
 
-    fn cidFontWidth(self: *const Reader, descendant: *const syntax.Object, cid: u16) !f64 {
-        const default_width = if (descendant.get("DW")) |obj| numericObjectValue(obj) orelse 1000 else 1000;
-        const widths_obj = descendant.get("W") orelse return default_width;
+    fn parseCidWidthsAlloc(self: *const Reader, descendant: *const syntax.Object) !CidWidths {
+        var result = CidWidths{
+            .default_width = cidDefaultWidth(descendant),
+        };
+        errdefer result.deinit(self.alloc);
+        const widths_obj = descendant.get("W") orelse return result;
         var resolved_widths = try self.resolveValue(widths_obj);
         defer resolved_widths.deinit(self.alloc);
-        if (resolved_widths != .array) return default_width;
+        if (resolved_widths != .array) return result;
+
+        var ranges = std.ArrayList(CidWidthRange).empty;
+        defer ranges.deinit(self.alloc);
+        errdefer for (ranges.items) |*range| range.deinit(self.alloc);
         const entries = resolved_widths.array;
         var i: usize = 0;
         while (i < entries.len) {
-            const first_i64 = entries[i].asInteger() orelse break;
-            if (first_i64 < 0 or first_i64 > std.math.maxInt(u16)) break;
+            const first_i64 = entries[i].asInteger() orelse return error.InvalidPdf;
+            if (first_i64 < 0 or first_i64 > std.math.maxInt(u16)) return error.InvalidPdf;
             const first: u16 = @intCast(first_i64);
             i += 1;
-            if (i >= entries.len) break;
+            if (i >= entries.len) return error.InvalidPdf;
             var resolved_entry = try self.resolveValue(&entries[i]);
             defer resolved_entry.deinit(self.alloc);
             if (resolved_entry == .array) {
-                const values = resolved_entry.array;
-                if (cid >= first) {
-                    const offset = @as(usize, cid - first);
-                    if (offset < values.len) return numericObjectValue(&values[offset]) orelse default_width;
+                if (resolved_entry.array.len == 0 or resolved_entry.array.len > @as(usize, std.math.maxInt(u16)) - first + 1) return error.InvalidPdf;
+                const values = try self.alloc.alloc(f64, resolved_entry.array.len);
+                errdefer self.alloc.free(values);
+                for (resolved_entry.array, 0..) |width_obj, index| {
+                    values[index] = numericObjectValue(&width_obj) orelse return error.InvalidPdf;
                 }
+                try ranges.append(self.alloc, .{
+                    .first = first,
+                    .last = @intCast(@as(usize, first) + values.len - 1),
+                    .widths = values,
+                });
                 i += 1;
                 continue;
             }
-            const last_i64 = entries[i].asInteger() orelse break;
+            const last_i64 = entries[i].asInteger() orelse return error.InvalidPdf;
+            if (last_i64 < first_i64 or last_i64 > std.math.maxInt(u16)) return error.InvalidPdf;
             i += 1;
-            if (i >= entries.len) break;
-            const width = numericObjectValue(&entries[i]) orelse default_width;
+            if (i >= entries.len) return error.InvalidPdf;
+            const width = numericObjectValue(&entries[i]) orelse return error.InvalidPdf;
             i += 1;
-            if (last_i64 >= 0 and cid >= first and @as(i64, cid) <= last_i64) return width;
+            try ranges.append(self.alloc, .{
+                .first = first,
+                .last = @intCast(last_i64),
+                .uniform_width = width,
+            });
         }
-        return default_width;
+        std.mem.sort(CidWidthRange, ranges.items, {}, struct {
+            fn lessThan(_: void, left: CidWidthRange, right: CidWidthRange) bool {
+                return left.first < right.first;
+            }
+        }.lessThan);
+        result.ranges = try ranges.toOwnedSlice(self.alloc);
+        return result;
     }
 
     fn buildType1Font(self: *const Reader, font_obj: *const syntax.Object) !?Type1Font {
@@ -10348,6 +10499,21 @@ fn measureFontAdvanceAlloc(
         return advance;
     }
     if (font.truetype) |truetype| {
+        if (truetype.raw_code_bytes > 0 and truetype.cid_widths != null) {
+            var advance: f64 = 0;
+            var raw_offset: usize = 0;
+            while (raw_offset < raw.len) {
+                const code_len = @min(truetype.raw_code_bytes, raw.len - raw_offset);
+                const raw_code = parseRawCode(raw[raw_offset .. raw_offset + code_len]);
+                raw_offset += code_len;
+                const width = if (raw_code <= std.math.maxInt(u16))
+                    truetype.cid_widths.?.width(@intCast(raw_code))
+                else
+                    truetype.cid_widths.?.default_width;
+                advance += (width * state.font_size / 1000.0 + state.char_spacing) * state.horizontal_scale;
+            }
+            return advance;
+        }
         if (truetype.raw_code_bytes == 0 and truetype.pdf_widths != null) {
             var advance: f64 = 0;
             var raw_offset: usize = 0;
@@ -10606,39 +10772,84 @@ fn contentMayContainOperator(bytes: []const u8, operator: []const u8) bool {
     return false;
 }
 
-/// Returns whether a content stream invokes the named XObject. Images can be
-/// very large after decoding, so resolving every entry in a page's XObject
-/// dictionary needlessly spends the document working set on resources that
-/// are never painted.
-fn contentReferencesXObjectNameAlloc(alloc: Allocator, bytes: []const u8, target: []const u8) !bool {
+const ReferencedResourceNames = struct {
+    names: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn deinit(self: *ReferencedResourceNames, alloc: Allocator) void {
+        var iterator = self.names.iterator();
+        while (iterator.next()) |entry| alloc.free(entry.key_ptr.*);
+        self.names.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn contains(self: *const ReferencedResourceNames, name: []const u8) bool {
+        return self.names.contains(name);
+    }
+};
+
+/// Collect resource names that are the immediate operand of one of the
+/// requested operators in a single content scan. This avoids O(resources ×
+/// content) discovery and does not treat malformed `/Huge 0 Do` content as a
+/// use of `/Huge`.
+fn collectReferencedResourceNamesAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    operators: []const []const u8,
+) !ReferencedResourceNames {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
-    var last_name: ?[]u8 = null;
-    defer if (last_name) |name| alloc.free(name);
+    var result = ReferencedResourceNames{};
+    errdefer result.deinit(alloc);
+    var previous_name: ?[]u8 = null;
+    defer if (previous_name) |name| alloc.free(name);
 
     while (true) {
         var lex = (try readContentLexeme(&scanner)) orelse {
-            if (last_name) |name| alloc.free(name);
-            last_name = null;
+            if (previous_name) |name| alloc.free(name);
+            previous_name = null;
             continue;
         };
         defer syntax.Scanner.freeLexeme(alloc, &lex);
         switch (lex) {
-            .eof => return false,
+            .eof => return result,
             .name => |name| {
-                if (last_name) |previous| alloc.free(previous);
-                last_name = try alloc.dupe(u8, name);
+                if (previous_name) |owned| alloc.free(owned);
+                previous_name = try alloc.dupe(u8, name);
             },
             .keyword => |keyword| {
-                if (std.mem.eql(u8, keyword, "Do")) {
-                    if (last_name) |name| if (std.mem.eql(u8, name, target)) return true;
+                if (previous_name) |name| {
+                    for (operators) |operator| {
+                        if (!std.mem.eql(u8, keyword, operator)) continue;
+                        if (result.names.contains(name)) {
+                            alloc.free(name);
+                        } else {
+                            try result.names.put(alloc, name, {});
+                        }
+                        previous_name = null;
+                        break;
+                    }
                 }
-                if (last_name) |name| alloc.free(name);
-                last_name = null;
+                if (previous_name) |name| alloc.free(name);
+                previous_name = null;
             },
-            else => {},
+            else => {
+                if (previous_name) |name| alloc.free(name);
+                previous_name = null;
+            },
         }
     }
+}
+
+fn contentReferencesXObjectNameAlloc(alloc: Allocator, bytes: []const u8, target: []const u8) !bool {
+    var references = try collectReferencedResourceNamesAlloc(alloc, bytes, &.{"Do"});
+    defer references.deinit(alloc);
+    return references.contains(target);
+}
+
+fn contentReferencesPatternNameAlloc(alloc: Allocator, bytes: []const u8, target: []const u8) !bool {
+    var references = try collectReferencedResourceNamesAlloc(alloc, bytes, &.{ "scn", "SCN" });
+    defer references.deinit(alloc);
+    return references.contains(target);
 }
 
 fn isContentTokenBoundary(byte: u8) bool {
@@ -10654,6 +10865,10 @@ fn numericObjectValue(obj: *const syntax.Object) ?f64 {
         .real => |value| value,
         else => null,
     };
+}
+
+fn cidDefaultWidth(descendant: *const syntax.Object) f64 {
+    return if (descendant.get("DW")) |obj| numericObjectValue(obj) orelse 1000 else 1000;
 }
 
 fn alphaByteFromNumber(alpha: f64) u8 {
@@ -18025,6 +18240,51 @@ test "reader extracts images through form xobject" {
     try std.testing.expectEqual(@as(usize, 1), image_runs.len);
 }
 
+test "reader does not decode images below an unused form xobject" {
+    const alloc = std.testing.allocator;
+    const page_content = "q Q\n";
+    const form_content = "/Huge Do\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Unused 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ page_content.len, page_content }),
+        try std.fmt.allocPrint(
+            alloc,
+            "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Huge 6 0 R >> >> /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+            .{ form_content.len, form_content },
+        ),
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 100000 /Height 100000 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 0 >>\nstream\n\nendstream\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    defer alloc.free(objects[4]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects, 0..) |object, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, object);
+    }
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 7\n0000000000 65535 f \n");
+    for (offsets) |offset| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{offset});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 7 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const image_runs = try reader.extractPageImageRunsAlloc(1);
+    defer alloc.free(image_runs);
+    try std.testing.expectEqual(@as(usize, 0), image_runs.len);
+}
+
 test "reader extracts axial shading runs" {
     const alloc = std.testing.allocator;
     const content = "/Sh1 sh\n";
@@ -18613,6 +18873,94 @@ test "content XObject discovery ignores unpainted resource names" {
     try std.testing.expect(try contentReferencesXObjectNameAlloc(alloc, content, "Used"));
     try std.testing.expect(try contentReferencesXObjectNameAlloc(alloc, content, "Form"));
     try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, content, "Unused"));
+}
+
+test "content resource discovery requires the name as the immediate operand" {
+    const alloc = std.testing.allocator;
+    try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, "/Huge 0 Do", "Huge"));
+    try std.testing.expect(!try contentReferencesXObjectNameAlloc(alloc, "/Huge [] Do", "Huge"));
+    try std.testing.expect(try contentReferencesPatternNameAlloc(alloc, "0.5 /Pattern scn", "Pattern"));
+}
+
+test "content resource discovery is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var references = try collectReferencedResourceNamesAlloc(alloc, "/A Do /B Do /A Do", &.{"Do"});
+            defer references.deinit(alloc);
+            try std.testing.expect(references.contains("A"));
+            try std.testing.expect(references.contains("B"));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "CID widths use sparse arrays ranges and defaults" {
+    var array_widths = [_]f64{ 500, 510, 520 };
+    var ranges = [_]CidWidthRange{
+        .{ .first = 10, .last = 12, .widths = &array_widths },
+        .{ .first = 20, .last = 30, .uniform_width = 700 },
+    };
+    const widths = CidWidths{ .default_width = 1000, .ranges = &ranges };
+    try std.testing.expectEqual(@as(f64, 500), widths.width(10));
+    try std.testing.expectEqual(@as(f64, 520), widths.width(12));
+    try std.testing.expectEqual(@as(f64, 700), widths.width(25));
+    try std.testing.expectEqual(@as(f64, 1000), widths.width(19));
+}
+
+test "reader vectorizes Type1C standard SID glyphs with StandardEncoding" {
+    const alloc = std.testing.allocator;
+    const cff_bytes = [_]u8{
+        1,   0,   4,   1, 0,   1,   1,   1,   5,   'T', 'e', 's',
+        't', 0,   1,   1, 1,   5,   190, 15,  165, 17,  0,   0,
+        0,   0,   0,   2, 1,   1,   2,   20,  14,  139, 139, 21,
+        247, 124, 139, 5, 251, 124, 250, 124, 5,   251, 124, 251,
+        124, 5,   14,  0, 0,   34,
+    };
+    const content = "BT /F1 12 Tf 10 20 Td <41> Tj ET\n";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Test /FirstChar 65 /LastChar 65 /Widths [600] /Encoding /StandardEncoding /FontDescriptor 6 0 R >>\nendobj\n",
+        "6 0 obj\n<< /Type /FontDescriptor /FontName /Test /Flags 32 /FontBBox [0 0 1000 1000] /Ascent 800 /Descent -200 /FontFile3 7 0 R >>\nendobj\n",
+        "",
+    };
+    defer alloc.free(objects[3]);
+
+    var prefix = std.ArrayList(u8).empty;
+    defer prefix.deinit(alloc);
+    try prefix.appendSlice(alloc, "%PDF-1.7\n");
+    var offsets: [objects.len]usize = undefined;
+    for (objects[0..6], 0..) |object, i| {
+        offsets[i] = prefix.items.len;
+        try prefix.appendSlice(alloc, object);
+    }
+    offsets[6] = prefix.items.len;
+    const font_header = try std.fmt.allocPrint(alloc, "7 0 obj\n<< /Subtype /Type1C /Length {d} >>\nstream\n", .{cff_bytes.len});
+    defer alloc.free(font_header);
+    try prefix.appendSlice(alloc, font_header);
+    try prefix.appendSlice(alloc, &cff_bytes);
+    try prefix.appendSlice(alloc, "\nendstream\nendobj\n");
+    const xref_offset = prefix.items.len;
+    try prefix.appendSlice(alloc, "xref\n0 8\n0000000000 65535 f \n");
+    for (offsets) |offset| {
+        const line = try std.fmt.allocPrint(alloc, "{d:0>10} 00000 n \n", .{offset});
+        defer alloc.free(line);
+        try prefix.appendSlice(alloc, line);
+    }
+    try prefix.appendSlice(alloc, "trailer\n<< /Size 8 /Root 1 0 R >>\n");
+    const sample = try std.fmt.allocPrint(alloc, "{s}startxref\n{d}\n%%EOF\n", .{ prefix.items, xref_offset });
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    const shapes = try reader.extractPageVectorTextShapeRunsAlloc(1);
+    defer {
+        for (shapes) |*shape| shape.deinit(alloc);
+        alloc.free(shapes);
+    }
+    try std.testing.expect(shapes.len > 0);
 }
 
 test "type1 font parsing is allocation-failure safe" {

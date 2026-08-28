@@ -230,10 +230,19 @@ fn executeCharStringAlloc(
                         if (stack.items.len < 2) return error.InvalidType1;
                         const subr_number_f = stack.pop().?;
                         const argument_count_f = stack.pop().?;
-                        if (!std.math.isFinite(subr_number_f) or !std.math.isFinite(argument_count_f) or argument_count_f < 0) return error.InvalidType1;
+                        if (!std.math.isFinite(subr_number_f) or
+                            @trunc(subr_number_f) != subr_number_f or
+                            subr_number_f < @as(f64, @floatFromInt(std.math.minInt(i32))) or
+                            subr_number_f > @as(f64, @floatFromInt(std.math.maxInt(i32))) or
+                            !std.math.isFinite(argument_count_f) or
+                            @trunc(argument_count_f) != argument_count_f or
+                            argument_count_f < 0 or
+                            argument_count_f > @as(f64, @floatFromInt(stack.items.len)))
+                        {
+                            return error.InvalidType1;
+                        }
                         const subr_number: i32 = @intFromFloat(subr_number_f);
                         const argument_count: usize = @intFromFloat(argument_count_f);
-                        if (argument_count > stack.items.len) return error.InvalidType1;
                         const first = stack.items.len - argument_count;
                         switch (subr_number) {
                             // Flex termination returns the final current point
@@ -510,6 +519,19 @@ test "type1 accepts standard othersubr and pop operators" {
     var outline = (try glyphOutlineAlloc(alloc, &charstring, null)).?;
     defer outline.deinit(alloc);
     try std.testing.expect(outline.contours.len >= 1);
+}
+
+test "type1 rejects non-integral and out-of-range othersubr operands" {
+    const alloc = std.testing.allocator;
+    // 0 2147483647 (2 4 div) div => subroutine number 4294967294.
+    const out_of_range = [_]u8{
+        139, 255, 0x7f, 0xff, 0xff, 0xff, 141, 143, 12, 12, 12, 12, 12, 16, 14,
+    };
+    try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &out_of_range, null));
+
+    // Fractional argument counts are invalid rather than implicitly truncated.
+    const fractional_count = [_]u8{ 141, 143, 12, 12, 139, 12, 16, 14 };
+    try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &fractional_count, null));
 }
 
 test "type1 decrypts charstring with lenIV" {
