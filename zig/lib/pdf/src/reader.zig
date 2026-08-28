@@ -742,8 +742,30 @@ pub const PageTextAnalysis = struct {
     }
 };
 
+const SharedImageRgba = struct {
+    bytes: []u8,
+    references: usize = 1,
+
+    fn retain(self: *SharedImageRgba) void {
+        self.references = std.math.add(usize, self.references, 1) catch std.math.maxInt(usize);
+    }
+
+    fn release(self: *SharedImageRgba, alloc: Allocator) void {
+        std.debug.assert(self.references > 0);
+        self.references -= 1;
+        if (self.references == 0) {
+            alloc.free(self.bytes);
+            alloc.destroy(self);
+        }
+    }
+};
+
 pub const ImageRun = struct {
     rgba: []u8,
+    /// Decoded XObject samples are immutable and shared by every `Do`
+    /// occurrence. Ad-hoc callers may leave this null and retain the legacy
+    /// owned-slice behavior.
+    shared_rgba: ?*SharedImageRgba = null,
     width: u32,
     height: u32,
     interpolate: bool = false,
@@ -771,7 +793,7 @@ pub const ImageRun = struct {
 
     pub fn deinit(self: *ImageRun, alloc: Allocator) void {
         if (self.clip_points) |points| alloc.free(points);
-        alloc.free(self.rgba);
+        if (self.shared_rgba) |shared| shared.release(alloc) else alloc.free(self.rgba);
         self.* = undefined;
     }
 };
@@ -919,6 +941,24 @@ pub const ShapeRun = struct {
 };
 
 const RenderTarget = struct { width: u32, height: u32 };
+const max_source_glyph_points: usize = 512;
+const max_flattened_glyph_points: usize = 4096;
+
+fn estimatePdfContentMaterializationUnits(content: []const u8) u64 {
+    const contains_text = std.mem.indexOf(u8, content, "Tj") != null or std.mem.indexOf(u8, content, "TJ") != null;
+    const units_per_byte: u64 = if (contains_text) max_flattened_glyph_points else 8;
+    return @max(@as(u64, max_flattened_glyph_points), saturatedMulU64(content.len, units_per_byte));
+}
+
+fn estimatePageFormMaterializationUnits(forms: []const PageForm, depth: usize) u64 {
+    if (depth >= 32) return std.math.maxInt(u64);
+    var units: u64 = 0;
+    for (forms) |form| {
+        units = saturatedAddU64(units, estimatePdfContentMaterializationUnits(form.content));
+        units = saturatedAddU64(units, estimatePageFormMaterializationUnits(form.forms, depth + 1));
+    }
+    return units;
+}
 
 /// Caps native outline work in units that track the renderer's dominant
 /// operation: point-in-path edge tests. The allowance scales with the final
@@ -927,6 +967,11 @@ const RenderTarget = struct { width: u32, height: u32 };
 /// transactional per PDF paint operator; rejected text stays on the bounded
 /// text fallback path instead of leaving a partially painted glyph.
 const VectorTextWorkBudget = struct {
+    const MaterializationReservation = struct {
+        points: u64,
+        resource_bytes: u64,
+    };
+
     remaining_edge_tests: u64,
     remaining_points: u64,
     remaining_resource_bytes: u64,
@@ -977,7 +1022,10 @@ const VectorTextWorkBudget = struct {
             edge_tests = saturatedAddU64(edge_tests, saturatedMulU64(work, 2));
         }
         for (images) |image| {
-            resource_bytes = saturatedAddU64(resource_bytes, image.rgba.len);
+            // Shared XObject samples were decoded before text expansion and
+            // retained without copying, so only independently owned samples
+            // consume the materialization allowance here.
+            if (image.shared_rgba == null) resource_bytes = saturatedAddU64(resource_bytes, image.rgba.len);
             const corners = [_][2]f64{
                 .{ image.e, image.f },
                 .{ image.a + image.e, image.b + image.f },
@@ -995,6 +1043,69 @@ const VectorTextWorkBudget = struct {
         self.remaining_edge_tests -= edge_tests;
         self.remaining_resource_bytes -= resource_bytes;
         return true;
+    }
+
+    /// Reserves a conservative upper bound before a text operator expands any
+    /// glyphs. Reconciliation immediately after that operator replaces the
+    /// reservation with its measured vector work. This prevents a single long
+    /// `Tj`/`TJ` from allocating its entire outline/resource set before the
+    /// page budget has a chance to reject it.
+    fn reserveTextMaterialization(self: *VectorTextWorkBudget, run: TextRun, font: PageFont) ?MaterializationReservation {
+        if (self.exhausted) return null;
+        const glyph_count: u64 = if (run.raw_text) |raw|
+            raw.len
+        else
+            (std.unicode.utf8CountCodepoints(run.text) catch run.text.len);
+        const paint_copies: u64 = switch (@mod(run.render_mode, 8)) {
+            2, 6 => 2,
+            3, 7 => 0,
+            else => 1,
+        };
+        // Native outline flattening is capped at 4096 points per glyph below.
+        // Reserve output copies plus the temporary flattened path, which
+        // makes this a real upper bound rather than a statistical estimate.
+        const materialization_copies = if (paint_copies == 0) 0 else paint_copies + 1;
+        // A Type1 `seac` glyph expands to independently bounded base and
+        // accent outlines.
+        const outline_paths_per_glyph: u64 = if (font.type1 != null) 2 else 1;
+        var construction_units = saturatedMulU64(saturatedMulU64(glyph_count, max_flattened_glyph_points), outline_paths_per_glyph);
+        var resource_bytes: u64 = 0;
+        if (font.type3) |type3| if (run.raw_text) |raw| {
+            construction_units = 0;
+            for (raw) |code| {
+                const glyph = type3.glyphForCode(code) orelse continue;
+                // Type3 CharProcs may contain arbitrary nested paint/text
+                // programs. Content length is available without decoding and
+                // provides an intentionally conservative construction bound.
+                construction_units = saturatedAddU64(construction_units, estimatePdfContentMaterializationUnits(glyph.content));
+                construction_units = saturatedAddU64(construction_units, estimatePageFormMaterializationUnits(type3.forms, 0));
+                for (type3.images) |image| {
+                    if (std.mem.indexOf(u8, glyph.content, image.name) != null and image.shared_rgba == null)
+                        resource_bytes = saturatedAddU64(resource_bytes, image.rgba.len);
+                }
+            }
+        };
+        const points = saturatedMulU64(construction_units, materialization_copies);
+        if (points > self.remaining_points or resource_bytes > self.remaining_resource_bytes) {
+            self.exhausted = true;
+            return null;
+        }
+        self.remaining_points -= points;
+        self.remaining_resource_bytes -= resource_bytes;
+        return .{ .points = points, .resource_bytes = resource_bytes };
+    }
+
+    fn reconcileTextMaterialization(
+        self: *VectorTextWorkBudget,
+        reservation: MaterializationReservation,
+        shapes: []const ShapeRun,
+        patterns: []const PatternRun,
+        images: []const ImageRun,
+        shadings: []const ShadingRun,
+    ) bool {
+        self.remaining_points = saturatedAddU64(self.remaining_points, reservation.points);
+        self.remaining_resource_bytes = saturatedAddU64(self.remaining_resource_bytes, reservation.resource_bytes);
+        return self.admit(shapes, patterns, images, shadings);
     }
 };
 
@@ -1193,13 +1304,14 @@ const ImageStackEntry = struct {
 const PageImage = struct {
     name: []u8,
     rgba: []u8,
+    shared_rgba: ?*SharedImageRgba = null,
     width: u32,
     height: u32,
     interpolate: bool = false,
 
     fn deinit(self: *PageImage, alloc: Allocator) void {
         alloc.free(self.name);
-        alloc.free(self.rgba);
+        if (self.shared_rgba) |shared| shared.release(alloc) else alloc.free(self.rgba);
         self.* = undefined;
     }
 };
@@ -2762,6 +2874,13 @@ pub const Reader = struct {
         work_budget: ?*VectorTextWorkBudget,
     ) !bool {
         if (work_budget) |budget| if (budget.exhausted) return false;
+        const budget_checkpoint = if (work_budget) |budget| budget.* else null;
+        var budget_committed = false;
+        defer if (!budget_committed) if (work_budget) |budget| {
+            const exhausted = budget.exhausted;
+            budget.* = budget_checkpoint.?;
+            budget.exhausted = exhausted;
+        };
         var group_images = std.ArrayList(ImageRun).empty;
         defer {
             for (group_images.items) |*image| image.deinit(alloc);
@@ -2800,6 +2919,14 @@ pub const Reader = struct {
             if (!run.vectorizable) return false;
             const font_index = run.font_index orelse return false;
             if (font_index >= fonts.len) return false;
+            const reservation = if (work_budget) |budget|
+                budget.reserveTextMaterialization(run, fonts[font_index]) orelse return false
+            else
+                null;
+            const image_start = group_images.items.len;
+            const shading_start = group_shadings.items.len;
+            const pattern_start = group_patterns.items.len;
+            const shape_start = group_shapes.items.len;
             if (fonts[font_index].type3) |type3| {
                 const raw = run.raw_text orelse return false;
                 var needs_combined_renderer = false;
@@ -2813,6 +2940,13 @@ pub const Reader = struct {
                 if (needs_combined_renderer) {
                     if (image_out == null or shading_out == null) return false;
                     if (!try appendType3RunResourceRunsAlloc(alloc, &group_images, &group_shadings, &group_patterns, &group_shapes, run, type3, raw, &type3_paint_phase, &next_resource_group_id)) return false;
+                    if (work_budget) |budget| if (!budget.reconcileTextMaterialization(
+                        reservation.?,
+                        group_shapes.items[shape_start..],
+                        group_patterns.items[pattern_start..],
+                        group_images.items[image_start..],
+                        group_shadings.items[shading_start..],
+                    )) return false;
                     continue;
                 }
             }
@@ -2824,28 +2958,34 @@ pub const Reader = struct {
             if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run, &type3_paint_phase)) return false;
             try appendPatternTextShapesAlloc(alloc, &group_patterns, patterns, temp_shapes.items, run);
             try transferSolidTextShapesAlloc(alloc, &group_shapes, &temp_shapes, run);
+            if (work_budget) |budget| if (!budget.reconcileTextMaterialization(
+                reservation.?,
+                group_shapes.items[shape_start..],
+                group_patterns.items[pattern_start..],
+                group_images.items[image_start..],
+                group_shadings.items[shading_start..],
+            )) return false;
         }
 
-        if (work_budget) |budget| {
-            if (!budget.admit(group_shapes.items, group_patterns.items, group_images.items, group_shadings.items)) return false;
-        }
-
+        // Reserve every destination before transferring any owned values so
+        // an allocation failure cannot expose a partially committed operator.
+        if (image_out) |out| try out.ensureUnusedCapacity(alloc, group_images.items.len);
+        if (shading_out) |out| try out.ensureUnusedCapacity(alloc, group_shadings.items.len);
+        try shape_out.ensureUnusedCapacity(alloc, group_shapes.items.len);
+        try pattern_out.ensureUnusedCapacity(alloc, group_patterns.items.len);
         if (image_out) |out| {
-            try out.ensureUnusedCapacity(alloc, group_images.items.len);
             for (group_images.items) |image| out.appendAssumeCapacity(image);
             group_images.clearRetainingCapacity();
         }
         if (shading_out) |out| {
-            try out.ensureUnusedCapacity(alloc, group_shadings.items.len);
             for (group_shadings.items) |shading| out.appendAssumeCapacity(shading);
             group_shadings.clearRetainingCapacity();
         }
-        try shape_out.ensureUnusedCapacity(alloc, group_shapes.items.len);
         for (group_shapes.items) |shape| shape_out.appendAssumeCapacity(shape);
         group_shapes.clearRetainingCapacity();
-        try pattern_out.ensureUnusedCapacity(alloc, group_patterns.items.len);
         for (group_patterns.items) |pattern| pattern_out.appendAssumeCapacity(pattern);
         group_patterns.clearRetainingCapacity();
+        budget_committed = true;
         return true;
     }
 
@@ -3772,6 +3912,11 @@ pub const Reader = struct {
         scale: f64,
         y_offset: f64,
     ) !FlattenedGlyphPath {
+        var source_points: usize = 0;
+        for (outline.contours) |contour| {
+            source_points = std.math.add(usize, source_points, contour.points.len) catch return error.PdfGlyphOutlineTooComplex;
+            if (source_points > max_source_glyph_points) return error.PdfGlyphOutlineTooComplex;
+        }
         var points = std.ArrayList([2]f64).empty;
         defer points.deinit(alloc);
         var starts = std.ArrayList(usize).empty;
@@ -3790,6 +3935,8 @@ pub const Reader = struct {
             const contour_points = try flattenTrueTypeContourAlloc(alloc, shifted, run, cursor_x, scale);
             defer alloc.free(contour_points);
             if (contour_points.len < 3) continue;
+            if (contour_points.len > max_flattened_glyph_points or points.items.len > max_flattened_glyph_points - contour_points.len)
+                return error.PdfGlyphOutlineTooComplex;
             try starts.append(alloc, points.items.len);
             try points.appendSlice(alloc, contour_points);
         }
@@ -4248,9 +4395,13 @@ pub const Reader = struct {
             var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
             errdefer if (name) |owned| self.alloc.free(owned);
             errdefer self.alloc.free(decoded.rgba);
+            const shared = try self.alloc.create(SharedImageRgba);
+            errdefer self.alloc.destroy(shared);
+            shared.* = .{ .bytes = decoded.rgba };
             try out.append(self.alloc, .{
                 .name = name.?,
                 .rgba = decoded.rgba,
+                .shared_rgba = shared,
                 .width = decoded.width,
                 .height = decoded.height,
                 .interpolate = if (xobj.get("Interpolate")) |value| value.* == .boolean and value.boolean else false,
@@ -10034,12 +10185,16 @@ fn applyImageOperator(
         const name = operands[operands.len - 1].name;
         for (images) |image| {
             if (!std.mem.eql(u8, image.name, name)) continue;
-            const rgba = try alloc.dupe(u8, image.rgba);
-            errdefer alloc.free(rgba);
+            const rgba = if (image.shared_rgba) |shared| blk: {
+                shared.retain();
+                break :blk shared.bytes;
+            } else try alloc.dupe(u8, image.rgba);
+            errdefer if (image.shared_rgba) |shared| shared.release(alloc) else alloc.free(rgba);
             const clip_points = if (current_clip_points.items.len > 0) try alloc.dupe([2]f64, current_clip_points.items) else null;
             errdefer if (clip_points) |clip| alloc.free(clip);
             try out.append(alloc, .{
                 .rgba = rgba,
+                .shared_rgba = image.shared_rgba,
                 .width = image.width,
                 .height = image.height,
                 .interpolate = image.interpolate,
@@ -19932,6 +20087,63 @@ test "vector text admission is raster relative and transactional" {
     try std.testing.expectEqual(remaining, budget.remaining_edge_tests);
 }
 
+test "vector text reserves before long glyph materialization and reconciles measured work" {
+    var budget = VectorTextWorkBudget.init(.{ .width = 100, .height = 100 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+    const font = PageFont{ .name = @constCast("F"), .decoder = .{} };
+    const initial_points = budget.remaining_points;
+    const reservation = budget.reserveTextMaterialization(.{
+        .text = @constCast("A"),
+        .raw_text = @constCast("A"),
+        .font_index = 0,
+        .x = 0,
+        .y = 0,
+        .font_size = 12,
+    }, font).?;
+    try std.testing.expect(budget.remaining_points < initial_points);
+
+    const points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    const shape = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = @constCast(&points) };
+    try std.testing.expect(budget.reconcileTextMaterialization(reservation, (&shape)[0..1], &.{}, &.{}, &.{}));
+    try std.testing.expectEqual(initial_points - points.len, budget.remaining_points);
+
+    var constrained = VectorTextWorkBudget.init(.{ .width = 10, .height = 10 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+    constrained.remaining_points = max_flattened_glyph_points * 2 - 1;
+    try std.testing.expect(constrained.reserveTextMaterialization(.{
+        .text = @constCast("A"),
+        .raw_text = @constCast("A"),
+        .font_index = 0,
+        .x = 0,
+        .y = 0,
+        .font_size = 12,
+    }, font) == null);
+    try std.testing.expect(constrained.exhausted);
+}
+
+test "image XObject occurrences retain one decoded sample buffer" {
+    const alloc = std.testing.allocator;
+    const shared = try alloc.create(SharedImageRgba);
+    shared.* = .{ .bytes = try alloc.dupe(u8, &.{ 1, 2, 3, 255 }) };
+    var image = PageImage{
+        .name = try alloc.dupe(u8, "Im"),
+        .rgba = shared.bytes,
+        .shared_rgba = shared,
+        .width = 1,
+        .height = 1,
+    };
+    defer image.deinit(alloc);
+    var runs = std.ArrayList(ImageRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractImageRunsFromContentAppend(alloc, &runs, "/Im Do /Im Do", (&image)[0..1], &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
+    try std.testing.expectEqual(@as(usize, 3), shared.references);
+    try std.testing.expectEqual(image.rgba.ptr, runs.items[0].rgba.ptr);
+    try std.testing.expectEqual(runs.items[0].rgba.ptr, runs.items[1].rgba.ptr);
+}
+
 test "uncolored Type3 accepts path-only forms and inherits caller color" {
     const alloc = std.testing.allocator;
     var form = PageForm{ .name = @constCast("Fm"), .content = @constCast("0 0 4 5 re f") };
@@ -20086,6 +20298,31 @@ test "flattened glyph ownership transfer is allocation-failure safe" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+}
+
+test "flattened glyph complexity is bounded before contour expansion" {
+    var glyph_points: [max_source_glyph_points + 1]font_lib.sfnt.GlyphPoint = undefined;
+    for (&glyph_points, 0..) |*point, i| point.* = .{
+        .x = @floatFromInt(i),
+        .y = @floatFromInt(i % 2),
+        .on_curve = true,
+    };
+    var contours = [_]font_lib.sfnt.GlyphContour{.{ .points = &glyph_points }};
+    const outline = font_lib.sfnt.GlyphOutline{
+        .contours = &contours,
+        .x_min = 0,
+        .y_min = 0,
+        .x_max = max_source_glyph_points,
+        .y_max = 1,
+    };
+    try std.testing.expectError(error.PdfGlyphOutlineTooComplex, Reader.flattenGlyphOutlineAlloc(
+        std.testing.allocator,
+        outline,
+        .{ .text = "", .x = 0, .y = 0, .font_size = 10 },
+        0,
+        1,
+        0,
+    ));
 }
 
 test "vector text preserves mixed pattern fill and solid stroke phases" {

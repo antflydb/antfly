@@ -186,6 +186,7 @@ const GroupMeta = struct {
     isolated: bool,
     knockout: bool,
     min_paint_order: usize,
+    min_paint_phase: usize,
 };
 
 const RenderChoice = union(enum) {
@@ -225,13 +226,19 @@ fn addOrUpdateGroupMeta(
     isolated: bool,
     knockout: bool,
     paint_order: usize,
+    paint_phase: usize,
 ) anyerror!void {
     if (group_indices.get(id)) |idx| {
         const group = &groups.items[idx];
         group.parent_id = parent_id;
         group.isolated = isolated;
         group.knockout = knockout;
-        group.min_paint_order = @min(group.min_paint_order, paint_order);
+        if (paint_order < group.min_paint_order) {
+            group.min_paint_order = paint_order;
+            group.min_paint_phase = paint_phase;
+        } else if (paint_order == group.min_paint_order) {
+            group.min_paint_phase = @min(group.min_paint_phase, paint_phase);
+        }
         return;
     }
     const idx = groups.items.len;
@@ -241,6 +248,7 @@ fn addOrUpdateGroupMeta(
         .isolated = isolated,
         .knockout = knockout,
         .min_paint_order = paint_order,
+        .min_paint_phase = paint_phase,
     });
     try group_indices.put(alloc, id, idx);
 }
@@ -283,6 +291,7 @@ fn renderChoicePhase(
     shading_runs: []const reader.ShadingRun,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
+    groups: []const GroupMeta,
 ) usize {
     return switch (choice) {
         .text => |idx| text_runs[idx].paint_phase,
@@ -290,7 +299,7 @@ fn renderChoicePhase(
         .shading => |idx| shading_runs[idx].paint_phase,
         .pattern => |idx| pattern_runs[idx].paint_phase,
         .shape => |idx| shape_runs[idx].paint_phase,
-        .group => 0,
+        .group => |idx| groups[idx].min_paint_phase,
     };
 }
 
@@ -306,8 +315,8 @@ const RenderChoiceSortContext = struct {
         const a_order = choiceOrder(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         const b_order = choiceOrder(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         if (a_order != b_order) return a_order < b_order;
-        const a_phase = renderChoicePhase(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs);
-        const b_phase = renderChoicePhase(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs);
+        const a_phase = renderChoicePhase(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
+        const b_phase = renderChoicePhase(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         if (a_phase != b_phase) return a_phase < b_phase;
         const a_kind = renderChoiceKindOrder(a);
         const b_kind = renderChoiceKindOrder(b);
@@ -329,11 +338,31 @@ fn buildRenderPlanAlloc(
     var group_indices = std.AutoHashMapUnmanaged(u32, usize).empty;
     defer group_indices.deinit(alloc);
 
-    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
-    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order);
+    for (text_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (image_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (shading_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (pattern_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+    for (shape_runs) |run| if (run.group_id) |id| try addOrUpdateGroupMeta(alloc, &groups, &group_indices, id, run.group_parent_id, run.group_isolated, run.group_knockout, run.paint_order, run.paint_phase);
+
+    // A parent group may contain only nested transparency groups. Propagate
+    // descendant minima so its position in its own parent remains the true
+    // earliest `(paint_order, paint_phase)` in the whole subtree.
+    var pass: usize = 0;
+    while (pass < groups.items.len) : (pass += 1) {
+        var changed = false;
+        for (groups.items) |child| if (child.parent_id) |parent_id| {
+            const parent_idx = group_indices.get(parent_id) orelse continue;
+            const parent = &groups.items[parent_idx];
+            if (child.min_paint_order < parent.min_paint_order or
+                (child.min_paint_order == parent.min_paint_order and child.min_paint_phase < parent.min_paint_phase))
+            {
+                parent.min_paint_order = child.min_paint_order;
+                parent.min_paint_phase = child.min_paint_phase;
+                changed = true;
+            }
+        };
+        if (!changed) break;
+    }
 
     const owned_groups = try groups.toOwnedSlice(alloc);
     errdefer alloc.free(owned_groups);
@@ -693,7 +722,7 @@ fn drawTextRun(
             switch (ch) {
                 ' ' => {},
                 '\n', '\r' => {},
-                else => drawAffineGlyphBox(rgba, width, height, margin, min_x, max_y, run, cursor, advance),
+                else => drawAffineFallbackGlyph(rgba, width, height, margin, min_x, max_y, run, ch, cursor, advance),
             }
             cursor += advance;
         }
@@ -705,7 +734,7 @@ fn drawTextRun(
         switch (cp) {
             ' ' => {},
             '\n', '\r' => {},
-            else => drawAffineGlyphBox(rgba, width, height, margin, min_x, max_y, run, cursor, advance),
+            else => drawAffineFallbackGlyph(rgba, width, height, margin, min_x, max_y, run, cp, cursor, advance),
         }
         cursor += advance;
     }
@@ -1543,7 +1572,12 @@ fn drawScaledGlyphBox(
     }
 }
 
-fn drawAffineGlyphBox(
+/// Draws a bounded, allocation-free 5x7 glyph when an embedded outline cannot
+/// be admitted. The previous solid affine rectangle destroyed character
+/// identity precisely when a page hit its vector-work limit. This compact
+/// native fallback keeps dense numbers OCR-readable and follows the original
+/// text matrix, clipping, colors, alpha, blend mode, and render mode.
+fn drawAffineFallbackGlyph(
     rgba: []u8,
     width: usize,
     height: usize,
@@ -1551,6 +1585,7 @@ fn drawAffineGlyphBox(
     min_x: f64,
     max_y: f64,
     run: reader.TextRun,
+    codepoint: u21,
     local_x: f64,
     local_w: f64,
 ) void {
@@ -1603,40 +1638,125 @@ fn drawAffineGlyphBox(
             const dy = world_y - run.y;
             const lx = inv_a * dx + inv_c * dy;
             const ly = inv_b * dx + inv_d * dy;
-            if (lx < local_x or lx > local_x + local_w or ly < -descent or ly > ascent) continue;
-            if (glyphModeColor(run, local_x, local_w, lx, ly)) |color| {
+            if (lx < local_x or lx >= local_x + local_w or ly <= -descent or ly > ascent) continue;
+            if (fallbackGlyphModeColor(run, codepoint, local_x, local_w, lx, ly)) |color| {
                 blendPixelMode(rgba, (py * width + px) * 4, color, run.blend_mode);
             }
         }
     }
 }
 
-fn glyphModeColor(run: reader.TextRun, local_x: f64, local_w: f64, lx: f64, ly: f64) ?[4]u8 {
+fn fallbackGlyphModeColor(run: reader.TextRun, codepoint: u21, local_x: f64, local_w: f64, lx: f64, ly: f64) ?[4]u8 {
     const mode = @mod(run.render_mode, 8);
+    const filled = fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly);
     return switch (mode) {
-        0, 4 => colorWithAlpha(run.fill_color, run.alpha),
-        1, 5 => if (glyphPointIsStroke(run, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else null,
-        2, 6 => if (glyphPointIsStroke(run, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else colorWithAlpha(run.fill_color, run.alpha),
+        0, 4 => if (filled) colorWithAlpha(run.fill_color, run.alpha) else null,
+        1, 5 => if (fallbackGlyphStrokeContains(run, codepoint, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else null,
+        2, 6 => if (fallbackGlyphStrokeContains(run, codepoint, local_x, local_w, lx, ly)) colorWithAlpha(run.stroke_color, run.stroke_alpha) else if (filled) colorWithAlpha(run.fill_color, run.alpha) else null,
         3, 7 => null,
-        else => colorWithAlpha(run.fill_color, run.alpha),
+        else => if (filled) colorWithAlpha(run.fill_color, run.alpha) else null,
     };
 }
 
-fn glyphPointIsStroke(run: reader.TextRun, local_x: f64, local_w: f64, lx: f64, ly: f64) bool {
+fn fallbackGlyphContains(run: reader.TextRun, codepoint: u21, local_x: f64, local_w: f64, lx: f64, ly: f64) bool {
     const ascent = effectiveRunAscent(run);
     const descent = effectiveRunDescent(run);
-    const usable_w = @max(1.0, local_w);
-    const usable_h = @max(1.0, ascent + descent);
+    const normalized_x = (lx - local_x) / local_w;
+    const normalized_y = (ascent - ly) / @max(0.000001, ascent + descent);
+    if (normalized_x < 0 or normalized_x >= 1 or normalized_y < 0 or normalized_y >= 1) return false;
+    const column: u3 = @intFromFloat(@min(4.0, @floor(normalized_x * 5.0)));
+    const row: u3 = @intFromFloat(@min(6.0, @floor(normalized_y * 7.0)));
+    return fallbackGlyphRow(codepoint, row) & (@as(u5, 0b10000) >> column) != 0;
+}
+
+fn fallbackGlyphStrokeContains(run: reader.TextRun, codepoint: u21, local_x: f64, local_w: f64, lx: f64, ly: f64) bool {
+    const ascent = effectiveRunAscent(run);
+    const descent = effectiveRunDescent(run);
+    const glyph_h = @max(0.000001, ascent + descent);
     const basis_x = @sqrt(run.a * run.a + run.b * run.b);
     const basis_y = @sqrt(run.c * run.c + run.d * run.d);
     const avg_scale = @max(0.000001, (basis_x + basis_y) / 2.0);
-    const stroke_from_width = run.stroke_width / avg_scale;
-    const stroke = std.math.clamp(@max(stroke_from_width, @min(usable_w, usable_h) * 0.12), 0.5, @min(usable_w, usable_h) / 2.0);
-    const left = lx - local_x;
-    const right = local_x + local_w - lx;
-    const bottom = ly + descent;
-    const top = ascent - ly;
-    return left <= stroke or right <= stroke or bottom <= stroke or top <= stroke;
+    const stroke = @max(run.stroke_width / avg_scale, @min(local_w / 5.0, glyph_h / 7.0) * 0.35);
+    if (!fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly)) {
+        return fallbackGlyphContains(run, codepoint, local_x, local_w, lx - stroke, ly) or
+            fallbackGlyphContains(run, codepoint, local_x, local_w, lx + stroke, ly) or
+            fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly - stroke) or
+            fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly + stroke);
+    }
+    return !fallbackGlyphContains(run, codepoint, local_x, local_w, lx - stroke, ly) or
+        !fallbackGlyphContains(run, codepoint, local_x, local_w, lx + stroke, ly) or
+        !fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly - stroke) or
+        !fallbackGlyphContains(run, codepoint, local_x, local_w, lx, ly + stroke);
+}
+
+fn fallbackGlyphRow(codepoint: u21, row: u3) u5 {
+    const cp: u21 = if (codepoint >= 'a' and codepoint <= 'z') codepoint - ('a' - 'A') else codepoint;
+    const rows: [7]u5 = switch (cp) {
+        '0' => .{ 0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110 },
+        '1' => .{ 0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 },
+        '2' => .{ 0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111 },
+        '3' => .{ 0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110 },
+        '4' => .{ 0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010 },
+        '5' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110 },
+        '6' => .{ 0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110 },
+        '7' => .{ 0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000 },
+        '8' => .{ 0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110 },
+        '9' => .{ 0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110 },
+        'A' => .{ 0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 },
+        'B' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110 },
+        'C' => .{ 0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111 },
+        'D' => .{ 0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110 },
+        'E' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111 },
+        'F' => .{ 0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000 },
+        'G' => .{ 0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111 },
+        'H' => .{ 0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001 },
+        'I' => .{ 0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110 },
+        'J' => .{ 0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100 },
+        'K' => .{ 0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001 },
+        'L' => .{ 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111 },
+        'M' => .{ 0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001 },
+        'N' => .{ 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001 },
+        'O' => .{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 },
+        'P' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000 },
+        'Q' => .{ 0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101 },
+        'R' => .{ 0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001 },
+        'S' => .{ 0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110 },
+        'T' => .{ 0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100 },
+        'U' => .{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110 },
+        'V' => .{ 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100 },
+        'W' => .{ 0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010 },
+        'X' => .{ 0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001 },
+        'Y' => .{ 0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100 },
+        'Z' => .{ 0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111 },
+        '.' => .{ 0, 0, 0, 0, 0, 0b00110, 0b00110 },
+        ',' => .{ 0, 0, 0, 0, 0b00110, 0b00110, 0b00100 },
+        ':' => .{ 0, 0b00110, 0b00110, 0, 0b00110, 0b00110, 0 },
+        ';' => .{ 0, 0b00110, 0b00110, 0, 0b00110, 0b00110, 0b00100 },
+        '-' => .{ 0, 0, 0, 0b11111, 0, 0, 0 },
+        '_' => .{ 0, 0, 0, 0, 0, 0, 0b11111 },
+        '=' => .{ 0, 0, 0b11111, 0, 0b11111, 0, 0 },
+        '+' => .{ 0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0 },
+        '/' => .{ 0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000 },
+        '\\' => .{ 0b10000, 0b01000, 0b01000, 0b00100, 0b00010, 0b00010, 0b00001 },
+        '(' => .{ 0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010 },
+        ')' => .{ 0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000 },
+        '[' => .{ 0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110 },
+        ']' => .{ 0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110 },
+        '<' => .{ 0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010 },
+        '>' => .{ 0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000 },
+        '!' => .{ 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100 },
+        '?' => .{ 0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100 },
+        '\'' => .{ 0b00100, 0b00100, 0b00010, 0, 0, 0, 0 },
+        '"' => .{ 0b01010, 0b01010, 0b00100, 0, 0, 0, 0 },
+        '#' => .{ 0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0 },
+        '&' => .{ 0b01100, 0b10010, 0b10100, 0b01000, 0b10101, 0b10010, 0b01101 },
+        '*' => .{ 0, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0 },
+        '|' => .{ 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100 },
+        '$' => .{ 0b00100, 0b01111, 0b10100, 0b01110, 0b00101, 0b11110, 0b00100 },
+        '%' => .{ 0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0 },
+        else => .{ 0b11111, 0b10001, 0b00010, 0b00100, 0b00000, 0b00100, 0b00100 },
+    };
+    return rows[row];
 }
 
 fn blendChannel(mode: reader.BlendMode, src: u8, dst: u8) u8 {
@@ -1799,6 +1919,23 @@ test "render plan preserves paint order ties and nested group schedules" {
     try std.testing.expect(child_schedule[0] == .text);
     try std.testing.expect(child_schedule[1] == .shape);
     try std.testing.expect(child_schedule[2] == .group);
+}
+
+test "render plan schedules transparency groups by earliest paint phase" {
+    const alloc = std.testing.allocator;
+    const shape_runs = [_]reader.ShapeRun{
+        .{ .kind = .fill, .paint_order = 10, .paint_phase = 4, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 10, .paint_phase = 8, .group_id = 7, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+        .{ .kind = .fill, .paint_order = 10, .paint_phase = 12, .color = .{ 0, 0, 0, 0xff }, .stroke_width = 0, .closed = true, .points = @constCast(&[_][2]f64{}) },
+    };
+    var plan = try buildRenderPlanAlloc(alloc, &.{}, &.{}, &.{}, &.{}, &shape_runs);
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), plan.schedules[0].items.len);
+    try std.testing.expect(plan.schedules[0].items[0] == .shape);
+    try std.testing.expect(plan.schedules[0].items[1] == .group);
+    try std.testing.expect(plan.schedules[0].items[2] == .shape);
+    try std.testing.expectEqual(@as(usize, 8), plan.groups[0].min_paint_phase);
 }
 
 test "render plan schedules a large page exactly once per choice" {
@@ -2495,10 +2632,13 @@ test "draw text run stroke-only mode leaves interior white" {
         .d = 1,
         .render_mode = 1,
     });
-    const edge = ((4 * 32) + 8) * 4;
-    const interior = ((4 * 32) + 10) * 4;
-    try std.testing.expectEqual(@as(u8, 0), canvas[edge + 0]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[interior + 0]);
+    var black: usize = 0;
+    var white: usize = 0;
+    for (canvas[0..], 0..) |channel, i| if (@mod(i, 4) == 0) {
+        if (channel == 0) black += 1 else if (channel == 0xff) white += 1;
+    };
+    try std.testing.expect(black > 0);
+    try std.testing.expect(white > black);
 }
 
 test "draw text run stroke-only mode uses stroke color" {
@@ -2519,10 +2659,12 @@ test "draw text run stroke-only mode uses stroke color" {
         .render_mode = 1,
         .stroke_color = .{ 0x00, 0x00, 0xff, 0xff },
     });
-    const edge = ((4 * 32) + 8) * 4;
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[edge + 2]);
+    var found_blue = false;
+    for (0..canvas.len / 4) |i| {
+        const px = i * 4;
+        if (canvas[px] == 0 and canvas[px + 1] == 0 and canvas[px + 2] == 0xff) found_blue = true;
+    }
+    try std.testing.expect(found_blue);
 }
 
 test "draw text run fill-stroke mode still fills interior" {
@@ -2565,14 +2707,15 @@ test "draw text run fill-stroke mode uses fill and stroke colors" {
         .fill_color = .{ 0xff, 0x00, 0x00, 0xff },
         .stroke_color = .{ 0x00, 0x00, 0xff, 0xff },
     });
-    const edge = ((4 * 32) + 8) * 4;
-    const interior = ((4 * 32) + 10) * 4;
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[edge + 1]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[edge + 2]);
-    try std.testing.expectEqual(@as(u8, 0xff), canvas[interior + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[interior + 1]);
-    try std.testing.expectEqual(@as(u8, 0x00), canvas[interior + 2]);
+    var found_blue = false;
+    var found_red = false;
+    for (0..canvas.len / 4) |i| {
+        const px = i * 4;
+        if (canvas[px] == 0 and canvas[px + 1] == 0 and canvas[px + 2] == 0xff) found_blue = true;
+        if (canvas[px] == 0xff and canvas[px + 1] == 0 and canvas[px + 2] == 0) found_red = true;
+    }
+    try std.testing.expect(found_blue);
+    try std.testing.expect(found_red);
 }
 
 test "draw text run stroke-only mode uses stroke alpha" {
@@ -2593,9 +2736,11 @@ test "draw text run stroke-only mode uses stroke alpha" {
         .render_mode = 1,
         .stroke_alpha = 0x80,
     });
-    const edge = ((4 * 32) + 8) * 4;
-    try std.testing.expect(canvas[edge + 0] > 0);
-    try std.testing.expect(canvas[edge + 0] < 0xff);
+    var found_translucent_stroke = false;
+    for (canvas[0..], 0..) |channel, i| if (@mod(i, 4) == 0 and channel > 0 and channel < 0xff) {
+        found_translucent_stroke = true;
+    };
+    try std.testing.expect(found_translucent_stroke);
 }
 
 test "draw text run stroke width changes outline thickness" {
@@ -2603,13 +2748,13 @@ test "draw text run stroke width changes outline thickness" {
     const text = try alloc.dupe(u8, "I");
     defer alloc.free(text);
 
-    var thin: [32 * 32 * 4]u8 = undefined;
+    var thin: [64 * 64 * 4]u8 = undefined;
     @memset(&thin, 0xff);
-    drawTextRun(&thin, 32, 32, 0, 0, 32, .{
+    drawTextRun(&thin, 64, 64, 0, 0, 64, .{
         .text = text,
-        .x = 8,
-        .y = 24,
-        .font_size = 8,
+        .x = 12,
+        .y = 52,
+        .font_size = 28,
         .a = 1,
         .b = 0,
         .c = 0,
@@ -2618,24 +2763,51 @@ test "draw text run stroke width changes outline thickness" {
         .stroke_width = 1,
     });
 
-    var thick: [32 * 32 * 4]u8 = undefined;
+    var thick: [64 * 64 * 4]u8 = undefined;
     @memset(&thick, 0xff);
-    drawTextRun(&thick, 32, 32, 0, 0, 32, .{
+    drawTextRun(&thick, 64, 64, 0, 0, 64, .{
         .text = text,
-        .x = 8,
-        .y = 24,
-        .font_size = 8,
+        .x = 12,
+        .y = 52,
+        .font_size = 28,
         .a = 1,
         .b = 0,
         .c = 0,
         .d = 1,
         .render_mode = 1,
-        .stroke_width = 3,
+        .stroke_width = 5,
     });
 
-    const near_interior = ((4 * 32) + 9) * 4;
-    try std.testing.expectEqual(@as(u8, 0xff), thin[near_interior + 0]);
-    try std.testing.expectEqual(@as(u8, 0x00), thick[near_interior + 0]);
+    var thin_pixels: usize = 0;
+    var thick_pixels: usize = 0;
+    for (thin[0..], thick[0..], 0..) |thin_channel, thick_channel, i| if (@mod(i, 4) == 0) {
+        if (thin_channel != 0xff) thin_pixels += 1;
+        if (thick_channel != 0xff) thick_pixels += 1;
+    };
+    try std.testing.expect(thick_pixels > thin_pixels);
+}
+
+test "fallback glyphs preserve numeric character identity" {
+    try std.testing.expect(fallbackGlyphRow('1', 0) != fallbackGlyphRow('8', 0));
+    try std.testing.expect(fallbackGlyphRow('1', 3) != fallbackGlyphRow('8', 3));
+
+    var canvas: [48 * 24 * 4]u8 = undefined;
+    @memset(&canvas, 0xff);
+    drawTextRun(&canvas, 48, 24, 0, 0, 24, .{
+        .text = @constCast("18"),
+        .x = 4,
+        .y = 20,
+        .font_size = 14,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+    });
+    var changed: usize = 0;
+    for (canvas[0..], 0..) |channel, i| if (@mod(i, 4) == 0 and channel != 0xff) {
+        changed += 1;
+    };
+    try std.testing.expect(changed > 10);
 }
 
 test "draw text run invisible mode skips rendering" {
