@@ -547,6 +547,22 @@ pub const VoprIo = struct {
         self.network.faults.delivery_paused = paused;
     }
 
+    /// Cut new and pooled client requests to one modeled IP listener without
+    /// suppressing the listener's responses or traffic to other endpoints.
+    pub fn setOutboundEndpointOutage(self: *VoprIo, address: ?std.Io.net.IpAddress) void {
+        self.network.setOutboundEndpointOutage(address);
+    }
+
+    /// Restrict an endpoint outage to writes containing one stable semantic
+    /// payload marker, such as an internal HTTP route suffix.
+    pub fn setOutboundEndpointPayloadOutage(
+        self: *VoprIo,
+        address: std.Io.net.IpAddress,
+        payload_contains: []const u8,
+    ) !void {
+        try self.network.setOutboundEndpointPayloadOutage(address, payload_contains);
+    }
+
     pub fn setDirectionalPartition(self: *VoprIo, source: ?std.Io.net.Socket.Handle, destination: ?std.Io.net.Socket.Handle) void {
         self.network.faults.partition_source = source;
         self.network.faults.partition_destination = destination;

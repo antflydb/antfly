@@ -16,6 +16,7 @@ const raft_transport = @import("../raft/transport/mod.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_server = @import("../api/http_server.zig");
+const api_distributed_graph = @import("../api/distributed_graph.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const common_http = @import("../common/http/http_common.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
@@ -62,7 +63,26 @@ const ModeledCapacitySource = struct {
     }
 };
 
+fn parseHttpBaseUriAddress(base_uri: []const u8) !std.Io.net.IpAddress {
+    const scheme_end = std.mem.indexOf(u8, base_uri, "://") orelse return error.InvalidProductionDataBaseUri;
+    const authority_and_path = base_uri[scheme_end + 3 ..];
+    const authority_end = std.mem.indexOfScalar(u8, authority_and_path, '/') orelse authority_and_path.len;
+    const authority = authority_and_path[0..authority_end];
+    const port_separator = std.mem.lastIndexOfScalar(u8, authority, ':') orelse
+        return error.InvalidProductionDataBaseUri;
+    var host = authority[0..port_separator];
+    if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
+    const port = std.fmt.parseInt(u16, authority[port_separator + 1 ..], 10) catch
+        return error.InvalidProductionDataBaseUri;
+    return std.Io.net.IpAddress.parse(host, port) catch error.InvalidProductionDataBaseUri;
+}
+
 pub const Fixture = struct {
+    pub const FaultMode = enum {
+        clean,
+        graph_transport_failure,
+    };
+
     pub const Phase = enum(u8) {
         created,
         metadata_quorum_ready,
@@ -193,6 +213,13 @@ pub const Fixture = struct {
     split_graph_inflight_rejected: bool = false,
     split_graph_inflight_sound: bool = false,
     post_split_graph_sound: bool = false,
+    graph_transport_failure_injected: bool = false,
+    graph_transport_failure_observed: bool = false,
+    graph_transport_failure_error_code: u16 = 0,
+    graph_partial_rejected_sound: bool = false,
+    graph_transport_fault_armed: bool = false,
+    graph_transport_fault_endpoint: ?std.Io.net.IpAddress = null,
+    graph_probe_route_index: usize = 1,
     topology_sound: bool = false,
     split_sound: bool = false,
     split_finalized: bool = false,
@@ -207,6 +234,7 @@ pub const Fixture = struct {
     teardown_started: bool = false,
     active_split_enabled: bool = true,
     graph_enabled: bool = false,
+    fault_mode: FaultMode = .clean,
 
     pub fn create(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
         const self = try alloc.create(Fixture);
@@ -231,8 +259,15 @@ pub const Fixture = struct {
         self.graph_enabled = enabled;
     }
 
+    pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
+        std.debug.assert(self.phase == .created);
+        self.fault_mode = mode;
+    }
+
     pub fn bootstrap(self: *Fixture) !void {
         if (self.phase != .created) return error.ProductionFixtureAlreadyBootstrapped;
+        if (self.fault_mode != .clean and (!self.graph_enabled or !self.active_split_enabled))
+            return error.InvalidProductionClusterFaultMode;
         const alloc = self.alloc;
         const sim = self.sim;
         self.metadata = try metadata_sim.VoprPublicClusterFixture.create(alloc, sim);
@@ -375,6 +410,10 @@ pub const Fixture = struct {
                 .data_raft_async_send_worker_count = 1,
             }, &self.metadata_base_uris);
             self.data_server_count += 1;
+            _ = self.data_servers[index].read_source.withDistributedGraphLifecycleHook(.{
+                .ptr = self,
+                .reach_fn = observeDistributedGraphLifecycle,
+            });
             const data_raft = self.data_servers[index].data_raft orelse return error.MissingDataRaft;
             self.data_raft_listeners[index] = try raft_transport.HttpxRuntime.start(
                 alloc,
@@ -467,6 +506,33 @@ pub const Fixture = struct {
     ) !void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         if (event.phase == .ingress) self.public_request_ingress_count +|= 1;
+    }
+
+    fn observeDistributedGraphLifecycle(
+        ptr: *anyopaque,
+        event: api_distributed_graph.LifecycleEvent,
+    ) void {
+        const self: *Fixture = @ptrCast(@alignCast(ptr));
+        if (self.fault_mode != .graph_transport_failure) return;
+        switch (event.phase) {
+            .expand_round_completed => {
+                if (!self.graph_transport_fault_armed or event.depth != 1 or self.graph_transport_failure_injected) return;
+                self.graph_transport_fault_armed = false;
+                const endpoint = self.graph_transport_fault_endpoint orelse return;
+                self.sim.setOutboundEndpointPayloadOutage(endpoint, "/graph-expand") catch unreachable;
+                self.graph_transport_failure_injected = true;
+            },
+            .attempt_failed => {
+                if (!self.graph_transport_failure_injected or self.graph_transport_failure_observed) return;
+                self.graph_transport_failure_observed = true;
+                self.graph_transport_failure_error_code = event.error_code;
+                // Heal before the coordinator converts the failed attempt into
+                // the public error response. This cuts the inter-owner fanout
+                // without making the client response itself undeliverable.
+                self.sim.setOutboundEndpointOutage(null);
+            },
+            else => {},
+        }
     }
 
     fn ensureMetadataIncarnation(self: *Fixture) !void {
@@ -882,6 +948,17 @@ pub const Fixture = struct {
             try self.waitForSplitInProgress();
             const ingress_before = self.public_request_ingress_count;
             self.split_graph_inflight_sound = probe: {
+                if (self.fault_mode == .graph_transport_failure) {
+                    const start_leader_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
+                        return error.ProductionDataGraphLeaderMissing;
+                    const target_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id) orelse
+                        return error.ProductionDataGraphLeaderMissing;
+                    self.graph_probe_route_index = for (0..self.data_api_uri_count) |index| {
+                        if (index != start_leader_index and index != target_index) break index;
+                    } else return error.ProductionDataGraphRemoteCoordinatorMissing;
+                    self.graph_transport_fault_endpoint = try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
+                    self.graph_transport_fault_armed = true;
+                }
                 var in_flight_graph = self.sim.io().async(runSplitGraphProbe, .{self});
                 errdefer _ = in_flight_graph.cancel(self.sim.io()) catch {};
                 try self.waitForPublicIngressAfter(ingress_before);
@@ -989,7 +1066,7 @@ pub const Fixture = struct {
         );
         defer self.alloc.free(query_body);
 
-        var response = try self.client.fetchQueryRaw(self.data_api_uris[1], "docs", query_body);
+        var response = try self.client.fetchQueryRaw(self.data_api_uris[self.graph_probe_route_index], "docs", query_body);
         defer response.deinit(self.alloc);
         switch (response.status) {
             200 => {
@@ -999,16 +1076,37 @@ pub const Fixture = struct {
                     2,
                     &.{ "doc:x", "doc:k" },
                 );
+                if (self.fault_mode == .graph_transport_failure) return false;
                 return self.split_graph_inflight_complete;
             },
             409, 503 => {
                 // A request crossing topology publication may fail closed,
                 // but it must never return a successful partial traversal.
-                self.split_graph_inflight_rejected = true;
-                return true;
+                self.split_graph_inflight_rejected = graphResponseFailClosed(response.status, response.body);
+                if (self.fault_mode == .graph_transport_failure) {
+                    self.graph_partial_rejected_sound =
+                        self.graph_transport_failure_injected and
+                        self.graph_transport_failure_observed and
+                        self.graph_transport_failure_error_code != 0 and
+                        response.status == 503 and
+                        std.mem.indexOf(u8, response.body, "\"code\":\"distributed_query_unavailable\"") != null and
+                        std.mem.indexOf(u8, response.body, "\"retryable\":true") != null and
+                        self.split_graph_inflight_rejected;
+                    return self.graph_partial_rejected_sound;
+                }
+                return self.split_graph_inflight_rejected;
             },
             else => return error.UnexpectedHttpStatus,
         }
+    }
+
+    fn graphResponseFailClosed(status: u16, body: []const u8) bool {
+        return (status == 409 or status == 503) and
+            std.mem.indexOf(u8, body, "\"code\":\"") != null and
+            std.mem.indexOf(u8, body, "\"retryable\":") != null and
+            std.mem.indexOf(u8, body, "graph_results") == null and
+            std.mem.indexOf(u8, body, "doc:x") == null and
+            std.mem.indexOf(u8, body, "doc:k") == null;
     }
 
     fn waitForPublicIngressAfter(self: *Fixture, baseline: u64) !void {
@@ -1280,9 +1378,21 @@ pub const Fixture = struct {
         return error.ProductionDataLeaderTimeout;
     }
 
+    fn currentDataLeaderIndex(self: *Fixture, group_id: u64) ?usize {
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            const raft = server.data_raft orelse continue;
+            const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
+            if (status.soft.role == .leader) return index;
+        }
+        return null;
+    }
+
     fn cleanupRuntime(self: *Fixture) void {
         if (self.cleanup_sound) return;
         self.cleanup_started = true;
+        self.graph_transport_fault_armed = false;
+        self.graph_transport_fault_endpoint = null;
+        self.sim.setOutboundEndpointOutage(null);
         var transition_index = self.transition_registration_count;
         while (transition_index > 0) {
             transition_index -= 1;
@@ -1485,6 +1595,9 @@ pub const Fixture = struct {
             },
         );
         self.teardown_started = true;
+        self.graph_transport_fault_armed = false;
+        self.graph_transport_fault_endpoint = null;
+        self.sim.setOutboundEndpointOutage(null);
         self.driver_stop = true;
         if (self.public_executor_live) self.public_executor.beginShutdown();
         if (self.transition_executor_live) self.transition_executor.beginShutdown();
@@ -1508,6 +1621,10 @@ pub const Fixture = struct {
         split_graph_inflight_rejected: bool,
         split_graph_inflight_ok: bool,
         post_split_graph_query_ok: bool,
+        graph_transport_failure_injected: bool,
+        graph_transport_failure_observed: bool,
+        graph_transport_failure_error_code: u16,
+        graph_partial_rejected_sound: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
         hosts: usize,
@@ -1527,6 +1644,10 @@ pub const Fixture = struct {
             .split_graph_inflight_rejected = self.split_graph_inflight_rejected,
             .split_graph_inflight_ok = self.split_graph_inflight_sound,
             .post_split_graph_query_ok = self.post_split_graph_sound,
+            .graph_transport_failure_injected = self.graph_transport_failure_injected,
+            .graph_transport_failure_observed = self.graph_transport_failure_observed,
+            .graph_transport_failure_error_code = self.graph_transport_failure_error_code,
+            .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally
             // reaches zero during cleanup. Keep the monotonic construction

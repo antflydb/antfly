@@ -20,6 +20,13 @@ pub const Config = struct {
 pub const Faults = struct {
     network_down: bool = false,
     delivery_paused: bool = false,
+    /// Reject client-to-server writes for one logical IP listener while
+    /// leaving its responses and every other endpoint available. This models
+    /// an application-service cut without also partitioning unrelated Raft or
+    /// control-plane traffic that happens to share the same VoprIo network.
+    outbound_endpoint_down: ?ids.StableId = null,
+    outbound_endpoint_payload_contains: ?[]u8 = null,
+    outbound_endpoint_payload_failure: ?[]usize = null,
     partition_source: ?std.Io.net.Socket.Handle = null,
     partition_destination: ?std.Io.net.Socket.Handle = null,
     drop_next: bool = false,
@@ -98,6 +105,7 @@ const SocketState = struct {
     connection_owner_id: ?ids.StableId = null,
     connection_client: bool = false,
     connection_identity_bound: bool = false,
+    outbound_fault_match_len: usize = 0,
 
     fn readResource(self: *const SocketState) ids.StableId {
         return ids.derive("sim-io.socket-read", self.id, 0);
@@ -154,6 +162,8 @@ pub const Network = struct {
     }
 
     pub fn deinit(self: *Network) void {
+        if (self.faults.outbound_endpoint_payload_contains) |selector| self.allocator.free(selector);
+        if (self.faults.outbound_endpoint_payload_failure) |failure| self.allocator.free(failure);
         for (self.packets.items) |packet| if (packet.bytes.len != 0) self.allocator.free(packet.bytes);
         self.packets.deinit(self.allocator);
         self.sockets.deinit(self.allocator);
@@ -292,7 +302,7 @@ pub const Network = struct {
             return error.SocketUnconnected;
         if (self.faults.network_down) return error.NetworkDown;
         const destination = self.getSocket(source.peer.?) orelse return error.ConnectionResetByPeer;
-        if (self.linkBlocked(source.handle, destination.handle)) return error.NetworkDown;
+        if (self.writeBlocked(source, destination, header, buffers, splat)) return error.NetworkDown;
         if (destination.closed or !destination.read_open) return error.ConnectionResetByPeer;
 
         var requested = header.len;
@@ -562,6 +572,40 @@ pub const Network = struct {
         return self.open_sockets;
     }
 
+    pub fn setOutboundEndpointOutage(self: *Network, address: ?std.Io.net.IpAddress) void {
+        if (self.faults.outbound_endpoint_payload_contains) |selector| self.allocator.free(selector);
+        if (self.faults.outbound_endpoint_payload_failure) |failure| self.allocator.free(failure);
+        self.faults.outbound_endpoint_down = if (address) |value|
+            ids.derive("sim-io.socket", ipEndpointIdentity("sim-io.ip-listener", value), 1)
+        else
+            null;
+        self.faults.outbound_endpoint_payload_contains = null;
+        self.faults.outbound_endpoint_payload_failure = null;
+        for (self.socket_order.items) |socket_state| socket_state.outbound_fault_match_len = 0;
+    }
+
+    pub fn setOutboundEndpointPayloadOutage(
+        self: *Network,
+        address: std.Io.net.IpAddress,
+        payload_contains: []const u8,
+    ) !void {
+        if (payload_contains.len == 0) return error.InvalidNetworkFaultSelector;
+        const owned_selector = try self.allocator.dupe(u8, payload_contains);
+        errdefer self.allocator.free(owned_selector);
+        const failure = try self.allocator.alloc(usize, payload_contains.len);
+        errdefer self.allocator.free(failure);
+        failure[0] = 0;
+        var matched: usize = 0;
+        for (payload_contains[1..], 1..) |byte, index| {
+            while (matched > 0 and payload_contains[matched] != byte) matched = failure[matched - 1];
+            if (payload_contains[matched] == byte) matched += 1;
+            failure[index] = matched;
+        }
+        self.setOutboundEndpointOutage(address);
+        self.faults.outbound_endpoint_payload_contains = owned_selector;
+        self.faults.outbound_endpoint_payload_failure = failure;
+    }
+
     fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress, owner_id: ids.StableId) !*SocketState {
         if (listener.pending_accept.items.len >= listener.backlog) return error.ConnectionRefused;
         const connection_owner = ids.derive("sim-io.connection-owner", listener.id, owner_id);
@@ -731,7 +775,42 @@ pub const Network = struct {
         return false;
     }
 
+    fn writeBlocked(
+        self: *const Network,
+        source: *SocketState,
+        destination: *const SocketState,
+        header: []const u8,
+        buffers: []const []const u8,
+        splat: usize,
+    ) bool {
+        if (self.linkBlocked(source.handle, destination.handle)) return true;
+        const endpoint_id = self.faults.outbound_endpoint_down orelse return false;
+        if (!source.connection_client or
+            source.connection_endpoint_id != endpoint_id or
+            destination.connection_endpoint_id != endpoint_id)
+        {
+            return false;
+        }
+        const selector = self.faults.outbound_endpoint_payload_contains orelse return true;
+        const failure = self.faults.outbound_endpoint_payload_failure.?;
+        if (feedFaultSelector(source, selector, failure, header)) return true;
+        for (0..splat) |_| for (buffers) |buffer| {
+            if (feedFaultSelector(source, selector, failure, buffer)) return true;
+        };
+        return false;
+    }
+
     fn linkBlocked(self: *const Network, source: std.Io.net.Socket.Handle, destination: std.Io.net.Socket.Handle) bool {
+        if (self.faults.outbound_endpoint_down) |endpoint_id| {
+            const source_state = self.getSocket(source) orelse return false;
+            const destination_state = self.getSocket(destination) orelse return false;
+            if (source_state.connection_client and
+                source_state.connection_endpoint_id == endpoint_id and
+                destination_state.connection_endpoint_id == endpoint_id)
+            {
+                if (self.faults.outbound_endpoint_payload_contains == null) return true;
+            }
+        }
         const blocked_source = self.faults.partition_source orelse return false;
         const blocked_destination = self.faults.partition_destination orelse return false;
         return source == blocked_source and destination == blocked_destination;
@@ -780,6 +859,26 @@ fn copyLimited(destination: []u8, source: []const u8, offset: usize) usize {
     const count = @min(destination.len - offset, source.len);
     @memcpy(destination[offset..][0..count], source[0..count]);
     return count;
+}
+
+fn feedFaultSelector(
+    socket_state: *SocketState,
+    selector: []const u8,
+    failure: []const usize,
+    bytes: []const u8,
+) bool {
+    std.debug.assert(selector.len > 0 and failure.len == selector.len);
+    var matched = socket_state.outbound_fault_match_len;
+    for (bytes) |byte| {
+        while (matched > 0 and selector[matched] != byte) matched = failure[matched - 1];
+        if (selector[matched] == byte) matched += 1;
+        if (matched == selector.len) {
+            socket_state.outbound_fault_match_len = failure[matched - 1];
+            return true;
+        }
+    }
+    socket_state.outbound_fault_match_len = matched;
+    return false;
 }
 
 fn takeBool(value: *bool) bool {
@@ -957,6 +1056,54 @@ test "connection identities are scoped to logical clients on one listener" {
 
     try std.testing.expectEqual(first.getSocket(first_client_a.handle).?.id, second.getSocket(second_client_a.handle).?.id);
     try std.testing.expectEqual(first.getSocket(first_client_b.handle).?.id, second.getSocket(second_client_b.handle).?.id);
+}
+
+test "outbound endpoint outage is directional and endpoint scoped" {
+    const NoopWaitPort = struct {
+        fn wait(_: *anyopaque, _: ids.StableId) anyerror!void {
+            return error.UnexpectedWait;
+        }
+
+        fn wake(_: *anyopaque, _: ids.StableId, _: u32) anyerror!void {}
+
+        fn ready(_: *anyopaque, _: ids.StableId) anyerror!void {}
+
+        const vtable = WaitPort.VTable{ .wait = wait, .wake = wake, .ready = ready };
+    };
+    const blocked_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_005) };
+    const healthy_address: std.Io.net.IpAddress = .{ .ip4 = .loopback(21_006) };
+
+    var network = try Network.init(std.testing.allocator, .{});
+    defer network.deinit();
+    var context: u8 = 0;
+    network.bindWaitPort(.{ .ptr = &context, .vtable = &NoopWaitPort.vtable });
+    const blocked_listener = try network.listenIp(&blocked_address, .{});
+    _ = try network.listenIp(&healthy_address, .{});
+    const blocked_client = try network.connectIp(&blocked_address, .{ .mode = .stream }, 1);
+    const blocked_server = try network.accept(blocked_listener.handle);
+    const healthy_client = try network.connectIp(&healthy_address, .{ .mode = .stream }, 2);
+
+    network.setOutboundEndpointOutage(blocked_address);
+    try std.testing.expectEqual(network.getSocket(blocked_listener.handle).?.id, network.faults.outbound_endpoint_down.?);
+    try std.testing.expect(network.getSocket(blocked_client.handle).?.connection_client);
+    try std.testing.expectEqual(network.faults.outbound_endpoint_down.?, network.getSocket(blocked_client.handle).?.connection_endpoint_id.?);
+    try std.testing.expectError(error.NetworkDown, network.write(blocked_client.handle, "", &.{"request"}, 1));
+    try std.testing.expectEqual(@as(usize, "request".len), try network.write(healthy_client.handle, "", &.{"request"}, 1));
+    try std.testing.expectEqual(@as(usize, "response".len), try network.write(blocked_server.handle, "", &.{"response"}, 1));
+
+    network.setOutboundEndpointOutage(null);
+    try std.testing.expectEqual(@as(usize, "request".len), try network.write(blocked_client.handle, "", &.{"request"}, 1));
+
+    try network.setOutboundEndpointPayloadOutage(blocked_address, "/graph-expand");
+    try std.testing.expectEqual(@as(usize, "POST /batch".len), try network.write(blocked_client.handle, "", &.{"POST /batch"}, 1));
+    try std.testing.expectError(error.NetworkDown, network.write(blocked_client.handle, "", &.{"POST /internal/v1/groups/7/tables/docs/graph-expand"}, 1));
+    try std.testing.expectEqual(@as(usize, "response /graph-expand".len), try network.write(blocked_server.handle, "", &.{"response /graph-expand"}, 1));
+    network.setOutboundEndpointOutage(null);
+
+    try network.setOutboundEndpointPayloadOutage(blocked_address, "/graph-expand");
+    try std.testing.expectEqual(@as(usize, "POST /internal/graph-".len), try network.write(blocked_client.handle, "", &.{"POST /internal/graph-"}, 1));
+    try std.testing.expectError(error.NetworkDown, network.write(blocked_client.handle, "", &.{"expand HTTP/1.1"}, 1));
+    network.setOutboundEndpointOutage(null);
 }
 
 test "first stream payload preserves logical owner independent of connect order" {

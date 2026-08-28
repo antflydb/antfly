@@ -2618,6 +2618,10 @@ pub const ProvisionedTableReadSource = struct {
     distributed_executor: ?http_common.RequestExecutor = null,
     internal_service_secret: ?[]const u8 = null,
     internal_service_issuer: ?[]const u8 = null,
+    /// Production-neutral graph phase observation. This is installed by
+    /// deployment owners that need to coordinate cancellation, topology, or
+    /// transport changes at an internally consistent suspension point.
+    distributed_graph_lifecycle_hook: ?distributed_graph.LifecycleHook = null,
 
     const topology_read_attempt_limit: usize = 4;
 
@@ -2694,6 +2698,14 @@ pub const ProvisionedTableReadSource = struct {
         return self;
     }
 
+    pub fn withDistributedGraphLifecycleHook(
+        self: *ProvisionedTableReadSource,
+        hook: ?distributed_graph.LifecycleHook,
+    ) *ProvisionedTableReadSource {
+        self.distributed_graph_lifecycle_hook = hook;
+        return self;
+    }
+
     fn distributedInternalExecutor(self: *ProvisionedTableReadSource) http_common.RequestExecutor {
         std.debug.assert(self.distributed_executor != null);
         return .{ .ptr = self, .vtable = &.{ .execute = executeDistributedInternalRequest } };
@@ -2721,6 +2733,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.secret_store = self.secret_store;
         hosted.remote_content = self.remote_content;
         hosted.graph_read_barrier = self.graph_read_barrier;
+        hosted.distributed_graph_lifecycle_hook = self.distributed_graph_lifecycle_hook;
         // Preserve the production resident/admission owner for routes that
         // resolve back to this DataServer. The hosted coordinator owns route
         // selection; it must not turn a local route into an unmanaged DB open.
@@ -8159,6 +8172,7 @@ const ProvisionedGraphWorkerContext = struct {
     fn worker(self: *@This()) distributed_graph.Worker {
         return .{
             .ptr = self,
+            .lifecycle_hook = self.source.distributed_graph_lifecycle_hook,
             .vtable = &.{
                 .execute_graph_expand = executeProvisionedGraphExpand,
                 .execute_graph_hydrate = executeProvisionedGraphHydrate,
