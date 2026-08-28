@@ -98,12 +98,15 @@ pub const Fixture = struct {
         workload_started,
         writes_complete,
         reads_complete,
+        join_query_complete,
         graph_query_complete,
         split_requested,
+        split_join_query_complete,
         split_graph_query_started,
         split_finalized,
         split_published,
         post_split_read_complete,
+        post_split_join_query_complete,
         post_split_graph_query_complete,
         cleanup_complete,
         complete,
@@ -140,6 +143,14 @@ pub const Fixture = struct {
         "{\"inserts\":{\"doc:c\":{\"title\":\"production-left\"},\"doc:k\":{\"title\":\"production-split\"}},\"sync_level\":\"write\"}";
     const ordinary_right_batch_body =
         "{\"inserts\":{\"doc:x\":{\"title\":\"production-right\"}},\"sync_level\":\"write\"}";
+    const join_left_batch_body =
+        "{\"inserts\":{\"doc:c\":{\"title\":\"production-left\"},\"doc:k\":{\"title\":\"production-split\"}},\"sync_level\":\"full_index\"}";
+    const join_right_batch_body =
+        "{\"inserts\":{\"doc:x\":{\"title\":\"production-right\"}},\"sync_level\":\"full_index\"}";
+    const tenant_batch_body =
+        "{\"inserts\":{\"tenant:q\":{\"title\":\"production-tenant\",\"body\":\"production join left\",\"customer_id\":\"doc:c\"},\"tenant:r\":{\"title\":\"production-tenant\",\"body\":\"production join left\",\"customer_id\":\"doc:x\"}},\"sync_level\":\"full_index\"}";
+    const join_query_body =
+        "{\"query\":{\"match_all\":{}},\"fields\":[\"title\"],\"limit\":10,\"profile\":true,\"join\":{\"right_table\":\"docs\",\"join_type\":\"inner\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\",\"operator\":\"eq\"},\"right_fields\":[\"title\"]}}";
     const resource_probe_body =
         "{\"inserts\":{\"pressure:probe\":{\"title\":\"pressure\",\"body\":\"production-owner-resource-recovery\"}},\"sync_level\":\"write\"}";
     const DataServer = data_runtime.DataServer;
@@ -222,6 +233,9 @@ pub const Fixture = struct {
     write_sound: bool = false,
     read_sound: bool = false,
     tenant_sound: bool = false,
+    join_sound: bool = false,
+    split_join_sound: bool = false,
+    post_split_join_sound: bool = false,
     graph_sound: bool = false,
     split_graph_inflight_started: bool = false,
     split_graph_inflight_complete: bool = false,
@@ -281,6 +295,7 @@ pub const Fixture = struct {
     teardown_started: bool = false,
     active_split_enabled: bool = true,
     graph_enabled: bool = false,
+    join_enabled: bool = false,
     fault_mode: FaultMode = .clean,
 
     pub fn create(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
@@ -304,6 +319,11 @@ pub const Fixture = struct {
     pub fn setGraphEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.graph_enabled = enabled;
+    }
+
+    pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.join_enabled = enabled;
     }
 
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
@@ -1130,8 +1150,18 @@ pub const Fixture = struct {
     }
 
     fn runWorkloadInner(self: *Fixture) !void {
-        const left_body = if (self.graph_enabled) left_batch_body else ordinary_left_batch_body;
-        const right_body = if (self.graph_enabled) right_batch_body else ordinary_right_batch_body;
+        const left_body = if (self.graph_enabled)
+            left_batch_body
+        else if (self.join_enabled)
+            join_left_batch_body
+        else
+            ordinary_left_batch_body;
+        const right_body = if (self.graph_enabled)
+            right_batch_body
+        else if (self.join_enabled)
+            join_right_batch_body
+        else
+            ordinary_right_batch_body;
         for (initial_groups) |group_id| {
             try self.waitForDataLeader(group_id);
             std.log.debug("production data-plane VOPR elected group leader group={}", .{group_id});
@@ -1157,7 +1187,7 @@ pub const Fixture = struct {
             2,
             self.data_api_uris[1],
             "tenant_b_docs",
-            "{\"inserts\":{\"tenant:q\":{\"title\":\"production-tenant\"}},\"sync_level\":\"write\"}",
+            tenant_batch_body,
         });
         const left_write_result = left_write.await(self.sim.io());
         const right_write_result = right_write.await(self.sim.io());
@@ -1211,7 +1241,7 @@ pub const Fixture = struct {
             self.data_api_uris[1],
             0,
             "tenant_b_docs",
-            "{\"inserts\":{\"tenant:q\":{\"title\":\"production-tenant\"}},\"sync_level\":\"write\"}",
+            tenant_batch_body,
             "tenant:q",
             "production-tenant",
         );
@@ -1227,6 +1257,15 @@ pub const Fixture = struct {
         self.phase = .reads_complete;
         if (!self.write_sound or !self.read_sound or !self.tenant_sound)
             return error.ProductionDataPublicRoundTripFailed;
+
+        if (self.join_enabled) {
+            if (!try self.waitForDocIdentityReady("tenant_b_docs", 64) or
+                !try self.waitForDocIdentityReady("docs", 64))
+                return error.ProductionDataJoinIdentityPublicationTimeout;
+            self.join_sound = try self.runJoinQuery();
+            self.phase = .join_query_complete;
+            if (!self.join_sound) return error.ProductionDataDistributedJoinFailed;
+        }
 
         if (self.graph_enabled) {
             if (!try self.waitForDocIdentityReady("docs", 64))
@@ -1251,8 +1290,27 @@ pub const Fixture = struct {
             split_key,
         );
         self.phase = .split_requested;
-        if (self.graph_enabled) {
+        if (self.join_enabled) {
+            // The control loop moves the split only when runOneControlRound is
+            // explicitly requested. Once this returns, hold the transition in
+            // a nonterminal production phase while the public join performs
+            // its real left query and cross-owner right-row fanout.
             try self.waitForSplitInProgress();
+            self.split_join_sound = try self.runJoinQuery();
+            self.phase = .split_join_query_complete;
+            if (!self.split_join_sound)
+                return error.ProductionDataActiveSplitDistributedJoinFailed;
+            // The active-split join deliberately runs before the destination
+            // is allowed to affect public routing. Once that observation is
+            // complete, invalidate each production owner's metadata snapshot
+            // through its ordinary API-backed refresh boundary so this mode
+            // exercises destination bootstrap/cutover instead of spending its
+            // deep-tier budget re-testing the passive snapshot TTL covered by
+            // the base split campaign.
+            try self.refreshDataServerMetadataSnapshots();
+        }
+        if (self.graph_enabled) {
+            if (!self.join_enabled) try self.waitForSplitInProgress();
             if (self.fault_mode == .resource_pressure)
                 try self.runResourcePressureDuringSplit();
             const ingress_before = self.public_request_ingress_count;
@@ -1334,6 +1392,14 @@ pub const Fixture = struct {
                 return error.ProductionDataResourceRecoveryLostAtSplitCutover;
         }
 
+        if (self.join_enabled) {
+            self.post_split_join_sound = try self.runJoinQuery();
+            self.join_sound = self.join_sound and self.split_join_sound and self.post_split_join_sound;
+            self.phase = .post_split_join_query_complete;
+            if (!self.post_split_join_sound)
+                return error.ProductionDataPostSplitDistributedJoinFailed;
+        }
+
         if (self.graph_enabled) {
             // The split key moves doc:k to the newly published destination
             // while doc:c and doc:x retain their original owners. Re-run both
@@ -1349,6 +1415,84 @@ pub const Fixture = struct {
             if (!self.post_split_graph_sound)
                 return error.ProductionDataPostSplitGraphQueryFailed;
         }
+    }
+
+    fn runJoinQuery(self: *Fixture) !bool {
+        // Public queries are idempotent. Preserve typed topology/availability
+        // responses as retryable, and accept 200 only when the response itself
+        // proves both expected matches came from a distributed right-side
+        // execution spanning at least two production groups.
+        for (0..node_count * 4) |attempt| {
+            const uri = self.data_api_uris[attempt % node_count];
+            var response = self.client.fetchQueryRaw(uri, "tenant_b_docs", join_query_body) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => {
+                    try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+            };
+            defer response.deinit(self.alloc);
+            if (response.status != 200) {
+                if (response.status != 409 and response.status != 503) {
+                    std.debug.print("production distributed join status={} body={s}\n", .{
+                        response.status,
+                        response.body,
+                    });
+                    return error.UnexpectedHttpStatus;
+                }
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                continue;
+            }
+            if (try self.joinResponseComplete(response.body)) return true;
+            if (attempt + 1 == node_count * 4) std.debug.print(
+                "production distributed join incomplete response: {s}\n",
+                .{response.body},
+            );
+            // A fixed-ID full-index write may be committed before every
+            // derived reader on a different production owner has published
+            // the indexed generation. Never accept the empty 200 as the join
+            // witness; rotate ingress and wait for the complete result.
+            try self.sim.io().sleep(.fromMilliseconds(10), .awake);
+        }
+        return false;
+    }
+
+    fn joinResponseComplete(self: *Fixture, body: []const u8) !bool {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
+        defer parsed.deinit();
+        const responses_value = parsed.value.object.get("responses") orelse return false;
+        if (responses_value != .array or responses_value.array.items.len != 1) return false;
+        const response_value = responses_value.array.items[0];
+        if (response_value != .object) return false;
+        const hits_value = response_value.object.get("hits") orelse return false;
+        if (hits_value != .object) return false;
+        const hit_items_value = hits_value.object.get("hits") orelse return false;
+        if (hit_items_value != .array or hit_items_value.array.items.len != 2) return false;
+
+        var saw_left = false;
+        var saw_right = false;
+        for (hit_items_value.array.items) |hit_value| {
+            if (hit_value != .object) return false;
+            const source_value = hit_value.object.get("_source") orelse return false;
+            if (source_value != .object) return false;
+            const title = source_value.object.get("title") orelse return false;
+            if (title != .string or !std.mem.eql(u8, title.string, "production-tenant")) return false;
+            const joined_title = source_value.object.get("docs.title") orelse return false;
+            if (joined_title != .string) return false;
+            saw_left = saw_left or std.mem.eql(u8, joined_title.string, "production-left");
+            saw_right = saw_right or std.mem.eql(u8, joined_title.string, "production-right");
+        }
+
+        const profile_value = response_value.object.get("profile") orelse return false;
+        if (profile_value != .object) return false;
+        const join_value = profile_value.object.get("join") orelse return false;
+        if (join_value != .object) return false;
+        const distributed = join_value.object.get("distributed_execution") orelse return false;
+        const groups = join_value.object.get("groups_queried") orelse return false;
+        const rows = join_value.object.get("rows_matched") orelse return false;
+        return saw_left and saw_right and distributed == .bool and distributed.bool and
+            groups == .integer and groups.integer >= 2 and
+            rows == .integer and rows.integer == 2;
     }
 
     fn runGraphQuery(
@@ -1716,15 +1860,19 @@ pub const Fixture = struct {
                 }
             }
             if (every_metadata_replica_ready) {
-                for (&self.data_servers, 0..) |*server, index| {
-                    if (!self.data_server_live[index]) continue;
-                    try server.refreshRemoteMetadataSnapshot();
-                }
+                try self.refreshDataServerMetadataSnapshots();
                 return true;
             }
             try self.runOneControlRound();
         }
         return false;
+    }
+
+    fn refreshDataServerMetadataSnapshots(self: *Fixture) !void {
+        for (&self.data_servers, 0..) |*server, index| {
+            if (!self.data_server_live[index]) continue;
+            try server.refreshRemoteMetadataSnapshot();
+        }
     }
 
     fn waitForSplitFinalized(self: *Fixture) !void {
@@ -2160,6 +2308,9 @@ pub const Fixture = struct {
     pub fn healthSnapshot(self: *const Fixture) struct {
         requests_ok: bool,
         topology_ok: bool,
+        join_query_ok: bool,
+        split_join_query_ok: bool,
+        post_split_join_query_ok: bool,
         graph_query_ok: bool,
         split_graph_inflight_started: bool,
         split_graph_inflight_complete: bool,
@@ -2198,10 +2349,14 @@ pub const Fixture = struct {
             .requests_ok = self.write_sound and
                 self.read_sound and
                 self.tenant_sound and
+                (!self.join_enabled or self.join_sound) and
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
+            .join_query_ok = self.join_sound,
+            .split_join_query_ok = self.split_join_sound,
+            .post_split_join_query_ok = self.post_split_join_sound,
             .graph_query_ok = self.graph_sound,
             .split_graph_inflight_started = self.split_graph_inflight_started,
             .split_graph_inflight_complete = self.split_graph_inflight_complete,

@@ -34,6 +34,49 @@ const join_model = @import("join_model.zig");
 const json_helpers = @import("json_helpers.zig");
 const unmatched_right_join_group_chunk_limit: u32 = 128;
 
+/// Preserve ownership and transport failures as typed coordinator outcomes.
+/// A stale group owner must restart the complete public join against a fresh
+/// topology; a broken worker transport must fail the whole join unavailable.
+/// Neither condition is an internal error, and neither may publish a partial
+/// result assembled from only the workers that answered.
+pub fn normalizeDistributedJoinOperationalError(err: anyerror) anyerror {
+    return switch (err) {
+        error.UnknownGroup,
+        error.NotLeader,
+        error.GroupLeaderUnavailable,
+        error.LeaderUnavailable,
+        => error.DistributedQueryUnavailable,
+        error.RemoteUnavailable,
+        error.ConnectionFailed,
+        error.ConnectionReset,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionClosed,
+        error.ConnectionAborted,
+        error.ConnectionTimeout,
+        error.ConnectionTimedOut,
+        error.BrokenPipe,
+        error.NotConnected,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.HostUnreachable,
+        error.DnsResolutionFailed,
+        error.TemporaryNameServerFailure,
+        error.NameServerFailure,
+        error.RecvFailed,
+        error.SendFailed,
+        => error.DistributedQueryUnavailable,
+        else => err,
+    };
+}
+
+test "distributed join ownership and transport failures remain retryable and fail closed" {
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.UnknownGroup));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.NotLeader));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.InternalFailure, normalizeDistributedJoinOperationalError(error.InternalFailure));
+}
+
 // ---------------------------------------------------------------------------
 // JoinContext vtable
 // ---------------------------------------------------------------------------
@@ -1491,7 +1534,10 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
         error.Cancelled => return error.Cancelled,
-        else => return error.InternalFailure,
+        else => {
+            std.log.err("distributed join primary query failed table={s} right_table={s} err={}", .{ table_name, join.right_table, err });
+            return error.InternalFailure;
+        },
     };
     defer primary_result.deinit(alloc);
     try ctx.ensureExecutionDeadline();
@@ -1510,7 +1556,10 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
         error.Cancelled => return error.Cancelled,
-        else => return error.InternalFailure,
+        else => {
+            std.log.err("distributed join planning failed table={s} right_table={s} err={}", .{ table_name, join.right_table, err });
+            return error.InternalFailure;
+        },
     };
 
     if (!uses_foreign and plan.strategy == .shuffle and join.nested_join == null) {
@@ -1544,7 +1593,12 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
         error.Timeout => return error.Timeout,
         error.Cancelled => return error.Cancelled,
-        else => return error.InternalFailure,
+        else => {
+            const normalized = normalizeDistributedJoinOperationalError(err);
+            if (normalized == error.DistributedQueryUnavailable) return error.DistributedQueryUnavailable;
+            std.log.err("distributed join right query failed table={s} right_table={s} err={}", .{ table_name, join.right_table, err });
+            return error.InternalFailure;
+        },
     };
     defer right_result.deinit(alloc);
     const stats = applyJoinedRightHitsToResponseWithContext(
@@ -1560,7 +1614,10 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.InvalidQueryRequest => return error.InvalidQueryRequest,
         error.Cancelled => return error.Cancelled,
         error.Timeout => return error.Timeout,
-        else => return error.InternalFailure,
+        else => {
+            std.log.err("distributed join response merge failed table={s} right_table={s} err={}", .{ table_name, join.right_table, err });
+            return error.InternalFailure;
+        },
     };
     try maybeAttachJoinProfile(alloc, &owned_response, stats, plan, right_result.strategy_used, right_result.distributed_execution, right_result.groups_queried);
     try ctx.ensureExecutionDeadline();

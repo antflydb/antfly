@@ -3640,7 +3640,34 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
+            // A routed data-Raft query may run on a leader that only recently
+            // applied the base document state. When the deployment installs a
+            // derived-state barrier, complete ReadIndex plus full-index catchup
+            // before admitting the query. Point-read visibility alone is not
+            // enough: otherwise an acknowledged full_index write can produce
+            // an empty successful search (and joins can silently skip work).
+            var read_activity = if (self.graph_read_barrier != null and consistency != .stale)
+                try self.prepareKnownGroupReadStrict(
+                    alloc,
+                    group_id,
+                    table_name,
+                    .{ .search = req },
+                    consistency,
+                    readPreparationKindForQuery(req),
+                    0,
+                    try queryRemainingTimeoutMs(req),
+                    req.cancellation orelse .none,
+                )
+            else
+                try self.prepareKnownGroupRead(
+                    alloc,
+                    group_id,
+                    table_name,
+                    .{ .search = req },
+                    consistency,
+                    readPreparationKindForQuery(req),
+                    0,
+                );
             defer if (read_activity) |*activity| activity.deinit();
             return preflightHostedLocal(
                 self.resident_db,
@@ -3713,7 +3740,28 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
+            var read_activity = if (self.graph_read_barrier != null and consistency != .stale)
+                try self.prepareKnownGroupReadStrict(
+                    alloc,
+                    group_id,
+                    table_name,
+                    .{ .search = req },
+                    consistency,
+                    readPreparationKindForQuery(req),
+                    0,
+                    try queryRemainingTimeoutMs(req),
+                    req.cancellation orelse .none,
+                )
+            else
+                try self.prepareKnownGroupRead(
+                    alloc,
+                    group_id,
+                    table_name,
+                    .{ .search = req },
+                    consistency,
+                    readPreparationKindForQuery(req),
+                    0,
+                );
             defer if (read_activity) |*activity| activity.deinit();
             const start_ns = self.monotonicNs();
             var execution = queryHostedLocalDetailed(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale, read_activity != null) catch |err| switch (err) {
@@ -3756,7 +3804,28 @@ pub const ProvisionedTableReadSource = struct {
         try self.ensureHAReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
-            var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .search = req }, consistency, readPreparationKindForQuery(req), 0);
+            var read_activity = if (self.graph_read_barrier != null and consistency != .stale)
+                try self.prepareKnownGroupReadStrict(
+                    alloc,
+                    group_id,
+                    table_name,
+                    .{ .search = req },
+                    consistency,
+                    readPreparationKindForQuery(req),
+                    0,
+                    try queryRemainingTimeoutMs(req),
+                    req.cancellation orelse .none,
+                )
+            else
+                try self.prepareKnownGroupRead(
+                    alloc,
+                    group_id,
+                    table_name,
+                    .{ .search = req },
+                    consistency,
+                    readPreparationKindForQuery(req),
+                    0,
+                );
             defer if (read_activity) |*activity| activity.deinit();
             return queryHostedLocal(self.resident_db, self.cache, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, .stale, read_activity != null) catch |err| switch (err) {
                 error.ResidentDbRetryRequired => {
@@ -4730,6 +4799,19 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, routePolicyForConsistency(consistency))) orelse return null;
+        defer route.deinit(alloc);
+        switch (route) {
+            .remote => |remote| return try queryResponseRemote(
+                self.internalExecutor(),
+                alloc,
+                remote.base_uri,
+                group_id,
+                table_name,
+                req,
+            ),
+            .local => {},
+        }
         if (self.local_source) |local| return try local.queryGroupLocal(alloc, group_id, table_name, req, consistency);
         const start_ns = self.monotonicNs();
         var execution = try queryHostedLocalDetailed(null, null, self.replica_root_dir, self.catalog, self.requester, alloc, group_id, self.visibleRootGeneration(group_id), self.managedReadRuntimeConfig(), table_name, req, consistency, false);
@@ -16603,26 +16685,41 @@ fn queryRemote(
     table_name: []const u8,
     req: db_mod.types.SearchRequest,
 ) !db_mod.types.SearchResult {
+    var result = try queryResponseRemote(executor, alloc, base_uri, group_id, table_name, req);
+    defer result.deinit(alloc);
+    var parsed = try parseRemoteSearchResult(alloc, result.json);
+    parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
+    return parsed;
+}
+
+fn queryResponseRemote(
+    executor: http_common.RequestExecutor,
+    alloc: std.mem.Allocator,
+    base_uri: []const u8,
+    group_id: u64,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+) !query_api.QueryResponse {
     var client = http_client.ApiHttpClient.init(alloc, executor);
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     const timeout_ms = try queryRemainingTimeoutMs(req);
     var cancellation = queryRequestCancellation(req);
     const cancellation_ptr = if (req.cancellation != null) &cancellation else null;
-    if (try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req)) |body| {
-        defer alloc.free(body);
-        var result = try client.fetchGroupVectorWorkerWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
-        defer result.deinit(alloc);
-        var parsed = try parseRemoteSearchResult(alloc, result.body);
-        parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
-        return parsed;
-    }
-    const body = try encodeQueryRequest(alloc, req);
+    const vector_body = try encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(alloc, req);
+    const body = if (vector_body) |owned_vector_body|
+        owned_vector_body
+    else
+        try encodeQueryRequest(alloc, req);
     defer alloc.free(body);
-    var result = try client.fetchGroupQueryWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
+    var result = if (vector_body != null)
+        try client.fetchGroupVectorWorkerWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr)
+    else
+        try client.fetchGroupQueryWithControl(base_uri, group_id, table_name, body, timeout_ms, cancellation_ptr);
     defer result.deinit(alloc);
-    var parsed = try parseRemoteSearchResult(alloc, result.body);
-    parsed.identity_read_generation = result.identity_read_generation orelse return error.InvalidQueryRequest;
-    return parsed;
+    return .{
+        .json = try alloc.dupe(u8, result.body),
+        .identity_read_generation = result.identity_read_generation,
+    };
 }
 
 fn preflightRemote(
@@ -21785,6 +21882,21 @@ test "hosted hierarchy navigation routes projection-safe hydration and advances 
         .limit = 1,
     };
 
+    // Group-local callbacks are invoked by higher-level distributed
+    // coordinators such as joins. They must preserve the exact-group contract
+    // even when the coordinator does not host that group itself.
+    const source = hosted.source();
+    var remote_group_result = (try source.queryGroupLocal(
+        alloc,
+        group_ids[0],
+        "docs",
+        base_request,
+        .read_index,
+    )).?;
+    defer remote_group_result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 42), remote_group_result.identity_read_generation);
+    try std.testing.expect(std.mem.indexOf(u8, remote_group_result.json, public_ids[0]) != null);
+
     var first = try queryHostedAcrossGroups(&hosted, alloc, &group_ids, base_request, "docs", .read_index);
     defer first.deinit();
     try std.testing.expectEqual(@as(usize, 1), first.hits.len);
@@ -21807,7 +21919,7 @@ test "hosted hierarchy navigation routes projection-safe hydration and advances 
     try std.testing.expectEqual(@as(usize, 1), replay.hits.len);
     try std.testing.expectEqualStrings(public_ids[1], replay.hits[0].id);
     try std.testing.expectEqualStrings(positions[1], replay.hits[0].sort_values[0].string);
-    try std.testing.expectEqual(@as(usize, 4), executor.query_calls);
+    try std.testing.expectEqual(@as(usize, 5), executor.query_calls);
     try std.testing.expectEqual(@as(usize, 2), executor.lookup_calls);
 
     // If every shard reports that it does not own the parent plan, the outer
@@ -21818,7 +21930,7 @@ test "hosted hierarchy navigation routes projection-safe hydration and advances 
         error.HierarchyCursorStale,
         queryHostedAcrossGroups(&hosted, alloc, &group_ids, replay_request, "docs", .read_index),
     );
-    try std.testing.expectEqual(@as(usize, 6), executor.query_calls);
+    try std.testing.expectEqual(@as(usize, 7), executor.query_calls);
     try std.testing.expectEqual(@as(usize, 2), executor.lookup_calls);
 }
 

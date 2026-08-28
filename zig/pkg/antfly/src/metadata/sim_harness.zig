@@ -6395,7 +6395,8 @@ pub const VoprPublicClusterFixture = struct {
     pub const tenant_data_group_id: u64 = 6844;
     pub const graph_data_group_id: u64 = 6845;
     const graph_index_name = "graph_idx";
-    const graph_indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}";
+    const graph_indexes_json =
+        "{\"full_text_index_v0\":{\"name\":\"full_text_index_v0\",\"type\":\"full_text\"},\"graph_idx\":{\"type\":\"graph\"}}";
 
     alloc: std.mem.Allocator,
     sim: *vopr.vopr_io.VoprIo,
