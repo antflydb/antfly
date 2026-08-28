@@ -8269,7 +8269,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginStructuralTableActivity(table_name);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
-        self.invalidateRuntimeStatusCache(table_name);
+        // An index-targeted mutation retains the storage root and cannot
+        // invalidate an unaffected sibling's published generation. Fence
+        // observations already in flight, but keep the last immutable group
+        // snapshot until the targeted reconciler publishes the new status.
+        if (self.runtime_status_cache) |snapshot_cache| {
+            snapshot_cache.fenceTablePublications(table_name);
+        }
     }
 
     fn finishLocalStructuralCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -14743,14 +14749,12 @@ pub const ProvisionedTableWriteSource = struct {
         managed_visibility_changed: bool,
     ) void {
         self.finishLocalStructuralCacheUpdate(table_name);
-        // Publish outside structural/cache admission, but before the
-        // synchronous structural hook reports store status. A fenced or
-        // skipped snapshot remains best-effort; the structural report and
-        // dirty bit still make it retryable without turning committed DDL into
-        // an API failure.
-        if (managed_visibility_changed) {
-            self.publishWriteCacheRuntimeStatusesForTableBestEffort(alloc, table_name);
-        }
+        _ = alloc;
+        // The targeted reconciler already owns the status fence. Publishing a
+        // whole-DB observation here would replace ready sibling entries with
+        // the target mutation's transient startup-catch-up view. Keep the
+        // prior immutable snapshot until reconciliation publishes the new
+        // target and its unchanged siblings together.
         // The named index was reconciled in place inside the current root.
         // Report the fresh runtime without asking the owner to enqueue a
         // redundant whole-table reconciliation that would transiently revoke
@@ -14793,6 +14797,11 @@ pub const ProvisionedTableWriteSource = struct {
             group_ids,
             if (self.local_index_repair_debt_hook != null) &repair_group_ids else null,
         );
+        // Install the target-aware status fence before releasing structural
+        // admission. The synchronous runtime-reconciled report below must use
+        // the retained snapshot instead of replacing ready siblings with the
+        // target's transient startup-catch-up observation.
+        try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
         self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
 
         // Reconciliation records debt while each DB is already leased. Publish
@@ -14837,6 +14846,7 @@ pub const ProvisionedTableWriteSource = struct {
             try dropLocalTableIndex(alloc, self.catalog, self.replica_root_dir, self.backend_runtime, table_name, index_name);
             break :blk false;
         };
+        try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
         self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
     }
 
@@ -35554,6 +35564,47 @@ test "targeted index reconciliation stales only the named cached index" {
     try std.testing.expect(indexes[0].runtime_observation_stale);
     try std.testing.expect(!indexes[1].runtime_observation_stale);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, status_items[0].metadata.freshness);
+}
+
+test "targeted index cache update retains the published sibling snapshot through handoff" {
+    const alloc = std.testing.allocator;
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-targeted-index-cache-handoff",
+        catalog.iface(),
+    );
+    defer source.deinit();
+    source.runtime_status_cache = &snapshot_cache;
+
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{ .name = "ready_sibling", .kind = .dense_vector, .doc_count = 4, .node_count = 1 },
+    };
+    const published = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .doc_count = 4, .index_count = 1, .indexes = &indexes },
+    };
+    const publication_token = try snapshot_cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try snapshot_cache.publishGroup(publication_token, "docs", published),
+    );
+
+    // Park the worker so the assertion observes the handoff between the
+    // synchronous index mutation and its targeted reconciler.
+    source.structural_reconcile_scheduled.store(true, .release);
+    source.beginLocalStructuralIndexCacheUpdate("docs");
+    try source.enqueueTableIndexStructuralReconcile("docs", "new_target");
+    source.finishLocalStructuralCacheUpdate("docs");
+
+    var cached = (try source.snapshotRuntimeStatusesBestEffort(alloc, "docs")).?;
+    defer cached.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cached.items.len);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, cached.items[0].metadata.freshness);
+    try std.testing.expectEqualStrings("ready_sibling", cached.items[0].stats.indexes[0].name);
+    try std.testing.expect(!cached.items[0].stats.indexes[0].runtime_observation_stale);
 }
 
 test "structural repair handoff keeps status fenced through final shard visibility" {

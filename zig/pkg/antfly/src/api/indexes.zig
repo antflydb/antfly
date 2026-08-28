@@ -1764,8 +1764,15 @@ fn aggregateIndexStatusIndexed(
                 aggregate.load_error = load_error;
             }
         }
-        const index_observation_fresh = statusFreshnessCountsAsFresh(runtime.metadata) and
-            !item.runtime_observation_stale;
+        const identity_scoped_transition_observation = switch (runtime.metadata.freshness) {
+            .stale, .opening, .catching_up => (item.kind == .dense_vector or item.kind == .sparse_vector) and
+                item.coverage_identity_ready and
+                item.coverage_summary_ready and
+                coverageIdentityMatches(item, coverage_generation, coverage_config_hash),
+            else => false,
+        };
+        const index_observation_fresh = !item.runtime_observation_stale and
+            (statusFreshnessCountsAsFresh(runtime.metadata) or identity_scoped_transition_observation);
         if (index_observation_fresh) {
             aggregate.fresh_group_count += 1;
             aggregate.runtime_fresh = true;
@@ -2742,9 +2749,46 @@ test "stale in-place status preserves an incarnation-scoped serviceability proof
     );
     try ant_json.testing.expectSubsetJsonText(
         std.testing.allocator,
-        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\",\"shard_observation_incomplete\",\"backfill\",\"coverage\",\"replay\"]}}",
+        "{\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false,\"pending_reasons\":[\"backfill\",\"coverage\"]}}",
         encoded.items,
     );
+}
+
+test "identity-proven embeddings stay current during sibling startup catch-up" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .doc_count = 2,
+        .node_count = 1,
+        .coverage_produced_count = 2,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
+        .stats = .{
+            .source_doc_count = 2,
+            .doc_count = 2,
+            .index_count = 1,
+            .indexes = indexes[0..],
+        },
+    }};
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "semantic_idx",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(u64, 1), aggregate.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.doc_count);
+    try std.testing.expectEqual(@as(u64, 2), aggregate.coverage_produced_count);
 }
 
 test "target-scoped stale full text observation cannot publish old readiness" {
@@ -3414,16 +3458,15 @@ fn backfillState(index_type: ApiIndexType, active: bool, enrichment_degraded: bo
     if (index_type == .embeddings) {
         _ = replay_applied_sequence;
         _ = replay_target_sequence;
+        if (enrichment) |stats| {
+            if (stats.worker_failed) return "failed";
+        }
         if (enrichment_degraded) return "degraded";
         if (active) {
             if (enrichment) |stats| {
-                if (stats.worker_failed) return "failed";
                 if (stats.retrying) return "retrying";
             }
             return "running";
-        }
-        if (enrichment) |stats| {
-            if (stats.worker_failed) return "failed";
         }
         return "ready";
     }

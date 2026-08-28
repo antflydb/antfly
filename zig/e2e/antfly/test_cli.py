@@ -102,6 +102,22 @@ def parse_json(output: str) -> dict | list:
     return json.loads(output.strip())
 
 
+def assert_no_unexpected_semantic_warning(
+    result: subprocess.CompletedProcess[str], index_name: str
+) -> None:
+    warning_lines = [
+        line.lower() for line in result.stderr.splitlines() if "warning:" in line.lower()
+    ]
+    if not warning_lines:
+        return
+
+    assert len(warning_lines) == 1, result.stderr
+    warning = warning_lines[0]
+    assert f"warning: semantic index {index_name} is queryable_partial" in warning
+    assert "results may be incomplete" in warning
+    assert "--until complete" in warning
+
+
 # ---------------------------------------------------------------------------
 # Table lifecycle
 # ---------------------------------------------------------------------------
@@ -267,7 +283,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--limit",
             "2",
         )
-        assert "warning:" not in text_query.stderr.lower()
+        assert_no_unexpected_semantic_warning(text_query, "title_body")
         text_hits = parse_json(text_query.stdout)["responses"][0]["hits"]["hits"]
         assert text_hits[0]["_id"] == "doc:alpha"
 
@@ -389,7 +405,7 @@ def test_cli_inline_create_load_wait_query_image_and_rag_pipeline(
             "--no-streaming",
             timeout_s=60.0,
         )
-        assert "warning:" not in rag.stderr.lower()
+        assert_no_unexpected_semantic_warning(rag, "title_body")
         rag_result = parse_json(rag.stdout)
         assert rag_result["status"] == "completed"
         assert rag_result["generation"]
