@@ -289,6 +289,12 @@ pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
 pub const node_lifecycle_finalizing = "finalizing";
 
+/// Data-store protocol required to stage, validate, and atomically publish a
+/// native backup generation without discarding validated generated indexes.
+/// Persisting this per store lets metadata fence restore placement during a
+/// rolling data-plane upgrade instead of relying on the metadata codec level.
+pub const native_generation_restore_protocol_version: u16 = 1;
+
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);
 }
@@ -311,6 +317,7 @@ pub const StoreRecord = struct {
     reporter_incarnation: u64 = 0,
     /// Highest status snapshot generation accepted for `reporter_incarnation`.
     status_generation: u64 = 0,
+    native_generation_restore_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -1988,6 +1995,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .node_id = record.node_id,
         .reporter_incarnation = record.reporter_incarnation,
         .status_generation = record.status_generation,
+        .native_generation_restore_version = record.native_generation_restore_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,

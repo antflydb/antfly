@@ -10847,6 +10847,7 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .node_id = registration.node_id,
             .reporter_incarnation = try self.reporterIncarnation(),
+            .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -11442,11 +11443,14 @@ pub const DataServer = struct {
         const reporter_incarnation = try self.reporterIncarnation();
         if (snapshot.status.runtime_status_protocol_ready_version >=
             metadata_runtime_status_protocol.current_record_version and
-            !storeReporterIncarnationVisible(
+            (!storeReporterIncarnationVisible(
                 snapshot.stores,
                 registration.store_id,
                 reporter_incarnation,
-            ))
+            ) or !storeNativeGenerationRestoreCapabilityVisible(
+                snapshot.stores,
+                registration.store_id,
+            )))
         {
             // A process that registered while v13 was still rolling out has a
             // legacy zero-incarnation record. Re-register once activation is
@@ -16963,6 +16967,7 @@ fn storeRegistrationVisible(
         // process incarnation and stale processes lose report authority.
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
+        if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
         return true;
     }
     return false;
@@ -16977,6 +16982,37 @@ fn storeReporterIncarnationVisible(
         if (store.store_id == store_id) return store.reporter_incarnation == reporter_incarnation;
     }
     return false;
+}
+
+fn storeNativeGenerationRestoreCapabilityVisible(
+    stores: []const antfly.metadata.table_manager.StoreRecord,
+    store_id: u64,
+) bool {
+    for (stores) |store| {
+        if (store.store_id == store_id) {
+            return store.native_generation_restore_version >=
+                antfly.metadata.table_manager.native_generation_restore_protocol_version;
+        }
+    }
+    return false;
+}
+
+test "data store registration waits for native generation capability acknowledgment" {
+    const expected = antfly.metadata.table_manager.StoreRecord{
+        .store_id = 101,
+        .node_id = 11,
+        .role = "data",
+        .reporter_incarnation = 0x1234,
+        .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+    };
+    var committed = expected;
+    committed.native_generation_restore_version = 0;
+
+    try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
+    try std.testing.expect(!storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
+    committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
+    try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
+    try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
 }
 
 fn findRangeByGroupId(

@@ -15629,7 +15629,7 @@ pub const DB = struct {
         }
 
         if (self.primary_lsm_storage) |storage| {
-            if (!storage.supportsNativePathLocks()) {
+            if (!storage.supportsHostPathGenerationPublication()) {
                 std.log.err(
                     "native backup requires atomic host-path generation publication for primary storage",
                     .{},
@@ -16186,6 +16186,14 @@ pub const DB = struct {
 
     fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, native_generation: *native_backup.LoadedManifest) !void {
         const manifest = native_generation.value();
+        const primary_sequence = self.core.nextDerivedSequence();
+        if (primary_sequence != manifest.capture_target_sequence) {
+            std.log.err(
+                "native backup primary checkpoint mismatch primary_sequence={d} manifest_target={d}",
+                .{ primary_sequence, manifest.capture_target_sequence },
+            );
+            return error.NativeBackupPrimaryCheckpointMismatch;
+        }
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
 
@@ -93034,6 +93042,72 @@ test "db native deferred restore preserves generated dense generation without em
     defer text_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), text_result.total_hits);
     try std.testing.expectEqualStrings("doc:native", text_result.hits[0].id);
+}
+
+test "db native restore rejects a primary revision outside the manifest generation" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .primary_backend = primary_backend });
+        defer source.close();
+        try source.batch(.{
+            .writes = &.{.{ .key = "doc:native", .value = "{\"title\":\"revision proof\"}" }},
+            .sync_level = .full_index,
+        });
+        _ = try source.snapshotNative("revision-mismatch");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/revision-mismatch", .{std.mem.span(source_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(source_path)})) |snapshots| {
+            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+        } else |_| {}
+    }
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
+    defer alloc.free(manifest_path);
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(manifest_raw);
+    var parsed = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
+    defer parsed.deinit();
+    parsed.value.capture_target_sequence += 1;
+    const mismatched_manifest = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+    defer alloc.free(mismatched_manifest);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = mismatched_manifest,
+    });
+
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    try std.testing.expectError(
+        error.NativeBackupPrimaryCheckpointMismatch,
+        DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
+            &staged,
+            alloc,
+            std.testing.io,
+            snapshot_root,
+            staged.path(),
+            .{ .primary_backend = primary_backend },
+            .{
+                .backup_id = "revision-mismatch",
+                .location = "local",
+                .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                .snapshot_path = "revision-mismatch",
+                .group_id = 7003,
+            },
+        ),
+    );
 }
 
 test "db native restore preserves primary generation and repairs only a missing projection" {

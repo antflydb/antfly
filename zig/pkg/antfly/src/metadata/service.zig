@@ -835,6 +835,7 @@ fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
 fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
     record.reporter_incarnation = 0;
     record.status_generation = 0;
+    record.native_generation_restore_version = 0;
 }
 
 fn runtimeStatusProtocolSafeCommand(
@@ -854,12 +855,17 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
-                record.reporter_incarnation != 0 or record.status_generation != 0;
+                record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             // Unlike registration, an upsert carrying an incarnation may be a
             // clone of already-committed v13 state. Downgrading it would erase
             // causal authority. Retry after readiness can be proven instead.
-            if (record.reporter_incarnation != 0) return error.RuntimeStatusProtocolUnavailable;
+            if (record.reporter_incarnation != 0 or
+                record.native_generation_restore_version != 0)
+            {
+                return error.RuntimeStatusProtocolUnavailable;
+            }
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
             stripRuntimeReporterFence(&legacy_record);
@@ -872,7 +878,8 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
-                record.reporter_incarnation != 0 or record.status_generation != 0;
+                record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
@@ -2300,7 +2307,7 @@ pub const MetadataService = struct {
 
     fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
         // The in-process service supports only a local metadata membership;
-        // the same proof that admits V13 therefore proves every applier is V14.
+        // current-protocol readiness proves the complete V14 restore contract.
         return self.runtimeStatusRepairProtocolReady();
     }
 
@@ -6940,6 +6947,7 @@ test "metadata service transition commands downgrade runtime repair status until
         .store_id = 1,
         .node_id = 2,
         .reporter_incarnation = 77,
+        .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
         .runtime_statuses = runtime_statuses[0..],
     };
 
@@ -6953,6 +6961,7 @@ test "metadata service transition commands downgrade runtime repair status until
     );
     try std.testing.expect(!storeHasRuntimeRepairStatus(safe_command.register_store));
     try std.testing.expectEqual(@as(u64, 0), safe_command.register_store.reporter_incarnation);
+    try std.testing.expectEqual(@as(u16, 0), safe_command.register_store.native_generation_restore_version);
     try std.testing.expect(storeHasRuntimeRepairStatus(store));
 
     var refused_downgrade: ?metadata_table_manager.StoreRecord = null;
@@ -6966,6 +6975,20 @@ test "metadata service transition commands downgrade runtime repair status until
     );
     try std.testing.expect(refused_downgrade == null);
 
+    const capability_only_store = metadata_table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
+    };
+    try std.testing.expectError(
+        error.RuntimeStatusProtocolUnavailable,
+        runtimeStatusProtocolSafeCommand(
+            &legacy_service,
+            .{ .upsert_store = capability_only_store },
+            &refused_downgrade,
+        ),
+    );
+
     var current_service = FakeService{ .alloc = std.testing.allocator, .ready = true };
     var unexpectedly_owned: ?metadata_table_manager.StoreRecord = null;
     const current_command = try runtimeStatusProtocolSafeCommand(
@@ -6976,6 +6999,10 @@ test "metadata service transition commands downgrade runtime repair status until
     try std.testing.expect(unexpectedly_owned == null);
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
+    try std.testing.expectEqual(
+        metadata_table_manager.native_generation_restore_protocol_version,
+        current_command.upsert_store.native_generation_restore_version,
+    );
 }
 
 test "metadata service gates mandatory native restore identity until protocol activation" {

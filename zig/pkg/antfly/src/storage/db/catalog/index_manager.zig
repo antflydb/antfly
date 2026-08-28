@@ -3560,7 +3560,7 @@ pub const IndexManager = struct {
         // provider may participate only when its logical paths are the same
         // native paths that are atomically published by that rename. Other
         // providers fail closed until they expose generation-stage/promote.
-        return storage == null or storage.?.supportsNativePathLocks();
+        return storage == null or storage.?.supportsHostPathGenerationPublication();
     }
 
     pub const NativeBackupCheckpoints = struct {

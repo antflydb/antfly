@@ -4278,7 +4278,8 @@ const metadata_incarnation_extension_version: u16 = 1;
 // embedded record-version upgrades therefore require capability negotiation.
 const store_record_extension_magic = "afsx1";
 const store_record_extension_legacy_version: u16 = 1;
-const store_record_extension_version: u16 = 2;
+const store_record_extension_reporter_version: u16 = 2;
+const store_record_extension_version: u16 = 3;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
 
@@ -4364,7 +4365,8 @@ fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
 }
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
-    if (record.reporter_incarnation != 0 or record.status_generation != 0)
+    if (record.reporter_incarnation != 0 or record.status_generation != 0 or
+        record.native_generation_restore_version != 0)
         return runtime_status_protocol.current_record_version;
     if (storeHasRuntimeRepairStatus(record)) return runtime_status_protocol.repair_status_record_version;
     return null;
@@ -5165,18 +5167,23 @@ fn appendStoreRecordExtensions(
         if (status.observed_reallocation_request_id != 0) observation_count += 1;
     }
     const has_reporter_fence = record.reporter_incarnation != 0 or record.status_generation != 0;
-    if (observation_count == 0 and !has_reporter_fence) return;
+    const has_native_restore_capability = record.native_generation_restore_version != 0;
+    if (observation_count == 0 and !has_reporter_fence and !has_native_restore_capability) return;
 
     try out.appendSlice(alloc, store_record_extension_magic);
-    const version: u16 = if (has_reporter_fence)
+    const version: u16 = if (has_native_restore_capability)
         store_record_extension_version
+    else if (has_reporter_fence)
+        store_record_extension_reporter_version
     else
         store_record_extension_legacy_version;
     try appendInt(alloc, out, u16, version);
-    if (version >= store_record_extension_version) {
+    if (version >= store_record_extension_reporter_version) {
         try appendInt(alloc, out, u64, record.reporter_incarnation);
         try appendInt(alloc, out, u64, record.status_generation);
     }
+    if (version >= store_record_extension_version)
+        try appendInt(alloc, out, u16, record.native_generation_restore_version);
     try appendInt(alloc, out, u32, observation_count);
     for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
@@ -5258,6 +5265,7 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .node_id = node_id,
         .reporter_incarnation = extensions.reporter_incarnation,
         .status_generation = extensions.status_generation,
+        .native_generation_restore_version = extensions.native_generation_restore_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,
@@ -5281,7 +5289,7 @@ fn readStoreRecordExtensions(
     encoded: []const u8,
     pos: *usize,
     group_statuses: []metadata.GroupStatusReport,
-) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0 } {
+) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0 } {
     if (pos.* == encoded.len) return .{};
     if (pos.* + store_record_extension_magic.len > encoded.len or
         !std.mem.eql(
@@ -5296,16 +5304,21 @@ fn readStoreRecordExtensions(
 
     const version = try readInt(encoded, pos, u16);
     if (version != store_record_extension_legacy_version and
+        version != store_record_extension_reporter_version and
         version != store_record_extension_version) return error.InvalidMetadataTransitionEncoding;
-    const reporter_incarnation = if (version >= store_record_extension_version)
+    const reporter_incarnation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
     else
         0;
-    const status_generation = if (version >= store_record_extension_version)
+    const status_generation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
     else
         0;
     if (reporter_incarnation == 0 and status_generation != 0) return error.InvalidMetadataTransitionEncoding;
+    const native_generation_restore_version = if (version >= store_record_extension_version)
+        try readInt(encoded, pos, u16)
+    else
+        0;
     const observation_count = try readInt(encoded, pos, u32);
     var observation_index: u32 = 0;
     while (observation_index < observation_count) : (observation_index += 1) {
@@ -5320,6 +5333,7 @@ fn readStoreRecordExtensions(
     return .{
         .reporter_incarnation = reporter_incarnation,
         .status_generation = status_generation,
+        .native_generation_restore_version = native_generation_restore_version,
     };
 }
 
@@ -10885,6 +10899,26 @@ test "metadata raft apply store transition codec preserves reporter fencing" {
         decoded.register_store.reporter_incarnation,
     );
     try std.testing.expectEqual(@as(u64, 42), decoded.register_store.status_generation);
+}
+
+test "metadata raft apply store transition codec preserves native generation restore capability" {
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .register_store = .{
+            .store_id = 101,
+            .node_id = 201,
+            .reporter_incarnation = 0x1234,
+            .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        metadata_table_manager.native_generation_restore_protocol_version,
+        decoded.register_store.native_generation_restore_version,
+    );
 }
 
 test "metadata raft apply store transition codec rejects generation without incarnation" {

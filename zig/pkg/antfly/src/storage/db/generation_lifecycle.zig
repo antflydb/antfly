@@ -619,6 +619,7 @@ pub const PreparationTransition = struct {
     path: []const u8,
     id: u64,
     cleanup_scheduler: ?CleanupScheduler = null,
+    io: ?std.Io = null,
     publication_lock: ?std.Io.File,
     preparation_lock: ?std.Io.File,
     active: bool = true,
@@ -626,7 +627,7 @@ pub const PreparationTransition = struct {
     pub fn beginStaging(self: *PreparationTransition) !StagedGeneration {
         if (!self.active) return error.InvalidGenerationTransition;
         try self.manager.validateStaging(self.id, self.path);
-        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, false);
+        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, self.io, false);
     }
 
     pub fn promote(self: *PreparationTransition) !ExclusiveTransition {
@@ -667,6 +668,7 @@ pub const PreparationTransition = struct {
             .publication_lock = publication_lock,
             .preparation_lock = preparation_lock,
             .cleanup_scheduler = self.cleanup_scheduler,
+            .io = self.io,
         };
     }
 
@@ -689,6 +691,7 @@ pub const ExclusiveTransition = struct {
     publication_lock: ?std.Io.File = null,
     preparation_lock: ?std.Io.File = null,
     cleanup_scheduler: ?CleanupScheduler = null,
+    io: ?std.Io = null,
     active: bool = true,
 
     pub fn validate(self: *const ExclusiveTransition, path: []const u8) !void {
@@ -708,6 +711,10 @@ pub const ExclusiveTransition = struct {
 
     pub fn reconcilePublished(self: *ExclusiveTransition) !void {
         try self.validate(self.path);
+        if (self.io) |io| {
+            _ = try reconcilePublishedGenerationExclusive(self.alloc, io, self.path, self.cleanup_scheduler);
+            return;
+        }
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         _ = try reconcilePublishedGenerationExclusive(self.alloc, io_impl.io(), self.path, self.cleanup_scheduler);
@@ -715,7 +722,7 @@ pub const ExclusiveTransition = struct {
 
     pub fn beginStaging(self: *ExclusiveTransition) !StagedGeneration {
         try self.validate(self.path);
-        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, true);
+        return try beginStagingGeneration(self.alloc, self.manager, self.path, self.id, self.cleanup_scheduler, self.io, true);
     }
 };
 
@@ -725,6 +732,7 @@ fn beginStagingGeneration(
     path: []const u8,
     transition_id: u64,
     cleanup_scheduler: ?CleanupScheduler,
+    io_override: ?std.Io,
     reconcile: bool,
 ) !StagedGeneration {
     const live_path = try alloc.dupe(u8, path);
@@ -737,10 +745,53 @@ fn beginStagingGeneration(
     const staging_path_z = try alloc.dupeZ(u8, staging_path);
     errdefer alloc.free(staging_path_z);
 
+    if (io_override) |io| {
+        return try beginStagingGenerationWithIo(
+            alloc,
+            manager,
+            live_path,
+            live_path_z,
+            staging_path,
+            staging_path_z,
+            transition_id,
+            cleanup_scheduler,
+            io,
+            reconcile,
+        );
+    }
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    const io = io_impl.io();
-    if (reconcile) _ = try reconcilePublishedGenerationExclusive(alloc, io, path, cleanup_scheduler);
+    var staged = try beginStagingGenerationWithIo(
+        alloc,
+        manager,
+        live_path,
+        live_path_z,
+        staging_path,
+        staging_path_z,
+        transition_id,
+        cleanup_scheduler,
+        io_impl.io(),
+        reconcile,
+    );
+    // The compatibility I/O exists only for this operation. Do not retain its
+    // capability after the local runtime is deinitialized.
+    staged.io = null;
+    return staged;
+}
+
+fn beginStagingGenerationWithIo(
+    alloc: Allocator,
+    manager: *Manager,
+    live_path: []u8,
+    live_path_z: [:0]u8,
+    staging_path: []u8,
+    staging_path_z: [:0]u8,
+    transition_id: u64,
+    cleanup_scheduler: ?CleanupScheduler,
+    io: std.Io,
+    reconcile: bool,
+) !StagedGeneration {
+    if (reconcile) _ = try reconcilePublishedGenerationExclusive(alloc, io, live_path, cleanup_scheduler);
     if (pathExists(io, staging_path)) return error.GenerationStagingCollision;
     try fs_paths.createDirPathPortable(io, staging_path);
     errdefer std.Io.Dir.cwd().deleteTree(io, staging_path) catch {};
@@ -753,6 +804,7 @@ fn beginStagingGeneration(
         .staging_path = staging_path,
         .staging_path_z = staging_path_z,
         .cleanup_scheduler = cleanup_scheduler,
+        .io = io,
     };
 }
 
@@ -771,6 +823,9 @@ pub const StagedGeneration = struct {
     sealed: bool = false,
     preserve_retired: bool = false,
     cleanup_scheduler: ?CleanupScheduler = null,
+    /// Runtime-owned I/O carried by runtime-backed transitions. Legacy direct
+    /// callers leave this null and retain the historical local-I/O fallback.
+    io: ?std.Io = null,
     closed: bool = false,
 
     pub fn path(self: *const StagedGeneration) []const u8 {
@@ -791,11 +846,15 @@ pub const StagedGeneration = struct {
     /// Further writes to the candidate after sealing violate the transition
     /// contract and require another seal before publication.
     pub fn seal(self: *StagedGeneration) !void {
-        if (self.closed or self.published) return error.InvalidGenerationTransition;
-        try self.manager.validateStaging(self.transition_id, self.live_path);
+        if (self.io) |io| return try self.sealWithIo(io);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const io = io_impl.io();
+        return try self.sealWithIo(io_impl.io());
+    }
+
+    fn sealWithIo(self: *StagedGeneration, io: std.Io) !void {
+        if (self.closed or self.published) return error.InvalidGenerationTransition;
+        try self.manager.validateStaging(self.transition_id, self.live_path);
         if (!pathExists(io, self.staging_path)) return error.GenerationStagingMissing;
         try syncTreePortable(self.alloc, io, self.staging_path);
         const parent = std.fs.path.dirname(self.staging_path) orelse if (std.fs.path.isAbsolute(self.staging_path)) "/" else ".";
@@ -809,12 +868,15 @@ pub const StagedGeneration = struct {
     /// admission. Every successful call must be followed by commitPublication
     /// or rollbackPublication.
     pub fn publishPrepared(self: *StagedGeneration) !PublicationOutcome {
-        if (self.closed or self.published) return error.InvalidGenerationTransition;
-        try self.manager.validateExclusive(self.transition_id, self.live_path);
-
+        if (self.io) |io| return try self.publishPreparedWithIo(io);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const io = io_impl.io();
+        return try self.publishPreparedWithIo(io_impl.io());
+    }
+
+    fn publishPreparedWithIo(self: *StagedGeneration, io: std.Io) !PublicationOutcome {
+        if (self.closed or self.published) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
         if (!pathExists(io, self.staging_path)) return error.GenerationStagingMissing;
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
         const had_live_generation = pathExists(io, self.live_path);
@@ -823,7 +885,7 @@ pub const StagedGeneration = struct {
             .retained_name = std.fs.path.basename(self.staging_path),
             .had_live_generation = had_live_generation,
         });
-        if (!self.sealed) try self.seal();
+        if (!self.sealed) try self.sealWithIo(io);
         try fs_paths.syncDirPortable(io, parent);
 
         if (had_live_generation) {
@@ -851,12 +913,15 @@ pub const StagedGeneration = struct {
     /// Commits a prepared namespace exchange and retires the previous root.
     /// Asynchronous cleanup scheduling failures remain reconciliation debt.
     pub fn commitPublication(self: *StagedGeneration) !void {
-        if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
-        try self.manager.validateExclusive(self.transition_id, self.live_path);
-
+        if (self.io) |io| return try self.commitPublicationWithIo(io);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const io = io_impl.io();
+        return try self.commitPublicationWithIo(io_impl.io());
+    }
+
+    fn commitPublicationWithIo(self: *StagedGeneration, io: std.Io) !void {
+        if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
         try writePublicationMarker(self.alloc, io, self.live_path, .{
             .phase = .committed,
@@ -880,12 +945,15 @@ pub const StagedGeneration = struct {
     /// The exclusive generation transition prevents either namespace from
     /// being admitted while this exchange is in flight.
     pub fn rollbackPublication(self: *StagedGeneration) !void {
-        if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
-        try self.manager.validateExclusive(self.transition_id, self.live_path);
-
+        if (self.io) |io| return try self.rollbackPublicationWithIo(io);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        const io = io_impl.io();
+        return try self.rollbackPublicationWithIo(io_impl.io());
+    }
+
+    fn rollbackPublicationWithIo(self: *StagedGeneration, io: std.Io) !void {
+        if (self.closed or !self.published or self.publication_committed) return error.InvalidGenerationTransition;
+        try self.manager.validateExclusive(self.transition_id, self.live_path);
         const parent = std.fs.path.dirname(self.live_path) orelse if (std.fs.path.isAbsolute(self.live_path)) "/" else ".";
         if (self.had_live_generation) {
             if (!exchangeDirectoriesAtomicSentinel(self.live_path_z, self.staging_path_z)) {
@@ -911,18 +979,23 @@ pub const StagedGeneration = struct {
 
     pub fn deinit(self: *StagedGeneration) void {
         if (self.closed) return;
+        if (self.io) |io| return self.deinitWithIo(io);
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
+        self.deinitWithIo(io_impl.io());
+    }
+
+    fn deinitWithIo(self: *StagedGeneration, io: std.Io) void {
         if (self.published and !self.publication_committed) {
-            self.rollbackPublication() catch |err| {
+            self.rollbackPublicationWithIo(io) catch |err| {
                 std.log.err("prepared generation rollback failed path={s} err={s}", .{ self.live_path, @errorName(err) });
                 self.preserve_retired = true;
             };
         }
         if (self.published) {
-            if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
+            if (!self.preserve_retired) std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch {};
         } else {
-            std.Io.Dir.cwd().deleteTree(io_impl.io(), self.staging_path) catch {};
+            std.Io.Dir.cwd().deleteTree(io, self.staging_path) catch {};
         }
         self.alloc.free(self.staging_path);
         self.alloc.free(self.staging_path_z);
@@ -1426,11 +1499,14 @@ pub fn beginProcessExclusive(path: []const u8) !ExclusiveTransition {
 pub fn beginProcessExclusiveWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !ExclusiveTransition {
     var transition = try process_manager.beginExclusive(path);
     transition.cleanup_scheduler = CleanupScheduler.fromRuntime(runtime);
+    transition.io = if (runtime) |backend| backend.io() else null;
     return transition;
 }
 
 pub fn beginProcessPreparationWithRuntime(path: []const u8, runtime: ?*background_runtime.BackendRuntime) !PreparationTransition {
-    return try process_manager.beginPreparation(path, CleanupScheduler.fromRuntime(runtime));
+    var transition = try process_manager.beginPreparation(path, CleanupScheduler.fromRuntime(runtime));
+    transition.io = if (runtime) |backend| backend.io() else null;
+    return transition;
 }
 
 pub fn hasPublishedGenerationRead(path: []const u8) !bool {
@@ -1645,6 +1721,7 @@ test "staged generation cannot publish after its exclusive capability is release
     var transition = try manager.beginExclusive(live_path);
     var staged = try transition.beginStaging();
     defer staged.deinit();
+    try std.testing.expect(staged.io == null);
 
     transition.deinit();
     try std.testing.expectError(error.InvalidGenerationTransition, staged.validatePath(staged.path()));
@@ -1940,8 +2017,10 @@ test "durable publication retires the previous generation through the cleanup ru
     defer runtime.deinit();
     var transition = try beginProcessExclusiveWithRuntime(live_path, runtime.ptr());
     defer transition.deinit();
+    try std.testing.expect(transition.io != null);
     var staged = try transition.beginStaging();
     defer staged.deinit();
+    try std.testing.expect(staged.io != null);
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "current" });
