@@ -114,6 +114,48 @@ const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const process_memory_mod = @import("antfly_platform").process_memory;
 
+fn quarantineClaimMismatchReason(
+    mismatch: index_manager_mod.IndexManager.FailedIndexLoadMismatch,
+) []const u8 {
+    // Stable safety/UX precedence: a replacement identity or configuration
+    // change must not be obscured by a simultaneous policy/revision change.
+    if (mismatch.incarnation_changed) return "quarantine_incarnation_changed";
+    if (mismatch.config_changed) return "quarantine_config_changed";
+    if (mismatch.action_changed) return "quarantine_recovery_policy_changed";
+    return "quarantine_claim_stale";
+}
+
+test "quarantine claim mismatch reason uses stable safety precedence" {
+    try std.testing.expectEqualStrings(
+        "quarantine_incarnation_changed",
+        quarantineClaimMismatchReason(.{
+            .incarnation_changed = true,
+            .config_changed = true,
+            .action_changed = true,
+            .revision_changed = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "quarantine_config_changed",
+        quarantineClaimMismatchReason(.{
+            .config_changed = true,
+            .action_changed = true,
+            .revision_changed = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "quarantine_recovery_policy_changed",
+        quarantineClaimMismatchReason(.{
+            .action_changed = true,
+            .revision_changed = true,
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "quarantine_claim_stale",
+        quarantineClaimMismatchReason(.{ .revision_changed = true }),
+    );
+}
+
 fn standaloneResourceManagerOptionsForTotal(alloc: Allocator, total: u64) resource_manager_mod.Options {
     var options = resource_manager_mod.Options{ .identity_allocator = alloc };
     if (total == 0) return options;
@@ -12747,7 +12789,10 @@ pub const DB = struct {
             .last_error = err_name,
             .replace_last_error = true,
         });
-        if (terminal) self.core.index_manager.releaseFailedIndexLoadRepairClaim(entry.intent.index_name);
+        if (terminal) self.core.index_manager.releaseFailedIndexLoadRepairClaim(
+            entry.intent.index_name,
+            entry.intent.repair_id,
+        );
     }
 
     fn indexRepairFailureIsTerminal(err: anyerror) bool {
@@ -12841,7 +12886,10 @@ pub const DB = struct {
             false,
             false,
         );
-        ctx.index_manager.releaseFailedIndexLoadRepairClaim(entry.intent.index_name);
+        ctx.index_manager.releaseFailedIndexLoadRepairClaim(
+            entry.intent.index_name,
+            entry.intent.repair_id,
+        );
         notifyIndexRepairVisibilityHook(
             ctx,
             .index_repair_cleared,
@@ -12986,7 +13034,10 @@ pub const DB = struct {
                 entry.intent.previous_active_relative_path,
             );
         }
-        self.core.index_manager.releaseFailedIndexLoadRepairClaim(entry.intent.index_name);
+        self.core.index_manager.releaseFailedIndexLoadRepairClaim(
+            entry.intent.index_name,
+            entry.intent.repair_id,
+        );
         _ = try self.retryQuarantinedIndexLoad(entry.intent.index_name, true);
         try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
         return true;
@@ -13032,7 +13083,7 @@ pub const DB = struct {
         result.automatic_sweep_complete = quantum.sweep_complete;
         for (quantum.candidates) |*candidate| {
             const cfg = candidate.config;
-            const action = candidate.action;
+            const action = candidate.token.action;
             if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate.*)) {
                 result.automatic_deferred += 1;
                 result.automatic_sweep_complete = false;
@@ -13048,12 +13099,23 @@ pub const DB = struct {
                 if (record.phase_terminal) {
                     self.core.index_manager.releaseFailedIndexLoadRecoveryCandidate(
                         cfg.name,
-                        candidate.failure_revision,
+                        candidate.token,
+                        record.repair_id,
                     );
                     result.terminal += 1;
                     result.existing_terminal += 1;
                 } else {
-                    _ = self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate.*);
+                    switch (self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(
+                        candidate.*,
+                        record.repair_id,
+                    )) {
+                        .claimed, .already_claimed => {},
+                        .absent, .stale, .claimed_by_other => {
+                            result.automatic_deferred += 1;
+                            result.automatic_sweep_complete = false;
+                            continue;
+                        },
+                    }
                     result.already_pending += 1;
                 }
                 candidate.classified = true;
@@ -13113,15 +13175,19 @@ pub const DB = struct {
                 result.automatic_sweep_complete = false;
                 continue;
             }
-            if (!self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate.*)) {
-                result.automatic_deferred += 1;
-                result.automatic_sweep_complete = false;
-                continue;
+            switch (self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate.*, repair_id)) {
+                .claimed, .already_claimed => {},
+                .absent, .stale, .claimed_by_other => {
+                    result.automatic_deferred += 1;
+                    result.automatic_sweep_complete = false;
+                    continue;
+                },
             }
             var release_repair_claim = true;
             defer if (release_repair_claim) self.core.index_manager.releaseFailedIndexLoadRecoveryCandidate(
                 candidate.config.name,
-                candidate.failure_revision,
+                candidate.token,
+                repair_id,
             );
             var admission_fence = try self.core.index_manager.beginRepairAdmissionFence(intent.index_name);
             defer self.core.index_manager.cancelRepairAdmissionFence(&admission_fence, intent.index_name);
@@ -13452,37 +13518,22 @@ pub const DB = struct {
             // fresh audit must authorize any different action.
             switch (self.core.index_manager.claimFailedIndexLoadRepair(
                 entry.intent.index_name,
-                .{
+                .{ .current_policy = .{
                     .action = .rebuild_from_artifacts,
                     .config_hash = entry.intent.config_hash,
-                },
+                } },
+                repair_id,
             )) {
                 .claimed, .already_claimed, .absent => {},
-                .wrong_action => {
-                    try self.recordIndexRepairAttemptFailure(
-                        alloc,
-                        repair_id,
-                        "quarantine_recovery_policy_changed",
-                        true,
-                    );
-                    result.terminal = true;
+                .claimed_by_other => {
+                    result.deferred = true;
                     return result;
                 },
-                .config_changed => {
+                .mismatch => |mismatch| {
                     try self.recordIndexRepairAttemptFailure(
                         alloc,
                         repair_id,
-                        "quarantine_config_changed",
-                        true,
-                    );
-                    result.terminal = true;
-                    return result;
-                },
-                .stale => {
-                    try self.recordIndexRepairAttemptFailure(
-                        alloc,
-                        repair_id,
-                        "quarantine_claim_stale",
+                        quarantineClaimMismatchReason(mismatch.differences),
                         true,
                     );
                     result.terminal = true;
