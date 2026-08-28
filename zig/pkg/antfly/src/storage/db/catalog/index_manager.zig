@@ -4685,6 +4685,7 @@ pub const IndexManager = struct {
         algebraic_active_dictionary = 11,
         algebraic_active_registry = 12,
         graph_artifacts = 13,
+        graph_global_contenders = 14,
     };
 
     const AlgebraicCleanupGeneration = enum { canonical, active };
@@ -5421,6 +5422,13 @@ pub const IndexManager = struct {
                 defer self.alloc.free(prefix);
                 return try self.drainGeneratedArtifactCleanupMetadataPage(store, key, record, prefix, .finalization);
             },
+            .graph_global_contenders => {
+                const index_name = try internal_keys.indexArtifactCleanupNameAlloc(self.alloc, key);
+                defer self.alloc.free(index_name);
+                const prefix = try internal_keys.graphGlobalEdgeContenderIndexPrefixAlloc(self.alloc, index_name);
+                defer self.alloc.free(prefix);
+                return try self.drainGeneratedArtifactCleanupMetadataPage(store, key, record, prefix, .dense_metadata);
+            },
             .algebraic_canonical_facts => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .canonical, .facts, .algebraic_canonical_tuples),
             .algebraic_canonical_tuples => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .canonical, .tuples, .algebraic_canonical_dictionary),
             .algebraic_canonical_dictionary => return try self.drainGeneratedArtifactCleanupAlgebraicPage(store, key, record, .canonical, .dictionary, .algebraic_canonical_registry),
@@ -5475,7 +5483,8 @@ pub const IndexManager = struct {
                 if (!should_delete) if (state.graph_index_name) |index_name| {
                     should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
                         internal_keys.matchesGraphAssetStateIndexName(candidate, index_name) or
-                        internal_keys.matchesGraphEdgeContenderIndexName(candidate, index_name);
+                        internal_keys.matchesGraphEdgeContenderIndexName(candidate, index_name) or
+                        internal_keys.matchesGraphGlobalEdgeContenderIndexName(candidate, index_name);
                 };
                 if (should_delete) try state.deletes.append(state.manager.alloc, try state.manager.alloc.dupe(u8, candidate));
 
@@ -5515,7 +5524,8 @@ pub const IndexManager = struct {
             return .{ .found = true, .completed = false };
         }
 
-        const next_value = try self.encodeGeneratedArtifactCleanupRecordFromDecoded(.dense_metadata, record, null);
+        const next_phase: GeneratedArtifactCleanupPhase = if (cleanup_graph) .graph_global_contenders else .dense_metadata;
+        const next_value = try self.encodeGeneratedArtifactCleanupRecordFromDecoded(next_phase, record, null);
         defer self.alloc.free(next_value);
         const writes = [_]docstore_mod.KVPair{.{ .key = key, .value = next_value }};
         try store.putBatch(&writes, delete_keys.items);
@@ -20244,13 +20254,7 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
     if (root.object.get("execution") != null) return error.InvalidIndexConfig;
-    // v0.2.0 stored the artifact-source discriminator inside `source` while
-    // keeping mapping fields at the index root. Keep accepting that durable
-    // catalog shape, but do not let root mappings leak into the canonical
-    // untagged API or the ordered `sources` form.
-    const v0_2_0_tagged_artifact_source = graphSourceHasV0_2_0Kind(root, "artifact");
-    if (!v0_2_0_tagged_artifact_source and
-        (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null))
+    if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null)
         return error.InvalidIndexConfig;
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
@@ -20411,21 +20415,7 @@ fn initGraphArtifactSource(
 fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtifactSource {
     const source = root.object.get("source") orelse return null;
     if (source != .object) return error.InvalidIndexConfig;
-    const v0_2_0_kind = source.object.get("kind");
-    if (v0_2_0_kind) |kind| {
-        if (kind != .string) return error.InvalidIndexConfig;
-        if (std.mem.eql(u8, kind.string, "document_field")) {
-            if (!objectHasOnlyFields(source.object, &.{ "kind", "field" })) return error.InvalidIndexConfig;
-            const field = source.object.get("field") orelse return error.InvalidIndexConfig;
-            if (field != .string or !std.mem.eql(u8, field.string, "_edges")) return error.InvalidIndexConfig;
-            return null;
-        }
-        if (!std.mem.eql(u8, kind.string, "artifact")) return error.InvalidIndexConfig;
-        if (!objectHasOnlyFields(source.object, &.{ "kind", "artifact", "path", "format", "mention_edge_type" })) return error.InvalidIndexConfig;
-    } else {
-        if (!objectHasOnlyFields(source.object, &.{ "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
-        if (root.object.get("nodes") != null or root.object.get("edge") != null or root.object.get("context") != null) return error.InvalidIndexConfig;
-    }
+    if (!objectHasOnlyFields(source.object, &.{ "artifact", "path", "format", "mention_edge_type", "nodes", "edge", "context" })) return error.InvalidIndexConfig;
 
     const artifact = source.object.get("artifact") orelse return error.InvalidIndexConfig;
     if (artifact != .string or artifact.string.len == 0) return error.InvalidIndexConfig;
@@ -20453,16 +20443,8 @@ fn parseGraphArtifactSource(alloc: Allocator, root: std.json.Value) !?GraphArtif
         .mention_edge_type = if (mention_edge_type.len > 0) try alloc.dupe(u8, mention_edge_type) else "",
     };
     errdefer out.deinit(alloc);
-    out.mapping = try parseGraphArtifactMapping(alloc, if (v0_2_0_kind != null) root else source);
+    out.mapping = try parseGraphArtifactMapping(alloc, source);
     return out;
-}
-
-fn graphSourceHasV0_2_0Kind(root: std.json.Value, expected_kind: []const u8) bool {
-    if (root != .object) return false;
-    const source = root.object.get("source") orelse return false;
-    if (source != .object) return false;
-    const kind = source.object.get("kind") orelse return false;
-    return kind == .string and std.mem.eql(u8, kind.string, expected_kind);
 }
 
 fn validateGraphArtifactPath(path: []const u8) !void {
@@ -20606,35 +20588,19 @@ fn parseGraphShorthandAsset(alloc: Allocator, root: std.json.Value) !?enrichment
 
     var field: []const u8 = "";
     var template: []const u8 = "";
-    if (artifact.object.get("source")) |source| {
-        // The canonical shape is deliberately closed. The v0.2.0 `field` and
-        // `template` alternatives below are only for already-durable configs.
-        if (artifact.object.get("field") != null or artifact.object.get("template") != null) return error.InvalidIndexConfig;
-        if (source != .object or !objectHasOnlyFields(source.object, &.{ "type", "value" })) return error.InvalidIndexConfig;
-        const source_type = source.object.get("type") orelse return error.InvalidIndexConfig;
-        const source_value = source.object.get("value") orelse return error.InvalidIndexConfig;
-        if (source_type != .string or source_value != .string or source_value.string.len == 0)
-            return error.InvalidIndexConfig;
-        if (std.mem.eql(u8, source_type.string, "field")) {
-            field = source_value.string;
-        } else if (std.mem.eql(u8, source_type.string, "template")) {
-            template = source_value.string;
-        } else {
-            return error.InvalidIndexConfig;
-        }
+    const source = artifact.object.get("source") orelse return error.InvalidIndexConfig;
+    if (artifact.object.get("field") != null or artifact.object.get("template") != null) return error.InvalidIndexConfig;
+    if (source != .object or !objectHasOnlyFields(source.object, &.{ "type", "value" })) return error.InvalidIndexConfig;
+    const source_type = source.object.get("type") orelse return error.InvalidIndexConfig;
+    const source_value = source.object.get("value") orelse return error.InvalidIndexConfig;
+    if (source_type != .string or source_value != .string or source_value.string.len == 0)
+        return error.InvalidIndexConfig;
+    if (std.mem.eql(u8, source_type.string, "field")) {
+        field = source_value.string;
+    } else if (std.mem.eql(u8, source_type.string, "template")) {
+        template = source_value.string;
     } else {
-        const v0_2_0_field = artifact.object.get("field");
-        const v0_2_0_template = artifact.object.get("template");
-        if (v0_2_0_field == null and v0_2_0_template == null) return error.InvalidIndexConfig;
-        if (v0_2_0_field) |value| {
-            if (value != .string) return error.InvalidIndexConfig;
-            field = value.string;
-        }
-        if (v0_2_0_template) |value| {
-            if (value != .string) return error.InvalidIndexConfig;
-            template = value.string;
-        }
-        if (field.len == 0 and template.len == 0) return error.InvalidIndexConfig;
+        return error.InvalidIndexConfig;
     }
     const content_type = if (artifact.object.get("content_type")) |value| blk: {
         if (value != .string) return error.InvalidIndexConfig;
@@ -20872,47 +20838,24 @@ test "graph config rejects artifact source combined with document field edge typ
     ));
 }
 
-test "graph config loads v0.2.0 source discriminator forms" {
+test "graph config rejects unreleased source discriminator forms" {
     const alloc = std.testing.allocator;
-    var document_field = try parseGraphConfig(alloc,
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field","field":"_edges"}}
-    );
-    defer document_field.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 0), document_field.artifact_sources.len);
-
-    var artifact = try parseGraphConfig(alloc,
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"artifact","artifact":"relations_v1"},"nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target }}"},"edge":{"type":"{{ _item.type }}"}}
-    );
-    defer artifact.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), artifact.artifact_sources.len);
-    try std.testing.expectEqualStrings("relations_v1", artifact.artifact_sources[0].artifact_name);
-    try std.testing.expectEqualStrings("{{ _doc.key }}", artifact.artifact_sources[0].mapping.source_template);
-    try std.testing.expectEqualStrings("{{ _item.target }}", artifact.artifact_sources[0].mapping.target_template);
-
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"document_field"}}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"document_field","field":"links"}}
-    ));
-    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
-        \\{"source":{"kind":"artifact","artifact":"relations_v1","nodes":{"target":"{{ _item.target }}"}}}
     ));
 }
 
-test "graph config loads v0.2.0 shorthand artifact producers" {
+test "graph config rejects unreleased shorthand artifact producers" {
     const alloc = std.testing.allocator;
-    var field_cfg = try parseGraphConfig(alloc,
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"artifact","artifact":"relations_v1"},"artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json"}}
-    );
-    defer field_cfg.deinit(alloc);
-    try std.testing.expectEqualStrings("body", field_cfg.shorthand_asset.?.source_field);
-
-    var template_cfg = try parseGraphConfig(alloc,
+    ));
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"artifact","artifact":"relations_v1"},"artifact":{"name":"relations_v1","kind":"asset","template":"{{ body }}"}}
-    );
-    defer template_cfg.deinit(alloc);
-    try std.testing.expectEqualStrings("{{ body }}", template_cfg.shorthand_asset.?.source_template);
+    ));
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {
@@ -26984,6 +26927,7 @@ test "graph retirement durably removes edge artifacts and source state before sa
 
     const cfg: types.IndexConfig = .{ .name = "graph_v1", .kind = .graph, .config_json = "{}" };
     try manager.addAllNoBackfill(&store, &.{cfg});
+    const removed_generation = manager.coverageGenerationForIndex(cfg.name) orelse return error.TestUnexpectedResult;
 
     const edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", cfg.name, "mentions", "doc:b");
     defer alloc.free(edge_key);
@@ -26997,6 +26941,12 @@ test "graph retirement durably removes edge artifacts and source state before sa
     try internal_keys.appendEncodedComponent(&state_key_list, alloc, "relations_v1");
     const state_key = try state_key_list.toOwnedSlice(alloc);
     defer alloc.free(state_key);
+    const contender_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, "doc:a", cfg.name, edge_key, state_key);
+    defer alloc.free(contender_key);
+    const global_contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, cfg.name, removed_generation, edge_key, 0, state_key);
+    defer alloc.free(global_contender_key);
+    const future_global_contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, cfg.name, removed_generation + 1, edge_key, 0, state_key);
+    defer alloc.free(future_global_contender_key);
     const unrelated_state_prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, "doc:a", "other_graph");
     defer alloc.free(unrelated_state_prefix);
     var unrelated_state_key_list = std.ArrayListUnmanaged(u8).empty;
@@ -27005,11 +26955,17 @@ test "graph retirement durably removes edge artifacts and source state before sa
     try internal_keys.appendEncodedComponent(&unrelated_state_key_list, alloc, "relations_v1");
     const unrelated_state_key = try unrelated_state_key_list.toOwnedSlice(alloc);
     defer alloc.free(unrelated_state_key);
+    const unrelated_global_contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, "other_graph", removed_generation, unrelated_edge_key, 0, unrelated_state_key);
+    defer alloc.free(unrelated_global_contender_key);
     try store.putBatch(&.{
         .{ .key = edge_key, .value = "legacy-edge" },
         .{ .key = state_key, .value = "legacy-state" },
+        .{ .key = contender_key, .value = "local-contender" },
+        .{ .key = global_contender_key, .value = "global-contender" },
+        .{ .key = future_global_contender_key, .value = "future-global-contender" },
         .{ .key = unrelated_edge_key, .value = "other-edge" },
         .{ .key = unrelated_state_key, .value = "other-state" },
+        .{ .key = unrelated_global_contender_key, .value = "other-global-contender" },
     }, &.{});
 
     try std.testing.expect(try manager.remove(&store, cfg.name));
@@ -27026,12 +26982,18 @@ test "graph retirement durably removes edge artifacts and source state before sa
 
     try std.testing.expectError(error.NotFound, store.get(alloc, edge_key));
     try std.testing.expectError(error.NotFound, store.get(alloc, state_key));
+    try std.testing.expectError(error.NotFound, store.get(alloc, contender_key));
+    try std.testing.expectError(error.NotFound, store.get(alloc, global_contender_key));
+    try std.testing.expectError(error.NotFound, store.get(alloc, future_global_contender_key));
     const unrelated_edge = try store.get(alloc, unrelated_edge_key);
     defer alloc.free(unrelated_edge);
     try std.testing.expectEqualStrings("other-edge", unrelated_edge);
     const unrelated_state = try store.get(alloc, unrelated_state_key);
     defer alloc.free(unrelated_state);
     try std.testing.expectEqualStrings("other-state", unrelated_state);
+    const unrelated_global_contender = try store.get(alloc, unrelated_global_contender_key);
+    defer alloc.free(unrelated_global_contender);
+    try std.testing.expectEqualStrings("other-global-contender", unrelated_global_contender);
     try manager.addManaged(&store, cfg, null);
 }
 

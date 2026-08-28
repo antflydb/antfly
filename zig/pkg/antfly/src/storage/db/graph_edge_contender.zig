@@ -27,9 +27,9 @@ pub const View = struct {
 };
 
 /// Contender records are deliberately one-record-per-(edge, source-state).
-/// Updating a source therefore writes only the identities that source changed,
-/// while winner selection scans only the usually tiny set of contenders for
-/// one logical edge.
+/// Document-local membership records use an empty payload; globally keyed
+/// records retain the edge payload used for winner selection. Updating a
+/// source therefore writes only the identities that source changed.
 pub fn encodeAlloc(
     alloc: Allocator,
     generation: u64,
@@ -69,7 +69,6 @@ pub fn decode(raw: []const u8, expected_generation: u64) !?View {
     const state_start = header_len + edge_key_len;
     if (state_key_len > raw.len - state_start) return error.InvalidGraphEdgeContender;
     const payload_start = state_start + state_key_len;
-    if (payload_start == raw.len) return error.InvalidGraphEdgeContender;
     return .{
         .source_priority = priority,
         .edge_key = raw[header_len..state_start],
@@ -113,6 +112,10 @@ test "graph edge contender and visible count are generation fenced" {
     try std.testing.expectEqualStrings("state key", view.state_key);
     try std.testing.expectEqualStrings("edge payload", view.payload);
     try std.testing.expect((try decode(raw, 41)) == null);
+
+    const membership = try encodeAlloc(alloc, 42, 3, "edge key", "state key", "");
+    defer alloc.free(membership);
+    try std.testing.expectEqual(@as(usize, 0), (try decode(membership, 42)).?.payload.len);
 
     const count = try encodeVisibleCount(42, 17);
     try std.testing.expectEqual(@as(?usize, 17), try decodeVisibleCount(&count, 42));

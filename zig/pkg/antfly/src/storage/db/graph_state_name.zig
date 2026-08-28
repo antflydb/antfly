@@ -60,35 +60,8 @@ pub fn sourceArtifact(state_name: []const u8) !?[]const u8 {
     return if (try identity(state_name)) |parsed| parsed.source_artifact else null;
 }
 
-/// Resolves a v0.2.0 separator-delimited state name to its source priority.
-/// Longest-match selection is required because released source names may
-/// themselves contain the legacy separator.
-pub fn legacySourcePriority(state_name: []const u8, sources: anytype) ?usize {
-    var best: ?usize = null;
-    var best_len: usize = 0;
-    for (sources, 0..) |source, i| {
-        if (source.artifact_name.len < best_len or !std.mem.startsWith(u8, state_name, source.artifact_name)) continue;
-        const boundary_matches = source.artifact_name.len == state_name.len or
-            (source.artifact_name.len < state_name.len and state_name[source.artifact_name.len] == '\x1f');
-        if (!boundary_matches) continue;
-        if (best == null or source.artifact_name.len > best_len) {
-            best = i;
-            best_len = source.artifact_name.len;
-        }
-    }
-    return best;
-}
-
 /// Resolves a persisted graph state name to its configured source precedence.
-///
-/// Released state names are checked before the canonical envelope because
-/// artifact names were unrestricted and may legally begin with `magic`. This
-/// ordering keeps names such as "GSN1" readable without turning malformed
-/// canonical envelopes into silently accepted state: names that do not match a
-/// configured legacy source are still decoded strictly by `identity`.
 pub fn materializedSourcePriority(state_name: []const u8, sources: anytype) !?usize {
-    if (legacySourcePriority(state_name, sources)) |priority| return priority;
-
     const parsed = try identity(state_name) orelse return null;
     if (parsed.role == .resolution_mention_artifacts) return null;
     for (sources, 0..) |source, i| {
@@ -127,40 +100,12 @@ pub fn artifactAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
     return try list.toOwnedSlice(alloc);
 }
 
-/// Returns the only released/pre-canonical state spelling for an artifact
-/// member. It is used exclusively to read and retire migration aliases.
-pub fn legacyArtifactAlloc(alloc: Allocator, artifact_ref: types.ArtifactRef) ![]u8 {
-    const document_wide = artifact_ref.kind == .asset and artifact_ref.unit_id == null and
-        artifact_ref.chunk_id == null and artifact_ref.source == null;
-    if (document_wide) return try alloc.dupe(u8, artifact_ref.name);
-
-    var list = std.ArrayListUnmanaged(u8).empty;
-    errdefer list.deinit(alloc);
-    try list.appendSlice(alloc, artifact_ref.name);
-    try list.append(alloc, '\x1f');
-    try list.appendSlice(alloc, @tagName(artifact_ref.kind));
-    if (artifact_ref.unit_id) |unit_id| {
-        try list.appendSlice(alloc, "\x1funit:");
-        try list.appendSlice(alloc, unit_id);
-    }
-    if (artifact_ref.chunk_id) |chunk_id| {
-        const chunk_component = try std.fmt.allocPrint(alloc, "\x1fchunk:{d}", .{chunk_id});
-        defer alloc.free(chunk_component);
-        try list.appendSlice(alloc, chunk_component);
-    }
-    return try list.toOwnedSlice(alloc);
-}
-
 pub fn mentionAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
     var list = try init(alloc, source_artifact);
     errdefer list.deinit(alloc);
     try appendComponent(&list, alloc, "resolution_mentions");
     try appendComponent(&list, alloc, resolution_artifact);
     return try list.toOwnedSlice(alloc);
-}
-
-pub fn legacyMentionAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
 }
 
 pub fn mentionArtifactAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
@@ -171,10 +116,6 @@ pub fn mentionArtifactAlloc(alloc: Allocator, source_artifact: []const u8, resol
     return try list.toOwnedSlice(alloc);
 }
 
-pub fn legacyMentionArtifactAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mention_artifacts\x1f{s}", .{ source_artifact, resolution_artifact });
-}
-
 test "canonical graph state names retain arbitrary source names" {
     const alloc = std.testing.allocator;
     const name = try mentionAlloc(alloc, "relations\x1fwest", "resolution:v1");
@@ -183,29 +124,7 @@ test "canonical graph state names retain arbitrary source names" {
     try std.testing.expectEqual(Role.resolution_mentions, (try identity(name)).?.role);
 }
 
-test "v0.2.0 graph state names prefer the longest source boundary" {
-    const Source = struct { artifact_name: []const u8 };
-    const sources = [_]Source{
-        .{ .artifact_name = "relations" },
-        .{ .artifact_name = "relations\x1fwest" },
-        .{ .artifact_name = "relation" },
-    };
-    try std.testing.expectEqual(@as(?usize, 1), legacySourcePriority("relations\x1fwest\x1fresolution_mentions", &sources));
-    try std.testing.expectEqual(@as(?usize, null), legacySourcePriority("relations-west", &sources));
-}
-
-test "released graph state names may begin with canonical magic" {
-    const Source = struct { artifact_name: []const u8 };
-    const sources = [_]Source{
-        .{ .artifact_name = "GSN1" },
-        .{ .artifact_name = "GSN1\x1fwest" },
-    };
-
-    try std.testing.expectEqual(@as(?usize, 0), try materializedSourcePriority("GSN1", &sources));
-    try std.testing.expectEqual(@as(?usize, 1), try materializedSourcePriority("GSN1\x1fwest\x1fasset", &sources));
-}
-
-test "canonical graph state names resolve after legacy collision check" {
+test "canonical graph state names resolve source priority" {
     const alloc = std.testing.allocator;
     const Source = struct { artifact_name: []const u8 };
     const sources = [_]Source{

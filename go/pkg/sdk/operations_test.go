@@ -368,6 +368,34 @@ func TestCreateIndexPreservesStorageAdmissionRetry(t *testing.T) {
 	}
 }
 
+func TestCreateIndexPreservesTemporaryMutationRetry(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "4")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"index_probe_unavailable","message":"model probe is temporarily unavailable","retryable":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+	request, err := NewCreateIndexRequest(EmbeddingsIndexConfig{Dimension: 512})
+	if err != nil {
+		t.Fatalf("NewCreateIndexRequest: %v", err)
+	}
+	_, err = client.CreateIndex(context.Background(), "docs", "vectors", *request)
+	var unavailable *IndexMutationTemporarilyUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("CreateIndex error = %T %[1]v, want IndexMutationTemporarilyUnavailableError", err)
+	}
+	if unavailable.StatusCode != http.StatusServiceUnavailable || unavailable.Code != "index_probe_unavailable" ||
+		!unavailable.Retryable || unavailable.RetryAfterSeconds != 4 {
+		t.Fatalf("IndexMutationTemporarilyUnavailableError = %#v", unavailable)
+	}
+}
+
 func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	var gotPath string
 	var gotBody string

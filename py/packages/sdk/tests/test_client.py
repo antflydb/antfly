@@ -14,6 +14,7 @@ from antfly import (  # noqa: E402
     CreatedEmbeddingsIndex,
     CreateEmbeddingsIndexRequest,
     CreateEmbeddingsIndexRequestType,
+    IndexMutationTemporarilyUnavailableError,
     StorageResourceExhaustedError,
     antfly_embedder,
 )
@@ -342,6 +343,30 @@ class TestAntflyClient:
         assert exc_info.value.retryable is True
         assert exc_info.value.retry_after_ms == 1250
         assert exc_info.value.retry_after_seconds == 2
+
+    @patch("antfly.client.Client")
+    def test_create_index_preserves_temporary_mutation_retry(self, mock_client_class: MagicMock) -> None:
+        mock_httpx = MagicMock()
+        response = configure_response(
+            mock_httpx,
+            503,
+            {
+                "error": "index_probe_unavailable",
+                "message": "model probe is temporarily unavailable",
+                "retryable": True,
+            },
+        )
+        response.headers = {"Retry-After": "4"}
+        mock_client_class.return_value.get_httpx_client.return_value = mock_httpx
+
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(IndexMutationTemporarilyUnavailableError) as exc_info:
+            client.indexes.create("docs", "vectors", {"type": "embeddings", "dimension": 512})
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.code == "index_probe_unavailable"
+        assert exc_info.value.retryable is True
+        assert exc_info.value.retry_after_seconds == 4
 
     @patch("antfly.client.Client")
     def test_query_preserves_sorted_cursor_contract(self, mock_client_class: MagicMock) -> None:

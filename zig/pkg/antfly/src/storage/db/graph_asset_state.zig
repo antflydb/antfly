@@ -6,9 +6,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const version_3_magic = "AGS3";
 const version_4_magic = "AGS4";
-const header_len = version_3_magic.len + @sizeOf(u64);
+const header_len = version_4_magic.len + @sizeOf(u64);
 pub const hard_max_edges_per_document: usize = 1_000_000;
 pub const hard_max_relation_items_per_artifact: usize = 1_000_000;
 pub const hard_max_manifest_bytes: usize = 64 * 1024 * 1024;
@@ -17,59 +16,7 @@ pub fn effectiveEdgeLimit(configured: u32) usize {
     return if (configured == 0) hard_max_edges_per_document else @min(@as(usize, configured), hard_max_edges_per_document);
 }
 
-pub const Format = enum {
-    /// v0.2.0 persisted only an edge count followed by length-prefixed keys.
-    v0_2_0,
-    v3,
-    /// Generation-fenced key manifest. Payloads live in per-edge contender
-    /// records so large graphs do not duplicate every source payload here.
-    v4,
-};
-
-pub const Entry = struct {
-    key: []u8,
-    value: []u8,
-
-    pub fn deinit(self: *Entry, alloc: Allocator) void {
-        alloc.free(self.key);
-        alloc.free(self.value);
-        self.* = undefined;
-    }
-};
-
-pub const EntryView = struct {
-    key: []const u8,
-    value: []const u8,
-};
-
-pub const EntryIterator = struct {
-    raw: []const u8,
-    pos: usize,
-    remaining: u32,
-
-    pub fn next(self: *EntryIterator) !?EntryView {
-        if (self.remaining == 0) {
-            if (self.pos != self.raw.len) return error.InvalidGraphAssetState;
-            return null;
-        }
-        const key_len = readU32Big(self.raw, &self.pos) catch return error.InvalidGraphAssetState;
-        if (key_len > self.raw.len - self.pos) return error.InvalidGraphAssetState;
-        const key = self.raw[self.pos..][0..key_len];
-        self.pos += key_len;
-        const value_len = readU32Big(self.raw, &self.pos) catch return error.InvalidGraphAssetState;
-        if (value_len > self.raw.len - self.pos) return error.InvalidGraphAssetState;
-        const value = self.raw[self.pos..][0..value_len];
-        self.pos += value_len;
-        self.remaining -= 1;
-        if (self.remaining == 0 and self.pos != self.raw.len) return error.InvalidGraphAssetState;
-        return .{ .key = key, .value = value };
-    }
-};
-
-pub fn freeEntries(alloc: Allocator, entries: []Entry) void {
-    for (entries) |*entry| entry.deinit(alloc);
-    if (entries.len > 0) alloc.free(entries);
-}
+pub const Format = enum { v4 };
 
 pub fn freeKeys(alloc: Allocator, keys: [][]u8) void {
     for (keys) |key| alloc.free(key);
@@ -78,45 +25,23 @@ pub fn freeKeys(alloc: Allocator, keys: [][]u8) void {
 
 pub fn format(raw: []const u8) !Format {
     if (raw.len > hard_max_manifest_bytes) return error.ResourceLimitExceeded;
-    if (std.mem.startsWith(u8, raw, version_3_magic)) {
-        if (raw.len < header_len) return error.InvalidGraphAssetState;
-        return .v3;
-    }
-    if (std.mem.startsWith(u8, raw, version_4_magic)) {
-        if (raw.len < header_len) return error.InvalidGraphAssetState;
-        var pos: usize = header_len;
-        const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-        if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
-        if (@as(usize, count) > (raw.len - pos) / @sizeOf(u32)) return error.InvalidGraphAssetState;
-        for (0..count) |_| {
-            const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-            if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
-            pos += key_len;
-        }
-        if (pos != raw.len) return error.InvalidGraphAssetState;
-        return .v4;
-    }
-    // The only released predecessor is v0.2.0's unversioned key-only
-    // encoding. Validate the whole payload before treating arbitrary bytes as
-    // that format so corrupt state fails closed instead of becoming migration
-    // input.
-    var pos: usize = 0;
+    if (!std.mem.startsWith(u8, raw, version_4_magic) or raw.len < header_len) return error.UnsupportedGraphAssetStateVersion;
+    var pos: usize = header_len;
     const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
     if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
-    const minimum_entry_bytes: usize = @sizeOf(u32);
-    if (@as(usize, count) > (raw.len - pos) / minimum_entry_bytes) return error.InvalidGraphAssetState;
+    if (@as(usize, count) > (raw.len - pos) / @sizeOf(u32)) return error.InvalidGraphAssetState;
     for (0..count) |_| {
         const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
         if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
         pos += key_len;
     }
     if (pos != raw.len) return error.InvalidGraphAssetState;
-    return .v0_2_0;
+    return .v4;
 }
 
-pub fn decodeV020KeysAlloc(alloc: Allocator, raw: []const u8) ![][]u8 {
-    if (try format(raw) != .v0_2_0) return error.UnsupportedGraphAssetStateVersion;
-    var pos: usize = 0;
+pub fn decodeKeysAlloc(alloc: Allocator, raw: []const u8) ![][]u8 {
+    _ = try format(raw);
+    var pos: usize = header_len;
     const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
     const keys = if (count > 0) try alloc.alloc([]u8, count) else return &.{};
     var initialized: usize = 0;
@@ -135,49 +60,9 @@ pub fn decodeV020KeysAlloc(alloc: Allocator, raw: []const u8) ![][]u8 {
     return keys;
 }
 
-pub fn decodeKeysAlloc(alloc: Allocator, raw: []const u8) ![][]u8 {
-    return switch (try format(raw)) {
-        .v0_2_0 => try decodeV020KeysAlloc(alloc, raw),
-        .v3 => blk: {
-            var entries = try entryIterator(raw);
-            const keys = if (entries.remaining > 0) try alloc.alloc([]u8, entries.remaining) else break :blk &.{};
-            var initialized: usize = 0;
-            errdefer {
-                for (keys[0..initialized]) |key| alloc.free(key);
-                alloc.free(keys);
-            }
-            for (keys) |*key| {
-                const entry = (try entries.next()) orelse return error.InvalidGraphAssetState;
-                key.* = try alloc.dupe(u8, entry.key);
-                initialized += 1;
-            }
-            break :blk keys;
-        },
-        .v4 => blk: {
-            var pos: usize = header_len;
-            const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-            const keys = if (count > 0) try alloc.alloc([]u8, count) else break :blk &.{};
-            var initialized: usize = 0;
-            errdefer {
-                for (keys[0..initialized]) |key| alloc.free(key);
-                alloc.free(keys);
-            }
-            for (keys) |*key| {
-                const key_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-                if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
-                key.* = try alloc.dupe(u8, raw[pos..][0..key_len]);
-                pos += key_len;
-                initialized += 1;
-            }
-            if (pos != raw.len) return error.InvalidGraphAssetState;
-            break :blk keys;
-        },
-    };
-}
-
 /// Stores the owning graph generation and edge keys. Complete payloads are
-/// retained by per-edge contender records, keeping this deletion manifest
-/// compact even when edge metadata is large.
+/// retained by logical-edge-global contender records, keeping this deletion
+/// manifest compact even when edge metadata is large.
 pub fn encodeAlloc(alloc: Allocator, generation: u64, writes: anytype) ![]u8 {
     if (writes.len > hard_max_edges_per_document) return error.ResourceLimitExceeded;
     var encoded_len: usize = header_len + @sizeOf(u32);
@@ -201,45 +86,12 @@ pub fn encodeAlloc(alloc: Allocator, generation: u64, writes: anytype) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn decodeAlloc(alloc: Allocator, raw: []const u8) ![]Entry {
-    var iterator = try entryIterator(raw);
-    const count = iterator.remaining;
-    const entries = if (count > 0) try alloc.alloc(Entry, count) else return &.{};
-    var initialized: usize = 0;
-    errdefer {
-        for (entries[0..initialized]) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
-    }
-
-    for (entries) |*entry| {
-        const view = (try iterator.next()) orelse return error.InvalidGraphAssetState;
-        const key = try alloc.dupe(u8, view.key);
-        errdefer alloc.free(key);
-        const value = try alloc.dupe(u8, view.value);
-        entry.* = .{ .key = key, .value = value };
-        initialized += 1;
-    }
-    if (try iterator.next() != null) return error.InvalidGraphAssetState;
-    return entries;
-}
-
-pub fn entryIterator(raw: []const u8) !EntryIterator {
-    if (!std.mem.startsWith(u8, raw, version_3_magic) or raw.len < header_len) return error.UnsupportedGraphAssetStateVersion;
-    if (raw.len > hard_max_manifest_bytes) return error.ResourceLimitExceeded;
+pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
+    _ = try format(raw);
     var pos: usize = header_len;
     const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
     if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
-    const minimum_entry_bytes: usize = 2 * @sizeOf(u32);
-    if (@as(usize, count) > (raw.len - pos) / minimum_entry_bytes) return error.InvalidGraphAssetState;
-    return .{ .raw = raw, .pos = pos, .remaining = count };
-}
-
-pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
-    const state_format = try format(raw);
-    var pos: usize = if (state_format == .v3 or state_format == .v4) header_len else 0;
-    const count = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-    if (@as(usize, count) > hard_max_edges_per_document) return error.ResourceLimitExceeded;
-    const minimum_entry_bytes: usize = if (state_format == .v3) 2 * @sizeOf(u32) else @sizeOf(u32);
+    const minimum_entry_bytes: usize = @sizeOf(u32);
     if (@as(usize, count) > (raw.len - pos) / minimum_entry_bytes) return error.InvalidGraphAssetState;
     var found = false;
     for (0..count) |_| {
@@ -247,22 +99,15 @@ pub fn containsKey(raw: []const u8, target_key: []const u8) !bool {
         if (key_len > raw.len - pos) return error.InvalidGraphAssetState;
         const matches = std.mem.eql(u8, raw[pos..][0..key_len], target_key);
         pos += key_len;
-        if (state_format == .v3) {
-            const value_len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-            if (value_len > raw.len - pos) return error.InvalidGraphAssetState;
-            pos += value_len;
-        }
         found = found or matches;
     }
     if (pos != raw.len) return error.InvalidGraphAssetState;
     return found;
 }
 
-pub fn coverageGeneration(raw: []const u8) !?u64 {
-    return switch (try format(raw)) {
-        .v0_2_0 => null,
-        .v3, .v4 => std.mem.readInt(u64, raw[version_3_magic.len..][0..@sizeOf(u64)], .big),
-    };
+pub fn coverageGeneration(raw: []const u8) !u64 {
+    _ = try format(raw);
+    return std.mem.readInt(u64, raw[version_4_magic.len..][0..@sizeOf(u64)], .big);
 }
 
 fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
@@ -296,43 +141,11 @@ test "graph asset state v4 round trip preserves generation and keys without payl
     try std.testing.expectEqualStrings("edge:a", keys[0]);
     try std.testing.expect(std.mem.indexOf(u8, raw, "payload:a") == null);
     try std.testing.expect(try containsKey(raw, "edge:b"));
-    try std.testing.expectEqual(@as(u64, 42), (try coverageGeneration(raw)).?);
-}
-
-test "graph asset state reads payload-bearing v3 manifests" {
-    const alloc = std.testing.allocator;
-    const raw = version_3_magic ++
-        [_]u8{ 0, 0, 0, 0, 0, 0, 0, 42 } ++
-        [_]u8{ 0, 0, 0, 1 } ++
-        [_]u8{ 0, 0, 0, 6 } ++ "edge:a" ++
-        [_]u8{ 0, 0, 0, 9 } ++ "payload:a";
-    try std.testing.expectEqual(Format.v3, try format(raw));
-    const entries = try decodeAlloc(alloc, raw);
-    defer freeEntries(alloc, entries);
-    try std.testing.expectEqualStrings("edge:a", entries[0].key);
-    try std.testing.expectEqualStrings("payload:a", entries[0].value);
-    const keys = try decodeKeysAlloc(alloc, raw);
-    defer freeKeys(alloc, keys);
-    try std.testing.expectEqualStrings("edge:a", keys[0]);
-}
-
-test "graph asset state reads v0.2.0 key-only manifests" {
-    const alloc = std.testing.allocator;
-    const raw = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 6 } ++ "edge:a";
-    try std.testing.expectEqual(Format.v0_2_0, try format(raw));
-    try std.testing.expect((try coverageGeneration(raw)) == null);
-    const keys = try decodeV020KeysAlloc(alloc, raw);
-    defer freeKeys(alloc, keys);
-    try std.testing.expectEqual(@as(usize, 1), keys.len);
-    try std.testing.expectEqualStrings("edge:a", keys[0]);
-    try std.testing.expect(try containsKey(raw, "edge:a"));
-    try std.testing.expectError(error.UnsupportedGraphAssetStateVersion, decodeAlloc(alloc, raw));
+    try std.testing.expectEqual(@as(u64, 42), try coverageGeneration(raw));
 }
 
 test "graph asset state rejects excessive entry counts before allocation" {
-    const alloc = std.testing.allocator;
-    const raw = version_3_magic ++ [_]u8{0} ** 8 ++ [_]u8{ 0xff, 0xff, 0xff, 0xff };
-    try std.testing.expectError(error.ResourceLimitExceeded, decodeAlloc(alloc, raw));
+    const raw = version_4_magic ++ [_]u8{0} ** 8 ++ [_]u8{ 0xff, 0xff, 0xff, 0xff };
     try std.testing.expectError(error.ResourceLimitExceeded, containsKey(raw, "edge:a"));
 }
 

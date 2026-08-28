@@ -94,6 +94,29 @@ export const QUERY_TEMPORARILY_UNAVAILABLE_CODES = [
 
 export type QueryTemporarilyUnavailableCode = (typeof QUERY_TEMPORARILY_UNAVAILABLE_CODES)[number];
 
+export const INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES = [
+  "index_capability_upgrade_pending",
+  "index_probe_unavailable",
+] as const;
+
+export type IndexMutationTemporarilyUnavailableCode =
+  (typeof INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES)[number];
+
+/** A retryable index mutation admission or validation failure. */
+export class IndexMutationTemporarilyUnavailableError extends Error {
+  readonly status = 503 as const;
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly code: IndexMutationTemporarilyUnavailableCode,
+    readonly retryAfterSeconds: number | undefined
+  ) {
+    super(message);
+    this.name = "IndexMutationTemporarilyUnavailableError";
+  }
+}
+
 /** A retryable query dependency or read-availability failure. */
 export class QueryTemporarilyUnavailableError extends Error {
   readonly status = 503 as const;
@@ -259,6 +282,27 @@ function queryError(prefix: string, error: unknown, response: Response | undefin
       message,
       code as QueryTemporarilyUnavailableCode,
       retryAfterSeconds
+    );
+  }
+  return new Error(message);
+}
+
+function indexMutationError(prefix: string, error: unknown, response: Response | undefined): Error {
+  const detail =
+    error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
+  const code = detail?.error;
+  const message = `${prefix}: ${apiErrorMessage(error)}`;
+  if (
+    response?.status === 503 &&
+    typeof code === "string" &&
+    (INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES as readonly string[]).includes(code) &&
+    detail?.retryable === true
+  ) {
+    const retryAfter = Number.parseInt(response.headers.get("Retry-After") ?? "", 10);
+    return new IndexMutationTemporarilyUnavailableError(
+      message,
+      code as IndexMutationTemporarilyUnavailableCode,
+      Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : undefined
     );
   }
   return new Error(message);
@@ -991,12 +1035,12 @@ export class AntflyClient {
           throw new TypeError(`Invalid index ${JSON.stringify(indexName)}: ${detail}`);
         }
       }
-      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}", {
+      const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
         body: config,
       });
       if (error) {
-        throw new Error(`Failed to create table: ${apiErrorMessage(error, "unknown error")}`);
+        throw indexMutationError("Failed to create table", error, response);
       }
       return data;
     },
@@ -1089,14 +1133,17 @@ export class AntflyClient {
       request: RestoreRequest,
       options?: RestoreOptions
     ): Promise<RestoreJob> => {
-      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/restore", {
-        params: { path: { tableName } },
-        ...(options?.idempotencyKey
-          ? { headers: { "Idempotency-Key": options.idempotencyKey } }
-          : {}),
-        body: request,
-      });
-      if (error) throw new Error(`Restore failed: ${error.error}`);
+      const { data, error, response } = await this.client.POST(
+        "/db/v1/tables/{tableName}/restore",
+        {
+          params: { path: { tableName } },
+          ...(options?.idempotencyKey
+            ? { headers: { "Idempotency-Key": options.idempotencyKey } }
+            : {}),
+          body: request,
+        }
+      );
+      if (error) throw indexMutationError("Restore failed", error, response);
       if (!data) throw new Error("Restore failed: unexpected empty response");
       return data;
     },
@@ -1583,7 +1630,7 @@ export class AntflyClient {
               : "storage capacity is temporarily exhausted";
           throw new StorageResourceExhaustedError(message, retryAfterMs, retryAfterSeconds);
         }
-        throw new Error(`Failed to create index: ${detail.error}`);
+        throw indexMutationError("Failed to create index", error, response);
       }
       if (!data) throw new Error("Failed to create index: unexpected empty response");
       return data;

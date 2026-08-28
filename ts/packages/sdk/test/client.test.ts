@@ -30,6 +30,7 @@ vi.mock("openapi-fetch", () => ({
 const {
   AntflyClient,
   HierarchyCursorStaleError,
+  IndexMutationTemporarilyUnavailableError,
   QueryTemporarilyUnavailableError,
   StorageResourceExhaustedError,
   StorageReadTemporarilyUnavailableError,
@@ -955,6 +956,37 @@ describe("AntflyClient", () => {
           dimension: 512,
         })
       ).rejects.toMatchObject({ retryAfterMs: 3000, retryAfterSeconds: 3 });
+    });
+
+    it("preserves temporary index mutation retry metadata", async () => {
+      mockPost.mockResolvedValueOnce({
+        data: undefined,
+        error: {
+          error: "index_probe_unavailable",
+          message: "model probe is temporarily unavailable",
+          retryable: true,
+        },
+        response: {
+          status: 503,
+          headers: new Headers({ "Retry-After": "4" }),
+        },
+      });
+
+      try {
+        await client.indexes.create("wikipedia", "thumbnail", {
+          type: "embeddings",
+          dimension: 512,
+        });
+        expect.fail("expected temporary index mutation failure");
+      } catch (error) {
+        expect(error).toBeInstanceOf(IndexMutationTemporarilyUnavailableError);
+        expect(error).toMatchObject({
+          status: 503,
+          code: "index_probe_unavailable",
+          retryable: true,
+          retryAfterSeconds: 4,
+        });
+      }
     });
   });
 
