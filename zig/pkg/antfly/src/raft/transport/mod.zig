@@ -35,6 +35,7 @@ pub const HttpServer = http_server.HttpServer;
 pub const HttpSnapshotTransport = http_snapshot.HttpSnapshotTransport;
 pub const FileSnapshotStore = file_snapshot_store.FileSnapshotStore;
 pub const FileSnapshotStoreConfig = file_snapshot_store.FileSnapshotStoreConfig;
+pub const SnapshotArtifactPolicy = file_snapshot_store.SnapshotArtifactPolicy;
 pub const HostBatchHandler = host_batch_handler.HostBatchHandler;
 pub const HttpTransportStack = stack.HttpTransportStack;
 pub const HttpTransportStackConfig = stack.HttpTransportStackConfig;
@@ -56,6 +57,7 @@ test "raft transport module compiles" {
     _ = HttpSnapshotTransport;
     _ = FileSnapshotStore;
     _ = FileSnapshotStoreConfig;
+    _ = SnapshotArtifactPolicy;
     _ = HostBatchHandler;
     _ = HttpTransportStack;
     _ = HttpTransportStackConfig;

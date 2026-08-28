@@ -56,6 +56,10 @@ pub const HostConfig = struct {
     replica_catalog_path: ?[]const u8 = null,
     replica_state_backend: ReplicaStateBackend = .file_image,
     trace_logger: ?raft_engine.core.TraceLogger = null,
+    /// Aggregate ownership retained by HTTP snapshot materialization and the
+    /// inbound Raft queue. This is a byte-weighted admission limit, not a
+    /// per-request ceiling.
+    max_pending_inbound_snapshot_bytes: usize = 1 << 30,
 };
 
 pub const RuntimeHooks = raft_engine.runtime.multi_raft.RuntimeHooks;
@@ -172,6 +176,8 @@ pub const HostMetrics = struct {
     inbound_message_enqueues: usize = 0,
     inbound_message_drains: usize = 0,
     pending_inbound_messages: usize = 0,
+    pending_inbound_snapshot_bytes: usize = 0,
+    inbound_snapshot_admission_denials: usize = 0,
     runtime_rounds: usize = 0,
     runtime_ticked_groups: usize = 0,
     runtime_processed_groups: usize = 0,
@@ -206,6 +212,7 @@ pub const HttpHostConfig = struct {
     transport: transport.HttpTransportStackConfig,
     listener: transport.StdHttpListenerConfig = .{},
     max_snapshot_bytes: usize = 1 << 30,
+    snapshot_artifact_policy: transport.SnapshotArtifactPolicy = .{},
 };
 
 pub const HttpHostDeps = struct {
@@ -224,6 +231,7 @@ const PeerSnapshotTargetResolver = struct {
             .ptr = self,
             .vtable = &.{
                 .resolve_upload_uri = resolveUploadUri,
+                .resolve_base_uri = resolveBaseUri,
             },
         };
     }
@@ -256,12 +264,35 @@ const PeerSnapshotTargetResolver = struct {
         }
         return error.NoHttpSnapshotEndpoint;
     }
+
+    fn resolveBaseUri(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        node_id: u64,
+    ) ![]u8 {
+        const self: *PeerSnapshotTargetResolver = @ptrCast(@alignCast(ptr));
+        const endpoints = try self.peer_resolver.resolveGroupPeer(alloc, group_id, node_id);
+        defer {
+            for (endpoints) |endpoint| {
+                alloc.free(endpoint.address);
+                alloc.free(endpoint.metadata);
+            }
+            alloc.free(endpoints);
+        }
+        for (endpoints) |endpoint| switch (endpoint.protocol) {
+            .http, .https, .http2, .http3 => return try alloc.dupe(u8, endpoint.address),
+            .quic => {},
+        };
+        return error.NoHttpSnapshotEndpoint;
+    }
 };
 
 pub const Host = struct {
     const PendingInboundMessage = struct {
         group_id: u64,
         message: raft_engine.core.Message,
+        snapshot_bytes: usize = 0,
 
         fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
             self.message.deinit(alloc);
@@ -294,6 +325,7 @@ pub const Host = struct {
     bootstrap_statuses: std.AutoHashMapUnmanaged(u64, OwnedBootstrapStatus) = .empty,
     inbound_mutex: std.atomic.Mutex = .unlocked,
     pending_inbound: std.ArrayListUnmanaged(PendingInboundMessage) = .empty,
+    pending_inbound_snapshot_bytes: usize = 0,
 
     pub fn init(alloc: std.mem.Allocator, cfg: HostConfig, deps: HostDeps) Host {
         return .{
@@ -308,6 +340,7 @@ pub const Host = struct {
         self.lockInbound();
         for (self.pending_inbound.items) |*pending| pending.deinit(self.alloc);
         self.pending_inbound.deinit(self.alloc);
+        self.pending_inbound_snapshot_bytes = 0;
         self.inbound_mutex.unlock();
         var bootstrap_it = self.bootstrap_statuses.valueIterator();
         while (bootstrap_it.next()) |bootstrap_status| bootstrap_status.deinit(self.alloc);
@@ -703,9 +736,11 @@ pub const Host = struct {
     fn drainInboundMessages(self: *Host, max_messages: usize) !usize {
         if (max_messages == 0) return 0;
         var pending = std.ArrayListUnmanaged(PendingInboundMessage).empty;
-        errdefer {
+        var owned_snapshot_bytes: usize = 0;
+        defer {
             for (pending.items) |*item| item.deinit(self.alloc);
             pending.deinit(self.alloc);
+            self.releaseInboundSnapshotBytes(owned_snapshot_bytes);
         }
 
         self.lockInbound();
@@ -727,13 +762,10 @@ pub const Host = struct {
             } else {
                 self.pending_inbound.clearRetainingCapacity();
             }
+            for (pending.items) |item| owned_snapshot_bytes += item.snapshot_bytes;
         }
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
         self.inbound_mutex.unlock();
-        defer {
-            for (pending.items) |*item| item.deinit(self.alloc);
-            pending.deinit(self.alloc);
-        }
 
         var drained: usize = 0;
         for (pending.items) |item| {
@@ -751,6 +783,15 @@ pub const Host = struct {
         while (!self.inbound_mutex.tryLock()) {
             std.Thread.yield() catch {};
         }
+    }
+
+    fn releaseInboundSnapshotBytes(self: *Host, snapshot_bytes: usize) void {
+        if (snapshot_bytes == 0) return;
+        self.lockInbound();
+        defer self.inbound_mutex.unlock();
+        std.debug.assert(self.pending_inbound_snapshot_bytes >= snapshot_bytes);
+        self.pending_inbound_snapshot_bytes -= snapshot_bytes;
+        self.metrics.pending_inbound_snapshot_bytes = self.pending_inbound_snapshot_bytes;
     }
 
     pub fn campaignGroup(self: *Host, group_id: u64) !void {
@@ -788,6 +829,21 @@ pub const Host = struct {
     pub fn handleSnapshotUpload(self: *Host, upload: transport.http_server.SnapshotUpload) !void {
         var owned = upload;
         errdefer owned.snapshot.deinit(self.alloc);
+        const snapshot_bytes = owned.snapshot.data.len;
+        var admission_reserved = owned.admission_reserved;
+        if (!admission_reserved) {
+            try self.admitSnapshotUpload(.{
+                .group_id = upload.group_id,
+                .to = upload.to,
+                .data_len = snapshot_bytes,
+            });
+            admission_reserved = true;
+        }
+        errdefer if (admission_reserved) self.cancelSnapshotUpload(.{
+            .group_id = upload.group_id,
+            .to = upload.to,
+            .data_len = snapshot_bytes,
+        });
         const grp = self.runtime_host.group(upload.group_id) orelse return error.UnknownGroup;
         if (upload.to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
         var msg: raft_engine.core.Message = .{
@@ -805,9 +861,36 @@ pub const Host = struct {
         try self.pending_inbound.append(self.alloc, .{
             .group_id = upload.group_id,
             .message = msg,
+            .snapshot_bytes = snapshot_bytes,
         });
+        admission_reserved = false;
         self.metrics.inbound_message_enqueues += 1;
         self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
+    }
+
+    pub fn admitSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) !void {
+        const data_len = std.math.cast(usize, admission.data_len) orelse return error.SnapshotTooLarge;
+        self.lockInbound();
+        defer self.inbound_mutex.unlock();
+        const grp = self.runtime_host.group(admission.group_id) orelse return error.UnknownGroup;
+        if (admission.to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
+        if (data_len > self.cfg.max_pending_inbound_snapshot_bytes or
+            self.pending_inbound_snapshot_bytes > self.cfg.max_pending_inbound_snapshot_bytes - data_len)
+        {
+            self.metrics.inbound_snapshot_admission_denials += 1;
+            return error.SnapshotAdmissionBackpressure;
+        }
+        self.pending_inbound_snapshot_bytes += data_len;
+        self.metrics.pending_inbound_snapshot_bytes = self.pending_inbound_snapshot_bytes;
+    }
+
+    pub fn cancelSnapshotUpload(self: *Host, admission: transport.http_server.SnapshotUploadAdmission) void {
+        const data_len = std.math.cast(usize, admission.data_len) orelse return;
+        self.lockInbound();
+        defer self.inbound_mutex.unlock();
+        std.debug.assert(self.pending_inbound_snapshot_bytes >= data_len);
+        self.pending_inbound_snapshot_bytes -|= data_len;
+        self.metrics.pending_inbound_snapshot_bytes = self.pending_inbound_snapshot_bytes;
     }
 
     pub fn forgetLeader(self: *Host, group_id: u64) !void {
@@ -1019,6 +1102,7 @@ pub const HttpHost = struct {
             snapshot_store.* = try transport.FileSnapshotStore.init(alloc, .{
                 .root_dir = cfg.transport.snapshot.root_dir,
                 .max_snapshot_bytes = cfg.max_snapshot_bytes,
+                .artifact_policy = cfg.snapshot_artifact_policy,
             });
             break :blk snapshot_store;
         } else null;
@@ -1483,7 +1567,10 @@ test "host queues live snapshot uploads for runtime round" {
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
     var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
-    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+    var host = Host.init(std.testing.allocator, .{
+        .local_node_id = 1,
+        .max_pending_inbound_snapshot_bytes = "queued-snapshot".len,
+    }, .{
         .descriptor_factory = factory.iface(),
     });
     defer host.deinit();
@@ -1513,11 +1600,19 @@ test "host queues live snapshot uploads for runtime round" {
 
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_enqueues);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, "queued-snapshot".len), host.metrics.pending_inbound_snapshot_bytes);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.inbound_message_drains);
+    try std.testing.expectError(error.SnapshotAdmissionBackpressure, host.admitSnapshotUpload(.{
+        .group_id = 41,
+        .to = 1,
+        .data_len = 1,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_snapshot_admission_denials);
 
     _ = try host.runRoundBounded(1, 1, 1);
     try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);
     try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_snapshot_bytes);
 }
 
 test "host drops stale inbound peer batch groups without leaking pending storage" {

@@ -40,6 +40,12 @@ pub const SnapshotTargetResolver = struct {
             node_id: u64,
             snapshot_id: []const u8,
         ) anyerror![]u8,
+        resolve_base_uri: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            node_id: u64,
+        ) anyerror![]u8 = null,
     };
 
     pub fn resolveUploadUri(
@@ -50,6 +56,16 @@ pub const SnapshotTargetResolver = struct {
         snapshot_id: []const u8,
     ) ![]u8 {
         return try self.vtable.resolve_upload_uri(self.ptr, alloc, group_id, node_id, snapshot_id);
+    }
+
+    pub fn resolveBaseUri(
+        self: SnapshotTargetResolver,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        node_id: u64,
+    ) ![]u8 {
+        const resolve = self.vtable.resolve_base_uri orelse return error.SnapshotCapabilityEndpointUnavailable;
+        return try resolve(self.ptr, alloc, group_id, node_id);
     }
 };
 
@@ -104,6 +120,7 @@ pub const HttpSnapshotTransport = struct {
 
     fn sendSnapshot(ptr: *anyopaque, req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest) !void {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
+        if (req.snapshot.data.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         const snapshot_id = if (req.locator) |locator|
             try self.alloc.dupe(u8, locator.snapshot_id)
         else
@@ -136,21 +153,103 @@ pub const HttpSnapshotTransport = struct {
         const headers: []const common.RequestHeader = if (req.from == 0) &.{} else live_headers[0..];
 
         if (req.snapshot.data.len > self.cfg.legacy_max_snapshot_bytes) {
-            self.sendChunkedSnapshot(req, uri, &live_headers) catch |chunked_err| {
-                // Mixed-version clusters can still transfer snapshots that fit
-                // the bounded v1 request. This is intentionally a fallback,
-                // not an unbounded retry that recreates the original failure.
-                const legacy_body = encodeSnapshotEnvelope(self.alloc, req.snapshot) catch |legacy_err| return legacy_err;
-                defer self.alloc.free(legacy_body);
-                if (legacy_body.len > self.cfg.legacy_fallback_max_request_bytes) return chunked_err;
-                return try self.sendLegacySnapshot(req, uri, headers, legacy_body);
-            };
-            return;
+            if (try self.resolveV2UploadTarget(req, snapshot_id, uri)) |target| {
+                defer target.deinit(self.alloc);
+                if (try self.peerSupportsSnapshotV2(target.capabilities_uri, req.from))
+                    return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers);
+            }
+
+            // Protocol selection is complete before any mutating request. A
+            // v1 fallback is permitted only when its complete wire envelope
+            // fits the configured listener ceiling.
+            const legacy_body = try encodeSnapshotEnvelope(self.alloc, req.snapshot);
+            defer self.alloc.free(legacy_body);
+            if (legacy_body.len > self.cfg.legacy_fallback_max_request_bytes)
+                return error.SnapshotTransferProtocolUpgradeRequired;
+            return try self.sendLegacySnapshot(req, uri, headers, legacy_body);
         }
 
         const body = try encodeSnapshotEnvelope(self.alloc, req.snapshot);
         defer self.alloc.free(body);
+        if (body.len > self.cfg.legacy_fallback_max_request_bytes) {
+            if (try self.resolveV2UploadTarget(req, snapshot_id, uri)) |target| {
+                defer target.deinit(self.alloc);
+                if (try self.peerSupportsSnapshotV2(target.capabilities_uri, req.from))
+                    return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers);
+            }
+            return error.SnapshotTransferProtocolUpgradeRequired;
+        }
         return try self.sendLegacySnapshot(req, uri, headers, body);
+    }
+
+    const V2UploadTarget = struct {
+        upload_uri: []u8,
+        capabilities_uri: []u8,
+
+        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.upload_uri);
+            alloc.free(self.capabilities_uri);
+        }
+    };
+
+    fn resolveV2UploadTarget(
+        self: *HttpSnapshotTransport,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
+        snapshot_id: []const u8,
+        legacy_uri: []const u8,
+    ) !?V2UploadTarget {
+        const base_uri: ?[]u8 = if (self.resolver) |resolver|
+            resolver.resolveBaseUri(self.alloc, req.group_id, req.to) catch
+                try baseUriFromLegacySnapshotUri(self.alloc, legacy_uri, routes.Routes.snapshot_upload, snapshot_id)
+        else
+            try baseUriFromLegacySnapshotUri(self.alloc, legacy_uri, routes.Routes.snapshot_upload, snapshot_id);
+        const base = base_uri orelse return null;
+        defer self.alloc.free(base);
+        const upload_path = try routes.Routes.snapshotUploadPathV2(self.alloc, snapshot_id);
+        defer self.alloc.free(upload_path);
+        const upload_uri = try routes.Routes.join(self.alloc, base, upload_path);
+        errdefer self.alloc.free(upload_uri);
+        return .{
+            .upload_uri = upload_uri,
+            .capabilities_uri = try routes.Routes.join(self.alloc, base, routes.Routes.capabilities),
+        };
+    }
+
+    fn baseUriFromLegacySnapshotUri(
+        alloc: std.mem.Allocator,
+        uri: []const u8,
+        route_prefix: []const u8,
+        snapshot_id: []const u8,
+    ) !?[]u8 {
+        const pos = std.mem.lastIndexOf(u8, uri, route_prefix) orelse return null;
+        const suffix = uri[pos + route_prefix.len ..];
+        if (suffix.len != snapshot_id.len + 1 or suffix[0] != '/' or
+            !std.mem.eql(u8, suffix[1..], snapshot_id)) return null;
+        return try alloc.dupe(u8, uri[0..pos]);
+    }
+
+    fn peerSupportsSnapshotV2(
+        self: *HttpSnapshotTransport,
+        capabilities_uri: []const u8,
+        source_node_id: u64,
+    ) !bool {
+        var resp = self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = capabilities_uri,
+            .source_node_id = if (source_node_id == 0) null else source_node_id,
+        }) catch return false;
+        defer resp.deinit(self.alloc);
+        if (resp.status < 200 or resp.status >= 300) return false;
+        const Capabilities = struct {
+            snapshot_transfer_protocol_version: u32 = 0,
+            snapshot_transfer_route_version: u32 = 0,
+        };
+        const parsed = std.json.parseFromSlice(Capabilities, self.alloc, resp.body, .{
+            .ignore_unknown_fields = true,
+        }) catch return false;
+        defer parsed.deinit();
+        return parsed.value.snapshot_transfer_protocol_version >= snapshot_transfer.protocol_version and
+            parsed.value.snapshot_transfer_route_version >= snapshot_transfer.http_route_version;
     }
 
     fn sendLegacySnapshot(
@@ -180,7 +279,6 @@ pub const HttpSnapshotTransport = struct {
     ) !void {
         if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > 4 * 1024 * 1024)
             return error.InvalidSnapshotChunkSize;
-        if (req.snapshot.data.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         const manifest: snapshot_transfer.Manifest = .{
             .group_id = req.group_id,
             .from = req.from,
@@ -211,7 +309,10 @@ pub const HttpSnapshotTransport = struct {
                 .uri = uri,
                 .headers = abort_headers[0..abort_count],
                 .source_node_id = if (req.from == 0) null else req.from,
-            }) catch {};
+            }) catch |err| std.log.warn("snapshot upload abort deferred uri={s} err={s}", .{
+                uri,
+                @errorName(err),
+            });
         }
 
         var offset: usize = 0;
@@ -256,23 +357,87 @@ pub const HttpSnapshotTransport = struct {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
         if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > 4 * 1024 * 1024)
             return error.InvalidSnapshotChunkSize;
+        if (try self.resolveV2FetchTarget(req)) |target| {
+            defer target.deinit(self.alloc);
+            if (try self.peerSupportsSnapshotV2(target.capabilities_uri, 0))
+                return try self.fetchSnapshotV2(req, receiver, target.fetch_uri);
+        }
+
+        var legacy = try self.executor.execute(self.alloc, .{
+            .method = .GET,
+            .uri = req.locator.uri,
+        });
+        defer legacy.deinit(self.alloc);
+        if (legacy.status < 200 or legacy.status >= 300) return error.UnexpectedHttpStatus;
+        if (legacy.body.len > self.cfg.legacy_fallback_max_request_bytes)
+            return error.SnapshotTooLarge;
+        const snapshot = try decodeSnapshotEnvelopeWithLimits(self.alloc, legacy.body, .{
+            .max_snapshot_bytes = self.cfg.max_snapshot_bytes,
+        });
+        return try receiver.receiveSnapshot(req, snapshot);
+    }
+
+    const V2FetchTarget = struct {
+        fetch_uri: []u8,
+        capabilities_uri: []u8,
+
+        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.fetch_uri);
+            alloc.free(self.capabilities_uri);
+        }
+    };
+
+    fn resolveV2FetchTarget(
+        self: *HttpSnapshotTransport,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest,
+    ) !?V2FetchTarget {
+        const base_uri: ?[]u8 = if (self.resolver) |resolver|
+            resolver.resolveBaseUri(self.alloc, req.group_id, req.from) catch
+                try baseUriFromLegacySnapshotUri(
+                    self.alloc,
+                    req.locator.uri,
+                    routes.Routes.snapshot_fetch,
+                    req.locator.snapshot_id,
+                )
+        else
+            try baseUriFromLegacySnapshotUri(
+                self.alloc,
+                req.locator.uri,
+                routes.Routes.snapshot_fetch,
+                req.locator.snapshot_id,
+            );
+        const base = base_uri orelse return null;
+        defer self.alloc.free(base);
+        const fetch_path = try routes.Routes.snapshotFetchPathV2(self.alloc, req.locator.snapshot_id);
+        defer self.alloc.free(fetch_path);
+        const fetch_uri = try routes.Routes.join(self.alloc, base, fetch_path);
+        errdefer self.alloc.free(fetch_uri);
+        return .{
+            .fetch_uri = fetch_uri,
+            .capabilities_uri = try routes.Routes.join(self.alloc, base, routes.Routes.capabilities),
+        };
+    }
+
+    fn fetchSnapshotV2(
+        self: *HttpSnapshotTransport,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest,
+        receiver: raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver,
+        fetch_uri: []const u8,
+    ) !void {
         const manifest_headers = [_]common.RequestHeader{
             .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
             .{ .name = "x-antfly-raft-snapshot-operation", .value = "manifest" },
         };
         var resp = try self.executor.execute(self.alloc, .{
             .method = .GET,
-            .uri = req.locator.uri,
+            .uri = fetch_uri,
             .headers = &manifest_headers,
         });
         defer resp.deinit(self.alloc);
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
         if (resp.content_type == null or
             !std.mem.eql(u8, resp.content_type.?, "application/x-antflydb-raft-snapshot-manifest-v2"))
-        {
-            const snapshot = try decodeSnapshotEnvelope(self.alloc, resp.body);
-            return try receiver.receiveSnapshot(req, snapshot);
-        }
+            return error.InvalidSnapshotManifestResponse;
 
         var manifest = try snapshot_transfer.decode(self.alloc, resp.body);
         defer manifest.deinit(self.alloc);
@@ -297,7 +462,7 @@ pub const HttpSnapshotTransport = struct {
             };
             var chunk = try self.executor.execute(self.alloc, .{
                 .method = .GET,
-                .uri = req.locator.uri,
+                .uri = fetch_uri,
                 .headers = &chunk_headers,
             });
             errdefer chunk.deinit(self.alloc);
@@ -316,6 +481,19 @@ pub const HttpSnapshotTransport = struct {
         const metadata = manifest.metadata;
         manifest.metadata = .{};
         try receiver.receiveSnapshot(req, .{ .metadata = metadata, .data = data });
+
+        const release_headers = [_]common.RequestHeader{
+            .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
+            .{ .name = "x-antfly-raft-snapshot-operation", .value = "release" },
+        };
+        self.executeExpectedSuccess(.{
+            .method = .DELETE,
+            .uri = fetch_uri,
+            .headers = &release_headers,
+        }) catch |err| std.log.warn("snapshot fetch artifact release deferred snapshot_id={s} err={s}", .{
+            req.locator.snapshot_id,
+            @errorName(err),
+        });
     }
 
     fn appendTransferHeaders(
@@ -372,18 +550,33 @@ pub const HttpSnapshotTransport = struct {
         return try out.toOwnedSlice(alloc);
     }
 
+    pub const SnapshotEnvelopeLimits = struct {
+        max_snapshot_bytes: usize = 1 << 30,
+        max_members_per_set: usize = snapshot_transfer.max_members_per_set,
+    };
+
     pub fn decodeSnapshotEnvelope(alloc: std.mem.Allocator, bytes: []const u8) !raft_engine.core.types.Snapshot {
+        return decodeSnapshotEnvelopeWithLimits(alloc, bytes, .{});
+    }
+
+    pub fn decodeSnapshotEnvelopeWithLimits(
+        alloc: std.mem.Allocator,
+        bytes: []const u8,
+        limits: SnapshotEnvelopeLimits,
+    ) !raft_engine.core.types.Snapshot {
         var cursor: usize = 0;
         const index = try readInt(u64, bytes, &cursor);
         const term = try readInt(u64, bytes, &cursor);
         var conf_state: raft_engine.core.types.ConfState = .{};
         errdefer conf_state.deinit(alloc);
-        conf_state.voters = try decodeNodeList(alloc, bytes, &cursor);
-        conf_state.voters_outgoing = try decodeNodeList(alloc, bytes, &cursor);
-        conf_state.learners = try decodeNodeList(alloc, bytes, &cursor);
-        conf_state.learners_next = try decodeNodeList(alloc, bytes, &cursor);
+        conf_state.voters = try decodeNodeList(alloc, bytes, &cursor, limits.max_members_per_set);
+        conf_state.voters_outgoing = try decodeNodeList(alloc, bytes, &cursor, limits.max_members_per_set);
+        conf_state.learners = try decodeNodeList(alloc, bytes, &cursor, limits.max_members_per_set);
+        conf_state.learners_next = try decodeNodeList(alloc, bytes, &cursor, limits.max_members_per_set);
         conf_state.auto_leave = try readBool(bytes, &cursor);
-        const data = try readBytes(alloc, bytes, &cursor);
+        const data = try readBytes(alloc, bytes, &cursor, limits.max_snapshot_bytes);
+        errdefer alloc.free(data);
+        if (cursor != bytes.len) return error.InvalidSnapshotEnvelope;
         return .{
             .metadata = .{
                 .index = index,
@@ -401,17 +594,21 @@ pub const HttpSnapshotTransport = struct {
     }
 
     fn appendBytes(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), bytes: []const u8) !void {
+        if (bytes.len > std.math.maxInt(u32)) return error.SnapshotTooLarge;
         try appendInt(u32, alloc, out, @intCast(bytes.len));
         try out.appendSlice(alloc, bytes);
     }
 
     fn encodeNodeList(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), nodes: []const u64) !void {
+        if (nodes.len > snapshot_transfer.max_members_per_set)
+            return error.SnapshotMembershipTooLarge;
         try appendInt(u32, alloc, out, @intCast(nodes.len));
         for (nodes) |node| try appendInt(u64, alloc, out, node);
     }
 
     fn readInt(comptime T: type, data: []const u8, cursor: *usize) !T {
-        if (cursor.* + @sizeOf(T) > data.len) return error.InvalidSnapshotEnvelope;
+        if (cursor.* > data.len or data.len - cursor.* < @sizeOf(T))
+            return error.InvalidSnapshotEnvelope;
         var buf: [@sizeOf(T)]u8 = undefined;
         @memcpy(&buf, data[cursor.* .. cursor.* + @sizeOf(T)]);
         const value = std.mem.readInt(T, &buf, .little);
@@ -421,20 +618,40 @@ pub const HttpSnapshotTransport = struct {
 
     fn readBool(data: []const u8, cursor: *usize) !bool {
         if (cursor.* >= data.len) return error.InvalidSnapshotEnvelope;
-        const value = data[cursor.*] != 0;
+        const raw = data[cursor.*];
+        if (raw > 1) return error.InvalidSnapshotEnvelope;
         cursor.* += 1;
-        return value;
+        return raw == 1;
     }
 
-    fn readBytes(alloc: std.mem.Allocator, data: []const u8, cursor: *usize) ![]u8 {
-        const len = try readInt(u32, data, cursor);
-        if (cursor.* + len > data.len) return error.InvalidSnapshotEnvelope;
+    fn readBytes(
+        alloc: std.mem.Allocator,
+        data: []const u8,
+        cursor: *usize,
+        max_len: usize,
+    ) ![]u8 {
+        const encoded_len = try readInt(u32, data, cursor);
+        const len = std.math.cast(usize, encoded_len) orelse return error.InvalidSnapshotEnvelope;
+        if (len > max_len) return error.SnapshotTooLarge;
+        if (cursor.* > data.len or data.len - cursor.* < len)
+            return error.InvalidSnapshotEnvelope;
         defer cursor.* += len;
         return try alloc.dupe(u8, data[cursor.* .. cursor.* + len]);
     }
 
-    fn decodeNodeList(alloc: std.mem.Allocator, data: []const u8, cursor: *usize) ![]u64 {
-        const len = try readInt(u32, data, cursor);
+    fn decodeNodeList(
+        alloc: std.mem.Allocator,
+        data: []const u8,
+        cursor: *usize,
+        max_len: usize,
+    ) ![]u64 {
+        const encoded_len = try readInt(u32, data, cursor);
+        const len = std.math.cast(usize, encoded_len) orelse return error.InvalidSnapshotEnvelope;
+        if (len > max_len) return error.SnapshotMembershipTooLarge;
+        const byte_len = std.math.mul(usize, len, @sizeOf(u64)) catch
+            return error.InvalidSnapshotEnvelope;
+        if (cursor.* > data.len or data.len - cursor.* < byte_len)
+            return error.InvalidSnapshotEnvelope;
         const out = try alloc.alloc(u64, len);
         errdefer alloc.free(out);
         for (out) |*node| node.* = try readInt(u64, data, cursor);
@@ -449,9 +666,57 @@ test "http snapshot transport module compiles" {
     _ = HttpSnapshotTransport;
 }
 
+test "legacy snapshot envelope rejects unbounded and non-canonical frames" {
+    const snapshot: raft_engine.core.types.Snapshot = .{
+        .metadata = .{ .index = 7, .term = 3 },
+        .data = @constCast("payload"),
+    };
+    const encoded = try HttpSnapshotTransport.encodeSnapshotEnvelope(std.testing.allocator, snapshot);
+    defer std.testing.allocator.free(encoded);
+
+    const trailing = try std.testing.allocator.alloc(u8, encoded.len + 1);
+    defer std.testing.allocator.free(trailing);
+    @memcpy(trailing[0..encoded.len], encoded);
+    trailing[encoded.len] = 0xff;
+    try std.testing.expectError(
+        error.InvalidSnapshotEnvelope,
+        HttpSnapshotTransport.decodeSnapshotEnvelope(std.testing.allocator, trailing),
+    );
+
+    const oversized_membership = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(oversized_membership);
+    std.mem.writeInt(
+        u32,
+        oversized_membership[16..20],
+        @intCast(snapshot_transfer.max_members_per_set + 1),
+        .little,
+    );
+    try std.testing.expectError(
+        error.SnapshotMembershipTooLarge,
+        HttpSnapshotTransport.decodeSnapshotEnvelope(std.testing.allocator, oversized_membership),
+    );
+
+    try std.testing.expectError(
+        error.SnapshotTooLarge,
+        HttpSnapshotTransport.decodeSnapshotEnvelopeWithLimits(std.testing.allocator, encoded, .{
+            .max_snapshot_bytes = snapshot.data.len - 1,
+        }),
+    );
+
+    const invalid_bool = try std.testing.allocator.dupe(u8, encoded);
+    defer std.testing.allocator.free(invalid_bool);
+    // Four empty membership counts follow index and term.
+    invalid_bool[16 + 4 * @sizeOf(u32)] = 2;
+    try std.testing.expectError(
+        error.InvalidSnapshotEnvelope,
+        HttpSnapshotTransport.decodeSnapshotEnvelope(std.testing.allocator, invalid_bool),
+    );
+}
+
 test "http snapshot transport posts and fetches serialized snapshots" {
     const RecordingExecutor = struct {
         server: *http_server.HttpServer,
+        v2_requests: usize = 0,
 
         fn iface(self: *@This()) common.RequestExecutor {
             return .{
@@ -464,7 +729,14 @@ test "http snapshot transport posts and fetches serialized snapshots" {
 
         fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            _ = alloc;
+            // Simulate an earlier PR build: it advertised wire version 2 but
+            // did not serve the isolated v2 route generation.
+            if (std.mem.eql(u8, req.uri, routes.Routes.capabilities)) return .{
+                .status = 200,
+                .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2}"),
+            };
+            if (std.mem.indexOf(u8, req.uri, "/raft/v2/snapshot/") != null)
+                self.v2_requests += 1;
             return try self.server.handle(req);
         }
     };
@@ -584,6 +856,7 @@ test "http snapshot transport posts and fetches serialized snapshots" {
     }, receiver.iface());
     try std.testing.expectEqual(@as(usize, 1), receiver.seen);
     try std.testing.expectEqual(@as(u64, 12), receiver.index);
+    try std.testing.expectEqual(@as(usize, 0), executor.v2_requests);
 }
 
 test "http snapshot transport resolves upload uri when locator is absent" {

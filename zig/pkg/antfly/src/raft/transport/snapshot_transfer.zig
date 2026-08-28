@@ -7,6 +7,9 @@ const std = @import("std");
 const raft_engine = @import("raft_engine");
 
 pub const protocol_version: u32 = 2;
+/// Generation of the isolated `/raft/v2/snapshot/*` HTTP routing contract.
+/// This is deliberately separate from the snapshot wire format version.
+pub const http_route_version: u32 = 1;
 pub const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 pub const max_manifest_bytes: usize = 256 * 1024;
 pub const max_members_per_set: usize = 16 * 1024;
