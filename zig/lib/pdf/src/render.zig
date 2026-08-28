@@ -280,7 +280,7 @@ fn renderChoicePhase(
     choice: RenderChoice,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
-) u8 {
+) usize {
     return switch (choice) {
         .pattern => |idx| pattern_runs[idx].paint_phase,
         .shape => |idx| shape_runs[idx].paint_phase,

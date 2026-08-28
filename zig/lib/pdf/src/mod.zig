@@ -2308,8 +2308,8 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
         "/CharStrings 4 dict dup begin\n" ++
         "/.notdef <8B8B150E> def\n" ++
         "/A <8B8B15F77C8B05FB7CFA7C05FB7CFB7C050E> def\n" ++
-        "/period <8B8B15938B058B93058D8B058B8D050E> def\n" ++
-        "/Aperiod <8BF75CF7C0CCB90C060E> def\n" ++
+        "/acute <8B8B15938B058B93058D8B058B8D050E> def\n" ++
+        "/Aacute <8BF75CF7C0CCF7560C060E> def\n" ++
         "end readonly def\n";
 
     const content = "BT\n/F1 20 Tf\n10 10 Td\n(A) Tj\nET\n";
@@ -2318,7 +2318,7 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
     const obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n";
     const obj4 = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
     defer alloc.free(obj4);
-    const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /TestT1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /Aperiod] >> /FontDescriptor 6 0 R >>\nendobj\n";
+    const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /TestT1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /Aacute] >> /FontDescriptor 6 0 R >>\nendobj\n";
     const obj6 = "6 0 obj\n<< /Type /FontDescriptor /FontName /TestT1 /FontFile 7 0 R >>\nendobj\n";
 
     var out = std.ArrayList(u8).empty;

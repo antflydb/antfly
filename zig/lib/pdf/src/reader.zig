@@ -445,10 +445,9 @@ const Type1Font = struct {
     }
 
     fn glyphForStandardCode(self: *const Type1Font, code: u8) ?*const Type1Glyph {
-        const rune = text_encoding.standard_encoding[code];
+        const name = font_lib.cff.standardEncodingGlyphName(code) orelse return null;
         for (self.glyphs) |*glyph| {
-            const glyph_rune = text_encoding.glyphNameToRune(glyph.name) orelse continue;
-            if (glyph_rune == rune) return glyph;
+            if (std.mem.eql(u8, glyph.name, name)) return glyph;
         }
         return null;
     }
@@ -786,9 +785,10 @@ pub const PatternRun = struct {
     kind: enum { fill, stroke },
     mode: enum { tiling, shading } = .tiling,
     paint_order: usize = 0,
-    /// Orders multiple paint phases emitted by one PDF operator. Text fill is
-    /// phase 0 and text stroke is phase 1, independent of backing paint type.
-    paint_phase: u8 = 0,
+    /// Orders multiple paint phases emitted by one PDF operator, independent
+    /// of backing paint type. Synthesized outlines use fill then stroke;
+    /// Type3 glyphs retain their intrinsic CharProc operator sequence.
+    paint_phase: usize = 0,
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
@@ -860,7 +860,7 @@ pub const BlendMode = enum {
 pub const ShapeRun = struct {
     kind: enum { fill, stroke },
     paint_order: usize = 0,
-    paint_phase: u8 = 0,
+    paint_phase: usize = 0,
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
@@ -3096,6 +3096,7 @@ pub const Reader = struct {
     ) !bool {
         var cursor_x: f64 = 0;
         var cursor_y: f64 = 0;
+        var paint_phase: usize = 0;
         var complete = true;
         for (raw) |code| {
             const glyph = type3.glyphForCode(code) orelse {
@@ -3111,7 +3112,8 @@ pub const Reader = struct {
             }
             try extractShapeRunsFromContentAppend(alloc, &glyph_shapes, glyph.content, &.{}, &.{});
             for (glyph_shapes.items) |shape| {
-                try appendOwnedValue(ShapeRun, alloc, out, try transformType3ShapeRunAlloc(alloc, shape, run, type3, cursor_x, cursor_y));
+                try appendOwnedValue(ShapeRun, alloc, out, try transformType3ShapeRunAlloc(alloc, shape, run, type3, cursor_x, cursor_y, paint_phase));
+                paint_phase += 1;
             }
 
             cursor_x += glyph.advance_x * run.font_size * run.horizontal_scale;
@@ -3129,6 +3131,7 @@ pub const Reader = struct {
         type3: Type3Font,
         cursor_x: f64,
         cursor_y: f64,
+        paint_phase: usize,
     ) !ShapeRun {
         var points = try alloc.alloc([2]f64, shape.points.len);
         errdefer alloc.free(points);
@@ -3144,7 +3147,11 @@ pub const Reader = struct {
 
         return .{
             .paint_order = run.paint_order,
-            .paint_phase = if (shape.kind == .fill) 0 else 1,
+            // A Type3 CharProc is an ordinary PDF content stream: its paint
+            // operators may occur in any sequence. Preserve that sequence
+            // across solid/pattern backing types instead of inferring text's
+            // synthesized fill-before-stroke phases from the shape kind.
+            .paint_phase = paint_phase,
             .blend_mode = run.blend_mode,
             .group_id = run.group_id,
             .group_parent_id = run.group_parent_id,
@@ -7893,12 +7900,12 @@ fn ensureType1SubrCapacity(alloc: Allocator, subrs: *std.ArrayList([]u8), index:
     for (subrs.items[old_len..]) |*item| item.* = &.{};
 }
 
-fn namedEncodingTable(enc: text_encoding.NamedEncoding) *const [256]u21 {
+fn type1EncodingGlyphName(enc: text_encoding.NamedEncoding, code: u8) ?[]const u8 {
     return switch (enc) {
-        .pdf_doc => &text_encoding.pdf_doc_encoding,
-        .win_ansi => &text_encoding.win_ansi_encoding,
-        .mac_roman => &text_encoding.mac_roman_encoding,
-        .standard => &text_encoding.standard_encoding,
+        .pdf_doc => null,
+        .win_ansi => if (std.mem.eql(u8, text_encoding.win_ansi_glyph_names[code], ".notdef")) null else text_encoding.win_ansi_glyph_names[code],
+        .mac_roman => text_encoding.mac_roman_glyph_names[code],
+        .standard => font_lib.cff.standardEncodingGlyphName(code),
     };
 }
 
@@ -7919,15 +7926,17 @@ fn populateType1EncodingFallbacks(
             else => {},
         }
     }
-    const table = namedEncodingTable(base_encoding);
     for (glyph_names) |name| {
-        const cp = text_encoding.glyphNameToRune(name) orelse continue;
         var code: usize = 0;
         while (code < 256) : (code += 1) {
             if (code_to_name[code] != null) continue;
-            if (table[code] != cp) continue;
+            if (type1EncodingGlyphName(base_encoding, @intCast(code))) |encoded_name| {
+                if (!std.mem.eql(u8, encoded_name, name)) continue;
+            } else if (base_encoding == .pdf_doc) {
+                const cp = text_encoding.glyphNameToRune(name) orelse continue;
+                if (text_encoding.pdf_doc_encoding[code] != cp) continue;
+            } else continue;
             code_to_name[code] = name;
-            break;
         }
     }
 }
@@ -19219,10 +19228,41 @@ test "vector text preserves mixed pattern fill and solid stroke phases" {
     try std.testing.expect(run.vectorizable);
     try std.testing.expectEqual(@as(usize, 1), pattern_out.items.len);
     try std.testing.expectEqual(@as(@FieldType(PatternRun, "kind"), .fill), pattern_out.items[0].kind);
-    try std.testing.expectEqual(@as(u8, 0), pattern_out.items[0].paint_phase);
+    try std.testing.expectEqual(@as(usize, 0), pattern_out.items[0].paint_phase);
     try std.testing.expectEqual(@as(usize, 1), shape_out.items.len);
     try std.testing.expectEqual(@as(@FieldType(ShapeRun, "kind"), .stroke), shape_out.items[0].kind);
-    try std.testing.expectEqual(@as(u8, 1), shape_out.items[0].paint_phase);
+    try std.testing.expectEqual(@as(usize, 1), shape_out.items[0].paint_phase);
+}
+
+test "Type3 vector text preserves intrinsic CharProc paint order" {
+    const alloc = std.testing.allocator;
+    var glyph_name = [_]u8{'A'};
+    var glyph_content = [_]u8{
+        '0', ' ', '0', ' ', 'm', ' ', '1', '0', ' ', '0', ' ', 'l', ' ', 'S', ' ',
+        '0', ' ', '0', ' ', 'm', ' ', '1', '0', ' ', '0', ' ', 'l', ' ', '1', '0',
+        ' ', '1', '0', ' ', 'l', ' ', 'f',
+    };
+    var glyphs = [_]Type3Glyph{.{
+        .code = 'A',
+        .name = &glyph_name,
+        .content = &glyph_content,
+        .advance_x = 1,
+        .advance_y = 0,
+    }};
+    const type3 = Type3Font{ .paint_type = 1, .font_matrix = .{ 1, 0, 0, 1, 0, 0 }, .glyphs = &glyphs };
+    const run = TextRun{ .text = "A", .x = 0, .y = 0, .font_size = 1, .paint_order = 7 };
+    var out = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (out.items) |*shape| shape.deinit(alloc);
+        out.deinit(alloc);
+    }
+
+    try std.testing.expect(try Reader.appendType3RunShapesAlloc(alloc, &out, run, type3, "A"));
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqual(@as(@FieldType(ShapeRun, "kind"), .stroke), out.items[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), out.items[0].paint_phase);
+    try std.testing.expectEqual(@as(@FieldType(ShapeRun, "kind"), .fill), out.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 1), out.items[1].paint_phase);
 }
 
 test "vector text failure retains a visible raster fallback" {
@@ -19268,7 +19308,7 @@ test "vector text failure retains a visible raster fallback" {
 test "Type1 seac accent offset follows horizontal text scaling" {
     const alloc = std.testing.allocator;
     var base_name = [_]u8{'A'};
-    var accent_name = [_]u8{ 'p', 'e', 'r', 'i', 'o', 'd' };
+    var accent_name = [_]u8{ 'a', 'c', 'u', 't', 'e' };
     var outline_program = [_]u8{
         139, 139, 21,
         189, 139, 5,
@@ -19278,7 +19318,7 @@ test "Type1 seac accent offset follows horizontal text scaling" {
     };
     var glyphs = [_]Type1Glyph{
         .{ .code = 'A', .name = &base_name, .charstring = &outline_program, .advance = 600 },
-        .{ .code = '.', .name = &accent_name, .charstring = &outline_program, .advance = 600 },
+        .{ .code = 194, .name = &accent_name, .charstring = &outline_program, .advance = 600 },
     };
     var font_bytes: [0]u8 = .{};
     const type1 = Type1Font{ .bytes = &font_bytes, .glyphs = &glyphs };
@@ -19300,7 +19340,7 @@ test "Type1 seac accent offset follows horizontal text scaling" {
         .adx = 100,
         .ady = 0,
         .bchar = 65,
-        .achar = 46,
+        .achar = 194,
     }));
     try std.testing.expectEqual(@as(usize, 2), out.items.len);
     var accent_min_x = std.math.inf(f64);

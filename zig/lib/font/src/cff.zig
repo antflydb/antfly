@@ -27,6 +27,23 @@ pub const Error = error{
 
 const ParseError = Error || std.mem.Allocator.Error;
 
+fn predefinedEncodingGlyphName(encoding: *const [256]u16, code: u8) ?[]const u8 {
+    const sid = encoding[code];
+    if (sid == 0 or sid >= cff_data.standard_strings.len) return null;
+    return cff_data.standard_strings[sid];
+}
+
+/// Adobe StandardEncoding names are shared by CFF and Type 1 fonts. Expose
+/// the canonical names so clients never have to round-trip through Unicode,
+/// where distinct PostScript glyph names can collapse or have no scalar.
+pub fn standardEncodingGlyphName(code: u8) ?[]const u8 {
+    return predefinedEncodingGlyphName(&cff_data.standard_encoding, code);
+}
+
+pub fn expertEncodingGlyphName(code: u8) ?[]const u8 {
+    return predefinedEncodingGlyphName(&cff_data.expert_encoding, code);
+}
+
 fn exactI32FromFloat(value: f64) Error!i32 {
     if (!std.math.isFinite(value) or
         @trunc(value) != value or
@@ -1557,10 +1574,10 @@ test "cff rejects overflowing charset ranges" {
 }
 
 test "cff resolves standard SID names and predefined encodings" {
-    var charset = [_]u16{ 0, 34, 35 };
+    var charset = [_]u16{ 0, 34, 35, 313 };
     const font = Font{
         .bytes = &.{},
-        .charstrings = .{ .count = 3, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .charstrings = .{ .count = 4, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
         .charset = &charset,
         .global_subrs = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
         .local_subrs = null,
@@ -1569,7 +1586,10 @@ test "cff resolves standard SID names and predefined encodings" {
     };
     try std.testing.expectEqual(@as(?u16, 1), font.glyphIndexForName("A"));
     try std.testing.expectEqual(@as(?u16, 2), font.glyphIndexForPredefinedCode('B', false));
+    try std.testing.expectEqual(@as(?u16, 3), font.glyphIndexForPredefinedCode(175, true));
     try std.testing.expectEqual(@as(?u16, null), font.glyphIndexForName("G21"));
+    try std.testing.expectEqualStrings("acute", standardEncodingGlyphName(194).?);
+    try std.testing.expectEqualStrings("Macronsmall", expertEncodingGlyphName(175).?);
 }
 
 test "cff parses custom encoding with supplements" {
