@@ -509,6 +509,8 @@ pub const A4bMappedLayer0PrewarmResult = struct {
 };
 
 pub const A4bResidencyMode = backend_contracts.A4bResidencyMode;
+pub const A4bLoadStrategy = backend_contracts.A4bLoadStrategy;
+pub const A4bPreparedPackMode = backend_contracts.A4bPreparedPackMode;
 pub const A4bInferenceRequest = backend_contracts.A4bInferenceRequest;
 pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
 pub const A4bInferenceConfig = backend_contracts.A4bInferenceConfig;

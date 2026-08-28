@@ -122,6 +122,11 @@ const Options = struct {
     scratch_budget_mb: usize = 0,
     a4b_residency_mode: ops.A4bResidencyMode = .auto,
     a4b_memory_budget_mb: u32 = 0,
+    a4b_load_strategy: ops.A4bLoadStrategy = .auto,
+    a4b_load_workers: u8 = 0,
+    a4b_load_staging_mb: u32 = 0,
+    a4b_prepared_pack: ops.A4bPreparedPackMode = .auto,
+    a4b_drop_host_cache_after_load: bool = false,
     a4b_options_explicit: bool = false,
     raw_prompt: bool = false,
     no_bos: bool = false,
@@ -2919,6 +2924,22 @@ fn cudaStatsCompactJson(
         &out,
         \\"a4b_resident_source_bytes":{d},
         \\"a4b_resident_source_count":{d},
+        \\"a4b_load_plan_ns":{d},
+        \\"a4b_load_dense_upload_ns":{d},
+        \\"a4b_load_dense_weight_count":{d},
+        \\"a4b_load_dense_mmap_weight_count":{d},
+        \\"a4b_load_host_stage_ns":{d},
+        \\"a4b_load_h2d_ns":{d},
+        \\"a4b_load_finalize_ns":{d},
+        \\"a4b_load_total_ns":{d},
+        \\"a4b_load_workers":{d},
+        \\"a4b_load_staging_bytes":{d},
+        \\"a4b_load_chunks":{d},
+        \\"a4b_load_pipeline_attempts":{d},
+        \\"a4b_load_pipeline_successes":{d},
+        \\"a4b_load_pipeline_fallbacks":{d},
+        \\"a4b_load_prepared_pack_hits":{d},
+        \\"a4b_load_prepared_pack_misses":{d},
         \\"a4b_route_calls":{d},
         \\"a4b_decode_calls":{d},
         \\"a4b_prefill_calls":{d},
@@ -2931,6 +2952,22 @@ fn cudaStatsCompactJson(
         .{
             stats.a4b_resident_source_bytes,
             stats.a4b_resident_source_count,
+            stats.a4b_load_plan_ns,
+            stats.a4b_load_dense_upload_ns,
+            stats.a4b_load_dense_weight_count,
+            stats.a4b_load_dense_mmap_weight_count,
+            stats.a4b_load_host_stage_ns,
+            stats.a4b_load_h2d_ns,
+            stats.a4b_load_finalize_ns,
+            stats.a4b_load_total_ns,
+            stats.a4b_load_workers,
+            stats.a4b_load_staging_bytes,
+            stats.a4b_load_chunks,
+            stats.a4b_load_pipeline_attempts,
+            stats.a4b_load_pipeline_successes,
+            stats.a4b_load_pipeline_fallbacks,
+            stats.a4b_load_prepared_pack_hits,
+            stats.a4b_load_prepared_pack_misses,
             stats.a4b_route_calls,
             stats.a4b_decode_calls,
             stats.a4b_prefill_calls,
@@ -4434,11 +4471,43 @@ fn writeJsonTiming(
                 &cuda_out,
                 \\"a4b_resident_source_bytes":{d},
                 \\"a4b_resident_source_count":{d},
+                \\"a4b_load_plan_ns":{d},
+                \\"a4b_load_dense_upload_ns":{d},
+                \\"a4b_load_dense_weight_count":{d},
+                \\"a4b_load_dense_mmap_weight_count":{d},
+                \\"a4b_load_host_stage_ns":{d},
+                \\"a4b_load_h2d_ns":{d},
+                \\"a4b_load_finalize_ns":{d},
+                \\"a4b_load_total_ns":{d},
+                \\"a4b_load_workers":{d},
+                \\"a4b_load_staging_bytes":{d},
+                \\"a4b_load_chunks":{d},
+                \\"a4b_load_pipeline_attempts":{d},
+                \\"a4b_load_pipeline_successes":{d},
+                \\"a4b_load_pipeline_fallbacks":{d},
+                \\"a4b_load_prepared_pack_hits":{d},
+                \\"a4b_load_prepared_pack_misses":{d},
                 \\
             ,
                 .{
                     cuda_stats.a4b_resident_source_bytes,
                     cuda_stats.a4b_resident_source_count,
+                    cuda_stats.a4b_load_plan_ns,
+                    cuda_stats.a4b_load_dense_upload_ns,
+                    cuda_stats.a4b_load_dense_weight_count,
+                    cuda_stats.a4b_load_dense_mmap_weight_count,
+                    cuda_stats.a4b_load_host_stage_ns,
+                    cuda_stats.a4b_load_h2d_ns,
+                    cuda_stats.a4b_load_finalize_ns,
+                    cuda_stats.a4b_load_total_ns,
+                    cuda_stats.a4b_load_workers,
+                    cuda_stats.a4b_load_staging_bytes,
+                    cuda_stats.a4b_load_chunks,
+                    cuda_stats.a4b_load_pipeline_attempts,
+                    cuda_stats.a4b_load_pipeline_successes,
+                    cuda_stats.a4b_load_pipeline_fallbacks,
+                    cuda_stats.a4b_load_prepared_pack_hits,
+                    cuda_stats.a4b_load_prepared_pack_misses,
                 },
             );
             try appendFmt(
@@ -7832,6 +7901,31 @@ fn parseArgs(args: []const []const u8) !Options {
             if (i >= args.len) return error.MissingA4bMemoryBudget;
             opts.a4b_memory_budget_mb = try std.fmt.parseInt(u32, args[i], 10);
             opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-load-strategy")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bLoadStrategy;
+            opts.a4b_load_strategy = std.meta.stringToEnum(ops.A4bLoadStrategy, args[i]) orelse
+                return error.InvalidA4bLoadStrategy;
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-load-workers")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bLoadWorkers;
+            opts.a4b_load_workers = try std.fmt.parseInt(u8, args[i], 10);
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-load-staging-mb")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bLoadStagingBudget;
+            opts.a4b_load_staging_mb = try std.fmt.parseInt(u32, args[i], 10);
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-prepared-pack")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bPreparedPackMode;
+            opts.a4b_prepared_pack = std.meta.stringToEnum(ops.A4bPreparedPackMode, args[i]) orelse
+                return error.InvalidA4bPreparedPackMode;
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-drop-host-cache-after-load")) {
+            opts.a4b_drop_host_cache_after_load = true;
+            opts.a4b_options_explicit = true;
         } else if (std.mem.eql(u8, arg, "--server")) {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
@@ -8110,6 +8204,11 @@ fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
     return .{
         .residency_mode = opts.a4b_residency_mode,
         .memory_budget_mb = opts.a4b_memory_budget_mb,
+        .load_strategy = opts.a4b_load_strategy,
+        .load_workers = opts.a4b_load_workers,
+        .load_staging_mb = opts.a4b_load_staging_mb,
+        .prepared_pack = opts.a4b_prepared_pack,
+        .drop_host_cache_after_load = opts.a4b_drop_host_cache_after_load,
     };
 }
 
@@ -8239,7 +8338,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|cuda|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--a4b-load-strategy auto|pipeline|legacy] [--a4b-load-workers N] [--a4b-load-staging-mb N] [--a4b-prepared-pack auto|off|required] [--a4b-drop-host-cache-after-load] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -8680,10 +8779,24 @@ test "parseArgs builds the explicit A4B residency request" {
         "streamed",
         "--a4b-memory-budget-mb",
         "4096",
+        "--a4b-load-strategy",
+        "pipeline",
+        "--a4b-load-workers",
+        "6",
+        "--a4b-load-staging-mb",
+        "384",
+        "--a4b-prepared-pack",
+        "required",
+        "--a4b-drop-host-cache-after-load",
     });
     const request = a4bInferenceRequest(opts).?;
     try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
     try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
+    try std.testing.expectEqual(ops.A4bLoadStrategy.pipeline, request.load_strategy);
+    try std.testing.expectEqual(@as(u8, 6), request.load_workers);
+    try std.testing.expectEqual(@as(u32, 384), request.load_staging_mb);
+    try std.testing.expectEqual(ops.A4bPreparedPackMode.required, request.prepared_pack);
+    try std.testing.expect(request.drop_host_cache_after_load);
     try std.testing.expect(!serverGenerateSupportsOptions(opts));
 
     try std.testing.expectError(error.InvalidA4bResidencyMode, parseArgs(&.{

@@ -49,6 +49,25 @@ pub const A4bResidencyMode = enum(u8) {
     resident,
 };
 
+/// Host-file to CUDA transfer policy for the qualified A4B runtime. `auto`
+/// selects the bounded multithreaded pipeline and may fall back to the legacy
+/// mmap upload only when the host cannot provide the required pinned staging
+/// resources. The choice is frozen at admission.
+pub const A4bLoadStrategy = enum(u8) {
+    auto,
+    pipeline,
+    legacy,
+};
+
+/// Selection policy for an optional prepared A4B CUDA load pack. Prepared
+/// packs are derived, bit-preserving load artifacts; the canonical model
+/// remains the source of architecture and tokenizer metadata.
+pub const A4bPreparedPackMode = enum(u8) {
+    auto,
+    off,
+    required,
+};
+
 /// The complete caller-controlled A4B surface. Expert slots, prefetch depth,
 /// worker counts, and routing placement are intentionally backend-owned.
 pub const A4bInferenceRequest = struct {
@@ -56,6 +75,15 @@ pub const A4bInferenceRequest = struct {
     /// Total memory envelope in MiB. Zero selects the conservative 2 GiB
     /// streamed floor; an explicitly smaller value is rejected.
     memory_budget_mb: u32 = 0,
+    load_strategy: A4bLoadStrategy = .auto,
+    /// Zero selects the production default. Explicit values are bounded so a
+    /// model request cannot create an unbounded host thread pool.
+    load_workers: u8 = 0,
+    /// Zero selects the production default. This is the aggregate pinned-host
+    /// staging envelope rather than a per-worker allocation.
+    load_staging_mb: u32 = 0,
+    prepared_pack: A4bPreparedPackMode = .auto,
+    drop_host_cache_after_load: bool = false,
 };
 
 pub const A4bExpertGeometry = struct {
@@ -86,6 +114,11 @@ pub const A4bInferenceConfig = struct {
     safety_reserve_bytes: u64 = default_safety_reserve_bytes,
     expert_cache_slots: u8,
     geometry: A4bExpertGeometry,
+    load_strategy: A4bLoadStrategy,
+    load_workers: u8,
+    load_staging_bytes: u64,
+    prepared_pack: A4bPreparedPackMode,
+    drop_host_cache_after_load: bool,
 
     pub const min_memory_budget_mb: u32 = 2048;
     /// Unassigned headroom inside the public envelope. Sixty-four MiB is the
@@ -96,6 +129,11 @@ pub const A4bInferenceConfig = struct {
     pub const min_expert_cache_slots: u8 = 8;
     pub const max_expert_cache_slots: u8 = 128;
     pub const expert_arena_alignment: u64 = 16 * 1024;
+    pub const default_load_workers: u8 = 4;
+    pub const max_load_workers: u8 = 8;
+    pub const default_load_staging_mb: u32 = 256;
+    pub const min_load_staging_mb: u32 = 64;
+    pub const max_load_staging_mb: u32 = 1024;
 
     pub fn softLimitBytes(self: A4bInferenceConfig) u64 {
         return self.memory_budget_bytes -| self.safety_reserve_bytes;
@@ -127,6 +165,8 @@ pub const A4bConfigError = error{
     A4bResidentBudgetTooSmall,
     A4bUnsupportedArtifact,
     A4bUnsupportedGeometry,
+    A4bInvalidLoadWorkers,
+    A4bInvalidLoadStagingBudget,
 };
 
 pub fn isQualifiedA4bGeometry(geometry: A4bExpertGeometry) bool {
@@ -147,6 +187,14 @@ pub fn buildA4bInferenceConfig(
         request.memory_budget_mb < A4bInferenceConfig.min_memory_budget_mb)
     {
         return error.A4bBudgetTooSmall;
+    }
+    if (request.load_workers > A4bInferenceConfig.max_load_workers)
+        return error.A4bInvalidLoadWorkers;
+    if (request.load_staging_mb != 0 and
+        (request.load_staging_mb < A4bInferenceConfig.min_load_staging_mb or
+            request.load_staging_mb > A4bInferenceConfig.max_load_staging_mb))
+    {
+        return error.A4bInvalidLoadStagingBudget;
     }
 
     const budget_mb = if (request.memory_budget_mb == 0)
@@ -175,6 +223,17 @@ pub fn buildA4bInferenceConfig(
         .kv_budget_bytes = kv_budget_bytes,
         .expert_cache_slots = slots,
         .geometry = geometry,
+        .load_strategy = request.load_strategy,
+        .load_workers = if (request.load_workers == 0)
+            A4bInferenceConfig.default_load_workers
+        else
+            request.load_workers,
+        .load_staging_bytes = @as(u64, if (request.load_staging_mb == 0)
+            A4bInferenceConfig.default_load_staging_mb
+        else
+            request.load_staging_mb) * 1024 * 1024,
+        .prepared_pack = request.prepared_pack,
+        .drop_host_cache_after_load = request.drop_host_cache_after_load,
     };
     const full_resident = @as(u16, slots) == geometry.expert_count and
         budget_bytes >= config.fullResidencyFloorBytes();
@@ -193,6 +252,9 @@ test "A4B inference contract is qualified and budget derived" {
     try std.testing.expectEqual(@as(u8, 8), floor.expert_cache_slots);
     try std.testing.expectEqual(@as(u64, 2048) * 1024 * 1024, floor.memory_budget_bytes);
     try std.testing.expectEqual(@as(u64, 512) * 1024 * 1024, floor.kv_budget_bytes);
+    try std.testing.expectEqual(A4bLoadStrategy.auto, floor.load_strategy);
+    try std.testing.expectEqual(@as(u8, 4), floor.load_workers);
+    try std.testing.expectEqual(@as(u64, 256) * 1024 * 1024, floor.load_staging_bytes);
 
     try std.testing.expectEqual(@as(u8, 24), (try buildA4bInferenceConfig(.{ .memory_budget_mb = 4096 }, geometry)).expert_cache_slots);
     try std.testing.expectEqual(@as(u8, 45), (try buildA4bInferenceConfig(.{ .memory_budget_mb = 6144 }, geometry)).expert_cache_slots);
@@ -222,6 +284,14 @@ test "A4B inference contract fails closed" {
     try std.testing.expectError(
         error.A4bResidentBudgetTooSmall,
         buildA4bInferenceConfig(.{ .residency_mode = .resident }, geometry),
+    );
+    try std.testing.expectError(
+        error.A4bInvalidLoadWorkers,
+        buildA4bInferenceConfig(.{ .load_workers = 9 }, geometry),
+    );
+    try std.testing.expectError(
+        error.A4bInvalidLoadStagingBudget,
+        buildA4bInferenceConfig(.{ .load_staging_mb = 32 }, geometry),
     );
     var wrong = geometry;
     wrong.expert_count -= 1;

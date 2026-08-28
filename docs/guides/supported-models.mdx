@@ -115,6 +115,18 @@ Server deployments must also leave transient host/combined admission headroom
 for the encoded GGUF during CUDA upload; only the 16 GiB CUDA envelope remains
 leased after load.
 
+CUDA uses a bounded multithreaded pinned-host load pipeline by default. Clean
+GGUF pages remain kernel-reclaimable and shared across rolling workers unless
+`--a4b-drop-host-cache-after-load` is selected. Production images can install
+a versioned `$MODEL/a4b-cuda-pack-v1` created with `antfly-inference a4b-pack`;
+use `a4b-pack --verify` after copying it and `--a4b-prepared-pack required` to
+fail closed if that artifact is absent or stale. This is deliberately a
+full-model residency contract, not an `ngl`-style layer split. Cache retention
+and server `startup_strategy: "prefetch"` are deployment tools rather than a
+latency guarantee; hosts must have enough reclaimable memory for their
+checkpoint and loader working set, and should measure replacement-worker load
+time on the actual storage topology.
+
 ## Known incompatible artifacts and families
 
 Rejected with HTTP 400 before any load. Some of these do not merely fail — they would

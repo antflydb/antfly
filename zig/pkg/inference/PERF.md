@@ -23,10 +23,64 @@ ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY=required \
   --print-token-ids --print-prompt-token-ids --print-timing
 ```
 
-The CUDA loader orders mmap-backed uploads by file offset and applies
-sequential advice only to consumed tensor spans. On the pinned 14.4 GB GGUF,
-this reduced model load from about 1,746 seconds to about 124 seconds. Server
-admission charges the encoded GGUF as transient host memory during upload;
+The CUDA loader orders mmap-backed dense uploads by file offset and moves the
+packed experts through a bounded pinned-host pipeline (four workers and 256
+MiB aggregate staging by default). On the pinned 14.4 GB GGUF, the original
+offset ordering reduced model load from about 1,746 seconds to about 124
+seconds. The first real pipeline qualification reduced it again to **91.3
+seconds**: 13.9 seconds for 598 dense weights and 73.0 seconds for 12.25 GiB of
+packed expert sources. The final ReleaseSafe qualification measured 90.77
+seconds cold and 89.99 seconds in an immediate replacement process: 13.77 /
+12.67 seconds for dense weights and 73.02 / 72.98 seconds for experts. The
+expert phase was storage-bound on that host (about 176 MiB/s), so increasing
+workers beyond the bounded default is not expected to beat the underlying
+volume.
+
+The default CUDA A4B policy is now full residency; an explicit A4B budget flag
+is unnecessary for the qualified model, although the global backend/combined
+budgets must still admit the allocation. `--a4b-load-strategy legacy` is the
+rollback. `pipeline` fails closed, while `auto` falls back only when pinned
+staging, worker creation, or host allocation is unavailable. JSON timing
+includes the dense, plan, host-stage, H2D, finalization, chunk, worker, and
+prepared-pack counters.
+
+For rolling workers, clean checkpoint pages remain in the reclaimable kernel
+page cache after successful full-residency upload. Use
+`--a4b-drop-host-cache-after-load` when host-memory pressure matters more than
+replacement-worker admission. Server `startup_strategy: "prefetch"` can warm
+the canonical GGUF or an installed prepared pack without creating a CUDA
+session. This is an operator-controlled cache-warming mechanism, not a promised
+restart-speedup: the qualification host had only about 15 GiB of RAM for a
+14.4 GiB checkpoint plus loader state, and its immediate replacement load was
+effectively unchanged. Deployments that depend on warm admission should
+measure it with their actual host-memory and storage topology.
+
+For immutable deployments, build a balanced expert pack offline (the command
+never overwrites an existing directory):
+
+```sh
+./zig-out/bin/antfly-inference a4b-pack "$MODEL" --shards 4
+./zig-out/bin/antfly-inference a4b-pack "$MODEL" --verify
+```
+
+The default `auto` pack policy uses `$MODEL/a4b-cuda-pack-v1` when present;
+`--a4b-prepared-pack required` rejects an absent, stale, malformed, or
+geometry-mismatched pack, while `off` forces the canonical GGUF. Manifests bind
+to a relocatable source fingerprint, preserve per-shard SHA-256 digests for
+offline verification, and validate every source name, length, bound, overlap,
+and load order before device allocation. A custom output directory is useful
+for image construction, but it must be installed or symlinked as
+`$MODEL/a4b-cuda-pack-v1` before automatic admission. Shards may be placed on
+independent mounted volumes by the deployment while the same bounded worker
+pool consumes them in parallel.
+
+The real 12.25 GiB expert pack was not materialized on the qualification host
+because the filesystem lacked the required free space. Synthetic pack
+creation, integrity, stale-source, overlap, no-replace, and loader-selection
+tests passed; a production pack should still be built, verified, and timed on
+the deployment storage before relying on that lane.
+
+Server admission charges the encoded GGUF as transient host memory during upload;
 the peak combined envelope is about 30,154 MiB and the retained CUDA envelope
 is 16,384 MiB.
 

@@ -25,6 +25,7 @@ const scratch_mod = @import("scratch.zig");
 const weight_source_mod = @import("../../models/weight_source.zig");
 const tensor_store_mod = @import("../../models/tensor_store.zig");
 const c_file = @import("../../util/c_file.zig");
+pub const a4b_prepared_pack = @import("a4b_prepared_pack.zig");
 const native_compute_mod = @import("../native_compute.zig");
 const run_memory = @import("../../runtime/tier/memory.zig");
 const load_plan = @import("load_plan.zig");
@@ -116,26 +117,111 @@ const CudaA4bSourceLoad = struct {
     name: []u8,
     raw_bytes: []const u8,
     mmap_offset: ?usize,
+    load_order: usize,
+    lane: u8 = 0,
 };
 
 const CudaA4bSourceLoadPlan = struct {
     sources: std.ArrayListUnmanaged(CudaA4bSourceLoad) = .empty,
     total_bytes: usize = 0,
     mmap_source_count: usize = 0,
+    parallel_lanes: u8 = 1,
+    prepared_pack: ?a4b_prepared_pack.Loaded = null,
 
     fn deinit(self: *CudaA4bSourceLoadPlan, allocator: std.mem.Allocator) void {
         for (self.sources.items) |source| allocator.free(source.name);
         self.sources.deinit(allocator);
+        if (self.prepared_pack) |*pack| pack.deinit();
         self.* = .{};
     }
 };
 
+const CudaA4bLoadChunk = struct {
+    source_index: usize,
+    source_offset: usize,
+    len: usize,
+};
+
+const CudaA4bLoadSlotState = enum(u8) {
+    empty,
+    filling,
+    ready,
+    in_flight,
+};
+
+const CudaA4bLoadSlot = struct {
+    host: buffer_mod.HostBuffer = .{},
+    event: driver_mod.CUevent = null,
+    state: CudaA4bLoadSlotState = .empty,
+    task_index: usize = 0,
+};
+
+const CudaA4bLoadPipelineState = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    plan: *const CudaA4bSourceLoadPlan,
+    tasks: []const CudaA4bLoadChunk,
+    slots: []CudaA4bLoadSlot,
+    next_task: usize = 0,
+    workers_done: usize = 0,
+    stop: bool = false,
+    worker_copy_ns: u64 = 0,
+
+    fn lock(self: *CudaA4bLoadPipelineState) void {
+        platform.sync.lockYielding(&self.mutex);
+    }
+
+    fn workerMain(self: *CudaA4bLoadPipelineState) void {
+        while (true) {
+            self.lock();
+            if (self.stop or self.next_task >= self.tasks.len) {
+                self.workers_done += 1;
+                self.mutex.unlock();
+                return;
+            }
+            var slot_index: ?usize = null;
+            for (self.slots, 0..) |slot, index| {
+                if (slot.state == .empty) {
+                    slot_index = index;
+                    break;
+                }
+            }
+            if (slot_index == null) {
+                self.mutex.unlock();
+                std.Thread.yield() catch std.atomic.spinLoopHint();
+                continue;
+            }
+            const task_index = self.next_task;
+            self.next_task += 1;
+            const slot = &self.slots[slot_index.?];
+            slot.state = .filling;
+            slot.task_index = task_index;
+            self.mutex.unlock();
+
+            const started_ns = platform.time.monotonicNs();
+            const task = self.tasks[task_index];
+            const source = self.plan.sources.items[task.source_index].raw_bytes;
+            @memcpy(
+                slot.host.bytes()[0..task.len],
+                source[task.source_offset..][0..task.len],
+            );
+            const elapsed_ns = platform.time.monotonicNs() -| started_ns;
+
+            self.lock();
+            if (self.stop) {
+                slot.state = .empty;
+                self.workers_done += 1;
+                self.mutex.unlock();
+                return;
+            }
+            self.worker_copy_ns +|= elapsed_ns;
+            slot.state = .ready;
+            self.mutex.unlock();
+        }
+    }
+};
+
 fn a4bSourceLoadLessThan(_: void, lhs: CudaA4bSourceLoad, rhs: CudaA4bSourceLoad) bool {
-    if (lhs.mmap_offset) |lhs_offset| {
-        if (rhs.mmap_offset) |rhs_offset| {
-            if (lhs_offset != rhs_offset) return lhs_offset < rhs_offset;
-        } else return true;
-    } else if (rhs.mmap_offset != null) return false;
+    if (lhs.load_order != rhs.load_order) return lhs.load_order < rhs.load_order;
     return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
 
@@ -145,9 +231,9 @@ test "CUDA A4B source upload order follows mmap offsets" {
     try std.testing.expectEqual(@as(?usize, null), c_file.mappedSliceOffset(mapped[16..], mapped[0..8]));
 
     var sources = [_]CudaA4bSourceLoad{
-        .{ .name = @constCast("heap"), .raw_bytes = &.{}, .mmap_offset = null },
-        .{ .name = @constCast("later"), .raw_bytes = &.{}, .mmap_offset = 48 },
-        .{ .name = @constCast("earlier"), .raw_bytes = &.{}, .mmap_offset = 8 },
+        .{ .name = @constCast("heap"), .raw_bytes = &.{}, .mmap_offset = null, .load_order = std.math.maxInt(usize) },
+        .{ .name = @constCast("later"), .raw_bytes = &.{}, .mmap_offset = 48, .load_order = 48 },
+        .{ .name = @constCast("earlier"), .raw_bytes = &.{}, .mmap_offset = 8, .load_order = 8 },
     };
     std.mem.sort(CudaA4bSourceLoad, &sources, {}, a4bSourceLoadLessThan);
     try std.testing.expectEqualStrings("earlier", sources[0].name);
@@ -942,6 +1028,22 @@ pub const RuntimeStats = struct {
     resident_weight_bytes: usize = 0,
     a4b_resident_source_bytes: usize = 0,
     a4b_resident_source_count: usize = 0,
+    a4b_load_plan_ns: u64 = 0,
+    a4b_load_dense_upload_ns: u64 = 0,
+    a4b_load_dense_weight_count: usize = 0,
+    a4b_load_dense_mmap_weight_count: usize = 0,
+    a4b_load_host_stage_ns: u64 = 0,
+    a4b_load_h2d_ns: u64 = 0,
+    a4b_load_finalize_ns: u64 = 0,
+    a4b_load_total_ns: u64 = 0,
+    a4b_load_workers: usize = 0,
+    a4b_load_staging_bytes: usize = 0,
+    a4b_load_chunks: usize = 0,
+    a4b_load_pipeline_attempts: u64 = 0,
+    a4b_load_pipeline_successes: u64 = 0,
+    a4b_load_pipeline_fallbacks: u64 = 0,
+    a4b_load_prepared_pack_hits: u64 = 0,
+    a4b_load_prepared_pack_misses: u64 = 0,
     a4b_route_calls: u64 = 0,
     a4b_decode_calls: u64 = 0,
     a4b_prefill_calls: u64 = 0,
@@ -2349,6 +2451,17 @@ pub const CudaCompute = struct {
         return stats;
     }
 
+    pub fn noteA4bDenseUpload(
+        self: *CudaCompute,
+        elapsed_ns: u64,
+        weight_count: usize,
+        mmap_weight_count: usize,
+    ) void {
+        self.stats.a4b_load_dense_upload_ns +|= elapsed_ns;
+        self.stats.a4b_load_dense_weight_count +|= weight_count;
+        self.stats.a4b_load_dense_mmap_weight_count +|= mmap_weight_count;
+    }
+
     pub fn attachLazyHostStore(self: *CudaCompute, store: *native_compute_mod.WeightStore) !void {
         self.lazy_host_store = store;
         try self.resident_weights.ensureTotalCapacity(
@@ -2427,18 +2540,29 @@ pub const CudaCompute = struct {
         return .{ .source = source, .base_offset = layout.base_offset, .expert_stride = layout.expert_stride };
     }
 
+    fn a4bPreparedPackGeometry(config: backend_contracts.A4bInferenceConfig) a4b_prepared_pack.GeometryIdentity {
+        return .{
+            .moe_layer_count = config.geometry.moe_layer_count,
+            .expert_count = config.geometry.expert_count,
+            .top_k = config.geometry.top_k,
+            .hidden_size = config.geometry.hidden_size,
+            .expert_intermediate_size = config.geometry.expert_intermediate_size,
+            .encoded_expert_bytes = config.geometry.encoded_expert_bytes,
+        };
+    }
+
     fn a4bSourceLoadPlan(
-        self: *CudaCompute,
+        allocator: std.mem.Allocator,
         store: *native_compute_mod.WeightStore,
         config: backend_contracts.A4bInferenceConfig,
     ) !CudaA4bSourceLoadPlan {
         var plan = CudaA4bSourceLoadPlan{};
-        errdefer plan.deinit(self.allocator);
+        errdefer plan.deinit(allocator);
         var source_indices = std.StringHashMapUnmanaged(usize){};
         defer {
             var it = source_indices.keyIterator();
-            while (it.next()) |name| self.allocator.free(name.*);
-            source_indices.deinit(self.allocator);
+            while (it.next()) |name| allocator.free(name.*);
+            source_indices.deinit(allocator);
         }
         var key_buf: [160]u8 = undefined;
         for (0..config.geometry.moe_layer_count) |layer| {
@@ -2463,18 +2587,22 @@ pub const CudaCompute = struct {
                         return error.A4bCudaAmbiguousPackedSource;
                     }
                 } else {
-                    const map_name = try self.allocator.dupe(u8, source_name);
-                    source_indices.put(self.allocator, map_name, plan.sources.items.len) catch |err| {
-                        self.allocator.free(map_name);
+                    const map_name = try allocator.dupe(u8, source_name);
+                    source_indices.put(allocator, map_name, plan.sources.items.len) catch |err| {
+                        allocator.free(map_name);
                         return err;
                     };
-                    const plan_name = try self.allocator.dupe(u8, source_name);
-                    plan.sources.append(self.allocator, .{
+                    const plan_name = try allocator.dupe(u8, source_name);
+                    plan.sources.append(allocator, .{
                         .name = plan_name,
                         .raw_bytes = storage.raw_bytes,
                         .mmap_offset = mmap_offset,
+                        // Heap-backed sources follow file-backed ranges in
+                        // stable discovery order. Qualified GGUF sources are
+                        // mmap-backed, but fallback ordering remains explicit.
+                        .load_order = mmap_offset orelse std.math.maxInt(usize) / 2 + plan.sources.items.len,
                     }) catch |err| {
-                        self.allocator.free(plan_name);
+                        allocator.free(plan_name);
                         return err;
                     };
                     plan.total_bytes = try checkedAdd(plan.total_bytes, storage.raw_bytes.len);
@@ -2486,7 +2614,118 @@ pub const CudaCompute = struct {
         return plan;
     }
 
-    fn loadA4bResidentSources(
+    fn a4bApplyPreparedPack(plan: *CudaA4bSourceLoadPlan, loaded: a4b_prepared_pack.Loaded) !void {
+        var pack = loaded;
+        errdefer pack.deinit();
+        if (pack.sources.len != plan.sources.items.len) return error.A4bPreparedPackSourceCountMismatch;
+        var max_lane: u8 = 0;
+        for (plan.sources.items) |*source| {
+            var match: ?a4b_prepared_pack.LoadedSource = null;
+            for (pack.sources) |candidate| {
+                if (std.mem.eql(u8, source.name, candidate.name)) {
+                    match = candidate;
+                    break;
+                }
+            }
+            const prepared = match orelse return error.A4bPreparedPackMissingSource;
+            if (prepared.bytes.len != source.raw_bytes.len) return error.A4bPreparedPackSourceLengthMismatch;
+            source.raw_bytes = prepared.bytes;
+            source.mmap_offset = null;
+            source.load_order = prepared.load_order;
+            source.lane = prepared.shard;
+            max_lane = @max(max_lane, prepared.shard);
+        }
+        std.mem.sort(CudaA4bSourceLoad, plan.sources.items, {}, a4bSourceLoadLessThan);
+        plan.mmap_source_count = plan.sources.items.len;
+        plan.parallel_lanes = max_lane + 1;
+        plan.prepared_pack = pack;
+    }
+
+    fn a4bResolvedSourceLoadPlan(
+        self: *CudaCompute,
+        store: *native_compute_mod.WeightStore,
+        config: backend_contracts.A4bInferenceConfig,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+    ) !CudaA4bSourceLoadPlan {
+        var plan = try a4bSourceLoadPlan(self.allocator, store, config);
+        errdefer plan.deinit(self.allocator);
+        switch (config.prepared_pack) {
+            .off => {},
+            .auto, .required => {
+                if (try a4b_prepared_pack.load(
+                    self.allocator,
+                    model_path,
+                    source_artifact_path,
+                    a4bPreparedPackGeometry(config),
+                )) |loaded| {
+                    try a4bApplyPreparedPack(&plan, loaded);
+                    self.stats.a4b_load_prepared_pack_hits +|= 1;
+                } else if (config.prepared_pack == .required) {
+                    return error.A4bPreparedPackRequired;
+                } else {
+                    self.stats.a4b_load_prepared_pack_misses +|= 1;
+                }
+            },
+        }
+        return plan;
+    }
+
+    /// Cross-check an installed pack against the canonical packed-source
+    /// inventory without constructing a CUDA context. Session admission calls
+    /// this after native catalog parsing but before allocating device memory.
+    pub fn preflightA4bPreparedPackInventory(
+        allocator: std.mem.Allocator,
+        store: *native_compute_mod.WeightStore,
+        config: backend_contracts.A4bInferenceConfig,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+    ) !void {
+        if (config.prepared_pack == .off) return;
+        var plan = try a4bSourceLoadPlan(allocator, store, config);
+        defer plan.deinit(allocator);
+        if (try a4b_prepared_pack.load(
+            allocator,
+            model_path,
+            source_artifact_path,
+            a4bPreparedPackGeometry(config),
+        )) |loaded| {
+            try a4bApplyPreparedPack(&plan, loaded);
+            // Metadata preflight must never undo an earlier explicit prefetch.
+            if (plan.prepared_pack) |*pack| pack.preserveFileCacheOnDeinit();
+        } else if (config.prepared_pack == .required) {
+            return error.A4bPreparedPackRequired;
+        }
+    }
+
+    pub fn writeA4bPreparedPack(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        store: *native_compute_mod.WeightStore,
+        config: backend_contracts.A4bInferenceConfig,
+        source_artifact_path: []const u8,
+        output_path: []const u8,
+        shard_count: u8,
+    ) !a4b_prepared_pack.WriteReport {
+        var plan = try a4bSourceLoadPlan(allocator, store, config);
+        defer plan.deinit(allocator);
+        const sources = try allocator.alloc(a4b_prepared_pack.SourceView, plan.sources.items.len);
+        defer allocator.free(sources);
+        for (plan.sources.items, 0..) |source, index| {
+            sources[index] = .{ .name = source.name, .bytes = source.raw_bytes };
+        }
+        return a4b_prepared_pack.write(
+            allocator,
+            io,
+            source_artifact_path,
+            output_path,
+            a4bPreparedPackGeometry(config),
+            sources,
+            shard_count,
+        );
+    }
+
+    fn loadA4bResidentSourcesLegacy(
         self: *CudaCompute,
         runtime: *CudaA4bRuntime,
         plan: *const CudaA4bSourceLoadPlan,
@@ -2505,14 +2744,280 @@ pub const CudaCompute = struct {
         }
     }
 
-    pub fn loadA4bResidentFromHostStore(self: *CudaCompute, store: *native_compute_mod.WeightStore) !void {
+    fn prepareA4bResidentSourceDestinations(
+        self: *CudaCompute,
+        plan: *const CudaA4bSourceLoadPlan,
+    ) !std.ArrayListUnmanaged(CudaA4bSource) {
+        var sources = std.ArrayListUnmanaged(CudaA4bSource).empty;
+        errdefer {
+            for (sources.items) |*source| {
+                source.buffer.free(&self.ctx);
+                self.allocator.free(source.name);
+            }
+            sources.deinit(self.allocator);
+        }
+        try sources.ensureTotalCapacity(self.allocator, plan.sources.items.len);
+        for (plan.sources.items) |source| {
+            var device = try allocDeviceBuffer(self, source.raw_bytes.len);
+            errdefer device.free(&self.ctx);
+            const owned_name = try self.allocator.dupe(u8, source.name);
+            sources.appendAssumeCapacity(.{ .name = owned_name, .buffer = device });
+        }
+        return sources;
+    }
+
+    fn buildA4bLoadChunks(
+        self: *CudaCompute,
+        plan: *const CudaA4bSourceLoadPlan,
+        chunk_bytes: usize,
+    ) !std.ArrayListUnmanaged(CudaA4bLoadChunk) {
+        if (chunk_bytes == 0) return error.A4bCudaInvalidLoadStaging;
+        var chunks = std.ArrayListUnmanaged(CudaA4bLoadChunk).empty;
+        errdefer chunks.deinit(self.allocator);
+        if (plan.parallel_lanes <= 1) {
+            for (plan.sources.items, 0..) |source, source_index| {
+                var offset: usize = 0;
+                while (offset < source.raw_bytes.len) {
+                    const len = @min(chunk_bytes, source.raw_bytes.len - offset);
+                    try chunks.append(self.allocator, .{
+                        .source_index = source_index,
+                        .source_offset = offset,
+                        .len = len,
+                    });
+                    offset += len;
+                }
+            }
+            return chunks;
+        }
+
+        // Prepared shards are independent sequential files. Interleave one
+        // chunk from each source/lane so workers can keep all backing devices
+        // busy instead of draining an entire shard before opening the next.
+        const offsets = try self.allocator.alloc(usize, plan.sources.items.len);
+        defer self.allocator.free(offsets);
+        @memset(offsets, 0);
+        var remaining = plan.sources.items.len;
+        while (remaining > 0) {
+            for (0..plan.parallel_lanes) |lane| {
+                for (plan.sources.items, 0..) |source, source_index| {
+                    if (source.lane != lane or offsets[source_index] >= source.raw_bytes.len) continue;
+                    const offset = offsets[source_index];
+                    const len = @min(chunk_bytes, source.raw_bytes.len - offset);
+                    try chunks.append(self.allocator, .{
+                        .source_index = source_index,
+                        .source_offset = offset,
+                        .len = len,
+                    });
+                    offsets[source_index] += len;
+                    if (offsets[source_index] == source.raw_bytes.len) remaining -= 1;
+                }
+            }
+        }
+        return chunks;
+    }
+
+    fn loadA4bResidentSourcesPipeline(
+        self: *CudaCompute,
+        runtime: *CudaA4bRuntime,
+        plan: *const CudaA4bSourceLoadPlan,
+        config: backend_contracts.A4bInferenceConfig,
+    ) !void {
+        const worker_count: usize = config.load_workers;
+        if (worker_count == 0 or worker_count > backend_contracts.A4bInferenceConfig.max_load_workers)
+            return error.A4bCudaInvalidLoadWorkers;
+        const staging_bytes: usize = @intCast(config.load_staging_bytes);
+        const slot_count = worker_count * 2;
+        if (slot_count == 0 or staging_bytes < slot_count) return error.A4bCudaInvalidLoadStaging;
+        const page_size = std.heap.page_size_min;
+        const raw_chunk_bytes = staging_bytes / slot_count;
+        const chunk_bytes = std.mem.alignBackward(usize, raw_chunk_bytes, page_size);
+        if (chunk_bytes == 0) return error.A4bCudaInvalidLoadStaging;
+
+        var chunks = try self.buildA4bLoadChunks(plan, chunk_bytes);
+        defer chunks.deinit(self.allocator);
+        if (chunks.items.len == 0) return;
+
+        var slots = try self.allocator.alloc(CudaA4bLoadSlot, slot_count);
+        defer self.allocator.free(slots);
+        @memset(slots, .{});
+        var slots_initialized: usize = 0;
+        defer {
+            for (slots[0..slots_initialized]) |*slot| {
+                if (slot.event != null) self.ctx.destroyEvent(slot.event);
+                slot.host.free(&self.ctx);
+            }
+        }
+        for (slots) |*slot| {
+            slot.host = buffer_mod.HostBuffer.alloc(&self.ctx, chunk_bytes) catch |err| switch (err) {
+                error.CudaSymbolMissing, error.CudaHostAllocationFailed => return error.A4bCudaPinnedStagingUnavailable,
+                else => return err,
+            };
+            slot.event = try self.ctx.createStreamEvent();
+            slots_initialized += 1;
+        }
+
+        var sources = try self.prepareA4bResidentSourceDestinations(plan);
+        var sources_committed = false;
+        defer {
+            if (!sources_committed) {
+                for (sources.items) |*source| {
+                    source.buffer.free(&self.ctx);
+                    self.allocator.free(source.name);
+                }
+            }
+            sources.deinit(self.allocator);
+        }
+
+        try self.ctx.makeCurrent();
+        var upload_stream: driver_mod.CUstream = null;
+        try self.ctx.driver.check(self.ctx.driver.fns.cuStreamCreate(&upload_stream, 1));
+        if (upload_stream == null) return error.InvalidCudaState;
+        defer _ = self.ctx.driver.fns.cuStreamDestroy(upload_stream);
+
+        for (plan.sources.items) |source| {
+            if (source.mmap_offset != null) c_file.MmapRegion.adviseBytesSequential(source.raw_bytes);
+        }
+
+        var state = CudaA4bLoadPipelineState{
+            .plan = plan,
+            .tasks = chunks.items,
+            .slots = slots,
+        };
+        const threads = try self.allocator.alloc(std.Thread, worker_count);
+        defer self.allocator.free(threads);
+        var spawned: usize = 0;
+        defer {
+            state.lock();
+            state.stop = true;
+            state.mutex.unlock();
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        for (threads) |*thread| {
+            thread.* = std.Thread.spawn(.{}, CudaA4bLoadPipelineState.workerMain, .{&state}) catch
+                return error.A4bCudaLoadWorkersUnavailable;
+            spawned += 1;
+        }
+
+        const transfer_started_ns = platform.time.monotonicNs();
+        var completed: usize = 0;
+        while (completed < chunks.items.len) {
+            var ready_index: ?usize = null;
+            state.lock();
+            for (state.slots, 0..) |slot, index| {
+                if (slot.state == .ready) {
+                    state.slots[index].state = .in_flight;
+                    ready_index = index;
+                    break;
+                }
+            }
+            state.mutex.unlock();
+
+            if (ready_index) |slot_index| {
+                const slot = &state.slots[slot_index];
+                const task = chunks.items[slot.task_index];
+                const destination = sources.items[task.source_index].buffer;
+                if (task.source_offset > destination.len or
+                    task.len > destination.len - task.source_offset)
+                {
+                    return error.InvalidPackedExpertTensor;
+                }
+                try self.ctx.makeCurrent();
+                try self.ctx.driver.check(self.ctx.driver.fns.cuMemcpyHtoDAsync(
+                    destination.ptr + @as(u64, @intCast(task.source_offset)),
+                    slot.host.ptr,
+                    task.len,
+                    upload_stream,
+                ));
+                try self.ctx.driver.check(self.ctx.driver.fns.cuEventRecord(slot.event, upload_stream));
+                self.stats.h2d_bytes = try checkedAdd(self.stats.h2d_bytes, task.len);
+                continue;
+            }
+
+            var in_flight_index: ?usize = null;
+            state.lock();
+            for (state.slots, 0..) |slot, index| {
+                if (slot.state == .in_flight) {
+                    in_flight_index = index;
+                    break;
+                }
+            }
+            state.mutex.unlock();
+            if (in_flight_index) |slot_index| {
+                const slot = &state.slots[slot_index];
+                try self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(slot.event));
+                state.lock();
+                slot.state = .empty;
+                state.mutex.unlock();
+                completed += 1;
+                continue;
+            }
+
+            state.lock();
+            const workers_done = state.workers_done;
+            state.mutex.unlock();
+            if (workers_done == worker_count) return error.A4bCudaIncompleteLoadPipeline;
+            std.Thread.yield() catch std.atomic.spinLoopHint();
+        }
+        try self.ctx.driver.check(self.ctx.driver.fns.cuStreamSynchronize(upload_stream));
+        self.stats.a4b_load_host_stage_ns +|= state.worker_copy_ns;
+        self.stats.a4b_load_h2d_ns +|= platform.time.monotonicNs() -| transfer_started_ns;
+        self.stats.a4b_load_workers = worker_count;
+        self.stats.a4b_load_staging_bytes = staging_bytes;
+        self.stats.a4b_load_chunks = chunks.items.len;
+
+        try runtime.sources.appendSlice(self.allocator, sources.items);
+        sources_committed = true;
+        runtime.loaded_source_bytes = try checkedAdd(runtime.loaded_source_bytes, plan.total_bytes);
+    }
+
+    fn loadA4bResidentSources(
+        self: *CudaCompute,
+        runtime: *CudaA4bRuntime,
+        plan: *const CudaA4bSourceLoadPlan,
+        config: backend_contracts.A4bInferenceConfig,
+    ) !void {
+        switch (config.load_strategy) {
+            .legacy => try self.loadA4bResidentSourcesLegacy(runtime, plan),
+            .pipeline => {
+                self.stats.a4b_load_pipeline_attempts +|= 1;
+                try self.loadA4bResidentSourcesPipeline(runtime, plan, config);
+                self.stats.a4b_load_pipeline_successes +|= 1;
+            },
+            .auto => {
+                self.stats.a4b_load_pipeline_attempts +|= 1;
+                self.loadA4bResidentSourcesPipeline(runtime, plan, config) catch |err| switch (err) {
+                    error.A4bCudaPinnedStagingUnavailable,
+                    error.A4bCudaLoadWorkersUnavailable,
+                    error.OutOfMemory,
+                    => {
+                        self.stats.a4b_load_pipeline_fallbacks +|= 1;
+                        std.log.warn("cuda_a4b: load pipeline unavailable error={s}; using legacy mmap upload", .{@errorName(err)});
+                        try self.loadA4bResidentSourcesLegacy(runtime, plan);
+                        return;
+                    },
+                    else => return err,
+                };
+                self.stats.a4b_load_pipeline_successes +|= 1;
+            },
+        }
+    }
+
+    pub fn loadA4bResidentFromHostStore(
+        self: *CudaCompute,
+        store: *native_compute_mod.WeightStore,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+    ) !void {
+        const total_started_ns = platform.time.monotonicNs();
         const config = self.a4b_inference orelse return;
         if (self.a4b_runtime != null) return error.A4bCudaAlreadyLoaded;
         if (config.residency_mode != .resident) return error.A4bCudaStreamingUnsupported;
         if (!self.kernels.hasGemma4A4BResidentQ4_0Primitives()) return error.A4bCudaKernelUnavailable;
 
-        var source_plan = try self.a4bSourceLoadPlan(store, config);
+        const plan_started_ns = platform.time.monotonicNs();
+        var source_plan = try self.a4bResolvedSourceLoadPlan(store, config, model_path, source_artifact_path);
         defer source_plan.deinit(self.allocator);
+        self.stats.a4b_load_plan_ns +|= platform.time.monotonicNs() -| plan_started_ns;
         const source_bytes = source_plan.total_bytes;
         const workspace_bytes = try a4bWorkspaceBytes(config);
         const projected_weight_bytes = try checkedAdd(self.stats.resident_weight_bytes, try checkedAdd(source_bytes, workspace_bytes));
@@ -2538,8 +3043,12 @@ pub const CudaCompute = struct {
             source_plan.mmap_source_count,
         });
         const upload_start_ns = platform.time.monotonicNs();
-        try self.loadA4bResidentSources(&runtime, &source_plan);
+        try self.loadA4bResidentSources(&runtime, &source_plan, config);
+        if (!config.drop_host_cache_after_load) {
+            if (source_plan.prepared_pack) |*pack| pack.preserveFileCacheOnDeinit();
+        }
 
+        const finalize_started_ns = platform.time.monotonicNs();
         var key_buf: [160]u8 = undefined;
         for (0..config.geometry.moe_layer_count) |layer| {
             var projections: [3]CudaA4bProjection = undefined;
@@ -2558,6 +3067,8 @@ pub const CudaCompute = struct {
             runtime.layers[layer] = .{ .gate = projections[0], .up = projections[1], .down = projections[2] };
         }
         try synchronizeAndDrainDeferredDeviceFrees(self);
+        self.stats.a4b_load_finalize_ns +|= platform.time.monotonicNs() -| finalize_started_ns;
+        self.stats.a4b_load_total_ns +|= platform.time.monotonicNs() -| total_started_ns;
         const upload_elapsed_ms = elapsedNsSince(upload_start_ns) / std.time.ns_per_ms;
         std.log.info("cuda_a4b: resident upload complete sources={d} source_mib={d} elapsed_ms={d}", .{
             runtime.sources.items.len,
@@ -2565,12 +3076,21 @@ pub const CudaCompute = struct {
             upload_elapsed_ms,
         });
         self.stats.resident_weight_bytes = try checkedAdd(self.stats.resident_weight_bytes, try checkedAdd(runtime.loaded_source_bytes, workspace_bytes));
-        std.log.info("cuda_a4b: resident load complete layers={d} sources={d} source_mib={d} workspace_mib={d} budget_mib={d}", .{
+        std.log.info("cuda_a4b: resident load complete layers={d} sources={d} source_mib={d} workspace_mib={d} budget_mib={d} strategy={s} workers={d} staging_mib={d} chunks={d} plan_ms={d} host_stage_worker_ms={d} h2d_wall_ms={d} finalize_ms={d} total_ms={d}", .{
             config.geometry.moe_layer_count,
             runtime.sources.items.len,
             runtime.loaded_source_bytes / (1024 * 1024),
             workspace_bytes / (1024 * 1024),
             config.memory_budget_bytes / (1024 * 1024),
+            @tagName(config.load_strategy),
+            self.stats.a4b_load_workers,
+            self.stats.a4b_load_staging_bytes / (1024 * 1024),
+            self.stats.a4b_load_chunks,
+            self.stats.a4b_load_plan_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_host_stage_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_h2d_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_finalize_ns / std.time.ns_per_ms,
+            self.stats.a4b_load_total_ns / std.time.ns_per_ms,
         });
         self.a4b_runtime = runtime;
         runtime_live = false;
@@ -21852,6 +22372,11 @@ test "cuda A4B resident workspace is bounded for the qualified geometry" {
         .kv_budget_bytes = 1024 * 1024 * 1024,
         .expert_cache_slots = 128,
         .geometry = backend_contracts.qualified_a4b_geometries[0],
+        .load_strategy = .auto,
+        .load_workers = backend_contracts.A4bInferenceConfig.default_load_workers,
+        .load_staging_bytes = backend_contracts.A4bInferenceConfig.default_load_staging_mb * 1024 * 1024,
+        .prepared_pack = .off,
+        .drop_host_cache_after_load = false,
     };
     try std.testing.expectEqual(@as(usize, 250_281_984), try CudaCompute.a4bWorkspaceBytes(config));
     try std.testing.expect(try CudaCompute.a4bWorkspaceBytes(config) < 256 * 1024 * 1024);

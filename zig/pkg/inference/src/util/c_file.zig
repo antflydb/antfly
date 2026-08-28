@@ -121,6 +121,11 @@ pub fn mappedSliceOffset(full: []const u8, slice: []const u8) ?usize {
 pub const MmapRegion = struct {
     data: []align(std.heap.page_size_min) u8,
     fd: std.posix.fd_t,
+    /// Whether deinit should evict clean pages from the kernel page cache.
+    /// Model stores default to the historical memory-conservative behavior;
+    /// CUDA full-residency admission can explicitly retain the cache so a
+    /// replacement worker shares the already-read checkpoint pages.
+    discard_on_deinit: bool = true,
 
     /// Memory-map an entire file read-only. Returns borrowed bytes backed by the OS page cache.
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !MmapRegion {
@@ -188,6 +193,13 @@ pub const MmapRegion = struct {
         );
     }
 
+    /// Keep clean file pages eligible for reuse after this mapping is closed.
+    /// The pages remain reclaimable by the kernel and are never anonymous
+    /// process memory. This is useful for rolling restarts and prefetching.
+    pub fn preserveFileCacheOnDeinit(self: *MmapRegion) void {
+        self.discard_on_deinit = false;
+    }
+
     pub fn deinit(self: *MmapRegion) void {
         const mapped_len = self.data.len;
         const fd = self.fd;
@@ -198,11 +210,11 @@ pub const MmapRegion = struct {
         // envelope even though the evicted model owns no live memory. Both
         // hints are best effort and affect only clean file-backed pages:
         // anonymous, dirty, writeback, and still-shared pages remain charged.
-        if (comptime build_options.link_libc and builtin.os.tag == .linux) {
+        if (self.discard_on_deinit and comptime build_options.link_libc and builtin.os.tag == .linux) {
             advise(self.data.ptr, mapped_len, .dont_need);
         }
         std.posix.munmap(self.data);
-        if (comptime build_options.link_libc and builtin.os.tag == .linux) {
+        if (self.discard_on_deinit and comptime build_options.link_libc and builtin.os.tag == .linux) {
             _ = c.posix_fadvise(
                 fd,
                 0,
@@ -289,6 +301,65 @@ pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
     return try fileSizeFromFd(fd);
 }
 
+pub const FileIdentity = struct {
+    size: u64,
+    inode: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: u32,
+    device_major: u32,
+    device_minor: u32,
+    quick_fingerprint_sha256: [32]u8,
+};
+
+/// Stable local identity for immutable deployment artifacts. A prepared model
+/// pack binds to this tuple so admission can reject stale sidecars without
+/// hashing a multi-gigabyte checkpoint on every process start.
+pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentity {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = try openReadOnlyZ(path_z);
+    defer closeFd(fd);
+    const linux = std.os.linux;
+    var statx = std.mem.zeroes(linux.Statx);
+    while (true) {
+        switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .{
+            .SIZE = true,
+            .INO = true,
+            .MTIME = true,
+        }, &statx))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return error.StatFailed,
+        }
+    }
+    if (!statx.mask.SIZE or !statx.mask.INO or !statx.mask.MTIME) return error.StatFailed;
+    const sample_bytes: usize = @intCast(@min(statx.size, 64 * 1024));
+    const sample = try allocator.alloc(u8, sample_bytes);
+    defer allocator.free(sample);
+    try readRegionFromFd(fd, sample, 0);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var size_le: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &size_le, statx.size, .little);
+    hasher.update(&size_le);
+    hasher.update(sample);
+    if (statx.size > sample_bytes) {
+        try readRegionFromFd(fd, sample, statx.size - sample_bytes);
+        hasher.update(sample);
+    }
+    var quick_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&quick_fingerprint);
+    return .{
+        .size = statx.size,
+        .inode = statx.ino,
+        .mtime_seconds = statx.mtime.sec,
+        .mtime_nanoseconds = statx.mtime.nsec,
+        .device_major = statx.dev_major,
+        .device_minor = statx.dev_minor,
+        .quick_fingerprint_sha256 = quick_fingerprint,
+    };
+}
+
 /// Read a byte range from a file using pread.
 pub fn readRegion(allocator: std.mem.Allocator, path: []const u8, offset: u64, len: usize) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
@@ -354,6 +425,99 @@ pub fn adviseFileRange(allocator: std.mem.Allocator, path: []const u8, offset: u
     _ = c.posix_fadvise(fd, @intCast(offset), @intCast(len), c_advice);
 }
 
+pub const FilePrefetchResult = struct {
+    bytes: u64,
+    workers: u8,
+};
+
+/// Populate the OS page cache with bounded parallel pread streams. This does
+/// not retain userspace buffers and never changes the file. It is intended for
+/// server startup prefetch, where CUDA admission happens later and consumes
+/// the warmed pages through the normal validated loader.
+pub fn prefetchFile(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    requested_workers: u8,
+) !FilePrefetchResult {
+    if (!comptime build_options.link_libc or builtin.os.tag != .linux)
+        return error.UnsupportedPlatform;
+    const workers: usize = std.math.clamp(@as(usize, requested_workers), 1, 8);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = try openReadOnlyZ(path_z);
+    defer closeFd(fd);
+    const file_size = try fileSizeFromFd(fd);
+    if (file_size == 0) return .{ .bytes = 0, .workers = @intCast(workers) };
+    _ = c.posix_fadvise(fd, 0, @intCast(file_size), c.POSIX_FADV_WILLNEED);
+
+    const Worker = struct {
+        fd: std.posix.fd_t,
+        start: u64,
+        end: u64,
+        bytes: u64 = 0,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            const buffer = std.heap.page_allocator.alloc(u8, 8 * 1024 * 1024) catch {
+                self.failure = error.OutOfMemory;
+                return;
+            };
+            defer std.heap.page_allocator.free(buffer);
+            var offset = self.start;
+            while (offset < self.end) {
+                const remaining: usize = @intCast(@min(
+                    self.end - offset,
+                    @as(u64, buffer.len),
+                ));
+                const n = readAt(self.fd, buffer[0..remaining], offset) catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (n == 0) {
+                    self.failure = error.IncompleteRead;
+                    return;
+                }
+                offset += n;
+                self.bytes += n;
+            }
+        }
+    };
+
+    if (workers == 1) {
+        var state = Worker{ .fd = fd, .start = 0, .end = file_size };
+        state.run();
+        if (state.failure) |err| return err;
+        if (state.bytes != file_size) return error.IncompleteRead;
+        return .{ .bytes = state.bytes, .workers = 1 };
+    }
+
+    const states = try allocator.alloc(Worker, workers);
+    defer allocator.free(states);
+    const threads = try allocator.alloc(std.Thread, workers);
+    defer allocator.free(threads);
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |thread| thread.join();
+    for (states, 0..) |*state, index| {
+        const start = (@as(u64, file_size) * @as(u64, @intCast(index))) /
+            @as(u64, @intCast(workers));
+        const end = (@as(u64, file_size) * @as(u64, @intCast(index + 1))) /
+            @as(u64, @intCast(workers));
+        state.* = .{ .fd = fd, .start = start, .end = end };
+        threads[index] = try std.Thread.spawn(.{}, Worker.run, .{state});
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+
+    var total: u64 = 0;
+    for (states) |state| {
+        if (state.failure) |err| return err;
+        total += state.bytes;
+    }
+    if (total != file_size) return error.IncompleteRead;
+    return .{ .bytes = total, .workers = @intCast(workers) };
+}
+
 /// Check if a file exists at the given path.
 pub fn fileExists(allocator: std.mem.Allocator, path: []const u8) bool {
     const path_z = allocator.dupeZ(u8, path) catch return false;
@@ -366,6 +530,33 @@ pub fn fileExistsZ(path_z: [:0]const u8) bool {
     const fd = openReadOnlyZ(path_z) catch return false;
     closeFd(fd);
     return true;
+}
+
+/// Atomically publish a path without replacing an existing destination.
+/// Prepared checkpoint directories use this after fully syncing a sibling
+/// temporary directory, so concurrent creators cannot clobber each other.
+pub fn renameNoReplace(allocator: std.mem.Allocator, old_path: []const u8, new_path: []const u8) !void {
+    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
+    const old_z = try allocator.dupeZ(u8, old_path);
+    defer allocator.free(old_z);
+    const new_z = try allocator.dupeZ(u8, new_path);
+    defer allocator.free(new_z);
+    const linux = std.os.linux;
+    switch (linux.errno(linux.renameat2(
+        linux.AT.FDCWD,
+        old_z.ptr,
+        linux.AT.FDCWD,
+        new_z.ptr,
+        .{ .NOREPLACE = true },
+    ))) {
+        .SUCCESS => {},
+        .EXIST => return error.PathAlreadyExists,
+        .NOENT => return error.FileNotFound,
+        .XDEV => return error.RenameAcrossMountPoints,
+        .NOTDIR => return error.NotDir,
+        .ACCES, .PERM => return error.AccessDenied,
+        else => return error.RenameFailed,
+    }
 }
 
 fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
@@ -545,6 +736,9 @@ test "MmapRegion advice preserves readable mapped data" {
     // the mapping or change the file-backed contents.
     region.discardFileRange(7, 13);
     try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
+    try std.testing.expect(region.discard_on_deinit);
+    region.preserveFileCacheOnDeinit();
+    try std.testing.expect(!region.discard_on_deinit);
 }
 
 test "mmapTempCopy maps unlinked temp data" {
@@ -554,4 +748,27 @@ test "mmapTempCopy maps unlinked temp data" {
 
     try std.testing.expectEqual(payload.len, region.data.len);
     try std.testing.expectEqualSlices(u8, payload, region.data[0..payload.len]);
+}
+
+test "prefetchFile reads every byte with bounded workers" {
+    if (!comptime build_options.link_libc or builtin.os.tag != .linux)
+        return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/antfly-prefetch-test-{d}.bin",
+        .{std.posix.system.getpid()},
+    );
+    defer allocator.free(path);
+    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+    const payload = try allocator.alloc(u8, 1024 * 1024 + 37);
+    defer allocator.free(payload);
+    for (payload, 0..) |*byte, index| byte.* = @truncate(index);
+    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
+    try file.writeStreamingAll(std.testing.io, payload);
+    file.close(std.testing.io);
+
+    const result = try prefetchFile(allocator, path, 4);
+    try std.testing.expectEqual(@as(u64, payload.len), result.bytes);
+    try std.testing.expectEqual(@as(u8, 4), result.workers);
 }

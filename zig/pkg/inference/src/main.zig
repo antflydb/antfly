@@ -47,6 +47,12 @@ const RunConfig = struct {
         quantization: ?[]const u8 = null,
         residency_mode: ?inference.ops.A4bResidencyMode = null,
         memory_budget_mb: ?u32 = null,
+        load_strategy: ?inference.ops.A4bLoadStrategy = null,
+        load_workers: ?u8 = null,
+        load_staging_mb: ?u32 = null,
+        prepared_pack: ?inference.ops.A4bPreparedPackMode = null,
+        drop_host_cache_after_load: bool = false,
+        startup_strategy: inference.server.WarmModelStartupStrategy = .eager,
     };
 
     const PromptCacheConfig = struct {
@@ -249,6 +255,12 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .quantization = value.quantization,
             .residency_mode = value.residency_mode,
             .memory_budget_mb = value.memory_budget_mb,
+            .load_strategy = value.load_strategy,
+            .load_workers = value.load_workers,
+            .load_staging_mb = value.load_staging_mb,
+            .prepared_pack = value.prepared_pack,
+            .drop_host_cache_after_load = value.drop_host_cache_after_load,
+            .startup_strategy = value.startup_strategy,
         };
     }
     return out;
@@ -309,6 +321,8 @@ pub fn runFromArgs(
         try inference.native_rerank.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "generate")) {
         try inference.native_generate.main(allocator, init.io, command_args);
+    } else if (std.mem.eql(u8, command, "a4b-pack")) {
+        try inference.native_a4b_pack.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "chat")) {
         try inference.native_chat.main(allocator, init.io, command_args);
     } else if (std.mem.eql(u8, command, "compile-artifact")) {
@@ -719,6 +733,7 @@ fn printUsage(usage_name: []const u8) void {
         \\  classify  Run native text classification from the command line
         \\  rerank    Run native text reranking from the command line
         \\  generate  Run native text generation from the command line
+        \\  a4b-pack  Create a pre-sharded Gemma 4 A4B CUDA expert pack
         \\  chat      Interactive chat with a local model (pulls known models on first use)
         \\  compile-artifact Compile one or more traced generation artifacts
         \\  export    Convert a model artifact to ONNX, GGUF, or safetensors
@@ -860,6 +875,23 @@ test "run config accepts canonical and legacy inference admission spellings" {
         error.InvalidInferenceConfig,
         parseRunConfig(std.testing.allocator, "{\"admission\":{\"infer\":{\"max_concurrent_requests\":1}}}"),
     );
+}
+
+test "run config preserves A4B CUDA load and prefetch policy" {
+    const parsed = try parseRunConfig(std.testing.allocator,
+        \\{"preload":[{"kind":"generator","name":"gemma-a4b","backend":"cuda","residency_mode":"resident","memory_budget_mb":16384,"load_strategy":"pipeline","load_workers":6,"load_staging_mb":384,"prepared_pack":"required","drop_host_cache_after_load":true,"startup_strategy":"prefetch"}]}
+    );
+    defer parsed.deinit();
+    const models = try preloadModelsFromConfig(std.testing.allocator, parsed.value.preload);
+    defer std.testing.allocator.free(models);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqual(inference.backends.BackendType.cuda, models[0].backend.?);
+    try std.testing.expectEqual(inference.ops.A4bLoadStrategy.pipeline, models[0].load_strategy.?);
+    try std.testing.expectEqual(@as(?u8, 6), models[0].load_workers);
+    try std.testing.expectEqual(@as(?u32, 384), models[0].load_staging_mb);
+    try std.testing.expectEqual(inference.ops.A4bPreparedPackMode.required, models[0].prepared_pack.?);
+    try std.testing.expect(models[0].drop_host_cache_after_load);
+    try std.testing.expectEqual(inference.server.WarmModelStartupStrategy.prefetch, models[0].startup_strategy);
 }
 
 test "run config rejects unrepresentable prompt cache values" {

@@ -1729,6 +1729,9 @@ pub fn loadHuggingFaceTokenizerFromDirOrGguf(
 fn loadHuggingFaceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []const u8) !*hf_tokenizer.HfTokenizer {
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
+    // Tokenizer extraction is metadata-only. A whole-file DONTNEED here would
+    // discard a warmed checkpoint immediately before CUDA model admission.
+    region.preserveFileCacheOnDeinit();
 
     const parse_allocator = platform.allocator.processAllocator(allocator);
     var parsed = try gguf_format.parse(parse_allocator, region.data);
@@ -2003,6 +2006,8 @@ fn adoptAndConfigureSentencePieceTokenizer(
 fn loadSentencePieceTokenizerFromGguf(allocator: std.mem.Allocator, gguf_path: []const u8) !sentencepiece.Processor {
     var region = try c_file.MmapRegion.init(allocator, gguf_path);
     defer region.deinit();
+    // Keep already-warm tensor payload pages; only metadata is consumed here.
+    region.preserveFileCacheOnDeinit();
 
     const parse_allocator = platform.allocator.processAllocator(allocator);
     var parsed = try gguf_format.parse(parse_allocator, region.data);

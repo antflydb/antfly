@@ -67,6 +67,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
+const a4b_prepared_pack = @import("../ops/cuda/a4b_prepared_pack.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
     pub const pjrt = struct {
@@ -1143,6 +1144,11 @@ pub const WarmModelKind = enum {
     extractor,
 };
 
+pub const WarmModelStartupStrategy = enum {
+    eager,
+    prefetch,
+};
+
 pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
@@ -1151,15 +1157,35 @@ pub const WarmModel = struct {
     quantization: ?[]const u8 = null,
     residency_mode: ?ops.A4bResidencyMode = null,
     memory_budget_mb: ?u32 = null,
+    load_strategy: ?ops.A4bLoadStrategy = null,
+    load_workers: ?u8 = null,
+    load_staging_mb: ?u32 = null,
+    prepared_pack: ?ops.A4bPreparedPackMode = null,
+    drop_host_cache_after_load: bool = false,
+    startup_strategy: WarmModelStartupStrategy = .eager,
 
     pub fn a4bRequest(self: WarmModel) ?ops.A4bInferenceRequest {
         const residency_mode = self.residency_mode orelse .auto;
         const memory_budget_mb = self.memory_budget_mb orelse 0;
+        const load_strategy = self.load_strategy orelse .auto;
+        const load_workers = self.load_workers orelse 0;
+        const load_staging_mb = self.load_staging_mb orelse 0;
+        const prepared_pack = self.prepared_pack orelse .auto;
         // The documented wire defaults are policy-neutral. Treating explicit
         // `auto`/`0` as an A4B request makes an otherwise ordinary generator
         // fail geometry qualification merely because defaults were serialized.
-        if (residency_mode == .auto and memory_budget_mb == 0) return null;
-        return .{ .residency_mode = residency_mode, .memory_budget_mb = memory_budget_mb };
+        if (residency_mode == .auto and memory_budget_mb == 0 and
+            load_strategy == .auto and load_workers == 0 and load_staging_mb == 0 and
+            prepared_pack == .auto and !self.drop_host_cache_after_load) return null;
+        return .{
+            .residency_mode = residency_mode,
+            .memory_budget_mb = memory_budget_mb,
+            .load_strategy = load_strategy,
+            .load_workers = load_workers,
+            .load_staging_mb = load_staging_mb,
+            .prepared_pack = prepared_pack,
+            .drop_host_cache_after_load = self.drop_host_cache_after_load,
+        };
     }
 };
 
@@ -1193,6 +1219,19 @@ test "warm model A4B controls are GPU generator only" {
         .memory_budget_mb = 16384,
     })).?;
     try std.testing.expectEqual(ops.A4bResidencyMode.resident, cuda_request.residency_mode);
+    const prepared_request = (try validatedWarmModelA4bRequest(.{
+        .name = "gemma4-a4b-cuda-pack",
+        .backend = .cuda,
+        .load_strategy = .pipeline,
+        .load_workers = 6,
+        .load_staging_mb = 384,
+        .prepared_pack = .required,
+        .drop_host_cache_after_load = true,
+    })).?;
+    try std.testing.expectEqual(ops.A4bLoadStrategy.pipeline, prepared_request.load_strategy);
+    try std.testing.expectEqual(@as(u8, 6), prepared_request.load_workers);
+    try std.testing.expectEqual(ops.A4bPreparedPackMode.required, prepared_request.prepared_pack);
+    try std.testing.expect(prepared_request.drop_host_cache_after_load);
     try std.testing.expectError(error.A4bRequiresGpu, validatedWarmModelA4bRequest(.{
         .name = "gemma4-a4b",
         .backend = .native,
@@ -4071,6 +4110,14 @@ pub const Node = struct {
             }
             return error.KernelJitRequiredPreloadMissing;
         }
+        if (self.config.kernel_jit.mode.failClosed() or
+            self.config.kernel_jit.qualified_profile_path != null)
+        {
+            for (self.config.preload) |model| {
+                if (model.startup_strategy == .prefetch)
+                    return error.KernelJitRequiredPreloadCannotBePrefetchOnly;
+            }
+        }
         if (self.config.kernel_jit.qualified_profile_path != null and self.config.preload.len != 1) {
             return error.KernelJitQualifiedProfileMultiplePreloadsUnsupported;
         }
@@ -4097,6 +4144,8 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.startup_strategy == .prefetch)
+            return self.prefetchWarmModel(allocator, model);
         const a4b_request = try validatedWarmModelA4bRequest(model);
         const materialize_optional_sessions = kernelJitMaterializesOptionalSessions(self.config.kernel_jit.mode);
         switch (model.kind) {
@@ -4108,6 +4157,37 @@ pub const Node = struct {
         if (materialize_optional_sessions and model.kind != .embedder) {
             try self.materializeWarmModelOptionalSessions(allocator, model);
         }
+    }
+
+    fn prefetchWarmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        if (model.kind != .generator) return error.A4bPrefetchRequiresGenerator;
+        if (model.backend != null and model.backend.? != .cuda)
+            return error.A4bPrefetchRequiresCuda;
+        var io_impl = std.Io.Threaded.init(allocator, .{});
+        defer io_impl.deinit();
+        const model_path = try self.resolveModelPath(io_impl.io(), model.name, warmModelTaskDir(model.kind));
+        defer self.allocator.free(model_path);
+        var manifest = try manifest_mod.loadFromDir(allocator, model_path);
+        defer manifest.deinit();
+        const gguf_path = manifest.gguf_path orelse return error.A4bPrefetchRequiresGguf;
+        const workers = model.load_workers orelse ops.A4bInferenceConfig.default_load_workers;
+        const started_ns = embedTimingNowNs();
+        if ((model.prepared_pack orelse .auto) != .off) {
+            if (try a4b_prepared_pack.prefetchInstalled(allocator, model_path, gguf_path, workers)) |prepared| {
+                std.log.info(
+                    "prefetched A4B prepared pack model={s} shards={d} bytes={d} workers={d} elapsed_ms={d}",
+                    .{ model.name, prepared.shard_count, prepared.bytes, prepared.workers, elapsedMs(started_ns, embedTimingNowNs()) },
+                );
+                return;
+            } else if ((model.prepared_pack orelse .auto) == .required) {
+                return error.A4bPreparedPackRequired;
+            }
+        }
+        const result = try c_file.prefetchFile(allocator, gguf_path, workers);
+        std.log.info(
+            "prefetched inference generator model={s} artifact={s} bytes={d} workers={d} elapsed_ms={d}",
+            .{ model.name, gguf_path, result.bytes, result.workers, elapsedMs(started_ns, embedTimingNowNs()) },
+        );
     }
 
     fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
