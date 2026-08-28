@@ -74,22 +74,43 @@ function validateEdgeTypes(value: unknown, path: string): void {
   });
 }
 
-function validateWeightBounds(value: JSONObject, path: string): void {
-  const minWeight = value.min_weight;
-  const maxWeight = value.max_weight;
+function validateEdgeWeight(value: JSONObject, path: string): void {
+  if (!("edge_weight" in value)) return;
+  const range = object(value.edge_weight);
+  if (!range) throw new TypeError(`${path}.edge_weight must be an object with min and/or max`);
+  const fields = Object.keys(range);
+  if (fields.length === 0 || fields.some((field) => field !== "min" && field !== "max")) {
+    throw new TypeError(`${path}.edge_weight must contain min and/or max only`);
+  }
+  const minWeight = range.min;
+  const maxWeight = range.max;
   for (const [field, bound] of [
-    ["min_weight", minWeight],
-    ["max_weight", maxWeight],
+    ["min", minWeight],
+    ["max", maxWeight],
   ] as const) {
     if (
       bound !== undefined &&
       (typeof bound !== "number" || !Number.isFinite(bound) || bound < 0)
     ) {
-      throw new TypeError(`${path}.${field} must be a finite non-negative number`);
+      throw new TypeError(`${path}.edge_weight.${field} must be a finite non-negative number`);
     }
   }
   if (typeof minWeight === "number" && typeof maxWeight === "number" && minWeight > maxWeight) {
-    throw new TypeError(`${path}.min_weight must not exceed max_weight`);
+    throw new TypeError(`${path}.edge_weight.min must not exceed edge_weight.max`);
+  }
+}
+
+function validatePathObjective(value: JSONObject, path: string): void {
+  const objective = value.objective;
+  if (
+    objective !== undefined &&
+    objective !== "min_hops" &&
+    objective !== "min_weight_sum" &&
+    objective !== "max_weight_product"
+  ) {
+    throw new TypeError(
+      `${path}.objective must be min_hops, min_weight_sum, or max_weight_product`
+    );
   }
 }
 
@@ -325,7 +346,7 @@ function validateEdges(value: unknown, path: string): void {
     requireIdentifier(edge.to, `${path}[${index}].to`);
     validateDirection(edge.direction, `${path}[${index}].direction`);
     validateEdgeTypes(edge.types, `${path}[${index}].types`);
-    validateWeightBounds(edge, `${path}[${index}]`);
+    validateEdgeWeight(edge, `${path}[${index}]`);
   });
 }
 
@@ -440,7 +461,7 @@ function validateTraverse(query: JSONObject, path: string): void {
   const traverse = object(query.traverse);
   validateDirection(traverse?.direction, `${path}.traverse.direction`);
   validateEdgeTypes(traverse?.edge_types, `${path}.traverse.edge_types`);
-  if (traverse) validateWeightBounds(traverse, `${path}.traverse`);
+  if (traverse) validateEdgeWeight(traverse, `${path}.traverse`);
   const start = object(traverse?.start);
   if (!start || !("result_ref" in start)) return;
 
@@ -465,12 +486,15 @@ function validateTraverse(query: JSONObject, path: string): void {
   }
 }
 
-function validatePathEdgeTypes(query: JSONObject, path: string): void {
+function validatePathOptions(query: JSONObject, path: string): void {
   for (const operation of ["shortest_path", "k_shortest_paths"] as const) {
     const body = object(query[operation]);
     validateDirection(body?.direction, `${path}.${operation}.direction`);
     validateEdgeTypes(body?.edge_types, `${path}.${operation}.edge_types`);
-    if (body) validateWeightBounds(body, `${path}.${operation}`);
+    if (body) {
+      validateEdgeWeight(body, `${path}.${operation}`);
+      validatePathObjective(body, `${path}.${operation}`);
+    }
   }
 }
 
@@ -498,7 +522,7 @@ export function validateGraphQueryIdentifiers(graphQueries: unknown): void {
       }
       validateMatch(query, path);
       validateTraverse(query, path);
-      validatePathEdgeTypes(query, path);
+      validatePathOptions(query, path);
     }
   }
 }

@@ -864,7 +864,7 @@ pub const Edge = struct {
     /// Base64-encoded target document key
     target: []const u8,
     type: GraphEdgeType,
-    /// Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
+    /// Finite non-negative edge cost or confidence. The max_weight_product path objective additionally requires values in [0,1].
     weight: f64,
     /// When the edge was created
     created_at: ?[]const u8 = null,
@@ -1769,6 +1769,12 @@ pub const GraphDocumentWildcardFilter = struct {
 /// Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
 pub const GraphEdgeType = []const u8;
 
+/// Inclusive per-edge weight filter. At least one bound is required. Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual stored edges and does not constrain the aggregate path objective.
+pub const GraphEdgeWeightRange = struct {
+    min: ?f64 = null,
+    max: ?f64 = null,
+};
+
 pub const GraphIdentityNodeSelector = struct {
     /// Exact node identities. Omitted table means the query table.
     identities: []const GraphPathEndpoint,
@@ -1901,9 +1907,8 @@ pub const GraphKShortestPaths = struct {
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
     max_depth: ?i64 = null,
-    min_weight: ?f64 = null,
-    max_weight: ?f64 = null,
-    weight_mode: ?PathWeightMode = null,
+    edge_weight: ?GraphEdgeWeightRange = null,
+    objective: ?GraphPathObjective = null,
     /// Non-scoring structured stored-document predicate for path nodes.
     filter: ?GraphDocumentFilter = null,
     /// Include stored documents on terminal result nodes returned alongside each path when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
@@ -1968,8 +1973,7 @@ pub const GraphMatchEdge = struct {
     types: ?[]const GraphEdgeType = null,
     min_hops: ?i64 = null,
     max_hops: ?i64 = null,
-    min_weight: ?f64 = null,
-    max_weight: ?f64 = null,
+    edge_weight: ?GraphEdgeWeightRange = null,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -2005,18 +2009,11 @@ pub const GraphMatchEdge = struct {
             try jw.objectField("max_hops");
             try jw.write(@as(?u8, null));
         }
-        if (self.min_weight) |value| {
-            try jw.objectField("min_weight");
+        if (self.edge_weight) |value| {
+            try jw.objectField("edge_weight");
             try jw.write(value);
         } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("min_weight");
-            try jw.write(@as(?u8, null));
-        }
-        if (self.max_weight) |value| {
-            try jw.objectField("max_weight");
-            try jw.write(value);
-        } else if (jw.options.emit_null_optional_fields) {
-            try jw.objectField("max_weight");
+            try jw.objectField("edge_weight");
             try jw.write(@as(?u8, null));
         }
         try jw.endObject();
@@ -2132,10 +2129,10 @@ pub const GraphPath = struct {
     nodes: []const GraphPathEndpoint,
     /// Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
     edges: []const GraphPathEdge,
-    weight_mode: PathWeightMode,
+    objective: GraphPathObjective,
     /// Sum of raw edge weights along the path, independent of the selected ranking objective.
     weight_sum: f64,
-    /// The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum for min_weight, and the raw edge-weight product for max_weight.
+    /// The user-facing value optimized by objective; edge count for min_hops, weight_sum for min_weight_sum, and the raw edge-weight product for max_weight_product.
     objective_value: f64,
     length: i64,
 };
@@ -2146,7 +2143,7 @@ pub const GraphPathEdge = struct {
     to: GraphPathEndpoint,
     direction: GraphPathEdgeDirection,
     type: GraphEdgeType,
-    /// Finite durable edge weight. max_weight paths further require values in [0,1].
+    /// Finite durable edge weight. max_weight_product paths further require values in [0,1].
     weight: f64,
     metadata: ?std.json.Value = null,
 };
@@ -2181,6 +2178,35 @@ pub const GraphPathEndpoint = struct {
     key: []const u8,
     /// Optional table qualifier for an exact cross-table node identity. Omit for the query table.
     table: ?[]const u8 = null,
+};
+
+/// Objective used to rank graph paths: - min_hops: Minimize the number of edges. - min_weight_sum: Minimize the sum of finite non-negative edge weights. - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
+pub const GraphPathObjective = enum {
+    min_hops,
+    min_weight_sum,
+    max_weight_product,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .min_hops => "min_hops",
+            .min_weight_sum => "min_weight_sum",
+            .max_weight_product => "max_weight_product",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "min_hops", .min_hops },
+            .{ "min_weight_sum", .min_weight_sum },
+            .{ "max_weight_product", .max_weight_product },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 pub const GraphQuery = union(enum) {
@@ -2649,9 +2675,8 @@ pub const GraphShortestPath = struct {
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
     max_depth: ?i64 = null,
-    min_weight: ?f64 = null,
-    max_weight: ?f64 = null,
-    weight_mode: ?PathWeightMode = null,
+    edge_weight: ?GraphEdgeWeightRange = null,
+    objective: ?GraphPathObjective = null,
     /// Non-scoring structured stored-document predicate for path nodes.
     filter: ?GraphDocumentFilter = null,
     /// Include stored documents on terminal result nodes returned alongside the path when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
@@ -2677,8 +2702,7 @@ pub const GraphTraversal = struct {
     edge_types: ?[]const GraphEdgeType = null,
     /// Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
     max_depth: ?i64 = null,
-    min_weight: ?f64 = null,
-    max_weight: ?f64 = null,
+    edge_weight: ?GraphEdgeWeightRange = null,
     limit: ?i64 = null,
     include_paths: ?bool = null,
     /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.

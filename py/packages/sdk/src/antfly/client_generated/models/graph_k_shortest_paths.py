@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 
 from ..models.edge_direction import EdgeDirection
-from ..models.path_weight_mode import PathWeightMode
+from ..models.graph_path_objective import GraphPathObjective
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from ..models.graph_document_term_filter import GraphDocumentTermFilter
     from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
     from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
+    from ..models.graph_edge_weight_range import GraphEdgeWeightRange
     from ..models.graph_path_endpoint import GraphPathEndpoint
 
 
@@ -45,12 +46,13 @@ class GraphKShortestPaths:
             - both: Both outgoing and incoming edges
         edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
         max_depth (int | Unset):  Default: 10.
-        min_weight (float | Unset):
-        max_weight (float | Unset):
-        weight_mode (PathWeightMode | Unset): Path weighting algorithm for pathfinding:
-            - min_hops: Minimize number of edges
-            - min_weight: Minimize sum of finite non-negative edge weights
-            - max_weight: Maximize product of finite edge weights in [0,1]
+        edge_weight (GraphEdgeWeightRange | Unset): Inclusive per-edge weight filter. At least one bound is required.
+            Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual
+            stored edges and does not constrain the aggregate path objective.
+        objective (GraphPathObjective | Unset): Objective used to rank graph paths:
+            - min_hops: Minimize the number of edges.
+            - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+            - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
         filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
             GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |
             GraphDocumentIdsFilter | GraphDocumentMatchAllFilter | GraphDocumentMatchNoneFilter |
@@ -73,9 +75,8 @@ class GraphKShortestPaths:
     direction: EdgeDirection | Unset = UNSET
     edge_types: list[str] | Unset = UNSET
     max_depth: int | Unset = 10
-    min_weight: float | Unset = UNSET
-    max_weight: float | Unset = UNSET
-    weight_mode: PathWeightMode | Unset = UNSET
+    edge_weight: GraphEdgeWeightRange | Unset = UNSET
+    objective: GraphPathObjective | Unset = UNSET
     filter_: (
         GraphDocumentBoolFieldFilter
         | GraphDocumentDateRangeFilter
@@ -129,13 +130,13 @@ class GraphKShortestPaths:
 
         max_depth = self.max_depth
 
-        min_weight = self.min_weight
+        edge_weight: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_weight, Unset):
+            edge_weight = self.edge_weight.to_dict()
 
-        max_weight = self.max_weight
-
-        weight_mode: str | Unset = UNSET
-        if not isinstance(self.weight_mode, Unset):
-            weight_mode = self.weight_mode.value
+        objective: str | Unset = UNSET
+        if not isinstance(self.objective, Unset):
+            objective = self.objective.value
 
         filter_: dict[str, Any] | Unset
         if isinstance(self.filter_, Unset):
@@ -192,12 +193,10 @@ class GraphKShortestPaths:
             field_dict["edge_types"] = edge_types
         if max_depth is not UNSET:
             field_dict["max_depth"] = max_depth
-        if min_weight is not UNSET:
-            field_dict["min_weight"] = min_weight
-        if max_weight is not UNSET:
-            field_dict["max_weight"] = max_weight
-        if weight_mode is not UNSET:
-            field_dict["weight_mode"] = weight_mode
+        if edge_weight is not UNSET:
+            field_dict["edge_weight"] = edge_weight
+        if objective is not UNSET:
+            field_dict["objective"] = objective
         if filter_ is not UNSET:
             field_dict["filter"] = filter_
         if include_documents is not UNSET:
@@ -224,6 +223,7 @@ class GraphKShortestPaths:
         from ..models.graph_document_term_filter import GraphDocumentTermFilter
         from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
         from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
+        from ..models.graph_edge_weight_range import GraphEdgeWeightRange
         from ..models.graph_path_endpoint import GraphPathEndpoint
 
         d = dict(src_dict)
@@ -244,16 +244,19 @@ class GraphKShortestPaths:
 
         max_depth = d.pop("max_depth", UNSET)
 
-        min_weight = d.pop("min_weight", UNSET)
-
-        max_weight = d.pop("max_weight", UNSET)
-
-        _weight_mode = d.pop("weight_mode", UNSET)
-        weight_mode: PathWeightMode | Unset
-        if isinstance(_weight_mode, Unset):
-            weight_mode = UNSET
+        _edge_weight = d.pop("edge_weight", UNSET)
+        edge_weight: GraphEdgeWeightRange | Unset
+        if isinstance(_edge_weight, Unset):
+            edge_weight = UNSET
         else:
-            weight_mode = PathWeightMode(_weight_mode)
+            edge_weight = GraphEdgeWeightRange.from_dict(_edge_weight)
+
+        _objective = d.pop("objective", UNSET)
+        objective: GraphPathObjective | Unset
+        if isinstance(_objective, Unset):
+            objective = UNSET
+        else:
+            objective = GraphPathObjective(_objective)
 
         def _parse_filter_(
             data: object,
@@ -408,9 +411,8 @@ class GraphKShortestPaths:
             direction=direction,
             edge_types=edge_types,
             max_depth=max_depth,
-            min_weight=min_weight,
-            max_weight=max_weight,
-            weight_mode=weight_mode,
+            edge_weight=edge_weight,
+            objective=objective,
             filter_=filter_,
             include_documents=include_documents,
             fields=fields,

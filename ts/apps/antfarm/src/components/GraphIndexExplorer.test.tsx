@@ -190,7 +190,7 @@ describe("GraphIndexExplorer", () => {
                 },
               ],
               length: 1,
-              weight_mode: "min_hops",
+              objective: "min_hops",
               weight_sum: 1,
               objective_value: 1,
             },

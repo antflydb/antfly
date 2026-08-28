@@ -656,18 +656,18 @@ class TestAntflyClient:
                 "match": {
                     "anchor": "person",
                     "nodes": {"person": {}, "author": {}},
-                    "edges": [{"from": "person", "to": "author", "min_weight": -0.1}],
+                    "edges": [{"from": "person", "to": "author", "edge_weight": {"min": -0.1}}],
                 },
                 "return": {"bindings": ["person"]},
             },
-            {"traverse": {"start": {"keys": ["doc:a"]}, "max_weight": -0.1}},
-            {"shortest_path": {"from": {"key": "doc:a"}, "to": {"key": "doc:b"}, "min_weight": -0.1}},
+            {"traverse": {"start": {"keys": ["doc:a"]}, "edge_weight": {"max": -0.1}}},
+            {"shortest_path": {"from": {"key": "doc:a"}, "to": {"key": "doc:b"}, "edge_weight": {"min": -0.1}}},
             {
                 "k_shortest_paths": {
                     "from": {"key": "doc:a"},
                     "to": {"key": "doc:b"},
                     "k": 2,
-                    "max_weight": -0.1,
+                    "edge_weight": {"max": -0.1},
                 }
             },
         ],
@@ -675,6 +675,25 @@ class TestAntflyClient:
     def test_query_rejects_negative_canonical_graph_weight_bounds(self, query: dict[str, object]) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
         with pytest.raises(AntflyException, match="finite non-negative number"):
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", **query}})
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {"traverse": {"start": {"keys": ["doc:a"]}, "edge_weight": None}},
+            {"traverse": {"start": {"keys": ["doc:a"]}, "edge_weight": {}}},
+            {
+                "shortest_path": {
+                    "from": {"key": "doc:a"},
+                    "to": {"key": "doc:b"},
+                    "objective": None,
+                }
+            },
+        ],
+    )
+    def test_query_rejects_empty_or_null_canonical_path_options(self, query: dict[str, object]) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException):
             client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", **query}})
 
     @pytest.mark.parametrize("operation", ["traverse", "shortest_path", "k_shortest_paths"])

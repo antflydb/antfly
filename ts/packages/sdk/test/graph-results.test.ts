@@ -43,9 +43,47 @@ describe("graph result admission", () => {
                 },
               ],
               length: 1,
-              weight_mode: "min_hops",
+              objective: "min_hops",
               weight_sum: 1,
               objective_value: 1,
+            },
+          ],
+          stats: { returned_items: 1, truncated: false },
+        }),
+        [canonicalRequest]
+      )
+    ).not.toThrow();
+  });
+
+  it("does not compute an overflowing product for a sum-independent objective", () => {
+    expect(() =>
+      validateGraphQueryResponses(
+        responses({
+          kind: "nodes",
+          nodes: [{ key: "c", depth: 2 }],
+          paths: [
+            {
+              nodes: [{ key: "a" }, { key: "b" }, { key: "c" }],
+              edges: [
+                {
+                  from: { key: "a" },
+                  to: { key: "b" },
+                  direction: "out",
+                  type: "related",
+                  weight: 1e200,
+                },
+                {
+                  from: { key: "b" },
+                  to: { key: "c" },
+                  direction: "out",
+                  type: "related",
+                  weight: 1e200,
+                },
+              ],
+              length: 2,
+              objective: "min_hops",
+              weight_sum: 2e200,
+              objective_value: 2,
             },
           ],
           stats: { returned_items: 1, truncated: false },
@@ -89,7 +127,7 @@ describe("graph result admission", () => {
           nodes: [{ key: "a" }, { key: "b" }],
           edges: [{ from: { key: "a" }, to: { key: "b" }, type: "related", weight: 1 }],
           length: 1,
-          weight_mode: "min_hops",
+          objective: "min_hops",
           weight_sum: 1,
           objective_value: 1,
         },
@@ -214,7 +252,7 @@ describe("graph result admission", () => {
             },
           ],
           length: 1,
-          weight_mode: "min_hops",
+          objective: "min_hops",
           weight_sum: 1,
           objective_value: 1,
         },
@@ -272,7 +310,7 @@ describe("graph result admission", () => {
       nodes: [{ key: "a" }],
       edges: [],
       length: 0,
-      weight_mode: "min_hops",
+      objective: "min_hops",
       weight_sum: 0,
       objective_value: 0,
     };

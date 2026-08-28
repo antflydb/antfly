@@ -115,7 +115,7 @@ function pathEdge(
   path: string,
   expectedFrom: JsonObject,
   expectedTo: JsonObject,
-  maxWeightMode: boolean
+  maxWeightProduct: boolean
 ): number {
   const edge = object(value, path);
   exactKeys(edge, path, ["from", "to", "direction", "type", "weight"], ["metadata"]);
@@ -129,10 +129,11 @@ function pathEdge(
   }
   nonemptyString(edge.type, `${path}.type`, MAX_EDGE_TYPE_BYTES);
   if (edge.metadata !== undefined) object(edge.metadata, `${path}.metadata`);
-  return finiteNonnegative(edge.weight, `${path}.weight`, maxWeightMode);
+  return finiteNonnegative(edge.weight, `${path}.weight`, maxWeightProduct);
 }
 
 function floatEqual(left: number, right: number): boolean {
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
   return Math.abs(left - right) <= 1e-12 * Math.max(1, Math.abs(left), Math.abs(right));
 }
 
@@ -142,7 +143,7 @@ function graphPath(value: unknown, path: string): JsonObject {
     "nodes",
     "edges",
     "length",
-    "weight_mode",
+    "objective",
     "weight_sum",
     "objective_value",
   ]);
@@ -156,9 +157,13 @@ function graphPath(value: unknown, path: string): JsonObject {
     invalid(path, "length, nodes, and edges do not align");
   }
   const nodes = rawNodes.map((node, index) => endpoint(node, `${path}.nodes[${index}]`));
-  const mode = result.weight_mode;
-  if (mode !== "min_hops" && mode !== "min_weight" && mode !== "max_weight") {
-    invalid(`${path}.weight_mode`, "has an unknown value");
+  const objectiveMode = result.objective;
+  if (
+    objectiveMode !== "min_hops" &&
+    objectiveMode !== "min_weight_sum" &&
+    objectiveMode !== "max_weight_product"
+  ) {
+    invalid(`${path}.objective`, "has an unknown value");
   }
   let sum = 0;
   let product = 1;
@@ -168,18 +173,23 @@ function graphPath(value: unknown, path: string): JsonObject {
       `${path}.edges[${index}]`,
       item(nodes, index, `${path}.nodes[${index}]`),
       item(nodes, index + 1, `${path}.nodes[${index + 1}]`),
-      mode === "max_weight"
+      objectiveMode === "max_weight_product"
     );
     sum += weight;
-    product *= weight;
+    if (!Number.isFinite(sum)) invalid(path, "path score overflowed");
+    if (objectiveMode === "max_weight_product") {
+      product *= weight;
+      if (!Number.isFinite(product)) invalid(path, "path score overflowed");
+    }
   });
   const weightSum = finiteNonnegative(result.weight_sum, `${path}.weight_sum`);
   const objective = finiteNonnegative(result.objective_value, `${path}.objective_value`);
   if (!floatEqual(weightSum, sum))
     invalid(`${path}.weight_sum`, "does not equal the edge-weight sum");
-  const expectedObjective = mode === "min_hops" ? length : mode === "min_weight" ? sum : product;
+  const expectedObjective =
+    objectiveMode === "min_hops" ? length : objectiveMode === "min_weight_sum" ? sum : product;
   if (!floatEqual(objective, expectedObjective))
-    invalid(`${path}.objective_value`, "does not match weight_mode");
+    invalid(`${path}.objective_value`, "does not match objective");
   return result;
 }
 

@@ -88,7 +88,270 @@ func decodeStrictJSON(encoded []byte, value any) error {
 	return nil
 }
 
+// strictPresent preserves the distinction between an omitted member, an
+// explicit null, and a concrete value while retaining strict decoding for the
+// selected value. Generated optional pointers cannot represent all three wire
+// states, which matters for operation-keyed structural unions.
+type strictPresent[T any] struct {
+	present bool
+	null    bool
+	value   T
+}
+
+func (p *strictPresent[T]) UnmarshalJSON(encoded []byte) error {
+	p.present = true
+	if bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
+		p.null = true
+		return nil
+	}
+	return decodeStrictJSON(encoded, &p.value)
+}
+
+// GraphQueryVariantKind identifies the concrete arm selected by GraphQuery.
+type GraphQueryVariantKind uint8
+
+const (
+	GraphQueryVariantMatch GraphQueryVariantKind = iota + 1
+	GraphQueryVariantTraverse
+	GraphQueryVariantShortestPath
+	GraphQueryVariantKShortestPaths
+)
+
+// DecodedGraphQuery is a presence-safe, strictly decoded GraphQuery arm.
+// Exactly one pointer is non-nil.
+type DecodedGraphQuery struct {
+	Kind           GraphQueryVariantKind
+	Match          *GraphMatchQuery
+	Traverse       *GraphTraverseQuery
+	ShortestPath   *GraphShortestPathQuery
+	KShortestPaths *GraphKShortestPathsQuery
+}
+
+type graphQueryStrictEnvelope struct {
+	Index          strictPresent[string]              `json:"index"`
+	Return         strictPresent[GraphReturn]         `json:"return"`
+	Match          strictPresent[GraphMatch]          `json:"match"`
+	Traverse       strictPresent[GraphTraversal]      `json:"traverse"`
+	ShortestPath   strictPresent[GraphShortestPath]   `json:"shortest_path"`
+	KShortestPaths strictPresent[GraphKShortestPaths] `json:"k_shortest_paths"`
+}
+
+// DecodeStrictVariant selects and decodes one operation-keyed GraphQuery arm
+// without copying the retained union through a RawMessage map. Null operation
+// members remain present and are rejected instead of being mistaken for
+// omission.
+func (t GraphQuery) DecodeStrictVariant() (DecodedGraphQuery, error) {
+	var envelope graphQueryStrictEnvelope
+	if err := decodeStrictJSON(t.union, &envelope); err != nil {
+		return DecodedGraphQuery{}, err
+	}
+	if !envelope.Index.present || envelope.Index.null {
+		return DecodedGraphQuery{}, errors.New("graph query requires a non-null index")
+	}
+	operations := []bool{
+		envelope.Match.present,
+		envelope.Traverse.present,
+		envelope.ShortestPath.present,
+		envelope.KShortestPaths.present,
+	}
+	count := 0
+	for _, present := range operations {
+		if present {
+			count++
+		}
+	}
+	if count != 1 {
+		return DecodedGraphQuery{}, errors.New("graph query must contain exactly one operation")
+	}
+	if envelope.Match.present {
+		if envelope.Match.null {
+			return DecodedGraphQuery{}, errors.New("graph query match must not be null")
+		}
+		if !envelope.Return.present || envelope.Return.null {
+			return DecodedGraphQuery{}, errors.New("graph match query requires a non-null return")
+		}
+		value := &GraphMatchQuery{Index: envelope.Index.value, Match: envelope.Match.value, Return: envelope.Return.value}
+		return DecodedGraphQuery{Kind: GraphQueryVariantMatch, Match: value}, nil
+	}
+	if envelope.Return.present {
+		return DecodedGraphQuery{}, errors.New("graph return is only valid for match queries")
+	}
+	if envelope.Traverse.present {
+		if envelope.Traverse.null {
+			return DecodedGraphQuery{}, errors.New("graph query traverse must not be null")
+		}
+		value := &GraphTraverseQuery{Index: envelope.Index.value, Traverse: envelope.Traverse.value}
+		return DecodedGraphQuery{Kind: GraphQueryVariantTraverse, Traverse: value}, nil
+	}
+	if envelope.ShortestPath.present {
+		if envelope.ShortestPath.null {
+			return DecodedGraphQuery{}, errors.New("graph query shortest_path must not be null")
+		}
+		value := &GraphShortestPathQuery{Index: envelope.Index.value, ShortestPath: envelope.ShortestPath.value}
+		return DecodedGraphQuery{Kind: GraphQueryVariantShortestPath, ShortestPath: value}, nil
+	}
+	if envelope.KShortestPaths.null {
+		return DecodedGraphQuery{}, errors.New("graph query k_shortest_paths must not be null")
+	}
+	value := &GraphKShortestPathsQuery{Index: envelope.Index.value, KShortestPaths: envelope.KShortestPaths.value}
+	return DecodedGraphQuery{Kind: GraphQueryVariantKShortestPaths, KShortestPaths: value}, nil
+}
+
+// GraphReturnVariantKind identifies the concrete canonical MATCH return arm.
+type GraphReturnVariantKind uint8
+
+const (
+	GraphReturnVariantBindings GraphReturnVariantKind = iota + 1
+	GraphReturnVariantAggregates
+)
+
+// DecodedGraphReturn is a strictly decoded canonical MATCH return arm.
+type DecodedGraphReturn struct {
+	Kind       GraphReturnVariantKind
+	Bindings   *GraphBindingsReturn
+	Aggregates *GraphAggregatesReturn
+}
+
+type graphReturnStrictEnvelope struct {
+	Bindings         strictPresent[[]GraphIdentifier]              `json:"bindings"`
+	Aggregates       strictPresent[map[string]GraphCountAggregate] `json:"aggregates"`
+	Limit            strictPresent[int]                            `json:"limit"`
+	IncludeDocuments strictPresent[bool]                           `json:"include_documents"`
+	Fields           strictPresent[[]string]                       `json:"fields"`
+}
+
+// DecodeStrictVariant selects one GraphReturn arm without remarshal/probe
+// cycles and rejects null or cross-arm members.
+func (t GraphReturn) DecodeStrictVariant() (DecodedGraphReturn, error) {
+	var envelope graphReturnStrictEnvelope
+	if err := decodeStrictJSON(t.union, &envelope); err != nil {
+		return DecodedGraphReturn{}, err
+	}
+	if envelope.Bindings.present == envelope.Aggregates.present {
+		return DecodedGraphReturn{}, errors.New("graph return must contain exactly one arm")
+	}
+	if envelope.Bindings.present {
+		if envelope.Bindings.null {
+			return DecodedGraphReturn{}, errors.New("graph return bindings must not be null")
+		}
+		if envelope.Limit.null || envelope.IncludeDocuments.null || envelope.Fields.null {
+			return DecodedGraphReturn{}, errors.New("graph binding return optional fields must not be null")
+		}
+		value := &GraphBindingsReturn{
+			Bindings:         envelope.Bindings.value,
+			Limit:            envelope.Limit.value,
+			IncludeDocuments: envelope.IncludeDocuments.value,
+			Fields:           envelope.Fields.value,
+		}
+		return DecodedGraphReturn{Kind: GraphReturnVariantBindings, Bindings: value}, nil
+	}
+	if envelope.Aggregates.null {
+		return DecodedGraphReturn{}, errors.New("graph return aggregates must not be null")
+	}
+	if envelope.Limit.present || envelope.IncludeDocuments.present || envelope.Fields.present {
+		return DecodedGraphReturn{}, errors.New("binding projection fields are not valid for aggregate returns")
+	}
+	value := &GraphAggregatesReturn{Aggregates: envelope.Aggregates.value}
+	return DecodedGraphReturn{Kind: GraphReturnVariantAggregates, Aggregates: value}, nil
+}
+
 type graphPathEndpointWire GraphPathEndpoint
+
+func (t *GraphEdgeWeightRange) UnmarshalJSON(encoded []byte) error {
+	var decoded struct {
+		Max strictPresent[float64] `json:"max"`
+		Min strictPresent[float64] `json:"min"`
+	}
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	if decoded.Min.null || decoded.Max.null {
+		return errors.New("graph edge_weight bounds must be omitted or non-null")
+	}
+	*t = GraphEdgeWeightRange{}
+	if decoded.Min.present {
+		value := decoded.Min.value
+		t.Min = &value
+	}
+	if decoded.Max.present {
+		value := decoded.Max.value
+		t.Max = &value
+	}
+	return nil
+}
+
+type graphTraversalWire GraphTraversal
+
+func (t *GraphTraversal) UnmarshalJSON(encoded []byte) error {
+	if err := rejectNullGraphPathOptions(encoded, false); err != nil {
+		return err
+	}
+	var decoded graphTraversalWire
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphTraversal(decoded)
+	return nil
+}
+
+type graphShortestPathWire GraphShortestPath
+
+func (t *GraphShortestPath) UnmarshalJSON(encoded []byte) error {
+	if err := rejectNullGraphPathOptions(encoded, true); err != nil {
+		return err
+	}
+	var decoded graphShortestPathWire
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphShortestPath(decoded)
+	return nil
+}
+
+type graphKShortestPathsWire GraphKShortestPaths
+
+func (t *GraphKShortestPaths) UnmarshalJSON(encoded []byte) error {
+	if err := rejectNullGraphPathOptions(encoded, true); err != nil {
+		return err
+	}
+	var decoded graphKShortestPathsWire
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphKShortestPaths(decoded)
+	return nil
+}
+
+type graphMatchEdgeWire GraphMatchEdge
+
+func (t *GraphMatchEdge) UnmarshalJSON(encoded []byte) error {
+	if err := rejectNullGraphPathOptions(encoded, false); err != nil {
+		return err
+	}
+	var decoded graphMatchEdgeWire
+	if err := decodeStrictJSON(encoded, &decoded); err != nil {
+		return err
+	}
+	*t = GraphMatchEdge(decoded)
+	return nil
+}
+
+func rejectNullGraphPathOptions(encoded []byte, hasObjective bool) error {
+	var presence struct {
+		EdgeWeight json.RawMessage `json:"edge_weight"`
+		Objective  json.RawMessage `json:"objective"`
+	}
+	if err := json.Unmarshal(encoded, &presence); err != nil {
+		return err
+	}
+	if err := rejectExplicitJSONNull(presence.EdgeWeight, "graph edge_weight must be omitted or non-null"); err != nil {
+		return err
+	}
+	if hasObjective {
+		return rejectExplicitJSONNull(presence.Objective, "graph path objective must be omitted or non-null")
+	}
+	return nil
+}
 
 // UnmarshalJSON preserves the OpenAPI distinction between an omitted optional
 // table qualifier and explicit null without requiring callers to retain a

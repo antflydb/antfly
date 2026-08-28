@@ -127,7 +127,7 @@ def _validate_path_edge(
     expected_from: Mapping[str, Any],
     expected_to: Mapping[str, Any],
     *,
-    max_weight_mode: bool,
+    max_weight_product: bool,
 ) -> float:
     edge = _object(value, path)
     _exact_keys(
@@ -143,13 +143,15 @@ def _validate_path_edge(
     if edge["direction"] not in {"out", "in"}:
         _invalid(f"{path}.direction", "must be out or in")
     _nonempty_string(edge["type"], f"{path}.type", max_utf8_bytes=65_536)
-    weight = _finite_nonnegative(edge["weight"], f"{path}.weight", at_most_one=max_weight_mode)
+    weight = _finite_nonnegative(edge["weight"], f"{path}.weight", at_most_one=max_weight_product)
     if "metadata" in edge:
         _object(edge["metadata"], f"{path}.metadata")
     return weight
 
 
 def _float_equal(left: float, right: float) -> bool:
+    if not isfinite(left) or not isfinite(right):
+        return False
     return abs(left - right) <= 1e-12 * max(1.0, abs(left), abs(right))
 
 
@@ -158,7 +160,7 @@ def _validate_path(value: object, path: str) -> Mapping[str, Any]:
     _exact_keys(
         graph_path,
         path,
-        required=frozenset({"nodes", "edges", "length", "weight_mode", "weight_sum", "objective_value"}),
+        required=frozenset({"nodes", "edges", "length", "objective", "weight_sum", "objective_value"}),
     )
     raw_nodes = _array(graph_path["nodes"], f"{path}.nodes")
     raw_edges = _array(graph_path["edges"], f"{path}.edges")
@@ -170,9 +172,9 @@ def _validate_path(value: object, path: str) -> Mapping[str, Any]:
     if length != len(raw_edges) or len(raw_nodes) != len(raw_edges) + 1:
         _invalid(path, "length, nodes, and edges do not align")
     nodes = [_validate_endpoint(node, f"{path}.nodes[{index}]") for index, node in enumerate(raw_nodes)]
-    weight_mode = graph_path["weight_mode"]
-    if weight_mode not in {"min_hops", "min_weight", "max_weight"}:
-        _invalid(f"{path}.weight_mode", "has an unknown value")
+    objective_mode = graph_path["objective"]
+    if objective_mode not in {"min_hops", "min_weight_sum", "max_weight_product"}:
+        _invalid(f"{path}.objective", "has an unknown value")
 
     weight_sum = 0.0
     weight_product = 1.0
@@ -182,22 +184,29 @@ def _validate_path(value: object, path: str) -> Mapping[str, Any]:
             f"{path}.edges[{index}]",
             nodes[index],
             nodes[index + 1],
-            max_weight_mode=weight_mode == "max_weight",
+            max_weight_product=objective_mode == "max_weight_product",
         )
         weight_sum += weight
-        weight_product *= weight
-        if not isfinite(weight_sum) or not isfinite(weight_product):
+        if not isfinite(weight_sum):
             _invalid(path, "path score overflowed")
+        if objective_mode == "max_weight_product":
+            weight_product *= weight
+            if not isfinite(weight_product):
+                _invalid(path, "path score overflowed")
 
     encoded_sum = _finite_nonnegative(graph_path["weight_sum"], f"{path}.weight_sum")
     encoded_objective = _finite_nonnegative(graph_path["objective_value"], f"{path}.objective_value")
     if not _float_equal(encoded_sum, weight_sum):
         _invalid(f"{path}.weight_sum", "does not equal the sum of edge weights")
     objective = (
-        float(length) if weight_mode == "min_hops" else weight_product if weight_mode == "max_weight" else weight_sum
+        float(length)
+        if objective_mode == "min_hops"
+        else weight_product
+        if objective_mode == "max_weight_product"
+        else weight_sum
     )
     if not _float_equal(encoded_objective, objective):
-        _invalid(f"{path}.objective_value", "does not match weight_mode")
+        _invalid(f"{path}.objective_value", "does not match objective")
     return graph_path
 
 
@@ -243,7 +252,7 @@ def _validate_result_node(value: object, path: str) -> Mapping[str, Any]:
                 f"{path}.path_edges[{index}]",
                 endpoints[index],
                 endpoints[index + 1],
-                max_weight_mode=False,
+                max_weight_product=False,
             )
     return node
 

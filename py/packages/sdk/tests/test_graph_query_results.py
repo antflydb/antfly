@@ -80,6 +80,51 @@ def test_canonical_query_decoder_rejects_legacy_or_missing_discriminator() -> No
         )
 
 
+def test_canonical_path_does_not_compute_unused_overflowing_product() -> None:
+    path_query = {
+        "path": {
+            "index": "graph",
+            "shortest_path": {"from": {"key": "a"}, "to": {"key": "c"}},
+        }
+    }
+    decode_query_responses(
+        _query_response(
+            {
+                "kind": "nodes",
+                "nodes": [{"key": "c", "depth": 2}],
+                "paths": [
+                    {
+                        "nodes": [{"key": "a"}, {"key": "b"}, {"key": "c"}],
+                        "edges": [
+                            {
+                                "from": {"key": "a"},
+                                "to": {"key": "b"},
+                                "direction": "out",
+                                "type": "related",
+                                "weight": 1e200,
+                            },
+                            {
+                                "from": {"key": "b"},
+                                "to": {"key": "c"},
+                                "direction": "out",
+                                "type": "related",
+                                "weight": 1e200,
+                            },
+                        ],
+                        "length": 2,
+                        "objective": "min_hops",
+                        "weight_sum": 2e200,
+                        "objective_value": 2,
+                    }
+                ],
+                "stats": {"returned_items": 1, "truncated": False},
+            },
+            operation="path",
+        ),
+        expected_graph_queries=path_query,
+    )
+
+
 def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
     path_query = {
         "path": {
@@ -171,7 +216,7 @@ def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> No
         "nodes": [{"key": "a"}],
         "edges": [],
         "length": 0,
-        "weight_mode": "min_hops",
+        "objective": "min_hops",
         "weight_sum": 0,
         "objective_value": 0,
     }
@@ -298,7 +343,7 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
                             }
                         ],
                         "length": 1,
-                        "weight_mode": "min_weight",
+                        "objective": "min_weight_sum",
                         "weight_sum": 0.5,
                         "objective_value": 0.5,
                     }
@@ -385,7 +430,7 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
                         }
                     ],
                     "length": 1,
-                    "weight_mode": "min_hops",
+                    "objective": "min_hops",
                     "weight_sum": 1,
                     "objective_value": 1,
                 }
@@ -503,7 +548,7 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
                         }
                     ],
                     "length": 1,
-                    "weight_mode": "min_hops",
+                    "objective": "min_hops",
                     "weight_sum": 0.5,
                     "objective_value": 1,
                 }
@@ -526,7 +571,7 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
                         }
                     ],
                     "length": 1,
-                    "weight_mode": "min_weight",
+                    "objective": "min_weight_sum",
                     "weight_sum": 0.25,
                     "objective_value": 0.5,
                 }
@@ -561,7 +606,7 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
                         }
                     ],
                     "length": 1,
-                    "weight_mode": "min_hops",
+                    "objective": "min_hops",
                     "weight_sum": 1,
                     "objective_value": 1,
                 }

@@ -358,6 +358,8 @@ type (
 	GraphDocumentFilterBoolean     = oapi.GraphDocumentFilterBoolean
 	GraphDocumentFilterConjunction = oapi.GraphDocumentFilterConjunction
 	GraphDocumentFilterDisjunction = oapi.GraphDocumentFilterDisjunction
+	GraphEdgeWeightRange           = oapi.GraphEdgeWeightRange
+	GraphPathObjective             = oapi.GraphPathObjective
 
 	// Graph traversal types
 	TraverseResponse = oapi.TraverseResponse
@@ -853,6 +855,11 @@ const (
 	PathWeightModeMaxWeight = oapi.PathWeightModeMaxWeight
 	PathWeightModeMinHops   = oapi.PathWeightModeMinHops
 	PathWeightModeMinWeight = oapi.PathWeightModeMinWeight
+
+	// GraphPathObjective values
+	GraphPathObjectiveMinHops          = oapi.GraphPathObjectiveMinHops
+	GraphPathObjectiveMinWeightSum     = oapi.GraphPathObjectiveMinWeightSum
+	GraphPathObjectiveMaxWeightProduct = oapi.GraphPathObjectiveMaxWeightProduct
 )
 
 // allToolNames is the complete set of valid ChatToolName values.

@@ -1,4 +1,10 @@
-import type { AntflyClient, GraphQueryResult, GraphResult, IndexStatus, QueryRequest } from "@antfly/sdk";
+import type {
+  AntflyClient,
+  GraphQueryResult,
+  GraphResult,
+  IndexStatus,
+  QueryRequest,
+} from "@antfly/sdk";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
 import { ApiConfigContext } from "../contexts/api-config-context";
@@ -172,7 +178,7 @@ const shortestPathResult: GraphQueryResult = {
         },
       ],
       length: 2,
-      weight_mode: "min_hops",
+      objective: "min_hops",
       weight_sum: 1.6,
       objective_value: 2,
     },

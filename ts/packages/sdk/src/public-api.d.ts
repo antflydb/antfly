@@ -7824,7 +7824,7 @@ export interface components {
             type: components["schemas"]["GraphEdgeType"];
             /**
              * Format: double
-             * @description Finite non-negative edge cost or confidence. The max_weight path mode additionally requires values in [0,1].
+             * @description Finite non-negative edge cost or confidence. The max_weight_product path objective additionally requires values in [0,1].
              */
             weight: number;
             /**
@@ -12054,6 +12054,13 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
+        /** @description Inclusive per-edge weight filter. At least one bound is required. Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual stored edges and does not constrain the aggregate path objective. */
+        GraphEdgeWeightRange: {
+            /** Format: double */
+            min?: number;
+            /** Format: double */
+            max?: number;
+        };
         /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
             from: components["schemas"]["GraphIdentifier"];
@@ -12066,10 +12073,7 @@ export interface components {
             min_hops?: number;
             /** @default 1 */
             max_hops?: number;
-            /** Format: double */
-            min_weight?: number;
-            /** Format: double */
-            max_weight?: number;
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
         };
         GraphWhereAnd: {
             and: components["schemas"]["GraphWhereExpression"][];
@@ -12193,10 +12197,7 @@ export interface components {
              * @default 1
              */
             max_depth?: number;
-            /** Format: double */
-            min_weight?: number;
-            /** Format: double */
-            max_weight?: number;
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
             /** @default 100 */
             limit?: number;
             /** @default false */
@@ -12216,13 +12217,13 @@ export interface components {
             traverse: components["schemas"]["GraphTraversal"];
         };
         /**
-         * @description Path weighting algorithm for pathfinding:
-         *     - min_hops: Minimize number of edges
-         *     - min_weight: Minimize sum of finite non-negative edge weights
-         *     - max_weight: Maximize product of finite edge weights in [0,1]
+         * @description Objective used to rank graph paths:
+         *     - min_hops: Minimize the number of edges.
+         *     - min_weight_sum: Minimize the sum of finite non-negative edge weights.
+         *     - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to be in [0,1].
          * @enum {string}
          */
-        PathWeightMode: "min_hops" | "min_weight" | "max_weight";
+        GraphPathObjective: "min_hops" | "min_weight_sum" | "max_weight_product";
         /** @description Find the best path from `from` to `to` in the requested stored-edge direction. */
         GraphShortestPath: {
             from: components["schemas"]["GraphPathEndpoint"];
@@ -12233,11 +12234,9 @@ export interface components {
             edge_types?: components["schemas"]["GraphEdgeType"][];
             /** @default 10 */
             max_depth?: number;
-            /** Format: double */
-            min_weight?: number;
-            /** Format: double */
-            max_weight?: number;
-            weight_mode?: components["schemas"]["PathWeightMode"];
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
+            /** @default min_hops */
+            objective?: components["schemas"]["GraphPathObjective"];
             /** @description Non-scoring structured stored-document predicate for path nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
             /**
@@ -12263,11 +12262,9 @@ export interface components {
             edge_types?: components["schemas"]["GraphEdgeType"][];
             /** @default 10 */
             max_depth?: number;
-            /** Format: double */
-            min_weight?: number;
-            /** Format: double */
-            max_weight?: number;
-            weight_mode?: components["schemas"]["PathWeightMode"];
+            edge_weight?: components["schemas"]["GraphEdgeWeightRange"];
+            /** @default min_hops */
+            objective?: components["schemas"]["GraphPathObjective"];
             /** @description Non-scoring structured stored-document predicate for path nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
             /**
@@ -12321,6 +12318,14 @@ export interface components {
             /** @description Filter which nodes to use as start/target */
             node_filter?: components["schemas"]["NodeFilter"];
         };
+        /**
+         * @description Path weighting algorithm for pathfinding:
+         *     - min_hops: Minimize number of edges
+         *     - min_weight: Minimize sum of finite non-negative edge weights
+         *     - max_weight: Maximize product of finite edge weights in [0,1]
+         * @enum {string}
+         */
+        PathWeightMode: "min_hops" | "min_weight" | "max_weight";
         /**
          * @deprecated
          * @description Deprecated graph_searches traversal and path parameters.
@@ -12501,7 +12506,7 @@ export interface components {
             type: components["schemas"]["GraphEdgeType"];
             /**
              * Format: double
-             * @description Finite durable edge weight. max_weight paths further require values in [0,1].
+             * @description Finite durable edge weight. max_weight_product paths further require values in [0,1].
              */
             weight: number;
             metadata?: {
@@ -12537,7 +12542,7 @@ export interface components {
             nodes: components["schemas"]["GraphPathEndpoint"][];
             /** @description Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1]. */
             edges: components["schemas"]["GraphPathEdge"][];
-            weight_mode: components["schemas"]["PathWeightMode"];
+            objective: components["schemas"]["GraphPathObjective"];
             /**
              * Format: double
              * @description Sum of raw edge weights along the path, independent of the selected ranking objective.
@@ -12545,7 +12550,7 @@ export interface components {
             weight_sum: number;
             /**
              * Format: double
-             * @description The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum for min_weight, and the raw edge-weight product for max_weight.
+             * @description The user-facing value optimized by objective; edge count for min_hops, weight_sum for min_weight_sum, and the raw edge-weight product for max_weight_product.
              */
             objective_value: number;
             length: number;

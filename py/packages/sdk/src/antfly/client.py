@@ -98,23 +98,38 @@ def _require_graph_edge_types(value: object, path: str) -> None:
             raise AntflyException(f"{path} must encode to at most {MAX_GRAPH_EDGE_TYPE_UTF8_BYTES} UTF-8 bytes")
 
 
-def _validate_graph_weight_bounds(value: Mapping[str, Any], path: str) -> None:
+def _validate_graph_edge_weight(value: Mapping[str, Any], path: str) -> None:
+    if "edge_weight" not in value:
+        return
+    raw_range = value["edge_weight"]
+    if not isinstance(raw_range, Mapping):
+        raise AntflyException(f"{path}.edge_weight must be an object with min and/or max")
+    if not raw_range or any(field not in {"min", "max"} for field in raw_range):
+        raise AntflyException(f"{path}.edge_weight must contain min and/or max only")
     bounds: dict[str, float] = {}
-    for field, label in (("min_weight", "minimum"), ("max_weight", "maximum")):
-        if field not in value:
+    for field, label in (("min", "minimum"), ("max", "maximum")):
+        if field not in raw_range:
             continue
-        bound = value[field]
+        bound = raw_range[field]
         if isinstance(bound, bool) or not isinstance(bound, (int, float)):
-            raise AntflyException(f"{path}.{field} must be a finite non-negative number")
+            raise AntflyException(f"{path}.edge_weight.{field} must be a finite non-negative number")
         try:
             normalized = float(bound)
         except (OverflowError, ValueError) as exc:
-            raise AntflyException(f"{path}.{field} must be a finite non-negative number") from exc
+            raise AntflyException(f"{path}.edge_weight.{field} must be a finite non-negative number") from exc
         if not math.isfinite(normalized) or normalized < 0:
-            raise AntflyException(f"{path}.{field} must be a finite non-negative number")
+            raise AntflyException(f"{path}.edge_weight.{field} must be a finite non-negative number")
         bounds[label] = normalized
     if bounds.get("minimum", 0) > bounds.get("maximum", math.inf):
-        raise AntflyException(f"{path}.min_weight must not exceed max_weight")
+        raise AntflyException(f"{path}.edge_weight.min must not exceed edge_weight.max")
+
+
+def _validate_graph_path_objective(value: Mapping[str, Any], path: str) -> None:
+    if "objective" not in value:
+        return
+    objective = value["objective"]
+    if objective not in {"min_hops", "min_weight_sum", "max_weight_product"}:
+        raise AntflyException(f"{path}.objective must be min_hops, min_weight_sum, or max_weight_product")
 
 
 def _validate_graph_edges(edges: object, path: str) -> None:
@@ -128,7 +143,7 @@ def _validate_graph_edges(edges: object, path: str) -> None:
         _require_graph_identifier(edge.get("to"), f"{edge_path}.to")
         _validate_graph_direction(edge, edge_path)
         _require_graph_edge_types(edge.get("types"), f"{edge_path}.types")
-        _validate_graph_weight_bounds(edge, edge_path)
+        _validate_graph_edge_weight(edge, edge_path)
 
 
 def _validate_graph_direction(value: Mapping[str, Any], path: str) -> None:
@@ -233,7 +248,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
         if isinstance(traverse, Mapping):
             _validate_graph_direction(traverse, f"graph_queries[{name!r}].traverse")
             _require_graph_edge_types(traverse.get("edge_types"), f"graph_queries[{name!r}].traverse.edge_types")
-            _validate_graph_weight_bounds(traverse, f"graph_queries[{name!r}].traverse")
+            _validate_graph_edge_weight(traverse, f"graph_queries[{name!r}].traverse")
             start = traverse.get("start")
             if isinstance(start, Mapping) and "result_ref" in start:
                 path = f"graph_queries[{name!r}].traverse.start"
@@ -254,7 +269,9 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
             path_query = encoded_query.get(operation)
             if isinstance(path_query, Mapping):
                 _validate_graph_direction(path_query, f"graph_queries[{name!r}].{operation}")
-                _validate_graph_weight_bounds(path_query, f"graph_queries[{name!r}].{operation}")
+                operation_path = f"graph_queries[{name!r}].{operation}"
+                _validate_graph_edge_weight(path_query, operation_path)
+                _validate_graph_path_objective(path_query, operation_path)
                 _require_graph_edge_types(
                     path_query.get("edge_types"),
                     f"graph_queries[{name!r}].{operation}.edge_types",

@@ -454,10 +454,34 @@ func TestGraphOpaqueUnionValidationRejectsUnknownMembers(t *testing.T) {
 		if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}},"return":null}`), &query); err != nil {
 			t.Fatal(err)
 		}
-		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "unknown field") {
+		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "return is only valid") {
 			t.Fatalf("expected cross-variant return member error, got %v", err)
 		}
 	})
+	t.Run("query explicit null operation counts as present", func(t *testing.T) {
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}},"match":null}`), &query); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "exactly one operation") {
+			t.Fatalf("expected explicit null operation to conflict with traversal, got %v", err)
+		}
+	})
+	for name, encoded := range map[string]string{
+		"null edge weight":       `{"index":"graph","traverse":{"start":{"keys":["a"]},"edge_weight":null}}`,
+		"null edge weight bound": `{"index":"graph","traverse":{"start":{"keys":["a"]},"edge_weight":{"min":null,"max":1}}}`,
+		"null objective":         `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"b"},"objective":null}}`,
+	} {
+		t.Run("query "+name, func(t *testing.T) {
+			var query GraphQuery
+			if err := json.Unmarshal([]byte(encoded), &query); err != nil {
+				t.Fatal(err)
+			}
+			if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "must be omitted or non-null") {
+				t.Fatalf("expected explicit null option to fail, got %v", err)
+			}
+		})
+	}
 
 	for name, encoded := range map[string]string{
 		"unknown":         `{"keys":["doc:a"],"unexpected":true}`,
@@ -764,7 +788,7 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 			name:     "canonical payload validates path invariants",
 			requests: canonicalRequest,
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"b","depth":0}],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`)},
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"b","depth":0}],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`)},
 			}}},
 			contains: "length, nodes, and edges do not align",
 		},
@@ -896,7 +920,7 @@ func TestDecodeGraphResultForQueryEnforcesOperationCardinalityAndPathOwnership(t
 		}
 		return result
 	}
-	const zeroHopPath = `{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}`
+	const zeroHopPath = `{"nodes":[{"key":"a"}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}`
 	tests := []struct {
 		name     string
 		query    string
@@ -1039,17 +1063,17 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 		`{"kind":"bindings","rows":[{"a":{"key":"a","table":""}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{"key":"a","table":null}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{"key":"a","document":null}}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops"}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a","table":""}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[{"key":"wrong","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops"}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a","table":""}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"wrong","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"b","depth":0,"path":[{"key":"a"},{"key":"b"}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"b","depth":1,"path":[{"key":"a","table":null},{"key":"b"}],"path_edges":[{"from":{"key":"a"},"to":{"key":"b"},"type":"edge","weight":1}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"b","depth":1,"path":[{"key":"a"},{"key":"b"}],"path_edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"sideways","type":"edge","weight":1}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"wrong","depth":1,"path":[{"key":"a"},{"key":"b"}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"type":"edge"}],"length":1,"weight_mode":"min_hops","weight_sum":0,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}`,
-		`{"kind":"nodes","nodes":[{"key":"b","depth":0}],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a","table":null},"to":{"key":"b"},"type":"edge","weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}`,
-		fmt.Sprintf(`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"type":%q,"weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}`, strings.Repeat("é", maxGraphEdgeTypeBytes/2+1)),
+		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"type":"edge"}],"length":1,"objective":"min_hops","weight_sum":0,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"b","depth":0}],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a","table":null},"to":{"key":"b"},"type":"edge","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}`,
+		fmt.Sprintf(`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[{"from":{"key":"a"},"to":{"key":"b"},"type":%q,"weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}`, strings.Repeat("é", maxGraphEdgeTypeBytes/2+1)),
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false},"unexpected":true}`,
 		`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false,"unexpected":true}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"unexpected":true}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
@@ -1201,23 +1225,30 @@ func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinHops: 2}); err == nil {
 		t.Fatal("expected omitted max_hops to default to one and reject min_hops=2")
 	}
-	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinWeight: &zero, MaxWeight: &zero}); err != nil {
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", EdgeWeight: &GraphEdgeWeightRange{Min: &zero, Max: &zero}}); err != nil {
 		t.Fatalf("explicit zero weight range must be representable: %v", err)
 	}
-	encoded, err := json.Marshal(GraphMatchEdge{From: "a", To: "b", MinWeight: &zero, MaxWeight: &zero})
+	encoded, err := json.Marshal(GraphMatchEdge{From: "a", To: "b", EdgeWeight: &GraphEdgeWeightRange{Min: &zero, Max: &zero}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(encoded), `"min_weight":0`) || !strings.Contains(string(encoded), `"max_weight":0`) {
-		t.Fatalf("explicit zero weight range was omitted: %s", encoded)
+	var payload struct {
+		EdgeWeight *GraphEdgeWeightRange `json:"edge_weight"`
 	}
-	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinWeight: &zero, MaxWeight: &negative}); err == nil {
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.EdgeWeight == nil || payload.EdgeWeight.Min == nil || payload.EdgeWeight.Max == nil ||
+		*payload.EdgeWeight.Min != 0 || *payload.EdgeWeight.Max != 0 {
+		t.Fatalf("explicit zero weight range was not preserved: %#v", payload.EdgeWeight)
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", EdgeWeight: &GraphEdgeWeightRange{Min: &zero, Max: &negative}}); err == nil {
 		t.Fatal("expected inverted graph weight range to fail")
 	}
-	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinWeight: &negative}); err == nil || !strings.Contains(err.Error(), "non-negative") {
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", EdgeWeight: &GraphEdgeWeightRange{Min: &negative}}); err == nil || !strings.Contains(err.Error(), "non-negative") {
 		t.Fatalf("expected negative graph minimum weight to fail, got %v", err)
 	}
-	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MaxWeight: &negative}); err == nil || !strings.Contains(err.Error(), "non-negative") {
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", EdgeWeight: &GraphEdgeWeightRange{Max: &negative}}); err == nil || !strings.Contains(err.Error(), "non-negative") {
 		t.Fatalf("expected negative graph maximum weight to fail, got %v", err)
 	}
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{"links", "links"}}); err == nil {
@@ -1231,6 +1262,26 @@ func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 	}
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{strings.Repeat("文", maxGraphEdgeTypeBytes/3+1)}}); err == nil {
 		t.Fatal("expected encoded graph edge type byte limit to fail")
+	}
+}
+
+func TestGraphPathValidationDoesNotComputeUnusedProduct(t *testing.T) {
+	nodes := []GraphPathEndpoint{{Key: "a"}, {Key: "b"}, {Key: "c"}}
+	edges := []GraphPathEdge{
+		{From: nodes[0], To: nodes[1], Direction: GraphPathEdgeDirectionOut, Type: "edge", Weight: 1e200},
+		{From: nodes[1], To: nodes[2], Direction: GraphPathEdgeDirectionOut, Type: "edge", Weight: 1e200},
+	}
+	path := GraphPath{
+		Nodes: nodes, Edges: edges, Length: 2, Objective: GraphPathObjectiveMinHops,
+		WeightSum: 2e200, ObjectiveValue: 2,
+	}
+	if err := validateDecodedGraphPath(path); err != nil {
+		t.Fatalf("min_hops must not reject an irrelevant overflowing edge-weight product: %v", err)
+	}
+	path.Objective = GraphPathObjectiveMinWeightSum
+	path.ObjectiveValue = path.WeightSum
+	if err := validateDecodedGraphPath(path); err != nil {
+		t.Fatalf("min_weight_sum must not reject an irrelevant overflowing edge-weight product: %v", err)
 	}
 }
 

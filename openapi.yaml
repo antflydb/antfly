@@ -16251,8 +16251,8 @@ components:
           type: number
           format: double
           minimum: 0
-          description: Finite non-negative edge cost or confidence. The max_weight path mode additionally
-            requires values in [0,1].
+          description: Finite non-negative edge cost or confidence. The max_weight_product path objective
+            additionally requires values in [0,1].
         created_at:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -22973,6 +22973,24 @@ components:
             execution rejects document filters on aliases qualified with a different table because its
             published snapshot contains only the queried table. Explicitly qualifying an alias with the
             queried table is equivalent to omitting `table`.
+    GraphEdgeWeightRange:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      description: Inclusive per-edge weight filter. At least one bound is required. Bounds must be finite
+        and non-negative; when both are present, min must not exceed max. This filters individual stored
+        edges and does not constrain the aggregate path objective.
+      properties:
+        min:
+          type: number
+          format: double
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
+        max:
+          type: number
+          format: double
+          minimum: 0
+          x-go-type-skip-optional-pointer: false
     GraphMatchEdge:
       type: object
       additionalProperties: false
@@ -23014,16 +23032,9 @@ components:
           minimum: 1
           maximum: 64
           default: 1
-        min_weight:
-          type: number
-          format: double
-          minimum: 0
+        edge_weight:
           x-go-type-skip-optional-pointer: false
-        max_weight:
-          type: number
-          format: double
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
+          $ref: '#/components/schemas/GraphEdgeWeightRange'
     GraphWhereAnd:
       type: object
       additionalProperties: false
@@ -23366,16 +23377,9 @@ components:
           maximum: 64
           default: 1
           description: Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
-        min_weight:
-          type: number
-          format: double
-          minimum: 0
+        edge_weight:
           x-go-type-skip-optional-pointer: false
-        max_weight:
-          type: number
-          format: double
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
+          $ref: '#/components/schemas/GraphEdgeWeightRange'
         limit:
           type: integer
           minimum: 1
@@ -23410,21 +23414,21 @@ components:
           pattern: .*\S.*
         traverse:
           $ref: '#/components/schemas/GraphTraversal'
-    PathWeightMode:
-      x-go-type-skip-optional-pointer: true
+    GraphPathObjective:
       type: string
       enum:
         - min_hops
-        - min_weight
-        - max_weight
+        - min_weight_sum
+        - max_weight_product
       description: >
-        Path weighting algorithm for pathfinding:
+        Objective used to rank graph paths:
 
-        - min_hops: Minimize number of edges
+        - min_hops: Minimize the number of edges.
 
-        - min_weight: Minimize sum of finite non-negative edge weights
+        - min_weight_sum: Minimize the sum of finite non-negative edge weights.
 
-        - max_weight: Maximize product of finite edge weights in [0,1]
+        - max_weight_product: Maximize the product of edge weights, requiring every traversed weight to
+        be in [0,1].
     GraphShortestPath:
       type: object
       additionalProperties: false
@@ -23452,18 +23456,12 @@ components:
           minimum: 1
           maximum: 64
           default: 10
-        min_weight:
-          type: number
-          format: double
-          minimum: 0
+        edge_weight:
           x-go-type-skip-optional-pointer: false
-        max_weight:
-          type: number
-          format: double
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
-        weight_mode:
-          $ref: '#/components/schemas/PathWeightMode'
+          $ref: '#/components/schemas/GraphEdgeWeightRange'
+        objective:
+          $ref: '#/components/schemas/GraphPathObjective'
+          default: min_hops
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: Non-scoring structured stored-document predicate for path nodes.
@@ -23523,18 +23521,12 @@ components:
           minimum: 1
           maximum: 64
           default: 10
-        min_weight:
-          type: number
-          format: double
-          minimum: 0
+        edge_weight:
           x-go-type-skip-optional-pointer: false
-        max_weight:
-          type: number
-          format: double
-          minimum: 0
-          x-go-type-skip-optional-pointer: false
-        weight_mode:
-          $ref: '#/components/schemas/PathWeightMode'
+          $ref: '#/components/schemas/GraphEdgeWeightRange'
+        objective:
+          $ref: '#/components/schemas/GraphPathObjective'
+          default: min_hops
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
           description: Non-scoring structured stored-document predicate for path nodes.
@@ -23635,6 +23627,21 @@ components:
         node_filter:
           $ref: '#/components/schemas/NodeFilter'
           description: Filter which nodes to use as start/target
+    PathWeightMode:
+      x-go-type-skip-optional-pointer: true
+      type: string
+      enum:
+        - min_hops
+        - min_weight
+        - max_weight
+      description: >
+        Path weighting algorithm for pathfinding:
+
+        - min_hops: Minimize number of edges
+
+        - min_weight: Minimize sum of finite non-negative edge weights
+
+        - max_weight: Maximize product of finite edge weights in [0,1]
     GraphQueryParams:
       x-go-type-skip-optional-pointer: true
       type: object
@@ -23993,7 +24000,8 @@ components:
           type: number
           format: double
           minimum: 0
-          description: Finite durable edge weight. max_weight paths further require values in [0,1].
+          description: Finite durable edge weight. max_weight_product paths further require values in
+            [0,1].
         metadata:
           type: object
           additionalProperties: true
@@ -24068,7 +24076,7 @@ components:
         - nodes
         - edges
         - length
-        - weight_mode
+        - objective
         - weight_sum
         - objective_value
       description: An ordered canonical graph path with table-qualified node identities and a self-describing
@@ -24087,8 +24095,8 @@ components:
           items:
             $ref: '#/components/schemas/GraphPathEdge'
           description: Ordered edges; edges[i] traverses from nodes[i] to nodes[i + 1].
-        weight_mode:
-          $ref: '#/components/schemas/PathWeightMode'
+        objective:
+          $ref: '#/components/schemas/GraphPathObjective'
         weight_sum:
           type: number
           format: double
@@ -24098,8 +24106,8 @@ components:
           type: number
           format: double
           minimum: 0
-          description: The user-facing value optimized by weight_mode; edge count for min_hops, weight_sum
-            for min_weight, and the raw edge-weight product for max_weight.
+          description: The user-facing value optimized by objective; edge count for min_hops, weight_sum
+            for min_weight_sum, and the raw edge-weight product for max_weight_product.
         length:
           type: integer
           minimum: 0

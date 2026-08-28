@@ -621,7 +621,7 @@ pub fn encodeWeightedGraphShortestPathQueryRequest(
     edge_types: []const []const u8,
     max_depth: i64,
     limit: i64,
-    weight_mode: indexes_openapi.PathWeightMode,
+    objective: indexes_openapi.GraphPathObjective,
 ) ![]u8 {
     var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_queries.deinit(alloc);
@@ -633,7 +633,7 @@ pub fn encodeWeightedGraphShortestPathQueryRequest(
             .to = .{ .key = target_keys[0] },
             .edge_types = edge_types,
             .max_depth = max_depth,
-            .weight_mode = weight_mode,
+            .objective = objective,
         },
     };
     try graph_queries.map.put(alloc, name, .{ .graph_shortest_path_query = &query });
@@ -653,7 +653,7 @@ pub fn encodeWeightedGraphKShortestPathsQueryRequest(
     max_depth: i64,
     limit: i64,
     k: i64,
-    weight_mode: indexes_openapi.PathWeightMode,
+    objective: indexes_openapi.GraphPathObjective,
 ) ![]u8 {
     var graph_queries = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
     defer graph_queries.deinit(alloc);
@@ -665,7 +665,7 @@ pub fn encodeWeightedGraphKShortestPathsQueryRequest(
             .to = .{ .key = target_keys[0] },
             .edge_types = edge_types,
             .max_depth = max_depth,
-            .weight_mode = weight_mode,
+            .objective = objective,
             .k = k,
         },
     };

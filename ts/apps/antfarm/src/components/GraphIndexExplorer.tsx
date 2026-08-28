@@ -28,11 +28,11 @@ import type {
   GraphNodesResult,
   GraphPathEdge,
   GraphPathEndpoint,
+  GraphPathObjective,
   GraphQuery,
   GraphResult,
   IndexStatus,
   LegacyGraphQueryResult,
-  PathWeightMode,
   QueryRequest,
 } from "@antfly/sdk";
 import { GitBranch, Hash, Loader2, Network, RefreshCw, Route, Search } from "lucide-react";
@@ -216,9 +216,7 @@ function addNode(
   });
 }
 
-function graphVisualizationResult(
-  result: GraphResult | null
-): GraphVisualizationWireResult | null {
+function graphVisualizationResult(result: GraphResult | null): GraphVisualizationWireResult | null {
   if (!result) return null;
   if (result.kind === "nodes" || result.kind === "legacy" || result.kind === undefined)
     return result;
@@ -374,7 +372,7 @@ export function GraphIndexExplorer({
   const availableEdgeTypes = useMemo(() => edgeTypesForIndex(selectedIndex), [selectedIndex]);
   const [selectedEdgeTypes, setSelectedEdgeTypes] = useState<string[]>([]);
   const [mode, setMode] = useState<GraphMode>(initialMode);
-  const [weightMode, setWeightMode] = useState<PathWeightMode>("min_hops");
+  const [objective, setObjective] = useState<GraphPathObjective>("min_hops");
   const [startKey, setStartKey] = useState(initialStartKey);
   const [targetKey, setTargetKey] = useState(initialTargetKey);
   const [maxDepth, setMaxDepth] = useState(2);
@@ -449,8 +447,8 @@ export function GraphIndexExplorer({
               to: { key: targetKey.trim() },
               edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
               max_depth: maxDepth,
-              min_weight: minWeight > 0 ? minWeight : undefined,
-              weight_mode: weightMode,
+              edge_weight: minWeight > 0 ? { min: minWeight } : undefined,
+              objective,
               include_documents: true,
             },
           }
@@ -461,7 +459,7 @@ export function GraphIndexExplorer({
               edge_types: selectedEdgeTypes.length > 0 ? selectedEdgeTypes : undefined,
               max_depth: mode === "neighbors" ? 1 : maxDepth,
               limit: maxResults,
-              min_weight: minWeight > 0 ? minWeight : undefined,
+              edge_weight: minWeight > 0 ? { min: minWeight } : undefined,
               include_paths: includePaths,
               include_documents: true,
             },
@@ -486,12 +484,12 @@ export function GraphIndexExplorer({
     maxResults,
     minWeight,
     mode,
+    objective,
     selectedEdgeTypes,
     selectedIndex,
     startKey,
     tableName,
     targetKey,
-    weightMode,
   ]);
 
   const toggleEdgeType = (edgeType: string, checked: boolean) => {
@@ -657,16 +655,16 @@ export function GraphIndexExplorer({
               <div className="space-y-2">
                 <Label>Path score</Label>
                 <Select
-                  value={weightMode}
-                  onValueChange={(value) => setWeightMode(value as PathWeightMode)}
+                  value={objective}
+                  onValueChange={(value) => setObjective(value as GraphPathObjective)}
                 >
                   <SelectTrigger>
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
                     <SelectItem value="min_hops">Min hops</SelectItem>
-                    <SelectItem value="min_weight">Min weight</SelectItem>
-                    <SelectItem value="max_weight">Max weight</SelectItem>
+                    <SelectItem value="min_weight_sum">Minimum total weight</SelectItem>
+                    <SelectItem value="max_weight_product">Maximum weight product</SelectItem>
                   </SelectContent>
                 </Select>
               </div>

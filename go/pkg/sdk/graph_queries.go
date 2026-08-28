@@ -77,79 +77,31 @@ func validateGraphQuery(query GraphQuery) error {
 	return err
 }
 
-type graphQueryReturnEnvelopeMember struct {
-	present bool
-	value   GraphReturn
-}
-
-// UnmarshalJSON retains presence even for an explicit null while decoding the
-// small MATCH return union. Operation bodies use ordinary typed pointers below,
-// so the outer strict decoder parses each selected body only once.
-func (m *graphQueryReturnEnvelopeMember) UnmarshalJSON(encoded []byte) error {
-	m.present = true
-	if bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
-		return nil
-	}
-	return json.Unmarshal(encoded, &m.value)
-}
-
-type graphQueryValidationEnvelope struct {
-	Index          string                         `json:"index"`
-	Return         graphQueryReturnEnvelopeMember `json:"return"`
-	Match          *GraphMatch                    `json:"match"`
-	Traverse       *GraphTraversal                `json:"traverse"`
-	ShortestPath   *GraphShortestPath             `json:"shortest_path"`
-	KShortestPaths *GraphKShortestPaths           `json:"k_shortest_paths"`
-}
-
 // validateGraphQueryWithKind validates a query and reports whether it is a
 // MATCH. Request-level admission uses that bit to enforce the independent
-// complete-anchor scan cap. The generated union already retains its JSON, so
-// decode it once into typed optional members instead of marshaling and copying
-// the entire query through a RawMessage map before decoding the selected arm.
+// complete-anchor scan cap. Structural union mechanics live beside the
+// generated type so every SDK caller gets the same presence-safe strict decode.
 func validateGraphQueryWithKind(query GraphQuery) (bool, error) {
-	var envelope graphQueryValidationEnvelope
-	if err := query.DecodeStrictInto(&envelope); err != nil {
+	decoded, err := query.DecodeStrictVariant()
+	if err != nil {
 		return false, fmt.Errorf("invalid graph query: %w", err)
 	}
-	hasMatch := envelope.Match != nil
-	hasTraverse := envelope.Traverse != nil
-	hasShortestPath := envelope.ShortestPath != nil
-	hasKShortestPaths := envelope.KShortestPaths != nil
-	variants := 0
-	for _, present := range []bool{hasMatch, hasTraverse, hasShortestPath, hasKShortestPaths} {
-		if present {
-			variants++
-		}
-	}
-	if variants != 1 {
-		return false, fmt.Errorf("graph query must contain exactly one of match, traverse, shortest_path, or k_shortest_paths")
-	}
-	switch {
-	case hasMatch:
-		value := GraphMatchQuery{Index: envelope.Index, Match: *envelope.Match, Return: envelope.Return.value}
-		return true, validateGraphMatchQuery(value)
-	case hasTraverse:
-		if envelope.Return.present {
-			return false, fmt.Errorf("invalid graph query: json: unknown field %q", "return")
-		}
-		value := GraphTraverseQuery{Index: envelope.Index, Traverse: *envelope.Traverse}
-		return false, validateGraphTraverseQuery(value)
-	case hasShortestPath:
-		if envelope.Return.present {
-			return false, fmt.Errorf("invalid graph query: json: unknown field %q", "return")
-		}
-		value := GraphShortestPathQuery{Index: envelope.Index, ShortestPath: *envelope.ShortestPath}
-		return false, validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.Direction, value.ShortestPath.Filter, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
-	default:
-		if envelope.Return.present {
-			return false, fmt.Errorf("invalid graph query: json: unknown field %q", "return")
-		}
-		value := GraphKShortestPathsQuery{Index: envelope.Index, KShortestPaths: *envelope.KShortestPaths}
+	switch decoded.Kind {
+	case oapi.GraphQueryVariantMatch:
+		return true, validateGraphMatchQuery(*decoded.Match)
+	case oapi.GraphQueryVariantTraverse:
+		return false, validateGraphTraverseQuery(*decoded.Traverse)
+	case oapi.GraphQueryVariantShortestPath:
+		value := decoded.ShortestPath
+		return false, validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.Direction, value.ShortestPath.Filter, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.EdgeWeight, value.ShortestPath.Objective, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
+	case oapi.GraphQueryVariantKShortestPaths:
+		value := decoded.KShortestPaths
 		if value.KShortestPaths.K < 1 || value.KShortestPaths.K > 100 {
 			return false, fmt.Errorf("graph k must be between 1 and 100")
 		}
-		return false, validateGraphPathQuery(value.Index, value.KShortestPaths.From, value.KShortestPaths.To, value.KShortestPaths.Direction, value.KShortestPaths.Filter, value.KShortestPaths.EdgeTypes, value.KShortestPaths.MaxDepth, value.KShortestPaths.MinWeight, value.KShortestPaths.MaxWeight, value.KShortestPaths.IncludeDocuments, value.KShortestPaths.Fields)
+		return false, validateGraphPathQuery(value.Index, value.KShortestPaths.From, value.KShortestPaths.To, value.KShortestPaths.Direction, value.KShortestPaths.Filter, value.KShortestPaths.EdgeTypes, value.KShortestPaths.MaxDepth, value.KShortestPaths.EdgeWeight, value.KShortestPaths.Objective, value.KShortestPaths.IncludeDocuments, value.KShortestPaths.Fields)
+	default:
+		return false, fmt.Errorf("invalid graph query: unknown operation")
 	}
 }
 
@@ -283,33 +235,18 @@ const (
 )
 
 func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResultContract, error) {
-	encoded, err := json.Marshal(query)
+	decoded, err := query.DecodeStrictVariant()
 	if err != nil {
 		return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph query: %w", err)
 	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &members); err != nil {
-		return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph query: %w", err)
-	}
-
-	if raw, ok := members["match"]; ok && !isNullGraphJSON(raw) {
-		var match GraphMatchQuery
-		if err := query.DecodeStrictInto(&match); err != nil {
-			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph match query: %w", err)
-		}
-		encodedReturn, err := json.Marshal(match.Return)
+	switch decoded.Kind {
+	case oapi.GraphQueryVariantMatch:
+		graphReturn, err := decoded.Match.Return.DecodeStrictVariant()
 		if err != nil {
 			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph return: %w", err)
 		}
-		var returnMembers map[string]json.RawMessage
-		if err := json.Unmarshal(encodedReturn, &returnMembers); err != nil {
-			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph return: %w", err)
-		}
-		if _, ok := returnMembers["bindings"]; ok {
-			var value GraphBindingsReturn
-			if err := match.Return.DecodeStrictInto(&value); err != nil {
-				return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph bindings return: %w", err)
-			}
+		if graphReturn.Kind == oapi.GraphReturnVariantBindings {
+			value := graphReturn.Bindings
 			limit := value.Limit
 			if limit == 0 {
 				limit = defaultGraphBindingsLimit
@@ -321,11 +258,8 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 				includeDocuments: value.IncludeDocuments,
 			}, nil
 		}
-		if _, ok := returnMembers["aggregates"]; ok {
-			var value GraphAggregatesReturn
-			if err := match.Return.DecodeStrictInto(&value); err != nil {
-				return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph aggregates return: %w", err)
-			}
+		if graphReturn.Kind == oapi.GraphReturnVariantAggregates {
+			value := graphReturn.Aggregates
 			names := make([]string, 0, len(value.Aggregates))
 			for name := range value.Aggregates {
 				names = append(names, name)
@@ -334,13 +268,8 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 			return canonicalGraphResultContract{kind: string(GraphAggregatesResultKindAggregates), names: names}, nil
 		}
 		return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph match return must select bindings or aggregates")
-	}
-
-	if raw, ok := members["traverse"]; ok && !isNullGraphJSON(raw) {
-		var value GraphTraverseQuery
-		if err := query.DecodeStrictInto(&value); err != nil {
-			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph traversal query: %w", err)
-		}
+	case oapi.GraphQueryVariantTraverse:
+		value := decoded.Traverse
 		limit := value.Traverse.Limit
 		if limit == 0 {
 			limit = defaultGraphBindingsLimit
@@ -352,32 +281,25 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 			includePaths:     value.Traverse.IncludePaths,
 			includeDocuments: value.Traverse.IncludeDocuments,
 		}, nil
-	}
-	if raw, ok := members["shortest_path"]; ok && !isNullGraphJSON(raw) {
-		var value GraphShortestPathQuery
-		if err := query.DecodeStrictInto(&value); err != nil {
-			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph shortest path query: %w", err)
-		}
+	case oapi.GraphQueryVariantShortestPath:
+		value := decoded.ShortestPath
 		return canonicalGraphResultContract{
 			kind:             string(GraphNodesResultKindNodes),
 			maxItems:         1,
 			nodeMode:         canonicalGraphNodeModeShortestPath,
 			includeDocuments: value.ShortestPath.IncludeDocuments,
 		}, nil
-	}
-	if raw, ok := members["k_shortest_paths"]; ok && !isNullGraphJSON(raw) {
-		var value GraphKShortestPathsQuery
-		if err := query.DecodeStrictInto(&value); err != nil {
-			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph k-shortest-paths query: %w", err)
-		}
+	case oapi.GraphQueryVariantKShortestPaths:
+		value := decoded.KShortestPaths
 		return canonicalGraphResultContract{
 			kind:             string(GraphNodesResultKindNodes),
 			maxItems:         value.KShortestPaths.K,
 			nodeMode:         canonicalGraphNodeModeKShortestPaths,
 			includeDocuments: value.KShortestPaths.IncludeDocuments,
 		}, nil
+	default:
+		return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph query has no supported operation")
 	}
-	return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph query has no supported operation")
 }
 
 type graphResultEnvelopeDecoder interface {
@@ -492,8 +414,8 @@ type graphPathValidation struct {
 	Edges          []graphPathEdgeValidation `json:"edges"`
 	Length         int                       `json:"length"`
 	Nodes          []GraphPathEndpoint       `json:"nodes"`
+	Objective      GraphPathObjective        `json:"objective"`
 	ObjectiveValue float64                   `json:"objective_value"`
-	WeightMode     PathWeightMode            `json:"weight_mode"`
 	WeightSum      float64                   `json:"weight_sum"`
 }
 
@@ -716,24 +638,30 @@ func validateGraphPathPayload(path *graphPathValidation) error {
 	}
 	var sum float64
 	product := 1.0
+	maxWeightProduct := path.Objective == GraphPathObjectiveMaxWeightProduct
 	for i := range path.Edges {
-		if err := validateGraphPathEdgePayload(&path.Edges[i], path.Nodes[i], path.Nodes[i+1], path.WeightMode == PathWeightModeMaxWeight); err != nil {
+		if err := validateGraphPathEdgePayload(&path.Edges[i], path.Nodes[i], path.Nodes[i+1], maxWeightProduct); err != nil {
 			return err
 		}
 		sum += path.Edges[i].Weight
-		product *= path.Edges[i].Weight
-		if math.IsInf(sum, 0) || math.IsNaN(sum) || math.IsInf(product, 0) || math.IsNaN(product) {
+		if !finiteNonNegative(sum) {
 			return fmt.Errorf("graph path score overflow")
 		}
+		if maxWeightProduct {
+			product *= path.Edges[i].Weight
+			if !finiteNonNegative(product) {
+				return fmt.Errorf("graph path score overflow")
+			}
+		}
 	}
-	return validateGraphPathScore(path.WeightMode, len(path.Edges), path.WeightSum, path.ObjectiveValue, sum, product)
+	return validateGraphPathScore(path.Objective, len(path.Edges), path.WeightSum, path.ObjectiveValue, sum, product)
 }
 
-func validateGraphPathEdgePayload(edge *graphPathEdgeValidation, from, to GraphPathEndpoint, maxWeightMode bool) error {
+func validateGraphPathEdgePayload(edge *graphPathEdgeValidation, from, to GraphPathEndpoint, maxWeightProduct bool) error {
 	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
 		return fmt.Errorf("graph path edge does not match adjacent nodes")
 	}
-	return validateGraphPathEdgeFields(edge.Direction, edge.Type, edge.Weight, maxWeightMode)
+	return validateGraphPathEdgeFields(edge.Direction, edge.Type, edge.Weight, maxWeightProduct)
 }
 
 func validateGraphResultNames[T any](requested map[string]T, received map[string]GraphResult) error {
@@ -1113,55 +1041,59 @@ func validateDecodedGraphPath(path GraphPath) error {
 	}
 	var sum float64
 	product := 1.0
+	maxWeightProduct := path.Objective == GraphPathObjectiveMaxWeightProduct
 	for i, edge := range path.Edges {
-		maxWeightMode := path.WeightMode == PathWeightModeMaxWeight
-		if err := validateDecodedGraphPathEdge(edge, path.Nodes[i], path.Nodes[i+1], maxWeightMode); err != nil {
+		if err := validateDecodedGraphPathEdge(edge, path.Nodes[i], path.Nodes[i+1], maxWeightProduct); err != nil {
 			return err
 		}
 		sum += edge.Weight
-		product *= edge.Weight
-		if !math.IsInf(sum, 0) && !math.IsNaN(sum) && !math.IsInf(product, 0) && !math.IsNaN(product) {
-			continue
+		if !finiteNonNegative(sum) {
+			return fmt.Errorf("graph path score overflow")
 		}
-		return fmt.Errorf("graph path score overflow")
+		if maxWeightProduct {
+			product *= edge.Weight
+			if !finiteNonNegative(product) {
+				return fmt.Errorf("graph path score overflow")
+			}
+		}
 	}
-	return validateGraphPathScore(path.WeightMode, len(path.Edges), path.WeightSum, path.ObjectiveValue, sum, product)
+	return validateGraphPathScore(path.Objective, len(path.Edges), path.WeightSum, path.ObjectiveValue, sum, product)
 }
 
-func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint, maxWeightMode bool) error {
+func validateDecodedGraphPathEdge(edge GraphPathEdge, from, to GraphPathEndpoint, maxWeightProduct bool) error {
 	if !sameDecodedGraphEndpoint(edge.From, from) || !sameDecodedGraphEndpoint(edge.To, to) {
 		return fmt.Errorf("graph path edge does not match adjacent nodes")
 	}
-	return validateGraphPathEdgeFields(edge.Direction, string(edge.Type), edge.Weight, maxWeightMode)
+	return validateGraphPathEdgeFields(edge.Direction, string(edge.Type), edge.Weight, maxWeightProduct)
 }
 
-func validateGraphPathEdgeFields(direction GraphPathEdgeDirection, edgeType string, weight float64, maxWeightMode bool) error {
+func validateGraphPathEdgeFields(direction GraphPathEdgeDirection, edgeType string, weight float64, maxWeightProduct bool) error {
 	if !direction.Valid() {
 		return fmt.Errorf("graph path edge direction must be out or in")
 	}
 	if edgeType == "" || len(edgeType) > maxGraphEdgeTypeBytes || !utf8.ValidString(edgeType) {
 		return fmt.Errorf("graph path edge type must encode to between 1 and %d UTF-8 bytes", maxGraphEdgeTypeBytes)
 	}
-	if !finiteNonNegative(weight) || maxWeightMode && weight > 1 {
+	if !finiteNonNegative(weight) || maxWeightProduct && weight > 1 {
 		return fmt.Errorf("graph path edge has an invalid weight")
 	}
 	return nil
 }
 
-func validateGraphPathScore(weightMode PathWeightMode, edgeCount int, weightSum, objectiveValue, sum, product float64) error {
+func validateGraphPathScore(objectiveMode GraphPathObjective, edgeCount int, weightSum, objectiveValue, sum, product float64) error {
 	if !finiteNonNegative(weightSum) || !finiteNonNegative(objectiveValue) || !graphFloatEqual(weightSum, sum) {
 		return fmt.Errorf("graph path has inconsistent weight_sum")
 	}
 	var objective float64
-	switch weightMode {
-	case PathWeightModeMinHops:
+	switch objectiveMode {
+	case GraphPathObjectiveMinHops:
 		objective = float64(edgeCount)
-	case PathWeightModeMinWeight:
+	case GraphPathObjectiveMinWeightSum:
 		objective = sum
-	case PathWeightModeMaxWeight:
+	case GraphPathObjectiveMaxWeightProduct:
 		objective = product
 	default:
-		return fmt.Errorf("graph path has an unknown weight_mode")
+		return fmt.Errorf("graph path has an unknown objective")
 	}
 	if !graphFloatEqual(objectiveValue, objective) {
 		return fmt.Errorf("graph path has an inconsistent objective_value")
@@ -1957,7 +1889,7 @@ func NewGraphTraverseQuery(query GraphTraverseQuery) (GraphQuery, error) {
 
 // NewGraphShortestPathQuery wraps a shortest-path query in the canonical GraphQuery union.
 func NewGraphShortestPathQuery(query GraphShortestPathQuery) (GraphQuery, error) {
-	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.Direction, query.ShortestPath.Filter, query.ShortestPath.EdgeTypes, query.ShortestPath.MaxDepth, query.ShortestPath.MinWeight, query.ShortestPath.MaxWeight, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.ShortestPath.From, query.ShortestPath.To, query.ShortestPath.Direction, query.ShortestPath.Filter, query.ShortestPath.EdgeTypes, query.ShortestPath.MaxDepth, query.ShortestPath.EdgeWeight, query.ShortestPath.Objective, query.ShortestPath.IncludeDocuments, query.ShortestPath.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -1970,7 +1902,7 @@ func NewGraphKShortestPathsQuery(query GraphKShortestPathsQuery) (GraphQuery, er
 	if query.KShortestPaths.K < 1 || query.KShortestPaths.K > 100 {
 		return GraphQuery{}, fmt.Errorf("antfly: graph k must be between 1 and 100")
 	}
-	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.Direction, query.KShortestPaths.Filter, query.KShortestPaths.EdgeTypes, query.KShortestPaths.MaxDepth, query.KShortestPaths.MinWeight, query.KShortestPaths.MaxWeight, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
+	if err := validateGraphPathQuery(query.Index, query.KShortestPaths.From, query.KShortestPaths.To, query.KShortestPaths.Direction, query.KShortestPaths.Filter, query.KShortestPaths.EdgeTypes, query.KShortestPaths.MaxDepth, query.KShortestPaths.EdgeWeight, query.KShortestPaths.Objective, query.KShortestPaths.IncludeDocuments, query.KShortestPaths.Fields); err != nil {
 		return GraphQuery{}, err
 	}
 	var result GraphQuery
@@ -2364,7 +2296,7 @@ func validateGraphMatchEdgeShape(edge GraphMatchEdge) error {
 	if err := validateGraphEdgeTypes(edge.Types); err != nil {
 		return err
 	}
-	if err := validateGraphWeightBounds(edge.MinWeight, edge.MaxWeight); err != nil {
+	if err := validateGraphEdgeWeightRange(edge.EdgeWeight); err != nil {
 		return err
 	}
 	return nil
@@ -2457,18 +2389,9 @@ func validateGraphWhereExpression(where GraphWhereExpression, aliases map[string
 }
 
 func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
-	encoded, err := json.Marshal(graphReturn)
+	decoded, err := graphReturn.DecodeStrictVariant()
 	if err != nil {
 		return err
-	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &members); err != nil {
-		return err
-	}
-	_, hasBindings := members["bindings"]
-	_, hasAggregates := members["aggregates"]
-	if hasBindings == hasAggregates {
-		return fmt.Errorf("antfly: graph return must contain exactly one of bindings or aggregates")
 	}
 	known := make(map[string]struct{}, len(match.Nodes))
 	for alias := range match.Nodes {
@@ -2479,11 +2402,8 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 			known[alias] = struct{}{}
 		}
 	}
-	if hasBindings {
-		var value GraphBindingsReturn
-		if err := graphReturn.DecodeStrictInto(&value); err != nil {
-			return err
-		}
+	if decoded.Kind == oapi.GraphReturnVariantBindings {
+		value := *decoded.Bindings
 		if err := validateGraphBindingsProjection(
 			value.Bindings,
 			value.Limit,
@@ -2499,11 +2419,7 @@ func validateGraphReturn(graphReturn GraphReturn, match GraphMatch) error {
 		}
 		return nil
 	}
-	var value GraphAggregatesReturn
-	if err := graphReturn.DecodeStrictInto(&value); err != nil {
-		return err
-	}
-	return validateGraphAggregates(value.Aggregates, known)
+	return validateGraphAggregates(decoded.Aggregates.Aggregates, known)
 }
 
 func rejectUnknownGraphFields(context string, members map[string]json.RawMessage, allowed ...string) error {
@@ -2660,7 +2576,7 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	if err := validateGraphEdgeTypes(query.Traverse.EdgeTypes); err != nil {
 		return err
 	}
-	if err := validateGraphWeightBounds(query.Traverse.MinWeight, query.Traverse.MaxWeight); err != nil {
+	if err := validateGraphEdgeWeightRange(query.Traverse.EdgeWeight); err != nil {
 		return err
 	}
 	if len(query.Traverse.Fields) > 0 && !query.Traverse.IncludeDocuments {
@@ -2674,7 +2590,7 @@ func validateGraphTraverseQuery(query GraphTraverseQuery) error {
 	return nil
 }
 
-func validateGraphPathQuery(index string, from, to GraphPathEndpoint, direction EdgeDirection, filter GraphDocumentFilter, edgeTypes []string, maxDepth int, minWeight, maxWeight *float64, includeDocuments bool, fields []string) error {
+func validateGraphPathQuery(index string, from, to GraphPathEndpoint, direction EdgeDirection, filter GraphDocumentFilter, edgeTypes []string, maxDepth int, edgeWeight *GraphEdgeWeightRange, objective GraphPathObjective, includeDocuments bool, fields []string) error {
 	if strings.TrimSpace(index) == "" {
 		return fmt.Errorf("antfly: graph index must not be empty")
 	}
@@ -2694,8 +2610,11 @@ func validateGraphPathQuery(index string, from, to GraphPathEndpoint, direction 
 	if err := validateGraphEdgeTypes(edgeTypes); err != nil {
 		return err
 	}
-	if err := validateGraphWeightBounds(minWeight, maxWeight); err != nil {
+	if err := validateGraphEdgeWeightRange(edgeWeight); err != nil {
 		return err
+	}
+	if objective != "" && objective != GraphPathObjectiveMinHops && objective != GraphPathObjectiveMinWeightSum && objective != GraphPathObjectiveMaxWeightProduct {
+		return fmt.Errorf("antfly: graph path objective must be min_hops, min_weight_sum, or max_weight_product")
 	}
 	if len(fields) > 0 && !includeDocuments {
 		return fmt.Errorf("antfly: graph path fields require IncludeDocuments")
@@ -2841,6 +2760,16 @@ func validateGraphWeightBounds(minWeight, maxWeight *float64) error {
 		return fmt.Errorf("antfly: graph minimum weight must not exceed maximum weight")
 	}
 	return nil
+}
+
+func validateGraphEdgeWeightRange(weight *GraphEdgeWeightRange) error {
+	if weight == nil {
+		return nil
+	}
+	if weight.Min == nil && weight.Max == nil {
+		return fmt.Errorf("antfly: graph edge_weight must contain min or max")
+	}
+	return validateGraphWeightBounds(weight.Min, weight.Max)
 }
 
 func validateGraphEdgeTypes(edgeTypes []string) error {

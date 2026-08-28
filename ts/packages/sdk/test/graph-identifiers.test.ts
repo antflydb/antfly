@@ -135,16 +135,16 @@ describe("graph identifier policy", () => {
       match: {
         anchor: "person",
         nodes: { person: {}, author: {} },
-        edges: [{ from: "person", to: "author", min_weight: -0.1 }],
+        edges: [{ from: "person", to: "author", edge_weight: { min: -0.1 } }],
       },
       return: { bindings: ["person"] },
     },
-    { traverse: { start: { keys: ["doc:a"] }, max_weight: -0.1 } },
+    { traverse: { start: { keys: ["doc:a"] }, edge_weight: { max: -0.1 } } },
     {
       shortest_path: {
         from: { key: "doc:a" },
         to: { key: "doc:b" },
-        min_weight: -0.1,
+        edge_weight: { min: -0.1 },
       },
     },
     {
@@ -152,13 +152,29 @@ describe("graph identifier policy", () => {
         from: { key: "doc:a" },
         to: { key: "doc:b" },
         k: 2,
-        max_weight: -0.1,
+        edge_weight: { max: -0.1 },
       },
     },
   ])("rejects negative canonical graph weight bounds", (query) => {
     expect(() => validateGraphQueryIdentifiers({ walk: { index: "graph_idx", ...query } })).toThrow(
       "finite non-negative number"
     );
+  });
+
+  it.each([
+    { traverse: { start: { keys: ["doc:a"] }, edge_weight: null } },
+    { traverse: { start: { keys: ["doc:a"] }, edge_weight: {} } },
+    {
+      shortest_path: {
+        from: { key: "doc:a" },
+        to: { key: "doc:b" },
+        objective: null,
+      },
+    },
+  ])("rejects empty or null canonical path options", (query) => {
+    expect(() =>
+      validateGraphQueryIdentifiers({ walk: { index: "graph_idx", ...query } })
+    ).toThrow();
   });
 
   it.each([

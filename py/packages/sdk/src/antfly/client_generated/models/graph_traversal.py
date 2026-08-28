@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from ..models.graph_document_term_filter import GraphDocumentTermFilter
     from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
     from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
+    from ..models.graph_edge_weight_range import GraphEdgeWeightRange
     from ..models.graph_identity_node_selector import GraphIdentityNodeSelector
     from ..models.graph_key_node_selector import GraphKeyNodeSelector
     from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
@@ -46,8 +47,9 @@ class GraphTraversal:
                 - both: Both outgoing and incoming edges
             edge_types (list[str] | Unset): At most 64 unique edge types totaling at most 64 KiB.
             max_depth (int | Unset): Maximum traversal depth. Defaults to one hop to keep fan-out explicit. Default: 1.
-            min_weight (float | Unset):
-            max_weight (float | Unset):
+            edge_weight (GraphEdgeWeightRange | Unset): Inclusive per-edge weight filter. At least one bound is required.
+                Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual
+                stored edges and does not constrain the aggregate path objective.
             limit (int | Unset):  Default: 100.
             include_paths (bool | Unset):  Default: False.
             include_documents (bool | Unset): Include each result node's stored document when it exists at the pinned
@@ -69,8 +71,7 @@ class GraphTraversal:
     direction: EdgeDirection | Unset = UNSET
     edge_types: list[str] | Unset = UNSET
     max_depth: int | Unset = 1
-    min_weight: float | Unset = UNSET
-    max_weight: float | Unset = UNSET
+    edge_weight: GraphEdgeWeightRange | Unset = UNSET
     limit: int | Unset = 100
     include_paths: bool | Unset = False
     include_documents: bool | Unset = False
@@ -130,9 +131,9 @@ class GraphTraversal:
 
         max_depth = self.max_depth
 
-        min_weight = self.min_weight
-
-        max_weight = self.max_weight
+        edge_weight: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_weight, Unset):
+            edge_weight = self.edge_weight.to_dict()
 
         limit = self.limit
 
@@ -191,10 +192,8 @@ class GraphTraversal:
             field_dict["edge_types"] = edge_types
         if max_depth is not UNSET:
             field_dict["max_depth"] = max_depth
-        if min_weight is not UNSET:
-            field_dict["min_weight"] = min_weight
-        if max_weight is not UNSET:
-            field_dict["max_weight"] = max_weight
+        if edge_weight is not UNSET:
+            field_dict["edge_weight"] = edge_weight
         if limit is not UNSET:
             field_dict["limit"] = limit
         if include_paths is not UNSET:
@@ -225,6 +224,7 @@ class GraphTraversal:
         from ..models.graph_document_term_filter import GraphDocumentTermFilter
         from ..models.graph_document_term_range_filter import GraphDocumentTermRangeFilter
         from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
+        from ..models.graph_edge_weight_range import GraphEdgeWeightRange
         from ..models.graph_identity_node_selector import GraphIdentityNodeSelector
         from ..models.graph_key_node_selector import GraphKeyNodeSelector
         from ..models.graph_result_ref_node_selector import GraphResultRefNodeSelector
@@ -267,9 +267,12 @@ class GraphTraversal:
 
         max_depth = d.pop("max_depth", UNSET)
 
-        min_weight = d.pop("min_weight", UNSET)
-
-        max_weight = d.pop("max_weight", UNSET)
+        _edge_weight = d.pop("edge_weight", UNSET)
+        edge_weight: GraphEdgeWeightRange | Unset
+        if isinstance(_edge_weight, Unset):
+            edge_weight = UNSET
+        else:
+            edge_weight = GraphEdgeWeightRange.from_dict(_edge_weight)
 
         limit = d.pop("limit", UNSET)
 
@@ -426,8 +429,7 @@ class GraphTraversal:
             direction=direction,
             edge_types=edge_types,
             max_depth=max_depth,
-            min_weight=min_weight,
-            max_weight=max_weight,
+            edge_weight=edge_weight,
             limit=limit,
             include_paths=include_paths,
             include_documents=include_documents,

@@ -30,7 +30,7 @@ class GraphPathEdge:
                 relationships.
             type_ (str): Durable graph edge type. Values must be valid UTF-8 and encode to at most 64 KiB; `maxLength` is
                 the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
-            weight (float): Finite durable edge weight. max_weight paths further require values in [0,1].
+            weight (float): Finite durable edge weight. max_weight_product paths further require values in [0,1].
             metadata (GraphPathEdgeMetadata | Unset):
     """
 

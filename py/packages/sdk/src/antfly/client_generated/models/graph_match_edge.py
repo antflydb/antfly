@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, TypeVar, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from attrs import define as _attrs_define
 
 from ..models.edge_direction import EdgeDirection
 from ..types import UNSET, Unset
+
+if TYPE_CHECKING:
+    from ..models.graph_edge_weight_range import GraphEdgeWeightRange
+
 
 T = TypeVar("T", bound="GraphMatchEdge")
 
@@ -39,8 +43,9 @@ class GraphMatchEdge:
                 at most 64 KiB.
             min_hops (int | Unset):  Default: 1.
             max_hops (int | Unset):  Default: 1.
-            min_weight (float | Unset):
-            max_weight (float | Unset):
+            edge_weight (GraphEdgeWeightRange | Unset): Inclusive per-edge weight filter. At least one bound is required.
+                Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual
+                stored edges and does not constrain the aggregate path objective.
     """
 
     from_: str
@@ -49,8 +54,7 @@ class GraphMatchEdge:
     types: list[str] | Unset = UNSET
     min_hops: int | Unset = 1
     max_hops: int | Unset = 1
-    min_weight: float | Unset = UNSET
-    max_weight: float | Unset = UNSET
+    edge_weight: GraphEdgeWeightRange | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
         from_ = self.from_
@@ -69,9 +73,9 @@ class GraphMatchEdge:
 
         max_hops = self.max_hops
 
-        min_weight = self.min_weight
-
-        max_weight = self.max_weight
+        edge_weight: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_weight, Unset):
+            edge_weight = self.edge_weight.to_dict()
 
         field_dict: dict[str, Any] = {}
 
@@ -89,15 +93,15 @@ class GraphMatchEdge:
             field_dict["min_hops"] = min_hops
         if max_hops is not UNSET:
             field_dict["max_hops"] = max_hops
-        if min_weight is not UNSET:
-            field_dict["min_weight"] = min_weight
-        if max_weight is not UNSET:
-            field_dict["max_weight"] = max_weight
+        if edge_weight is not UNSET:
+            field_dict["edge_weight"] = edge_weight
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_edge_weight_range import GraphEdgeWeightRange
+
         d = dict(src_dict)
         from_ = d.pop("from")
 
@@ -116,9 +120,12 @@ class GraphMatchEdge:
 
         max_hops = d.pop("max_hops", UNSET)
 
-        min_weight = d.pop("min_weight", UNSET)
-
-        max_weight = d.pop("max_weight", UNSET)
+        _edge_weight = d.pop("edge_weight", UNSET)
+        edge_weight: GraphEdgeWeightRange | Unset
+        if isinstance(_edge_weight, Unset):
+            edge_weight = UNSET
+        else:
+            edge_weight = GraphEdgeWeightRange.from_dict(_edge_weight)
 
         graph_match_edge = cls(
             from_=from_,
@@ -127,8 +134,7 @@ class GraphMatchEdge:
             types=types,
             min_hops=min_hops,
             max_hops=max_hops,
-            min_weight=min_weight,
-            max_weight=max_weight,
+            edge_weight=edge_weight,
         )
 
         return graph_match_edge

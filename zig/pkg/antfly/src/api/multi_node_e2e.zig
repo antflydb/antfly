@@ -6207,7 +6207,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
         &.{"links"},
         5,
         10,
-        .min_weight,
+        .min_weight_sum,
     );
     defer std.heap.page_allocator.free(min_weight_query_body);
     var min_weight_query = try client.fetchQuery(client_base, "docs", min_weight_query_body);
@@ -6227,7 +6227,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
         &.{"links"},
         5,
         10,
-        .max_weight,
+        .max_weight_product,
     );
     defer std.heap.page_allocator.free(max_weight_query_body);
     var max_weight_query = try client.fetchQuery(client_base, "docs", max_weight_query_body);
@@ -6248,7 +6248,7 @@ test "public api multi-node e2e routes split flow from a non-host node" {
         5,
         10,
         2,
-        .min_weight,
+        .min_weight_sum,
     );
     defer std.heap.page_allocator.free(k_shortest_query_body);
     var k_shortest_query = try client.fetchQuery(client_base, "docs", k_shortest_query_body);

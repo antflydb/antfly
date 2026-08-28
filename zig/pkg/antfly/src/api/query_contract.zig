@@ -6346,7 +6346,7 @@ test "canonical graph paths preserve table-qualified node identities" {
     try std.testing.expectEqualStrings("doc:a", canonical.graph_nodes_result.paths[0].edges[0].from.key);
     try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].edges[0].to.key);
     try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].edges[0].to.table.?);
-    try std.testing.expectEqual(indexes_openapi.PathWeightMode.min_hops, canonical.graph_nodes_result.paths[0].weight_mode);
+    try std.testing.expectEqual(indexes_openapi.GraphPathObjective.min_hops, canonical.graph_nodes_result.paths[0].objective);
     try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].weight_sum);
     try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].objective_value);
 
@@ -6606,10 +6606,10 @@ fn toOpenApiGraphPaths(
                 path.edges,
             ),
             .length = @intCast(path.length),
-            .weight_mode = switch (weight_mode) {
+            .objective = switch (weight_mode) {
                 .min_hops => .min_hops,
-                .min_weight => .min_weight,
-                .max_weight => .max_weight,
+                .min_weight => .min_weight_sum,
+                .max_weight => .max_weight_product,
             },
             .weight_sum = weight_sum,
             .objective_value = objective_value,
@@ -10075,7 +10075,7 @@ fn parseLegacyGraphQueryParams(
 fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.GraphTraverseQuery) !graph_query_mod.GraphQuery {
     const traversal = value.traverse;
     try validateGraphIndexName(value.index);
-    try validateGraphWeightBounds(traversal.min_weight, traversal.max_weight);
+    const weight_bounds = try parseGraphEdgeWeightRange(traversal.edge_weight);
     if (traversal.fields != null and traversal.include_documents != true)
         return error.InvalidQueryRequest;
     const index = try alloc.dupe(u8, value.index);
@@ -10099,8 +10099,8 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
             .direction = parseGraphDirection(traversal.direction),
             .max_depth = try parseGraphBoundedU32(traversal.max_depth, 1, 1, 64),
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
-            .min_weight = traversal.min_weight,
-            .max_weight = traversal.max_weight,
+            .min_weight = weight_bounds.min,
+            .max_weight = weight_bounds.max,
             .deduplicate = true,
             .include_paths = traversal.include_paths orelse false,
             .node_filter = filter,
@@ -10120,7 +10120,7 @@ fn parseGraphPathQuery(
 ) !graph_query_mod.GraphQuery {
     if (k == 0 or k > 100) return error.InvalidQueryRequest;
     try validateGraphIndexName(index_value);
-    try validateGraphWeightBounds(path.min_weight, path.max_weight);
+    const weight_bounds = try parseGraphEdgeWeightRange(path.edge_weight);
     if (path.fields != null and path.include_documents != true)
         return error.InvalidQueryRequest;
     const index = try alloc.dupe(u8, index_value);
@@ -10147,12 +10147,12 @@ fn parseGraphPathQuery(
             .edge_types = edge_types,
             .direction = parseGraphDirection(path.direction),
             .max_depth = try parseGraphBoundedU32(path.max_depth, 10, 1, 64),
-            .min_weight = path.min_weight,
-            .max_weight = path.max_weight,
-            .weight_mode = if (path.weight_mode) |mode| switch (mode) {
+            .min_weight = weight_bounds.min,
+            .max_weight = weight_bounds.max,
+            .weight_mode = if (path.objective) |objective| switch (objective) {
                 .min_hops => .min_hops,
-                .min_weight => .min_weight,
-                .max_weight => .max_weight,
+                .min_weight_sum => .min_weight,
+                .max_weight_product => .max_weight,
             } else .min_hops,
             .node_filter = filter,
         },
@@ -10343,7 +10343,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         alloc.free(edges);
     }
     for (value, 0..) |edge, i| {
-        try validateGraphWeightBounds(edge.min_weight, edge.max_weight);
+        const weight_bounds = try parseGraphEdgeWeightRange(edge.edge_weight);
         if (!graph_query_mod.isValidIdentifier(edge.from) or
             !graph_query_mod.isValidIdentifier(edge.to))
             return error.InvalidQueryRequest;
@@ -10363,8 +10363,8 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
                 .direction = parseGraphDirection(edge.direction),
                 .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
-                .min_weight = edge.min_weight,
-                .max_weight = edge.max_weight,
+                .min_weight = weight_bounds.min,
+                .max_weight = weight_bounds.max,
             },
         };
         if (edges[i].step.min_hops > edges[i].step.max_hops) return error.InvalidQueryRequest;
@@ -10383,6 +10383,18 @@ fn validateGraphWeightBounds(min_weight: ?f64, max_weight: ?f64) !void {
     if (max_weight) |value| if (!std.math.isFinite(value) or value < 0) return error.InvalidQueryRequest;
     if (min_weight != null and max_weight != null and min_weight.? > max_weight.?)
         return error.InvalidQueryRequest;
+}
+
+const GraphEdgeWeightBounds = struct {
+    min: ?f64 = null,
+    max: ?f64 = null,
+};
+
+fn parseGraphEdgeWeightRange(value: ?indexes_openapi.GraphEdgeWeightRange) !GraphEdgeWeightBounds {
+    const range = value orelse return .{};
+    if (range.min == null and range.max == null) return error.InvalidQueryRequest;
+    try validateGraphWeightBounds(range.min, range.max);
+    return .{ .min = range.min, .max = range.max };
 }
 
 test "canonical graph admission preserves and validates weight bounds" {

@@ -18226,7 +18226,7 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","depth":1,"path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"weight_mode":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","depth":1,"path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
@@ -18997,25 +18997,25 @@ fn validateRemoteCanonicalGraphPathScores(item: indexes_openapi.GraphPath) !void
     var product: f64 = 1;
     for (item.edges) |edge| {
         graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
-        switch (item.weight_mode) {
+        switch (item.objective) {
             .min_hops => {},
-            .min_weight => _ = graph_paths.pathEdgeCost(.min_weight, edge.weight) catch
+            .min_weight_sum => _ = graph_paths.pathEdgeCost(.min_weight, edge.weight) catch
                 return error.InvalidRemoteResponse,
-            .max_weight => _ = graph_paths.pathEdgeCost(.max_weight, edge.weight) catch
+            .max_weight_product => _ = graph_paths.pathEdgeCost(.max_weight, edge.weight) catch
                 return error.InvalidRemoteResponse,
         }
         sum += edge.weight;
         if (!std.math.isFinite(sum)) return error.InvalidRemoteResponse;
-        if (item.weight_mode == .max_weight) {
+        if (item.objective == .max_weight_product) {
             product *= edge.weight;
             if (!std.math.isFinite(product)) return error.InvalidRemoteResponse;
         }
     }
     if (!graphPathScoreEql(item.weight_sum, sum)) return error.InvalidRemoteResponse;
-    const objective: f64 = switch (item.weight_mode) {
+    const objective: f64 = switch (item.objective) {
         .min_hops => @floatFromInt(item.edges.len),
-        .min_weight => sum,
-        .max_weight => product,
+        .min_weight_sum => sum,
+        .max_weight_product => product,
     };
     if (!std.math.isFinite(objective) or !graphPathScoreEql(item.objective_value, objective))
         return error.InvalidRemoteResponse;
@@ -19209,10 +19209,10 @@ test "remote canonical graph result stats and aggregate exactness fail closed" {
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","depth":0},{"key":"extra","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","depth":0},{"key":"extra","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
 }
 
@@ -19265,7 +19265,7 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     var path = indexes_openapi.GraphPath{
         .nodes = &nodes,
         .edges = &edges,
-        .weight_mode = .max_weight,
+        .objective = .max_weight_product,
         .weight_sum = 0.5,
         .objective_value = 0.5,
         .length = 1,
@@ -19306,16 +19306,29 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     edges[0].type = "related";
 
     edges[0].weight = -0.1;
-    path.weight_mode = .min_hops;
+    path.objective = .min_hops;
     path.weight_sum = -0.1;
     path.objective_value = 1;
     try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(path));
 
     edges[0].weight = 1.1;
-    path.weight_mode = .max_weight;
+    path.objective = .max_weight_product;
     path.weight_sum = 1.1;
     path.objective_value = 1.1;
     try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(path));
+
+    const product_overflow_edges = [_]indexes_openapi.GraphPathEdge{
+        .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .direction = .out, .type = "e", .weight = 1e200 },
+        .{ .from = .{ .key = "b" }, .to = .{ .key = "c" }, .direction = .out, .type = "e", .weight = 1e200 },
+    };
+    try validateRemoteCanonicalGraphPathScores(.{
+        .nodes = &.{ .{ .key = "a" }, .{ .key = "b" }, .{ .key = "c" } },
+        .edges = &product_overflow_edges,
+        .objective = .min_hops,
+        .weight_sum = 2e200,
+        .objective_value = 2,
+        .length = 2,
+    });
 
     const overflow_edges = [_]indexes_openapi.GraphPathEdge{
         .{ .from = .{ .key = "a" }, .to = .{ .key = "b" }, .direction = .out, .type = "e", .weight = std.math.floatMax(f64) },
@@ -19324,7 +19337,7 @@ test "remote canonical graph paths reject impossible shapes and weight domains" 
     try std.testing.expectError(error.InvalidRemoteResponse, validateRemoteCanonicalGraphPathScores(.{
         .nodes = &.{ .{ .key = "a" }, .{ .key = "b" }, .{ .key = "c" } },
         .edges = &overflow_edges,
-        .weight_mode = .min_hops,
+        .objective = .min_hops,
         .weight_sum = 0,
         .objective_value = 2,
         .length = 2,

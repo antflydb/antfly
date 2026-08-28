@@ -359,6 +359,7 @@ from .graph_document_term_filter import GraphDocumentTermFilter
 from .graph_document_term_range_body import GraphDocumentTermRangeBody
 from .graph_document_term_range_filter import GraphDocumentTermRangeFilter
 from .graph_document_wildcard_filter import GraphDocumentWildcardFilter
+from .graph_edge_weight_range import GraphEdgeWeightRange
 from .graph_identity_node_selector import GraphIdentityNodeSelector
 from .graph_index_config import GraphIndexConfig
 from .graph_index_stats import GraphIndexStats
@@ -393,6 +394,7 @@ from .graph_path_edge import GraphPathEdge
 from .graph_path_edge_direction import GraphPathEdgeDirection
 from .graph_path_edge_metadata import GraphPathEdgeMetadata
 from .graph_path_endpoint import GraphPathEndpoint
+from .graph_path_objective import GraphPathObjective
 from .graph_path_weight_domain_error import GraphPathWeightDomainError
 from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
 from .graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
@@ -1292,6 +1294,7 @@ __all__ = (
     "GraphDocumentTermRangeBody",
     "GraphDocumentTermRangeFilter",
     "GraphDocumentWildcardFilter",
+    "GraphEdgeWeightRange",
     "GraphIdentityNodeSelector",
     "GraphIndexConfig",
     "GraphIndexStats",
@@ -1326,6 +1329,7 @@ __all__ = (
     "GraphPathEdgeDirection",
     "GraphPathEdgeMetadata",
     "GraphPathEndpoint",
+    "GraphPathObjective",
     "GraphPathWeightDomainError",
     "GraphPathWeightDomainErrorError",
     "GraphPathWeightDomainErrorMode",
