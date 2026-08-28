@@ -23,9 +23,14 @@ pub const Error = error{
     MissingTable,
     UnsupportedCff,
     InvalidGlyphIndex,
+    GlyphOutlineTooComplex,
 };
 
 const ParseError = Error || std.mem.Allocator.Error;
+
+pub const OutlineLimits = struct {
+    max_operations: usize = std.math.maxInt(usize),
+};
 
 fn predefinedEncodingGlyphName(encoding: *const [256]u16, code: u8) ?[]const u8 {
     const sid = encoding[code];
@@ -178,6 +183,10 @@ pub const Font = struct {
     }
 
     pub fn glyphOutlineAlloc(self: Font, alloc: std.mem.Allocator, glyph_index: u16) ParseError!?GlyphOutline {
+        return self.glyphOutlineAllocLimited(alloc, glyph_index, .{});
+    }
+
+    pub fn glyphOutlineAllocLimited(self: Font, alloc: std.mem.Allocator, glyph_index: u16, limits: OutlineLimits) ParseError!?GlyphOutline {
         if (glyph_index >= self.charstrings.count) return error.InvalidGlyphIndex;
         const program = try self.charstrings.getObject(self.bytes, glyph_index);
         if (program.len == 0) return null;
@@ -197,7 +206,8 @@ pub const Font = struct {
         var width_seen = false;
         var hint_count: usize = 0;
         var transient: [32]f64 = [_]f64{0} ** 32;
-        try self.executeCharStringAlloc(alloc, program, self.localSubrsForGlyph(glyph_index), &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
+        var remaining_operations = limits.max_operations;
+        try self.executeCharStringAllocLimited(alloc, program, self.localSubrsForGlyph(glyph_index), &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, &remaining_operations, 0);
 
         if (contours.items.len == 0) return null;
         return .{
@@ -265,9 +275,31 @@ pub const Font = struct {
         transient: *[32]f64,
         subr_depth: u8,
     ) ParseError!void {
+        var remaining_operations: usize = std.math.maxInt(usize);
+        return self.executeCharStringAllocLimited(alloc, program, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, &remaining_operations, subr_depth);
+    }
+
+    fn executeCharStringAllocLimited(
+        self: Font,
+        alloc: std.mem.Allocator,
+        program: []const u8,
+        active_local_subrs: ?Index,
+        stack: *std.ArrayList(f64),
+        current: *std.ArrayList(GlyphPoint),
+        contours: *std.ArrayList(GlyphContour),
+        x: *f64,
+        y: *f64,
+        width_seen: *bool,
+        hint_count: *usize,
+        transient: *[32]f64,
+        remaining_operations: *usize,
+        subr_depth: u8,
+    ) ParseError!void {
         if (subr_depth > 16) return error.UnsupportedCff;
         var i: usize = 0;
         while (i < program.len) {
+            if (remaining_operations.* == 0) return error.GlyphOutlineTooComplex;
+            remaining_operations.* -= 1;
             const b0 = program[i];
             i += 1;
             switch (b0) {
@@ -299,7 +331,7 @@ pub const Font = struct {
                     if (active_local_subrs == null or stack.items.len == 0) return error.UnsupportedCff;
                     const subr_index = try subroutineIndex(stack.orderedRemove(stack.items.len - 1), active_local_subrs.?.count);
                     const subr = try active_local_subrs.?.getObject(self.bytes, subr_index);
-                    try self.executeCharStringAlloc(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, subr_depth + 1);
+                    try self.executeCharStringAllocLimited(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, remaining_operations, subr_depth + 1);
                 },
                 11 => return,
                 12 => {
@@ -375,7 +407,7 @@ pub const Font = struct {
                     if (stack.items.len == 0 or self.global_subrs.count == 0) return error.UnsupportedCff;
                     const subr_index = try subroutineIndex(stack.orderedRemove(stack.items.len - 1), self.global_subrs.count);
                     const subr = try self.global_subrs.getObject(self.bytes, subr_index);
-                    try self.executeCharStringAlloc(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, subr_depth + 1);
+                    try self.executeCharStringAllocLimited(alloc, subr, active_local_subrs, stack, current, contours, x, y, width_seen, hint_count, transient, remaining_operations, subr_depth + 1);
                 },
                 30 => try executeVhcurveto(alloc, stack, current, x, y),
                 31 => try executeHvcurveto(alloc, stack, current, x, y),
@@ -1464,6 +1496,36 @@ test "cff hintmask skips mask bytes and continues outline parsing" {
     try std.testing.expectEqual(@as(usize, 1), hint_count);
     try std.testing.expectEqual(@as(usize, 1), contours.items.len);
     try std.testing.expectApproxEqAbs(@as(f64, 50), contours.items[0].points[1].x, 0.001);
+}
+
+test "cff enforces a shared charstring operation limit" {
+    const alloc = std.testing.allocator;
+    const font = Font{
+        .bytes = &.{},
+        .charstrings = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .charset = &.{},
+        .global_subrs = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
+        .local_subrs = null,
+        .fd_array = null,
+        .fd_select = null,
+    };
+    const program = [_]u8{ 139, 139, 21, 14 };
+    var contours = std.ArrayList(GlyphContour).empty;
+    defer {
+        for (contours.items) |*contour| contour.deinit(alloc);
+        contours.deinit(alloc);
+    }
+    var current = std.ArrayList(GlyphPoint).empty;
+    defer current.deinit(alloc);
+    var stack = std.ArrayList(f64).empty;
+    defer stack.deinit(alloc);
+    var x: f64 = 0;
+    var y: f64 = 0;
+    var width_seen = false;
+    var hint_count: usize = 0;
+    var transient: [32]f64 = [_]f64{0} ** 32;
+    var remaining_operations: usize = 2;
+    try std.testing.expectError(error.GlyphOutlineTooComplex, font.executeCharStringAllocLimited(alloc, &program, null, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, &remaining_operations, 0));
 }
 
 test "cff supports transient and logical Type2 operators" {

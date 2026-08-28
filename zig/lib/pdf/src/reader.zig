@@ -943,22 +943,9 @@ pub const ShapeRun = struct {
 const RenderTarget = struct { width: u32, height: u32 };
 const max_source_glyph_points: usize = 512;
 const max_flattened_glyph_points: usize = 4096;
-
-fn estimatePdfContentMaterializationUnits(content: []const u8) u64 {
-    const contains_text = std.mem.indexOf(u8, content, "Tj") != null or std.mem.indexOf(u8, content, "TJ") != null;
-    const units_per_byte: u64 = if (contains_text) max_flattened_glyph_points else 8;
-    return @max(@as(u64, max_flattened_glyph_points), saturatedMulU64(content.len, units_per_byte));
-}
-
-fn estimatePageFormMaterializationUnits(forms: []const PageForm, depth: usize) u64 {
-    if (depth >= 32) return std.math.maxInt(u64);
-    var units: u64 = 0;
-    for (forms) |form| {
-        units = saturatedAddU64(units, estimatePdfContentMaterializationUnits(form.content));
-        units = saturatedAddU64(units, estimatePageFormMaterializationUnits(form.forms, depth + 1));
-    }
-    return units;
-}
+const max_glyph_charstring_operations: usize = 16_384;
+const min_text_materialization_bytes: usize = 256 * 1024;
+const max_text_materialization_bytes: usize = 64 * 1024 * 1024;
 
 /// Caps native outline work in units that track the renderer's dominant
 /// operation: point-in-path edge tests. The allowance scales with the final
@@ -970,6 +957,15 @@ const VectorTextWorkBudget = struct {
     const MaterializationReservation = struct {
         points: u64,
         resource_bytes: u64,
+
+        fn byteLimit(self: MaterializationReservation) usize {
+            // A source/flattened point can temporarily coexist with contour,
+            // path, and destination metadata. Keep enough headroom for normal
+            // fonts while imposing a process-safe ceiling per PDF operator.
+            const point_bytes = saturatedMulU64(self.points, 32);
+            const requested = saturatedAddU64(point_bytes, self.resource_bytes);
+            return @intCast(@min(@max(requested, min_text_materialization_bytes), max_text_materialization_bytes));
+        }
     };
 
     remaining_edge_tests: u64,
@@ -1048,8 +1044,8 @@ const VectorTextWorkBudget = struct {
     /// Reserves a conservative upper bound before a text operator expands any
     /// glyphs. Reconciliation immediately after that operator replaces the
     /// reservation with its measured vector work. This prevents a single long
-    /// `Tj`/`TJ` from allocating its entire outline/resource set before the
-    /// page budget has a chance to reject it.
+    /// text-showing operator from allocating its entire outline/resource set
+    /// before the page budget has a chance to reject it.
     fn reserveTextMaterialization(self: *VectorTextWorkBudget, run: TextRun, font: PageFont) ?MaterializationReservation {
         if (self.exhausted) return null;
         const glyph_count: u64 = if (run.raw_text) |raw|
@@ -1068,23 +1064,8 @@ const VectorTextWorkBudget = struct {
         // A Type1 `seac` glyph expands to independently bounded base and
         // accent outlines.
         const outline_paths_per_glyph: u64 = if (font.type1 != null) 2 else 1;
-        var construction_units = saturatedMulU64(saturatedMulU64(glyph_count, max_flattened_glyph_points), outline_paths_per_glyph);
-        var resource_bytes: u64 = 0;
-        if (font.type3) |type3| if (run.raw_text) |raw| {
-            construction_units = 0;
-            for (raw) |code| {
-                const glyph = type3.glyphForCode(code) orelse continue;
-                // Type3 CharProcs may contain arbitrary nested paint/text
-                // programs. Content length is available without decoding and
-                // provides an intentionally conservative construction bound.
-                construction_units = saturatedAddU64(construction_units, estimatePdfContentMaterializationUnits(glyph.content));
-                construction_units = saturatedAddU64(construction_units, estimatePageFormMaterializationUnits(type3.forms, 0));
-                for (type3.images) |image| {
-                    if (std.mem.indexOf(u8, glyph.content, image.name) != null and image.shared_rgba == null)
-                        resource_bytes = saturatedAddU64(resource_bytes, image.rgba.len);
-                }
-            }
-        };
+        const construction_units = saturatedMulU64(saturatedMulU64(glyph_count, max_flattened_glyph_points), outline_paths_per_glyph);
+        const resource_bytes: u64 = 0;
         const points = saturatedMulU64(construction_units, materialization_copies);
         if (points > self.remaining_points or resource_bytes > self.remaining_resource_bytes) {
             self.exhausted = true;
@@ -1095,6 +1076,11 @@ const VectorTextWorkBudget = struct {
         return .{ .points = points, .resource_bytes = resource_bytes };
     }
 
+    fn releaseTextMaterialization(self: *VectorTextWorkBudget, reservation: MaterializationReservation) void {
+        self.remaining_points = saturatedAddU64(self.remaining_points, reservation.points);
+        self.remaining_resource_bytes = saturatedAddU64(self.remaining_resource_bytes, reservation.resource_bytes);
+    }
+
     fn reconcileTextMaterialization(
         self: *VectorTextWorkBudget,
         reservation: MaterializationReservation,
@@ -1103,8 +1089,7 @@ const VectorTextWorkBudget = struct {
         images: []const ImageRun,
         shadings: []const ShadingRun,
     ) bool {
-        self.remaining_points = saturatedAddU64(self.remaining_points, reservation.points);
-        self.remaining_resource_bytes = saturatedAddU64(self.remaining_resource_bytes, reservation.resource_bytes);
+        self.releaseTextMaterialization(reservation);
         return self.admit(shapes, patterns, images, shadings);
     }
 };
@@ -2923,6 +2908,7 @@ pub const Reader = struct {
                 budget.reserveTextMaterialization(run, fonts[font_index]) orelse return false
             else
                 null;
+            const materialization_limit = if (reservation) |reserved| reserved.byteLimit() else max_text_materialization_bytes;
             const image_start = group_images.items.len;
             const shading_start = group_shadings.items.len;
             const pattern_start = group_patterns.items.len;
@@ -2939,14 +2925,14 @@ pub const Reader = struct {
                 }
                 if (needs_combined_renderer) {
                     if (image_out == null or shading_out == null) return false;
-                    if (!try appendType3RunResourceRunsAlloc(alloc, &group_images, &group_shadings, &group_patterns, &group_shapes, run, type3, raw, &type3_paint_phase, &next_resource_group_id)) return false;
-                    if (work_budget) |budget| if (!budget.reconcileTextMaterialization(
-                        reservation.?,
-                        group_shapes.items[shape_start..],
-                        group_patterns.items[pattern_start..],
-                        group_images.items[image_start..],
-                        group_shadings.items[shading_start..],
-                    )) return false;
+                    if (work_budget) |budget| budget.releaseTextMaterialization(reservation.?);
+                    var materialization_allocator = DecodeBudgetAllocator.init(alloc, 0, materialization_limit);
+                    const bounded_alloc = materialization_allocator.allocator();
+                    const complete = appendType3RunResourceRunsAlloc(bounded_alloc, &group_images, &group_shadings, &group_patterns, &group_shapes, run, type3, raw, &type3_paint_phase, &next_resource_group_id, work_budget) catch |err| {
+                        if (err == error.OutOfMemory and materialization_allocator.limit_exceeded) return false;
+                        return err;
+                    };
+                    if (!complete) return false;
                     continue;
                 }
             }
@@ -2955,9 +2941,21 @@ pub const Reader = struct {
                 for (temp_shapes.items) |*shape| shape.deinit(alloc);
                 temp_shapes.deinit(alloc);
             }
-            if (!try appendVectorTextRunShapesAlloc(alloc, &temp_shapes, fonts, run, &type3_paint_phase)) return false;
-            try appendPatternTextShapesAlloc(alloc, &group_patterns, patterns, temp_shapes.items, run);
-            try transferSolidTextShapesAlloc(alloc, &group_shapes, &temp_shapes, run);
+            var materialization_allocator = DecodeBudgetAllocator.init(alloc, 0, materialization_limit);
+            const bounded_alloc = materialization_allocator.allocator();
+            const complete = appendVectorTextRunShapesAlloc(bounded_alloc, &temp_shapes, fonts, run, &type3_paint_phase) catch |err| {
+                if (err == error.OutOfMemory and materialization_allocator.limit_exceeded) return false;
+                return err;
+            };
+            if (!complete) return false;
+            appendPatternTextShapesAlloc(bounded_alloc, &group_patterns, patterns, temp_shapes.items, run) catch |err| {
+                if (err == error.OutOfMemory and materialization_allocator.limit_exceeded) return false;
+                return err;
+            };
+            transferSolidTextShapesAlloc(bounded_alloc, &group_shapes, &temp_shapes, run) catch |err| {
+                if (err == error.OutOfMemory and materialization_allocator.limit_exceeded) return false;
+                return err;
+            };
             if (work_budget) |budget| if (!budget.reconcileTextMaterialization(
                 reservation.?,
                 group_shapes.items[shape_start..],
@@ -3665,6 +3663,7 @@ pub const Reader = struct {
         raw: []const u8,
         paint_phase: *usize,
         next_resource_group_id: *u32,
+        work_budget: ?*VectorTextWorkBudget,
     ) !bool {
         var cursor_x: f64 = 0;
         var cursor_y: f64 = 0;
@@ -3771,6 +3770,11 @@ pub const Reader = struct {
                 pattern.paint_order = run.paint_order;
                 pattern.paint_phase = paint_phase.* + local_order * 4 + @min(pattern.paint_phase, 3);
             }
+
+            // Charge the parser's real expansion once per glyph. This covers
+            // every text-showing operator and every repeated form invocation
+            // without trying to infer work from CharProc source text.
+            if (work_budget) |budget| if (!budget.admit(glyph_shapes.items, glyph_patterns.items, glyph_images.items, glyph_shadings.items)) return false;
 
             try image_out.ensureUnusedCapacity(alloc, glyph_images.items.len);
             for (glyph_images.items) |image| image_out.appendAssumeCapacity(image);
@@ -4001,7 +4005,7 @@ pub const Reader = struct {
                 return false;
             };
             const advance_width = truetype.font.advanceWidth(glyph_index) catch return false;
-            if (try truetype.font.glyphOutlineAlloc(alloc, glyph_index)) |outline_value| {
+            if (try truetype.font.glyphOutlineAllocLimited(alloc, glyph_index, .{ .max_points = max_source_glyph_points })) |outline_value| {
                 var outline = outline_value;
                 defer outline.deinit(alloc);
                 var path = try flattenGlyphOutlineAlloc(alloc, outline, run, cursor_x, scale, 0);
@@ -4048,9 +4052,9 @@ pub const Reader = struct {
                 cursor_x += estimateType1MissingAdvance(run, code);
                 continue;
             };
-            const outline_value = font_lib.type1.glyphOutlineAlloc(alloc, glyph.charstring, type1.local_subrs) catch |err| blk: {
+            const outline_value = font_lib.type1.glyphOutlineAllocLimited(alloc, glyph.charstring, type1.local_subrs, .{ .max_operations = max_glyph_charstring_operations }) catch |err| blk: {
                 if (err != error.UnsupportedType1) return err;
-                if (font_lib.type1.seacComponentsAlloc(alloc, glyph.charstring, type1.local_subrs) catch null) |seac| {
+                if (font_lib.type1.seacComponentsAllocLimited(alloc, glyph.charstring, type1.local_subrs, .{ .max_operations = max_glyph_charstring_operations }) catch null) |seac| {
                     if (!try appendType1SeacRunShapesAlloc(alloc, out, run, type1, cursor_x, scale, seac))
                         complete = false;
                 } else {
@@ -4081,14 +4085,14 @@ pub const Reader = struct {
         const mode = @mod(run.render_mode, 8);
         var complete = true;
         if (type1.glyphForStandardCode(seac.bchar)) |base_glyph| {
-            if (try font_lib.type1.glyphOutlineAlloc(alloc, base_glyph.charstring, type1.local_subrs)) |outline| {
+            if (try font_lib.type1.glyphOutlineAllocLimited(alloc, base_glyph.charstring, type1.local_subrs, .{ .max_operations = max_glyph_charstring_operations })) |outline| {
                 var owned_outline = outline;
                 defer owned_outline.deinit(alloc);
                 try appendType1OutlineShapesAlloc(alloc, out, run, cursor_x, scale, owned_outline, mode, 0);
             } else complete = false;
         } else complete = false;
         if (type1.glyphForStandardCode(seac.achar)) |accent_glyph| {
-            if (try font_lib.type1.glyphOutlineAlloc(alloc, accent_glyph.charstring, type1.local_subrs)) |outline| {
+            if (try font_lib.type1.glyphOutlineAllocLimited(alloc, accent_glyph.charstring, type1.local_subrs, .{ .max_operations = max_glyph_charstring_operations })) |outline| {
                 var owned_outline = outline;
                 defer owned_outline.deinit(alloc);
                 try appendType1OutlineShapesAlloc(
@@ -4148,7 +4152,7 @@ pub const Reader = struct {
                 return false;
             };
             const advance_width = cff_otf.sfnt.advanceWidth(glyph_index) catch return false;
-            if (try cff_otf.cff.glyphOutlineAlloc(alloc, glyph_index)) |outline_value| {
+            if (try cff_otf.cff.glyphOutlineAllocLimited(alloc, glyph_index, .{ .max_operations = max_glyph_charstring_operations })) |outline_value| {
                 var outline = outline_value;
                 defer outline.deinit(alloc);
                 var path = try flattenGlyphOutlineAlloc(alloc, outline, run, cursor_x, scale, 0);
@@ -4189,7 +4193,7 @@ pub const Reader = struct {
                 cursor_x += estimateRenderedRunCodepointAdvance(run, 0xfffd);
                 return false;
             };
-            if (try cff.font.glyphOutlineAlloc(alloc, glyph.glyph_index)) |outline_value| {
+            if (try cff.font.glyphOutlineAllocLimited(alloc, glyph.glyph_index, .{ .max_operations = max_glyph_charstring_operations })) |outline_value| {
                 var outline = outline_value;
                 defer outline.deinit(alloc);
                 var path = try flattenGlyphOutlineAlloc(alloc, outline, run, cursor_x, scale, 0);
@@ -20031,7 +20035,7 @@ test "Type3 combined renderer retains direct image resources and paint phase" {
     defer shapes.deinit(alloc);
     var phase: usize = 12;
     var next_group_id: u32 = 1;
-    try std.testing.expect(try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id));
+    try std.testing.expect(try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id, null));
     try std.testing.expectEqual(@as(usize, 1), images.items.len);
     try std.testing.expectEqual(@as(usize, 9), images.items[0].paint_order);
     try std.testing.expectEqual(@as(usize, 12), images.items[0].paint_phase);
@@ -20066,10 +20070,36 @@ test "Type3 combined renderer retains direct image resources and paint phase" {
             }
             var local_phase: usize = 0;
             var local_group: u32 = 1;
-            if (!try Reader.appendType3RunResourceRunsAlloc(failing_alloc, &local_images, &local_shadings, &local_patterns, &local_shapes, local_run, local_type3, "A", &local_phase, &local_group)) return error.UnexpectedType3Fallback;
+            if (!try Reader.appendType3RunResourceRunsAlloc(failing_alloc, &local_images, &local_shadings, &local_patterns, &local_shapes, local_run, local_type3, "A", &local_phase, &local_group, null)) return error.UnexpectedType3Fallback;
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{});
+}
+
+test "Type3 combined renderer charges repeated form expansion before commit" {
+    const alloc = std.testing.allocator;
+    var form = PageForm{ .name = @constCast("Fm"), .content = @constCast("0 0 4 5 re f") };
+    var glyph = Type3Glyph{ .code = 'A', .name = @constCast("A"), .content = @constCast("/Fm Do /Fm Do"), .advance_x = 1, .advance_y = 0, .outline_only = false };
+    const type3 = Type3Font{ .font_matrix = .{ 1, 0, 0, 1, 0, 0 }, .glyphs = (&glyph)[0..1], .forms = (&form)[0..1] };
+    const text_run = TextRun{ .text = @constCast("A"), .raw_text = @constCast("A"), .x = 0, .y = 0, .font_size = 1 };
+    var images = std.ArrayList(ImageRun).empty;
+    defer images.deinit(alloc);
+    var shadings = std.ArrayList(ShadingRun).empty;
+    defer shadings.deinit(alloc);
+    var patterns = std.ArrayList(PatternRun).empty;
+    defer patterns.deinit(alloc);
+    var shapes = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (shapes.items) |*shape| shape.deinit(alloc);
+        shapes.deinit(alloc);
+    }
+    var budget = VectorTextWorkBudget.init(.{ .width = 100, .height = 100 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+    budget.remaining_points = 1;
+    var phase: usize = 0;
+    var next_group_id: u32 = 1;
+    try std.testing.expect(!try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id, &budget));
+    try std.testing.expect(budget.exhausted);
+    try std.testing.expectEqual(@as(usize, 0), shapes.items.len);
 }
 
 test "vector text admission is raster relative and transactional" {
@@ -20163,7 +20193,7 @@ test "uncolored Type3 accepts path-only forms and inherits caller color" {
     }
     var phase: usize = 0;
     var next_group_id: u32 = 1;
-    try std.testing.expect(try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id));
+    try std.testing.expect(try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id, null));
     try std.testing.expectEqual(@as(usize, 1), shapes.items.len);
     try std.testing.expectEqual([4]u8{ 200, 10, 20, 255 }, shapes.items[0].color);
 }

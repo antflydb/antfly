@@ -23,9 +23,14 @@ pub const Error = error{
     TruncatedType1,
     UnsupportedType1,
     InvalidSubroutine,
+    GlyphOutlineTooComplex,
 };
 
 const ParseError = Error || std.mem.Allocator.Error;
+
+pub const OutlineLimits = struct {
+    max_operations: usize = std.math.maxInt(usize),
+};
 
 const FlexState = struct {
     active: bool = false,
@@ -117,6 +122,10 @@ fn decryptWithSeedAlloc(alloc: std.mem.Allocator, encrypted: []const u8, seed: u
 }
 
 pub fn glyphOutlineAlloc(alloc: std.mem.Allocator, charstring: []const u8, local_subrs: ?[]const []const u8) ParseError!?GlyphOutline {
+    return glyphOutlineAllocLimited(alloc, charstring, local_subrs, .{});
+}
+
+pub fn glyphOutlineAllocLimited(alloc: std.mem.Allocator, charstring: []const u8, local_subrs: ?[]const []const u8, limits: OutlineLimits) ParseError!?GlyphOutline {
     if (charstring.len == 0) return null;
 
     var contours = std.ArrayList(GlyphContour).empty;
@@ -135,7 +144,8 @@ pub fn glyphOutlineAlloc(alloc: std.mem.Allocator, charstring: []const u8, local
     var x: f64 = 0;
     var y: f64 = 0;
     var width_seen = false;
-    try executeCharStringAlloc(alloc, charstring, local_subrs, &stack, &othersubr_results, &flex, &current, &contours, &x, &y, &width_seen, null, 0);
+    var remaining_operations = limits.max_operations;
+    try executeCharStringAlloc(alloc, charstring, local_subrs, &stack, &othersubr_results, &flex, &current, &contours, &x, &y, &width_seen, null, &remaining_operations, 0);
 
     if (contours.items.len == 0) return null;
     return .{
@@ -148,6 +158,10 @@ pub fn glyphOutlineAlloc(alloc: std.mem.Allocator, charstring: []const u8, local
 }
 
 pub fn seacComponentsAlloc(alloc: std.mem.Allocator, charstring: []const u8, local_subrs: ?[]const []const u8) ParseError!?SeacComponents {
+    return seacComponentsAllocLimited(alloc, charstring, local_subrs, .{});
+}
+
+pub fn seacComponentsAllocLimited(alloc: std.mem.Allocator, charstring: []const u8, local_subrs: ?[]const []const u8, limits: OutlineLimits) ParseError!?SeacComponents {
     if (charstring.len == 0) return null;
 
     var stack = std.ArrayList(f64).empty;
@@ -166,6 +180,7 @@ pub fn seacComponentsAlloc(alloc: std.mem.Allocator, charstring: []const u8, loc
     var y: f64 = 0;
     var width_seen = false;
     var out: ?SeacComponents = null;
+    var remaining_operations = limits.max_operations;
     try executeCharStringAlloc(
         alloc,
         charstring,
@@ -179,6 +194,7 @@ pub fn seacComponentsAlloc(alloc: std.mem.Allocator, charstring: []const u8, loc
         &y,
         &width_seen,
         &out,
+        &remaining_operations,
         0,
     );
     return out;
@@ -197,11 +213,14 @@ fn executeCharStringAlloc(
     y: *f64,
     width_seen: *bool,
     seac_out: ?*?SeacComponents,
+    remaining_operations: *usize,
     depth: u8,
 ) ParseError!void {
     if (depth > 16) return error.UnsupportedType1;
     var i: usize = 0;
     while (i < program.len) {
+        if (remaining_operations.* == 0) return error.GlyphOutlineTooComplex;
+        remaining_operations.* -= 1;
         const b0 = program[i];
         i += 1;
         switch (b0) {
@@ -243,7 +262,7 @@ fn executeCharStringAlloc(
                 if (local_subrs == null or stack.items.len == 0) return error.UnsupportedType1;
                 const raw_idx = try exactIntFromFloat(i32, stack.pop().?);
                 if (raw_idx < 0 or raw_idx >= local_subrs.?.len) return error.InvalidSubroutine;
-                try executeCharStringAlloc(alloc, local_subrs.?[@intCast(raw_idx)], local_subrs, stack, othersubr_results, flex, current, contours, x, y, width_seen, seac_out, depth + 1);
+                try executeCharStringAlloc(alloc, local_subrs.?[@intCast(raw_idx)], local_subrs, stack, othersubr_results, flex, current, contours, x, y, width_seen, seac_out, remaining_operations, depth + 1);
             },
             11 => return,
             12 => {
@@ -329,17 +348,10 @@ fn executeCharStringAlloc(
                                 if (argument_count != 1) return error.InvalidType1;
                                 try othersubr_results.append(alloc, arguments[0]);
                             },
-                            // For an unrecognized OtherSubr, the Type 1 format
-                            // requires successive `pop`s to receive arg1,
-                            // arg2, ...; reverse the retained arguments because
-                            // `othersubr_results` is consumed as a stack.
-                            else => {
-                                var argument_index = arguments.len;
-                                while (argument_index > 0) {
-                                    argument_index -= 1;
-                                    try othersubr_results.append(alloc, arguments[argument_index]);
-                                }
-                            },
+                            // Font-defined OtherSubrs execute arbitrary
+                            // PostScript. Never fabricate their results: doing
+                            // so produces plausible but incorrect outlines.
+                            else => return error.UnsupportedType1,
                         }
                         stack.shrinkRetainingCapacity(first);
                     },
@@ -629,7 +641,7 @@ test "type1 rejects non-integral and out-of-range othersubr operands" {
     try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &fractional_count, null));
 }
 
-test "type1 preserves custom OtherSubr compatibility results" {
+test "type1 rejects custom OtherSubrs that require PostScript execution" {
     const alloc = std.testing.allocator;
     const custom_othersubr = [_]u8{
         139, 139, 21, // 0 0 rmoveto
@@ -637,12 +649,12 @@ test "type1 preserves custom OtherSubr compatibility results" {
         12, 17, 12, 17, 12, 33, // pop pop setcurrentpoint
         139, 189, 5, 14, // 0 50 rlineto endchar
     };
-    var outline = (try glyphOutlineAlloc(alloc, &custom_othersubr, null)).?;
-    defer outline.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 1), outline.contours.len);
-    try std.testing.expectApproxEqAbs(@as(f64, 10), outline.contours[0].points[0].x, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 20), outline.contours[0].points[0].y, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f64, 70), outline.contours[0].points[1].y, 0.001);
+    try std.testing.expectError(error.UnsupportedType1, glyphOutlineAlloc(alloc, &custom_othersubr, null));
+}
+
+test "type1 enforces a shared charstring operation limit" {
+    const charstring = [_]u8{ 139, 139, 21, 149, 139, 5, 14 };
+    try std.testing.expectError(error.GlyphOutlineTooComplex, glyphOutlineAllocLimited(std.testing.allocator, &charstring, null, .{ .max_operations = 3 }));
 }
 
 test "type1 rejects empty OtherSubr pop" {
