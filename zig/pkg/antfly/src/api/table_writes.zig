@@ -22012,12 +22012,8 @@ fn managedIndexCoverageIncomplete(alloc: std.mem.Allocator, db: *db_mod.DB, inde
 }
 
 fn managedDbHasIndexLoadFailure(alloc: std.mem.Allocator, db: *db_mod.DB) !bool {
-    const configs = try db.core.listIndexes(alloc);
-    defer db_mod.types.freeIndexConfigs(alloc, configs);
-    for (configs) |cfg| {
-        if (db.core.index_manager.loadFailure(cfg.name) != null) return true;
-    }
-    return false;
+    _ = alloc;
+    return db.core.index_manager.failedIndexLoadSummary().total != 0;
 }
 
 fn seedManagedIndexReplayFromStoredDocsIfNeeded(
@@ -24663,6 +24659,7 @@ fn catchUpManagedDb(
     var repaired_indexes: usize = 0;
     var degraded_indexes: usize = 0;
     var made_progress = false;
+    var automatic_discovery_pending = false;
     defer if (made_progress) {
         // Readers must reopen after any durable visibility change. A repair
         // that leased the live writer has already changed that authoritative
@@ -24813,6 +24810,7 @@ fn catchUpManagedDb(
     if (initial_index_load_failure) {
         const discovery = try db.discoverRecoverableStartupIndexFailures(alloc, 1);
         made_progress = made_progress or discovery.discovered != 0;
+        automatic_discovery_pending = discovery.automaticDiscoveryPending();
     }
     var repair_summary = try db.indexRepairIntentSummary(alloc);
     if (repair_summary.runnable != 0) {
@@ -24826,6 +24824,7 @@ fn catchUpManagedDb(
             };
         }
         const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, index_repair_options);
+        automatic_discovery_pending = automatic_discovery_pending or repair.automatic_discovery_pending;
         attempted_index_repairs = repair.attempted;
         repaired_indexes = repair.repaired;
         degraded_indexes = repair.degraded;
@@ -24899,6 +24898,21 @@ fn catchUpManagedDb(
             .had_debt = true,
             .terminal_degraded = true,
             .made_progress = made_progress,
+            // A genuine terminal intent may coexist with an incompletely
+            // inspected automatic-load-failure sweep. Preserve both truths:
+            // status remains degraded while the owner retains the repair route.
+            .index_repair_pending = automatic_discovery_pending,
+        };
+    }
+    if (automatic_discovery_pending) {
+        return .{
+            .had_debt = true,
+            .made_progress = made_progress,
+            .index_repair_pending = true,
+            .index_repair_paused = repair_summary.paused != 0,
+            .index_repair_attempted = attempted_index_repairs != 0,
+            .index_repair_repaired = repaired_indexes != 0,
+            .index_repair_degraded = degraded_indexes != 0,
         };
     }
     if (try managedDbHasIndexLoadFailure(alloc, db)) {

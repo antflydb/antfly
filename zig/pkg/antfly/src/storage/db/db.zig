@@ -7901,6 +7901,31 @@ pub const DB = struct {
         }
     };
 
+    /// Lightweight serialization for repair-control commits which bind to the
+    /// current catalog incarnation but do not publish or retire runtime index
+    /// pointers. Full structural mutations take the same mutex and additionally
+    /// drain background pointer borrowers; discovery needs only the shared
+    /// incarnation boundary and therefore does not stop merge/compaction work.
+    const IndexCatalogIncarnationGuard = struct {
+        db: *DB,
+        active: bool = true,
+
+        fn release(self: *@This()) void {
+            if (!self.active) return;
+            self.db.index_structural_mutation_mutex.unlock();
+            self.active = false;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.release();
+        }
+    };
+
+    fn beginIndexCatalogIncarnationGuard(self: *DB) IndexCatalogIncarnationGuard {
+        lockAtomicWithBackoff(&self.index_structural_mutation_mutex);
+        return .{ .db = self };
+    }
+
     const QuarantineIndexPublicationFence = struct {
         db: *DB,
         structural_guard: ?IndexStructuralMutationGuard = null,
@@ -10811,6 +10836,14 @@ pub const DB = struct {
         already_pending: usize = 0,
         terminal: usize = 0,
         existing_terminal: usize = 0,
+        automatic_remaining: usize = 0,
+        automatic_deferred: usize = 0,
+        automatic_sweep_complete: bool = true,
+
+        pub fn automaticDiscoveryPending(self: @This()) bool {
+            return self.automatic_remaining != 0 and
+                (!self.automatic_sweep_complete or self.automatic_deferred != 0);
+        }
     };
 
     fn indexRepairStateLocation(self: *const DB) !index_repair_state.Location {
@@ -12714,6 +12747,7 @@ pub const DB = struct {
             .last_error = err_name,
             .replace_last_error = true,
         });
+        if (terminal) self.core.index_manager.releaseFailedIndexLoadRepairClaim(entry.intent.index_name);
     }
 
     fn indexRepairFailureIsTerminal(err: anyerror) bool {
@@ -12807,6 +12841,7 @@ pub const DB = struct {
             false,
             false,
         );
+        ctx.index_manager.releaseFailedIndexLoadRepairClaim(entry.intent.index_name);
         notifyIndexRepairVisibilityHook(
             ctx,
             .index_repair_cleared,
@@ -12951,6 +12986,7 @@ pub const DB = struct {
                 entry.intent.previous_active_relative_path,
             );
         }
+        self.core.index_manager.releaseFailedIndexLoadRepairClaim(entry.intent.index_name);
         _ = try self.retryQuarantinedIndexLoads(true);
         try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
         return true;
@@ -12978,14 +13014,22 @@ pub const DB = struct {
             @as(usize, 1),
             std.math.mul(usize, limit, index_repair_inspections_per_execution_slot) catch std.math.maxInt(usize),
         );
-        const candidates = try self.core.index_manager.failedIndexLoadRecoveryCandidates(alloc, inspection_limit);
-        defer {
-            for (candidates) |*candidate| candidate.deinit(alloc);
-            alloc.free(candidates);
-        }
-        for (candidates) |candidate| {
+        var quantum = try self.core.index_manager.failedIndexLoadRecoveryCandidates(
+            alloc,
+            .rebuild_from_artifacts,
+            inspection_limit,
+        );
+        defer quantum.deinit(alloc);
+        result.automatic_remaining = quantum.action_total;
+        result.automatic_sweep_complete = quantum.sweep_complete;
+        for (quantum.candidates) |candidate| {
             const cfg = candidate.config;
             const action = candidate.action;
+            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
             lockAtomic(&self.async_context.index_repair_scheduler_mutex);
             const existing = if (self.async_context.index_repair_scheduler.by_name.get(cfg.name)) |record_index|
                 self.async_context.index_repair_scheduler.records.items[record_index]
@@ -12994,9 +13038,14 @@ pub const DB = struct {
             self.async_context.index_repair_scheduler_mutex.unlock();
             if (existing) |record| {
                 if (record.phase_terminal) {
+                    self.core.index_manager.releaseFailedIndexLoadRecoveryCandidate(
+                        cfg.name,
+                        candidate.failure_revision,
+                    );
                     result.terminal += 1;
                     result.existing_terminal += 1;
                 } else {
+                    _ = self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate);
                     result.already_pending += 1;
                 }
                 continue;
@@ -13016,7 +13065,10 @@ pub const DB = struct {
                 result.terminal += 1;
                 continue;
             }
-            if (result.discovered >= limit) continue;
+            if (result.discovered >= limit) {
+                result.automatic_deferred += 1;
+                continue;
+            }
 
             const checkpoint = try self.core.loadProjectionCheckpoint(alloc, cfg.name);
             const now_ms = currentTimeNs() / std.time.ns_per_ms;
@@ -13039,9 +13091,34 @@ pub const DB = struct {
                 .owner_epoch = 0,
             };
             defer intent.deinit(alloc);
+            var catalog_incarnation = self.beginIndexCatalogIncarnationGuard();
+            defer catalog_incarnation.deinit();
+            // Detached config cloning and checkpoint inspection run without the
+            // catalog lock. Revalidate under the same short lifecycle boundary
+            // used by drop/recreate and quarantine publication so the durable
+            // intent cannot bind a stale same-name catalog incarnation.
+            if (!self.core.index_manager.failedIndexLoadRecoveryCandidateIsCurrent(candidate)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
+            if (!self.core.index_manager.claimFailedIndexLoadRecoveryCandidate(candidate)) {
+                result.automatic_deferred += 1;
+                result.automatic_sweep_complete = false;
+                continue;
+            }
+            var release_repair_claim = true;
+            defer if (release_repair_claim) self.core.index_manager.releaseFailedIndexLoadRecoveryCandidate(
+                candidate.config.name,
+                candidate.failure_revision,
+            );
             var admission_fence = try self.core.index_manager.beginRepairAdmissionFence(intent.index_name);
             defer self.core.index_manager.cancelRepairAdmissionFence(&admission_fence, intent.index_name);
             const control_revision = try index_repair_state.putEntryAt(alloc, location, state_identity, null, .{ .intent = intent });
+            // The durable intent now owns this exact quarantine incarnation.
+            // Keep the claim until terminal classification or successful
+            // replacement removes the failed-load entry.
+            release_repair_claim = false;
             self.core.index_manager.finishRepairAdmissionFence(
                 &admission_fence,
                 intent.index_name,
@@ -13050,15 +13127,6 @@ pub const DB = struct {
                 false,
             );
             noteIndexRepairSchedulerUpsert(self.async_context, intent, 1, control_revision);
-            notifyIndexRepairVisibilityHook(
-                self.async_context,
-                .index_repair_pending,
-                intent,
-                1,
-                .serviceable,
-                false,
-            );
-            result.discovered += 1;
 
             // Intent durability precedes the serviceability marker. If this
             // checkpoint write fails, restart still rediscovers the intent and
@@ -13069,7 +13137,20 @@ pub const DB = struct {
                 .generation = checkpoint.generation,
                 .config_hash = types.indexConfigHash(cfg),
             });
+            catalog_incarnation.release();
+            notifyIndexRepairVisibilityHook(
+                self.async_context,
+                .index_repair_pending,
+                intent,
+                1,
+                .serviceable,
+                false,
+            );
+            result.discovered += 1;
         }
+        const failure_summary = self.core.index_manager.failedIndexLoadSummary();
+        result.automatic_remaining = failure_summary.rebuild_from_artifacts;
+        if (result.automatic_remaining == 0) result.automatic_sweep_complete = true;
         return result;
     }
 
@@ -13789,6 +13870,7 @@ pub const DB = struct {
         next_retry_at_ms: u64 = 0,
         wake: IndexRepairWake = .empty,
         inspected: usize = 0,
+        automatic_discovery_pending: bool = false,
     };
 
     const index_repair_inspections_per_execution_slot: usize = 8;
@@ -13882,6 +13964,7 @@ pub const DB = struct {
         var result: StartupIndexRepairResult = .{};
         const discovery = try self.discoverRecoverableStartupIndexFailures(alloc, limit);
         result.discovered = discovery.discovered;
+        result.automatic_discovery_pending = discovery.automaticDiscoveryPending();
         // Existing terminal intents are counted from the durable state below.
         // Discovery contributes only terminal load failures for which no intent
         // exists, avoiding double-counting checkpointed failures.
@@ -19852,10 +19935,15 @@ pub const DB = struct {
     /// its persisted rebuild state and catches up before registering.
     pub fn retryQuarantinedIndexLoads(self: *DB, force: bool) !index_manager_mod.IndexManager.QuarantineRetryResult {
         var publication_fence = QuarantineIndexPublicationFence{ .db = self };
+        const execution_limit = if (force)
+            self.core.index_manager.failedIndexLoadSummary().total
+        else
+            @as(usize, 8);
         return try self.core.index_manager.retryFailedIndexLoads(
             self.core.store,
             monotonicTimeNs(),
             force,
+            execution_limit,
             publication_fence.iface(),
         );
     }
