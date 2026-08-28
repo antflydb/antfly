@@ -19,6 +19,7 @@ const data_raft_protocol = @import("../../common/data_raft_protocol.zig");
 const common = @import("http_common.zig");
 const http_snapshot = @import("http_snapshot.zig");
 const routes = @import("routes.zig");
+const snapshot_transfer = @import("snapshot_transfer.zig");
 
 pub const HttpServerConfig = struct {
     max_request_bytes: usize = common_http.default_max_request_bytes,
@@ -44,6 +45,17 @@ pub const SnapshotStore = struct {
     pub const VTable = struct {
         put_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, body: []const u8) anyerror!void,
         get_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) anyerror![]u8,
+        begin_chunked_snapshot: ?*const fn (ptr: *anyopaque, manifest: snapshot_transfer.Manifest, snapshot_id: []const u8) anyerror!void = null,
+        put_snapshot_chunk: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8, offset: u64, body: []const u8) anyerror!void = null,
+        commit_chunked_snapshot: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            snapshot_id: []const u8,
+            materialize: bool,
+        ) anyerror!?raft_engine.core.types.Snapshot = null,
+        get_snapshot_manifest: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) anyerror!snapshot_transfer.Manifest = null,
+        get_snapshot_chunk: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, offset: u64, max_len: usize) anyerror![]u8 = null,
+        abort_chunked_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8) anyerror!void = null,
     };
 
     pub fn putSnapshot(self: SnapshotStore, alloc: std.mem.Allocator, snapshot_id: []const u8, body: []const u8) !void {
@@ -52,6 +64,12 @@ pub const SnapshotStore = struct {
 
     pub fn getSnapshot(self: SnapshotStore, alloc: std.mem.Allocator, snapshot_id: []const u8) ![]u8 {
         return try self.vtable.get_snapshot(self.ptr, alloc, snapshot_id);
+    }
+
+    pub fn supportsChunkedTransfer(self: SnapshotStore) bool {
+        return self.vtable.begin_chunked_snapshot != null and self.vtable.put_snapshot_chunk != null and
+            self.vtable.commit_chunked_snapshot != null and self.vtable.get_snapshot_manifest != null and
+            self.vtable.get_snapshot_chunk != null;
     }
 };
 
@@ -78,6 +96,11 @@ pub const SnapshotUploadHandler = struct {
 };
 
 pub const HttpServer = struct {
+    const snapshot_protocol_header = "x-antfly-raft-snapshot-protocol";
+    const snapshot_operation_header = "x-antfly-raft-snapshot-operation";
+    const snapshot_offset_header = "x-antfly-raft-snapshot-offset";
+    const snapshot_chunk_length_header = "x-antfly-raft-snapshot-chunk-length";
+
     alloc: std.mem.Allocator,
     cfg: HttpServerConfig,
     codec: raft_engine.runtime.MessageCodec,
@@ -117,6 +140,11 @@ pub const HttpServer = struct {
     }
 
     pub fn handle(self: *HttpServer, req: common.HttpRequest) !common.HttpResponse {
+        if (req.header(snapshot_protocol_header)) |version| {
+            if (std.mem.eql(u8, version, "2")) {
+                if (try self.handleChunkedSnapshot(req)) |response| return response;
+            }
+        }
         if (std.mem.eql(u8, req.uri, routes.Routes.health) and req.method == .GET) {
             return .{
                 .status = 200,
@@ -132,8 +160,8 @@ pub const HttpServer = struct {
                 .content_type = content_type,
                 .body = try std.fmt.allocPrint(
                     self.alloc,
-                    "{{\"data_raft_batch_protocol_version\":{d}}}",
-                    .{data_raft_protocol.batch_protocol_version},
+                    "{{\"data_raft_batch_protocol_version\":{d},\"snapshot_transfer_protocol_version\":{d}}}",
+                    .{ data_raft_protocol.batch_protocol_version, snapshot_transfer.protocol_version },
                 ),
             };
         }
@@ -201,6 +229,124 @@ pub const HttpServer = struct {
             .content_type = try self.alloc.dupe(u8, "text/plain"),
             .body = try self.alloc.dupe(u8, "not found"),
         };
+    }
+
+    fn handleChunkedSnapshot(self: *HttpServer, req: common.HttpRequest) !?common.HttpResponse {
+        const store = self.snapshot_store orelse return error.MissingSnapshotStore;
+        // A v1 store may receive a v2 manifest probe during a rolling upgrade.
+        // Fall through to its ordinary fetch response so the client can detect
+        // the legacy content type without treating capability discovery as an
+        // application failure.
+        if (!store.supportsChunkedTransfer()) return null;
+        const operation = req.header(snapshot_operation_header) orelse return error.InvalidSnapshotTransferOperation;
+
+        if (routes.Routes.matchSnapshotUpload(req.uri)) |snapshot_id| {
+            if (std.mem.eql(u8, operation, "begin") and req.method == .POST) {
+                if (req.body.len > self.cfg.max_request_bytes) return error.RequestTooLarge;
+                var manifest = try snapshot_transfer.decode(self.alloc, req.body);
+                defer manifest.deinit(self.alloc);
+                try validateManifestRequest(req, manifest);
+                try store.vtable.begin_chunked_snapshot.?(store.ptr, manifest, snapshot_id);
+                return try self.textResponse(201, "snapshot upload initialized");
+            }
+            if (std.mem.eql(u8, operation, "chunk") and req.method == .PUT) {
+                if (req.body.len > self.cfg.max_request_bytes) return error.RequestTooLarge;
+                const offset = try parseRequiredU64Header(req, snapshot_offset_header);
+                var manifest = try store.vtable.get_snapshot_manifest.?(store.ptr, self.alloc, snapshot_id);
+                defer manifest.deinit(self.alloc);
+                try validateManifestRequest(req, manifest);
+                try store.vtable.put_snapshot_chunk.?(store.ptr, snapshot_id, offset, req.body);
+                return try self.textResponse(202, "snapshot chunk accepted");
+            }
+            if (std.mem.eql(u8, operation, "commit") and req.method == .POST) {
+                var manifest = try store.vtable.get_snapshot_manifest.?(store.ptr, self.alloc, snapshot_id);
+                defer manifest.deinit(self.alloc);
+                try validateManifestRequest(req, manifest);
+                const handler = self.snapshot_upload_handler;
+                var snapshot = try store.vtable.commit_chunked_snapshot.?(
+                    store.ptr,
+                    self.alloc,
+                    snapshot_id,
+                    handler != null,
+                );
+                errdefer if (snapshot) |*owned| owned.deinit(self.alloc);
+                if (handler) |live_handler| {
+                    const upload: SnapshotUpload = .{
+                        .group_id = manifest.group_id,
+                        .from = manifest.from,
+                        .to = manifest.to,
+                        .term = manifest.request_term,
+                        .snapshot = snapshot orelse return error.SnapshotMaterializationMissing,
+                    };
+                    snapshot = null;
+                    try live_handler.handleSnapshotUpload(upload);
+                } else if (snapshot) |*unexpected| {
+                    // Defensive ownership handling for custom stores that
+                    // materialize despite the explicit artifact-only request.
+                    unexpected.deinit(self.alloc);
+                    snapshot = null;
+                }
+                return try self.textResponse(201, "snapshot committed");
+            }
+            if (std.mem.eql(u8, operation, "abort") and req.method == .DELETE) {
+                var manifest = try store.vtable.get_snapshot_manifest.?(store.ptr, self.alloc, snapshot_id);
+                defer manifest.deinit(self.alloc);
+                try validateManifestRequest(req, manifest);
+                if (store.vtable.abort_chunked_snapshot) |abort| try abort(store.ptr, snapshot_id);
+                return try self.textResponse(204, "");
+            }
+            return error.InvalidSnapshotTransferOperation;
+        }
+
+        if (routes.Routes.matchSnapshotFetch(req.uri)) |snapshot_id| {
+            if (std.mem.eql(u8, operation, "manifest") and req.method == .GET) {
+                var manifest = try store.vtable.get_snapshot_manifest.?(store.ptr, self.alloc, snapshot_id);
+                defer manifest.deinit(self.alloc);
+                const body = try snapshot_transfer.encode(self.alloc, manifest);
+                return .{
+                    .status = 200,
+                    .content_type = try self.alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
+                    .body = body,
+                };
+            }
+            if (std.mem.eql(u8, operation, "chunk") and req.method == .GET) {
+                const offset = try parseRequiredU64Header(req, snapshot_offset_header);
+                const requested_len = try parseRequiredU64Header(req, snapshot_chunk_length_header);
+                const max_len = std.math.cast(usize, requested_len) orelse return error.InvalidSnapshotChunkLength;
+                if (max_len == 0 or max_len > common_http.default_max_request_bytes)
+                    return error.InvalidSnapshotChunkLength;
+                return .{
+                    .status = 200,
+                    .content_type = try self.alloc.dupe(u8, "application/x-antflydb-raft-snapshot-chunk-v2"),
+                    .body = try store.vtable.get_snapshot_chunk.?(store.ptr, self.alloc, snapshot_id, offset, max_len),
+                };
+            }
+            return error.InvalidSnapshotTransferOperation;
+        }
+        return null;
+    }
+
+    fn textResponse(self: *HttpServer, status: u16, body: []const u8) !common.HttpResponse {
+        return .{
+            .status = status,
+            .content_type = try self.alloc.dupe(u8, "text/plain"),
+            .body = try self.alloc.dupe(u8, body),
+        };
+    }
+
+    fn parseRequiredU64Header(req: common.HttpRequest, name: []const u8) !u64 {
+        const encoded = req.header(name) orelse return error.MissingSnapshotTransferHeader;
+        return std.fmt.parseInt(u64, encoded, 10) catch return error.InvalidSnapshotTransferHeader;
+    }
+
+    fn validateManifestRequest(req: common.HttpRequest, manifest: snapshot_transfer.Manifest) !void {
+        if (try parseRequiredU64Header(req, "x-antfly-raft-group-id") != manifest.group_id or
+            try parseRequiredU64Header(req, "x-antfly-raft-from-node-id") != manifest.from or
+            try parseRequiredU64Header(req, "x-antfly-raft-to-node-id") != manifest.to or
+            try parseRequiredU64Header(req, "x-antfly-raft-term") != manifest.request_term)
+        {
+            return error.SnapshotTransferIdentityMismatch;
+        }
     }
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
@@ -285,13 +431,17 @@ test "http server exposes health and data raft protocol capabilities" {
     });
     defer capabilities.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), capabilities.status);
-    const Parsed = struct { data_raft_batch_protocol_version: u16 };
+    const Parsed = struct {
+        data_raft_batch_protocol_version: u16,
+        snapshot_transfer_protocol_version: u32,
+    };
     const parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, capabilities.body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(
         data_raft_protocol.batch_protocol_version,
         parsed.value.data_raft_batch_protocol_version,
     );
+    try std.testing.expectEqual(snapshot_transfer.protocol_version, parsed.value.snapshot_transfer_protocol_version);
 }
 
 test "http server decodes raft batch requests and dispatches them" {

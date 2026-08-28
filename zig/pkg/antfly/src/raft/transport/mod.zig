@@ -16,6 +16,7 @@ pub const http_common = @import("http_common.zig");
 pub const http_driver = @import("http_driver.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_snapshot = @import("http_snapshot.zig");
+pub const snapshot_transfer = @import("snapshot_transfer.zig");
 pub const file_snapshot_store = @import("file_snapshot_store.zig");
 pub const host_batch_handler = @import("host_batch_handler.zig");
 pub const stack = @import("stack.zig");

@@ -377,10 +377,12 @@ fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     // accidental unbounded clone can exhaust the process.
     cfg.max_single_outbound_ready_bytes = data_raft_max_single_ready_bytes;
     cfg.max_single_apply_ready_bytes = data_raft_max_single_ready_bytes;
-    // Every replica can now build a complete point-in-time data snapshot. Keep
-    // replicated logs bounded independently instead of restricting compaction
-    // to single-node groups.
-    cfg.applied_log_compaction_single_node_only = false;
+    // Chunked snapshot transport is bounded and durable, but mixed-version
+    // groups cannot safely compact until every member advertises protocol v2.
+    // Keep the fail-closed rollout gate here; capability-aware activation can
+    // turn it off per group without making deployment order an availability
+    // dependency.
+    cfg.applied_log_compaction_single_node_only = true;
     return cfg;
 }
 
@@ -11761,8 +11763,23 @@ pub const DataServer = struct {
             if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else null
         else
             null;
+        const retirement_targets = if (retirement_source != null) blk: {
+            const targets = try self.alloc.alloc(
+                antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementTarget,
+                reconcile.removals.len,
+            );
+            for (reconcile.removals, targets) |group_id, *target| {
+                const table_name = if (findRangeByGroupId(snapshot.ranges, group_id)) |range|
+                    if (findTableById(snapshot.tables, range.table_id)) |table| table.name else null
+                else
+                    null;
+                target.* = .{ .group_id = group_id, .table_name = table_name };
+            }
+            break :blk targets;
+        } else &.{};
+        defer if (retirement_targets.len > 0) self.alloc.free(retirement_targets);
         var prepared_retirements = if (retirement_source) |source|
-            source.prepareReplicaRetirements(self.alloc, reconcile.removals) catch |err| {
+            source.prepareReplicaRetirements(self.alloc, retirement_targets) catch |err| {
                 lockAtomic(&self.data_raft_mutex);
                 defer self.data_raft_mutex.unlock();
                 reconcile.abortDurable() catch {};
@@ -11790,10 +11807,7 @@ pub const DataServer = struct {
             if (prepared_retirements) |*prepared| {
                 const source = retirement_source.?;
                 if (reconcile.catalog_commit_complete) {
-                    source.completePreparedReplicaRetirements(
-                        reconcile.removals,
-                        prepared,
-                    ) catch |retirement_err| {
+                    source.completePreparedReplicaRetirements(prepared) catch |retirement_err| {
                         std.log.warn("committed local replica retirement deferred groups={d} err={s}", .{
                             reconcile.removals.len,
                             @errorName(retirement_err),
@@ -11807,10 +11821,7 @@ pub const DataServer = struct {
             return err;
         }
         if (prepared_retirements) |*prepared| {
-            retirement_source.?.completePreparedReplicaRetirements(
-                reconcile.removals,
-                prepared,
-            ) catch |err| {
+            retirement_source.?.completePreparedReplicaRetirements(prepared) catch |err| {
                 // Replica admission is already durably removed. The sidecar
                 // intent and recovery worker own convergence; do not roll the
                 // metadata epoch back or hold consensus progress on deletion.
@@ -19332,7 +19343,7 @@ test "data runtime module compiles" {
     try std.testing.expectEqual(data_raft_max_single_ready_bytes, runtime_cfg.max_single_apply_ready_bytes);
     try std.testing.expect(runtime_cfg.max_single_outbound_ready_bytes != std.math.maxInt(usize));
     try std.testing.expect(runtime_cfg.max_single_apply_ready_bytes != std.math.maxInt(usize));
-    try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
+    try std.testing.expect(runtime_cfg.applied_log_compaction_single_node_only);
 }
 
 test "data raft bootstrap campaign retries leaderless voter elections" {

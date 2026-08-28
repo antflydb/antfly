@@ -14,13 +14,18 @@
 
 const std = @import("std");
 const raft_engine = @import("raft_engine");
+const common_http = @import("../../common/http/mod.zig");
 const common = @import("http_common.zig");
 const http_server = @import("http_server.zig");
 const routes = @import("routes.zig");
+const snapshot_transfer = @import("snapshot_transfer.zig");
 
 pub const HttpSnapshotConfig = struct {
     root_dir: []const u8,
     chunk_size: usize = 1 << 20,
+    legacy_max_snapshot_bytes: usize = 8 * 1024 * 1024,
+    legacy_fallback_max_request_bytes: usize = common_http.default_max_request_bytes,
+    max_snapshot_bytes: usize = 1 << 30,
 };
 
 pub const SnapshotTargetResolver = struct {
@@ -114,9 +119,6 @@ pub const HttpSnapshotTransport = struct {
         const uri = try self.resolveUploadUri(req, snapshot_id);
         defer self.alloc.free(uri);
 
-        const body = try encodeSnapshotEnvelope(self.alloc, req.snapshot);
-        defer self.alloc.free(body);
-
         var group_id_buf: [32]u8 = undefined;
         var from_buf: [32]u8 = undefined;
         var to_buf: [32]u8 = undefined;
@@ -133,6 +135,31 @@ pub const HttpSnapshotTransport = struct {
         };
         const headers: []const common.RequestHeader = if (req.from == 0) &.{} else live_headers[0..];
 
+        if (req.snapshot.data.len > self.cfg.legacy_max_snapshot_bytes) {
+            self.sendChunkedSnapshot(req, uri, &live_headers) catch |chunked_err| {
+                // Mixed-version clusters can still transfer snapshots that fit
+                // the bounded v1 request. This is intentionally a fallback,
+                // not an unbounded retry that recreates the original failure.
+                const legacy_body = encodeSnapshotEnvelope(self.alloc, req.snapshot) catch |legacy_err| return legacy_err;
+                defer self.alloc.free(legacy_body);
+                if (legacy_body.len > self.cfg.legacy_fallback_max_request_bytes) return chunked_err;
+                return try self.sendLegacySnapshot(req, uri, headers, legacy_body);
+            };
+            return;
+        }
+
+        const body = try encodeSnapshotEnvelope(self.alloc, req.snapshot);
+        defer self.alloc.free(body);
+        return try self.sendLegacySnapshot(req, uri, headers, body);
+    }
+
+    fn sendLegacySnapshot(
+        self: *HttpSnapshotTransport,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
+        uri: []const u8,
+        headers: []const common.RequestHeader,
+        body: []const u8,
+    ) !void {
         var resp = try self.executor.execute(self.alloc, .{
             .method = .POST,
             .uri = uri,
@@ -145,20 +172,175 @@ pub const HttpSnapshotTransport = struct {
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
     }
 
+    fn sendChunkedSnapshot(
+        self: *HttpSnapshotTransport,
+        req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
+        uri: []const u8,
+        identity_headers: []const common.RequestHeader,
+    ) !void {
+        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > 4 * 1024 * 1024)
+            return error.InvalidSnapshotChunkSize;
+        if (req.snapshot.data.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
+        const manifest: snapshot_transfer.Manifest = .{
+            .group_id = req.group_id,
+            .from = req.from,
+            .to = req.to,
+            .request_term = req.term,
+            .metadata = req.snapshot.metadata,
+            .data_len = req.snapshot.data.len,
+            .digest = snapshot_transfer.digest(req.snapshot.data),
+        };
+        const encoded_manifest = try snapshot_transfer.encode(self.alloc, manifest);
+        defer self.alloc.free(encoded_manifest);
+
+        var begin_headers: [6]common.RequestHeader = undefined;
+        const begin_count = appendTransferHeaders(&begin_headers, identity_headers, "begin", null, null);
+        try self.executeExpectedSuccess(.{
+            .method = .POST,
+            .uri = uri,
+            .headers = begin_headers[0..begin_count],
+            .source_node_id = if (req.from == 0) null else req.from,
+            .content_type = "application/x-antflydb-raft-snapshot-manifest-v2",
+            .body = encoded_manifest,
+        });
+        errdefer {
+            var abort_headers: [6]common.RequestHeader = undefined;
+            const abort_count = appendTransferHeaders(&abort_headers, identity_headers, "abort", null, null);
+            self.executeExpectedSuccess(.{
+                .method = .DELETE,
+                .uri = uri,
+                .headers = abort_headers[0..abort_count],
+                .source_node_id = if (req.from == 0) null else req.from,
+            }) catch {};
+        }
+
+        var offset: usize = 0;
+        while (offset < req.snapshot.data.len) {
+            const end = @min(req.snapshot.data.len, offset + self.cfg.chunk_size);
+            var offset_buf: [32]u8 = undefined;
+            const encoded_offset = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+            var chunk_headers: [7]common.RequestHeader = undefined;
+            const chunk_count = appendTransferHeaders(&chunk_headers, identity_headers, "chunk", encoded_offset, null);
+            try self.executeExpectedSuccess(.{
+                .method = .PUT,
+                .uri = uri,
+                .headers = chunk_headers[0..chunk_count],
+                .source_node_id = if (req.from == 0) null else req.from,
+                .content_type = "application/x-antflydb-raft-snapshot-chunk-v2",
+                .body = req.snapshot.data[offset..end],
+            });
+            offset = end;
+        }
+
+        var commit_headers: [6]common.RequestHeader = undefined;
+        const commit_count = appendTransferHeaders(&commit_headers, identity_headers, "commit", null, null);
+        try self.executeExpectedSuccess(.{
+            .method = .POST,
+            .uri = uri,
+            .headers = commit_headers[0..commit_count],
+            .source_node_id = if (req.from == 0) null else req.from,
+        });
+    }
+
+    fn executeExpectedSuccess(self: *HttpSnapshotTransport, req: common.HttpRequest) !void {
+        var resp = try self.executor.execute(self.alloc, req);
+        defer resp.deinit(self.alloc);
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+    }
+
     fn fetchSnapshot(
         ptr: *anyopaque,
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest,
         receiver: raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver,
     ) !void {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
-        const bytes = try self.fetch(.{
-            .group_id = req.group_id,
-            .snapshot_id = req.locator.snapshot_id,
+        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > 4 * 1024 * 1024)
+            return error.InvalidSnapshotChunkSize;
+        const manifest_headers = [_]common.RequestHeader{
+            .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
+            .{ .name = "x-antfly-raft-snapshot-operation", .value = "manifest" },
+        };
+        var resp = try self.executor.execute(self.alloc, .{
+            .method = .GET,
             .uri = req.locator.uri,
+            .headers = &manifest_headers,
         });
-        defer self.alloc.free(bytes);
-        const snapshot = try decodeSnapshotEnvelope(self.alloc, bytes);
-        try receiver.receiveSnapshot(req, snapshot);
+        defer resp.deinit(self.alloc);
+        if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
+        if (resp.content_type == null or
+            !std.mem.eql(u8, resp.content_type.?, "application/x-antflydb-raft-snapshot-manifest-v2"))
+        {
+            const snapshot = try decodeSnapshotEnvelope(self.alloc, resp.body);
+            return try receiver.receiveSnapshot(req, snapshot);
+        }
+
+        var manifest = try snapshot_transfer.decode(self.alloc, resp.body);
+        defer manifest.deinit(self.alloc);
+        if (manifest.group_id != req.group_id or manifest.from != req.from)
+            return error.SnapshotTransferIdentityMismatch;
+        if (manifest.data_len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
+        const data_len = std.math.cast(usize, manifest.data_len) orelse return error.SnapshotTooLarge;
+        const data = try self.alloc.alloc(u8, data_len);
+        errdefer self.alloc.free(data);
+        var offset: usize = 0;
+        while (offset < data.len) {
+            const requested = @min(self.cfg.chunk_size, data.len - offset);
+            var offset_buf: [32]u8 = undefined;
+            var length_buf: [32]u8 = undefined;
+            const encoded_offset = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+            const encoded_length = try std.fmt.bufPrint(&length_buf, "{d}", .{requested});
+            const chunk_headers = [_]common.RequestHeader{
+                .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
+                .{ .name = "x-antfly-raft-snapshot-operation", .value = "chunk" },
+                .{ .name = "x-antfly-raft-snapshot-offset", .value = encoded_offset },
+                .{ .name = "x-antfly-raft-snapshot-chunk-length", .value = encoded_length },
+            };
+            var chunk = try self.executor.execute(self.alloc, .{
+                .method = .GET,
+                .uri = req.locator.uri,
+                .headers = &chunk_headers,
+            });
+            errdefer chunk.deinit(self.alloc);
+            if (chunk.status < 200 or chunk.status >= 300 or
+                chunk.content_type == null or
+                !std.mem.eql(u8, chunk.content_type.?, "application/x-antflydb-raft-snapshot-chunk-v2") or
+                chunk.body.len != requested)
+                return error.InvalidSnapshotChunkResponse;
+            @memcpy(data[offset .. offset + requested], chunk.body);
+            chunk.deinit(self.alloc);
+            offset += requested;
+        }
+        const actual_digest = snapshot_transfer.digest(data);
+        if (!std.mem.eql(u8, &actual_digest, &manifest.digest))
+            return error.SnapshotChecksumMismatch;
+        const metadata = manifest.metadata;
+        manifest.metadata = .{};
+        try receiver.receiveSnapshot(req, .{ .metadata = metadata, .data = data });
+    }
+
+    fn appendTransferHeaders(
+        out: []common.RequestHeader,
+        identity: []const common.RequestHeader,
+        operation: []const u8,
+        offset: ?[]const u8,
+        chunk_length: ?[]const u8,
+    ) usize {
+        std.debug.assert(out.len >= identity.len + 2 + @intFromBool(offset != null) + @intFromBool(chunk_length != null));
+        @memcpy(out[0..identity.len], identity);
+        var count = identity.len;
+        out[count] = .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" };
+        count += 1;
+        out[count] = .{ .name = "x-antfly-raft-snapshot-operation", .value = operation };
+        count += 1;
+        if (offset) |value| {
+            out[count] = .{ .name = "x-antfly-raft-snapshot-offset", .value = value };
+            count += 1;
+        }
+        if (chunk_length) |value| {
+            out[count] = .{ .name = "x-antfly-raft-snapshot-chunk-length", .value = value };
+            count += 1;
+        }
+        return count;
     }
 
     fn resolveUploadUri(
@@ -370,6 +552,8 @@ test "http snapshot transport posts and fetches serialized snapshots" {
     var executor = RecordingExecutor{ .server = &server };
     var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
         .root_dir = "/tmp",
+        // Exercise rolling-upgrade fallback through a v1-only store.
+        .legacy_max_snapshot_bytes = 1,
     }, executor.iface(), null);
 
     var voters = [_]u64{ 1, 2 };
