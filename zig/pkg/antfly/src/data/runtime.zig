@@ -365,9 +365,18 @@ const internal_service_secret_key = "antfly.internal_service.secret";
 const internal_service_verification_secret_key = "antfly.internal_service.verification_secret";
 const internal_service_issuer_key = "antfly.internal_service.issuer";
 const internal_service_rollout_mode_key = "antfly.internal_service.rollout_mode";
+const data_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
+const data_raft_max_regular_ready_bytes: usize = 64 * 1024 * 1024;
+const data_raft_max_single_ready_bytes: usize =
+    data_raft_max_snapshot_transfer_bytes + data_raft_max_regular_ready_bytes;
 
 fn dataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     var cfg: raft_engine.runtime.RuntimeConfig = .{};
+    // The empty-queue liveness grant must remain large enough for one accepted
+    // snapshot or regular batch, while still failing closed before an
+    // accidental unbounded clone can exhaust the process.
+    cfg.max_single_outbound_ready_bytes = data_raft_max_single_ready_bytes;
+    cfg.max_single_apply_ready_bytes = data_raft_max_single_ready_bytes;
     // Every replica can now build a complete point-in-time data snapshot. Keep
     // replicated logs bounded independently instead of restricting compaction
     // to single-node groups.
@@ -1046,6 +1055,8 @@ const DataDescriptorFactory = struct {
                     .pre_vote = true,
                     .check_quorum = true,
                     .step_down_on_removal = true,
+                    .max_size_per_msg = data_raft_max_regular_ready_bytes,
+                    .max_committed_size_per_ready = data_raft_max_regular_ready_bytes,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
                 .storage = store.storage(),
@@ -1088,6 +1099,8 @@ test "data descriptor factory separates bootstrap voters from transport peers" {
     defer factory.iface().freeDescriptor(std.testing.allocator, &desc);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4 }, desc.group.raft_config.peers);
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, desc.initial_voters.?);
+    try std.testing.expectEqual(data_raft_max_regular_ready_bytes, desc.group.raft_config.max_size_per_msg);
+    try std.testing.expectEqual(data_raft_max_regular_ready_bytes, desc.group.raft_config.max_committed_size_per_ready);
 }
 
 test "data descriptor factory restores persisted voters before metadata peer discovery" {
@@ -8868,13 +8881,13 @@ pub const DataServer = struct {
                 // unrelated live writers and creates a transient read outage.
                 self.provisioned_storage.invalidateInPlaceMetadataReconcileCaches();
                 self.pruneStaleVisibleWriteCaches();
-                self.syncDataRaftFromRemoteMetadata() catch |err| {
-                    std.log.warn("failed to sync data raft placement after structural change table={s} err={}", .{
-                        table_name,
-                        err,
-                    });
-                };
-                self.reportStoreStatusAfterStructuralChange(table_name);
+                // Structural callbacks can originate from filesystem and cache
+                // lifecycle code. Keep callback dispatch allocation-free and
+                // non-blocking: the control owner coalesces metadata refresh
+                // and status publication without re-entering caller locks or
+                // holding a request open on remote I/O.
+                self.requestDataRaftMetadataSync();
+                self.markStoreStatusDirtyImmediate();
             },
         }
         self.markRuntimeStatusDirty(table_name, kind);
@@ -15000,6 +15013,7 @@ pub const DataServer = struct {
                                 .replica_state_backend = cfg.data_raft_state_backend,
                             },
                             .listener = antfly.raft.httpListenerConfig(cfg.raft_bind_host, cfg.raft_bind_port),
+                            .max_snapshot_bytes = data_raft_max_snapshot_transfer_bytes,
                             .transport = .{
                                 .snapshot = .{
                                     .root_dir = cfg.snapshot_root_dir orelse cfg.replica_root_dir,
@@ -19313,7 +19327,12 @@ test "data runtime module compiles" {
     _ = DataServerConfig;
     _ = DataServer;
     _ = GroupLeadershipSource;
-    try std.testing.expect(!dataRaftRuntimeConfig().applied_log_compaction_single_node_only);
+    const runtime_cfg = dataRaftRuntimeConfig();
+    try std.testing.expectEqual(data_raft_max_single_ready_bytes, runtime_cfg.max_single_outbound_ready_bytes);
+    try std.testing.expectEqual(data_raft_max_single_ready_bytes, runtime_cfg.max_single_apply_ready_bytes);
+    try std.testing.expect(runtime_cfg.max_single_outbound_ready_bytes != std.math.maxInt(usize));
+    try std.testing.expect(runtime_cfg.max_single_apply_ready_bytes != std.math.maxInt(usize));
+    try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);
 }
 
 test "data raft bootstrap campaign retries leaderless voter elections" {
@@ -25423,10 +25442,14 @@ test "data runtime structural changes preserve writer-published runtime status a
 
     server.runtime_status_dirty.store(false, .release);
     server.provisioned_startup_catch_up_dirty.store(false, .release);
-    server.markRuntimeStatusDirty("docs", .structural);
+    server.data_raft_metadata_sync_requested.store(false, .release);
+    server.store_status_dirty.store(false, .release);
+    DataServer.onLocalTableChanged(&server, "docs", .structural);
 
     try std.testing.expect(server.runtime_status_dirty.load(.acquire));
     try std.testing.expect(server.provisioned_startup_catch_up_dirty.load(.acquire));
+    try std.testing.expect(server.data_raft_metadata_sync_requested.load(.acquire));
+    try std.testing.expect(server.store_status_dirty.load(.acquire));
     var statuses = (try server.provisioned_storage.runtime_status_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), statuses.items.len);

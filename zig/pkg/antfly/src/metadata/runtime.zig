@@ -43,22 +43,23 @@ fn isExpectedControlRoundError(err: anyerror) bool {
 }
 
 const metadata_raft_max_snapshot_transfer_bytes: usize = 1 << 30;
+const metadata_raft_max_regular_ready_bytes: usize = 64 * 1024 * 1024;
+const metadata_raft_max_single_ready_bytes: usize =
+    metadata_raft_max_snapshot_transfer_bytes + metadata_raft_max_regular_ready_bytes;
 
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
         .max_tick_batch = 32,
         .max_pending_outbound_messages = 4096,
         .max_pending_outbound_bytes = 16 * 1024 * 1024,
-        // Metadata snapshots are indivisible Raft Ready work and their size is
-        // not bounded by any one admitted command. A finite single-Ready cap
-        // would permanently quarantine an otherwise healthy consensus group.
-        // Queue budgets still provide backpressure around the isolated Ready.
-        .max_single_outbound_ready_bytes = std.math.maxInt(usize),
+        // One Ready may exceed the queue budget for liveness, but never the
+        // configured snapshot ceiling plus one bounded regular batch.
+        .max_single_outbound_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_transport_messages_per_round = 64,
         .max_transport_bytes_per_round = 512 * 1024,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
-        .max_single_apply_ready_bytes = std.math.maxInt(usize),
+        .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_apply_tasks_per_round = 16,
         .applied_log_retained_entries = metadata_raft_retained_entries,
         .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
@@ -142,6 +143,8 @@ const Factory = struct {
                     .pre_vote = true,
                     .check_quorum = true,
                     .step_down_on_removal = true,
+                    .max_size_per_msg = metadata_raft_max_regular_ready_bytes,
+                    .max_committed_size_per_ready = metadata_raft_max_regular_ready_bytes,
                     .random_seed = antfly.raft.stableRandomSeed(record.group_id, record.local_node_id),
                 },
                 .storage = self.store.storage(),
@@ -1985,6 +1988,10 @@ test "metadata runtime legacy multi-node cluster config does not require orchest
 
 test "metadata runtime enables bounded raft storage compaction for multi-node groups" {
     const runtime_cfg = metadataRaftRuntimeConfig();
+    try std.testing.expectEqual(metadata_raft_max_single_ready_bytes, runtime_cfg.max_single_outbound_ready_bytes);
+    try std.testing.expectEqual(metadata_raft_max_single_ready_bytes, runtime_cfg.max_single_apply_ready_bytes);
+    try std.testing.expect(runtime_cfg.max_single_outbound_ready_bytes != std.math.maxInt(usize));
+    try std.testing.expect(runtime_cfg.max_single_apply_ready_bytes != std.math.maxInt(usize));
     try std.testing.expectEqual(@as(u64, metadata_raft_retained_entries), runtime_cfg.applied_log_retained_entries);
     try std.testing.expectEqual(@as(u64, metadata_raft_compaction_min_interval_entries), runtime_cfg.applied_log_compaction_min_interval_entries);
     try std.testing.expect(!runtime_cfg.applied_log_compaction_single_node_only);

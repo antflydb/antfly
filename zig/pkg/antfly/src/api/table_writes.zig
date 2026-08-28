@@ -435,6 +435,7 @@ const TestRestoreRepairStepHook = struct {
 };
 
 var test_before_batch_execution_hook: ?TestExecutionHook = null;
+var test_before_drop_table_structural_activity_hook: ?TestExecutionHook = null;
 var test_before_drop_table_delete_hook: ?TestExecutionHook = null;
 var test_dropped_table_recovery_pass_hook: ?TestExecutionHook = null;
 var test_before_drop_index_work_hook: ?TestExecutionHook = null;
@@ -554,6 +555,12 @@ fn runTestBeforeBatchExecutionHook() void {
 fn runTestBeforeDropTableDeleteHook() void {
     if (comptime builtin.is_test) {
         if (test_before_drop_table_delete_hook) |hook| hook.run(hook.ptr);
+    }
+}
+
+fn runTestBeforeDropTableStructuralActivityHook() void {
+    if (comptime builtin.is_test) {
+        if (test_before_drop_table_structural_activity_hook) |hook| hook.run(hook.ptr);
     }
 }
 
@@ -15997,8 +16004,8 @@ pub const ProvisionedTableWriteSource = struct {
         retire_publication_authority: bool,
     ) !void {
         const open_fence = self.dropped_table_cleanup_outer_mutex;
-        if (open_fence) |mutex| lockAtomic(mutex);
-        defer if (open_fence) |mutex| mutex.unlock();
+        var open_fence_held = false;
+        defer if (open_fence_held) open_fence.?.unlock();
         const group_ids = contract.group_ids;
         // A durable index repair owns group admission while it advances one
         // bounded build slice. Publish cancellation before waiting for the
@@ -16011,10 +16018,15 @@ pub const ProvisionedTableWriteSource = struct {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         };
 
+        runTestBeforeDropTableStructuralActivityHook();
         self.beginStructuralTableActivity(table_name);
         var structural_mutation_active = true;
         errdefer if (structural_mutation_active) {
-            self.abortDroppedTableCleanupMutation(table_name, group_ids, open_fence);
+            self.abortDroppedTableCleanupMutation(
+                table_name,
+                group_ids,
+                if (open_fence_held) open_fence else null,
+            );
         };
         // Ask the metadata leader for an exact linearizable ownership proof.
         // The destructive decision must never depend on a process-local
@@ -16078,10 +16090,15 @@ pub const ProvisionedTableWriteSource = struct {
             self.retireDroppedTablePublicationAuthority(table_name);
         }
 
-        // Keep the hosted cache-open fence across invalidation, lease drain,
-        // and rename, but acquire its state mutex only for cache publication.
-        // Existing leases continue serving during the metadata round trip;
-        // new opens cannot race the filesystem transition.
+        // The keyed structural reservation above prevents new opens for this
+        // table and has drained every already-admitted group/status operation.
+        // Take the process-wide cache-open mutex only for the physical cache
+        // transition; holding it while waiting for activity or metadata would
+        // invert the normal activity->open order and convoy unrelated tables.
+        if (open_fence) |mutex| {
+            lockAtomic(mutex);
+            open_fence_held = true;
+        }
         lockAtomic(&self.local_db_mutex);
         self.invalidateWriteCache(table_name);
         self.invalidateReadCache(table_name);
@@ -16090,9 +16107,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.local_db_mutex.unlock();
             return err;
         };
-        defer {
-            if (read_cache_exclusive) |*exclusive| exclusive.deinit();
-        }
+        defer if (read_cache_exclusive) |*exclusive| exclusive.deinit();
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingClosesForGroupsWithOpenFence(table_name, group_ids, open_fence);
 
@@ -16119,6 +16134,16 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.finishDroppedTableCleanupMutation(table_name, group_ids, open_fence);
         structural_mutation_active = false;
+        // Lifecycle callbacks are allowed to reconcile metadata and open
+        // status-only DB handles. Release every physical publication guard
+        // before dispatch so callback behavior can never re-enter a lock held
+        // by its caller.
+        if (read_cache_exclusive) |*exclusive| exclusive.deinit();
+        read_cache_exclusive = null;
+        if (open_fence_held) {
+            open_fence.?.unlock();
+            open_fence_held = false;
+        }
         for (group_ids) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
             self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
@@ -44725,6 +44750,68 @@ test "provisioned table write source drop table does not hold local db mutex dur
     source.drainDroppedTableDeletes();
 
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path, .{}));
+}
+
+test "provisioned table drop scopes cache-open fence after activity drain and before callbacks" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provisioned-drop-table-open-fence-scope",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    var source = ProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    source.dropped_table_cleanup_outer_mutex = &write_cache.open_mutex;
+
+    const Probe = struct {
+        cache: *ProvisionedTableWriteCache,
+        before_structural_open_available: bool = false,
+        callback_open_available: bool = false,
+
+        fn beforeStructural(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.before_structural_open_available = self.cache.open_mutex.tryLock();
+            if (self.before_structural_open_available) self.cache.open_mutex.unlock();
+        }
+
+        fn onChange(
+            ptr: *anyopaque,
+            _: []const u8,
+            kind: ProvisionedTableWriteSource.LocalChangeKind,
+        ) void {
+            if (kind != .structural) return;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.callback_open_available = self.cache.open_mutex.tryLock();
+            if (self.callback_open_available) self.cache.open_mutex.unlock();
+        }
+    };
+    var probe = Probe{ .cache = &write_cache };
+    test_before_drop_table_structural_activity_hook = .{
+        .ptr = &probe,
+        .run = Probe.beforeStructural,
+    };
+    defer test_before_drop_table_structural_activity_hook = null;
+    source.setLocalChangeHook(.{ .ptr = &probe, .on_change = Probe.onChange });
+
+    _ = try source.source().dropTable(alloc, "docs", .{
+        .table_id = 7,
+        .expected_transition_generation = 1,
+        .group_ids = &.{7001},
+    });
+
+    try std.testing.expect(probe.before_structural_open_available);
+    try std.testing.expect(probe.callback_open_available);
 }
 
 test "provisioned table write source drop table waits for in-flight group batch on same table" {
