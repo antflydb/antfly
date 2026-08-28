@@ -276,6 +276,7 @@ const FontDecoder = struct {
     code_bytes: usize = 1,
     base_encoding: text_encoding.NamedEncoding = .pdf_doc,
     differences: [256]?[]u8 = [_]?[]u8{null} ** 256,
+    difference_codepoints: [256]?u21 = [_]?u21{null} ** 256,
     difference_defined: [256]bool = [_]bool{false} ** 256,
     to_unicode: []ToUnicodeEntry = &.{},
     codespace_ranges: []CodeSpaceRange = &.{},
@@ -357,6 +358,20 @@ const FontDecoder = struct {
         }
 
         return @min(self.code_bytes, remaining.len);
+    }
+
+    /// Resolve a simple-font character code for painting. ToUnicode is
+    /// intentionally excluded: it describes extraction text and may expand
+    /// one PDF code into several Unicode scalars.
+    fn paintCodepoint(self: *const FontDecoder, code: u8) ?u21 {
+        if (self.difference_defined[code]) return self.difference_codepoints[code];
+        const cp = switch (self.base_encoding) {
+            .pdf_doc => text_encoding.pdf_doc_encoding[code],
+            .win_ansi => text_encoding.win_ansi_encoding[code],
+            .mac_roman => text_encoding.mac_roman_encoding[code],
+            .standard => text_encoding.standard_encoding[code],
+        };
+        return if (cp == text_encoding.no_rune) null else cp;
     }
 };
 
@@ -458,6 +473,7 @@ const TrueTypeFont = struct {
     units_per_em: u16,
     raw_code_bytes: usize = 0,
     cid_to_gid: ?[]u16 = null,
+    simple_code_to_gid: ?[]u16 = null,
     pdf_widths: ?[]f64 = null,
     pdf_missing_width: ?f64 = null,
     cid_widths: ?CidWidths = null,
@@ -465,12 +481,60 @@ const TrueTypeFont = struct {
     fn deinit(self: *TrueTypeFont, alloc: Allocator) void {
         self.font.deinit(alloc);
         if (self.cid_to_gid) |map| if (map.len > 0) alloc.free(map);
+        if (self.simple_code_to_gid) |map| alloc.free(map);
         if (self.pdf_widths) |widths| alloc.free(widths);
         if (self.cid_widths) |*widths| widths.deinit(alloc);
         alloc.free(self.bytes);
         self.* = undefined;
     }
 };
+
+const missing_simple_truetype_gid = std.math.maxInt(u16);
+const max_cid_to_gid_entries: usize = @as(usize, std.math.maxInt(u16)) + 1;
+const max_cid_to_gid_bytes: usize = max_cid_to_gid_entries * 2;
+
+fn lookupSimpleTrueTypeGlyph(font: font_lib.sfnt.Font, decoder: *const FontDecoder, code: u8, symbolic: ?bool) !?u16 {
+    // Differences are explicit and win regardless of the descriptor flags.
+    if (decoder.difference_defined[code]) {
+        const cp = decoder.difference_codepoints[code] orelse return null;
+        return try font.cmapGlyphIndex(cp);
+    }
+
+    if (symbolic != true) {
+        if (decoder.paintCodepoint(code)) |cp| if (try font.cmapGlyphIndex(cp)) |gid| return gid;
+    }
+
+    // Windows symbol cmaps conventionally place byte codes in the F000
+    // private-use block. Some producers instead store the byte directly.
+    if (symbolic != false) {
+        if (try font.cmapGlyphIndexForPlatform(3, 0, 0xf000 + @as(u21, code))) |gid| return gid;
+        if (try font.cmapGlyphIndexForPlatform(3, 0, code)) |gid| return gid;
+        if (try font.cmapGlyphIndex(0xf000 + @as(u21, code))) |gid| return gid;
+        if (try font.cmapGlyphIndex(code)) |gid| return gid;
+    }
+
+    // Malformed nonsymbolic fonts occasionally omit Encoding while retaining
+    // a byte-addressed cmap. This fallback is paint-only and never consults
+    // ToUnicode.
+    if (symbolic == false) return try font.cmapGlyphIndex(code);
+    return null;
+}
+
+fn buildSimpleTrueTypeGlyphMapAlloc(alloc: Allocator, font: font_lib.sfnt.Font, decoder: *const FontDecoder, symbolic: ?bool) ![]u16 {
+    const map = try alloc.alloc(u16, 256);
+    errdefer alloc.free(map);
+    for (map, 0..) |*gid, code| {
+        gid.* = (try lookupSimpleTrueTypeGlyph(font, decoder, @intCast(code), symbolic)) orelse missing_simple_truetype_gid;
+    }
+    return map;
+}
+
+fn parseCidToGidMapAlloc(alloc: Allocator, bytes: []const u8) ![]u16 {
+    if (bytes.len % 2 != 0 or bytes.len > max_cid_to_gid_bytes) return error.InvalidCidToGidMap;
+    const map = try alloc.alloc(u16, bytes.len / 2);
+    for (map, 0..) |*gid, i| gid.* = (@as(u16, bytes[i * 2]) << 8) | bytes[i * 2 + 1];
+    return map;
+}
 
 fn simpleTrueTypePdfWidth(pdf_widths: ?[]f64, missing_width: ?f64, code: u8) ?f64 {
     if (pdf_widths) |widths| {
@@ -4086,7 +4150,8 @@ pub const Reader = struct {
         truetype: TrueTypeFont,
         raw: ?[]const u8,
     ) !bool {
-        if (run.text.len == 0) return true;
+        const raw_bytes = raw orelse return false;
+        if (raw_bytes.len == 0) return true;
         const mode = @mod(run.render_mode, 8);
         if (mode == 3 or mode == 7) return true;
 
@@ -4094,14 +4159,10 @@ pub const Reader = struct {
         var cursor_x: f64 = 0;
         var raw_offset: usize = 0;
         var simple_raw_offset: usize = 0;
-        var view = std.unicode.Utf8View.init(run.text) catch return false;
-        var iter = view.iterator();
         while (true) {
-            var cp: u21 = 0xfffd;
             var simple_code: ?u8 = null;
             var cid_code: ?u16 = null;
             const glyph_index = (if (truetype.raw_code_bytes > 0) blk: {
-                const raw_bytes = raw orelse return false;
                 if (raw_offset >= raw_bytes.len) break;
                 const code_len = @min(truetype.raw_code_bytes, raw_bytes.len - raw_offset);
                 const cid = parseRawCode(raw_bytes[raw_offset .. raw_offset + code_len]);
@@ -4115,12 +4176,13 @@ pub const Reader = struct {
                 }
                 break :blk null;
             } else blk: {
-                cp = iter.nextCodepoint() orelse break;
-                if (raw) |raw_bytes| if (simple_raw_offset < raw_bytes.len) {
-                    simple_code = raw_bytes[simple_raw_offset];
-                    simple_raw_offset += 1;
-                };
-                break :blk truetype.font.cmapGlyphIndex(cp) catch return false;
+                if (simple_raw_offset >= raw_bytes.len) break;
+                const code = raw_bytes[simple_raw_offset];
+                simple_raw_offset += 1;
+                simple_code = code;
+                const map = truetype.simple_code_to_gid orelse return false;
+                const gid = map[code];
+                break :blk if (gid == missing_simple_truetype_gid) null else gid;
             }) orelse {
                 const missing_advance = if (cid_code != null and truetype.cid_widths != null)
                     truetype.cid_widths.?.width(cid_code.?) * run.font_size / 1000.0
@@ -4131,7 +4193,7 @@ pub const Reader = struct {
                         run.font_size * 0.6
                 else
                     run.font_size * 0.6;
-                cursor_x += (missing_advance + run.char_spacing + if (cp == ' ') run.word_spacing else 0.0) * run.horizontal_scale;
+                cursor_x += (missing_advance + run.char_spacing + if (simple_code == ' ') run.word_spacing else 0.0) * run.horizontal_scale;
                 return false;
             };
             const advance_width = truetype.font.advanceWidth(glyph_index) catch return false;
@@ -4149,7 +4211,7 @@ pub const Reader = struct {
                     }
                 }
             }
-            const spacing = run.char_spacing + if (cp == ' ') run.word_spacing else 0.0;
+            const spacing = run.char_spacing + if (simple_code == ' ') run.word_spacing else 0.0;
             const glyph_advance = if (cid_code != null and truetype.cid_widths != null)
                 truetype.cid_widths.?.width(cid_code.?) * run.font_size / 1000.0
             else if (simple_code) |code|
@@ -6618,7 +6680,13 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
-        font.truetype = try self.buildTrueTypeFont(font_obj, &font.outline_fallback);
+        font.truetype = self.buildTrueTypeFont(font_obj, &font.decoder, &font.outline_fallback) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => blk: {
+                font.outline_fallback = true;
+                break :blk null;
+            },
+        };
         font.cff_otf = try self.buildCffOpenTypeFont(font_obj, &font.outline_fallback);
         font.cff = self.buildEmbeddedCffFont(font_obj) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -6792,7 +6860,20 @@ pub const Reader = struct {
         return font;
     }
 
-    fn buildTrueTypeFont(self: *const Reader, font_obj: *const syntax.Object, outline_fallback: *bool) !?TrueTypeFont {
+    fn buildTrueTypeFont(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder, outline_fallback: *bool) !?TrueTypeFont {
+        // Keep the embedded SFNT, table directory, decoded CID mapping, and
+        // compact paint maps under one live-allocation ceiling. Returned
+        // allocations remain owned by the Reader's backing allocator.
+        var budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
+        var scoped_reader = self.*;
+        scoped_reader.alloc = budget.allocator();
+        return scoped_reader.buildTrueTypeFontBudgeted(font_obj, decoder, outline_fallback) catch |err| {
+            if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
+            return err;
+        };
+    }
+
+    fn buildTrueTypeFontBudgeted(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder, outline_fallback: *bool) !?TrueTypeFont {
         const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
         errdefer self.alloc.free(bytes);
         var font = font_lib.sfnt.Font.init(self.alloc, bytes) catch |err| switch (err) {
@@ -6819,10 +6900,12 @@ pub const Reader = struct {
 
         var raw_code_bytes: usize = 0;
         var cid_to_gid: ?[]u16 = null;
+        var simple_code_to_gid: ?[]u16 = null;
         var pdf_widths: ?[]f64 = null;
         var pdf_missing_width: ?f64 = null;
         var cid_widths: ?CidWidths = null;
         errdefer if (cid_to_gid) |map| if (map.len > 0) self.alloc.free(map);
+        errdefer if (simple_code_to_gid) |map| self.alloc.free(map);
         errdefer if (pdf_widths) |widths| self.alloc.free(widths);
         errdefer if (cid_widths) |*widths| widths.deinit(self.alloc);
         const composite = if (font_obj.get("Subtype")) |subtype| std.mem.eql(u8, subtype.asName() orelse "", "Type0") else false;
@@ -6879,18 +6962,12 @@ pub const Reader = struct {
                     cid_to_gid = try self.alloc.alloc(u16, 0);
                     raw_code_bytes = 2;
                 } else if (mapping == .stream) {
-                    const mapping_bytes = try self.readDecodedStreamData(&mapping);
+                    const mapping_bytes = try self.readDecodedStreamDataWithLimits(&mapping, .{
+                        .max_decoded_stream_bytes = @min(self.decode_limits.max_decoded_stream_bytes, max_cid_to_gid_bytes),
+                        .max_working_set_bytes = self.decode_limits.max_working_set_bytes,
+                    });
                     defer self.alloc.free(mapping_bytes);
-                    if (mapping_bytes.len % 2 != 0) {
-                        outline_fallback.* = true;
-                        font.deinit(self.alloc);
-                        self.alloc.free(bytes);
-                        return null;
-                    }
-                    const count = mapping_bytes.len / 2;
-                    const map = try self.alloc.alloc(u16, count);
-                    for (map, 0..) |*gid, i| gid.* = (@as(u16, mapping_bytes[i * 2]) << 8) | mapping_bytes[i * 2 + 1];
-                    cid_to_gid = map;
+                    cid_to_gid = try parseCidToGidMapAlloc(self.alloc, mapping_bytes);
                     raw_code_bytes = 2;
                 } else {
                     outline_fallback.* = true;
@@ -6912,6 +6989,7 @@ pub const Reader = struct {
             };
         } else {
             pdf_missing_width = try self.simpleFontMissingWidthAlloc(font_obj);
+            simple_code_to_gid = try buildSimpleTrueTypeGlyphMapAlloc(self.alloc, font, decoder, try self.simpleFontSymbolicAlloc(font_obj));
         }
 
         if (!composite) {
@@ -6942,6 +7020,7 @@ pub const Reader = struct {
             .units_per_em = head.units_per_em,
             .raw_code_bytes = raw_code_bytes,
             .cid_to_gid = cid_to_gid,
+            .simple_code_to_gid = simple_code_to_gid,
             .pdf_widths = pdf_widths,
             .pdf_missing_width = pdf_missing_width,
             .cid_widths = cid_widths,
@@ -7176,6 +7255,20 @@ pub const Reader = struct {
         if (descriptor != .dict) return 0;
         const width_obj = descriptor.get("MissingWidth") orelse return 0;
         return (try self.resolvedNumericObjectValue(width_obj)) orelse 0;
+    }
+
+    fn simpleFontSymbolicAlloc(self: *const Reader, font_obj: *const syntax.Object) !?bool {
+        const descriptor_obj = font_obj.get("FontDescriptor") orelse return null;
+        var descriptor = try self.resolveValue(descriptor_obj);
+        defer descriptor.deinit(self.alloc);
+        if (descriptor != .dict) return null;
+        const flags_obj = descriptor.get("Flags") orelse return null;
+        const flags = (try self.resolvedIntegerObjectValue(flags_obj)) orelse return null;
+        if (flags < 0) return null;
+        const symbolic = (flags & 4) != 0;
+        const nonsymbolic = (flags & 32) != 0;
+        if (symbolic == nonsymbolic) return null;
+        return symbolic;
     }
 
     fn cidDefaultWidthAlloc(self: *const Reader, descendant: *const syntax.Object) !f64 {
@@ -8829,6 +8922,7 @@ fn applyEncodingDifferences(alloc: Allocator, decoder: *FontDecoder, obj: *const
                     }
                     if (decoder.differences[code]) |previous| alloc.free(previous);
                     decoder.differences[code] = null;
+                    decoder.difference_codepoints[code] = text_encoding.glyphNameToRune(name);
                     decoder.difference_defined[code] = true;
                     decoder.differences[code] = try text_encoding.glyphNameToUtf8Alloc(alloc, name);
                     current_code = if (code + 1 < decoder.differences.len) code + 1 else null;
@@ -11734,6 +11828,16 @@ fn measureFontVerticalMetrics(fonts: []const PageFont, font_idx: usize, state: T
     return defaultTextVerticalMetrics(state);
 }
 
+fn measureSimpleTrueTypePdfAdvance(raw: []const u8, pdf_widths: ?[]f64, missing_width: f64, state: TextRunState) f64 {
+    var advance: f64 = 0;
+    for (raw) |code| {
+        const width = simpleTrueTypePdfWidth(pdf_widths, missing_width, code).?;
+        const spacing = state.char_spacing + if (code == ' ') state.word_spacing else 0.0;
+        advance += (width * state.font_size / 1000.0 + spacing) * state.horizontal_scale;
+    }
+    return advance;
+}
+
 fn measureFontAdvanceAlloc(
     alloc: Allocator,
     fonts: []const PageFont,
@@ -11782,20 +11886,7 @@ fn measureFontAdvanceAlloc(
             return advance;
         }
         if (truetype.raw_code_bytes == 0 and truetype.pdf_missing_width != null) {
-            var advance: f64 = 0;
-            var raw_offset: usize = 0;
-            var view = std.unicode.Utf8View.init(decoded) catch return estimateDecodedAdvance(decoded, state);
-            var iter = view.iterator();
-            while (iter.nextCodepoint()) |cp| {
-                const width = if (raw_offset < raw.len)
-                    simpleTrueTypePdfWidth(truetype.pdf_widths, truetype.pdf_missing_width, raw[raw_offset]).?
-                else
-                    truetype.pdf_missing_width.?;
-                raw_offset += 1;
-                const glyph_advance = width * state.font_size / 1000.0;
-                advance += (glyph_advance + state.char_spacing + if (cp == ' ') state.word_spacing else 0.0) * state.horizontal_scale;
-            }
-            return advance;
+            return measureSimpleTrueTypePdfAdvance(raw, truetype.pdf_widths, truetype.pdf_missing_width.?, state);
         }
         return try measureSfntAdvanceAlloc(alloc, decoded, state, truetype.font, truetype.units_per_em);
     }
@@ -15361,11 +15452,56 @@ test "Type1 and Type3 spacing follows horizontal scaling in measurement and geom
 }
 
 test "simple TrueType PDF widths fall back to MissingWidth" {
+    const alloc = std.testing.allocator;
     var widths = [_]f64{-1} ** 256;
     widths['A'] = 600;
     try std.testing.expectEqual(@as(?f64, 600), simpleTrueTypePdfWidth(&widths, 375, 'A'));
     try std.testing.expectEqual(@as(?f64, 375), simpleTrueTypePdfWidth(&widths, 375, 'B'));
     try std.testing.expectEqual(@as(?f64, null), simpleTrueTypePdfWidth(&widths, null, 'B'));
+
+    var extraction_text = [_]u8{ 'f', 'i' };
+    var to_unicode = [_]ToUnicodeEntry{.{ .src = 'A', .src_len = 1, .dst = &extraction_text }};
+    const decoder = FontDecoder{ .base_encoding = .standard, .to_unicode = &to_unicode };
+    const decoded = try decoder.decodeAlloc(alloc, "A");
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("fi", decoded);
+    try std.testing.expectEqual(@as(?u21, 'A'), decoder.paintCodepoint('A'));
+
+    // Minimal SFNT with one Windows Unicode format-4 cmap: A -> GID 1 and
+    // B -> GID 2. The paint map must select GID 1 from the raw A even though
+    // the extraction map above expands A to "fi".
+    const sfnt_bytes = [_]u8{
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        'c',  'm',  'a',  'p',  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1c,
+        0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x0c, 0x00, 0x04, 0x00, 0x20, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x42, 0xff, 0xff, 0x00, 0x00,
+        0x00, 0x41, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    };
+    var sfnt = try font_lib.sfnt.Font.init(alloc, &sfnt_bytes);
+    defer sfnt.deinit(alloc);
+    const paint_map = try buildSimpleTrueTypeGlyphMapAlloc(alloc, sfnt, &decoder, false);
+    defer alloc.free(paint_map);
+    try std.testing.expectEqual(@as(u16, 1), paint_map['A']);
+
+    const state = TextRunState{ .font_size = 10, .horizontal_scale = 0.5, .char_spacing = 2, .word_spacing = 4 };
+    // Extraction expands A to two scalars, but paint measurement remains one
+    // raw code: (600 * 10 / 1000 + 2) * 0.5 = 4.
+    try std.testing.expectApproxEqAbs(@as(f64, 4), measureSimpleTrueTypePdfAdvance("A", &widths, 375, state), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.875), measureSimpleTrueTypePdfAdvance("B", &widths, 375, state), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.875), measureSimpleTrueTypePdfAdvance(" ", &widths, 375, state), 0.001);
+}
+
+test "CIDToGIDMap is limited to the addressable CID domain" {
+    const alloc = std.testing.allocator;
+    const valid = try parseCidToGidMapAlloc(alloc, &.{ 0x00, 0x01, 0xab, 0xcd });
+    defer alloc.free(valid);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 0xabcd }, valid);
+    try std.testing.expectError(error.InvalidCidToGidMap, parseCidToGidMapAlloc(alloc, &.{0}));
+
+    const oversized = try alloc.alloc(u8, max_cid_to_gid_bytes + 2);
+    defer alloc.free(oversized);
+    try std.testing.expectError(error.InvalidCidToGidMap, parseCidToGidMapAlloc(alloc, oversized));
 }
 
 test "reader measures type1 text run advance width" {
@@ -21050,6 +21186,9 @@ test "font Differences own replacements safely and stop at byte 255" {
     const decoded = try decoder.decodeAlloc(alloc, &.{ 65, 66, 255 });
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("Á�ﬁ", decoded);
+    try std.testing.expectEqual(@as(?u21, 0x00c1), decoder.paintCodepoint(65));
+    try std.testing.expectEqual(@as(?u21, null), decoder.paintCodepoint(66));
+    try std.testing.expectEqual(@as(?u21, 0xfb01), decoder.paintCodepoint(255));
 
     const Runner = struct {
         fn run(failing_alloc: Allocator) !void {

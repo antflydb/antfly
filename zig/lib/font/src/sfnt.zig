@@ -284,6 +284,33 @@ pub const Font = struct {
         return null;
     }
 
+    /// Look up a codepoint in one exact cmap platform/encoding pair. PDF
+    /// symbolic TrueType fonts must prefer the Windows symbol cmap (3, 0)
+    /// even when the SFNT also contains a Unicode cmap.
+    pub fn cmapGlyphIndexForPlatform(self: Font, platform: u16, encoding: u16, codepoint: u21) Error!?u16 {
+        const cmap = self.findTable(.{ 'c', 'm', 'a', 'p' }) orelse return error.MissingTable;
+        const data = try self.tableBytes(cmap);
+        if (data.len < 4) return error.TruncatedSfnt;
+        const num_tables = readU16(data, 2);
+        var i: usize = 0;
+        while (i < num_tables) : (i += 1) {
+            const base = 4 + i * 8;
+            if (base + 8 > data.len) return error.TruncatedSfnt;
+            if (readU16(data, base) != platform or readU16(data, base + 2) != encoding) continue;
+            const sub_offset = readU32(data, base + 4);
+            if (sub_offset >= data.len) return error.TruncatedSfnt;
+            const sub = data[sub_offset..];
+            if (sub.len < 2) return error.TruncatedSfnt;
+            return switch (readU16(sub, 0)) {
+                0 => try cmapFormat0Glyph(sub, codepoint),
+                4 => try cmapFormat4Glyph(sub, codepoint),
+                12 => try cmapFormat12Glyph(sub, codepoint),
+                else => null,
+            };
+        }
+        return null;
+    }
+
     pub fn glyphOutlineAlloc(self: Font, alloc: std.mem.Allocator, glyph_index: u16) ParseError!?GlyphOutline {
         return self.glyphOutlineAllocLimited(alloc, glyph_index, .{});
     }
@@ -892,6 +919,8 @@ test "sfnt reader maps cmap and extracts simple glyph outline" {
     defer font.deinit(alloc);
 
     try std.testing.expectEqual(@as(?u16, 1), try font.cmapGlyphIndex('A'));
+    try std.testing.expectEqual(@as(?u16, 1), try font.cmapGlyphIndexForPlatform(3, 1, 'A'));
+    try std.testing.expectEqual(@as(?u16, null), try font.cmapGlyphIndexForPlatform(3, 0, 'A'));
     try std.testing.expectEqual(@as(u16, 1000), try font.advanceWidth(1));
 
     var outline = (try font.glyphOutlineAlloc(alloc, 1)).?;
