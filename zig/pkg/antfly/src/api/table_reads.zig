@@ -309,6 +309,7 @@ pub const ProvisionedTableReadCache = struct {
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
     hit_count: std.atomic.Value(u64) = .init(0),
     miss_count: std.atomic.Value(u64) = .init(0),
     mutex: Io.Mutex = .init,
@@ -431,10 +432,12 @@ pub const ProvisionedTableReadCache = struct {
         return .{
             .alloc = alloc,
             .threaded = threaded_io_limits.initService(alloc),
+            .incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.init(alloc),
         };
     }
 
     pub fn deinit(self: *ProvisionedTableReadCache) void {
+        self.incoming_graph_routes.deinit();
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         for (self.entries.items) |entry| {
@@ -750,6 +753,7 @@ pub const ProvisionedTableReadCache = struct {
     }
 
     pub fn invalidateTable(self: *ProvisionedTableReadCache, table_name: []const u8) void {
+        self.incoming_graph_routes.clear();
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -770,6 +774,7 @@ pub const ProvisionedTableReadCache = struct {
     }
 
     pub fn clear(self: *ProvisionedTableReadCache) void {
+        self.incoming_graph_routes.clear();
         const io = self.threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
@@ -3816,6 +3821,7 @@ pub const HostedProvisionedTableReadSource = struct {
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
+    incoming_graph_routes: ?*distributed_graph.IncomingSourceGroupCache = null,
 
     pub fn init(
         replica_root_dir: []const u8,
@@ -3840,6 +3846,14 @@ pub const HostedProvisionedTableReadSource = struct {
 
     pub fn withBackendRuntime(self: *HostedProvisionedTableReadSource, backend_runtime: *db_mod.background_runtime.BackendRuntime) *HostedProvisionedTableReadSource {
         self.backend_runtime = backend_runtime;
+        return self;
+    }
+
+    pub fn withIncomingGraphRoutes(
+        self: *HostedProvisionedTableReadSource,
+        cache: *distributed_graph.IncomingSourceGroupCache,
+    ) *HostedProvisionedTableReadSource {
+        self.incoming_graph_routes = cache;
         return self;
     }
 
@@ -7772,6 +7786,8 @@ const ProvisionedGraphWorkerContext = struct {
                 .execute_graph_expand = executeProvisionedGraphExpand,
                 .execute_graph_hydrate = executeProvisionedGraphHydrate,
                 .execute_graph_get_edges = executeProvisionedGraphGetEdges,
+                .resolve_incoming_source_groups = resolveProvisionedIncomingSourceGroups,
+                .record_incoming_source_groups = recordProvisionedIncomingSourceGroups,
                 .fanout_io = provisionedGraphFanoutIo,
                 .fanout_width_cap = provisionedGraphFanoutWidthCap,
             },
@@ -7786,10 +7802,67 @@ fn hostedGraphWorker(self: *HostedProvisionedTableReadSource) distributed_graph.
             .execute_graph_expand = executeHostedGraphExpand,
             .execute_graph_hydrate = executeHostedGraphHydrate,
             .execute_graph_get_edges = executeHostedGraphGetEdges,
+            .resolve_incoming_source_groups = resolveHostedIncomingSourceGroups,
+            .record_incoming_source_groups = recordHostedIncomingSourceGroups,
             .fanout_io = hostedGraphFanoutIo,
             .fanout_width_cap = hostedGraphFanoutWidthCap,
         },
     };
+}
+
+fn emptyIncomingSourceGroupsResponseAlloc(
+    alloc: std.mem.Allocator,
+    key_count: usize,
+) !distributed_graph.IncomingSourceGroupsResponse {
+    const entries = try alloc.alloc(distributed_graph.IncomingSourceGroupEntry, key_count);
+    for (entries) |*entry| entry.* = .{};
+    return .{ .entries = entries, .complete = false };
+}
+
+fn resolveProvisionedIncomingSourceGroups(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: distributed_graph.IncomingSourceGroupsRequest,
+    _: raft_mod.ReadConsistency,
+) !distributed_graph.IncomingSourceGroupsResponse {
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    const cache = ctx.source.cache orelse return try emptyIncomingSourceGroupsResponseAlloc(alloc, req.keys.len);
+    return try cache.incoming_graph_routes.resolveAlloc(alloc, table_name, req);
+}
+
+fn recordProvisionedIncomingSourceGroups(
+    ptr: *anyopaque,
+    table_name: []const u8,
+    req: distributed_graph.IncomingSourceGroupsRequest,
+    response: distributed_graph.IncomingSourceGroupsResponse,
+) !void {
+    const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
+    const cache = ctx.source.cache orelse return;
+    try cache.incoming_graph_routes.record(table_name, req, response);
+}
+
+fn resolveHostedIncomingSourceGroups(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: distributed_graph.IncomingSourceGroupsRequest,
+    _: raft_mod.ReadConsistency,
+) !distributed_graph.IncomingSourceGroupsResponse {
+    const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+    const cache = self.incoming_graph_routes orelse return try emptyIncomingSourceGroupsResponseAlloc(alloc, req.keys.len);
+    return try cache.resolveAlloc(alloc, table_name, req);
+}
+
+fn recordHostedIncomingSourceGroups(
+    ptr: *anyopaque,
+    table_name: []const u8,
+    req: distributed_graph.IncomingSourceGroupsRequest,
+    response: distributed_graph.IncomingSourceGroupsResponse,
+) !void {
+    const self: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+    const cache = self.incoming_graph_routes orelse return;
+    try cache.record(table_name, req, response);
 }
 
 fn provisionedGraphFanoutIo(ptr: *anyopaque) ?std.Io {

@@ -1979,6 +1979,7 @@ pub const ApiHttpServer = struct {
     local_resource_manager: resource_manager_mod.ResourceManager,
     shared_resource_manager: ?*resource_manager_mod.ResourceManager,
     query_embedding_cache: query_embedding_cache.QueryEmbeddingCache,
+    incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
 
     pub const RequestStats = struct {
         request_count: u64 = 0,
@@ -2113,6 +2114,7 @@ pub const ApiHttpServer = struct {
             .table_reads = table_read_source,
             .table_writes = table_write_source,
             .foreign_registry = cfg.foreign_registry,
+            .incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.init(owner_alloc),
             .created_at_ns = platform_time.monotonicNs(),
             .txn_sessions = blk: {
                 var registry = transactions_api.SessionRegistry.initWithOptions(
@@ -2551,6 +2553,7 @@ pub const ApiHttpServer = struct {
         }
         self.connections_cache.deinit();
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
+        self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
         self.* = undefined;
     }
@@ -5972,6 +5975,8 @@ pub const ApiHttpServer = struct {
                     .vtable = &.{
                         .execute_graph_expand = executeGraphExpand,
                         .execute_graph_hydrate = executeGraphHydrate,
+                        .resolve_incoming_source_groups = resolveIncomingSourceGroups,
+                        .record_incoming_source_groups = recordIncomingSourceGroups,
                         .fanout_io = fanoutIo,
                     },
                 };
@@ -6004,6 +6009,27 @@ pub const ApiHttpServer = struct {
                     req,
                     consistency,
                 )) orelse error.TableNotFound;
+            }
+
+            fn resolveIncomingSourceGroups(
+                ptr: *anyopaque,
+                inner_alloc: std.mem.Allocator,
+                inner_table_name: []const u8,
+                req: distributed_graph.IncomingSourceGroupsRequest,
+                _: raft_mod.ReadConsistency,
+            ) !distributed_graph.IncomingSourceGroupsResponse {
+                const worker: *@This() = @ptrCast(@alignCast(ptr));
+                return try worker.server.incoming_graph_routes.resolveAlloc(inner_alloc, inner_table_name, req);
+            }
+
+            fn recordIncomingSourceGroups(
+                ptr: *anyopaque,
+                inner_table_name: []const u8,
+                req: distributed_graph.IncomingSourceGroupsRequest,
+                response: distributed_graph.IncomingSourceGroupsResponse,
+            ) !void {
+                const worker: *@This() = @ptrCast(@alignCast(ptr));
+                try worker.server.incoming_graph_routes.record(inner_table_name, req, response);
             }
 
             fn fanoutIo(ptr: *anyopaque) ?std.Io {

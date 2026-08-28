@@ -189,6 +189,7 @@ pub fn encodeSegmentAlloc(alloc: Allocator, generation: u64, writes: anytype) ![
 }
 
 pub fn decodeSegmentKeysAlloc(alloc: Allocator, raw: []const u8, expected_generation: u64) ![][]u8 {
+    if (raw.len > hard_max_manifest_bytes) return error.ResourceLimitExceeded;
     if (raw.len < header_len + @sizeOf(u32) or !std.mem.startsWith(u8, raw, segment_magic)) {
         return error.InvalidGraphAssetState;
     }

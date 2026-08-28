@@ -11958,7 +11958,7 @@ fn appendRuntimeGraphAssetStateSegmentDeletes(
     }
 }
 
-fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]const u8 {
+fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]u8 {
     const alloc = runtime.alloc;
     const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
@@ -11966,11 +11966,13 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
     };
     defer alloc.free(raw);
     if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
-    const decoded_keys = switch (try graph_asset_state.format(raw)) {
+    return switch (try graph_asset_state.format(raw)) {
         .v4 => try graph_asset_state.decodeKeysAlloc(alloc, raw),
         .v5 => blk: {
             const root = try graph_asset_state.segmentedRoot(raw);
+            const root_key_count: usize = root.key_count;
             var all = std.ArrayListUnmanaged([]u8).empty;
+            var encoded_bytes: usize = 0;
             errdefer {
                 for (all.items) |key| alloc.free(key);
                 all.deinit(alloc);
@@ -11980,26 +11982,19 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
                 defer alloc.free(segment_key);
                 const segment_raw = storeGetAlloc(runtime, segment_key) catch return error.InvalidGraphAssetState;
                 defer alloc.free(segment_raw);
+                encoded_bytes = std.math.add(usize, encoded_bytes, segment_raw.len) catch return error.ResourceLimitExceeded;
+                if (encoded_bytes > graph_asset_state.hard_max_manifest_bytes) return error.ResourceLimitExceeded;
                 const segment_keys = try graph_asset_state.decodeSegmentKeysAlloc(alloc, segment_raw, expected_generation);
                 defer if (segment_keys.len > 0) alloc.free(segment_keys);
+                if (all.items.len > root_key_count or segment_keys.len > root_key_count - all.items.len) {
+                    return error.InvalidGraphAssetState;
+                }
                 try all.appendSlice(alloc, segment_keys);
             }
             if (all.items.len != root.key_count) return error.InvalidGraphAssetState;
             break :blk try all.toOwnedSlice(alloc);
         },
     };
-    defer graph_asset_state.freeKeys(alloc, decoded_keys);
-    const keys = if (decoded_keys.len > 0) try alloc.alloc([]const u8, decoded_keys.len) else return &.{};
-    var initialized: usize = 0;
-    errdefer {
-        for (keys[0..initialized]) |key| alloc.free(@constCast(key));
-        alloc.free(keys);
-    }
-    for (keys, decoded_keys) |*key, decoded_key| {
-        key.* = try alloc.dupe(u8, decoded_key);
-        initialized += 1;
-    }
-    return keys;
 }
 
 fn readU32Big(bytes: []const u8, pos: *usize) !u32 {

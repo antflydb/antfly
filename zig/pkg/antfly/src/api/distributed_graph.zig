@@ -40,6 +40,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const platform_time = @import("antfly_platform").time;
+const platform_sync = @import("antfly_platform").sync;
 const indexes_api = @import("indexes.zig");
 const query_contract = @import("query_contract.zig");
 const tables_api = @import("tables.zig");
@@ -82,6 +83,12 @@ pub const Worker = struct {
             req: IncomingSourceGroupsRequest,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!IncomingSourceGroupsResponse = null,
+        record_incoming_source_groups: ?*const fn (
+            ptr: *anyopaque,
+            table_name: []const u8,
+            req: IncomingSourceGroupsRequest,
+            response: IncomingSourceGroupsResponse,
+        ) anyerror!void = null,
         fanout_io: ?*const fn (ptr: *anyopaque) ?std.Io = null,
         fanout_width_cap: ?*const fn (ptr: *anyopaque) usize = null,
     };
@@ -156,6 +163,20 @@ pub const Worker = struct {
         return response;
     }
 
+    pub fn recordIncomingSourceGroups(
+        self: Worker,
+        table_name: []const u8,
+        req: IncomingSourceGroupsRequest,
+        response: IncomingSourceGroupsResponse,
+    ) !void {
+        const func = self.vtable.record_incoming_source_groups orelse return;
+        try func(self.ptr, table_name, req, response);
+    }
+
+    fn recordsIncomingSourceGroups(self: Worker) bool {
+        return self.vtable.record_incoming_source_groups != null;
+    }
+
     pub fn fanoutIo(self: Worker) ?std.Io {
         const func = self.vtable.fanout_io orelse return null;
         return func(self.ptr);
@@ -205,7 +226,7 @@ pub const IncomingSourceGroupEntry = struct {
 pub const IncomingSourceGroupsResponse = struct {
     entries: []IncomingSourceGroupEntry = &.{},
     /// Complete is a correctness assertion, not a cache freshness hint. It may
-    /// be true only when the target-owned projection is fenced through the
+    /// be true only when an exact route projection is fenced through the
     /// requested read and topology generations for every source shard.
     complete: bool = false,
 
@@ -215,6 +236,195 @@ pub const IncomingSourceGroupsResponse = struct {
         self.* = undefined;
     }
 };
+
+/// Exact, generation-fenced coordinator directory for incoming graph routes.
+/// Source-owned reverse adjacency remains authoritative; a miss falls back to
+/// bounded exact probes and records their result. Keys include the complete
+/// topology/read-generation fence, so cached negatives and positives cannot
+/// cross a snapshot boundary. Memory is process-bounded and cache exhaustion
+/// drops old hints without affecting correctness.
+pub const IncomingSourceGroupCache = struct {
+    alloc: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    entries: std.StringHashMapUnmanaged([]u64) = .empty,
+    resident_bytes: usize = 0,
+
+    const max_resident_bytes: usize = 16 * 1024 * 1024;
+    const max_entries: usize = 65_536;
+
+    pub fn init(alloc: std.mem.Allocator) @This() {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *@This()) void {
+        platform_sync.lockYielding(&self.mutex);
+        self.clearLocked();
+        self.entries.deinit(self.alloc);
+        self.mutex.unlock();
+        self.* = undefined;
+    }
+
+    pub fn clear(self: *@This()) void {
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        self.clearLocked();
+    }
+
+    pub fn resolveAlloc(
+        self: *@This(),
+        out_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: IncomingSourceGroupsRequest,
+    ) !IncomingSourceGroupsResponse {
+        const entries = try out_alloc.alloc(IncomingSourceGroupEntry, req.keys.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (entries[0..initialized]) |*entry| entry.deinit(out_alloc);
+            if (entries.len > 0) out_alloc.free(entries);
+        }
+        const has_read_fence = incomingRouteRequestHasReadFence(req);
+        const fence = incomingRouteFence(table_name, req);
+        var complete = has_read_fence;
+        for (req.keys, 0..) |key, i| {
+            const cache_key = try incomingRouteCacheKeyAlloc(out_alloc, fence, key);
+            defer out_alloc.free(cache_key);
+            var cached: ?[]u64 = null;
+            if (has_read_fence) {
+                platform_sync.lockYielding(&self.mutex);
+                if (self.entries.get(cache_key)) |groups| {
+                    cached = out_alloc.dupe(u64, groups) catch |err| {
+                        self.mutex.unlock();
+                        return err;
+                    };
+                }
+                self.mutex.unlock();
+            }
+            if (cached) |groups| {
+                entries[i] = .{ .source_group_ids = groups };
+            } else {
+                entries[i] = .{};
+                complete = false;
+            }
+            initialized += 1;
+        }
+        return .{ .entries = entries, .complete = complete };
+    }
+
+    pub fn record(
+        self: *@This(),
+        table_name: []const u8,
+        req: IncomingSourceGroupsRequest,
+        response: IncomingSourceGroupsResponse,
+    ) !void {
+        if (!response.complete or response.entries.len != req.keys.len) return error.InvalidGraphIncomingRouteResult;
+        // A topology epoch alone cannot fence graph mutations. Requests that
+        // lack either a scalar single-shard generation or a distributed
+        // generation vector remain exact-probe-only.
+        if (!incomingRouteRequestHasReadFence(req)) return;
+        const fence = incomingRouteFence(table_name, req);
+        for (req.keys, response.entries) |key, entry| {
+            const cache_key = try incomingRouteCacheKeyAlloc(self.alloc, fence, key);
+            var cache_key_owned = true;
+            errdefer if (cache_key_owned) self.alloc.free(cache_key);
+            const groups = try self.alloc.dupe(u64, entry.source_group_ids);
+            var groups_owned = true;
+            errdefer if (groups_owned and groups.len > 0) self.alloc.free(groups);
+
+            platform_sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            const new_bytes = cache_key.len + groups.len * @sizeOf(u64);
+            if (new_bytes > max_resident_bytes) return error.ResourceLimitExceeded;
+            while (self.entries.count() >= max_entries or self.resident_bytes +| new_bytes > max_resident_bytes) {
+                if (!self.evictOneLocked()) break;
+            }
+            const gop = try self.entries.getOrPut(self.alloc, cache_key);
+            if (gop.found_existing) {
+                self.resident_bytes -= gop.key_ptr.*.len + gop.value_ptr.*.len * @sizeOf(u64);
+                self.alloc.free(gop.value_ptr.*);
+                self.alloc.free(cache_key);
+                cache_key_owned = false;
+            } else {
+                gop.key_ptr.* = cache_key;
+                cache_key_owned = false;
+            }
+            gop.value_ptr.* = groups;
+            groups_owned = false;
+            self.resident_bytes += gop.key_ptr.*.len + groups.len * @sizeOf(u64);
+        }
+    }
+
+    fn clearLocked(self: *@This()) void {
+        var it = self.entries.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            if (entry.value_ptr.*.len > 0) self.alloc.free(entry.value_ptr.*);
+        }
+        self.entries.clearRetainingCapacity();
+        self.resident_bytes = 0;
+    }
+
+    /// Hash-map order gives a cheap bounded victim without maintaining a
+    /// second per-hit allocation structure. Evict only as much as the next
+    /// insertion needs, avoiding the latency cliff and cold-cache stampede of
+    /// clearing the whole directory at its byte boundary.
+    fn evictOneLocked(self: *@This()) bool {
+        var it = self.entries.iterator();
+        const entry = it.next() orelse return false;
+        const key = entry.key_ptr.*;
+        const groups = entry.value_ptr.*;
+        self.resident_bytes -= key.len + groups.len * @sizeOf(u64);
+        _ = self.entries.remove(key);
+        self.alloc.free(key);
+        if (groups.len > 0) self.alloc.free(groups);
+        return true;
+    }
+};
+
+fn incomingRouteRequestHasReadFence(req: IncomingSourceGroupsRequest) bool {
+    return req.identity_read_generation != null or req.identity_read_generations.len > 0;
+}
+
+fn incomingRouteCacheKeyAlloc(
+    alloc: std.mem.Allocator,
+    fence: [std.crypto.hash.sha2.Sha256.digest_length]u8,
+    key: []const u8,
+) ![]u8 {
+    const out = try alloc.alloc(u8, fence.len + key.len);
+    @memcpy(out[0..fence.len], &fence);
+    @memcpy(out[fence.len..], key);
+    return out;
+}
+
+fn incomingRouteFence(
+    table_name: []const u8,
+    req: IncomingSourceGroupsRequest,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashIncomingRouteComponent(&hasher, table_name);
+    hashIncomingRouteComponent(&hasher, req.index_name);
+    hashIncomingRouteU64(&hasher, req.topology_epoch);
+    hasher.update(&.{@intFromBool(req.identity_read_generation != null)});
+    if (req.identity_read_generation) |generation| hashIncomingRouteU64(&hasher, generation);
+    hashIncomingRouteU64(&hasher, @intCast(req.identity_read_generations.len));
+    for (req.identity_read_generations) |generation| {
+        hashIncomingRouteU64(&hasher, generation.group_id);
+        hashIncomingRouteU64(&hasher, generation.generation);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn hashIncomingRouteComponent(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+    hashIncomingRouteU64(hasher, @intCast(value.len));
+    hasher.update(value);
+}
+
+fn hashIncomingRouteU64(hasher: *std.crypto.hash.sha2.Sha256, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .big);
+    hasher.update(&bytes);
+}
 
 /// Reconstitutes a node-local absolute deadline from the coordinator's
 /// remaining transport budget. Saturating addition keeps maliciously large
@@ -2767,6 +2977,15 @@ fn appendIncomingProbeBatchWindow(
         };
     }
 
+    const observed = if (worker.recordsIncomingSourceGroups()) try alloc.alloc(std.ArrayListUnmanaged(u64), keys.len) else null;
+    defer if (observed) |routes| {
+        for (routes) |*route| route.deinit(alloc);
+        alloc.free(routes);
+    };
+    if (observed) |routes| {
+        for (routes) |*route| route.* = .empty;
+    }
+
     const Probe = struct {
         fn run(
             a: std.mem.Allocator,
@@ -2868,9 +3087,11 @@ fn appendIncomingProbeBatchWindow(
                 for (slots) |slot| if (slot.err) |err| return err;
                 for (slots, entries[start..end]) |slot, entry| {
                     try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, slot.result.?.has_incoming);
+                    if (observed) |routes| try appendObservedIncomingGroups(alloc, routes, entry.group_id, slot.result.?.has_incoming);
                 }
             }
             recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - start_ns));
+            if (observed) |routes| recordObservedIncomingGroups(alloc, worker, table_state, index_name, keys, routes);
             return;
         }
     }
@@ -2888,7 +3109,47 @@ fn appendIncomingProbeBatchWindow(
         );
         defer response.deinit(alloc);
         try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, response.has_incoming);
+        if (observed) |routes| try appendObservedIncomingGroups(alloc, routes, entry.group_id, response.has_incoming);
     }
+    if (observed) |routes| recordObservedIncomingGroups(alloc, worker, table_state, index_name, keys, routes);
+}
+
+fn appendObservedIncomingGroups(
+    alloc: std.mem.Allocator,
+    routes: []std.ArrayListUnmanaged(u64),
+    group_id: u64,
+    mask: []const bool,
+) !void {
+    if (routes.len != mask.len) return error.InvalidGraphNodeAdmissionResult;
+    for (routes, mask) |*route, has_incoming| {
+        if (has_incoming) try route.append(alloc, group_id);
+    }
+}
+
+fn recordObservedIncomingGroups(
+    alloc: std.mem.Allocator,
+    worker: Worker,
+    table_state: *const GraphAdmissionTableState,
+    index_name: []const u8,
+    keys: []const []const u8,
+    routes: []const std.ArrayListUnmanaged(u64),
+) void {
+    const entries = alloc.alloc(IncomingSourceGroupEntry, routes.len) catch return;
+    defer alloc.free(entries);
+    for (routes, entries) |route, *entry| entry.* = .{ .source_group_ids = route.items };
+    worker.recordIncomingSourceGroups(
+        table_state.table_name,
+        .{
+            .index_name = index_name,
+            .keys = keys,
+            .topology_epoch = table_state.topology_epoch,
+            .identity_read_generation = table_state.identity_read_generation,
+            .identity_read_generations = table_state.identity_read_generations,
+        },
+        .{ .entries = entries, .complete = true },
+    ) catch |err| {
+        std.log.warn("could not record generation-fenced incoming graph routes: {}", .{err});
+    };
 }
 
 test "distributed graph incoming probe expands only positive source shards" {
@@ -2991,6 +3252,49 @@ test "distributed graph incoming probe expands only positive source shards" {
     try std.testing.expectEqual(@as(usize, 9), state.calls);
     try std.testing.expectEqual(@as(usize, 256), state.max_keys_per_call);
     try std.testing.expectEqual(@as(usize, 0), bounded_batches.count());
+}
+
+test "incoming graph route cache is exact and generation fenced" {
+    const alloc = std.testing.allocator;
+    var cache = IncomingSourceGroupCache.init(alloc);
+    defer cache.deinit();
+
+    const generations = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 101 },
+        .{ .group_id = 22, .generation = 202 },
+    };
+    const req = IncomingSourceGroupsRequest{
+        .index_name = "relations",
+        .keys = &.{ "doc:a", "doc:b" },
+        .topology_epoch = 9,
+        .identity_read_generations = &generations,
+    };
+    try cache.record("docs", req, .{
+        .entries = @constCast(&[_]IncomingSourceGroupEntry{
+            .{ .source_group_ids = @constCast(&[_]u64{22}) },
+            .{},
+        }),
+        .complete = true,
+    });
+
+    var hit = try cache.resolveAlloc(alloc, "docs", req);
+    defer hit.deinit(alloc);
+    try std.testing.expect(hit.complete);
+    try std.testing.expectEqualSlices(u64, &.{22}, hit.entries[0].source_group_ids);
+    try std.testing.expectEqual(@as(usize, 0), hit.entries[1].source_group_ids.len);
+
+    const newer_generations = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 101 },
+        .{ .group_id = 22, .generation = 203 },
+    };
+    var miss = try cache.resolveAlloc(alloc, "docs", .{
+        .index_name = req.index_name,
+        .keys = req.keys,
+        .topology_epoch = req.topology_epoch,
+        .identity_read_generations = &newer_generations,
+    });
+    defer miss.deinit(alloc);
+    try std.testing.expect(!miss.complete);
 }
 
 test "distributed graph authoritative incoming routes avoid shard probes" {
