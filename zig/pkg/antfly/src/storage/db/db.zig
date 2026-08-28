@@ -749,6 +749,7 @@ const AsyncContext = struct {
     index_repair_checkpoint: ?index_repair_state.Location = null,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
     repair_replay_mutex: ?*std.atomic.Mutex = null,
     repair_sequence: u64 = 0,
     repair_issue_counter: ?*AtomicU64 = null,
@@ -3285,6 +3286,16 @@ pub const DB = struct {
         return barrier.acquireShared();
     }
 
+    fn acquireSnapshotReplayMutation(self: *DB) !snapshot_admission_mod.SnapshotAdmission.MutationLease {
+        if (self.backend_runtime.io()) |io| {
+            return try self.core.snapshot_replay_admission.acquireMutationIo(
+                io,
+                @as(?types.CancellationToken, null),
+            );
+        }
+        return self.core.snapshot_replay_admission.acquireMutation();
+    }
+
     fn mirrorHAReplayPayloadBestEffort(self: *DB, payload: []const u8) void {
         var ctx = self.batchContext();
         mirrorHAReplayPayloadBestEffortContext(&ctx, payload);
@@ -3827,6 +3838,7 @@ pub const DB = struct {
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
+            .snapshot_replay_admission = async_resources.snapshot_replay_admission,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
             .io = self.backend_runtime.io(),
             .require_graph_resolution_contract = true,
@@ -5141,6 +5153,8 @@ pub const DB = struct {
     }
 
     fn runLsmMaintenanceStepWithHAMutationHeld(self: *DB) !bool {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -5163,6 +5177,8 @@ pub const DB = struct {
     pub fn runLsmMaintenanceStepBestEffort(self: *DB) !bool {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -5183,6 +5199,8 @@ pub const DB = struct {
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceScore();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -5195,6 +5213,8 @@ pub const DB = struct {
     pub fn runPrimaryLsmMaintenanceStepBestEffort(self: *DB) !bool {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         if (try self.core.primary_store_owner.runDueLsmObsoleteReclaim()) return true;
         const primary_score = self.core.primary_store_owner.lsmMaintenanceDebtHint();
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
@@ -5219,6 +5239,8 @@ pub const DB = struct {
     pub fn runDueLsmObsoleteReclaimUntilIdle(self: *DB, max_steps: usize) !usize {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var steps: usize = 0;
         while (steps < max_steps) : (steps += 1) {
             var progressed = false;
@@ -15533,10 +15555,15 @@ pub const DB = struct {
         defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
 
         if (!include_generated) {
+            // Portable snapshots omit generated files, but their replay log and
+            // durable watermarks must still describe a converged generation so
+            // restore can deterministically rebuild every managed projection.
+            try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
             lockApply(self);
             var apply_held = true;
             defer if (apply_held) self.core.unlockApply();
             try self.core.syncStore(true);
+            try self.core.index_manager.syncAll(true);
             const total = try self.core.writeSnapshot(staging_root);
             self.core.unlockApply();
             apply_held = false;
@@ -15919,8 +15946,8 @@ pub const DB = struct {
             if (!std.mem.eql(u8, projection.kind, @tagName(cfg.kind)) or
                 projection.config_hash != types.indexConfigHash(cfg.*) or
                 projection.coverage_generation != cfg.coverage_generation or
-                projection.target_sequence > manifest.capture_target_sequence or
-                projection.applied_sequence > projection.target_sequence)
+                projection.target_sequence != manifest.capture_target_sequence or
+                projection.applied_sequence != projection.target_sequence)
             {
                 return error.NativeBackupProjectionMismatch;
             }
@@ -18117,6 +18144,8 @@ pub const DB = struct {
     }
 
     pub fn evaluateAlgebraicAdaptiveCandidates(self: *DB) !u64 {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.evaluateAlgebraicAdaptiveCandidatesLocked();
@@ -18133,6 +18162,8 @@ pub const DB = struct {
     }
 
     pub fn runAlgebraicAdaptiveWork(self: *DB) !u64 {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         const target_sequence = self.core.nextDerivedSequence();
@@ -18300,6 +18331,8 @@ pub const DB = struct {
 
     pub fn compactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.compactTextIndexes();
@@ -18307,6 +18340,8 @@ pub const DB = struct {
 
     pub fn drainScheduledTextMerges(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.drainScheduledTextMerges();
@@ -18333,6 +18368,8 @@ pub const DB = struct {
                     merge_permit = try runtime.acquireProducerPermit(index_name, planned.estimate.segment_count, planned.estimate.byte_count);
                 }
                 defer if (merge_permit) |*permit| permit.release();
+                var snapshot_replay = try self.acquireSnapshotReplayMutation();
+                defer snapshot_replay.release();
                 lockApply(self);
                 const published = self.core.index_manager.indexTextKernelDocuments(index_name, chunk) catch |err| {
                     self.core.unlockApply();
@@ -18350,6 +18387,8 @@ pub const DB = struct {
 
     pub fn forceCompactTextIndexes(self: *DB) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         try self.core.forceCompactTextIndexes();
@@ -19612,6 +19651,8 @@ pub const DB = struct {
     }
 
     pub fn rebuildDenseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var names = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (names.items) |name| alloc.free(name);
@@ -19630,6 +19671,8 @@ pub const DB = struct {
     }
 
     pub fn rebuildSparseIndexesForTargetCoverage(self: *DB, alloc: Allocator) !usize {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var names = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (names.items) |name| alloc.free(name);
@@ -19648,6 +19691,8 @@ pub const DB = struct {
     }
 
     pub fn rebuildGraphIndexesForTargetCoverage(self: *DB, alloc: Allocator) !void {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         try applySplitGraphArtifactsInRange(
             alloc,
             "",
@@ -19658,6 +19703,8 @@ pub const DB = struct {
     }
 
     pub fn runDensePostingMaintenanceForIdle(self: *DB) !usize {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.index_manager.runDensePostingMaintenance(.{
@@ -21285,6 +21332,8 @@ pub const DB = struct {
         progress_ctx: ?*anyopaque,
         progress_hook: ?ReplayProgressHook,
     ) !DenseArtifactRebuildOutcome {
+        var snapshot_replay = try self.acquireSnapshotReplayMutation();
+        defer snapshot_replay.release();
         var dense_visibility_attempted = false;
         errdefer if (dense_visibility_attempted) self.clearDenseHbcCaches();
         var plan = try self.collectDenseArtifactRebuildPlan(alloc);
@@ -35521,7 +35570,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     var ha_mutation = acquireHAMutationSharedContext(ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(ctx.ha_write_gate);
-    var snapshot_replay = acquireSnapshotReplayContext(ctx);
+    var snapshot_replay = try acquireSnapshotReplayContext(ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     ctx.apply_mutex.lockExclusive();
     defer ctx.apply_mutex.unlockExclusive();
@@ -35537,7 +35586,7 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
 fn appendReplicatedHADerivedEffectContext(ctx: *const BatchExecutionContext, record: ha_replication_record_mod.RecordView) !u64 {
     var snapshot_mutation = acquireSnapshotMutationContext(ctx);
     defer if (snapshot_mutation) |*lease| lease.release();
-    var snapshot_replay = acquireSnapshotReplayContext(ctx);
+    var snapshot_replay = try acquireSnapshotReplayContext(ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     var decoded = try ha_effects_mod.decodeDerivedChangeRecord(ctx.alloc, record);
     defer decoded.deinit();
@@ -35606,8 +35655,19 @@ fn acquireSnapshotMutationContext(ctx: *const BatchExecutionContext) ?snapshot_a
     return admission.acquireMutation();
 }
 
-fn acquireSnapshotReplayContext(ctx: *const BatchExecutionContext) ?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+fn acquireSnapshotReplayContext(ctx: *const BatchExecutionContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
     const admission = ctx.snapshot_replay_admission orelse return null;
+    if (ctx.io) |io| {
+        return try admission.acquireMutationIo(io, @as(?types.CancellationToken, null));
+    }
+    return admission.acquireMutation();
+}
+
+fn acquireSnapshotReplayAsyncContext(ctx: *const AsyncContext) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    const admission = ctx.snapshot_replay_admission orelse return null;
+    if (ctx.io) |io| {
+        return try admission.acquireMutationIo(io, @as(?types.CancellationToken, null));
+    }
     return admission.acquireMutation();
 }
 
@@ -37096,7 +37156,7 @@ fn appendResolutionRecordWithHook(
     var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
-    var snapshot_replay = acquireSnapshotReplayContext(&batch_ctx);
+    var snapshot_replay = try acquireSnapshotReplayContext(&batch_ctx);
     defer if (snapshot_replay) |*lease| lease.release();
 
     const store_writes = try batch_ctx.alloc.alloc(docstore_mod.KVPair, write.artifact_writes.len);
@@ -37804,7 +37864,7 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     var ha_mutation = acquireHAMutationSharedContext(&batch_ctx);
     defer if (ha_mutation) |*lease| lease.release();
     try enforceHAWriteGateOptional(batch_ctx.ha_write_gate);
-    var snapshot_replay = acquireSnapshotReplayContext(&batch_ctx);
+    var snapshot_replay = try acquireSnapshotReplayContext(&batch_ctx);
     defer if (snapshot_replay) |*lease| lease.release();
     const replay_deleted_keys = try concatKeyViews(batch_ctx.alloc, batch.deleted_keys, artifact_delete_keys);
     defer batch_ctx.alloc.free(replay_deleted_keys);
@@ -37951,6 +38011,7 @@ fn canAdvanceDerivedReplayTargetContext(
         .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
+        .snapshot_replay_admission = ctx.snapshot_replay_admission,
         .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
         .resolution_runtime = ctx.resolution_runtime,
         .promotion_runtime = ctx.promotion_runtime,
@@ -37970,10 +38031,12 @@ fn applyDerivedBatchToIndexReplayContext(
 
     const async_ctx = AsyncContext{
         .alloc = ctx.alloc,
+        .io = ctx.io,
         .store = ctx.store,
         .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
+        .snapshot_replay_admission = ctx.snapshot_replay_admission,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
@@ -38046,10 +38109,12 @@ fn applyDerivedBatchTargetsContextProfiled(ctx: *const BatchExecutionContext, ba
         if (try batchAdvancesManagedIndexApplyState(ctx.index_manager, batch, index_ref)) {
             const async_ctx = AsyncContext{
                 .alloc = ctx.alloc,
+                .io = ctx.io,
                 .store = ctx.store,
                 .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
                 .index_manager = ctx.index_manager,
                 .apply_mutex = ctx.apply_mutex,
+                .snapshot_replay_admission = ctx.snapshot_replay_admission,
                 .dense_bulk_session_scope = ctx.dense_bulk_session_scope,
                 .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
             };
@@ -38419,10 +38484,12 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
     const resources = self.core.asyncResources();
     const ctx = AsyncContext{
         .alloc = self.alloc,
+        .io = self.backend_runtime.io(),
         .store = resources.store,
         .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
+        .snapshot_replay_admission = resources.snapshot_replay_admission,
         .text_merge_runtime = self.text_merge_runtime,
     };
     try applyDerivedBatchToIndexContext(&ctx, batch, index_ref);
@@ -39742,6 +39809,11 @@ fn filterAndRecordSparseEmbeddingArtifactRepairIssuesForReplay(
 }
 
 fn applyDerivedBatchToIndexContextProfiled(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, profile: ?*BatchProfile) !void {
+    // Generated files and their publication metadata are one physical
+    // generation. Native capture takes the exclusive side of this admission
+    // while copying, so no async worker may rewrite an artifact mid-copy.
+    var snapshot_replay = try acquireSnapshotReplayAsyncContext(ctx);
+    defer if (snapshot_replay) |*lease| lease.release();
     if (index_ref.kind == .full_text) {
         const apply_start_ns = monotonicTimeNs();
         const text_replay_options: index_manager_mod.IndexBatchOptions = .{
@@ -42543,10 +42615,12 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
     if (!try batchAdvancesManagedIndexApplyStateForReplay(resources.index_manager, batch, index_ref)) return false;
     const ctx = AsyncContext{
         .alloc = self.alloc,
+        .io = self.backend_runtime.io(),
         .store = resources.store,
         .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
+        .snapshot_replay_admission = resources.snapshot_replay_admission,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
     };
@@ -42751,10 +42825,12 @@ fn applyDerivedBatchToShadowIfNeeded(self: *DB, batch: derived_types.DerivedBatc
     const async_resources = self.core.asyncResources();
     const ctx = AsyncContext{
         .alloc = self.alloc,
+        .io = self.backend_runtime.io(),
         .store = async_resources.store,
         .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
         .index_manager = shadow.manager,
         .apply_mutex = async_resources.apply_mutex,
+        .snapshot_replay_admission = async_resources.snapshot_replay_admission,
         .allow_graph_materialization = false,
     };
 
@@ -92189,6 +92265,8 @@ test "db native snapshot admission bounds capture under concurrent writes" {
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
         apply_released: std.atomic.Value(bool) = .init(false),
+        copy_entered: std.atomic.Value(bool) = .init(false),
+        release_copy: std.atomic.Value(bool) = .init(false),
 
         fn afterCaptureAdmission(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -92198,9 +92276,12 @@ test "db native snapshot admission bounds capture under concurrent writes" {
 
         fn afterApplyRelease(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (!self.db.core.apply_mutex.tryLockExclusive()) return;
-            self.db.core.apply_mutex.unlockExclusive();
-            self.apply_released.store(true, .release);
+            if (self.db.core.apply_mutex.tryLockExclusive()) {
+                self.db.core.apply_mutex.unlockExclusive();
+                self.apply_released.store(true, .release);
+            }
+            self.copy_entered.store(true, .release);
+            while (!self.release_copy.load(.acquire)) std.atomic.spinLoopHint();
         }
     };
     const SnapshotWorker = struct {
@@ -92227,6 +92308,22 @@ test "db native snapshot admission bounds capture under concurrent writes" {
                 .sync_level = .write,
             }) catch |err| {
                 self.err = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    const Maintenance = struct {
+        db: *DB,
+        started: std.atomic.Value(bool) = .init(false),
+        done: std.atomic.Value(bool) = .init(false),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            _ = self.db.runLsmMaintenanceStepBestEffort() catch |err| {
+                self.err = err;
+                self.done.store(true, .release);
+                return;
             };
             self.done.store(true, .release);
         }
@@ -92258,9 +92355,21 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     for (0..1024) |_| std.Thread.yield() catch {};
     try std.testing.expect(!writer.done.load(.acquire));
     fence.release.store(true, .release);
+    while (!fence.copy_entered.load(.acquire)) std.atomic.spinLoopHint();
+
+    // Releasing apply keeps foreground latency bounded, but physical index
+    // maintenance remains excluded until every generated artifact is staged.
+    var maintenance = Maintenance{ .db = &db };
+    const maintenance_thread = try std.Thread.spawn(.{}, Maintenance.run, .{&maintenance});
+    while (!maintenance.started.load(.acquire)) std.atomic.spinLoopHint();
+    for (0..1024) |_| std.Thread.yield() catch {};
+    try std.testing.expect(!maintenance.done.load(.acquire));
+    fence.release_copy.store(true, .release);
     snapshot_thread.join();
+    maintenance_thread.join();
     writer_thread.join();
     if (worker.err) |err| return err;
+    if (maintenance.err) |err| return err;
     if (writer.err) |err| return err;
     try std.testing.expect(writer.done.load(.acquire));
     try std.testing.expect(fence.apply_released.load(.acquire));

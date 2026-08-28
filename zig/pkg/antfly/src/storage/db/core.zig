@@ -313,6 +313,7 @@ pub const AsyncResources = struct {
     index_repair_checkpoint: ?index_repair_state.Location,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
 };
 
@@ -434,6 +435,7 @@ pub const DBCore = struct {
             .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .snapshot_replay_admission = self.snapshot_replay_admission,
             .repair_replay_mutex = self.repair_replay_mutex,
         };
     }

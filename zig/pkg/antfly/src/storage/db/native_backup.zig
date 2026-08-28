@@ -173,6 +173,7 @@ pub fn finalizeCaptureWithCancellation(
     cancellation: CancellationToken,
 ) !u64 {
     try ensureActive(cancellation);
+    try validateProjectionInventory(capture_target_sequence, projections);
     var artifacts = try collectArtifacts(alloc, io, snapshot_root, cancellation);
     defer {
         for (artifacts.items) |*artifact| artifact.deinit(alloc);
@@ -232,6 +233,7 @@ pub fn validateAndMaterialize(
     {
         return error.InvalidNativeBackupManifest;
     }
+    try validateProjectionInventory(manifest.capture_target_sequence, manifest.projections);
 
     var previous_path: ?[]const u8 = null;
     for (manifest.artifacts) |artifact| {
@@ -271,6 +273,28 @@ pub fn validateAndMaterialize(
         _ = try fs_paths.copyFileDurablePortable(io, source, destination);
     }
     return .{ .parsed = parsed };
+}
+
+fn validateProjectionInventory(capture_target_sequence: u64, projections: []const Projection) !void {
+    if (projections.len > max_artifacts) return error.InvalidNativeBackupManifest;
+    var previous_name: ?[]const u8 = null;
+    for (projections) |projection| {
+        if (projection.name.len == 0 or
+            projection.kind.len == 0 or
+            projection.target_sequence != capture_target_sequence or
+            projection.applied_sequence != projection.target_sequence)
+        {
+            return error.InvalidNativeBackupManifest;
+        }
+        if (previous_name) |previous| {
+            // Capture emits canonical order. Strict ordering simultaneously
+            // rejects duplicate identities and makes a same-length inventory
+            // a one-to-one mapping during DB-level config validation.
+            if (std.mem.order(u8, previous, projection.name) != .lt)
+                return error.InvalidNativeBackupManifest;
+        }
+        previous_name = projection.name;
+    }
 }
 
 fn isGeneratedArtifact(path: []const u8) bool {
@@ -585,6 +609,40 @@ test "native generation manifest captures validates and materializes generated a
     try std.testing.expectError(
         error.NativeBackupArtifactIntegrityMismatch,
         validateAndMaterialize(alloc, std.testing.io, snapshot, destination),
+    );
+}
+
+test "native generation projection inventory is complete and revision exact" {
+    const first = Projection{
+        .name = "dense_a",
+        .kind = "dense_vector",
+        .config_hash = 7,
+        .coverage_generation = 3,
+        .checkpoint_generation = 3,
+        .applied_sequence = 12,
+        .target_sequence = 12,
+    };
+    const second = Projection{
+        .name = "dense_b",
+        .kind = "dense_vector",
+        .config_hash = 9,
+        .coverage_generation = 4,
+        .checkpoint_generation = 4,
+        .applied_sequence = 12,
+        .target_sequence = 12,
+    };
+    try validateProjectionInventory(12, &.{ first, second });
+    try std.testing.expectError(
+        error.InvalidNativeBackupManifest,
+        validateProjectionInventory(12, &.{ first, first }),
+    );
+
+    var stale = second;
+    stale.applied_sequence = 11;
+    stale.target_sequence = 11;
+    try std.testing.expectError(
+        error.InvalidNativeBackupManifest,
+        validateProjectionInventory(12, &.{ first, stale }),
     );
 }
 

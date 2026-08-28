@@ -105,6 +105,26 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 
+    /// Cooperatively acquire mutation admission from a backend-runtime task.
+    /// Nested and capture-owned calls preserve the synchronous fast path; only
+    /// actual contention yields through std.Io.
+    pub fn acquireMutationIo(self: *@This(), io: std.Io, cancellation: anytype) !MutationLease {
+        if (ownsExclusive(self)) {
+            return .{ .admission = self, .bypassed = true };
+        }
+        for (shared_entries[0..shared_entry_count]) |*entry| {
+            if (entry.admission == self) {
+                entry.depth += 1;
+                return .{ .admission = self };
+            }
+        }
+        std.debug.assert(shared_entry_count < shared_entries.len);
+        try self.lock.lockSharedIo(io, cancellation);
+        shared_entries[shared_entry_count] = .{ .admission = self, .depth = 1 };
+        shared_entry_count += 1;
+        return .{ .admission = self };
+    }
+
     pub fn acquireCapture(self: *@This()) CaptureLease {
         std.debug.assert(!ownsExclusive(self));
         for (shared_entries[0..shared_entry_count]) |entry| {
@@ -147,6 +167,28 @@ test "storage.db snapshot admission permits nested mutation leases" {
     try std.testing.expect(!admission.lock.tryLockExclusive());
     inner.release();
     try std.testing.expect(!admission.lock.tryLockExclusive());
+    outer.release();
+    try std.testing.expect(admission.lock.tryLockExclusive());
+    admission.lock.unlockExclusive();
+}
+
+test "storage.db snapshot admission cooperatively acquires nested mutation leases" {
+    const NeverCancelled = struct {
+        pub fn isCancelled(_: @This()) bool {
+            return false;
+        }
+    };
+    var admission: SnapshotAdmission = .{};
+    var outer = try admission.acquireMutationIo(
+        std.testing.io,
+        @as(?NeverCancelled, null),
+    );
+    var inner = try admission.acquireMutationIo(
+        std.testing.io,
+        @as(?NeverCancelled, null),
+    );
+    try std.testing.expect(!admission.lock.tryLockExclusive());
+    inner.release();
     outer.release();
     try std.testing.expect(admission.lock.tryLockExclusive());
     admission.lock.unlockExclusive();
