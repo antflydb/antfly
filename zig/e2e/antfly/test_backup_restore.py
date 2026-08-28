@@ -187,6 +187,31 @@ def _semantic_top_hit(
     return None
 
 
+def _dense_top_hit(
+    stateful_api,
+    table_name: str,
+    vector: list[float],
+    index_name: str,
+    expected_id: str,
+) -> dict | None:
+    try:
+        result = stateful_api.query_table(
+            table_name,
+            {
+                "embeddings": {index_name: vector},
+                "indexes": [index_name],
+                "limit": 5,
+            },
+        )
+    except requests.HTTPError:
+        return None
+    responses = result.get("responses", [])
+    if not responses:
+        return None
+    hits = responses[0].get("hits", {}).get("hits", [])
+    return result if any(hit.get("_id") == expected_id for hit in hits) else None
+
+
 def _chunked_doc(
     stateful_api, table_name: str, key: str, chunk_field: str
 ) -> list[dict] | None:
@@ -661,7 +686,7 @@ def test_table_backup_restore_round_trip(backup_api):
 
 
 def test_table_backup_restore_round_trip_managed_chunked_semantic(
-    backup_api, slow_openai_embedder
+    backup_api, rate_limited_openai_embedder
 ):
     table_name = f"backup_chunked_semantic_{time.time_ns()}"
     backup_id = f"backup-chunked-semantic-{time.time_ns()}"
@@ -670,6 +695,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
         table_name, num_shards=1, description="chunked semantic backup docs"
     )
     assert created["name"] == table_name
+    rate_limited_openai_embedder.allow_all_requests()
 
     assert_created_index(
         backup_api.create_index(
@@ -683,7 +709,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
                 "embedder": {
                     "provider": "openai",
                     "model": "text-embedding-3-small",
-                    "url": slow_openai_embedder,
+                    "url": rate_limited_openai_embedder.url,
                 },
                 "chunker": {
                     "provider": "antfly",
@@ -740,6 +766,33 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
 
     before_chunks = before_scan[0]["_chunks"]["semantic_chunked_idx_chunks"]
     assert len(before_chunks) >= 2
+    backup_api.wait_index_ready(
+        table_name,
+        "semantic_chunked_idx",
+        timeout_s=60.0,
+        interval_s=0.5,
+        require_query_fresh=True,
+    )
+    before_status = backup_api.get_index(table_name, "semantic_chunked_idx")["status"]
+    before_readiness_incarnation = before_status["readiness"]["incarnation"]
+    before_coverage = {
+        key: before_status["coverage"].get(key)
+        for key in (
+            "incarnation",
+            "config_hash",
+            "source_total",
+            "covered",
+            "produced",
+            "complete",
+            "healthy",
+        )
+        if key in before_status["coverage"]
+    }
+    before_counts = {
+        key: before_status.get(key)
+        for key in ("total_indexed", "doc_count", "query_visible_doc_count")
+        if key in before_status
+    }
 
     with tempfile.TemporaryDirectory(
         prefix="antfly-backup-chunked-semantic-"
@@ -747,9 +800,14 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
         location = _file_location(backup_dir)
 
         backup = backup_api.backup_table(
-            table_name, backup_id=backup_id, location=location
+            table_name,
+            backup_id=backup_id,
+            location=location,
+            backup_format="native",
         )
         assert backup["backup"] == "successful"
+        rate_limited_openai_embedder.deny_requests()
+        embedder_before_restore = rate_limited_openai_embedder.stats()
 
         deleted = backup_api.delete_table(table_name)
         assert deleted == {}
@@ -779,40 +837,27 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
             interval_s=1.0,
             require_query_fresh=True,
         )
+        after_status = backup_api.get_index(table_name, "semantic_chunked_idx")[
+            "status"
+        ]
+        assert after_status["readiness"]["incarnation"] == before_readiness_incarnation
+        assert {
+            key: after_status["coverage"].get(key) for key in before_coverage
+        } == before_coverage
+        assert {key: after_status.get(key) for key in before_counts} == before_counts
 
-        semantic_after = wait_until(
-            lambda: _semantic_top_hit(
-                backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"
-            ),
-            timeout_s=120.0,
-            interval_s=1.0,
+        semantic_after = _dense_top_hit(
+            backup_api,
+            table_name,
+            [1.0, 0.0, 0.0],
+            "semantic_chunked_idx",
+            "doc:a",
         )
-        if semantic_after is None:
-            after_status = backup_api.get_index(table_name, "semantic_chunked_idx")
-            after_scan = backup_api.scan_keys(
-                table_name,
-                {
-                    "from": "doc:a",
-                    "to": "doc:a;",
-                    "inclusive_from": True,
-                    "fields": ["title", "_chunks", "_embeddings"],
-                },
-            )
-            after_query = backup_api.query_table(
-                table_name,
-                {
-                    "semantic_search": "alpha concept",
-                    "indexes": ["semantic_chunked_idx"],
-                    "limit": 5,
-                    "fields": ["title", "_chunks", "_embeddings"],
-                },
-            )
-            server_logs = backup_api.debug_logs()
-            raise AssertionError(
-                "semantic restore query did not recover; "
-                f"status={after_status}, scan={after_scan}, query={after_query}, logs={server_logs}"
-            )
-        assert semantic_after
+        assert semantic_after is not None, {
+            "status": after_status,
+            "logs": backup_api.debug_logs(),
+        }
+        assert rate_limited_openai_embedder.stats() == embedder_before_restore
 
         after_scan = wait_until(
             lambda: _chunked_doc(

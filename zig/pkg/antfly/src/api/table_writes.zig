@@ -5058,7 +5058,7 @@ pub const BoundTableWriteSource = struct {
 
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-local", .{plan.backup_id});
         defer alloc.free(snapshot_token);
-        _ = try db.snapshot(snapshot_token);
+        _ = try db.snapshotNative(snapshot_token);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
         defer alloc.free(snapshot_root);
@@ -15353,7 +15353,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g{d}", .{ plan.backup_id, group_id });
         defer alloc.free(snapshot_token);
-        _ = try db.snapshot(snapshot_token);
+        _ = try db.snapshotNative(snapshot_token);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
         errdefer alloc.free(snapshot_root);
