@@ -1708,6 +1708,95 @@ fn statusFreshnessCountsAsRemoteUnknown(metadata: runtime_status.RuntimeStatusMe
     return metadata.freshness == .remote_unknown;
 }
 
+const IndexObservationAuthority = struct {
+    runtime_present: bool,
+    incarnation_current: bool,
+    freshness_authoritative: bool,
+    readiness_authoritative: bool,
+    coverage_authoritative: bool,
+};
+
+fn indexObservationIsDerived(item: anytype) bool {
+    const Item = @TypeOf(item);
+    if (!@hasField(Item, "kind")) return false;
+    const kind = if (@typeInfo(@TypeOf(item.kind)) == .optional)
+        item.kind orelse return false
+    else
+        item.kind;
+    return kind == .dense_vector or kind == .sparse_vector;
+}
+
+/// Classifies one index observation at the only boundary where table-level
+/// freshness, index-local fencing, and derived-incarnation identity meet.
+/// Both shard serialization and table aggregation consume this result so a
+/// serviceable catching-up generation cannot be queryable in one view and
+/// stale in the other.
+fn classifyIndexObservation(
+    item: anytype,
+    metadata: ?runtime_status.RuntimeStatusMetadata,
+    runtime_present: bool,
+    expected_generation: u64,
+    expected_config_hash: u64,
+) IndexObservationAuthority {
+    const Item = @TypeOf(item);
+    const incarnation_current = coverageIdentityMatches(item, expected_generation, expected_config_hash);
+    if (!runtime_present) return .{
+        .runtime_present = false,
+        .incarnation_current = incarnation_current,
+        .freshness_authoritative = false,
+        .readiness_authoritative = false,
+        .coverage_authoritative = false,
+    };
+
+    const explicitly_stale = if (@hasField(Item, "runtime_observation_stale"))
+        item.runtime_observation_stale
+    else
+        false;
+    const cache_proves_serviceability = if (@hasField(Item, "runtime_observation_serviceable"))
+        item.runtime_observation_serviceable
+    else
+        false;
+    const coverage_identity_ready = if (@hasField(Item, "coverage_identity_ready"))
+        item.coverage_identity_ready
+    else
+        expected_generation == 0;
+    const coverage_summary_ready = if (@hasField(Item, "coverage_summary_ready"))
+        item.coverage_summary_ready
+    else
+        true;
+    const repair_proves_serviceability = publicIndexRepairState(item) != null and
+        repairActiveGenerationServiceable(item);
+    const transition_serviceable = if (metadata) |value|
+        value.freshness == .catching_up and
+            indexObservationIsDerived(item) and
+            incarnation_current and
+            coverage_identity_ready and
+            coverage_summary_ready and
+            (cache_proves_serviceability or repair_proves_serviceability)
+    else
+        false;
+    // Aggregates have already reduced the per-shard freshness decision and do
+    // not carry one table-level metadata label. Their stale/missing counters
+    // remain an independent completeness fence during serialization.
+    const metadata_authoritative = if (metadata) |value|
+        statusFreshnessCountsAsFresh(value) or transition_serviceable
+    else if (@hasField(Item, "runtime_fresh"))
+        item.runtime_fresh
+    else
+        true;
+    const freshness_authoritative = !explicitly_stale and metadata_authoritative;
+    const readiness_authoritative = freshness_authoritative and incarnation_current;
+    return .{
+        .runtime_present = true,
+        .incarnation_current = incarnation_current,
+        .freshness_authoritative = freshness_authoritative,
+        .readiness_authoritative = readiness_authoritative,
+        // Coverage may be incomplete, but its counters are authoritative once
+        // the observation is fresh and bound to the requested incarnation.
+        .coverage_authoritative = readiness_authoritative,
+    };
+}
+
 fn aggregateIndexStatus(
     runtimes: []const runtime_status.LocalTableRuntimeStatus,
     index_name: []const u8,
@@ -1764,16 +1853,14 @@ fn aggregateIndexStatusIndexed(
                 aggregate.load_error = load_error;
             }
         }
-        const repair_proves_serviceability = publicIndexRepairState(item) != null and
-            item.index_repair_active_generation_serviceable;
-        const identity_scoped_transition_observation = runtime.metadata.freshness == .catching_up and
-            (item.runtime_observation_serviceable or repair_proves_serviceability) and
-            (item.kind == .dense_vector or item.kind == .sparse_vector) and
-            item.coverage_identity_ready and
-            item.coverage_summary_ready and
-            coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
-        const index_observation_fresh = !item.runtime_observation_stale and
-            (statusFreshnessCountsAsFresh(runtime.metadata) or identity_scoped_transition_observation);
+        const authority = classifyIndexObservation(
+            item,
+            runtime.metadata,
+            runtime_present,
+            coverage_generation,
+            coverage_config_hash,
+        );
+        const index_observation_fresh = authority.freshness_authoritative;
         if (index_observation_fresh) {
             aggregate.fresh_group_count += 1;
             aggregate.runtime_fresh = true;
@@ -1784,8 +1871,7 @@ fn aggregateIndexStatusIndexed(
         } else {
             aggregate.stale_group_count += 1;
         }
-        const observation_current = index_observation_fresh and
-            coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
+        const observation_current = authority.readiness_authoritative;
         // A serviceability proof is scoped to the dense incarnation itself,
         // not to the table-status publication epoch. Preserve it across a
         // transiently stale in-place observation so sibling index DDL cannot
@@ -2791,6 +2877,64 @@ test "identity-proven embeddings stay current during sibling startup catch-up" {
     try std.testing.expectEqual(@as(u64, 0), aggregate.stale_group_count);
     try std.testing.expectEqual(@as(u64, 2), aggregate.doc_count);
     try std.testing.expectEqual(@as(u64, 2), aggregate.coverage_produced_count);
+
+    var shard_status = std.ArrayListUnmanaged(u8).empty;
+    defer shard_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &shard_status,
+        .embeddings,
+        indexes[0],
+        runtimes[0].stats.source_doc_count,
+        .strict,
+        false,
+        42,
+        99,
+        null,
+        runtimes[0].stats.async_indexing,
+        runtimes[0].stats.enrichment,
+        runtimes[0].stats.resolution,
+        runtimes[0].stats.promotion,
+        runtimes[0].stats.resolver_replay,
+        runtimes[0].metadata,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"total_indexed\":2,\"coverage\":{\"observation_complete\":true,\"produced\":2,\"complete\":true},\"runtime_freshness\":\"catching_up\",\"readiness\":{\"state\":\"ready\",\"queryable\":true,\"complete\":true}}",
+        shard_status.items,
+    );
+
+    // The target-local fence always outranks the same cache-continuity proof.
+    // This is the delete/recreate boundary that prevents a same-name index
+    // from inheriting its predecessor's readiness.
+    indexes[0].runtime_observation_stale = true;
+    var fenced_shard_status = std.ArrayListUnmanaged(u8).empty;
+    defer fenced_shard_status.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &fenced_shard_status,
+        .embeddings,
+        indexes[0],
+        runtimes[0].stats.source_doc_count,
+        .strict,
+        false,
+        42,
+        99,
+        null,
+        runtimes[0].stats.async_indexing,
+        runtimes[0].stats.enrichment,
+        runtimes[0].stats.resolution,
+        runtimes[0].stats.promotion,
+        runtimes[0].stats.resolver_replay,
+        runtimes[0].metadata,
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"total_indexed\":0,\"coverage\":{\"observation_complete\":false,\"observation_incomplete_reasons\":[\"stale_group\"]},\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false}}",
+        fenced_shard_status.items,
+    );
 }
 
 test "opening embeddings observation cannot publish cached queryability" {
@@ -3449,7 +3593,14 @@ fn appendCoverageIncompleteReasons(
     source_total: u64,
 ) !void {
     const Item = @TypeOf(item);
-    const observation_current = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
+    const authority = classifyIndexObservation(
+        item,
+        metadata,
+        runtime_present,
+        expected_generation,
+        expected_config_hash,
+    );
+    const observation_current = authority.coverage_authoritative;
     var reasons = std.EnumSet(CoverageIncompleteReason).initEmpty();
 
     if (!runtime_present) reasons.insert(.runtime_unavailable);
@@ -3464,12 +3615,13 @@ fn appendCoverageIncompleteReasons(
         reasons.insert(.remote_unknown_group);
     if (@hasField(Item, "stale_group_count") and item.stale_group_count > 0)
         reasons.insert(.stale_group);
-    if (metadata != null and metadata.?.freshness != .fresh and metadata.?.freshness != .unknown and metadata.?.freshness != .remote_unknown)
+    if (metadata != null and !authority.freshness_authoritative and
+        metadata.?.freshness != .unknown and metadata.?.freshness != .remote_unknown)
         reasons.insert(.stale_group);
     if (@hasField(Item, "coverage_summary_ready") and !item.coverage_summary_ready)
         reasons.insert(.summary_unavailable);
     const config_mismatch = (@hasField(Item, "coverage_config_mismatch_count") and item.coverage_config_mismatch_count > 0) or
-        (observation_current and !coverageIdentityMatches(item, expected_generation, expected_config_hash));
+        (authority.freshness_authoritative and !authority.incarnation_current);
     if (config_mismatch) reasons.insert(.config_mismatch);
     const summary_ready = if (@hasField(Item, "coverage_summary_ready")) item.coverage_summary_ready else false;
     const produced = if (@hasField(Item, "coverage_produced_count")) item.coverage_produced_count else 0;
@@ -3495,6 +3647,7 @@ test "derived coverage reasons expose counter mismatch" {
         .coverage_produced_count = 2,
         .coverage_skipped_count = 1,
         .coverage_summary_ready = true,
+        .runtime_fresh = true,
     };
     var reasons = std.ArrayListUnmanaged(u8).empty;
     defer reasons.deinit(std.testing.allocator);
@@ -3738,9 +3891,16 @@ fn appendSingleIndexRuntimeStatus(
     metadata: ?runtime_status.RuntimeStatusMetadata,
     runtime_present: bool,
 ) !void {
-    const coverage_runtime_present = runtime_present and (metadata == null or metadata.?.freshness == .fresh);
+    const authority = classifyIndexObservation(
+        item,
+        metadata,
+        runtime_present,
+        coverage_generation,
+        coverage_config_hash,
+    );
+    const coverage_runtime_present = authority.coverage_authoritative;
     const embeddings_materialization_current = index_type != .embeddings or
-        (coverage_runtime_present and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
+        authority.readiness_authoritative;
     const public_item = publicIndexRuntimeView(item);
     const observed_repair_state = publicIndexRepairState(item);
     // Aggregates use a boolean reduction for serviceability. Require the
@@ -3990,7 +4150,10 @@ fn appendSingleIndexRuntimeStatus(
         const coverage_summary_ready = embeddings_materialization_current and if (@hasField(@TypeOf(item), "coverage_summary_ready")) item.coverage_summary_ready else false;
         try out.appendSlice(alloc, if (coverage_summary_ready) "true" else "false");
         try out.appendSlice(alloc, ",\"config_mismatch_group_count\":");
-        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count")) item.coverage_config_mismatch_count else @intFromBool(coverage_runtime_present and !coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
+        const config_mismatch_group_count = if (@hasField(@TypeOf(item), "coverage_config_mismatch_count"))
+            item.coverage_config_mismatch_count
+        else
+            @intFromBool(authority.freshness_authoritative and !authority.incarnation_current);
         try appendIntValue(alloc, out, config_mismatch_group_count);
         try out.appendSlice(alloc, ",\"source_total\":");
         try appendIntValue(alloc, out, table_doc_count);
@@ -4154,9 +4317,7 @@ fn appendSingleIndexRuntimeStatus(
         item,
         embeddings_coverage_policy,
         coverage_generation,
-        coverage_config_hash,
-        runtime_present,
-        metadata,
+        authority,
         backfill_active,
         terminal_load_failure,
         terminal_enrichment_failure,
@@ -4179,9 +4340,7 @@ fn appendIndexReadinessStatus(
     item: anytype,
     embeddings_coverage_policy: EmbeddingsCoveragePolicy,
     coverage_generation: u64,
-    coverage_config_hash: u64,
-    runtime_present: bool,
-    metadata: ?runtime_status.RuntimeStatusMetadata,
+    authority: IndexObservationAuthority,
     backfill_active: bool,
     terminal_load_failure: bool,
     terminal_enrichment_failure: bool,
@@ -4193,23 +4352,13 @@ fn appendIndexReadinessStatus(
     active_generation_serviceable: bool,
 ) !void {
     const Item = @TypeOf(item);
-    const item_observation_current = if (@hasField(Item, "runtime_observation_stale"))
-        !item.runtime_observation_stale
-    else
-        true;
-    const observation_fresh = runtime_present and item_observation_current and
-        if (metadata) |md|
-            md.freshness == .fresh
-        else if (@hasField(Item, "runtime_fresh"))
-            item.runtime_fresh
-        else
-            true;
+    const observation_fresh = authority.freshness_authoritative;
     const topology_complete = if (@hasField(Item, "expected_group_count") and @hasField(Item, "fresh_group_count"))
         item.expected_group_count == item.fresh_group_count
     else
         true;
     const incarnation_current = index_type != .embeddings or
-        (coverage_generation != 0 and coverageIdentityMatches(item, coverage_generation, coverage_config_hash));
+        (coverage_generation != 0 and authority.incarnation_current);
     const repair_failed = if (repair_state) |state|
         std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")
     else
