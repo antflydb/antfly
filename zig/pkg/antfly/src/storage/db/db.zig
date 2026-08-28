@@ -16183,7 +16183,8 @@ pub const DB = struct {
 
     const graph_ownership_restore_cursor_magic_v1 = "GRC1";
     const graph_ownership_restore_cursor_magic_v2 = "GRC2";
-    const graph_ownership_restore_cursor_magic = "GRC3";
+    const graph_ownership_restore_cursor_magic_v3 = "GRC3";
+    const graph_ownership_restore_cursor_magic = "GRC4";
 
     const GraphOwnershipRestoreCursor = struct {
         artifact_key: []const u8,
@@ -16192,6 +16193,7 @@ pub const DB = struct {
         segment_index: u32 = 0,
         key_count: u32 = 0,
         manifest_bytes: u32 = 0,
+        rollback: bool = false,
     };
 
     fn decodeGraphOwnershipRestoreCursor(cursor: ?[]const u8) !?GraphOwnershipRestoreCursor {
@@ -16216,13 +16218,29 @@ pub const DB = struct {
                 .key_count = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
             };
         }
-        const header_len = graph_ownership_restore_cursor_magic.len + 5 * @sizeOf(u32);
+        const v3_header_len = graph_ownership_restore_cursor_magic_v3.len + 5 * @sizeOf(u32);
+        if (std.mem.startsWith(u8, raw, graph_ownership_restore_cursor_magic_v3)) {
+            if (raw.len <= v3_header_len) return error.InvalidRestoreState;
+            var pos = graph_ownership_restore_cursor_magic_v3.len;
+            return .{
+                .artifact_key = raw[v3_header_len..],
+                .graph_index_offset = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
+                .item_offset = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
+                .segment_index = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
+                .key_count = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
+                .manifest_bytes = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
+            };
+        }
+        const header_len = graph_ownership_restore_cursor_magic.len + 1 + 5 * @sizeOf(u32);
         if (std.mem.startsWith(u8, raw, graph_ownership_restore_cursor_magic)) {
             if (raw.len <= header_len) return error.InvalidRestoreState;
         } else {
             return null;
         }
         var pos = graph_ownership_restore_cursor_magic.len;
+        const mode = raw[pos];
+        pos += 1;
+        if (mode > 1) return error.InvalidRestoreState;
         return .{
             .artifact_key = raw[header_len..],
             .graph_index_offset = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
@@ -16230,6 +16248,7 @@ pub const DB = struct {
             .segment_index = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
             .key_count = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
             .manifest_bytes = readU32Big(raw, &pos) catch return error.InvalidRestoreState,
+            .rollback = mode == 1,
         };
     }
 
@@ -16241,14 +16260,17 @@ pub const DB = struct {
         segment_index: usize,
         key_count: usize,
         manifest_bytes: usize,
+        rollback: bool,
     ) ![]u8 {
         if (graph_index_offset > std.math.maxInt(u32) or item_offset > std.math.maxInt(u32) or
             segment_index > std.math.maxInt(u32) or key_count > std.math.maxInt(u32) or
             manifest_bytes > std.math.maxInt(u32)) return error.InvalidRestoreState;
-        const header_len = graph_ownership_restore_cursor_magic.len + 5 * @sizeOf(u32);
+        const header_len = graph_ownership_restore_cursor_magic.len + 1 + 5 * @sizeOf(u32);
         const out = try alloc.alloc(u8, header_len + artifact_key.len);
         @memcpy(out[0..graph_ownership_restore_cursor_magic.len], graph_ownership_restore_cursor_magic);
         var pos = graph_ownership_restore_cursor_magic.len;
+        out[pos] = if (rollback) 1 else 0;
+        pos += 1;
         for ([_]usize{ graph_index_offset, item_offset, segment_index, key_count, manifest_bytes }) |value| {
             std.mem.writeInt(u32, out[pos..][0..4], @intCast(value), .big);
             pos += 4;
@@ -16266,9 +16288,26 @@ pub const DB = struct {
         segment_index: usize,
         key_count: usize,
         manifest_bytes: usize,
+        rollback: bool,
     ) !GraphOwnershipRestorePage {
         const graph_indexes = self.core.index_manager.graphIndexes();
         if (graph_index_offset >= graph_indexes.len) return error.InvalidRestoreState;
+        const index_name = graph_indexes[graph_index_offset].config.name;
+
+        if (rollback) {
+            var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.InvalidRestoreState;
+            defer artifact_ref.deinit(alloc);
+            const more = try rollbackGraphSourceArtifactRestoreStatePage(self, alloc, index_name, artifact_ref);
+            return .{
+                .replayed = 1,
+                .next_cursor = if (more)
+                    try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset, 0, 0, 0, 0, true)
+                else if (graph_index_offset + 1 < graph_indexes.len)
+                    try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset + 1, 0, 0, 0, 0, false)
+                else
+                    try alloc.dupe(u8, artifact_key),
+            };
+        }
 
         // Runtime restore repair operates on an unpublished staged generation
         // with optional workers disabled. Parsing, contender reconstruction,
@@ -16284,24 +16323,24 @@ pub const DB = struct {
             self,
             alloc,
             artifact_key,
-            graph_indexes[graph_index_offset].config.name,
+            index_name,
             item_offset,
             segment_index,
             key_count,
             manifest_bytes,
         ) catch |err| switch (err) {
             error.ArtifactRepairRequired => null,
-            error.ResourceLimitExceeded, error.InvalidGraphArtifact => blk: {
-                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse break :blk null;
+            error.ResourceLimitExceeded, error.InvalidGraphArtifact => {
+                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.InvalidRestoreState;
                 defer artifact_ref.deinit(alloc);
                 const source = self.core.index_manager.graphArtifactSourceForArtifact(
-                    graph_indexes[graph_index_offset].config.name,
+                    index_name,
                     artifact_ref.name,
-                ) orelse break :blk null;
+                ) orelse return error.InvalidRestoreState;
                 try recordArtifactRepairIssueContextForIndexSource(
                     self.async_context,
                     .graph,
-                    graph_indexes[graph_index_offset].config.name,
+                    index_name,
                     artifact_ref.document_id,
                     "",
                     artifact_ref.unit_id orelse "",
@@ -16313,13 +16352,16 @@ pub const DB = struct {
                     0,
                     if (err == error.ResourceLimitExceeded) .resource_limit_exceeded else .corrupt_artifact,
                 );
-                try deleteGraphSourceArtifactRestoreState(
-                    alloc,
-                    self.core.store,
-                    graph_indexes[graph_index_offset].config.name,
-                    artifact_ref,
-                );
-                break :blk null;
+                const more = try rollbackGraphSourceArtifactRestoreStatePage(self, alloc, index_name, artifact_ref);
+                return .{
+                    .replayed = 1,
+                    .next_cursor = if (more)
+                        try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset, 0, 0, 0, 0, true)
+                    else if (graph_index_offset + 1 < graph_indexes.len)
+                        try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset + 1, 0, 0, 0, 0, false)
+                    else
+                        try alloc.dupe(u8, artifact_key),
+                };
             },
             else => return err,
         };
@@ -16335,6 +16377,7 @@ pub const DB = struct {
                     page.next_segment_index,
                     page.key_count,
                     page.manifest_bytes,
+                    false,
                 ),
             };
         }
@@ -16342,7 +16385,7 @@ pub const DB = struct {
         return .{
             .replayed = 1,
             .next_cursor = if (graph_index_offset + 1 < graph_indexes.len)
-                try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset + 1, 0, 0, 0, 0)
+                try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset + 1, 0, 0, 0, 0, false)
             else
                 try alloc.dupe(u8, artifact_key),
         };
@@ -16363,6 +16406,7 @@ pub const DB = struct {
                 continuation.segment_index,
                 continuation.key_count,
                 continuation.manifest_bytes,
+                continuation.rollback,
             );
         }
 
@@ -16387,7 +16431,7 @@ pub const DB = struct {
                 internal_keys.isResolutionArtifactKey(key);
             consumed_rows += 1;
             if (artifact_row) {
-                return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, key, 0, 0, 0, 0, 0);
+                return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, key, 0, 0, 0, 0, 0, false);
             }
         }
 
@@ -32202,11 +32246,12 @@ fn loadGraphAssetStateKeysAlloc(
         .v5 => blk: {
             const root = try graph_asset_state.segmentedRoot(raw);
             const root_key_count: usize = root.key_count;
-            var all = std.ArrayListUnmanaged([]u8).empty;
+            const all = try alloc.alloc([]u8, root_key_count);
+            var initialized: usize = 0;
             var encoded_bytes: usize = 0;
             errdefer {
-                for (all.items) |key| alloc.free(key);
-                all.deinit(alloc);
+                for (all[0..initialized]) |key| alloc.free(key);
+                if (all.len > 0) alloc.free(all);
             }
             for (0..root.segment_count) |segment_index| {
                 const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
@@ -32220,13 +32265,14 @@ fn loadGraphAssetStateKeysAlloc(
                 if (encoded_bytes > graph_asset_state.hard_max_manifest_bytes) return error.ResourceLimitExceeded;
                 const segment_keys = try graph_asset_state.decodeSegmentKeysAlloc(alloc, segment_raw, expected_generation);
                 defer if (segment_keys.len > 0) alloc.free(segment_keys);
-                if (all.items.len > root_key_count or segment_keys.len > root_key_count - all.items.len) {
+                if (initialized > root_key_count or segment_keys.len > root_key_count - initialized) {
                     return error.InvalidGraphAssetState;
                 }
-                try all.appendSlice(alloc, segment_keys);
+                @memcpy(all[initialized..][0..segment_keys.len], segment_keys);
+                initialized += segment_keys.len;
             }
-            if (all.items.len != root.key_count) return error.InvalidGraphAssetState;
-            break :blk try all.toOwnedSlice(alloc);
+            if (initialized != root.key_count) return error.InvalidGraphAssetState;
+            break :blk all;
         },
     };
 }
@@ -32252,15 +32298,6 @@ fn appendGraphAssetStateSegmentDeleteKeys(
             try deletes.append(alloc, key);
         }
     }
-}
-
-fn pendingStoreWriteValue(writes: []const docstore_mod.KVPair, key: []const u8) ?[]const u8 {
-    var i = writes.len;
-    while (i > 0) {
-        i -= 1;
-        if (std.mem.eql(u8, writes[i].key, key)) return writes[i].value;
-    }
-    return null;
 }
 
 const GraphEdgeWinner = struct {
@@ -32305,6 +32342,48 @@ const GraphContenderChange = struct {
 };
 
 const GraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(GraphContenderChange));
+
+/// Batch-local contender overlay. Reconciliation may touch thousands of
+/// logical edges, so pending writes/deletes must be indexed once rather than
+/// rescanned for every edge winner lookup.
+const PendingGraphContenderOverlay = struct {
+    write_positions: std.StringHashMapUnmanaged(usize) = .empty,
+    delete_keys: std.StringHashMapUnmanaged(void) = .empty,
+    global_writes_by_edge: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty,
+
+    fn init(
+        alloc: Allocator,
+        pending_writes: []const docstore_mod.KVPair,
+        pending_deletes: []const []const u8,
+        expected_generation: u64,
+    ) !@This() {
+        var overlay = @This(){};
+        errdefer overlay.deinit(alloc);
+        for (pending_writes, 0..) |write, i| {
+            try overlay.write_positions.put(alloc, write.key, i);
+            if (!internal_keys.isGraphGlobalEdgeContenderKey(write.key)) continue;
+            // One document batch may reconcile multiple graph indexes or
+            // generations. Only index writes authenticated for this
+            // generation; unrelated overlay records remain addressable by
+            // full key but do not participate in its edge buckets.
+            const view = (try graph_edge_contender.decode(write.value, expected_generation)) orelse continue;
+            const gop = try overlay.global_writes_by_edge.getOrPut(alloc, view.edge_key);
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            try gop.value_ptr.append(alloc, i);
+        }
+        for (pending_deletes) |key| try overlay.delete_keys.put(alloc, key, {});
+        return overlay;
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        var it = self.global_writes_by_edge.valueIterator();
+        while (it.next()) |indexes| indexes.deinit(alloc);
+        self.global_writes_by_edge.deinit(alloc);
+        self.write_positions.deinit(alloc);
+        self.delete_keys.deinit(alloc);
+        self.* = undefined;
+    }
+};
 
 const GraphContenderReconcileResult = struct {
     winners: GraphEdgeWinners = .{},
@@ -32395,7 +32474,7 @@ fn reconcileGlobalGraphEdgeWinner(
     edge_key: []const u8,
     edge_changes: []const GraphContenderChange,
     pending_writes: []const docstore_mod.KVPair,
-    pending_deletes: []const []const u8,
+    pending: *const PendingGraphContenderOverlay,
     result: *GraphContenderReconcileResult,
 ) !void {
     const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, index_name, expected_generation, edge_key);
@@ -32409,13 +32488,12 @@ fn reconcileGlobalGraphEdgeWinner(
         generation: u64,
         edge_key: []const u8,
         edge_changes: []const GraphContenderChange,
-        pending_writes: []const docstore_mod.KVPair,
-        pending_deletes: []const []const u8,
+        pending: *const PendingGraphContenderOverlay,
         winners: *GraphEdgeWinners,
 
         fn scan(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
             const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-            if (containsDeleteKey(state.pending_deletes, key) or pendingStoreWriteValue(state.pending_writes, key) != null) return .@"continue";
+            if (state.pending.delete_keys.contains(key) or state.pending.write_positions.contains(key)) return .@"continue";
             const view = (try graph_edge_contender.decode(value, state.generation)) orelse return .@"continue";
             if (!std.mem.eql(u8, view.edge_key, state.edge_key)) return error.InvalidGraphEdgeContender;
             const expected_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(
@@ -32443,8 +32521,7 @@ fn reconcileGlobalGraphEdgeWinner(
         .generation = expected_generation,
         .edge_key = edge_key,
         .edge_changes = edge_changes,
-        .pending_writes = pending_writes,
-        .pending_deletes = pending_deletes,
+        .pending = pending,
         .winners = &result.winners,
     };
     try store.scanWithContext(prefix, if (upper) |value| value else "", .{}, &scan_state, ScanState.scan);
@@ -32452,8 +32529,12 @@ fn reconcileGlobalGraphEdgeWinner(
     // Reconciliation groups in one document batch are processed sequentially.
     // Fold earlier groups' not-yet-committed global contenders into this winner
     // selection so same-batch cross-document collisions are atomic.
-    for (pending_writes) |write| {
-        if (!std.mem.startsWith(u8, write.key, prefix) or containsDeleteKey(pending_deletes, write.key)) continue;
+    const pending_indexes: []const usize = if (pending.global_writes_by_edge.get(edge_key)) |indexes| indexes.items else &.{};
+    for (pending_indexes) |pending_index| {
+        const write = pending_writes[pending_index];
+        const latest_position = pending.write_positions.get(write.key) orelse continue;
+        if (latest_position != pending_index or pending.delete_keys.contains(write.key)) continue;
+        if (!std.mem.startsWith(u8, write.key, prefix)) return error.InvalidGraphEdgeContender;
         const view = (try graph_edge_contender.decode(write.value, expected_generation)) orelse continue;
         if (!std.mem.eql(u8, view.edge_key, edge_key)) return error.InvalidGraphEdgeContender;
         if (graphContenderStateChanged(edge_changes, view.state_key)) continue;
@@ -32583,6 +32664,8 @@ fn reconcileGraphEdgeContenders(
     // another. Reset the local winner projection before selecting globally.
     result.winners.deinit(alloc);
     result.winners = .{};
+    var pending = try PendingGraphContenderOverlay.init(alloc, pending_writes, pending_deletes, expected_generation);
+    defer pending.deinit(alloc);
     var global_it = changes.iterator();
     while (global_it.next()) |entry| {
         try reconcileGlobalGraphEdgeWinner(
@@ -32593,7 +32676,7 @@ fn reconcileGraphEdgeContenders(
             entry.key_ptr.*,
             entry.value_ptr.items,
             pending_writes,
-            pending_deletes,
+            &pending,
             &result,
         );
     }
@@ -42750,25 +42833,132 @@ const GraphArtifactRestoreMaterializationPage = struct {
     manifest_bytes: usize,
 };
 
-fn deleteGraphSourceArtifactRestoreState(
+/// Roll back one durable restore segment. The segment manifest and every
+/// contender/projection mutation derived from it are committed in the same
+/// batch, so retrying after a crash is idempotent and bounded by one restore
+/// page rather than by the full artifact.
+fn rollbackGraphSourceArtifactRestoreStatePage(
+    self: *DB,
     alloc: Allocator,
-    store: *docstore_mod.DocStore,
     index_name: []const u8,
     artifact_ref: types.ArtifactRef,
-) !void {
+) !bool {
+    const store = self.core.store;
+    const graph_index = self.core.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const generation = graph_index.config.coverage_generation;
     const state_name = try graphArtifactStateNameAlloc(alloc, artifact_ref);
     defer alloc.free(state_name);
     const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
     defer alloc.free(state_key);
     const segment_prefix = try internal_keys.graphAssetStateSegmentPrefixAlloc(alloc, state_key);
     defer alloc.free(segment_prefix);
-    const segments = try store.scanPrefix(alloc, segment_prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, segments);
-    const deletes = try alloc.alloc([]const u8, segments.len + 1);
-    defer alloc.free(deletes);
-    deletes[0] = state_key;
-    for (segments, 1..) |entry, i| deletes[i] = entry.key;
-    try store.putBatch(&.{}, deletes);
+    const segment_upper = try internal_keys.nextPrefixAlloc(alloc, segment_prefix);
+    defer if (segment_upper) |upper| alloc.free(upper);
+
+    const SegmentScan = struct {
+        alloc: Allocator,
+        key: ?[]u8 = null,
+        value: ?[]u8 = null,
+        has_more: bool = false,
+
+        fn deinit(state: *@This()) void {
+            if (state.key) |key| state.alloc.free(key);
+            if (state.value) |value| state.alloc.free(value);
+            state.* = undefined;
+        }
+
+        fn scan(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            if (state.key != null) {
+                state.has_more = true;
+                return .stop;
+            }
+            state.key = try state.alloc.dupe(u8, key);
+            errdefer {
+                state.alloc.free(state.key.?);
+                state.key = null;
+            }
+            state.value = try state.alloc.dupe(u8, value);
+            return .@"continue";
+        }
+    };
+    var segment = SegmentScan{ .alloc = alloc };
+    defer segment.deinit();
+    try store.scanWithContext(
+        segment_prefix,
+        if (segment_upper) |upper| upper else "",
+        .{},
+        &segment,
+        SegmentScan.scan,
+    );
+
+    if (segment.key == null) {
+        try store.putBatch(&.{}, &.{state_key});
+        return false;
+    }
+
+    const previous_keys = try graph_asset_state.decodeSegmentKeysAlloc(alloc, segment.value.?, generation);
+    defer freeOwnedConstKeySlice(alloc, previous_keys);
+    var reconciled = try reconcileSingleGraphStateContenders(
+        alloc,
+        store,
+        artifact_ref.document_id,
+        index_name,
+        state_key,
+        previous_keys,
+        &.{},
+        self.core.index_manager.graphArtifactSources(index_name),
+        generation,
+    );
+    defer reconciled.deinit(alloc);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        writes.deinit(alloc);
+    }
+    var write_positions = StoreWritePositions.empty;
+    defer write_positions.deinit(alloc);
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (deletes.items) |key| alloc.free(@constCast(key));
+        deletes.deinit(alloc);
+    }
+
+    for (previous_keys) |edge_key| {
+        if (reconciled.winners.map.get(edge_key)) |winner| {
+            const payload = try alloc.dupe(u8, winner.payload);
+            var payload_owned = true;
+            errdefer if (payload_owned) alloc.free(payload);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, edge_key, payload);
+            payload_owned = false;
+        } else {
+            try deletes.append(alloc, try alloc.dupe(u8, edge_key));
+        }
+    }
+    for (reconciled.writes.items) |write| {
+        const value = try alloc.dupe(u8, write.value);
+        var value_owned = true;
+        errdefer if (value_owned) alloc.free(value);
+        try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, write.key, value);
+        value_owned = false;
+    }
+    for (reconciled.deletes.items) |key| {
+        if (containsStoreWriteKey(writes.items, key) or containsDeleteKey(deletes.items, key)) continue;
+        try deletes.append(alloc, try alloc.dupe(u8, key));
+    }
+    try deletes.append(alloc, try alloc.dupe(u8, segment.key.?));
+    if (!segment.has_more) try deletes.append(alloc, try alloc.dupe(u8, state_key));
+
+    var changed_batch = try filterChangedGraphMaterializationBatch(alloc, store, writes.items, deletes.items);
+    defer changed_batch.deinit(alloc);
+    if (changed_batch.writes.len > 0 or changed_batch.deletes.len > 0) {
+        try store.putBatch(changed_batch.writes, changed_batch.deletes);
+    }
+    return segment.has_more;
 }
 
 fn materializeGraphSourceArtifactRestorePage(
@@ -96252,7 +96442,7 @@ test "db restore state uses strict structured content identity markers" {
 
 test "db graph ownership restore cursor resumes one artifact index exactly" {
     const alloc = std.testing.allocator;
-    const encoded = try DB.encodeGraphOwnershipRestoreCursorAlloc(alloc, "\x01artifact:key", 37, 4096, 2, 3072, 65536);
+    const encoded = try DB.encodeGraphOwnershipRestoreCursorAlloc(alloc, "\x01artifact:key", 37, 4096, 2, 3072, 65536, true);
     defer alloc.free(encoded);
     const decoded = (try DB.decodeGraphOwnershipRestoreCursor(encoded)) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("\x01artifact:key", decoded.artifact_key);
@@ -96261,9 +96451,11 @@ test "db graph ownership restore cursor resumes one artifact index exactly" {
     try std.testing.expectEqual(@as(u32, 2), decoded.segment_index);
     try std.testing.expectEqual(@as(u32, 3072), decoded.key_count);
     try std.testing.expectEqual(@as(u32, 65536), decoded.manifest_bytes);
+    try std.testing.expect(decoded.rollback);
     try std.testing.expect(try DB.decodeGraphOwnershipRestoreCursor("\x01legacy-scan-cursor") == null);
     try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC2truncated"));
     try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC3truncated"));
+    try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC4truncated"));
     try std.testing.expectError(error.InvalidRestoreState, DB.decodeGraphOwnershipRestoreCursor("GRC1"));
 }
 
@@ -96311,15 +96503,43 @@ test "db graph ownership restore materializes large artifacts in published segme
     try std.testing.expectEqual(@as(usize, 1), first.next_segment_index);
     try std.testing.expectEqual(@as(usize, 2048), first.key_count);
 
+    // A failed later page rolls back one committed segment atomically. With a
+    // single segment there is no continuation, and neither the visible edge
+    // nor its ownership manifest may survive.
+    var partial_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.TestUnexpectedResult;
+    defer partial_ref.deinit(alloc);
+    try std.testing.expect(!try rollbackGraphSourceArtifactRestoreStatePage(&db, alloc, "relations_graph", partial_ref));
+    const partial_state_name = try graphArtifactStateNameAlloc(alloc, partial_ref);
+    defer alloc.free(partial_state_name);
+    const partial_state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", partial_state_name);
+    defer alloc.free(partial_state_key);
+    const partial_segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, partial_state_key, 0);
+    defer alloc.free(partial_segment_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, partial_segment_key));
+    const partial_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:0");
+    defer alloc.free(partial_edge_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, partial_edge_key));
+
+    const restarted_first = try materializeGraphSourceArtifactRestorePage(
+        &db,
+        alloc,
+        artifact_key,
+        "relations_graph",
+        0,
+        0,
+        0,
+        0,
+    );
+
     const second = try materializeGraphSourceArtifactRestorePage(
         &db,
         alloc,
         artifact_key,
         "relations_graph",
-        first.next_item_offset.?,
-        first.next_segment_index,
-        first.key_count,
-        first.manifest_bytes,
+        restarted_first.next_item_offset.?,
+        restarted_first.next_segment_index,
+        restarted_first.key_count,
+        restarted_first.manifest_bytes,
     );
     try std.testing.expectEqual(@as(?usize, null), second.next_item_offset);
     try std.testing.expectEqual(@as(usize, 2), second.next_segment_index);

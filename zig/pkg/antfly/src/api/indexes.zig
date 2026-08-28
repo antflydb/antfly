@@ -3058,6 +3058,53 @@ test "progressive embeddings readiness exposes a queryable partial generation" {
     );
 }
 
+test "serviceable empty embeddings generation remains pending until first published member" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .replay_applied_sequence = 7,
+        .replay_target_sequence = 11,
+        .replay_catch_up_required = true,
+        .projection_checkpoint_status = "clean",
+        .projection_checkpoint_applied_sequence = 7,
+        .backfill_active = true,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        2,
+        .strict,
+        false,
+        42,
+        99,
+        .{},
+        .{
+            .enabled = true,
+            .target_sequence = 11,
+            .applied_sequence = 7,
+        },
+        null,
+        null,
+        .{},
+        .{ .source = .live_writer_publish, .freshness = .fresh },
+        true,
+    );
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"incarnation\":\"g-000000000000002a\"},\"coverage\":{\"source_total\":2,\"covered\":0,\"complete\":false}}",
+        encoded.items,
+    );
+}
+
 test "repair-free embeddings aggregate retains live dense catch-up" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "thumbnail",
@@ -4273,7 +4320,6 @@ fn appendSingleIndexRuntimeStatus(
         replay_target_sequence,
         replay_catch_up_required,
         catch_up_active,
-        active_generation_serviceable,
     );
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
@@ -4299,7 +4345,6 @@ fn appendIndexReadinessStatus(
     replay_target_sequence: u64,
     replay_catch_up_required: bool,
     catch_up_active: bool,
-    active_generation_serviceable: bool,
 ) !void {
     const Item = @TypeOf(item);
     const expected_source_observations: u64 = if (@hasField(Item, "fresh_group_count"))
@@ -4343,8 +4388,12 @@ fn appendIndexReadinessStatus(
             (if (@hasField(Item, "term_count")) item.term_count > 0 else false) or
             (if (@hasField(Item, "edge_count")) item.edge_count > 0 else false) or
             (if (@hasField(Item, "node_count")) item.node_count > 0 else false));
+    // A serviceable generation only proves that the index may safely accept
+    // reads; it does not prove that the generation has published a semantic
+    // member yet. Keep progressive indexes fail-closed until runtime stats
+    // observe at least one query-visible member.
     const queryable_partial = !failed and pending and
-        (active_generation_serviceable or published_generation_has_results) and
+        published_generation_has_results and
         observation_fresh and topology_complete and incarnation_current;
     const readiness_state = if (failed)
         "failed"

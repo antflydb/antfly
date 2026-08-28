@@ -216,6 +216,10 @@ pub const IncomingSourceGroupsRequest = struct {
 
 pub const IncomingSourceGroupEntry = struct {
     source_group_ids: []u64 = &.{},
+    /// Completeness is per key so a bounded cache may return a mixture of
+    /// exact hits and misses without forcing already-resolved keys through a
+    /// second all-shard probe.
+    complete: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.source_group_ids.len > 0) alloc.free(self.source_group_ids);
@@ -300,7 +304,7 @@ pub const IncomingSourceGroupCache = struct {
                 self.mutex.unlock();
             }
             if (cached) |groups| {
-                entries[i] = .{ .source_group_ids = groups };
+                entries[i] = .{ .source_group_ids = groups, .complete = true };
             } else {
                 entries[i] = .{};
                 complete = false;
@@ -329,6 +333,12 @@ pub const IncomingSourceGroupCache = struct {
             const groups = try self.alloc.dupe(u64, entry.source_group_ids);
             var groups_owned = true;
             errdefer if (groups_owned and groups.len > 0) self.alloc.free(groups);
+            std.mem.sort(u64, groups, {}, std.sort.asc(u64));
+            if (groups.len > 1) {
+                for (groups[1..], groups[0 .. groups.len - 1]) |group_id, previous| {
+                    if (group_id == previous) return error.InvalidGraphIncomingRouteResult;
+                }
+            }
 
             platform_sync.lockYielding(&self.mutex);
             defer self.mutex.unlock();
@@ -2938,6 +2948,11 @@ fn appendIncomingProbeBatchWindow(
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (frontier_ids.len != keys.len) return error.InvalidQueryResult;
+    var unresolved_frontier_ids = std.ArrayListUnmanaged(u32).empty;
+    defer unresolved_frontier_ids.deinit(alloc);
+    var unresolved_keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer unresolved_keys.deinit(alloc);
+    var route_projection_seen = false;
     if (try worker.resolveIncomingSourceGroups(
         alloc,
         table_state.table_name,
@@ -2952,18 +2967,26 @@ fn appendIncomingProbeBatchWindow(
     )) |route_response_value| {
         var route_response = route_response_value;
         defer route_response.deinit(alloc);
+        route_projection_seen = true;
         if (route_response.entries.len != keys.len) return error.InvalidGraphIncomingRouteResult;
-        for (route_response.entries, frontier_ids) |route, frontier_id| {
-            for (route.source_group_ids) |source_group_id| {
-                if (!std.mem.containsAtLeast(u64, group_ids, 1, &.{source_group_id})) {
-                    if (route_response.complete) return error.InvalidGraphIncomingRouteResult;
-                    continue;
+        for (route_response.entries, frontier_ids, keys) |route, frontier_id, key| {
+            const entry_complete = route.complete or route_response.complete;
+            if (entry_complete) {
+                for (route.source_group_ids) |source_group_id| {
+                    if (!std.mem.containsAtLeast(u64, group_ids, 1, &.{source_group_id})) {
+                        return error.InvalidGraphIncomingRouteResult;
+                    }
+                    try appendFrontierBatch(alloc, batches, table_state, source_group_id, frontier_id);
                 }
-                try appendFrontierBatch(alloc, batches, table_state, source_group_id, frontier_id);
+            } else {
+                try unresolved_frontier_ids.append(alloc, frontier_id);
+                try unresolved_keys.append(alloc, key);
             }
         }
-        if (route_response.complete) return;
+        if (unresolved_keys.items.len == 0) return;
     }
+    const probe_frontier_ids: []const u32 = if (route_projection_seen) unresolved_frontier_ids.items else frontier_ids;
+    const probe_keys: []const []const u8 = if (route_projection_seen) unresolved_keys.items else keys;
     const Entry = struct {
         group_id: u64,
         identity_read_generation: ?u64,
@@ -2977,7 +3000,7 @@ fn appendIncomingProbeBatchWindow(
         };
     }
 
-    const observed = if (worker.recordsIncomingSourceGroups()) try alloc.alloc(std.ArrayListUnmanaged(u64), keys.len) else null;
+    const observed = if (worker.recordsIncomingSourceGroups()) try alloc.alloc(std.ArrayListUnmanaged(u64), probe_keys.len) else null;
     defer if (observed) |routes| {
         for (routes) |*route| route.deinit(alloc);
         alloc.free(routes);
@@ -3078,7 +3101,7 @@ fn appendIncomingProbeBatchWindow(
                         table_state.table_name,
                         table_state.topology_epoch,
                         index_name,
-                        keys,
+                        probe_keys,
                         entry,
                         consistency,
                     });
@@ -3086,12 +3109,12 @@ fn appendIncomingProbeBatchWindow(
                 group.await(io) catch {};
                 for (slots) |slot| if (slot.err) |err| return err;
                 for (slots, entries[start..end]) |slot, entry| {
-                    try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, slot.result.?.has_incoming);
+                    try Probe.appendPositive(alloc, batches, table_state, entry, probe_frontier_ids, slot.result.?.has_incoming);
                     if (observed) |routes| try appendObservedIncomingGroups(alloc, routes, entry.group_id, slot.result.?.has_incoming);
                 }
             }
             recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - start_ns));
-            if (observed) |routes| recordObservedIncomingGroups(alloc, worker, table_state, index_name, keys, routes);
+            if (observed) |routes| recordObservedIncomingGroups(alloc, worker, table_state, index_name, probe_keys, routes);
             return;
         }
     }
@@ -3103,15 +3126,15 @@ fn appendIncomingProbeBatchWindow(
             table_state.table_name,
             table_state.topology_epoch,
             index_name,
-            keys,
+            probe_keys,
             entry,
             consistency,
         );
         defer response.deinit(alloc);
-        try Probe.appendPositive(alloc, batches, table_state, entry, frontier_ids, response.has_incoming);
+        try Probe.appendPositive(alloc, batches, table_state, entry, probe_frontier_ids, response.has_incoming);
         if (observed) |routes| try appendObservedIncomingGroups(alloc, routes, entry.group_id, response.has_incoming);
     }
-    if (observed) |routes| recordObservedIncomingGroups(alloc, worker, table_state, index_name, keys, routes);
+    if (observed) |routes| recordObservedIncomingGroups(alloc, worker, table_state, index_name, probe_keys, routes);
 }
 
 fn appendObservedIncomingGroups(
@@ -3136,7 +3159,7 @@ fn recordObservedIncomingGroups(
 ) void {
     const entries = alloc.alloc(IncomingSourceGroupEntry, routes.len) catch return;
     defer alloc.free(entries);
-    for (routes, entries) |route, *entry| entry.* = .{ .source_group_ids = route.items };
+    for (routes, entries) |route, *entry| entry.* = .{ .source_group_ids = route.items, .complete = true };
     worker.recordIncomingSourceGroups(
         table_state.table_name,
         .{
@@ -3280,6 +3303,8 @@ test "incoming graph route cache is exact and generation fenced" {
     var hit = try cache.resolveAlloc(alloc, "docs", req);
     defer hit.deinit(alloc);
     try std.testing.expect(hit.complete);
+    try std.testing.expect(hit.entries[0].complete);
+    try std.testing.expect(hit.entries[1].complete);
     try std.testing.expectEqualSlices(u64, &.{22}, hit.entries[0].source_group_ids);
     try std.testing.expectEqual(@as(usize, 0), hit.entries[1].source_group_ids.len);
 
@@ -3297,7 +3322,7 @@ test "incoming graph route cache is exact and generation fenced" {
     try std.testing.expect(!miss.complete);
 }
 
-test "distributed graph authoritative incoming routes avoid shard probes" {
+test "distributed graph per-key authoritative incoming routes avoid shard probes" {
     const alloc = std.testing.allocator;
     const FakeWorker = struct {
         fn iface() Worker {
@@ -3342,9 +3367,11 @@ test "distributed graph authoritative incoming routes avoid shard probes" {
             try std.testing.expectEqual(@as(u64, 9), req.topology_epoch);
             try std.testing.expectEqual(@as(usize, 2), req.keys.len);
             const entries = try a.alloc(IncomingSourceGroupEntry, 2);
-            entries[0] = .{ .source_group_ids = try a.dupe(u64, &.{11}) };
-            entries[1] = .{ .source_group_ids = try a.dupe(u64, &.{ 11, 22 }) };
-            return .{ .entries = entries, .complete = true };
+            entries[0] = .{ .source_group_ids = try a.dupe(u64, &.{11}), .complete = true };
+            entries[1] = .{ .source_group_ids = try a.dupe(u64, &.{ 11, 22 }), .complete = true };
+            // Exercise a mixed-window response: every requested key is exact
+            // even though the response-wide convenience bit is conservative.
+            return .{ .entries = entries, .complete = false };
         }
     };
 
@@ -3935,6 +3962,9 @@ pub fn probeIncomingEdgesForKeys(
     errdefer alloc.free(result);
     @memset(result, false);
     if (keys.len == 0) return result;
+    const route_resolved = try alloc.alloc(bool, keys.len);
+    defer alloc.free(route_resolved);
+    @memset(route_resolved, false);
 
     try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
     const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
@@ -3963,14 +3993,23 @@ pub fn probeIncomingEdgesForKeys(
             var route_response = route_response_value;
             defer route_response.deinit(alloc);
             if (route_response.entries.len != route_end - route_start) return error.InvalidGraphIncomingRouteResult;
-            route_projection_complete = route_projection_complete and route_response.complete;
+            var response_complete = route_response.complete;
+            if (!response_complete) {
+                response_complete = true;
+                for (route_response.entries) |route| response_complete = response_complete and route.complete;
+            }
+            route_projection_complete = route_projection_complete and response_complete;
             for (route_response.entries, route_start..) |route, output_index| {
+                const entry_complete = route.complete or route_response.complete;
                 for (route.source_group_ids) |source_group_id| {
                     if (!std.mem.containsAtLeast(u64, group_ids, 1, &.{source_group_id})) {
-                        if (route_response.complete) return error.InvalidGraphIncomingRouteResult;
+                        if (entry_complete) return error.InvalidGraphIncomingRouteResult;
                         continue;
                     }
-                    if (route_response.complete) result[output_index] = true;
+                }
+                if (entry_complete) {
+                    route_resolved[output_index] = true;
+                    result[output_index] = route.source_group_ids.len > 0;
                 }
             }
         } else {
@@ -3985,7 +4024,7 @@ pub fn probeIncomingEdgesForKeys(
     var unresolved = std.ArrayListUnmanaged(usize).empty;
     defer unresolved.deinit(alloc);
     try unresolved.ensureTotalCapacityPrecise(alloc, keys.len);
-    for (keys, 0..) |_, i| if (!result[i]) unresolved.appendAssumeCapacity(i);
+    for (keys, 0..) |_, i| if (!route_resolved[i]) unresolved.appendAssumeCapacity(i);
 
     const Entry = struct {
         group_id: u64,
