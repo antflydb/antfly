@@ -2865,6 +2865,12 @@ pub const IndexSourceReplayStatus = struct {
     /// A terminal request failure isolated to this configured artifact stream.
     /// Global worker/index failures remain index-level readiness facts.
     failed: bool = false,
+    /// Durable repair debt scoped to this source. Runtime failure maps may add
+    /// diagnostics, but never replace this authoritative count.
+    repair_issue_count: u64 = 0,
+    /// False while the bounded repair-ledger summary is rebuilding. Readiness
+    /// must remain pending until absence of source-local debt is proven.
+    repair_summary_ready: bool = true,
     // Internal distributed-status proof; not part of the public contract.
     observation_count: u64 = 1,
 };

@@ -948,6 +948,9 @@ const dense_catch_up_default_maintenance_steps: usize = 8;
 const dense_catch_up_default_maintenance_cooldown_ns: u64 = 250 * std.time.ns_per_ms;
 const dense_catch_up_default_maintenance_urgent_score: u64 = 1_000_000;
 const artifact_repair_summary_dirty_marker = "dirty";
+// v2 adds exact per-(index, artifact source) counters. Presence alone is not a
+// sufficient readiness proof because v1 summaries remain durable on upgrade.
+const artifact_repair_summary_ready_marker = "2";
 const artifact_repair_summary_invalidation_page_size: usize = 256;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
@@ -9077,8 +9080,8 @@ pub const DB = struct {
             error.NotFound => return false,
             else => return err,
         };
-        alloc.free(ready);
-        return true;
+        defer alloc.free(ready);
+        return std.mem.eql(u8, ready, artifact_repair_summary_ready_marker);
     }
 
     fn loadArtifactRepairSummaryCountOrScan(
@@ -9159,6 +9162,27 @@ pub const DB = struct {
         if (ready) return .{ .ready = true, .count = 0 };
         const scanned_count = try self.scanArtifactRepairIssueCountBounded(alloc, index_name);
         return .{ .ready = false, .count = scanned_count, .repair_scan_count = scanned_count };
+    }
+
+    fn artifactRepairSummarySourceSnapshot(
+        self: *DB,
+        alloc: Allocator,
+        index_name: []const u8,
+        artifact_name: []const u8,
+        ready: bool,
+    ) !ArtifactRepairSummarySnapshot {
+        // During a rebuild there is no safe bounded fallback that can prove
+        // absence for an arbitrary source. Return the partial shadow count for
+        // diagnostics and keep readiness explicitly false until publication.
+        const key = if (ready)
+            try internal_keys.artifactRepairSummarySourceKeyAlloc(alloc, index_name, artifact_name)
+        else
+            try internal_keys.artifactRepairSummaryRebuildSourceKeyAlloc(alloc, index_name, artifact_name);
+        defer alloc.free(key);
+        return .{
+            .ready = ready,
+            .count = (try self.loadArtifactRepairSummaryCountByKey(alloc, key)) orelse 0,
+        };
     }
 
     const ArtifactRepairIndexFallbackCounts = struct {
@@ -9579,21 +9603,6 @@ pub const DB = struct {
             return true;
         }
 
-        if (!invalidation_pending and raw_progress == null and (try self.loadArtifactRepairSummaryCountByKey(alloc, root_summary_key)) != null) {
-            const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
-            defer alloc.free(ready_key);
-            var deletes = std.ArrayListUnmanaged([]const u8).empty;
-            defer deletes.deinit(alloc);
-            var owned_delete_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer {
-                for (owned_delete_keys.items) |owned_key| alloc.free(@constCast(owned_key));
-                owned_delete_keys.deinit(alloc);
-            }
-            try self.appendArtifactRepairSummaryRebuildInvalidation(alloc, null, &deletes, &owned_delete_keys);
-            const writes = [_]docstore_mod.KVPair{.{ .key = ready_key, .value = "1" }};
-            try self.core.store.putBatchWithReplayWithOptions(null, writes[0..], deletes.items, null, .{ .defer_commit_flush = true });
-            return false;
-        }
         if (!invalidation_pending and raw_progress == null) {
             var deletes = std.ArrayListUnmanaged([]const u8).empty;
             defer deletes.deinit(alloc);
@@ -9630,6 +9639,10 @@ pub const DB = struct {
             alloc: Allocator,
             root_count: u64 = 0,
             per_index: std.StringHashMapUnmanaged(u64) = .empty,
+            // Keys are already encoded shadow-summary keys. This avoids a
+            // second composite identity codec and lets publication switch the
+            // namespace byte exactly like every other shadow counter.
+            per_source: std.StringHashMapUnmanaged(u64) = .empty,
             rows: usize = 0,
             last_key: ?[]u8 = null,
 
@@ -9637,6 +9650,9 @@ pub const DB = struct {
                 var it = state.per_index.iterator();
                 while (it.next()) |entry| state.alloc.free(entry.key_ptr.*);
                 state.per_index.deinit(state.alloc);
+                var source_it = state.per_source.iterator();
+                while (source_it.next()) |entry| state.alloc.free(entry.key_ptr.*);
+                state.per_source.deinit(state.alloc);
                 if (state.last_key) |key| state.alloc.free(key);
             }
 
@@ -9652,6 +9668,25 @@ pub const DB = struct {
                     result.value_ptr.* = 0;
                 }
                 result.value_ptr.* += 1;
+                const artifact_name = if (issue.artifact_name.len > 0)
+                    issue.artifact_name
+                else
+                    issue.source_artifact_name;
+                if (artifact_name.len > 0) {
+                    const source_key = try internal_keys.artifactRepairSummaryRebuildSourceKeyAlloc(
+                        state.alloc,
+                        issue.index_name,
+                        artifact_name,
+                    );
+                    const source_result = try state.per_source.getOrPut(state.alloc, source_key);
+                    if (source_result.found_existing) {
+                        state.alloc.free(source_key);
+                    } else {
+                        source_result.key_ptr.* = source_key;
+                        source_result.value_ptr.* = 0;
+                    }
+                    source_result.value_ptr.* += 1;
+                }
                 if (state.last_key) |existing| state.alloc.free(existing);
                 state.last_key = try state.alloc.dupe(u8, key);
                 if (state.rows >= batch_limit) return .stop;
@@ -9744,6 +9779,13 @@ pub const DB = struct {
                 try PublishState.addCount(&publish_state, live_key, entry.value_ptr.*);
             }
 
+            var source_it = state.per_source.iterator();
+            while (source_it.next()) |entry| {
+                var live_key = try alloc.dupe(u8, entry.key_ptr.*);
+                live_key[2] = internal_keys.artifact_repair_summary_kind;
+                try PublishState.addCount(&publish_state, live_key, entry.value_ptr.*);
+            }
+
             var count_it = publish_counts.iterator();
             while (count_it.next()) |entry| {
                 if (entry.value_ptr.* == 0) continue;
@@ -9754,7 +9796,7 @@ pub const DB = struct {
 
             const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
             try owned_keys.append(alloc, ready_key);
-            const ready_value = try alloc.dupe(u8, "1");
+            const ready_value = try alloc.dupe(u8, artifact_repair_summary_ready_marker);
             try writes.append(alloc, .{ .key = ready_key, .value = ready_value });
             try deletes.append(alloc, progress_key);
         } else if (state.last_key) |last_key| {
@@ -9767,6 +9809,17 @@ pub const DB = struct {
                 const key = try internal_keys.artifactRepairSummaryRebuildIndexKeyAlloc(alloc, entry.key_ptr.*);
                 try owned_keys.append(alloc, key);
                 try self.appendArtifactRepairSummaryWrite(alloc, &writes, &deletes, key, @intCast(entry.value_ptr.*));
+            }
+
+            var source_it = state.per_source.iterator();
+            while (source_it.next()) |entry| {
+                try self.appendArtifactRepairSummaryWrite(
+                    alloc,
+                    &writes,
+                    &deletes,
+                    entry.key_ptr.*,
+                    @intCast(entry.value_ptr.*),
+                );
             }
 
             const progress_key_copy = try alloc.dupe(u8, progress_key);
@@ -16121,15 +16174,25 @@ pub const DB = struct {
         // and mutation filtering can be proportional to one admitted artifact;
         // do not hold the shard apply lock across that work. The durable restore
         // cursor serializes these units and advances only after putBatch returns.
-        const changed = try materializeGraphSourceArtifactsForIndex(
+        // Legacy v0.2 artifacts are monolithic. Admit a bounded relation and
+        // byte window so a single restored document cannot monopolize memory
+        // or produce an unbounded store batch. Invalid/oversized inputs are
+        // durable source-local repair debt: they must not brick the remainder
+        // of an otherwise healthy restore.
+        const changed = materializeGraphSourceArtifactsForIndex(
             alloc,
             self.core.store,
             self.core.index_manager,
             &.{artifact_key},
             graph_indexes[graph_index_offset].config.name,
-            .{},
-        );
-        freeOwnedKeySlice(alloc, changed);
+            .{
+                .repair_ctx = self.async_context,
+            },
+        ) catch |err| switch (err) {
+            error.ArtifactRepairRequired => null,
+            else => return err,
+        };
+        if (changed) |keys| freeOwnedKeySlice(alloc, keys);
 
         return .{
             .replayed = 1,
@@ -16159,34 +16222,29 @@ pub const DB = struct {
         // continuation for the remaining indexes. This prevents source count,
         // graph index count, and artifact size from multiplying in one quantum.
         const scan_page_size: usize = 128;
-        const max_page_input_bytes: usize = 4 * 1024 * 1024;
         const user_prefix = [_]u8{internal_keys.user_namespace};
-        const rows = try self.core.store.scanPrefixPage(alloc, &user_prefix, cursor, scan_page_size);
-        defer docstore_mod.DocStore.freeResults(alloc, rows);
-        if (rows.len == 0) return .{ .complete = true };
+        const keys = try self.core.store.scanPrefixKeysPage(alloc, &user_prefix, cursor, scan_page_size);
+        defer freeOwnedKeySlice(alloc, keys);
+        if (keys.len == 0) return .{ .complete = true };
 
         var consumed_rows: usize = 0;
-        var consumed_bytes: usize = 0;
-        for (rows) |row| {
-            const row_bytes = row.key.len +| row.value.len;
-            const artifact_row = internal_keys.isAssetArtifactKey(row.key) or
-                internal_keys.isChunkArtifactRecordKey(row.key) or
-                internal_keys.isResolutionArtifactKey(row.key);
-            if (consumed_rows > 0 and consumed_bytes +| row_bytes > max_page_input_bytes) break;
+        for (keys) |key| {
+            const artifact_row = internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isChunkArtifactRecordKey(key) or
+                internal_keys.isResolutionArtifactKey(key);
             consumed_rows += 1;
-            consumed_bytes +|= row_bytes;
             if (artifact_row) {
-                return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, row.key, 0);
+                return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, key, 0);
             }
         }
 
         return .{
             .replayed = 0,
-            .next_cursor = if (consumed_rows < rows.len or rows.len == scan_page_size)
-                try alloc.dupe(u8, rows[consumed_rows - 1].key)
+            .next_cursor = if (consumed_rows < keys.len or keys.len == scan_page_size)
+                try alloc.dupe(u8, keys[consumed_rows - 1])
             else
                 null,
-            .complete = consumed_rows == rows.len and rows.len < scan_page_size,
+            .complete = consumed_rows == keys.len and keys.len < scan_page_size,
         };
     }
 
@@ -21573,11 +21631,21 @@ pub const DB = struct {
             for (names[initialized..]) |name| alloc.free(name);
             alloc.free(statuses);
         }
+        const repair_summary_ready = try self.artifactRepairSummaryReady(alloc);
         for (names) |name| {
+            const source_repair = try self.artifactRepairSummarySourceSnapshot(
+                alloc,
+                index_name,
+                name,
+                repair_summary_ready,
+            );
             statuses[initialized] = .{
                 .artifact_name = name,
                 .published_sequence = published_sequence,
                 .target_sequence = try self.artifactSourceTargetSequence(alloc, name, published_sequence, aggregate_target_sequence),
+                .failed = source_repair.ready and source_repair.count != 0,
+                .repair_issue_count = source_repair.count,
+                .repair_summary_ready = source_repair.ready,
             };
             initialized += 1;
         }
@@ -22214,9 +22282,9 @@ pub const DB = struct {
             defer self.async_context.enrichment_lifecycle_mutex.unlock();
             if (self.async_context.enrichment_runtime) |runtime| {
                 for (runtime_stats.indexes) |*item| {
-                    item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
+                    item.enrichment_failed = item.enrichment_failed or runtime.indexHasIsolatedFailure(item.name);
                     for (item.source_replay) |*source| {
-                        source.failed = runtime.indexSourceHasIsolatedFailure(item.name, source.artifact_name);
+                        source.failed = source.failed or runtime.indexSourceHasIsolatedFailure(item.name, source.artifact_name);
                     }
                 }
             }
@@ -34472,6 +34540,7 @@ fn preparePrecomputedGraphSourceArtifactMutation(
         var graph_write_positions = StoreWritePositions.empty;
 
         if (mutation.value) |value| {
+            if (value.len > graph_asset_state.hard_max_relation_artifact_bytes) return error.ResourceLimitExceeded;
             const raw_doc = try batchDocumentValueForGraphSource(scratch, self.core.store, store_writes.items, artifact_ref.document_id);
             defer if (raw_doc) |doc_value| scratch.free(doc_value);
             const graph_writes = try graphWritesFromArtifactValueAlloc(scratch, graph_entry.config.name, artifact_ref.document_id, value, source, graphArtifactContentType(self.core.index_manager, source.artifact_name), raw_doc, graph_asset_state.hard_max_relation_items_per_artifact);
@@ -42188,6 +42257,9 @@ const GraphMaterializationOptions = struct {
     require_resolution_contract: bool = false,
     repair_ctx: ?*const AsyncContext = null,
     sequence: u64 = 0,
+    max_input_bytes: usize = graph_asset_state.hard_max_relation_artifact_bytes,
+    max_relation_items: usize = graph_asset_state.hard_max_relation_items_per_artifact,
+    max_materialized_edges: usize = graph_asset_state.hard_max_edges_per_document,
 };
 
 fn recordGraphResourceLimitForRepair(
@@ -42298,9 +42370,13 @@ fn materializeGraphSourceArtifactsForIndex(
         defer write_positions.deinit(alloc);
 
         if (raw) |value| {
+            if (value.len > options.max_input_bytes) {
+                if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
+                return error.ResourceLimitExceeded;
+            }
             const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
             defer if (raw_doc) |doc_value| alloc.free(doc_value);
-            const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc, graph_asset_state.hard_max_relation_items_per_artifact) catch |err| switch (err) {
+            const graph_writes = graphWritesFromArtifactValueAlloc(alloc, index_name, artifact_ref.document_id, value, source, graphArtifactContentType(index_manager, source.artifact_name), raw_doc, options.max_relation_items) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 error.ResourceLimitExceeded => {
                     if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
@@ -42376,7 +42452,8 @@ fn materializeGraphSourceArtifactsForIndex(
             else => return err,
         };
         defer reconciled.deinit(alloc);
-        if (raw != null and reconciled.visible_count > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) {
+        const configured_edge_limit = graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document);
+        if (raw != null and reconciled.visible_count > @min(configured_edge_limit, options.max_materialized_edges)) {
             if (try recordGraphResourceLimitForRepair(options, index_name, artifact_ref, artifact_key)) return error.ArtifactRepairRequired;
             return error.ResourceLimitExceeded;
         }
@@ -42445,6 +42522,12 @@ fn materializeMentionEdgesForResolutionKey(
         else => return err,
     };
     defer if (raw_resolution) |raw| alloc.free(raw);
+    if (raw_resolution) |raw| {
+        if (raw.len > options.max_input_bytes) {
+            if (try recordGraphResolutionResourceLimitForRepair(alloc, options, index_name, source, resolution_key)) return error.ArtifactRepairRequired;
+            return error.ResourceLimitExceeded;
+        }
+    }
 
     const cfg = resolverConfigForResolution(index_manager, source.artifact_name, parsed_key.artifact_name) orelse {
         if (options.require_resolution_contract) return error.MissingResolverArtifactContract;
@@ -42534,7 +42617,11 @@ fn materializeMentionEdgesForResolutionKey(
         generation,
     );
     defer reconciled.deinit(alloc);
-    if (raw_resolution != null and reconciled.visible_count > graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document)) return error.ResourceLimitExceeded;
+    const configured_edge_limit = graph_asset_state.effectiveEdgeLimit((index_manager.graphIndex(index_name) orelse return error.IndexNotFound).max_edges_per_document);
+    if (raw_resolution != null and reconciled.visible_count > @min(configured_edge_limit, options.max_materialized_edges)) {
+        if (try recordGraphResolutionResourceLimitForRepair(alloc, options, index_name, source, resolution_key)) return error.ArtifactRepairRequired;
+        return error.ResourceLimitExceeded;
+    }
     var affected = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (affected.items) |key| alloc.free(key);
@@ -60328,6 +60415,88 @@ test "db artifact repair summary rebuild invalidates partial counters on mutatio
         try std.testing.expect(stats.repair_summary_ready);
         try std.testing.expectEqual(@as(u64, seeded_count + 1), stats.repair_issue_count);
     }
+}
+
+test "db artifact repair summary durably scopes debt to configured source" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .start_optional_runtime_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "semantic_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+        });
+        var issue = types.ArtifactRepairIssue{
+            .artifact_kind = .embedding,
+            .index_name = try alloc.dupe(u8, "semantic_idx"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .source_artifact_name = try alloc.dupe(u8, "body_chunks_v1"),
+            .artifact_name = try alloc.dupe(u8, "chunk_dense_v1"),
+            .reason = .enrichment_failed,
+            .sequence = 7,
+        };
+        defer issue.deinit(alloc);
+        try db.recordArtifactRepairIssue(alloc, issue);
+
+        const dirty = try db.stats(alloc);
+        defer types.freeDBStats(alloc, dirty);
+        try std.testing.expectEqual(@as(usize, 1), dirty.indexes[0].source_replay.len);
+        try std.testing.expect(!dirty.indexes[0].source_replay[0].repair_summary_ready);
+        try std.testing.expect(!dirty.indexes[0].source_replay[0].failed);
+
+        try db.runUntilIdle();
+        const ready = try db.stats(alloc);
+        defer types.freeDBStats(alloc, ready);
+        try std.testing.expect(ready.indexes[0].source_replay[0].repair_summary_ready);
+        try std.testing.expect(ready.indexes[0].source_replay[0].failed);
+        try std.testing.expectEqual(@as(u64, 1), ready.indexes[0].source_replay[0].repair_issue_count);
+    }
+
+    // The source-local failure remains authoritative without a live enrichment
+    // runtime and after process restart.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    const stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.indexes[0].source_replay[0].failed);
+    try std.testing.expectEqual(@as(u64, 1), stats.indexes[0].source_replay[0].repair_issue_count);
+}
+
+test "db artifact repair v1 ready marker forces source-summary rebuild" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    const ready_key = try internal_keys.artifactRepairSummaryReadyKeyAlloc(alloc);
+    defer alloc.free(ready_key);
+    try db.core.store.put(ready_key, "1");
+    try std.testing.expect(!try db.artifactRepairSummaryReady(alloc));
+    try std.testing.expect(!try db.rebuildArtifactRepairSummaryIfMissing(alloc));
+    try std.testing.expect(try db.artifactRepairSummaryReady(alloc));
+    const upgraded = try db.core.store.get(alloc, ready_key);
+    defer alloc.free(upgraded);
+    try std.testing.expectEqualStrings(artifact_repair_summary_ready_marker, upgraded);
 }
 
 test "db artifact repair dirty marker drains shadow summaries in bounded pages" {

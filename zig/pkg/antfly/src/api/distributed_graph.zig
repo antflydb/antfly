@@ -2631,6 +2631,51 @@ fn appendIncomingProbeBatches(
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (frontier_ids.len != keys.len) return error.InvalidQueryResult;
+    // Keep the exact source-owned reverse-adjacency fallback bounded. This is
+    // deliberately independent of fanout width: width bounds concurrent
+    // shards, while these windows bound the request bytes duplicated to each
+    // shard until target-owned reverse routing is available.
+    const max_window_keys: usize = 256;
+    const max_window_bytes: usize = 256 * 1024;
+    var window_start: usize = 0;
+    while (window_start < keys.len) {
+        var window_end = window_start;
+        var window_bytes: usize = 0;
+        while (window_end < keys.len and window_end - window_start < max_window_keys) : (window_end += 1) {
+            const next_bytes = window_bytes +| keys[window_end].len;
+            if (window_end > window_start and next_bytes > max_window_bytes) break;
+            window_bytes = next_bytes;
+        }
+        // One adversarial key may exceed the byte target; admitting it alone
+        // guarantees cursor progress without silently changing graph results.
+        if (window_end == window_start) window_end += 1;
+        try appendIncomingProbeBatchWindow(
+            alloc,
+            worker,
+            batches,
+            table_state,
+            group_ids,
+            frontier_ids[window_start..window_end],
+            keys[window_start..window_end],
+            index_name,
+            consistency,
+        );
+        window_start = window_end;
+    }
+}
+
+fn appendIncomingProbeBatchWindow(
+    alloc: std.mem.Allocator,
+    worker: Worker,
+    batches: *GraphExpandBatches,
+    table_state: *const GraphAdmissionTableState,
+    group_ids: []const u64,
+    frontier_ids: []const u32,
+    keys: []const []const u8,
+    index_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !void {
+    if (frontier_ids.len != keys.len) return error.InvalidQueryResult;
     const Entry = struct {
         group_id: u64,
         identity_read_generation: ?u64,
@@ -2770,7 +2815,10 @@ fn appendIncomingProbeBatches(
 
 test "distributed graph incoming probe expands only positive source shards" {
     const alloc = std.testing.allocator;
-    const TestState = struct { calls: usize = 0 };
+    const TestState = struct {
+        calls: usize = 0,
+        max_keys_per_call: usize = 0,
+    };
     const FakeWorker = struct {
         fn iface(state: *TestState) Worker {
             return .{ .ptr = state, .vtable = &.{
@@ -2800,9 +2848,11 @@ test "distributed graph incoming probe expands only positive source shards" {
         ) !GraphHydrateResponse {
             const state: *TestState = @ptrCast(@alignCast(ptr));
             state.calls += 1;
+            state.max_keys_per_call = @max(state.max_keys_per_call, req.keys.len);
             try std.testing.expectEqualStrings("graph_idx", req.incoming_index_name);
-            try std.testing.expectEqual(@as(usize, 2), req.keys.len);
-            const mask = try a.alloc(bool, 2);
+            const mask = try a.alloc(bool, req.keys.len);
+            @memset(mask, false);
+            if (req.keys.len != 2) return .{ .has_incoming = mask };
             const expected: [2]bool = switch (group_id) {
                 11 => .{ true, false },
                 22 => .{ false, true },
@@ -2840,6 +2890,29 @@ test "distributed graph incoming probe expands only positive source shards" {
     try std.testing.expectEqualSlices(u32, &.{0}, batches.get(.{ .table_name = "docs", .group_id = 11 }).?.frontier_ids.items);
     try std.testing.expectEqualSlices(u32, &.{1}, batches.get(.{ .table_name = "docs", .group_id = 22 }).?.frontier_ids.items);
     try std.testing.expect(batches.get(.{ .table_name = "docs", .group_id = 33 }) == null);
+
+    var many_ids: [257]u32 = undefined;
+    var many_keys: [257][]const u8 = undefined;
+    for (&many_ids, &many_keys, 0..) |*id, *key, i| {
+        id.* = @intCast(i);
+        key.* = "doc:bounded";
+    }
+    var bounded_batches = GraphExpandBatches.empty;
+    defer freeFrontierBatches(alloc, &bounded_batches);
+    try appendIncomingProbeBatches(
+        alloc,
+        FakeWorker.iface(&state),
+        &bounded_batches,
+        &table_state,
+        &.{ 11, 22, 33 },
+        &many_ids,
+        &many_keys,
+        "graph_idx",
+        .read_index,
+    );
+    try std.testing.expectEqual(@as(usize, 9), state.calls);
+    try std.testing.expectEqual(@as(usize, 256), state.max_keys_per_call);
+    try std.testing.expectEqual(@as(usize, 0), bounded_batches.count());
 }
 
 fn freeFrontierBatches(

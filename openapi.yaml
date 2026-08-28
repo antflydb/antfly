@@ -18492,8 +18492,10 @@ components:
       additionalProperties: false
       required:
         - artifact
-      description: Artifact stream materialized into graph edges. Artifact-backed graph sources require
-        index_capabilities.artifact_sources=true and are rejected by serverless deployments.
+      description: Artifact stream materialized into graph edges. Each source artifact is limited to 16
+        MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission
+        contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are
+        rejected by serverless deployments.
       properties:
         artifact:
           type: string
@@ -19599,6 +19601,7 @@ components:
       enum:
         - index_failed
         - enrichment_failure
+        - repair
         - runtime_unavailable
         - shard_observation_incomplete
         - source_observation_incomplete

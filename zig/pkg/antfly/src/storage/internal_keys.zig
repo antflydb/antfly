@@ -1031,6 +1031,23 @@ pub fn artifactRepairSummaryIndexKeyAlloc(alloc: Allocator, index_name: []const 
     return try list.toOwnedSlice(alloc);
 }
 
+/// Exact durable repair-debt counter for one configured artifact source of an
+/// index. The extra encoded component keeps this in the existing summary
+/// namespace so publication/rebuild invalidation remains atomic with the
+/// root and per-index counters.
+pub fn artifactRepairSummarySourceKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, artifact_name);
+    return try list.toOwnedSlice(alloc);
+}
+
 pub fn artifactRepairSummaryRebuildRootKeyAlloc(alloc: Allocator) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -1043,6 +1060,19 @@ pub fn artifactRepairSummaryRebuildIndexKeyAlloc(alloc: Allocator, index_name: [
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_rebuild_kind });
     try appendEncodedComponent(&list, alloc, index_name);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn artifactRepairSummaryRebuildSourceKeyAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    artifact_name: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.appendSlice(alloc, &[_]u8{ replay_namespace, 0xff, artifact_repair_summary_rebuild_kind });
+    try appendEncodedComponent(&list, alloc, index_name);
+    try appendEncodedComponent(&list, alloc, artifact_name);
     return try list.toOwnedSlice(alloc);
 }
 

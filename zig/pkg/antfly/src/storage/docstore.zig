@@ -1623,6 +1623,45 @@ pub const DocStore = struct {
         return owned;
     }
 
+    /// Scan only keys with the given prefix after `after_key`. Unlike
+    /// `scanPrefixPage`, this never copies values into the caller allocator;
+    /// maintenance cursors can therefore discover a very large value without
+    /// transiently materializing it before their own admission checks run.
+    pub fn scanPrefixKeysPage(
+        self: *DocStore,
+        alloc: Allocator,
+        prefix: []const u8,
+        after_key: ?[]const u8,
+        limit: usize,
+    ) ![][]u8 {
+        if (limit == 0) return try alloc.dupe([]u8, &.{});
+
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        var results = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (results.items) |key| alloc.free(key);
+            results.deinit(alloc);
+        }
+
+        const bounded_after_key = if (after_key) |key| if (std.mem.startsWith(u8, key, prefix)) key else null else null;
+        const seek_key = bounded_after_key orelse prefix;
+        var entry = (try cur.seekAtOrAfter(seek_key)) orelse return try results.toOwnedSlice(alloc);
+        while (true) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (bounded_after_key == null or std.mem.order(u8, entry.key, bounded_after_key.?) == .gt) {
+                try results.append(alloc, try alloc.dupe(u8, entry.key));
+                if (results.items.len >= limit) break;
+            }
+            entry = (try cur.next()) orelse break;
+        }
+        return try results.toOwnedSlice(alloc);
+    }
+
     /// Scan keys in [lower, upper). Caller owns returned slices.
     pub fn scanRange(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8) ![]OwnedKVPair {
         var txn = try self.beginReadTxn();

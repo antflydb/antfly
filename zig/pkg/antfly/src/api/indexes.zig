@@ -2048,6 +2048,8 @@ fn accumulateSourceReplayStatus(aggregate: *AggregatedIndexStatus, source: db_mo
         existing.published_sequence +|= source.published_sequence;
         existing.target_sequence +|= source.target_sequence;
         existing.failed = existing.failed or source.failed;
+        existing.repair_issue_count +|= source.repair_issue_count;
+        existing.repair_summary_ready = existing.repair_summary_ready and source.repair_summary_ready;
         existing.observation_count +|= source.observation_count;
         return;
     }
@@ -4425,7 +4427,7 @@ fn indexSourcesComplete(
 ) bool {
     if (!observation_fresh or !topology_complete) return false;
     for (sources) |source| {
-        if (source.failed or source.observation_count < expected_observation_count or
+        if (source.failed or !source.repair_summary_ready or source.observation_count < expected_observation_count or
             source.published_sequence < source.target_sequence) return false;
     }
     return true;
@@ -4447,7 +4449,7 @@ fn appendIndexSourceReadinessStatuses(
         const replay_pending = source.published_sequence < source.target_sequence;
         const source_observation_complete = source.observation_count >= expected_observation_count;
         const source_failed = index_failed or source.failed;
-        const pending = !source_failed and (!observation_fresh or !topology_complete or !source_observation_complete or replay_pending);
+        const pending = !source_failed and (!source.repair_summary_ready or !observation_fresh or !topology_complete or !source_observation_complete or replay_pending);
         const state = if (source_failed) "failed" else if (pending) "pending" else "ready";
         try out.appendSlice(alloc, "{\"artifact\":");
         try appendJsonString(alloc, out, source.artifact_name);
@@ -4463,7 +4465,12 @@ fn appendIndexSourceReadinessStatuses(
         }
         if (source.failed) {
             if (emitted) try out.append(alloc, ',');
-            try appendJsonString(alloc, out, "enrichment_failure");
+            try appendJsonString(alloc, out, if (source.repair_issue_count != 0) "repair" else "enrichment_failure");
+            emitted = true;
+        }
+        if (!source.repair_summary_ready) {
+            if (emitted) try out.append(alloc, ',');
+            try appendJsonString(alloc, out, "repair");
             emitted = true;
         }
         if (!observation_fresh) {
@@ -4528,6 +4535,23 @@ test "source readiness isolates terminal enrichment failures" {
     try appendIndexSourceReadinessStatuses(std.testing.allocator, &out, &sources, true, true, false, 1);
     try std.testing.expectEqualStrings(
         ",\"sources\":[{\"artifact\":\"document_vectors\",\"state\":\"ready\",\"complete\":true,\"pending_reasons\":[]},{\"artifact\":\"chunk_vectors\",\"state\":\"failed\",\"complete\":false,\"pending_reasons\":[\"enrichment_failure\"]}]",
+        out.items,
+    );
+}
+
+test "source readiness distinguishes durable repair debt from runtime enrichment failure" {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    const sources = [_]db_mod.types.IndexSourceReplayStatus{.{
+        .artifact_name = "chunk_vectors",
+        .published_sequence = 9,
+        .target_sequence = 9,
+        .failed = true,
+        .repair_issue_count = 2,
+    }};
+    try appendIndexSourceReadinessStatuses(std.testing.allocator, &out, &sources, true, true, false, 1);
+    try std.testing.expectEqualStrings(
+        ",\"sources\":[{\"artifact\":\"chunk_vectors\",\"state\":\"failed\",\"complete\":false,\"pending_reasons\":[\"repair\"]}]",
         out.items,
     );
 }

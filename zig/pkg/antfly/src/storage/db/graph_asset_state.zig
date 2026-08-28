@@ -10,6 +10,10 @@ const version_4_magic = "AGS4";
 const header_len = version_4_magic.len + @sizeOf(u64);
 pub const hard_max_edges_per_document: usize = 1_000_000;
 pub const hard_max_relation_items_per_artifact: usize = 1_000_000;
+/// Graph source artifacts are replayed during live apply, repair, split, and
+/// restore. A shared byte ceiling keeps every path within the same admission
+/// contract instead of making restore uniquely reject data accepted live.
+pub const hard_max_relation_artifact_bytes: usize = 16 * 1024 * 1024;
 pub const hard_max_manifest_bytes: usize = 64 * 1024 * 1024;
 
 pub fn effectiveEdgeLimit(configured: u32) usize {

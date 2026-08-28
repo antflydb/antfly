@@ -1266,7 +1266,7 @@ pub const GraphArtifactProducerSourceConfig = struct {
     value: []const u8,
 };
 
-/// Artifact stream materialized into graph edges. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments.
+/// Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments.
 pub const GraphArtifactSourceConfig = struct {
     artifact: []const u8,
     /// Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
@@ -1900,6 +1900,7 @@ pub const IndexRepairStatus = struct {
 pub const IndexSourceReadinessReason = enum {
     index_failed,
     enrichment_failure,
+    repair,
     runtime_unavailable,
     shard_observation_incomplete,
     source_observation_incomplete,
@@ -1909,6 +1910,7 @@ pub const IndexSourceReadinessReason = enum {
         const s = switch (self) {
             .index_failed => "index_failed",
             .enrichment_failure => "enrichment_failure",
+            .repair => "repair",
             .runtime_unavailable => "runtime_unavailable",
             .shard_observation_incomplete => "shard_observation_incomplete",
             .source_observation_incomplete => "source_observation_incomplete",
@@ -1925,6 +1927,7 @@ pub const IndexSourceReadinessReason = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "index_failed", .index_failed },
             .{ "enrichment_failure", .enrichment_failure },
+            .{ "repair", .repair },
             .{ "runtime_unavailable", .runtime_unavailable },
             .{ "shard_observation_incomplete", .shard_observation_incomplete },
             .{ "source_observation_incomplete", .source_observation_incomplete },
