@@ -103,6 +103,12 @@ pub fn finalLmHeadSlot(configured_layer_count: usize) usize {
     return configured_layer_count * 10;
 }
 
+/// The exact Q6_K companion for an optional lossy lm-head runtime transform.
+/// Slot +1 is the PLE model projection, so +2 is the first tail-reserved slot.
+pub fn lmHeadRefineSlot(configured_layer_count: usize) usize {
+    return finalLmHeadSlot(configured_layer_count) + 2;
+}
+
 pub fn pleModelProjSlot(configured_layer_count: usize) usize {
     return finalLmHeadSlot(configured_layer_count) + 1;
 }

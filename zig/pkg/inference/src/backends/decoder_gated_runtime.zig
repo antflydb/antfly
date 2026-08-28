@@ -4805,6 +4805,7 @@ fn prepareLinearNoBiasSlotForConfig(
 
 const PrepareSlotTags = struct {
     lm_head: bool = false,
+    lm_head_refine_slot: ?usize = null,
     prefer_q8_over_dense_bf16: bool = false,
 };
 
@@ -4825,6 +4826,7 @@ fn prepareLinearNoBiasSlotForConfigTagged(
             .disable_mapped_quant_weight = disable_mapped_quant_weight,
             .dense_fallback_max_bytes = dense_fallback_max_bytes,
             .lm_head = tags.lm_head,
+            .lm_head_refine_slot = tags.lm_head_refine_slot,
             .prefer_q8_over_dense_bf16 = tags.prefer_q8_over_dense_bf16,
         });
     }
@@ -4844,6 +4846,7 @@ fn prepareLinearNoBiasSlotForConfigTagged(
         .disable_mapped_quant_weight = disable_mapped_quant_weight,
         .dense_fallback_max_bytes = dense_fallback_max_bytes,
         .lm_head = tags.lm_head,
+        .lm_head_refine_slot = tags.lm_head_refine_slot,
         .prefer_q8_over_dense_bf16 = tags.prefer_q8_over_dense_bf16,
     });
 }
@@ -5315,7 +5318,13 @@ pub fn prepareDecodeRuntime(
         gpt_config.hidden_size,
         gpt_config.vocab_size,
         false,
-        .{ .lm_head = true },
+        .{
+            .lm_head = true,
+            .lm_head_refine_slot = if (gpt_config.family == .gemma)
+                gemma4_runtime.lmHeadRefineSlot(configured_layer_count)
+            else
+                null,
+        },
     ))) {
         timing_stats.prepare_final_norm_failures += 1;
         return false;

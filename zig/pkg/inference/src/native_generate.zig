@@ -3553,6 +3553,7 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
+        \\"lm_head_q4_q6_refine":{{"dispatches":{d}}},
         \\"q4_0_policy":{{
         \\"mmv_nr4_nsg2":{d},
         \\"mmv_nr8_nsg2":{d},
@@ -3565,6 +3566,7 @@ fn metalStatsCompactJson(
         \\}}
     ,
         .{
+            provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
             provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
             provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
             provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
@@ -5594,7 +5596,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} lm_head_q4_q6_refine_dispatches={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_1,
@@ -5611,6 +5613,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_9_64,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
+            metal_snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
         },
     );
     print(
@@ -8116,6 +8119,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     snapshot.provider.metal_runtime_q4_0_pair_activation_reduce = 5;
     snapshot.provider.metal_runtime_q6_k_linear_reduce = 10;
     snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1 = 3;
+    snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches = 7;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
     defer std.testing.allocator.free(json);
@@ -8128,6 +8132,8 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     const k_quant = parsed.value.object.get("k_quant_dispatch").?.object;
     try std.testing.expectEqual(@as(i64, 10), k_quant.get("q6_linear_reduce").?.integer);
     try std.testing.expectEqual(@as(i64, 3), k_quant.get("q6_linear_reduce_rows_1").?.integer);
+    const refine = parsed.value.object.get("lm_head_q4_q6_refine").?.object;
+    try std.testing.expectEqual(@as(i64, 7), refine.get("dispatches").?.integer);
 
     const plan = parsed.value.object.get("quant_kernel_plan").?.object;
     try std.testing.expectEqual(@as(i64, 30), plan.get("planned").?.integer);

@@ -75,12 +75,31 @@ if order_log:
 stage_enabled = os.environ.get("TERMITE_METAL_STAGE_TIMING") == "1"
 pair_decode = os.environ.get("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION") == "1"
 pair_prefill = os.environ.get("TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_MM") == "1"
+lm_head_repack = os.environ.get("TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK") == "q4_k"
 concurrent = os.environ.get("TERMITE_METAL_ENABLE_CONCURRENT_PLANNED_DISPATCH") == "1"
 if concurrent and os.environ.get("TERMITE_METAL_DISABLE_CONCURRENT_PLANNED_DISPATCH") == "1":
     raise SystemExit("concurrent dispatch simultaneously enabled and disabled")
 
 decode_frames = tokens
-attention = 42 * decode_frames
+model_topology = os.environ.get("FAKE_GEMMA4_TOPOLOGY", "e4b")
+if model_topology == "e2b":
+    attention = 35 * decode_frames + 28
+    generated_flash_prefill = 0
+    generated_flash_prefill_hd512 = 7
+    prefill_paged_kv = 7
+    pair_count = 35
+    logical_decode_q4 = 175
+    logical_prefill_q4 = 275
+elif model_topology == "e4b":
+    attention = 42 * decode_frames
+    generated_flash_prefill = 35
+    generated_flash_prefill_hd512 = 7
+    prefill_paged_kv = 42
+    pair_count = 42
+    logical_decode_q4 = 210
+    logical_prefill_q4 = 342
+else:
+    raise SystemExit(f"invalid fake model topology: {model_topology}")
 gqa_split_schedule = os.environ.get("TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE") == "1"
 gqa_swa_calls = 35 * decode_frames
 gqa_global_calls = 7 * decode_frames
@@ -95,10 +114,10 @@ if gqa_swa_variant not in ("s8", "s16", "s24", "s32"):
     raise SystemExit(f"invalid SWA GQA split variant: {gqa_swa_variant}")
 if gqa_global_variant not in ("s8", "s16", "s24", "s32"):
     raise SystemExit(f"invalid global GQA split variant: {gqa_global_variant}")
-decode_pairs = 42 * decode_frames if pair_decode else 0
-prefill_pairs = 42 if pair_prefill else 0
-q4_row_one = 210 * decode_frames - 2 * decode_pairs
-q4_row_65 = 342 - 2 * prefill_pairs
+decode_pairs = pair_count * decode_frames if pair_decode else 0
+prefill_pairs = pair_count if pair_prefill else 0
+q4_row_one = logical_decode_q4 * decode_frames - 2 * decode_pairs
+q4_row_65 = logical_prefill_q4 - 2 * prefill_pairs
 
 q4_variant_names = ("nr4-nsg2", "nr8-nsg2", "nr4-nsg4", "nr8-nsg4")
 q4_workload_env = {
@@ -127,6 +146,15 @@ for workload in ("generic", "attention", "ffn_gate_up", "ffn_down"):
         selected = "nr4-nsg2"
     q4_workload_policy[workload] = (override, selected)
     q4_variant_counts[selected] += q4_workload_calls[workload]
+if model_topology == "e2b":
+    if not pair_decode or pair_prefill or gqa_split_schedule:
+        raise SystemExit("fake E2B only supports the qualified decode-pair topology")
+    q4_variant_counts = {
+        "nr4-nsg2": 70 * decode_frames,
+        "nr8-nsg2": 35 * decode_frames,
+        "nr4-nsg4": 0,
+        "nr8-nsg4": 0,
+    }
 
 if stage_enabled:
     prefill_ms, decode_ms = 20000, 30000
@@ -230,12 +258,13 @@ payload = {
         "attention_dispatch": {
             "paged_1x": 0 if gqa_split_schedule else attention,
             "decode_gqa_split": attention if gqa_split_schedule else 0,
-            "generated_flash_prefill": 35,
-            "generated_flash_prefill_hd512": 7,
+            "generated_flash_prefill": generated_flash_prefill,
+            "generated_flash_prefill_hd512": generated_flash_prefill_hd512,
             "prefill_direct_kv": 0,
-            "prefill_paged_kv": 42,
+            "prefill_paged_kv": prefill_paged_kv,
         },
         "prepared_frame": {"fast_path": decode_frames, "fallback": 0},
+        "lm_head_q4_q6_refine": {"dispatches": tokens if lm_head_repack else 0},
         "stage_timing_ns": stage,
         "q4_0_policy": q4_variants,
         "frame_fallbacks": {
@@ -256,8 +285,9 @@ print(
     "metal_attention_dispatch: "
     f"paged_1x={0 if gqa_split_schedule else attention} "
     f"decode_gqa_split={attention if gqa_split_schedule else 0} "
-    "generated_decode_1x=0 generated_flash_prefill=35 "
-    "generated_flash_prefill_hd512=7 prefill_direct_kv=0 prefill_paged_kv=42 "
+    f"generated_decode_1x=0 generated_flash_prefill={generated_flash_prefill} "
+    f"generated_flash_prefill_hd512={generated_flash_prefill_hd512} "
+    f"prefill_direct_kv=0 prefill_paged_kv={prefill_paged_kv} "
     "generated_rms_norm=0"
 )
 if os.environ.get("TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE") == "1":
@@ -314,12 +344,21 @@ if os.environ.get("TERMITE_METAL_TRACE_Q4_0_MMV_VARIANT") == "1":
             f"override={override} shape={in_dim}x{out_dim} selected={selected} fallback=0"
         )
 print(
-    f"metal_q4_0_pair_activation_policy: mmv_nr4_nsg2={decode_pairs} "
-    "mmv_nr8_nsg2=0 mmv_nr4_nsg4=0 mmv_nr8_nsg4=0 mmv_variant_fallbacks=0 "
+    f"metal_q4_0_pair_activation_policy: "
+    f"mmv_nr4_nsg2={decode_pairs if model_topology == 'e4b' else 0} "
+    f"mmv_nr8_nsg2=0 mmv_nr4_nsg4={decode_pairs if model_topology == 'e2b' else 0} "
+    "mmv_nr8_nsg4=0 mmv_variant_fallbacks=0 "
     f"mm_m32_n64_aligned=0 mm_m32_n64_tail={prefill_pairs} "
     "mm_m32_n32_aligned=0 mm_m32_n32_tail=0 mm_variant_fallbacks=0"
 )
-print(f"metal_q4_q6_k_dispatch: q6_linear_reduce_rows={tokens + 1}/0/0/0")
+if lm_head_repack:
+    print("info: lm_head Q4_K repack: slot=350 refine_slot=352 rows=262144 cols=2560")
+print(
+    "metal_q4_q6_k_dispatch: "
+    f"q4_linear_reduce_rows={tokens if lm_head_repack else 0}/0/0/0 "
+    f"q6_linear_reduce_rows={1 if lm_head_repack else tokens + 1}/0/0/0 "
+    f"lm_head_q4_q6_refine_dispatches={tokens if lm_head_repack else 0}"
+)
 p = stage["prefill"]
 d = stage["decode"]
 print(
@@ -359,6 +398,20 @@ class RouteFormulaTests(unittest.TestCase):
                     paired["q4_row_65_plus"] + 2 * paired["prefill_pairs"],
                     paired["logical_prefill_q4"],
                 )
+                repack = _route_expectations("lm_head_repack", tokens)
+                self.assertEqual(repack["q4_row_one"], 126 * tokens)
+                self.assertEqual(repack["decode_pairs"], 42 * tokens)
+                self.assertEqual(repack["prefill_pairs"], 0)
+                e2b = _route_expectations("lm_head_repack", tokens, "e2b")
+                self.assertEqual(e2b["attention_routes"], (35 * tokens + 28, 0, 0, 7, 0, 7))
+                self.assertEqual(e2b["q4_row_one"], 105 * tokens)
+                self.assertEqual(e2b["decode_pairs"], 35 * tokens)
+                self.assertEqual(
+                    e2b["q4_mmv_variants"],
+                    (70 * tokens, 35 * tokens, 0, 0),
+                )
+        with self.assertRaisesRegex(BenchmarkContractError, "not qualified for E2B"):
+            _route_expectations("split_ffn", OUTPUT_TOKENS, "e2b")
 
 
 class HarnessTests(unittest.TestCase):
@@ -705,6 +758,91 @@ class HarnessTests(unittest.TestCase):
             routes["q4_pair_activation_policy"]["mm_m32_n64_tail"], 42
         )
         self.assertEqual(routes["q4_pair_activation_total"], 5_418)
+
+    def test_lm_head_repack_profile_attests_q4_nomination_and_q6_refine(self) -> None:
+        out = self.tmp / "lm-head-repack"
+        command = self.paired_command(out)
+        command.extend(
+            (
+                "--baseline-route-profile",
+                "pair_decode",
+                "--candidate-route-profile",
+                "lm_head_repack",
+                "--baseline-env",
+                "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION=1",
+                "--candidate-env",
+                "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION=1",
+                "--candidate-env",
+                "TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK=q4_k",
+            )
+        )
+        completed = subprocess.run(command, text=True, capture_output=True, check=True)
+        self.assertIn("passed=True", completed.stdout)
+        summary = json.loads((out / "summary.json").read_text())
+        by_variant = {
+            sample["variant"]: sample
+            for sample in summary["performance_samples"]
+            if sample["index"] == 1
+        }
+        self.assertEqual(by_variant["baseline"]["routes"]["q4_k_linear_reduce_rows"], [0, 0, 0, 0])
+        self.assertEqual(by_variant["baseline"]["routes"]["q6_linear_reduce_rows"], [129, 0, 0, 0])
+        candidate = by_variant["candidate"]["routes"]
+        self.assertEqual(candidate["q4_k_linear_reduce_rows"], [128, 0, 0, 0])
+        self.assertEqual(candidate["q6_linear_reduce_rows"], [1, 0, 0, 0])
+        self.assertEqual(candidate["lm_head_q4_q6_refine_dispatches"], 128)
+        self.assertEqual(candidate["lm_head_q4_k_repack_count"], 1)
+
+        log_path = out / "performance-candidate-01.log"
+        log_path.write_text(
+            log_path.read_text().replace(
+                "lm_head_q4_q6_refine_dispatches=128",
+                "lm_head_q4_q6_refine_dispatches=127",
+            )
+        )
+        with self.assertRaisesRegex(BenchmarkContractError, "lm-head Q4_K/Q6_K routes"):
+            build_summary(out)
+
+    def test_e2b_lm_head_repack_profile_uses_explicit_topology(self) -> None:
+        out = self.tmp / "lm-head-repack-e2b"
+        command = self.paired_command(out)
+        command.extend(
+            (
+                "--model-topology",
+                "e2b",
+                "--baseline-route-profile",
+                "pair_decode",
+                "--candidate-route-profile",
+                "lm_head_repack",
+                "--expected-pair-mmv-variant",
+                "nr4-nsg4",
+                "--common-env",
+                "FAKE_GEMMA4_TOPOLOGY=e2b",
+                "--baseline-env",
+                "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION=1",
+                "--candidate-env",
+                "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION=1",
+                "--candidate-env",
+                "TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK=q4_k",
+            )
+        )
+        completed = subprocess.run(command, text=True, capture_output=True, check=True)
+        self.assertIn("passed=True", completed.stdout)
+        summary = json.loads((out / "summary.json").read_text())
+        self.assertEqual(summary["metadata"]["model_topology"], "e2b")
+        candidate = next(
+            sample
+            for sample in summary["performance_samples"]
+            if sample["variant"] == "candidate" and sample["index"] == 1
+        )
+        routes = candidate["routes"]
+        self.assertEqual(routes["paged_1x"], 4_508)
+        self.assertEqual(routes["q4_linear_reduce_rows"], [13_440, 0, 0, 275])
+        self.assertEqual(routes["q4_mmv_variants"], [8_960, 4_480, 0, 0])
+        self.assertEqual(routes["q4_pair_activation_decode"], 4_480)
+        self.assertEqual(
+            routes["q4_pair_activation_policy"]["mmv_nr4_nsg4"], 4_480
+        )
+        self.assertEqual(routes["lm_head_q4_q6_refine_dispatches"], 128)
 
     def test_q4_mmv_workload_profile_proves_role_specific_override(self) -> None:
         out = self.tmp / "q4-mmv-workload"

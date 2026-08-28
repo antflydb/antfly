@@ -1457,10 +1457,10 @@ pub const TailCommandLowerer = struct {
 
     norm_resources: [3]ResourceUse = undefined,
     linear_resources: [3]ResourceUse = undefined,
-    argmax_resources: [2]ResourceUse = undefined,
+    argmax_resources: [4]ResourceUse = undefined,
     ops: [3]Op = undefined,
-    storage: BoundedPlan(3, 3, 8) = .{},
-    command_storage: BoundedGraphCommandPlan(3, 1, 8, 4, 8) = .{},
+    storage: BoundedPlan(3, 3, 10) = .{},
+    command_storage: BoundedGraphCommandPlan(3, 1, 10, 4, 10) = .{},
     scratch_sizes: [4]ScratchSlotSize = undefined,
     scratch_size_count: usize = 0,
     plan_view: PlanView = .{
@@ -1480,6 +1480,7 @@ pub const TailCommandLowerer = struct {
     pub const BuildOptions = struct {
         final_norm_slot: usize,
         lm_head_slot: usize,
+        lm_head_refine_slot: ?usize = null,
         source: usize,
         region: usize,
         hidden_size: usize = 0,
@@ -1499,10 +1500,17 @@ pub const TailCommandLowerer = struct {
             .{ .range = .whole(.quant_slot, options.lm_head_slot), .access = .read },
             .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.logits)), .access = .write },
         };
-        self.argmax_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.logits)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.token)), .access = .write },
-        };
+        self.argmax_resources[0] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.logits)), .access = .read };
+        self.argmax_resources[1] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.token)), .access = .write };
+        var argmax_resource_count: usize = 2;
+        if (options.lm_head_refine_slot) |refine_slot| {
+            // Candidate refinement reuses the normalized hidden row and reads
+            // the checkpoint-format head that backs the lossy nomination head.
+            self.argmax_resources[argmax_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read };
+            argmax_resource_count += 1;
+            self.argmax_resources[argmax_resource_count] = .{ .range = .whole(.quant_slot, refine_slot), .access = .read };
+            argmax_resource_count += 1;
+        }
         const lm_head_op = quantOp(options.quant_format, 1, options.hidden_size, options.vocab_size);
         self.ops = .{
             .{ .kind = .tail_final_norm, .source = options.source, .region = options.region, .resources = &self.norm_resources },
@@ -1514,7 +1522,7 @@ pub const TailCommandLowerer = struct {
                 .quant_matmul = lm_head_op.quant_matmul,
                 .operator_plan = lm_head_op.operator_plan,
             },
-            .{ .kind = .tail_argmax, .source = options.source, .region = options.region, .resources = &self.argmax_resources },
+            .{ .kind = .tail_argmax, .source = options.source, .region = options.region, .resources = self.argmax_resources[0..argmax_resource_count] },
         };
         self.addScratchSize(@intFromEnum(Resource.input), options.hidden_size * @sizeOf(f32));
         self.addScratchSize(@intFromEnum(Resource.normalized), options.hidden_size * @sizeOf(f32));
@@ -2986,6 +2994,30 @@ test "metal command planner handles row-1 tail dependency shape" {
         }
     }
     try std.testing.expect(found_logits);
+}
+
+test "metal command planner tracks lm-head refine dependencies" {
+    var tail_plan = TailCommandLowerer{};
+
+    try tail_plan.build(.{
+        .final_norm_slot = 8,
+        .lm_head_slot = 40,
+        .lm_head_refine_slot = 41,
+        .source = 8,
+        .region = 5,
+        .hidden_size = 2048,
+        .vocab_size = 262144,
+        .quant_format = .q4_k,
+    });
+
+    const command = tail_plan.commandView();
+    try std.testing.expectEqual(@as(usize, 10), command.resources.len);
+    try std.testing.expectEqual(@as(usize, 4), command.ops[2].resource_count);
+    const argmax_resources = command.resources[command.ops[2].resource_start..][0..command.ops[2].resource_count];
+    try std.testing.expectEqual(ResourceKind.scratch_slot, argmax_resources[2].range.kind);
+    try std.testing.expectEqual(@intFromEnum(TailCommandLowerer.Resource.normalized), argmax_resources[2].range.id);
+    try std.testing.expectEqual(ResourceKind.quant_slot, argmax_resources[3].range.kind);
+    try std.testing.expectEqual(@as(usize, 41), argmax_resources[3].range.id);
 }
 
 test "metal command planner appends graph command plans into a frame plan" {

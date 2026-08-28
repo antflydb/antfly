@@ -397,6 +397,10 @@ pub const DecoderRuntimePrepareLinearRequest = struct {
     /// prepare transforms (the opt-in Q4 repack) so shape heuristics cannot
     /// misfire on large FFN projections.
     lm_head: bool = false,
+    /// Optional slot that retains the checkpoint-format lm_head while `slot`
+    /// carries a lossy fast-path transform. Backends that do not implement
+    /// exact candidate refinement ignore it.
+    lm_head_refine_slot: ?usize = null,
     /// Stage this dense-BF16 slot to Q8_0 at prepare time (half the bytes,
     /// planned quant-MMV route instead of a dense encoder break).
     prefer_q8_over_dense_bf16: bool = false,

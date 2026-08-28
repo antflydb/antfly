@@ -805,6 +805,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_q6_k_linear_reduce_rows_9_64: u64 = 0,
     metal_runtime_q6_k_linear_reduce_rows_65_plus: u64 = 0,
     metal_runtime_q6_k_linear_reduce_f16_input: u64 = 0,
+    metal_runtime_lm_head_q4_q6_refine_dispatches: u64 = 0,
     /// Generated small-batch quant kernel dispatch counters indexed by
     /// [quant_matmul.GeneratedQuantFormatIndex][quant_matmul.GeneratedQuantEpilogueIndex].
     metal_runtime_antfly_generated_dispatch_counts: quant_matmul.GeneratedQuantDispatchCounts = quant_matmul.generated_quant_dispatch_counts_zero,

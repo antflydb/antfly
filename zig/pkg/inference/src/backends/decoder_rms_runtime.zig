@@ -148,6 +148,7 @@ pub const PrepareLinearNoBiasSlotOptions = struct {
     disable_mapped_quant_weight: bool = false,
     dense_fallback_max_bytes: ?usize = null,
     lm_head: bool = false,
+    lm_head_refine_slot: ?usize = null,
     prefer_q8_over_dense_bf16: bool = false,
 };
 
@@ -204,6 +205,7 @@ pub fn prepareLinearNoBiasSlotWithOptions(
             .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
             .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
             .lm_head = options.lm_head,
+            .lm_head_refine_slot = options.lm_head_refine_slot,
             .prefer_q8_over_dense_bf16 = options.prefer_q8_over_dense_bf16,
         });
         const finished_at = monotonicNowNs();
@@ -226,6 +228,7 @@ pub fn prepareLinearNoBiasSlotWithOptions(
         .disable_mapped_quant_weight = options.disable_mapped_quant_weight,
         .dense_fallback_max_bytes = options.dense_fallback_max_bytes,
         .lm_head = options.lm_head,
+        .lm_head_refine_slot = options.lm_head_refine_slot,
         .prefer_q8_over_dense_bf16 = options.prefer_q8_over_dense_bf16,
     });
     const finished_at = monotonicNowNs();

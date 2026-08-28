@@ -21363,10 +21363,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.hidden_size,
                 request.vocab_size,
             ) orelse break :final_tail_blk;
+            const tail_refine_slot = metal_runtime.exactLmHeadLinearSlot(
+                self.provider_impl,
+                request.final_lm_head_slot,
+                request.hidden_size,
+                request.vocab_size,
+            );
             var tail_plan_storage = metal_command_planner.TailCommandLowerer{};
             tail_plan_storage.build(.{
                 .final_norm_slot = request.final_norm_slot,
                 .lm_head_slot = request.final_lm_head_slot,
+                .lm_head_refine_slot = tail_refine_slot,
                 .source = @intFromEnum(metal_runtime.ComputeSource.tail),
                 .region = @intFromEnum(metal_runtime.ComputeRegion.tail),
                 .hidden_size = request.hidden_size,
@@ -23295,6 +23302,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q6_k_linear_reduce_rows_9_64 = runtime_stats.q6_k_linear_reduce_rows_9_64;
         stats.metal_runtime_q6_k_linear_reduce_rows_65_plus = runtime_stats.q6_k_linear_reduce_rows_65_plus;
         stats.metal_runtime_q6_k_linear_reduce_f16_input = runtime_stats.q6_k_linear_reduce_f16_input;
+        stats.metal_runtime_lm_head_q4_q6_refine_dispatches = runtime_stats.lm_head_q4_q6_refine_dispatches;
         const provider_generated_stats = metal_runtime.providerGeneratedQuantSnapshot(self.provider_impl.raw_provider);
         for (
             &stats.metal_runtime_antfly_generated_dispatch_counts,
@@ -23628,6 +23636,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .disable_mapped_quant_weight = request.disable_mapped_quant_weight,
             .dense_fallback_max_bytes = request.dense_fallback_max_bytes,
             .lm_head = request.lm_head,
+            .lm_head_refine_slot = request.lm_head_refine_slot,
             .prefer_q8_over_dense_bf16 = request.prefer_q8_over_dense_bf16,
             .allow_direct_quant_fallback = request.allow_direct_quant_fallback,
             .prefer_bf16_fallback = request.prefer_bf16_fallback,

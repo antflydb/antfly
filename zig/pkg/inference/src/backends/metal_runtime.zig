@@ -4160,10 +4160,17 @@ pub fn decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self: anytype, request: any
         const quant_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, request.linear_slot, request.hidden_size, request.out_dim);
         const format = metalQuantFormatForKind(quant_kind);
         if (format == .unsupported) return false;
+        var refine_linear_slot: usize = std.math.maxInt(usize);
+        if (exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim)) |slot| {
+            if (quant_kind != .q4_k or
+                ensureQuantizedRuntimeLinearSlotPrepared(self, slot, request.hidden_size, request.out_dim) != .q6_k) return false;
+            refine_linear_slot = slot;
+        }
         const rc = termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argmax_device(
             runtime,
             request.norm_slot,
             request.linear_slot,
+            refine_linear_slot,
             @intFromEnum(format),
             request.input.deviceHandle(),
             request.input.deviceByteOffset(),
@@ -4215,7 +4222,8 @@ pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: any
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
     if (!request.input.isDevice()) return null;
-    const quant_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, request.linear_slot, request.hidden_size, request.out_dim);
+    const effective_slot = exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim) orelse request.linear_slot;
+    const quant_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, effective_slot, request.hidden_size, request.out_dim);
     const format = metalQuantFormatForKind(quant_kind);
     if (format == .unsupported) return null;
     const planned_layer_contract: ops.PlannedLayerContract = if (@hasField(@TypeOf(request), "planned_layer_contract")) request.planned_layer_contract else .{};
@@ -4224,7 +4232,7 @@ pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: any
     const rc = termite_metal_decode_runtime_encode_rms_norm_quantized_linear_logits_device(
         runtime,
         request.norm_slot,
-        request.linear_slot,
+        effective_slot,
         @intFromEnum(format),
         request.input.deviceHandle(),
         request.input.deviceByteOffset(),
@@ -7793,10 +7801,14 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
     const rows = @as(usize, @intCast(request.input.dim(0)));
     if (rows == 0) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.in_dim) return null;
+    // Generic/full-logit consumers (sampling, MTP verification, diagnostics)
+    // retain checkpoint semantics. Only the planned greedy tail uses the
+    // transformed slot plus exact candidate refinement.
+    const effective_slot = exactLmHeadLinearSlot(self, request.slot, request.in_dim, request.out_dim) orelse request.slot;
 
     if (try tryApplyQuantizedRuntimeLinear(
         self,
-        request.slot,
+        effective_slot,
         request.input,
         rows,
         request.in_dim,
@@ -7804,7 +7816,7 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
     )) |tensor| return tensor;
     if (try tryApplyDenseRuntimeLinear(
         self,
-        request.slot,
+        effective_slot,
         request.input,
         rows,
         request.in_dim,
@@ -7815,7 +7827,7 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
     const output = try std.heap.c_allocator.alloc(f32, request.out_dim);
     errdefer std.heap.c_allocator.free(output);
     var input = request.input;
-    if (!(try tryRawLinearHost(self, request.slot, try tensorHostConstPtr(&input), request.in_dim, request.out_dim, output.ptr))) {
+    if (!(try tryRawLinearHost(self, effective_slot, try tensorHostConstPtr(&input), request.in_dim, request.out_dim, output.ptr))) {
         std.heap.c_allocator.free(output);
         return null;
     }
@@ -7871,22 +7883,23 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
     if (request.input.ndim() != 2) return null;
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
+    const effective_slot = exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim) orelse request.linear_slot;
 
-    if (self.raw_linear_slot_kinds[request.linear_slot] == .quantized) {
+    if (self.raw_linear_slot_kinds[effective_slot] == .quantized) {
         if (frame_active) return null;
         const direct_output = try std.heap.c_allocator.alloc(f32, request.out_dim);
         errdefer std.heap.c_allocator.free(direct_output);
         var request_input = request.input;
         const direct_rc: c_int = switch (ensureQuantizedRuntimeLinearSlotPrepared(
             self,
-            request.linear_slot,
+            effective_slot,
             request.hidden_size,
             request.out_dim,
         )) {
             .q4_k => termite_metal_decode_runtime_apply_rms_norm_q4_k_linear_slot(
                 runtime,
                 request.norm_slot,
-                request.linear_slot,
+                effective_slot,
                 try tensorHostConstPtr(&request_input),
                 request.hidden_size,
                 request.eps,
@@ -7896,7 +7909,7 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
             .q5_k => termite_metal_decode_runtime_apply_rms_norm_q5_k_linear_slot(
                 runtime,
                 request.norm_slot,
-                request.linear_slot,
+                effective_slot,
                 try tensorHostConstPtr(&request_input),
                 request.hidden_size,
                 request.eps,
@@ -8161,17 +8174,68 @@ pub fn decoderRuntimePrepareLinear(self: anytype, request: anytype, stats: anyty
         const request_is_lm_head = if (@hasField(@TypeOf(request), "lm_head")) request.lm_head else false;
         if (request_is_lm_head and request.out_dim >= lm_head_q4_repack_min_out_dim) repack: {
             const target = lmHeadQ4RepackFormat() orelse break :repack;
-            if (try makeRuntimeQ4StorageFromQ6K(storage, request.in_dim, request.out_dim, target)) |q4k_storage| {
-                errdefer {
-                    q4k_storage.deinit();
-                    std.heap.c_allocator.destroy(q4k_storage);
+            const refine_slot = if (@hasField(@TypeOf(request), "lm_head_refine_slot"))
+                request.lm_head_refine_slot
+            else
+                null;
+            // Q4_K is admitted only with an exact checkpoint-format companion.
+            // Q4_0 remains an explicitly warned evidence-only configuration.
+            if (target == .Q4_K) {
+                if (!typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots") or
+                    refine_slot == null or
+                    refine_slot.? >= decoder_runtime_linear_slot_capacity or
+                    refine_slot.? == request.slot or
+                    self.raw_linear_slots_prepared[refine_slot.?]) break :repack;
+                if (termite_metal_decode_runtime_lm_head_q4_q6_refine_ready(runtime) == 0) {
+                    std.log.warn("lm_head Q4_K repack requested but refine pipelines are unavailable; preserving checkpoint Q6_K head", .{});
+                    break :repack;
+                }
+            }
+            const maybe_q4_storage = makeRuntimeQ4StorageFromQ6K(
+                storage,
+                request.in_dim,
+                request.out_dim,
+                target,
+            ) catch |err| {
+                std.log.warn("lm_head {s} repack failed ({s}); preserving checkpoint Q6_K head", .{ @tagName(target), @errorName(err) });
+                break :repack;
+            };
+            if (maybe_q4_storage) |created_q4_storage| {
+                var q4_storage_owner: ?*QuantizedStorage = created_q4_storage;
+                defer if (q4_storage_owner) |owned| {
+                    owned.deinit();
+                    std.heap.c_allocator.destroy(owned);
+                };
+                var exact_storage_owner: ?*QuantizedStorage = null;
+                defer if (exact_storage_owner) |owned| {
+                    owned.deinit();
+                    std.heap.c_allocator.destroy(owned);
+                };
+                if (target == .Q4_K) {
+                    exact_storage_owner = dupQuantizedStorage(storage) catch |err| {
+                        std.log.warn("lm_head Q4_K refine copy failed ({s}); preserving checkpoint Q6_K head", .{@errorName(err)});
+                        break :repack;
+                    };
+                }
+                if (exact_storage_owner) |owned| {
+                    const exact_slot = refine_slot.?;
+                    clearRawLinearSlot(self, exact_slot);
+                    self.raw_linear_slot_quantized_storage[exact_slot] = owned;
+                    exact_storage_owner = null;
+                    setRuntimeQuantMappedDisabled(self, exact_slot, disable_mapped_quant_weight);
+                    self.raw_linear_slot_kinds[exact_slot] = .quantized;
+                    self.raw_linear_slots_prepared[exact_slot] = true;
+                    self.raw_linear_slot_in_dims[exact_slot] = request.in_dim;
+                    self.raw_linear_slot_out_dims[exact_slot] = request.out_dim;
+                    setLmHeadRefineSlot(self, request.slot, exact_slot);
                 }
                 std.log.info(
-                    "lm_head {s} repack: slot={d} rows={d} cols={d} bytes {d} -> {d}",
-                    .{ @tagName(target), request.slot, request.out_dim, request.in_dim, storage.raw_bytes.len, q4k_storage.raw_bytes.len },
+                    "lm_head {s} repack: slot={d} refine_slot={?d} rows={d} cols={d} bytes {d} -> {d}",
+                    .{ @tagName(target), request.slot, refine_slot, request.out_dim, request.in_dim, storage.raw_bytes.len, q4_storage_owner.?.raw_bytes.len },
                 );
                 stats.decoder_runtime_prepare_linear_calls += 1;
-                self.raw_linear_slot_quantized_storage[request.slot] = q4k_storage;
+                self.raw_linear_slot_quantized_storage[request.slot] = q4_storage_owner.?;
+                q4_storage_owner = null;
                 setRuntimeQuantMappedDisabled(self, request.slot, disable_mapped_quant_weight);
                 self.raw_linear_slot_kinds[request.slot] = .quantized;
                 self.raw_linear_slots_prepared[request.slot] = true;
@@ -8463,10 +8527,10 @@ fn makeRuntimeRepackedStorageFromOwnedBytes(
     return owned;
 }
 
-/// Opt-in vocab-tail byte reduction: requantize a Q6_K lm_head slot to Q4_K
-/// at prepare time (6.5625 -> 4.5 bits/weight, ~-172 MB per decoded token on
-/// the Gemma4 E4B head). Head-only precision change; stays opt-in until the
-/// quality eval suite qualifies a default.
+/// Opt-in vocab-tail bandwidth reduction: a Q4_K copy nominates greedy token
+/// candidates and the retained checkpoint Q6_K head re-scores them. Full-logit
+/// and sampling callers keep using Q6_K. The extra copy raises resident memory,
+/// so this remains opt-in pending broader quality and deployment qualification.
 fn lmHeadQ4RepackFormat() ?gguf_tensor_types.KnownTensorType {
     if (comptime @import("builtin").os.tag == .freestanding) return null;
     const c_std = @cImport(@cInclude("stdlib.h"));
@@ -8519,13 +8583,14 @@ fn makeRuntimeQ4StorageFromQ6K(
     const q6k_block_bytes = gguf_tensor_types.bytesPerBlock(.{ .known = .Q6_K }) orelse return null;
     if (in_dim == 0 or out_dim == 0 or
         in_dim % target_values_per_block != 0 or in_dim % q6k_values_per_block != 0) return null;
-    const source_row_bytes = (in_dim / q6k_values_per_block) * q6k_block_bytes;
+    const source_row_bytes = std.math.mul(usize, in_dim / q6k_values_per_block, q6k_block_bytes) catch return null;
     const source_bytes = std.math.mul(usize, out_dim, source_row_bytes) catch return null;
     if (storage.raw_bytes.len < source_bytes) return null;
 
     const blocks_per_row = in_dim / target_values_per_block;
-    const repacked_row_bytes = blocks_per_row * target_block_bytes;
-    const repacked = try std.heap.c_allocator.alloc(u8, out_dim * repacked_row_bytes);
+    const repacked_row_bytes = std.math.mul(usize, blocks_per_row, target_block_bytes) catch return null;
+    const repacked_bytes = std.math.mul(usize, out_dim, repacked_row_bytes) catch return null;
+    const repacked = try std.heap.c_allocator.alloc(u8, repacked_bytes);
     const row_values = std.heap.c_allocator.alloc(f32, in_dim) catch |err| {
         std.heap.c_allocator.free(repacked);
         return err;
@@ -9866,6 +9931,7 @@ pub const RawRuntimeMemoryStats = extern struct {
     q6_k_linear_reduce_rows_9_64: u64 = 0,
     q6_k_linear_reduce_rows_65_plus: u64 = 0,
     q6_k_linear_reduce_f16_input: u64 = 0,
+    lm_head_q4_q6_refine_dispatches: u64 = 0,
     // Mirrors `uint64_t antfly_generated_dispatch_counts[12][4]` in
     // termite_metal_decode_runtime_memory_stats (metal_kernels.m); the extern
     // layout must stay in lockstep with the C struct.
@@ -15344,6 +15410,7 @@ pub extern fn termite_metal_provider_destroy(provider: ?*RawMetalProvider) void;
 pub extern fn termite_metal_decode_runtime_create() ?*RawMetalDecodeRuntime;
 pub extern fn termite_metal_decode_runtime_destroy(runtime: ?*RawMetalDecodeRuntime) void;
 pub extern fn termite_metal_decode_runtime_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
+pub extern fn termite_metal_decode_runtime_lm_head_q4_q6_refine_ready(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_reserve(runtime: ?*RawMetalDecodeRuntime, scratch_bytes: usize, token_bytes: usize) c_int;
 pub extern fn termite_metal_decode_runtime_begin_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
 pub extern fn termite_metal_decode_runtime_begin_prepared_frame(runtime: ?*RawMetalDecodeRuntime) c_int;
@@ -17481,6 +17548,7 @@ pub extern fn termite_metal_decode_runtime_encode_rms_norm_quantized_linear_argm
     runtime: ?*RawMetalDecodeRuntime,
     norm_slot: usize,
     linear_slot: usize,
+    refine_linear_slot: usize,
     format: u32,
     input_handle: ?*anyopaque,
     input_offset: usize,
@@ -20214,6 +20282,54 @@ fn typeHasField(comptime T: type, comptime field_name: []const u8) bool {
     };
 }
 
+fn lmHeadRefineSlot(self: anytype, main_slot: usize) ?usize {
+    if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots")) {
+        if (main_slot < @field(self, "raw_linear_slot_lm_head_refine_slots").len) {
+            return @field(self, "raw_linear_slot_lm_head_refine_slots")[main_slot];
+        }
+    }
+    return null;
+}
+
+fn setLmHeadRefineSlot(self: anytype, main_slot: usize, refine_slot: usize) void {
+    if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots")) {
+        if (main_slot < @field(self, "raw_linear_slot_lm_head_refine_slots").len) {
+            @field(self, "raw_linear_slot_lm_head_refine_slots")[main_slot] = refine_slot;
+        }
+    }
+}
+
+fn clearLmHeadRefineSlotMapping(self: anytype, main_slot: usize) ?usize {
+    if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots")) {
+        if (main_slot < @field(self, "raw_linear_slot_lm_head_refine_slots").len) {
+            const previous = @field(self, "raw_linear_slot_lm_head_refine_slots")[main_slot];
+            @field(self, "raw_linear_slot_lm_head_refine_slots")[main_slot] = null;
+            return previous;
+        }
+    }
+    return null;
+}
+
+pub fn exactLmHeadLinearSlot(self: anytype, main_slot: usize, in_dim: usize, out_dim: usize) ?usize {
+    const refine_slot = lmHeadRefineSlot(self, main_slot) orelse return null;
+    if (main_slot >= decoder_runtime_linear_slot_capacity or
+        refine_slot >= decoder_runtime_linear_slot_capacity or
+        refine_slot == main_slot) return null;
+    if (!self.raw_linear_slots_prepared[main_slot] or
+        !self.raw_linear_slots_prepared[refine_slot]) return null;
+    if (self.raw_linear_slot_kinds[main_slot] != .quantized or
+        self.raw_linear_slot_kinds[refine_slot] != .quantized) return null;
+    if (self.raw_linear_slot_in_dims[main_slot] != in_dim or
+        self.raw_linear_slot_out_dims[main_slot] != out_dim or
+        self.raw_linear_slot_in_dims[refine_slot] != in_dim or
+        self.raw_linear_slot_out_dims[refine_slot] != out_dim) return null;
+    const main_storage = self.raw_linear_slot_quantized_storage[main_slot] orelse return null;
+    const refine_storage = self.raw_linear_slot_quantized_storage[refine_slot] orelse return null;
+    if (quantizedRuntimeLinearKind(main_storage) != .q4_k or
+        quantizedRuntimeLinearKind(refine_storage) != .q6_k) return null;
+    return refine_slot;
+}
+
 fn setRuntimeQuantPrepareMode(self: anytype, slot: usize, mode: RawQuantizedRuntimeLinearStorageMode) void {
     if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_runtime_prepared_modes")) {
         if (slot < @field(self, "raw_linear_slot_runtime_prepared_modes").len) {
@@ -20952,7 +21068,7 @@ pub fn releaseRawLinearSlot(self: anytype, slot: usize) void {
     }
 }
 
-pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+fn clearRawLinearSlotStorage(self: anytype, slot: usize) void {
     if (comptime @hasField(@TypeOf(self.*), "deberta_relative_projection_cache")) {
         while (!self.deberta_relative_projection_cache_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.deberta_relative_projection_cache_mutex.unlock();
@@ -20971,6 +21087,29 @@ pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
     setRuntimeQuantMappedDisabled(self, slot, false);
     setRuntimeQuantPrepareMode(self, slot, .none);
     self.raw_linear_slots_prepared[slot] = false;
+}
+
+pub fn clearRawLinearSlot(self: anytype, slot: usize) void {
+    const refine_slot = clearLmHeadRefineSlotMapping(self, slot);
+    if (comptime typeHasField(@TypeOf(self), "raw_linear_slot_lm_head_refine_slots")) {
+        for (&@field(self, "raw_linear_slot_lm_head_refine_slots"), 0..) |*mapped_slot, main_slot| {
+            if (mapped_slot.* == slot) {
+                mapped_slot.* = null;
+                // A lossy main slot must never survive without its exact
+                // companion. This also makes direct refine-slot teardown safe.
+                if (main_slot != slot and main_slot < decoder_runtime_linear_slot_capacity) {
+                    clearRawLinearSlotStorage(self, main_slot);
+                }
+            }
+        }
+    }
+    clearRawLinearSlotStorage(self, slot);
+    if (refine_slot) |exact_slot| {
+        if (exact_slot < decoder_runtime_linear_slot_capacity and exact_slot != slot) {
+            _ = clearLmHeadRefineSlotMapping(self, exact_slot);
+            clearRawLinearSlotStorage(self, exact_slot);
+        }
+    }
 }
 
 pub fn releaseRawLayerNormSlot(self: anytype, slot: usize) void {
