@@ -640,53 +640,26 @@ fn applyManifestNativeRestore(
         "antfly-lsm-checkpoint",
     );
 
+    // Primary and small durable metadata come first. They let the restored
+    // catalog classify config/incarnation/checkpoint compatibility before any
+    // projection corpus bytes are requested from remote storage.
     for (generation.value().artifacts) |artifact| {
-        try restore.cancellation.check();
-        const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
-            shard.snapshot_path,
-            artifact.path,
-        });
-        defer alloc.free(source_path);
-        const materialized_path = if (artifact.role == .primary and physical_primary)
-            artifact.path["primary-lsm/".len..]
-        else
-            artifact.path;
-        const destination_root = if (artifact.role == .primary and !physical_primary)
-            logical_primary_root
-        else
-            staged_path;
-        const destination_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{
-            destination_root,
-            materialized_path,
-        });
-        defer alloc.free(destination_path);
-        backups_api.copyFileFromLocationVerifiedUsingIo(
+        if (artifact.role == .projection) continue;
+        try copyNativeManifestArtifact(
             alloc,
             io,
+            restore,
             location,
-            source_path,
-            destination_path,
-            artifact.size_bytes,
-            artifact.sha256,
-            restore.cancellation,
-        ) catch |err| switch (err) {
-            error.FileNotFound => {
-                if (artifact.role != .projection) return error.NativeBackupArtifactMissing;
-                try generation.invalidateProjection(artifact.projection_name, .missing_artifact);
-                continue;
-            },
-            error.BackupArtifactIntegrityMismatch => {
-                if (artifact.role != .projection) return error.NativeBackupArtifactIntegrityMismatch;
-                try generation.invalidateProjection(artifact.projection_name, .integrity_mismatch);
-                continue;
-            },
-            else => return err,
-        };
+            shard.snapshot_path,
+            staged_path,
+            logical_primary_root,
+            physical_primary,
+            artifact,
+        );
     }
-    try generation.discardInvalidProjectionArtifacts(io, staged_path);
 
-    std.log.info("native restore staged generation phase=materialization", .{});
-    try db_mod.DB.restoreMaterializedNativeGenerationToDeferredRuntimeRepairWithIoAndCancellation(
+    std.log.info("native restore staged generation phase=primary_validation", .{});
+    try db_mod.DB.restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(
         staged_generation,
         alloc,
         io,
@@ -708,6 +681,87 @@ fn applyManifestNativeRestore(
         &generation,
         restore.cancellation,
     );
+
+    // Transfer only artifact groups which survived static and restored-catalog
+    // planning. A single missing/corrupt member invalidates its projection and
+    // causes every later member of that group to be skipped.
+    for (generation.value().artifacts) |artifact| {
+        if (artifact.role != .projection or generation.projectionInvalid(artifact.projection_name)) continue;
+        copyNativeManifestArtifact(
+            alloc,
+            io,
+            restore,
+            location,
+            shard.snapshot_path,
+            staged_path,
+            logical_primary_root,
+            physical_primary,
+            artifact,
+        ) catch |err| switch (err) {
+            error.NativeBackupArtifactMissing => {
+                try generation.invalidateProjection(artifact.projection_name, .missing_artifact);
+            },
+            error.NativeBackupArtifactIntegrityMismatch => {
+                try generation.invalidateProjection(artifact.projection_name, .integrity_mismatch);
+            },
+            else => return err,
+        };
+    }
+    try generation.discardInvalidProjectionArtifacts(io, staged_path);
+
+    std.log.info("native restore staged generation phase=physical_validation", .{});
+    try db_mod.DB.finishMaterializedNativeGenerationWithIo(
+        staged_generation,
+        alloc,
+        io,
+        staged_path,
+        .{
+            .identity_namespace = options.expected_identity_namespace,
+            .backend_runtime = restore.backend_runtime,
+        },
+        &generation,
+        true,
+    );
+}
+
+fn copyNativeManifestArtifact(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    restore: RestoreSource,
+    location: *backups_api.BackupLocation,
+    snapshot_path: []const u8,
+    staged_path: []const u8,
+    logical_primary_root: []const u8,
+    physical_primary: bool,
+    artifact: db_mod.native_backup.Artifact,
+) !void {
+    try restore.cancellation.check();
+    const source_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_path, artifact.path });
+    defer alloc.free(source_path);
+    const materialized_path = if (artifact.role == .primary and physical_primary)
+        artifact.path["primary-lsm/".len..]
+    else
+        artifact.path;
+    const destination_root = if (artifact.role == .primary and !physical_primary)
+        logical_primary_root
+    else
+        staged_path;
+    const destination_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ destination_root, materialized_path });
+    defer alloc.free(destination_path);
+    backups_api.copyFileFromLocationVerifiedUsingIo(
+        alloc,
+        io,
+        location,
+        source_path,
+        destination_path,
+        artifact.size_bytes,
+        artifact.sha256,
+        restore.cancellation,
+    ) catch |err| switch (err) {
+        error.FileNotFound => return error.NativeBackupArtifactMissing,
+        error.BackupArtifactIntegrityMismatch => return error.NativeBackupArtifactIntegrityMismatch,
+        else => return err,
+    };
 }
 
 fn sha256Matches(bytes: []const u8, expected: []const u8) bool {

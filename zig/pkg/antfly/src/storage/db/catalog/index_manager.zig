@@ -19,6 +19,7 @@ const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
 const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
@@ -3593,6 +3594,16 @@ pub const IndexManager = struct {
             staging_root: []const u8,
             cancellation: CancellationToken,
         ) !u64 {
+            return try self.materializeWithSink(io, staging_root, cancellation, null);
+        }
+
+        pub fn materializeWithSink(
+            self: *const NativeBackupCheckpoints,
+            io: std.Io,
+            staging_root: []const u8,
+            cancellation: CancellationToken,
+            sink: ?native_artifact_sink.Sink,
+        ) !u64 {
             var total: u64 = 0;
             const indexes_root = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{staging_root});
             defer self.alloc.free(indexes_root);
@@ -3605,12 +3616,13 @@ pub const IndexManager = struct {
                     try std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}", .{ indexes_root, artifact.index_name, artifact.backend_root });
                 defer self.alloc.free(destination);
                 const copied = switch (artifact.checkpoint) {
-                    .lsm => |*checkpoint| try checkpoint.materialize(io, destination, cancellation),
-                    .text_segments => |*checkpoint| try checkpoint.materialize(
+                    .lsm => |*checkpoint| try checkpoint.materializeWithSink(io, destination, cancellation, sink),
+                    .text_segments => |*checkpoint| try checkpoint.materializeWithSink(
                         self.alloc,
                         io,
                         destination,
                         cancellation,
+                        sink,
                     ),
                 };
                 total = std.math.add(u64, total, copied) catch return error.FileTooBig;

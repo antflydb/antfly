@@ -39,6 +39,7 @@ const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("../common/fs_paths.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
+const native_artifact_sink = @import("native_artifact_sink.zig");
 
 const State = state_mod.State;
 const ActiveMemTable = state_mod.ActiveMemTable;
@@ -210,7 +211,7 @@ const RunSnapshotRefRegistry = struct {
 
 var run_snapshot_refs = RunSnapshotRefRegistry{};
 
-fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8) !u64 {
+fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8, sink: ?native_artifact_sink.Sink) !u64 {
     if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(io, parent);
     var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
     defer file.close(io);
@@ -219,6 +220,11 @@ fn writeCheckpointBytes(io: std.Io, path: []const u8, bytes: []const u8) !u64 {
     try writer.interface.writeAll(bytes);
     try writer.end();
     try file.sync(io);
+    if (sink) |active| {
+        var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+        native_artifact_sink.Sha256.hash(bytes, &digest, .{});
+        try active.record(path, @intCast(bytes.len), digest);
+    }
     return @intCast(bytes.len);
 }
 
@@ -229,23 +235,31 @@ fn copyCheckpointStorageFile(
     source: []const u8,
     destination: []const u8,
     cancellation: CancellationToken,
+    sink: ?native_artifact_sink.Sink,
 ) !u64 {
     if (std.fs.path.dirname(destination)) |parent| try fs_paths.createDirPathPortable(io, parent);
     const size = try storage.fileSize(source);
     var file = try fs_paths.createFilePortable(io, destination, .{ .truncate = true });
     defer file.close(io);
     var buffer: [256 * 1024]u8 = undefined;
+    var hasher = native_artifact_sink.Sha256.init(.{});
     var offset: u64 = 0;
     while (offset < size) {
         try cancellation.check();
         const len: usize = @intCast(@min(size - offset, buffer.len));
         try storage.readFileRangeInto(allocator, source, offset, buffer[0..len]);
         try file.writePositionalAll(io, buffer[0..len], offset);
+        hasher.update(buffer[0..len]);
         offset += len;
     }
     try cancellation.check();
     if (try storage.fileSize(source) != size) return error.SourceFileChanged;
     try file.sync(io);
+    if (sink) |active| {
+        var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        try active.record(destination, size, digest);
+    }
     return size;
 }
 
@@ -1800,11 +1814,21 @@ pub const Backend = struct {
             destination_root: []const u8,
             cancellation: CancellationToken,
         ) !u64 {
+            return try self.materializeWithSink(io, destination_root, cancellation, null);
+        }
+
+        pub fn materializeWithSink(
+            self: *const NativeCheckpoint,
+            io: std.Io,
+            destination_root: []const u8,
+            cancellation: CancellationToken,
+            sink: ?native_artifact_sink.Sink,
+        ) !u64 {
             try cancellation.check();
             try fs_paths.createDirPathPortable(io, destination_root);
             const manifest_path = try std.fmt.allocPrint(self.allocator, "{s}/manifest.bin", .{destination_root});
             defer self.allocator.free(manifest_path);
-            var total = try writeCheckpointBytes(io, manifest_path, self.manifest_bytes);
+            var total = try writeCheckpointBytes(io, manifest_path, self.manifest_bytes, sink);
             for (self.run_paths, self.run_ids) |source, run_id| {
                 try cancellation.check();
                 const destination = try std.fmt.allocPrint(self.allocator, "{s}/runs/{d}.tbl", .{ destination_root, run_id });
@@ -1819,6 +1843,7 @@ pub const Backend = struct {
                         source,
                         destination,
                         cancellation,
+                        sink,
                     ),
                 ) catch return error.FileTooBig;
             }

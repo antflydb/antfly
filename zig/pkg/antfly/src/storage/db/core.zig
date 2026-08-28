@@ -37,6 +37,7 @@ const shard_mod = @import("../shard.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const ttl_mod = @import("../ttl.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const native_artifact_sink = @import("../native_artifact_sink.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
@@ -2113,6 +2114,17 @@ const LogicalPinnedStoreSnapshot = struct {
         snapshot_root: []const u8,
         cancellation: types.CancellationToken,
     ) !u64 {
+        return try self.materializeWithSink(alloc, io, snapshot_root, cancellation, null);
+    }
+
+    fn materializeWithSink(
+        self: *LogicalPinnedStoreSnapshot,
+        alloc: Allocator,
+        io: std.Io,
+        snapshot_root: []const u8,
+        cancellation: types.CancellationToken,
+        sink: ?native_artifact_sink.Sink,
+    ) !u64 {
         try cancellation.check();
         const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, store_snapshot_file_name });
         defer alloc.free(snapshot_path);
@@ -2121,6 +2133,8 @@ const LogicalPinnedStoreSnapshot = struct {
         var writer_buffer: [256 * 1024]u8 = undefined;
         var writer = file.writer(io, &writer_buffer);
         try writer.interface.writeAll(store_snapshot_v2_magic);
+        var hasher = native_artifact_sink.Sha256.init(.{});
+        hasher.update(store_snapshot_v2_magic);
         var total: u64 = store_snapshot_v2_magic.len;
 
         var cursor = try self.txn.openCursor();
@@ -2134,12 +2148,20 @@ const LogicalPinnedStoreSnapshot = struct {
             try writer.interface.writeAll(&lengths);
             try writer.interface.writeAll(kv.key);
             try writer.interface.writeAll(kv.value);
+            hasher.update(&lengths);
+            hasher.update(kv.key);
+            hasher.update(kv.value);
             total = std.math.add(u64, total, 16 + @as(u64, @intCast(kv.key.len)) + @as(u64, @intCast(kv.value.len))) catch
                 return error.SnapshotTooLarge;
         }
         try cancellation.check();
         try writer.end();
         try file.sync(io);
+        if (sink) |active| {
+            var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+            hasher.final(&digest);
+            try active.record(snapshot_path, total, digest);
+        }
         try fs_paths.syncDirPortable(io, snapshot_root);
         return total;
     }
@@ -2164,12 +2186,23 @@ pub const PinnedStoreSnapshot = union(enum) {
         snapshot_root: []const u8,
         cancellation: types.CancellationToken,
     ) !u64 {
+        return try self.materializeWithSink(alloc, io, snapshot_root, cancellation, null);
+    }
+
+    pub fn materializeWithSink(
+        self: *PinnedStoreSnapshot,
+        alloc: Allocator,
+        io: std.Io,
+        snapshot_root: []const u8,
+        cancellation: types.CancellationToken,
+        sink: ?native_artifact_sink.Sink,
+    ) !u64 {
         return switch (self.*) {
-            .logical => |*snapshot| try snapshot.materialize(alloc, io, snapshot_root, cancellation),
+            .logical => |*snapshot| try snapshot.materializeWithSink(alloc, io, snapshot_root, cancellation, sink),
             .lsm => |*snapshot| blk: {
                 const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, primary_lsm_checkpoint_directory_name });
                 defer alloc.free(destination);
-                break :blk try snapshot.materialize(io, destination, cancellation);
+                break :blk try snapshot.materializeWithSink(io, destination, cancellation, sink);
             },
         };
     }

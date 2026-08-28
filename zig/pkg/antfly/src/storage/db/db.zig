@@ -15819,24 +15819,31 @@ pub const DB = struct {
                 if (hook.before_artifact_materialize) |run| run(hook.ptr);
             }
         }
-        var total = try generated_checkpoints.materialize(io, staging_root, cancellation);
+        var artifact_receipts = native_backup.ArtifactReceiptCollector.init(
+            self.alloc,
+            staging_root,
+            projections,
+        );
+        defer artifact_receipts.deinit();
+        const receipt_sink = artifact_receipts.sink();
+        var total = try generated_checkpoints.materializeWithSink(io, staging_root, cancellation, receipt_sink);
         total = std.math.add(
             u64,
             total,
-            try generated_metadata.materialize(staging_root, cancellation),
+            try generated_metadata.materializeWithSink(staging_root, cancellation, receipt_sink),
         ) catch return error.FileTooBig;
-        total = std.math.add(u64, total, try primary_snapshot.materialize(
+        total = std.math.add(u64, total, try primary_snapshot.materializeWithSink(
             self.alloc,
             io,
             staging_root,
             cancellation,
+            receipt_sink,
         )) catch return error.FileTooBig;
-        total = std.math.add(u64, total, try native_backup.finalizeCaptureGenerationWithCancellation(
+        total = std.math.add(u64, total, try native_backup.finalizeCaptureGenerationFromReceiptsWithCancellation(
             self.alloc,
             io,
-            staging_root,
+            &artifact_receipts,
             capture_target_sequence,
-            projections,
             .{
                 .artifact_format = primary_snapshot.artifactFormat(),
                 .artifact_version = primary_snapshot.artifactVersion(),
@@ -16055,8 +16062,50 @@ pub const DB = struct {
         native_generation: *native_backup.LoadedManifest,
         cancellation: types.CancellationToken,
     ) !void {
+        // Tree-materialized callers may already contain every projection.
+        // Remove statically incompatible physical codecs before opening the
+        // staged catalog; the manifest-first remote planner calls the primary
+        // phase directly and has not downloaded these groups yet.
+        try classifyIncompatibleNativeProjections(native_generation, opts);
+        try native_generation.discardInvalidProjectionArtifacts(io, path);
+        try restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(
+            staged_generation,
+            alloc,
+            io,
+            primary_snapshot_root,
+            path,
+            opts,
+            identity,
+            native_generation,
+            cancellation,
+        );
+        try finishMaterializedNativeGenerationWithIo(
+            staged_generation,
+            alloc,
+            io,
+            path,
+            opts,
+            native_generation,
+            true,
+        );
+    }
+
+    /// Restores only the primary and small generation metadata, then uses the
+    /// restored catalog to decide which projection artifact groups are worth
+    /// transferring. No physical projection corpus is required by this phase.
+    pub fn restoreMaterializedNativePrimaryAndPlanProjectionsWithIoAndCancellation(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        primary_snapshot_root: []const u8,
+        path: []const u8,
+        opts: OpenOptions,
+        identity: RestoreIdentity,
+        native_generation: *native_backup.LoadedManifest,
+        cancellation: types.CancellationToken,
+    ) !void {
         try staged_generation.validatePath(path);
-        try classifyAndDiscardIncompatibleNativeProjections(native_generation, io, path, opts);
+        try classifyIncompatibleNativeProjections(native_generation, opts);
         try restoreSnapshotStoreTo(
             alloc,
             primary_snapshot_root,
@@ -16067,6 +16116,26 @@ pub const DB = struct {
             cancellation,
             native_generation.value(),
         );
+        var validation_opts = opts;
+        validation_opts.open_mode = .query_readonly;
+        validation_opts.staged_generation = staged_generation;
+        validation_opts.start_index_workers = false;
+        validation_opts.start_optional_runtimes = false;
+        validation_opts.start_optional_runtime_workers = false;
+        var validation = try DB.open(alloc, path, validation_opts);
+        defer validation.close();
+        try validation.classifyNativeProjectionCatalogCompatibility(alloc, native_generation);
+    }
+
+    pub fn finishMaterializedNativeGenerationWithIo(
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+        alloc: Allocator,
+        io: Io,
+        path: []const u8,
+        opts: OpenOptions,
+        native_generation: *native_backup.LoadedManifest,
+        complete_runtime_repair: bool,
+    ) !void {
         try validateInstalledNativeBackupGeneration(
             staged_generation,
             alloc,
@@ -16074,7 +16143,7 @@ pub const DB = struct {
             path,
             opts,
             native_generation,
-            true,
+            complete_runtime_repair,
         );
     }
 
@@ -16118,8 +16187,10 @@ pub const DB = struct {
             cancellation,
         );
         defer if (native_generation) |*generation| generation.deinit();
-        if (native_generation) |*generation|
-            try classifyAndDiscardIncompatibleNativeProjections(generation, io, path, opts);
+        if (native_generation) |*generation| {
+            try classifyIncompatibleNativeProjections(generation, opts);
+            try generation.discardInvalidProjectionArtifacts(io, path);
+        }
         try restoreSnapshotStoreTo(
             alloc,
             snapshot_root,
@@ -16220,7 +16291,11 @@ pub const DB = struct {
         }
     }
 
-    fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, native_generation: *native_backup.LoadedManifest) !void {
+    fn classifyNativeProjectionCatalogCompatibility(
+        self: *DB,
+        alloc: Allocator,
+        native_generation: *native_backup.LoadedManifest,
+    ) !void {
         const manifest = native_generation.value();
         const primary_sequence = self.core.nextDerivedSequence();
         if (primary_sequence != manifest.capture_target_sequence) {
@@ -16299,6 +16374,24 @@ pub const DB = struct {
                 try native_generation.invalidateProjection(projection.name, .checkpoint_mismatch);
                 continue;
             }
+        }
+    }
+
+    fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, native_generation: *native_backup.LoadedManifest) !void {
+        try self.classifyNativeProjectionCatalogCompatibility(alloc, native_generation);
+        const configs = try self.core.listIndexes(alloc);
+        defer types.freeIndexConfigs(alloc, configs);
+        var configs_by_name = std.StringHashMapUnmanaged(*const types.IndexConfig).empty;
+        defer configs_by_name.deinit(alloc);
+        try configs_by_name.ensureTotalCapacity(alloc, @intCast(configs.len));
+        for (configs) |*cfg| {
+            const entry = configs_by_name.getOrPutAssumeCapacity(cfg.name);
+            if (entry.found_existing) return error.InvalidIndexCatalog;
+            entry.value_ptr.* = cfg;
+        }
+        for (native_generation.value().projections) |projection| {
+            if (native_generation.projectionInvalid(projection.name)) continue;
+            const cfg = configs_by_name.get(projection.name) orelse continue;
             if (self.core.index_manager.loadFailure(projection.name)) |err_name| {
                 if (nativeBackupProjectionLoadFailureIsRepairable(err_name)) {
                     try native_generation.invalidateProjection(projection.name, .unreadable);
@@ -16348,10 +16441,8 @@ pub const DB = struct {
         return false;
     }
 
-    fn classifyAndDiscardIncompatibleNativeProjections(
+    fn classifyIncompatibleNativeProjections(
         generation: *native_backup.LoadedManifest,
-        io: Io,
-        path: []const u8,
         opts: OpenOptions,
     ) !void {
         for (generation.value().projections) |projection| {
@@ -16370,7 +16461,6 @@ pub const DB = struct {
                 try generation.invalidateProjection(projection.name, .backend_mismatch);
             }
         }
-        try generation.discardInvalidProjectionArtifacts(io, path);
     }
 
     fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
@@ -93208,10 +93298,8 @@ test "db native restore preserves primary generation and repairs only a missing 
     defer compatibility.deinit();
     var mismatch_options = OpenOptions{ .primary_backend = primary_backend };
     mismatch_options.index_backends.dense_storage_backend = .lmdb;
-    try DB.classifyAndDiscardIncompatibleNativeProjections(
+    try DB.classifyIncompatibleNativeProjections(
         &compatibility,
-        std.testing.io,
-        compatibility_path,
         mismatch_options,
     );
     try std.testing.expect(compatibility.projectionInvalid("dense_idx"));

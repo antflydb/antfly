@@ -43,6 +43,7 @@ const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
 const backend_types = @import("backend_types.zig");
+const native_artifact_sink = @import("native_artifact_sink.zig");
 const supports_main_lmdb = builtin.os.tag != .freestanding and build_options.lmdb_enabled;
 const lmdb = if (supports_main_lmdb) @import("lmdb.zig") else struct {
     pub const CommitBackend = enum {
@@ -1852,6 +1853,17 @@ pub const PersistentIndex = struct {
             destination_root: []const u8,
             cancellation: CancellationToken,
         ) !u64 {
+            return try self.materializeWithSink(alloc, io, destination_root, cancellation, null);
+        }
+
+        pub fn materializeWithSink(
+            self: *const NativeSegmentCheckpoint,
+            alloc: Allocator,
+            io: std.Io,
+            destination_root: []const u8,
+            cancellation: CancellationToken,
+            sink: ?native_artifact_sink.Sink,
+        ) !u64 {
             try fs_paths.createDirPathPortable(io, destination_root);
             var total: u64 = 0;
             for (self.snapshot.segments) |*segment| {
@@ -1865,6 +1877,11 @@ pub const PersistentIndex = struct {
                 try writer.interface.writeAll(segment.data.bytes());
                 try writer.end();
                 try file.sync(io);
+                if (sink) |active| {
+                    var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+                    native_artifact_sink.Sha256.hash(segment.data.bytes(), &digest, .{});
+                    try active.record(destination, @intCast(segment.data.bytes().len), digest);
+                }
                 total = std.math.add(u64, total, @intCast(segment.data.bytes().len)) catch
                     return error.FileTooBig;
             }

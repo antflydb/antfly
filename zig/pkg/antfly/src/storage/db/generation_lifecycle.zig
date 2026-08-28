@@ -19,6 +19,10 @@ const max_publication_marker_bytes = 4096;
 const publication_lock_suffix = ".antfly-generation.lock";
 const preparation_lock_suffix = ".antfly-generation-prepare.lock";
 const retired_cleanup_lock_name = ".antfly-generation-cleanup.lock";
+const cleanup_intent_dir_suffix = ".antfly-generation-cleanup-v1";
+const cleanup_intent_file_suffix = ".json";
+const cleanup_intent_tmp_suffix = ".tmp";
+const max_cleanup_intent_bytes = 1024;
 const max_reconciled_paths = 8192;
 
 const PublicationPhase = enum {
@@ -42,6 +46,15 @@ const OwnedPublicationMarker = struct {
         alloc.free(self.retained_name);
         self.* = undefined;
     }
+};
+
+/// Cleanup is a separate durable transaction from namespace publication.
+/// Every retired generation owns one immutable, sibling-scoped intent so an
+/// older worker can acknowledge only its own deletion and can never erase the
+/// crash-recovery marker of a newer publication.
+const CleanupIntent = struct {
+    version: u8 = 1,
+    retained_name: []const u8,
 };
 
 fn publicationLockPathAlloc(alloc: Allocator, canonical_path: []const u8) ![]u8 {
@@ -739,7 +752,10 @@ fn beginStagingGeneration(
     errdefer alloc.free(live_path);
     const live_path_z = try alloc.dupeZ(u8, path);
     errdefer alloc.free(live_path_z);
-    const nonce = platform.time.monotonicNs();
+    // The basename is also the durable publication/cleanup identity. Mix wall
+    // and monotonic time so an intent surviving a process or host restart does
+    // not alias a new staging generation after local counters reset.
+    const nonce = platform.time.realtimeNs() ^ std.math.rotl(u64, platform.time.monotonicNs(), 23);
     const staging_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-{x}-{x}", .{ path, transition_id, nonce });
     errdefer alloc.free(staging_path);
     const staging_path_z = try alloc.dupeZ(u8, staging_path);
@@ -930,6 +946,15 @@ pub const StagedGeneration = struct {
         });
         if (self.publication_outcome.? == .durable) {
             if (self.had_live_generation) {
+                // Persist cleanup debt before the mutable recovery marker can
+                // be removed. The intent is scoped to this retained generation
+                // and survives queue loss, worker failure, and later publishes.
+                try writeCleanupIntent(
+                    self.alloc,
+                    io,
+                    self.live_path,
+                    std.fs.path.basename(self.staging_path),
+                );
                 if (self.cleanup_scheduler != null) {
                     scheduleRetiredGenerationCleanupAfterPublication(
                         self.cleanup_scheduler,
@@ -937,9 +962,9 @@ pub const StagedGeneration = struct {
                         parent,
                         self.live_path,
                     ) catch |err| {
-                        // The committed marker deliberately remains durable.
-                        // A later read admission can rediscover and retire the
-                        // old generation without resetting validated state.
+                        // The immutable cleanup intent remains durable. A
+                        // later read admission can rediscover and retire the
+                        // old generation without touching publication state.
                         std.log.warn("retired generation cleanup scheduling deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
                     };
                 } else {
@@ -949,15 +974,23 @@ pub const StagedGeneration = struct {
                         &.{self.staging_path},
                         parent,
                     ) catch |err| {
-                        // Keep the committed marker and generated stage name
-                        // as durable reconciliation debt if synchronous
+                        // Keep both the immutable cleanup intent and generated
+                        // stage name as reconciliation debt if synchronous
                         // standalone cleanup cannot complete.
                         std.log.warn("retired generation cleanup deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
                         self.publication_committed = true;
                         return;
                     };
-                    _ = clearPublicationMarker(self.alloc, io, self.live_path);
+                    acknowledgeCleanupIntent(
+                        self.alloc,
+                        io,
+                        self.live_path,
+                        std.fs.path.basename(self.staging_path),
+                    ) catch |err| {
+                        std.log.warn("retired generation cleanup intent acknowledgement deferred path={s} err={s}", .{ self.staging_path, @errorName(err) });
+                    };
                 }
+                _ = clearPublicationMarker(self.alloc, io, self.live_path);
             } else {
                 _ = clearPublicationMarker(self.alloc, io, self.live_path);
             }
@@ -1123,12 +1156,102 @@ fn clearPublicationMarker(alloc: Allocator, io: std.Io, root: []const u8) bool {
     return true;
 }
 
+fn cleanupIntentDirAlloc(alloc: Allocator, live_path: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ live_path, cleanup_intent_dir_suffix });
+}
+
+fn cleanupIntentPathAlloc(
+    alloc: Allocator,
+    live_path: []const u8,
+    retained_name: []const u8,
+) ![]u8 {
+    const validated = try retainedGenerationPathAlloc(alloc, live_path, retained_name);
+    alloc.free(validated);
+    const intent_dir = try cleanupIntentDirAlloc(alloc, live_path);
+    defer alloc.free(intent_dir);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}{s}", .{
+        intent_dir,
+        retained_name,
+        cleanup_intent_file_suffix,
+    });
+}
+
+fn writeCleanupIntent(
+    alloc: Allocator,
+    io: std.Io,
+    live_path: []const u8,
+    retained_name: []const u8,
+) !void {
+    const validated = try retainedGenerationPathAlloc(alloc, live_path, retained_name);
+    defer alloc.free(validated);
+    const intent_dir = try cleanupIntentDirAlloc(alloc, live_path);
+    defer alloc.free(intent_dir);
+    try fs_paths.createDirPathPortable(io, intent_dir);
+    const intent_path = try cleanupIntentPathAlloc(alloc, live_path, retained_name);
+    defer alloc.free(intent_path);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ intent_path, cleanup_intent_tmp_suffix });
+    defer alloc.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    const encoded = try std.json.Stringify.valueAlloc(alloc, CleanupIntent{
+        .retained_name = retained_name,
+    }, .{});
+    defer alloc.free(encoded);
+    if (encoded.len > max_cleanup_intent_bytes) return error.InvalidGenerationCleanupIntent;
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var writer_buffer: [1024]u8 = undefined;
+        var writer = file.writer(io, &writer_buffer);
+        try writer.interface.writeAll(encoded);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), intent_path, io);
+    try fs_paths.syncDirPortable(io, intent_dir);
+}
+
+fn parseCleanupIntentRetainedName(
+    alloc: Allocator,
+    encoded: []const u8,
+) ![]u8 {
+    var parsed = std.json.parseFromSlice(CleanupIntent, alloc, encoded, .{
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidGenerationCleanupIntent,
+    };
+    defer parsed.deinit();
+    if (parsed.value.version != 1 or parsed.value.retained_name.len == 0 or
+        std.mem.indexOfAny(u8, parsed.value.retained_name, "/\\") != null)
+    {
+        return error.InvalidGenerationCleanupIntent;
+    }
+    return try alloc.dupe(u8, parsed.value.retained_name);
+}
+
+fn acknowledgeCleanupIntent(
+    alloc: Allocator,
+    io: std.Io,
+    live_path: []const u8,
+    retained_name: []const u8,
+) !void {
+    const intent_path = try cleanupIntentPathAlloc(alloc, live_path, retained_name);
+    defer alloc.free(intent_path);
+    std.Io.Dir.cwd().deleteFile(io, intent_path) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    const intent_dir = try cleanupIntentDirAlloc(alloc, live_path);
+    defer alloc.free(intent_dir);
+    try fs_paths.syncDirPortable(io, intent_dir);
+}
+
 const RetiredGenerationCleanupBatch = struct {
     alloc: Allocator,
     io: std.Io,
     paths: [][]u8,
     parent: []u8,
-    publication_root: ?[]u8,
+    live_path: []u8,
 
     fn run(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1136,10 +1259,24 @@ const RetiredGenerationCleanupBatch = struct {
             test_retired_cleanup_started.store(true, .release);
             while (test_block_retired_cleanup.load(.acquire)) platform.time.yieldBriefly();
         }
-        try deleteRetiredGenerationPaths(self.alloc, self.io, self.paths, self.parent);
-        if (self.publication_root) |root| {
-            if (!clearPublicationMarker(self.alloc, self.io, root))
-                return error.GenerationPublicationMarkerCleanupDeferred;
+        const max_attempts = 3;
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const result = cleanup: {
+                deleteRetiredGenerationPaths(self.alloc, self.io, self.paths, self.parent) catch |err| break :cleanup err;
+                for (self.paths) |path| {
+                    acknowledgeCleanupIntent(
+                        self.alloc,
+                        self.io,
+                        self.live_path,
+                        std.fs.path.basename(path),
+                    ) catch |err| break :cleanup err;
+                }
+                return;
+            };
+            if (attempt + 1 == max_attempts) return result;
+            const delay_ms: i64 = if (attempt == 0) 10 else 100;
+            self.io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch return result;
         }
     }
 
@@ -1149,7 +1286,7 @@ const RetiredGenerationCleanupBatch = struct {
         for (self.paths) |path| alloc.free(path);
         alloc.free(self.paths);
         alloc.free(self.parent);
-        if (self.publication_root) |root| alloc.free(root);
+        alloc.free(self.live_path);
         alloc.destroy(self);
     }
 };
@@ -1191,16 +1328,16 @@ fn scheduleRetiredGenerationCleanupAfterPublication(
     scheduler: ?CleanupScheduler,
     path: []const u8,
     parent: []const u8,
-    publication_root: []const u8,
+    live_path: []const u8,
 ) !void {
-    return try scheduleRetiredGenerationCleanupBatch(scheduler, &.{path}, parent, publication_root);
+    return try scheduleRetiredGenerationCleanupBatch(scheduler, &.{path}, parent, live_path);
 }
 
 fn scheduleRetiredGenerationCleanupBatch(
     scheduler: ?CleanupScheduler,
     paths: []const []const u8,
     parent: []const u8,
-    publication_root: ?[]const u8,
+    live_path: []const u8,
 ) !void {
     const active = scheduler orelse return;
     if (paths.len == 0) return;
@@ -1221,10 +1358,10 @@ fn scheduleRetiredGenerationCleanupBatch(
         .io = active.io,
         .paths = owned_paths,
         .parent = try active.alloc.dupe(u8, parent),
-        .publication_root = if (publication_root) |root| try active.alloc.dupe(u8, root) else null,
+        .live_path = try active.alloc.dupe(u8, live_path),
     };
     errdefer active.alloc.free(work.parent);
-    errdefer if (work.publication_root) |root| active.alloc.free(root);
+    errdefer active.alloc.free(work.live_path);
     try active.lane.submit(.{
         .owner_id = active.owner_id,
         .class = .cleanup,
@@ -1310,40 +1447,72 @@ fn cleanupStagedGenerations(
     };
     defer dir.close(io);
 
-    var stale_paths = std.ArrayListUnmanaged([]u8).empty;
-    defer {
-        for (stale_paths.items) |path| alloc.free(path);
-        stale_paths.deinit(alloc);
-    }
-
     var iterator = dir.iterate();
     while (try iterator.next(io)) |entry| {
         if (entry.kind != .directory or !isGeneratedStageName(entry.name, stage_prefix)) continue;
         const stale_path = try std.fs.path.join(alloc, &.{ parent, entry.name });
-        var stale_path_owned = true;
-        defer if (stale_path_owned) alloc.free(stale_path);
+        defer alloc.free(stale_path);
         var marker = readPublicationMarker(alloc, io, stale_path) catch |err| {
             std.log.warn("stale generation marker validation deferred path={s} err={s}", .{ stale_path, @errorName(err) });
             continue;
         };
         defer if (marker) |*value| value.deinit(alloc);
-        const has_marker = marker != null;
-        if (scheduler != null) {
-            std.log.info("scheduling stale generation cleanup path={s} marker={}", .{ stale_path, has_marker });
-        } else {
-            std.log.info("deferring stale generation cleanup until read admission path={s} marker={}", .{ stale_path, has_marker });
-        }
-        try stale_paths.append(alloc, stale_path);
-        stale_path_owned = false;
+        // Converting every discoverable staging directory to an immutable
+        // intent makes the filesystem the cleanup queue. Scheduling can now
+        // fail without losing the path on the next reconciliation or restart.
+        try writeCleanupIntent(alloc, io, live_path, entry.name);
     }
+
+    const intent_dir_path = try cleanupIntentDirAlloc(alloc, live_path);
+    defer alloc.free(intent_dir_path);
+    var intent_dir = (if (std.fs.path.isAbsolute(intent_dir_path))
+        std.Io.Dir.openDirAbsolute(io, intent_dir_path, .{ .iterate = true })
+    else
+        std.Io.Dir.cwd().openDir(io, intent_dir_path, .{ .iterate = true })) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return,
+        else => return err,
+    };
+    defer intent_dir.close(io);
+
+    var cleanup_paths = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (cleanup_paths.items) |path| alloc.free(path);
+        cleanup_paths.deinit(alloc);
+    }
+    var intent_iterator = intent_dir.iterate();
+    while (try intent_iterator.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, cleanup_intent_file_suffix)) continue;
+        if (cleanup_paths.items.len == max_reconciled_paths) return error.TooManyGenerationCleanupIntents;
+        const intent_path = try std.fs.path.join(alloc, &.{ intent_dir_path, entry.name });
+        defer alloc.free(intent_path);
+        const encoded = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            intent_path,
+            alloc,
+            .limited(max_cleanup_intent_bytes),
+        );
+        defer alloc.free(encoded);
+        const retained_name = try parseCleanupIntentRetainedName(alloc, encoded);
+        defer alloc.free(retained_name);
+        const expected_name = try std.fmt.allocPrint(alloc, "{s}{s}", .{
+            retained_name,
+            cleanup_intent_file_suffix,
+        });
+        defer alloc.free(expected_name);
+        if (!std.mem.eql(u8, expected_name, entry.name)) return error.InvalidGenerationCleanupIntent;
+        const cleanup_path = try retainedGenerationPathAlloc(alloc, live_path, retained_name);
+        errdefer alloc.free(cleanup_path);
+        try cleanup_paths.append(alloc, cleanup_path);
+    }
+
+    if (cleanup_paths.items.len == 0) return;
     if (scheduler != null) {
-        scheduleRetiredGenerationCleanupBatch(scheduler, stale_paths.items, parent, null) catch |err| {
-            std.log.warn("stale generation cleanup batch scheduling deferred path={s} count={} err={s}", .{ live_path, stale_paths.items.len, @errorName(err) });
-        };
+        std.log.info("scheduling durable generation cleanup path={s} count={}", .{ live_path, cleanup_paths.items.len });
+        try scheduleRetiredGenerationCleanupBatch(scheduler, cleanup_paths.items, parent, live_path);
     } else {
-        try deferred_cleanup.ensureUnusedCapacity(alloc, stale_paths.items.len);
-        for (stale_paths.items) |path| deferred_cleanup.appendAssumeCapacity(path);
-        stale_paths.clearRetainingCapacity();
+        try deferred_cleanup.ensureUnusedCapacity(alloc, cleanup_paths.items.len);
+        for (cleanup_paths.items) |path| deferred_cleanup.appendAssumeCapacity(path);
+        cleanup_paths.clearRetainingCapacity();
     }
 }
 
@@ -1368,6 +1537,9 @@ fn reconcilePublishedGeneration(
                     return error.GenerationDurabilityUncertain;
                 }
                 fs_paths.syncDirPortable(io, parent) catch return error.GenerationDurabilityUncertain;
+                if (pathExists(io, retained_path)) {
+                    try writeCleanupIntent(alloc, io, live_path, value.retained_name);
+                }
             },
         }
     }
@@ -1394,6 +1566,9 @@ fn reconcilePublishedGenerationExclusive(
     if (deferred_cleanup.items.len > 0) {
         const parent = std.fs.path.dirname(live_path) orelse if (std.fs.path.isAbsolute(live_path)) "/" else ".";
         try deleteRetiredGenerationPaths(alloc, io, deferred_cleanup.items, parent);
+        for (deferred_cleanup.items) |stale_path| {
+            try acknowledgeCleanupIntent(alloc, io, live_path, std.fs.path.basename(stale_path));
+        }
     }
     return reconciled;
 }
@@ -1451,7 +1626,13 @@ pub fn acquirePublishedGenerationReadWithRuntime(alloc: Allocator, path: []const
         const parent = std.fs.path.dirname(path) orelse if (std.fs.path.isAbsolute(path)) "/" else ".";
         deleteRetiredGenerationPaths(alloc, io, deferred_cleanup.items, parent) catch |err| {
             std.log.warn("stale generation cleanup remains retryable after read admission path={s} count={} err={s}", .{ path, deferred_cleanup.items.len, @errorName(err) });
+            return read_lease;
         };
+        for (deferred_cleanup.items) |stale_path| {
+            acknowledgeCleanupIntent(alloc, io, path, std.fs.path.basename(stale_path)) catch |err| {
+                std.log.warn("stale generation cleanup acknowledgement remains retryable path={s} err={s}", .{ stale_path, @errorName(err) });
+            };
+        }
     }
     return read_lease;
 }
@@ -2080,7 +2261,10 @@ test "durable publication retires the previous generation through the cleanup ru
     try std.testing.expect(pathExists(std.testing.io, staged.path()));
     const marker_path = try publicationMarkerPathAlloc(alloc, live_path);
     defer alloc.free(marker_path);
-    try std.testing.expect(pathExists(std.testing.io, marker_path));
+    const intent_path = try cleanupIntentPathAlloc(alloc, live_path, std.fs.path.basename(staged.path()));
+    defer alloc.free(intent_path);
+    try std.testing.expect(!pathExists(std.testing.io, marker_path));
+    try std.testing.expect(pathExists(std.testing.io, intent_path));
     const current = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(current);
     try std.testing.expectEqualStrings("current", current);
@@ -2090,6 +2274,110 @@ test "durable publication retires the previous generation through the cleanup ru
     scheduler.lane.drainOwner(scheduler.owner_id);
     try std.testing.expect(!pathExists(std.testing.io, staged.path()));
     try std.testing.expect(!pathExists(std.testing.io, marker_path));
+    try std.testing.expect(!pathExists(std.testing.io, intent_path));
+}
+
+test "older cleanup cannot acknowledge a newer prepared publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-publication-race", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
+    defer alloc.free(live_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "zero" });
+
+    var runtime = try background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    test_retired_cleanup_started.store(false, .release);
+    test_block_retired_cleanup.store(true, .release);
+    defer test_block_retired_cleanup.store(false, .release);
+
+    var first_transition = try beginProcessExclusiveWithRuntime(live_path, runtime.ptr());
+    var first = try first_transition.beginStaging();
+    defer first.deinit();
+    const first_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{first.path()});
+    defer alloc.free(first_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = first_value_path, .data = "one" });
+    try std.testing.expectEqual(PublicationOutcome.durable, try first.publish());
+    var attempts: usize = 0;
+    while (!test_retired_cleanup_started.load(.acquire) and attempts < 10_000) : (attempts += 1) platform.time.yieldBriefly();
+    try std.testing.expect(test_retired_cleanup_started.load(.acquire));
+    first_transition.deinit();
+
+    var second_transition = try beginProcessExclusiveWithRuntime(live_path, runtime.ptr());
+    defer second_transition.deinit();
+    var second = try second_transition.beginStaging();
+    defer second.deinit();
+    const second_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{second.path()});
+    defer alloc.free(second_value_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = second_value_path, .data = "two" });
+    try std.testing.expectEqual(PublicationOutcome.durable, try second.publishPrepared());
+
+    test_block_retired_cleanup.store(false, .release);
+    const scheduler = first.cleanup_scheduler orelse return error.TestUnexpectedResult;
+    scheduler.lane.drainOwner(scheduler.owner_id);
+
+    var marker = (try readPublicationMarker(alloc, std.testing.io, live_path)) orelse return error.TestUnexpectedResult;
+    defer marker.deinit(alloc);
+    try std.testing.expectEqual(PublicationPhase.prepared, marker.phase);
+    const published = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    defer alloc.free(published);
+    try std.testing.expectEqualStrings("two", published);
+
+    try second.rollbackPublication();
+}
+
+test "cleanup submission failure preserves a durable retry intent" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/submission-debt", .{tmp.sub_path});
+    defer alloc.free(live_path);
+    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    const stale_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-a-b", .{live_path});
+    defer alloc.free(stale_path);
+    try fs_paths.createDirPathPortable(std.testing.io, stale_path);
+
+    const RejectingLane = struct {
+        fn submit(_: *anyopaque, _: background_runtime.Job) !void {
+            return error.ResourceBudgetExceeded;
+        }
+        fn drain(_: *anyopaque, _: u64) void {}
+        fn close(_: *anyopaque, _: u64) void {}
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+        const vtable = background_runtime.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drain,
+            .close_owner = close,
+            .poll = poll,
+        };
+    };
+    var lane_state: u8 = 0;
+    const scheduler = CleanupScheduler{
+        .alloc = alloc,
+        .io = std.testing.io,
+        .lane = .{ .ptr = &lane_state, .vtable = &RejectingLane.vtable },
+        .owner_id = 1,
+    };
+    var deferred = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (deferred.items) |path| alloc.free(path);
+        deferred.deinit(alloc);
+    }
+    try std.testing.expect(!try reconcilePublishedGeneration(alloc, std.testing.io, live_path, scheduler, &deferred));
+    const intent_path = try cleanupIntentPathAlloc(alloc, live_path, std.fs.path.basename(stale_path));
+    defer alloc.free(intent_path);
+    try std.testing.expect(pathExists(std.testing.io, stale_path));
+    try std.testing.expect(pathExists(std.testing.io, intent_path));
+
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
+    try std.testing.expect(!pathExists(std.testing.io, stale_path));
+    try std.testing.expect(!pathExists(std.testing.io, intent_path));
 }
 
 test "generation publication reclaims retired roots synchronously without a cleanup runtime" {

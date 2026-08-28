@@ -23,6 +23,7 @@
 const std = @import("std");
 const fs_paths = @import("../../common/fs_paths.zig");
 const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
+const native_artifact_sink = @import("../native_artifact_sink.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -196,6 +197,70 @@ const OwnedArtifact = struct {
     }
 };
 
+/// Collects manifest identities at the durable write boundary. Checkpoint
+/// backends stream SHA-256 through this sink while copying, eliminating the
+/// former second walk and corpus-sized reread of the staged generation.
+pub const ArtifactReceiptCollector = struct {
+    alloc: Allocator,
+    snapshot_root: []const u8,
+    projections: []const Projection,
+    artifacts: std.ArrayListUnmanaged(OwnedArtifact) = .empty,
+
+    pub fn init(
+        alloc: Allocator,
+        snapshot_root: []const u8,
+        projections: []const Projection,
+    ) ArtifactReceiptCollector {
+        return .{
+            .alloc = alloc,
+            .snapshot_root = snapshot_root,
+            .projections = projections,
+        };
+    }
+
+    pub fn deinit(self: *ArtifactReceiptCollector) void {
+        for (self.artifacts.items) |*artifact| artifact.deinit(self.alloc);
+        self.artifacts.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    pub fn sink(self: *ArtifactReceiptCollector) native_artifact_sink.Sink {
+        return .{ .ptr = self, .record_fn = record };
+    }
+
+    fn record(
+        ptr: *anyopaque,
+        absolute_path: []const u8,
+        size_bytes: u64,
+        digest: [Sha256.digest_length]u8,
+    ) !void {
+        const self: *ArtifactReceiptCollector = @ptrCast(@alignCast(ptr));
+        if (absolute_path.len <= self.snapshot_root.len or
+            !std.mem.eql(u8, absolute_path[0..self.snapshot_root.len], self.snapshot_root) or
+            absolute_path[self.snapshot_root.len] != '/')
+        {
+            return error.InvalidNativeBackupArtifactPath;
+        }
+        const relative = absolute_path[self.snapshot_root.len + 1 ..];
+        try validateRelativePath(relative);
+        if (std.mem.eql(u8, relative, manifest_file_name)) return error.InvalidNativeBackupArtifactPath;
+        if (self.artifacts.items.len == max_artifacts) return error.NativeBackupManifestTooLarge;
+        const ownership = try artifactOwnership(relative, self.projections);
+        const owned_path = try self.alloc.dupe(u8, relative);
+        errdefer self.alloc.free(owned_path);
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const sha256 = try self.alloc.dupe(u8, &hex);
+        errdefer self.alloc.free(sha256);
+        try self.artifacts.append(self.alloc, .{
+            .path = owned_path,
+            .size_bytes = size_bytes,
+            .sha256 = sha256,
+            .role = ownership.role,
+            .projection_name = ownership.projection_name,
+        });
+    }
+};
+
 const PinnedArtifactFile = struct {
     relative_path: []u8,
     pinned_path: []u8,
@@ -233,6 +298,15 @@ pub const PinnedGeneratedArtifacts = struct {
         snapshot_root: []const u8,
         cancellation: CancellationToken,
     ) !u64 {
+        return try self.materializeWithSink(snapshot_root, cancellation, null);
+    }
+
+    pub fn materializeWithSink(
+        self: *PinnedGeneratedArtifacts,
+        snapshot_root: []const u8,
+        cancellation: CancellationToken,
+        sink: ?native_artifact_sink.Sink,
+    ) !u64 {
         var total: u64 = 0;
         for (self.files) |*pinned| {
             try ensureActive(cancellation);
@@ -241,7 +315,7 @@ pub const PinnedGeneratedArtifacts = struct {
             total = std.math.add(
                 u64,
                 total,
-                try copyPinnedFileDurable(self.io, pinned, destination, cancellation),
+                try copyPinnedFileDurable(self.io, pinned, destination, cancellation, sink),
             ) catch return error.FileTooBig;
         }
         try std.Io.Dir.cwd().deleteTree(self.io, self.pin_root);
@@ -345,6 +419,16 @@ pub fn pinGeneratedArtifactsForProjections(
     cancellation: CancellationToken,
 ) !PinnedGeneratedArtifacts {
     try ensureActive(cancellation);
+    var included_projections = std.StringHashMapUnmanaged(void).empty;
+    defer included_projections.deinit(alloc);
+    if (projections) |inventory| {
+        try included_projections.ensureTotalCapacity(alloc, @intCast(inventory.len));
+        for (inventory) |projection| {
+            if (projection.artifact_state != .complete) continue;
+            const entry = included_projections.getOrPutAssumeCapacity(projection.name);
+            if (entry.found_existing) return error.InvalidNativeBackupManifest;
+        }
+    }
     try fs_paths.createDirPathPortable(io, pin_root);
     errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
     var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
@@ -375,17 +459,10 @@ pub fn pinGeneratedArtifactsForProjections(
                     // creates fresh WAL control/payload files from the pinned
                     // manifest and runs.
                     if (std.mem.endsWith(u8, entry.path, ".log")) continue;
-                    if (projections) |inventory| {
+                    if (projections != null) {
                         const separator = std.mem.indexOfAny(u8, entry.path, "/\\");
                         const index_name = if (separator) |offset| entry.path[0..offset] else entry.path;
-                        var include = false;
-                        for (inventory) |projection| {
-                            if (std.mem.eql(u8, projection.name, index_name)) {
-                                include = projection.artifact_state == .complete;
-                                break;
-                            }
-                        }
-                        if (!include) continue;
+                        if (!included_projections.contains(index_name)) continue;
                     }
                     const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_indexes, entry.path });
                     defer alloc.free(source);
@@ -527,11 +604,66 @@ pub fn finalizeCaptureGenerationWithCancellation(
         for (artifacts.items) |*artifact| artifact.deinit(alloc);
         artifacts.deinit(alloc);
     }
-    if (artifacts.items.len == 0) return error.NativeBackupGenerationEmpty;
+    return try writeManifestFromArtifacts(
+        alloc,
+        io,
+        snapshot_root,
+        capture_target_sequence,
+        projections,
+        primary,
+        artifacts.items,
+        cancellation,
+    );
+}
 
-    const manifest_artifacts = try alloc.alloc(Artifact, artifacts.items.len);
+pub fn finalizeCaptureGenerationFromReceiptsWithCancellation(
+    alloc: Allocator,
+    io: Io,
+    collector: *ArtifactReceiptCollector,
+    capture_target_sequence: u64,
+    primary: Primary,
+    cancellation: CancellationToken,
+) !u64 {
+    try ensureActive(cancellation);
+    try validateProjectionInventory(capture_target_sequence, collector.projections);
+    try validatePrimary(primary);
+    std.mem.sort(OwnedArtifact, collector.artifacts.items, {}, struct {
+        fn lessThan(_: void, lhs: OwnedArtifact, rhs: OwnedArtifact) bool {
+            return std.mem.order(u8, lhs.path, rhs.path) == .lt;
+        }
+    }.lessThan);
+    if (collector.artifacts.items.len > 1) {
+        for (collector.artifacts.items[1..], collector.artifacts.items[0 .. collector.artifacts.items.len - 1]) |current, previous| {
+            if (std.mem.eql(u8, current.path, previous.path)) return error.InvalidNativeBackupManifest;
+        }
+    }
+    return try writeManifestFromArtifacts(
+        alloc,
+        io,
+        collector.snapshot_root,
+        capture_target_sequence,
+        collector.projections,
+        primary,
+        collector.artifacts.items,
+        cancellation,
+    );
+}
+
+fn writeManifestFromArtifacts(
+    alloc: Allocator,
+    io: Io,
+    snapshot_root: []const u8,
+    capture_target_sequence: u64,
+    projections: []const Projection,
+    primary: Primary,
+    artifacts: []const OwnedArtifact,
+    cancellation: CancellationToken,
+) !u64 {
+    if (artifacts.len == 0) return error.NativeBackupGenerationEmpty;
+
+    const manifest_artifacts = try alloc.alloc(Artifact, artifacts.len);
     defer alloc.free(manifest_artifacts);
-    for (artifacts.items, 0..) |artifact, i| {
+    for (artifacts, 0..) |artifact, i| {
         manifest_artifacts[i] = .{
             .path = artifact.path,
             .size_bytes = artifact.size_bytes,
@@ -997,6 +1129,16 @@ fn copyFileDurableCancellable(
     destination_path: []const u8,
     cancellation: CancellationToken,
 ) !u64 {
+    return try copyFileDurableCancellableWithSink(io, source_path, destination_path, cancellation, null);
+}
+
+fn copyFileDurableCancellableWithSink(
+    io: Io,
+    source_path: []const u8,
+    destination_path: []const u8,
+    cancellation: CancellationToken,
+    sink: ?native_artifact_sink.Sink,
+) !u64 {
     if (std.fs.path.dirname(destination_path)) |parent| try fs_paths.createDirPathPortable(io, parent);
     var source = if (std.fs.path.isAbsolute(source_path))
         try std.Io.Dir.openFileAbsolute(io, source_path, .{})
@@ -1011,6 +1153,7 @@ fn copyFileDurableCancellable(
     var writer_buffer: [64 * 1024]u8 = undefined;
     var writer = destination.writer(io, &writer_buffer);
     var buffer: [256 * 1024]u8 = undefined;
+    var hasher = Sha256.init(.{});
     var offset: u64 = 0;
     while (offset < initial.size) {
         try ensureActive(cancellation);
@@ -1018,6 +1161,7 @@ fn copyFileDurableCancellable(
         const read = try source.readPositionalAll(io, buffer[0..wanted], offset);
         if (read != wanted) return error.SourceFileChanged;
         try writer.interface.writeAll(buffer[0..read]);
+        hasher.update(buffer[0..read]);
         offset += read;
     }
     try writer.end();
@@ -1026,6 +1170,11 @@ fn copyFileDurableCancellable(
     if (final.size != initial.size or !std.meta.eql(final.mtime, initial.mtime))
         return error.SourceFileChanged;
     try destination.sync(io);
+    if (sink) |active| {
+        var digest: [Sha256.digest_length]u8 = undefined;
+        hasher.final(&digest);
+        try active.record(destination_path, initial.size, digest);
+    }
     const parent = std.fs.path.dirname(destination_path) orelse if (std.fs.path.isAbsolute(destination_path)) "/" else ".";
     try fs_paths.syncDirPortable(io, parent);
     return initial.size;
@@ -1036,6 +1185,7 @@ fn copyPinnedFileDurable(
     pinned: *const PinnedArtifactFile,
     destination_path: []const u8,
     cancellation: CancellationToken,
+    sink: ?native_artifact_sink.Sink,
 ) !u64 {
     const current = try statRegularFile(io, pinned.pinned_path);
     if (current.inode != pinned.stat.inode or
@@ -1045,7 +1195,7 @@ fn copyPinnedFileDurable(
         std.log.err("native backup pinned artifact changed before copy path={s}", .{pinned.relative_path});
         return error.SourceFileChanged;
     }
-    return copyFileDurableCancellable(io, pinned.pinned_path, destination_path, cancellation) catch |err| {
+    return copyFileDurableCancellableWithSink(io, pinned.pinned_path, destination_path, cancellation, sink) catch |err| {
         if (err == error.SourceFileChanged)
             std.log.err("native backup pinned artifact changed during copy path={s}", .{pinned.relative_path});
         return err;
@@ -1210,6 +1360,90 @@ test "native generation manifest captures validates and materializes generated a
     try std.testing.expect(corrupted.projectionInvalid("dense"));
     try corrupted.discardInvalidProjectionArtifacts(std.testing.io, destination);
     try std.testing.expect(!try pathExists(std.testing.io, restored));
+}
+
+test "native materialization receipts construct the manifest in one corpus pass" {
+    const alloc = std.testing.allocator;
+    var source_tmp = std.testing.tmpDir(.{});
+    defer source_tmp.cleanup();
+    var snapshot_tmp = std.testing.tmpDir(.{});
+    defer snapshot_tmp.cleanup();
+    const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
+    defer alloc.free(source);
+    const snapshot = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{snapshot_tmp.sub_path});
+    defer alloc.free(snapshot);
+    const index_source = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{source});
+    defer alloc.free(index_source);
+    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(index_source).?);
+    _ = try writeFileDurable(std.testing.io, index_source, "dense-receipt");
+    const primary_source = try std.fmt.allocPrint(alloc, "{s}/primary.bin", .{source});
+    defer alloc.free(primary_source);
+    _ = try writeFileDurable(std.testing.io, primary_source, "primary-receipt");
+    const projection = Projection{
+        .name = "dense",
+        .kind = "dense_vector",
+        .config_hash = 7,
+        .coverage_generation = 3,
+        .checkpoint_generation = 3,
+        .applied_sequence = 12,
+        .target_sequence = 12,
+        .artifact_format = "antfly-managed-index-tree",
+        .artifact_version = 1,
+        .backend_id = "lsm",
+        .codec_version = 1,
+        .artifact_state = .complete,
+        .repair_reason = "",
+    };
+    const projections = [_]Projection{projection};
+    const pin_root = try std.fmt.allocPrint(alloc, "{s}/.pin", .{snapshot});
+    defer alloc.free(pin_root);
+    var pinned = try pinGeneratedArtifactsForProjections(
+        alloc,
+        std.testing.io,
+        source,
+        pin_root,
+        &projections,
+        .none,
+    );
+    defer pinned.deinit();
+    var receipts = ArtifactReceiptCollector.init(alloc, snapshot, &projections);
+    defer receipts.deinit();
+    const sink_value = receipts.sink();
+    _ = try pinned.materializeWithSink(snapshot, .none, sink_value);
+    const primary_destination = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot});
+    defer alloc.free(primary_destination);
+    _ = try copyFileDurableCancellableWithSink(
+        std.testing.io,
+        primary_source,
+        primary_destination,
+        .none,
+        sink_value,
+    );
+    _ = try finalizeCaptureGenerationFromReceiptsWithCancellation(
+        alloc,
+        std.testing.io,
+        &receipts,
+        12,
+        .{
+            .artifact_format = "antfly-kv-stream",
+            .artifact_version = 2,
+            .source_backend = "lmdb",
+        },
+        .none,
+    );
+
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot, manifest_file_name });
+    defer alloc.free(manifest_path);
+    const raw = try readFileAlloc(alloc, std.testing.io, manifest_path, max_manifest_bytes);
+    defer alloc.free(raw);
+    var loaded = try parseManifestBytes(alloc, raw);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.value().artifacts.len);
+    try std.testing.expectEqualStrings("indexes/dense/data.bin", loaded.value().artifacts[0].path);
+    var expected_digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash("dense-receipt", &expected_digest, .{});
+    const expected_hex = std.fmt.bytesToHex(expected_digest, .lower);
+    try std.testing.expectEqualStrings(&expected_hex, loaded.value().artifacts[0].sha256);
 }
 
 test "native generation projection inventory is complete and revision exact" {
