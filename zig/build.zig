@@ -6292,6 +6292,7 @@ pub fn build(b: *std.Build) void {
             "structural reconcile retry backoff is bounded",
             "structural reconcile productive quantum yields immediately while blocked work backs off",
             "structural reconcile retries a transient worker failure",
+            "db structural mutation autonomously retries transient maintenance restart failures",
             "structural reconcile returns a bounded pending quantum while a group is busy",
             "structural reconcile publishes durable index repair debt once per group",
             "structural repair handoff keeps status fenced through final shard visibility",

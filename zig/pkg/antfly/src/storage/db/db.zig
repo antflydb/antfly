@@ -7463,7 +7463,7 @@ pub const DB = struct {
             // Index catalog durability is already decided at this point.
             // Queries and foreground indexing remain available; surface the
             // maintenance degradation without misreporting the mutation.
-            std.log.err("failed to restart text merge runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            std.log.warn("failed to restart text merge runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
             scheduleMaintenanceRestartContext(
                 self.async_context,
                 self.backend_runtime.durable_jobs,
@@ -7476,7 +7476,7 @@ pub const DB = struct {
     fn restartSparseCompactionAfterStructuralMutation(self: *DB, operation: []const u8, index_name: []const u8) void {
         const runtime = self.sparse_compaction_runtime orelse return;
         runtime.resumeAfterPause() catch |err| {
-            std.log.err("failed to restart sparse compaction runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
+            std.log.warn("failed to restart sparse compaction runtime after {s} index={s} err={s}", .{ operation, index_name, @errorName(err) });
             scheduleMaintenanceRestartContext(
                 self.async_context,
                 self.backend_runtime.durable_jobs,
