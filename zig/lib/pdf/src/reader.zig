@@ -605,6 +605,7 @@ const Type3Glyph = struct {
     /// pixel-affecting CharProc operator. Resource-backed paint must never be
     /// silently dropped while the enclosing text run remains vectorizable.
     vectorizable: bool = true,
+    outline_only: bool = true,
 
     fn deinit(self: *Type3Glyph, alloc: Allocator) void {
         alloc.free(self.name);
@@ -617,10 +618,28 @@ const Type3Font = struct {
     paint_type: i64 = 0,
     font_matrix: [6]f64 = .{ 0.001, 0, 0, 0.001, 0, 0 },
     glyphs: []Type3Glyph = &.{},
+    fonts: []PageFont = &.{},
+    images: []PageImage = &.{},
+    shadings: []PageShading = &.{},
+    patterns: []PagePattern = &.{},
+    gstates: []PageExtGState = &.{},
+    forms: []PageForm = &.{},
 
     fn deinit(self: *Type3Font, alloc: Allocator) void {
         for (self.glyphs) |*glyph| glyph.deinit(alloc);
         if (self.glyphs.len > 0) alloc.free(self.glyphs);
+        for (self.fonts) |*font| font.deinit(alloc);
+        if (self.fonts.len > 0) alloc.free(self.fonts);
+        for (self.images) |*image| image.deinit(alloc);
+        if (self.images.len > 0) alloc.free(self.images);
+        for (self.shadings) |*shading| shading.deinit(alloc);
+        if (self.shadings.len > 0) alloc.free(self.shadings);
+        for (self.patterns) |*pattern| pattern.deinit(alloc);
+        if (self.patterns.len > 0) alloc.free(self.patterns);
+        for (self.gstates) |*gstate| gstate.deinit(alloc);
+        if (self.gstates.len > 0) alloc.free(self.gstates);
+        for (self.forms) |*form| form.deinit(alloc);
+        if (self.forms.len > 0) alloc.free(self.forms);
         self.* = undefined;
     }
 
@@ -666,6 +685,7 @@ pub const TextRun = struct {
     ascent: f64 = 0,
     descent: f64 = 0,
     paint_order: usize = 0,
+    paint_phase: usize = 0,
     output_span: ?TextOutputSpan = null,
 
     blend_mode: BlendMode = .normal,
@@ -729,6 +749,7 @@ pub const ImageRun = struct {
     interpolate: bool = false,
     alpha: u8 = 0xff,
     paint_order: usize = 0,
+    paint_phase: usize = 0,
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
@@ -758,6 +779,7 @@ pub const ImageRun = struct {
 pub const ShadingRun = struct {
     kind: enum { axial, radial },
     paint_order: usize = 0,
+    paint_phase: usize = 0,
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
     group_parent_id: ?u32 = null,
@@ -895,6 +917,120 @@ pub const ShapeRun = struct {
         self.* = undefined;
     }
 };
+
+const RenderTarget = struct { width: u32, height: u32 };
+
+/// Caps native outline work in units that track the renderer's dominant
+/// operation: point-in-path edge tests. The allowance scales with the final
+/// raster, so thumbnails do not inherit page-sized work and large requested
+/// outputs retain proportionally more vector detail. Admission is
+/// transactional per PDF paint operator; rejected text stays on the bounded
+/// text fallback path instead of leaving a partially painted glyph.
+const VectorTextWorkBudget = struct {
+    remaining_edge_tests: u64,
+    remaining_points: u64,
+    remaining_resource_bytes: u64,
+    raster_pixels: u64,
+    scale_x: f64,
+    scale_y: f64,
+    exhausted: bool = false,
+
+    fn init(target: ?RenderTarget, page_box: PageBox) VectorTextWorkBudget {
+        const resolved = target orelse return .{
+            .remaining_edge_tests = std.math.maxInt(u64),
+            .remaining_points = std.math.maxInt(u64),
+            .remaining_resource_bytes = std.math.maxInt(u64),
+            .raster_pixels = 0,
+            .scale_x = 1,
+            .scale_y = 1,
+        };
+        const page_width = @max(1.0, @abs(page_box.max_x - page_box.min_x));
+        const page_height = @max(1.0, @abs(page_box.max_y - page_box.min_y));
+        const pixels = saturatedMulU64(resolved.width, resolved.height);
+        return .{
+            // Roughly 32 non-AA edge tests per output pixel. Antialiased
+            // outlines are charged four samples below.
+            .remaining_edge_tests = saturatedMulU64(pixels, 32),
+            .remaining_points = saturatedAddU64(saturatedMulU64(pixels, 4), 65_536),
+            .remaining_resource_bytes = @min(saturatedMulU64(pixels, 16), 256 * 1024 * 1024),
+            .raster_pixels = pixels,
+            .scale_x = @as(f64, @floatFromInt(resolved.width)) / page_width,
+            .scale_y = @as(f64, @floatFromInt(resolved.height)) / page_height,
+        };
+    }
+
+    fn admit(self: *VectorTextWorkBudget, shapes: []const ShapeRun, patterns: []const PatternRun, images: []const ImageRun, shadings: []const ShadingRun) bool {
+        if (self.exhausted) return false;
+        var edge_tests: u64 = 0;
+        var points: u64 = 0;
+        var resource_bytes: u64 = 0;
+        for (shapes) |shape| {
+            points = saturatedAddU64(points, shape.points.len);
+            edge_tests = saturatedAddU64(edge_tests, estimateVectorPaintWork(shape.points, shape.stroke_width, shape.kind == .stroke, shape.antialias, self.scale_x, self.scale_y));
+        }
+        for (patterns) |pattern| {
+            points = saturatedAddU64(points, pattern.points.len);
+            // Pattern lookup/tile composition is at least as expensive as the
+            // clipping path itself. Charge it twice so a pattern cannot use
+            // the outline gate as an unmetered route back to page-wide work.
+            const work = estimateVectorPaintWork(pattern.points, pattern.stroke_width, pattern.kind == .stroke, true, self.scale_x, self.scale_y);
+            edge_tests = saturatedAddU64(edge_tests, saturatedMulU64(work, 2));
+        }
+        for (images) |image| {
+            resource_bytes = saturatedAddU64(resource_bytes, image.rgba.len);
+            const corners = [_][2]f64{
+                .{ image.e, image.f },
+                .{ image.a + image.e, image.b + image.f },
+                .{ image.c + image.e, image.d + image.f },
+                .{ image.a + image.c + image.e, image.b + image.d + image.f },
+            };
+            edge_tests = saturatedAddU64(edge_tests, estimateVectorPaintWork(&corners, 0, false, false, self.scale_x, self.scale_y));
+        }
+        edge_tests = saturatedAddU64(edge_tests, saturatedMulU64(self.raster_pixels, shadings.len));
+        if (points > self.remaining_points or edge_tests > self.remaining_edge_tests or resource_bytes > self.remaining_resource_bytes) {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining_points -= points;
+        self.remaining_edge_tests -= edge_tests;
+        self.remaining_resource_bytes -= resource_bytes;
+        return true;
+    }
+};
+
+fn saturatedAddU64(a: anytype, b: anytype) u64 {
+    return std.math.add(u64, @intCast(a), @intCast(b)) catch std.math.maxInt(u64);
+}
+
+fn saturatedMulU64(a: anytype, b: anytype) u64 {
+    return std.math.mul(u64, @intCast(a), @intCast(b)) catch std.math.maxInt(u64);
+}
+
+fn finitePositiveCeilToU64(value: f64) u64 {
+    if (!std.math.isFinite(value) or value >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
+    if (value <= 0) return 0;
+    return @intFromFloat(@ceil(value));
+}
+
+fn estimateVectorPaintWork(points: []const [2]f64, stroke_width: f64, stroke: bool, antialias: bool, scale_x: f64, scale_y: f64) u64 {
+    if (points.len < 2) return 0;
+    var min_x = points[0][0];
+    var max_x = min_x;
+    var min_y = points[0][1];
+    var max_y = min_y;
+    for (points[1..]) |point| {
+        min_x = @min(min_x, point[0]);
+        max_x = @max(max_x, point[0]);
+        min_y = @min(min_y, point[1]);
+        max_y = @max(max_y, point[1]);
+    }
+    const padding = if (stroke) @max(0.0, stroke_width) else 0.0;
+    const width = finitePositiveCeilToU64((@max(0.0, max_x - min_x) + padding) * @abs(scale_x) + 1.0);
+    const height = finitePositiveCeilToU64((@max(0.0, max_y - min_y) + padding) * @abs(scale_y) + 1.0);
+    var work = saturatedMulU64(saturatedMulU64(width, height), points.len);
+    if (antialias) work = saturatedMulU64(work, 4);
+    return work;
+}
 
 /// Appends a fully-owned value without exposing the common allocation-failure
 /// hole between constructing the value and growing the destination list.
@@ -1731,6 +1867,7 @@ pub const Reader = struct {
     encryption: ?EncryptionContext = null,
     decrypted_streams: *std.AutoHashMapUnmanaged(usize, []u8),
     image_decode_target: ?ImageDecodeTarget = null,
+    render_target: ?RenderTarget = null,
 
     const max_recursive_pdf_objects: usize = 100_000;
 
@@ -2334,7 +2471,18 @@ pub const Reader = struct {
         if (decoded_content.len > 0) {
             try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms);
         }
-        try appendVectorTextRenderRunsAlloc(self.alloc, &shape_out, &pattern_out, fonts, patterns, text_out.items);
+        var vector_budget = VectorTextWorkBudget.init(self.render_target, page_box);
+        try appendVectorTextRenderRunsAlloc(
+            self.alloc,
+            &image_out,
+            &shading_out,
+            &shape_out,
+            &pattern_out,
+            fonts,
+            patterns,
+            text_out.items,
+            if (self.render_target != null) &vector_budget else null,
+        );
 
         result.text_runs = try text_out.toOwnedSlice(self.alloc);
         text_transferred = true;
@@ -2355,8 +2503,13 @@ pub const Reader = struct {
     pub fn extractPageRenderRunsForRasterAlloc(self: *Reader, page_num: usize, raster_width: u32, raster_height: u32) !PageRenderRuns {
         if (raster_width == 0 or raster_height == 0) return error.RenderedPageTooLarge;
         const previous_target = self.image_decode_target;
+        const previous_render_target = self.render_target;
         self.image_decode_target = .{ .max_dimension = @max(raster_width, raster_height) };
-        defer self.image_decode_target = previous_target;
+        self.render_target = .{ .width = raster_width, .height = raster_height };
+        defer {
+            self.image_decode_target = previous_target;
+            self.render_target = previous_render_target;
+        }
         return try self.extractPageRenderRunsAlloc(page_num);
     }
 
@@ -2564,11 +2717,14 @@ pub const Reader = struct {
 
     fn appendVectorTextRenderRunsAlloc(
         alloc: Allocator,
+        image_out: ?*std.ArrayList(ImageRun),
+        shading_out: ?*std.ArrayList(ShadingRun),
         shape_out: *std.ArrayList(ShapeRun),
         pattern_out: *std.ArrayList(PatternRun),
         fonts: []const PageFont,
         patterns: []const PagePattern,
         text_runs: []TextRun,
+        work_budget: ?*VectorTextWorkBudget,
     ) !void {
         var start: usize = 0;
         while (start < text_runs.len) {
@@ -2577,11 +2733,14 @@ pub const Reader = struct {
 
             const complete = appendVectorTextRenderGroupAlloc(
                 alloc,
+                image_out,
+                shading_out,
                 shape_out,
                 pattern_out,
                 fonts,
                 patterns,
                 text_runs[start..end],
+                work_budget,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => false,
@@ -2593,12 +2752,26 @@ pub const Reader = struct {
 
     fn appendVectorTextRenderGroupAlloc(
         alloc: Allocator,
+        image_out: ?*std.ArrayList(ImageRun),
+        shading_out: ?*std.ArrayList(ShadingRun),
         shape_out: *std.ArrayList(ShapeRun),
         pattern_out: *std.ArrayList(PatternRun),
         fonts: []const PageFont,
         patterns: []const PagePattern,
         text_runs: []TextRun,
+        work_budget: ?*VectorTextWorkBudget,
     ) !bool {
+        if (work_budget) |budget| if (budget.exhausted) return false;
+        var group_images = std.ArrayList(ImageRun).empty;
+        defer {
+            for (group_images.items) |*image| image.deinit(alloc);
+            group_images.deinit(alloc);
+        }
+        var group_shadings = std.ArrayList(ShadingRun).empty;
+        defer {
+            for (group_shadings.items) |*shading| shading.deinit(alloc);
+            group_shadings.deinit(alloc);
+        }
         var group_shapes = std.ArrayList(ShapeRun).empty;
         defer {
             for (group_shapes.items) |*shape| shape.deinit(alloc);
@@ -2611,8 +2784,38 @@ pub const Reader = struct {
         }
 
         var type3_paint_phase: usize = 0;
+        var next_resource_group_id: u32 = 1;
+        const update_next_group = struct {
+            fn apply(next: *u32, maybe_id: ?u32) void {
+                const id = maybe_id orelse return;
+                next.* = @max(next.*, std.math.add(u32, id, 1) catch std.math.maxInt(u32));
+            }
+        }.apply;
+        if (image_out) |out| for (out.items) |item| update_next_group(&next_resource_group_id, item.group_id);
+        if (shading_out) |out| for (out.items) |item| update_next_group(&next_resource_group_id, item.group_id);
+        for (shape_out.items) |item| update_next_group(&next_resource_group_id, item.group_id);
+        for (pattern_out.items) |item| update_next_group(&next_resource_group_id, item.group_id);
+        for (text_runs) |item| update_next_group(&next_resource_group_id, item.group_id);
         for (text_runs) |run| {
             if (!run.vectorizable) return false;
+            const font_index = run.font_index orelse return false;
+            if (font_index >= fonts.len) return false;
+            if (fonts[font_index].type3) |type3| {
+                const raw = run.raw_text orelse return false;
+                var needs_combined_renderer = false;
+                for (raw) |code| {
+                    const glyph = type3.glyphForCode(code) orelse continue;
+                    if (!glyph.outline_only) {
+                        needs_combined_renderer = true;
+                        break;
+                    }
+                }
+                if (needs_combined_renderer) {
+                    if (image_out == null or shading_out == null) return false;
+                    if (!try appendType3RunResourceRunsAlloc(alloc, &group_images, &group_shadings, &group_patterns, &group_shapes, run, type3, raw, &type3_paint_phase, &next_resource_group_id)) return false;
+                    continue;
+                }
+            }
             var temp_shapes = std.ArrayList(ShapeRun).empty;
             defer {
                 for (temp_shapes.items) |*shape| shape.deinit(alloc);
@@ -2623,6 +2826,20 @@ pub const Reader = struct {
             try transferSolidTextShapesAlloc(alloc, &group_shapes, &temp_shapes, run);
         }
 
+        if (work_budget) |budget| {
+            if (!budget.admit(group_shapes.items, group_patterns.items, group_images.items, group_shadings.items)) return false;
+        }
+
+        if (image_out) |out| {
+            try out.ensureUnusedCapacity(alloc, group_images.items.len);
+            for (group_images.items) |image| out.appendAssumeCapacity(image);
+            group_images.clearRetainingCapacity();
+        }
+        if (shading_out) |out| {
+            try out.ensureUnusedCapacity(alloc, group_shadings.items.len);
+            for (group_shadings.items) |shading| out.appendAssumeCapacity(shading);
+            group_shadings.clearRetainingCapacity();
+        }
         try shape_out.ensureUnusedCapacity(alloc, group_shapes.items.len);
         for (group_shapes.items) |shape| shape_out.appendAssumeCapacity(shape);
         group_shapes.clearRetainingCapacity();
@@ -3190,7 +3407,7 @@ pub const Reader = struct {
                 cursor_x += estimateType3MissingAdvance(run, code);
                 continue;
             };
-            if (!glyph.vectorizable) return false;
+            if (!glyph.outline_only) return false;
 
             var glyph_shapes = std.ArrayList(ShapeRun).empty;
             defer {
@@ -3208,6 +3425,231 @@ pub const Reader = struct {
             cursor_y += glyph.advance_y * run.font_size;
         }
         return complete;
+    }
+
+    fn type3ResourcesAvailableAlloc(alloc: Allocator, glyph: Type3Glyph, type3: Type3Font) !bool {
+        var image_refs = try collectReferencedResourceNamesAlloc(alloc, glyph.content, &.{"Do"});
+        defer image_refs.deinit(alloc);
+        var iterator = image_refs.names.keyIterator();
+        while (iterator.next()) |name| {
+            var found = false;
+            for (type3.images) |image| if (std.mem.eql(u8, image.name, name.*)) {
+                found = true;
+                break;
+            };
+            if (!found) for (type3.forms) |form| if (std.mem.eql(u8, form.name, name.*)) {
+                found = true;
+                break;
+            };
+            if (!found) return false;
+        }
+
+        var shading_refs = try collectReferencedResourceNamesAlloc(alloc, glyph.content, &.{"sh"});
+        defer shading_refs.deinit(alloc);
+        iterator = shading_refs.names.keyIterator();
+        while (iterator.next()) |name| {
+            var found = false;
+            for (type3.shadings) |shading| if (std.mem.eql(u8, shading.name, name.*)) {
+                found = true;
+                break;
+            };
+            if (!found) return false;
+        }
+
+        var pattern_refs = try collectReferencedResourceNamesAlloc(alloc, glyph.content, &.{ "scn", "SCN" });
+        defer pattern_refs.deinit(alloc);
+        iterator = pattern_refs.names.keyIterator();
+        while (iterator.next()) |name| {
+            var found = false;
+            for (type3.patterns) |pattern| if (std.mem.eql(u8, pattern.name, name.*)) {
+                found = true;
+                break;
+            };
+            if (!found) return false;
+        }
+
+        var gstate_refs = try collectReferencedResourceNamesAlloc(alloc, glyph.content, &.{"gs"});
+        defer gstate_refs.deinit(alloc);
+        iterator = gstate_refs.names.keyIterator();
+        while (iterator.next()) |name| if (findExtGState(type3.gstates, name.*) == null) return false;
+
+        var font_refs = try collectReferencedResourceNamesAlloc(alloc, glyph.content, &.{"Tf"});
+        defer font_refs.deinit(alloc);
+        iterator = font_refs.names.keyIterator();
+        while (iterator.next()) |name| {
+            var found = false;
+            for (type3.fonts) |font| if (std.mem.eql(u8, font.name, name.*)) {
+                found = true;
+                break;
+            };
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    fn type3InitialGraphicsState(run: TextRun, type3: Type3Font, cursor_x: f64, cursor_y: f64) GraphicsState {
+        const origin = transformType3Point(.{ 0, 0 }, run, type3, cursor_x, cursor_y);
+        const x_axis = transformType3Point(.{ 1, 0 }, run, type3, cursor_x, cursor_y);
+        const y_axis = transformType3Point(.{ 0, 1 }, run, type3, cursor_x, cursor_y);
+        return .{
+            .matrix = .{
+                .a = x_axis[0] - origin[0],
+                .b = x_axis[1] - origin[1],
+                .c = y_axis[0] - origin[0],
+                .d = y_axis[1] - origin[1],
+                .e = origin[0],
+                .f = origin[1],
+            },
+            .fill_color = run.fill_color,
+            .stroke_color = run.stroke_color,
+            .fill_alpha = run.alpha,
+            .stroke_alpha = run.stroke_alpha,
+            .blend_mode = run.blend_mode,
+            .group_id = run.group_id,
+            .group_parent_id = run.group_parent_id,
+            .group_isolated = run.group_isolated,
+            .group_knockout = run.group_knockout,
+            .stroke_width = run.stroke_width,
+            .clip_box = run.clip_box,
+        };
+    }
+
+    fn appendType3RunResourceRunsAlloc(
+        alloc: Allocator,
+        image_out: *std.ArrayList(ImageRun),
+        shading_out: *std.ArrayList(ShadingRun),
+        pattern_out: *std.ArrayList(PatternRun),
+        shape_out: *std.ArrayList(ShapeRun),
+        run: TextRun,
+        type3: Type3Font,
+        raw: []const u8,
+        paint_phase: *usize,
+        next_resource_group_id: *u32,
+    ) !bool {
+        var cursor_x: f64 = 0;
+        var cursor_y: f64 = 0;
+        for (raw) |code| {
+            const glyph = type3.glyphForCode(code) orelse return false;
+            if (!glyph.vectorizable or !try type3ResourcesAvailableAlloc(alloc, glyph.*, type3)) return false;
+            // Uncolored Type3 glyphs may contain paths only; images and
+            // shadings carry their own color and would violate PaintType 2.
+            if (type3.paint_type == 2 and (contentMayContainOperator(glyph.content, "Do") or contentMayContainOperator(glyph.content, "sh"))) return false;
+
+            const initial_state = type3InitialGraphicsState(run, type3, cursor_x, cursor_y);
+            const initial_clip = run.clip_points orelse &.{};
+            var glyph_images = std.ArrayList(ImageRun).empty;
+            defer {
+                for (glyph_images.items) |*image| image.deinit(alloc);
+                glyph_images.deinit(alloc);
+            }
+            var glyph_shadings = std.ArrayList(ShadingRun).empty;
+            defer {
+                for (glyph_shadings.items) |*shading| shading.deinit(alloc);
+                glyph_shadings.deinit(alloc);
+            }
+            var glyph_shapes = std.ArrayList(ShapeRun).empty;
+            defer {
+                for (glyph_shapes.items) |*shape| shape.deinit(alloc);
+                glyph_shapes.deinit(alloc);
+            }
+            var glyph_patterns = std.ArrayList(PatternRun).empty;
+            defer {
+                for (glyph_patterns.items) |*pattern| pattern.deinit(alloc);
+                glyph_patterns.deinit(alloc);
+            }
+            var glyph_text = std.ArrayList(TextRun).empty;
+            defer {
+                for (glyph_text.items) |*text| text.deinit(alloc);
+                glyph_text.deinit(alloc);
+            }
+
+            var image_order: usize = 0;
+            var shading_order: usize = 0;
+            var shape_order: usize = 0;
+            var pattern_order: usize = 0;
+            // Leave headroom for bounded nested form expansion; the content
+            // parsers use checked u32 increments for generated group ids.
+            if (next_resource_group_id.* > std.math.maxInt(u32) - 1_000_000) return false;
+            const glyph_group_base = next_resource_group_id.*;
+            var next_image_group = glyph_group_base;
+            var next_shading_group = glyph_group_base;
+            var next_shape_group = glyph_group_base;
+            var next_pattern_group = glyph_group_base;
+            try extractImageRunsFromContentAppendWithState(alloc, &glyph_images, glyph.content, type3.images, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &image_order, &next_image_group);
+            try extractShadingRunsFromContentAppendWithState(alloc, &glyph_shadings, glyph.content, type3.shadings, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &shading_order, &next_shading_group);
+            try extractPatternRunsFromContentAppendWithState(alloc, &glyph_patterns, glyph.content, type3.patterns, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &pattern_order, &next_pattern_group);
+            try extractShapeRunsFromContentAppendWithState(alloc, &glyph_shapes, glyph.content, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &shape_order, &next_shape_group);
+            const next_non_text_group_id = @max(@max(next_image_group, next_shading_group), @max(next_shape_group, next_pattern_group));
+            var text_parser = try PositionedTextParser.init(alloc, .{ .render = &glyph_text }, .{
+                .alpha = run.alpha,
+                .stroke_alpha = run.stroke_alpha,
+                .fill_color = run.fill_color,
+                .stroke_color = run.stroke_color,
+                .stroke_width = run.stroke_width,
+                .blend_mode = run.blend_mode,
+                .group_id = run.group_id,
+                .group_parent_id = run.group_parent_id,
+                .group_isolated = run.group_isolated,
+                .group_knockout = run.group_knockout,
+                .matrix = initial_state.matrix,
+                .clip_box = run.clip_box,
+            }, initial_clip, run.clip_fill_rule);
+            defer text_parser.deinit();
+            text_parser.next_group_id = glyph_group_base;
+            try text_parser.consume(glyph.content, type3.fonts, type3.gstates, type3.forms);
+            next_resource_group_id.* = @max(next_non_text_group_id, text_parser.next_group_id);
+            var nested_type3_phase: usize = 0;
+            for (glyph_text.items) |text| {
+                if (!text.vectorizable or text.fill_pattern_name != null or text.stroke_pattern_name != null) return false;
+                if (!try appendVectorTextRunShapesAlloc(alloc, &glyph_shapes, type3.fonts, text, &nested_type3_phase)) return false;
+            }
+
+            for (glyph_images.items) |*image| {
+                const local_order = image.paint_order;
+                image.paint_order = run.paint_order;
+                image.paint_phase = paint_phase.* + local_order * 4;
+            }
+            for (glyph_shadings.items) |*shading| {
+                const local_order = shading.paint_order;
+                shading.paint_order = run.paint_order;
+                shading.paint_phase = paint_phase.* + local_order * 4;
+            }
+            for (glyph_shapes.items) |*shape| {
+                const local_order = shape.paint_order;
+                shape.paint_order = run.paint_order;
+                shape.paint_phase = paint_phase.* + local_order * 4 + @min(shape.paint_phase, 3);
+                shape.stroke_width = scaleType3StrokeWidth(shape.stroke_width, run, type3);
+                if (type3.paint_type == 2) shape.color = switch (shape.kind) {
+                    .fill => colorWithAlpha(run.fill_color, run.alpha),
+                    .stroke => colorWithAlpha(run.stroke_color, run.stroke_alpha),
+                };
+                shape.antialias = true;
+            }
+            for (glyph_patterns.items) |*pattern| {
+                const local_order = pattern.paint_order;
+                pattern.paint_order = run.paint_order;
+                pattern.paint_phase = paint_phase.* + local_order * 4 + @min(pattern.paint_phase, 3);
+            }
+
+            try image_out.ensureUnusedCapacity(alloc, glyph_images.items.len);
+            for (glyph_images.items) |image| image_out.appendAssumeCapacity(image);
+            glyph_images.clearRetainingCapacity();
+            try shading_out.ensureUnusedCapacity(alloc, glyph_shadings.items.len);
+            for (glyph_shadings.items) |shading| shading_out.appendAssumeCapacity(shading);
+            glyph_shadings.clearRetainingCapacity();
+            try pattern_out.ensureUnusedCapacity(alloc, glyph_patterns.items.len);
+            for (glyph_patterns.items) |pattern| pattern_out.appendAssumeCapacity(pattern);
+            glyph_patterns.clearRetainingCapacity();
+            try shape_out.ensureUnusedCapacity(alloc, glyph_shapes.items.len);
+            for (glyph_shapes.items) |shape| shape_out.appendAssumeCapacity(shape);
+            glyph_shapes.clearRetainingCapacity();
+
+            paint_phase.* += @max(@max(@max(@max(image_order, shading_order), pattern_order), shape_order), text_parser.paint_order) * 4;
+            const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
+            cursor_x += (glyph.advance_x * run.font_size + spacing) * run.horizontal_scale;
+            cursor_y += glyph.advance_y * run.font_size;
+        }
+        return true;
     }
 
     fn transformType3ShapeRunAlloc(
@@ -3653,14 +4095,14 @@ pub const Reader = struct {
         defer if (resources) |*obj| obj.deinit(self.alloc);
         const content = try self.collectPageContentAlloc(page);
         defer self.alloc.free(content);
-        return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+        return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content, false);
     }
 
     fn collectPagePatternsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PagePattern {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PagePattern, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+        return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content, false);
     }
 
     fn collectPageExtGStatesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageExtGState {
@@ -3676,14 +4118,14 @@ pub const Reader = struct {
         defer if (resources) |*obj| obj.deinit(self.alloc);
         const content = try self.collectPageContentAlloc(page);
         defer self.alloc.free(content);
-        return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+        return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content, false);
     }
 
     fn collectPageFormsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageForm {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageForm, 0);
         defer if (resources) |*obj| obj.deinit(self.alloc);
-        return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+        return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content, false);
     }
 
     fn collectPageTextFormsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageForm {
@@ -3744,6 +4186,36 @@ pub const Reader = struct {
             var font_obj = try self.resolveValue(&entry.value);
             defer font_obj.deinit(self.alloc);
             if (font_obj != .dict) continue;
+            var font = try self.buildPageFont(entry.key, &font_obj);
+            errdefer font.deinit(self.alloc);
+            try out.append(self.alloc, font);
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    /// Type3 CharProcs may paint text with ordinary embedded fonts. Resolve
+    /// those fonts without recursively rebuilding Type3 fonts that reference
+    /// their own resource dictionary.
+    fn collectNonType3FontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) anyerror![]PageFont {
+        const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
+        var resolved_fonts = try self.resolveValue(fonts_obj);
+        defer resolved_fonts.deinit(self.alloc);
+        if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
+
+        var out = std.ArrayList(PageFont).empty;
+        errdefer {
+            for (out.items) |*font| font.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (resolved_fonts.dict) |entry| {
+            var font_obj = try self.resolveValue(&entry.value);
+            defer font_obj.deinit(self.alloc);
+            if (font_obj != .dict) continue;
+            if (font_obj.get("Subtype")) |subtype| {
+                var resolved_subtype = try self.resolveValue(subtype);
+                defer resolved_subtype.deinit(self.alloc);
+                if (std.mem.eql(u8, resolved_subtype.asName() orelse "", "Type3")) continue;
+            }
             var font = try self.buildPageFont(entry.key, &font_obj);
             errdefer font.deinit(self.alloc);
             try out.append(self.alloc, font);
@@ -3838,7 +4310,7 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectPatternsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8) anyerror![]PagePattern {
+    fn collectPatternsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8, exclude_type3_fonts: bool) anyerror![]PagePattern {
         if (depth > 1) return try self.alloc.alloc(PagePattern, 0);
         const pattern_obj = resources.get("Pattern") orelse return try self.alloc.alloc(PagePattern, 0);
         var resolved_patterns = try self.resolveValue(pattern_obj);
@@ -3920,7 +4392,7 @@ pub const Reader = struct {
                 resolved_pattern_resources = try fallback.clone(self.alloc);
             }
 
-            const fonts = if (resolved_pattern_resources) |*pattern_resources| try self.collectFontsFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageFont, 0);
+            const fonts = if (resolved_pattern_resources) |*pattern_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(pattern_resources) else try self.collectFontsFromResourcesAlloc(pattern_resources) else try self.alloc.alloc(PageFont, 0);
             errdefer {
                 for (fonts) |*font| font.deinit(self.alloc);
                 if (fonts.len > 0) self.alloc.free(fonts);
@@ -3935,7 +4407,7 @@ pub const Reader = struct {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
             }
-            const patterns = if (resolved_pattern_resources) |*pattern_resources| try self.collectPatternsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content) else try self.alloc.alloc(PagePattern, 0);
+            const patterns = if (resolved_pattern_resources) |*pattern_resources| try self.collectPatternsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PagePattern, 0);
             errdefer {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
@@ -3945,7 +4417,7 @@ pub const Reader = struct {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
             }
-            const forms = if (resolved_pattern_resources) |*pattern_resources| try self.collectFormsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content) else try self.alloc.alloc(PageForm, 0);
+            const forms = if (resolved_pattern_resources) |*pattern_resources| try self.collectFormsFromResourcesAlloc(pattern_resources, fallback_resources orelse pattern_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PageForm, 0);
             errdefer {
                 for (forms) |*form| form.deinit(self.alloc);
                 if (forms.len > 0) self.alloc.free(forms);
@@ -3973,7 +4445,7 @@ pub const Reader = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
-    fn collectFormsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8) anyerror![]PageForm {
+    fn collectFormsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, fallback_resources: ?*const syntax.Object, depth: u8, parent_content: []const u8, exclude_type3_fonts: bool) anyerror![]PageForm {
         if (depth > 1) return try self.alloc.alloc(PageForm, 0);
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
         var resolved_xobjects = try self.resolveValue(xobject_obj);
@@ -4004,7 +4476,7 @@ pub const Reader = struct {
                 resolved_form_resources = try fallback.clone(self.alloc);
             }
 
-            const fonts = if (resolved_form_resources) |*form_resources| try self.collectFontsFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageFont, 0);
+            const fonts = if (resolved_form_resources) |*form_resources| if (exclude_type3_fonts) try self.collectNonType3FontsFromResourcesAlloc(form_resources) else try self.collectFontsFromResourcesAlloc(form_resources) else try self.alloc.alloc(PageFont, 0);
             errdefer {
                 for (fonts) |*font| font.deinit(self.alloc);
                 if (fonts.len > 0) self.alloc.free(fonts);
@@ -4019,7 +4491,7 @@ pub const Reader = struct {
                 for (shadings) |*shading| shading.deinit(self.alloc);
                 if (shadings.len > 0) self.alloc.free(shadings);
             }
-            const patterns = if (resolved_form_resources) |*form_resources| try self.collectPatternsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content) else try self.alloc.alloc(PagePattern, 0);
+            const patterns = if (resolved_form_resources) |*form_resources| try self.collectPatternsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PagePattern, 0);
             errdefer {
                 for (patterns) |*pattern| pattern.deinit(self.alloc);
                 if (patterns.len > 0) self.alloc.free(patterns);
@@ -4029,7 +4501,7 @@ pub const Reader = struct {
                 for (gstates) |*gstate| gstate.deinit(self.alloc);
                 if (gstates.len > 0) self.alloc.free(gstates);
             }
-            const forms = if (resolved_form_resources) |*form_resources| try self.collectFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content) else try self.alloc.alloc(PageForm, 0);
+            const forms = if (resolved_form_resources) |*form_resources| try self.collectFormsFromResourcesAlloc(form_resources, fallback_resources orelse form_resources, depth + 1, content, exclude_type3_fonts) else try self.alloc.alloc(PageForm, 0);
             errdefer {
                 for (forms) |*form| form.deinit(self.alloc);
                 if (forms.len > 0) self.alloc.free(forms);
@@ -5943,12 +6415,34 @@ pub const Reader = struct {
                 .content = content,
                 .advance_x = advance_x,
                 .advance_y = advance_y,
-                .vectorizable = try type3CharProcIsVectorizableAlloc(self.alloc, content),
+                .vectorizable = try type3CharProcIsNativelyRenderableAlloc(self.alloc, content),
+                .outline_only = try type3CharProcIsVectorizableAlloc(self.alloc, content),
             });
             name = null;
         }
 
         font.glyphs = try glyphs.toOwnedSlice(self.alloc);
+        if (font_obj.get("Resources")) |resources_obj| {
+            var resources = try self.resolveValue(resources_obj);
+            defer resources.deinit(self.alloc);
+            if (resources == .dict) {
+                var resource_content = std.ArrayList(u8).empty;
+                defer resource_content.deinit(self.alloc);
+                for (font.glyphs) |glyph| {
+                    const glyph_len = std.math.add(usize, glyph.content.len, 1) catch return error.PdfDecodeWorkingSetTooLarge;
+                    const next_len = std.math.add(usize, resource_content.items.len, glyph_len) catch return error.PdfDecodeWorkingSetTooLarge;
+                    if (next_len > self.decode_limits.max_working_set_bytes / 2) return error.PdfDecodeWorkingSetTooLarge;
+                    try resource_content.appendSlice(self.alloc, glyph.content);
+                    try resource_content.append(self.alloc, '\n');
+                }
+                font.images = try self.collectImagesFromResourcesAlloc(&resources, resource_content.items);
+                font.shadings = try self.collectShadingsFromResourcesAlloc(&resources);
+                font.gstates = try self.collectExtGStatesFromResourcesAlloc(&resources);
+                font.fonts = try self.collectNonType3FontsFromResourcesAlloc(&resources);
+                font.patterns = try self.collectPatternsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
+                font.forms = try self.collectFormsFromResourcesAlloc(&resources, &resources, 0, resource_content.items, true);
+            }
+        }
         return font;
     }
 
@@ -9365,7 +9859,7 @@ fn applyTextRunOperator(
             nested_state.group_id = next_group_id.*;
             nested_state.group_isolated = form.group_isolated;
             nested_state.group_knockout = form.group_knockout;
-            next_group_id.* += 1;
+            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
         const nested_clip = if (out.isLayout()) &.{} else current_clip_points.items;
         var nested_parser = try PositionedTextParser.init(alloc, out, nested_state, nested_clip, current_clip_fill_rule.*);
@@ -9579,7 +10073,7 @@ fn applyImageOperator(
             nested_state.group_id = next_group_id.*;
             nested_state.group_isolated = form.group_isolated;
             nested_state.group_knockout = form.group_knockout;
-            next_group_id.* += 1;
+            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
         try extractImageRunsFromContentAppendWithState(alloc, out, form.content, form.images, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id);
     }
@@ -9670,7 +10164,7 @@ fn applyShapeOperator(
             nested_state.group_id = next_group_id.*;
             nested_state.group_isolated = form.group_isolated;
             nested_state.group_knockout = form.group_knockout;
-            next_group_id.* += 1;
+            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
         try extractShapeRunsFromContentAppendWithState(alloc, out, form.content, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id);
         return;
@@ -10118,7 +10612,7 @@ fn applyShadingOperator(
             nested_state.group_id = next_group_id.*;
             nested_state.group_isolated = form.group_isolated;
             nested_state.group_knockout = form.group_knockout;
-            next_group_id.* += 1;
+            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
         try extractShadingRunsFromContentAppendWithState(alloc, out, form.content, form.shadings, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id);
         return;
@@ -10239,7 +10733,7 @@ fn applyPatternOperator(
             nested_state.group_id = next_group_id.*;
             nested_state.group_isolated = form.group_isolated;
             nested_state.group_knockout = form.group_knockout;
-            next_group_id.* += 1;
+            next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
         try extractPatternRunsFromContentAppendWithState(alloc, out, form.content, form.patterns, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id);
         return;
@@ -11085,6 +11579,27 @@ fn type3CharProcIsVectorizableAlloc(alloc: Allocator, bytes: []const u8) !bool {
                     std.mem.eql(u8, op, "CS") or
                     std.mem.eql(u8, op, "scn") or
                     std.mem.eql(u8, op, "SCN")) return false;
+            },
+            else => {},
+        }
+    }
+}
+
+/// The combined renderer can preserve ordinary graphics-state changes plus
+/// direct image, shading, pattern, and form resources plus nested text in
+/// ordinary embedded fonts. Inline images remain conservative.
+fn type3CharProcIsNativelyRenderableAlloc(alloc: Allocator, bytes: []const u8) !bool {
+    var scanner = syntax.Scanner.init(alloc, bytes);
+    defer scanner.deinit();
+    while (true) {
+        var lex = (try readContentLexeme(&scanner)) orelse continue;
+        defer syntax.Scanner.freeLexeme(alloc, &lex);
+        switch (lex) {
+            .eof => return true,
+            .keyword => |op| {
+                if (std.mem.eql(u8, op, "BI") or
+                    std.mem.eql(u8, op, "ID") or
+                    std.mem.eql(u8, op, "EI")) return false;
             },
             else => {},
         }
@@ -19328,6 +19843,92 @@ test "Type3 CharProc preflight rejects dropped resource paint transactionally" {
     try std.testing.expect(!try type3CharProcIsVectorizableAlloc(alloc, "q /Logo Do Q"));
     try std.testing.expect(!try type3CharProcIsVectorizableAlloc(alloc, "/GS1 gs 0 0 10 10 re f"));
     try std.testing.expect(!try type3CharProcIsVectorizableAlloc(alloc, "BT /F1 10 Tf (x) Tj ET"));
+    try std.testing.expect(try type3CharProcIsNativelyRenderableAlloc(alloc, "q /Logo Do Q"));
+    try std.testing.expect(try type3CharProcIsNativelyRenderableAlloc(alloc, "/GS1 gs 0 0 10 10 re f"));
+    try std.testing.expect(try type3CharProcIsNativelyRenderableAlloc(alloc, "BT /F1 10 Tf (x) Tj ET"));
+    try std.testing.expect(!try type3CharProcIsNativelyRenderableAlloc(alloc, "BI /W 1 /H 1 ID x EI"));
+}
+
+test "Type3 combined renderer retains direct image resources and paint phase" {
+    const alloc = std.testing.allocator;
+    const content = try alloc.dupe(u8, "q 2 0 0 3 4 5 cm /Im Do Q");
+    defer alloc.free(content);
+    const image_name = try alloc.dupe(u8, "Im");
+    defer alloc.free(image_name);
+    const rgba = try alloc.dupe(u8, &.{ 10, 20, 30, 255 });
+    defer alloc.free(rgba);
+    var glyph = Type3Glyph{ .code = 'A', .name = @constCast("A"), .content = content, .advance_x = 1, .advance_y = 0, .outline_only = false };
+    var image = PageImage{ .name = image_name, .rgba = rgba, .width = 1, .height = 1 };
+    const type3 = Type3Font{ .font_matrix = .{ 1, 0, 0, 1, 0, 0 }, .glyphs = (&glyph)[0..1], .images = (&image)[0..1] };
+    const text_run = TextRun{ .text = @constCast("A"), .raw_text = @constCast("A"), .x = 7, .y = 11, .font_size = 1, .paint_order = 9 };
+
+    var images = std.ArrayList(ImageRun).empty;
+    defer {
+        for (images.items) |*item| item.deinit(alloc);
+        images.deinit(alloc);
+    }
+    var shadings = std.ArrayList(ShadingRun).empty;
+    defer shadings.deinit(alloc);
+    var patterns = std.ArrayList(PatternRun).empty;
+    defer patterns.deinit(alloc);
+    var shapes = std.ArrayList(ShapeRun).empty;
+    defer shapes.deinit(alloc);
+    var phase: usize = 12;
+    var next_group_id: u32 = 1;
+    try std.testing.expect(try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id));
+    try std.testing.expectEqual(@as(usize, 1), images.items.len);
+    try std.testing.expectEqual(@as(usize, 9), images.items[0].paint_order);
+    try std.testing.expectEqual(@as(usize, 12), images.items[0].paint_phase);
+    try std.testing.expectApproxEqAbs(@as(f64, 11), images.items[0].e, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 16), images.items[0].f, 0.0001);
+
+    const AllocationRunner = struct {
+        fn run(failing_alloc: Allocator) !void {
+            var local_glyph = Type3Glyph{ .code = 'A', .name = @constCast("A"), .content = @constCast("q /Im Do Q"), .advance_x = 1, .advance_y = 0, .outline_only = false };
+            var local_image = PageImage{ .name = @constCast("Im"), .rgba = @constCast(&[_]u8{ 1, 2, 3, 255 }), .width = 1, .height = 1 };
+            const local_type3 = Type3Font{ .font_matrix = .{ 1, 0, 0, 1, 0, 0 }, .glyphs = (&local_glyph)[0..1], .images = (&local_image)[0..1] };
+            const local_run = TextRun{ .text = @constCast("A"), .raw_text = @constCast("A"), .x = 0, .y = 0, .font_size = 1 };
+            var local_images = std.ArrayList(ImageRun).empty;
+            defer {
+                for (local_images.items) |*item| item.deinit(failing_alloc);
+                local_images.deinit(failing_alloc);
+            }
+            var local_shadings = std.ArrayList(ShadingRun).empty;
+            defer {
+                for (local_shadings.items) |*item| item.deinit(failing_alloc);
+                local_shadings.deinit(failing_alloc);
+            }
+            var local_patterns = std.ArrayList(PatternRun).empty;
+            defer {
+                for (local_patterns.items) |*item| item.deinit(failing_alloc);
+                local_patterns.deinit(failing_alloc);
+            }
+            var local_shapes = std.ArrayList(ShapeRun).empty;
+            defer {
+                for (local_shapes.items) |*item| item.deinit(failing_alloc);
+                local_shapes.deinit(failing_alloc);
+            }
+            var local_phase: usize = 0;
+            var local_group: u32 = 1;
+            if (!try Reader.appendType3RunResourceRunsAlloc(failing_alloc, &local_images, &local_shadings, &local_patterns, &local_shapes, local_run, local_type3, "A", &local_phase, &local_group)) return error.UnexpectedType3Fallback;
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{});
+}
+
+test "vector text admission is raster relative and transactional" {
+    var budget = VectorTextWorkBudget.init(.{ .width = 10, .height = 10 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+    const small_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
+    const small = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = @constCast(&small_points), .antialias = true };
+    try std.testing.expect(budget.admit((&small)[0..1], &.{}, &.{}, &.{}));
+    const remaining = budget.remaining_edge_tests;
+
+    var expensive_points: [128][2]f64 = undefined;
+    for (&expensive_points, 0..) |*point, i| point.* = .{ @floatFromInt(i % 2), @floatFromInt((i / 2) % 2) };
+    expensive_points[1] = .{ 100, 100 };
+    const expensive = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = &expensive_points, .antialias = true };
+    try std.testing.expect(!budget.admit((&expensive)[0..1], &.{}, &.{}, &.{}));
+    try std.testing.expectEqual(remaining, budget.remaining_edge_tests);
 }
 
 test "content resource discovery requires the name as the immediate operand" {
@@ -19517,7 +20118,7 @@ test "vector text preserves mixed pattern fill and solid stroke phases" {
         pattern_out.deinit(alloc);
     }
 
-    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &patterns, (&run)[0..1]);
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, null, null, &shape_out, &pattern_out, &fonts, &patterns, (&run)[0..1], null);
     try std.testing.expect(run.vectorizable);
     try std.testing.expectEqual(@as(usize, 1), pattern_out.items.len);
     try std.testing.expectEqual(@as(@FieldType(PatternRun, "kind"), .fill), pattern_out.items[0].kind);
@@ -19590,7 +20191,7 @@ test "Type3 TJ fragments share paint phases and fall back atomically" {
     var pattern_out = std.ArrayList(PatternRun).empty;
     defer pattern_out.deinit(alloc);
 
-    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &.{}, &runs);
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, null, null, &shape_out, &pattern_out, &fonts, &.{}, &runs, null);
     try std.testing.expectEqual(@as(usize, 4), shape_out.items.len);
     for (shape_out.items, 0..) |shape, phase| try std.testing.expectEqual(phase, shape.paint_phase);
 
@@ -19599,7 +20200,7 @@ test "Type3 TJ fragments share paint phases and fall back atomically" {
     runs[0].vectorizable = true;
     runs[1].vectorizable = true;
     runs[1].raw_text = "C";
-    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &.{}, &runs);
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, null, null, &shape_out, &pattern_out, &fonts, &.{}, &runs, null);
     try std.testing.expect(!runs[0].vectorizable);
     try std.testing.expect(!runs[1].vectorizable);
     try std.testing.expectEqual(@as(usize, 0), shape_out.items.len);
@@ -19637,7 +20238,7 @@ test "vector text failure retains a visible raster fallback" {
     var pattern_out = std.ArrayList(PatternRun).empty;
     defer pattern_out.deinit(alloc);
 
-    try Reader.appendVectorTextRenderRunsAlloc(alloc, &shape_out, &pattern_out, &fonts, &.{}, (&run)[0..1]);
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, null, null, &shape_out, &pattern_out, &fonts, &.{}, (&run)[0..1], null);
     try std.testing.expect(!run.vectorizable);
     try std.testing.expect(run.fill_pattern_name == null);
     try std.testing.expectEqual(@as(usize, 0), shape_out.items.len);

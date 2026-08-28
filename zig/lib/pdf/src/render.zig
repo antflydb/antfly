@@ -278,13 +278,19 @@ fn renderChoiceIndex(choice: RenderChoice) usize {
 
 fn renderChoicePhase(
     choice: RenderChoice,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
 ) usize {
     return switch (choice) {
+        .text => |idx| text_runs[idx].paint_phase,
+        .image => |idx| image_runs[idx].paint_phase,
+        .shading => |idx| shading_runs[idx].paint_phase,
         .pattern => |idx| pattern_runs[idx].paint_phase,
         .shape => |idx| shape_runs[idx].paint_phase,
-        else => 0,
+        .group => 0,
     };
 }
 
@@ -300,8 +306,8 @@ const RenderChoiceSortContext = struct {
         const a_order = choiceOrder(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         const b_order = choiceOrder(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs, ctx.groups);
         if (a_order != b_order) return a_order < b_order;
-        const a_phase = renderChoicePhase(a, ctx.pattern_runs, ctx.shape_runs);
-        const b_phase = renderChoicePhase(b, ctx.pattern_runs, ctx.shape_runs);
+        const a_phase = renderChoicePhase(a, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs);
+        const b_phase = renderChoicePhase(b, ctx.text_runs, ctx.image_runs, ctx.shading_runs, ctx.pattern_runs, ctx.shape_runs);
         if (a_phase != b_phase) return a_phase < b_phase;
         const a_kind = renderChoiceKindOrder(a);
         const b_kind = renderChoiceKindOrder(b);
@@ -417,6 +423,83 @@ fn renderChoiceAlloc(
     }
 }
 
+const PixelRect = struct {
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+
+    fn full(width: usize, height: usize) PixelRect {
+        return .{ .x0 = 0, .y0 = 0, .x1 = width, .y1 = height };
+    }
+
+    fn empty(self: PixelRect) bool {
+        return self.x0 >= self.x1 or self.y0 >= self.y1;
+    }
+};
+
+fn boundsPixelRect(bounds: anytype, page_box: reader.PageBox, width: usize, height: usize, padding: f64) PixelRect {
+    return .{
+        .x0 = floorToCanvas(bounds.min_x - page_box.min_x - padding, width),
+        .x1 = ceilToCanvas(bounds.max_x - page_box.min_x + padding, width),
+        .y0 = floorToCanvas(page_box.max_y - bounds.max_y - padding, height),
+        .y1 = ceilToCanvas(page_box.max_y - bounds.min_y + padding, height),
+    };
+}
+
+fn patternRunBounds(run: reader.PatternRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
+    if (run.points.len == 0) return .{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
+    var min_x = run.points[0][0];
+    var max_x = min_x;
+    var min_y = run.points[0][1];
+    var max_y = min_y;
+    for (run.points[1..]) |point| {
+        min_x = @min(min_x, point[0]);
+        max_x = @max(max_x, point[0]);
+        min_y = @min(min_y, point[1]);
+        max_y = @max(max_y, point[1]);
+    }
+    if (run.kind == .stroke) {
+        const radius = run.stroke_width / 2.0;
+        const padding = if (run.line_join == .miter) radius * @max(1.0, run.miter_limit) else radius;
+        min_x -= padding;
+        max_x += padding;
+        min_y -= padding;
+        max_y += padding;
+    }
+    return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = max_y };
+}
+
+fn renderChoicePixelRect(
+    choice: RenderChoice,
+    width: usize,
+    height: usize,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+) PixelRect {
+    return switch (choice) {
+        .text => |idx| boundsPixelRect(textRunBounds(text_runs[idx]), page_box, width, height, @max(1.0, text_runs[idx].stroke_width)),
+        .image => |idx| boundsPixelRect(imageRunBounds(image_runs[idx]), page_box, width, height, 1.0),
+        // Shadings and nested transparency groups can affect the whole clip;
+        // retaining the full-page conservative region preserves semantics.
+        .shading, .group => PixelRect.full(width, height),
+        .pattern => |idx| boundsPixelRect(patternRunBounds(pattern_runs[idx]), page_box, width, height, 1.0),
+        .shape => |idx| boundsPixelRect(shapeRunBounds(shape_runs[idx]), page_box, width, height, 1.0),
+    };
+}
+
+fn copyCanvasRect(dst: []u8, src: []const u8, canvas_width: usize, rect: PixelRect) void {
+    var y = rect.y0;
+    while (y < rect.y1) : (y += 1) {
+        const start = (y * canvas_width + rect.x0) * 4;
+        const end = (y * canvas_width + rect.x1) * 4;
+        @memcpy(dst[start..end], src[start..end]);
+    }
+}
+
 fn renderGroupChildrenAlloc(
     alloc: Allocator,
     canvas: []u8,
@@ -434,13 +517,16 @@ fn renderGroupChildrenAlloc(
 ) anyerror!void {
     const backdrop = if (knockout) try alloc.dupe(u8, canvas) else null;
     defer if (backdrop) |buf| alloc.free(buf);
+    const scratch = if (knockout) try alloc.dupe(u8, canvas) else null;
+    defer if (scratch) |buf| alloc.free(buf);
 
     for (plan.schedules[schedule_index].items) |choice| {
         if (knockout) {
-            const scratch = try alloc.dupe(u8, backdrop orelse canvas);
-            defer alloc.free(scratch);
-            try renderChoiceAlloc(alloc, scratch, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
-            replaceCanvasWhereChanged(canvas, scratch, backdrop orelse canvas);
+            const rect = renderChoicePixelRect(choice, width, height, page_box, text_runs, image_runs, pattern_runs, shape_runs);
+            if (rect.empty()) continue;
+            copyCanvasRect(scratch.?, backdrop.?, width, rect);
+            try renderChoiceAlloc(alloc, scratch.?, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
+            replaceCanvasWhereChangedRect(canvas, scratch.?, backdrop.?, width, rect);
         } else {
             try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
         }
@@ -1622,18 +1708,36 @@ fn clearCanvasWhereOpaque(canvas: []u8, mask: []const u8) void {
     }
 }
 
-fn replaceCanvasWhereChanged(canvas: []u8, next: []const u8, backdrop: []const u8) void {
-    var i: usize = 0;
-    while (i + 3 < next.len) : (i += 4) {
-        if (next[i + 0] == backdrop[i + 0] and
-            next[i + 1] == backdrop[i + 1] and
-            next[i + 2] == backdrop[i + 2] and
-            next[i + 3] == backdrop[i + 3]) continue;
-        canvas[i + 0] = next[i + 0];
-        canvas[i + 1] = next[i + 1];
-        canvas[i + 2] = next[i + 2];
-        canvas[i + 3] = next[i + 3];
+fn replaceCanvasWhereChangedRect(canvas: []u8, next: []const u8, backdrop: []const u8, canvas_width: usize, rect: PixelRect) void {
+    var y = rect.y0;
+    while (y < rect.y1) : (y += 1) {
+        var i = (y * canvas_width + rect.x0) * 4;
+        const end = (y * canvas_width + rect.x1) * 4;
+        while (i < end) : (i += 4) {
+            if (next[i + 0] == backdrop[i + 0] and
+                next[i + 1] == backdrop[i + 1] and
+                next[i + 2] == backdrop[i + 2] and
+                next[i + 3] == backdrop[i + 3]) continue;
+            canvas[i + 0] = next[i + 0];
+            canvas[i + 1] = next[i + 1];
+            canvas[i + 2] = next[i + 2];
+            canvas[i + 3] = next[i + 3];
+        }
     }
+}
+
+test "knockout dirty replacement never scans or mutates outside its bounds" {
+    var backdrop = [_]u8{0} ** (4 * 4 * 4);
+    var canvas = backdrop;
+    var next = backdrop;
+    next[0] = 99;
+    const inside = (1 * 4 + 1) * 4;
+    next[inside] = 42;
+    next[inside + 3] = 255;
+    replaceCanvasWhereChangedRect(&canvas, &next, &backdrop, 4, .{ .x0 = 1, .y0 = 1, .x1 = 2, .y1 = 2 });
+    try std.testing.expectEqual(@as(u8, 0), canvas[0]);
+    try std.testing.expectEqual(@as(u8, 42), canvas[inside]);
+    try std.testing.expectEqual(@as(u8, 255), canvas[inside + 3]);
 }
 
 fn colorWithAlpha(color: [4]u8, alpha: u8) [4]u8 {
