@@ -3717,6 +3717,7 @@ pub const ApiHttpServer = struct {
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
                 .dense_vector_projection_pending = index.dense_vector_projection_pending,
+                .dense_native_storage_phase = index.dense_native_storage_phase,
                 .index_repair_status = index.repair_status,
                 .index_repair_active_generation_serviceable = index.repair_active_generation_serviceable,
                 .catch_up_active = dense_catch_up_active,

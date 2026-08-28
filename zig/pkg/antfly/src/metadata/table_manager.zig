@@ -16,9 +16,11 @@ const std = @import("std");
 const group_ids = @import("../common/group_ids.zig");
 const topology_records = @import("../common/topology_records.zig");
 const index_repair_status = @import("../common/index_repair_status.zig");
+const dense_native_storage_phase = @import("../common/dense_native_storage_phase.zig");
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
+pub const DenseNativeStoragePhase = dense_native_storage_phase.DenseNativeStoragePhase;
 
 pub const PlacementClass = enum {
     data,
@@ -828,6 +830,7 @@ pub const RuntimeIndexStatusReport = struct {
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
     dense_vector_projection_pending: bool = false,
+    dense_native_storage_phase: DenseNativeStoragePhase = .legacy,
     repair_status: ?IndexRepairStatus = null,
     /// This proof is meaningful only while repair_status is non-null. It means
     /// the active generation is safe to query, not necessarily complete.
@@ -2151,6 +2154,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
         .dense_vector_projection_pending = record.dense_vector_projection_pending,
+        .dense_native_storage_phase = record.dense_native_storage_phase,
         .repair_status = record.repair_status,
         .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };

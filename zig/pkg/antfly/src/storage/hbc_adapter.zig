@@ -10132,7 +10132,12 @@ pub const HBCIndex = struct {
     }
 
     pub fn rebuildAllQuantizedForExperiment(self: *HBCIndex) !void {
-        var txn = try self.beginRuntimeWriteTxn();
+        // Maintenance changes query-visible quantized payloads just like an
+        // ordinary write. Use the published wrapper so generation leases see
+        // either the complete old tree or the complete rebuilt tree; a raw
+        // runtime transaction would also make this helper impossible to pass
+        // to finishWriteTxn's type-safe public boundary.
+        var txn = try self.beginWriteTxn();
         errdefer txn.abort();
         try self.rebuildAllQuantized(&txn);
         try self.finishWriteTxn(&txn);
@@ -14316,11 +14321,12 @@ test "stale flat directory build preserves the current generation cache" {
         idx.releaseSearchScratch(&scratch_handle);
     }
     var profile: SearchProfile = .{};
-    const probes = try vectorindex_spfresh_index.selectFlatRabitqPostingsAlloc(
+    const selection = try vectorindex_spfresh_index.selectFlatPostingsAlloc(
         &idx,
         &older_txn,
         &.{ 1, 1, 1, 1 },
-        &scratch_handle,
+        std.math.maxInt(usize),
+        &scratch_handle.scratch,
         &profile,
         .complete_snapshot,
         older_snapshot,
@@ -14328,6 +14334,8 @@ test "stale flat directory build preserves the current generation cache" {
         nowNs,
         elapsedSince,
     );
+    const probes = selection.probes;
+    defer alloc.free(probes);
     try std.testing.expect(probes.len > 0);
 
     lockAtomic(&idx.flat_centroid_mu);
@@ -15844,6 +15852,7 @@ test "hbc uncached external rerank does not publish snapshot metadata" {
     var distances: [1]f32 = undefined;
     var vector_ids: [1]u64 = undefined;
     var metadata: [1]?[]const u8 = undefined;
+    var vector_views: [1][]const f32 = undefined;
     var lookups: [1]FixedKeyLookup = undefined;
     var key_views: [1][]const u8 = undefined;
     var values: [1]?[]const u8 = undefined;
@@ -15858,6 +15867,7 @@ test "hbc uncached external rerank does not publish snapshot metadata" {
         &distances,
         &vector_ids,
         &metadata,
+        &vector_views,
         &lookups,
         &key_views,
         &values,

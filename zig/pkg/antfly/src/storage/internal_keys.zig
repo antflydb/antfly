@@ -1181,6 +1181,61 @@ pub fn matchesDerivedEmbeddingArtifactName(key: []const u8, artifact_name: []con
     return findComponentTerminator(key, pos).? + 2 == key.len;
 }
 
+/// Stable logical identity for the artifact family represented by either a
+/// document embedding key or a derived/chunk embedding key. Hash decoded name
+/// bytes so embedded NULs have the same identity as the caller's configured
+/// artifact name without allocating during a corpus scan.
+pub fn embeddingArtifactScopeHash(key: []const u8) ?u64 {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
+    var pos = doc_term + 2;
+    if (pos >= key.len) return null;
+
+    if (key[pos] == artifact_kind) {
+        pos += 1;
+        const type_term = findComponentTerminator(key, pos) orelse return null;
+        if (componentEquals(key, pos, "embedding")) {
+            pos = type_term + 2;
+            const name_term = findComponentTerminator(key, pos) orelse return null;
+            if (name_term + 2 == key.len) return hashEncodedComponentBody(key[pos..name_term]);
+        }
+        pos = type_term + 2;
+        const name_term = findComponentTerminator(key, pos) orelse return null;
+        pos = name_term + 2;
+        if (pos == key.len) return null;
+        pos = skipDerivedEmbeddingBaseRecordSuffix(key, pos) orelse return null;
+    } else return null;
+
+    if (pos >= key.len or key[pos] != derived_embedding_kind) return null;
+    pos += 1;
+    const embedding_term = findComponentTerminator(key, pos) orelse return null;
+    if (embedding_term + 2 != key.len) return null;
+    return hashEncodedComponentBody(key[pos..embedding_term]);
+}
+
+pub fn embeddingArtifactScopeHashForName(artifact_name: []const u8) u64 {
+    return std.hash.XxHash64.hash(0, artifact_name);
+}
+
+fn hashEncodedComponentBody(body: []const u8) ?u64 {
+    var hasher = std.hash.XxHash64.init(0);
+    var pos: usize = 0;
+    var literal_start: usize = 0;
+    while (pos < body.len) {
+        if (body[pos] != 0) {
+            pos += 1;
+            continue;
+        }
+        if (pos + 1 >= body.len or body[pos + 1] != 0xff) return null;
+        if (literal_start < pos) hasher.update(body[literal_start..pos]);
+        hasher.update("\x00");
+        pos += 2;
+        literal_start = pos;
+    }
+    if (literal_start < body.len) hasher.update(body[literal_start..]);
+    return hasher.final();
+}
+
 fn skipDerivedEmbeddingBaseRecordSuffix(key: []const u8, pos: usize) ?usize {
     var cursor = pos;
     if (cursor < key.len and key[cursor] == document_unit_record_kind) {
@@ -1766,6 +1821,22 @@ test "isEmbeddingArtifactKey round trip" {
     const view = (try parseEmbeddingArtifactKeyView(key)).?;
     try std.testing.expectEqualStrings("my-doc", view.doc_key);
     try std.testing.expectEqualStrings("my-index", view.artifact_name);
+}
+
+test "embedding artifact scope hash is shared by direct and derived keys" {
+    const alloc = std.testing.allocator;
+    const artifact_name = "dense\x00shared";
+    const direct = try embeddingArtifactKeyForDocumentAlloc(alloc, "doc", artifact_name);
+    defer alloc.free(direct);
+    const chunk = try chunkArtifactKeyAlloc(alloc, "doc", "chunks", 4);
+    defer alloc.free(chunk);
+    const derived = try derivedEmbeddingArtifactKeyAlloc(alloc, chunk, artifact_name);
+    defer alloc.free(derived);
+
+    const expected = embeddingArtifactScopeHashForName(artifact_name);
+    try std.testing.expectEqual(expected, embeddingArtifactScopeHash(direct).?);
+    try std.testing.expectEqual(expected, embeddingArtifactScopeHash(derived).?);
+    try std.testing.expect(embeddingArtifactScopeHash(chunk) == null);
 }
 
 test "embedding artifact key round trip with zero bytes in doc key" {

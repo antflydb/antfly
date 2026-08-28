@@ -841,6 +841,7 @@ fn preserveIndexProjectionLifecycle(dst: *db_mod.types.DBIndexStats, cached: db_
     dst.projection_checkpoint_config_hash = cached.projection_checkpoint_config_hash;
     dst.checkpoint_replay_tail_sequence_count = cached.checkpoint_replay_tail_sequence_count;
     dst.dense_vector_projection_pending = cached.dense_vector_projection_pending;
+    dst.dense_native_storage_phase = cached.dense_native_storage_phase;
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
@@ -860,6 +861,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
         if (indexHasArtifactVisibilityFacts(index)) return true;
         if (index.repair_degraded or index.repair_issue_count != 0) return true;
         if (index.dense_vector_projection_pending) return true;
+        if (index.dense_native_storage_phase != .legacy) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
         // A target-only replay/catch-up marker can be synthesized from topology
         // and accepted sequence. It is not enough to prove that a live runtime
@@ -1365,6 +1367,8 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .coverage_identity_ready = item.coverage_identity_ready,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
+            .dense_vector_projection_pending = item.dense_vector_projection_pending,
+            .dense_native_storage_phase = item.dense_native_storage_phase,
             .enrichment_failed = item.enrichment_failed,
             .repair_degraded = item.repair_degraded,
             .repair_issue_count = item.repair_issue_count,

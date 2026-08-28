@@ -23,4 +23,7 @@ pub const repair_status_record_version: u16 = 13;
 /// V14 carries readiness-critical native dense-vector projection debt across
 /// the data-to-metadata status boundary.
 pub const vector_projection_record_version: u16 = 14;
-pub const current_record_version: u16 = vector_projection_record_version;
+/// V15 carries the durable native dense-storage rollout phase. Enum ordinals
+/// are fixed by common/dense_native_storage_phase.zig.
+pub const dense_native_storage_record_version: u16 = 15;
+pub const current_record_version: u16 = dense_native_storage_record_version;

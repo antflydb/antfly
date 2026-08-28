@@ -120,13 +120,12 @@ if [[ -z "$vdbbench_python" ]]; then
   vdbbench_python=$vdbbench_root/.venv/bin/python
 fi
 
-if [[ "$native_hbc" == "1" ]]; then
-  export ANTFLY_HBC_POSTING_SIDECAR=1
-  export ANTFLY_HBC_POSTING_WAL_STORE=1
-fi
-if [[ "$vector_blocks" == "1" ]]; then
-  export ANTFLY_HBC_VECTOR_BLOCK_STORE=1
-fi
+# Production defaults to native storage. Qualification modes set every gate
+# explicitly so legacy-vs-native A/B runs remain reproducible as defaults
+# evolve and never accidentally measure a mixed storage authority.
+export ANTFLY_HBC_POSTING_SIDECAR=$native_hbc
+export ANTFLY_HBC_POSTING_WAL_STORE=$native_hbc
+export ANTFLY_HBC_VECTOR_BLOCK_STORE=$vector_blocks
 if [[ "$vector_block_encoding" != "float32" && "$vector_block_encoding" != "float16" && "$vector_block_encoding" != "f32" && "$vector_block_encoding" != "f16" ]]; then
   echo "vector block encoding must be float32 or float16" >&2
   exit 2

@@ -27,7 +27,10 @@ const artifact_codec = @import("db/enrichment/artifact_codec.zig");
 pub const Encoding = vector_block.Encoding;
 
 const current_name = "CURRENT";
-const max_manifest_bytes: usize = 1024 * 1024;
+// A maximally admitted 1024-shard, 64-delta manifest is roughly 2.7 MiB
+// before scoped coverage certificates. Keep the local recovery read bounded
+// while permitting every layout accepted by vector_block_manifest.validate.
+const max_manifest_bytes: usize = 4 * 1024 * 1024;
 const max_wal_bytes: usize = 512 * 1024 * 1024;
 const wal_checkpoint_bytes: usize = 64 * 1024 * 1024;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
@@ -126,6 +129,10 @@ pub const BaseBuildOptions = struct {
     // read and file-cache demand; its encoding is explicit in every block and
     // old float32 generations remain readable.
     encoding: vector_block.Encoding = .float16,
+    /// Sorted, unique hashes of configured embedding artifact names. The
+    /// shared base stores each payload once while publishing an independent
+    /// exact cardinality/membership certificate for every logical scope.
+    artifact_scope_hashes: []const u64 = &.{},
 };
 
 pub const BaseBuildStats = struct {
@@ -146,6 +153,7 @@ pub const Store = struct {
     root_dir: []u8,
     manifest: ?vector_manifest.Manifest = null,
     manifest_segments: []vector_manifest.Segment = &.{},
+    manifest_coverages: []vector_manifest.Coverage = &.{},
     wal_generation: u64 = 1,
     wal_committed_bytes: u64 = 0,
     wal_has_mutations: bool = false,
@@ -192,6 +200,7 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         if (self.manifest_segments.len != 0) self.alloc.free(self.manifest_segments);
+        if (self.manifest_coverages.len != 0) self.alloc.free(self.manifest_coverages);
         self.alloc.free(self.root_dir);
         self.* = undefined;
     }
@@ -341,6 +350,23 @@ pub const Store = struct {
             covered_source_sequence,
             staged,
             if (replace_base) .replace_base else .append_delta,
+            null,
+        );
+    }
+
+    fn publishStagedBaseWithCoverage(
+        self: *Store,
+        generation: u64,
+        covered_source_sequence: u64,
+        staged: []const StagedBlock,
+        coverages: []const vector_manifest.Coverage,
+    ) !void {
+        return try self.publishStagedGenerationMode(
+            generation,
+            covered_source_sequence,
+            staged,
+            .replace_base,
+            coverages,
         );
     }
 
@@ -361,6 +387,7 @@ pub const Store = struct {
             covered_source_sequence,
             staged,
             .replace_deltas,
+            null,
         );
     }
 
@@ -370,6 +397,7 @@ pub const Store = struct {
         covered_source_sequence: u64,
         staged: []const StagedBlock,
         mode: PublicationMode,
+        replacement_coverages: ?[]const vector_manifest.Coverage,
     ) !void {
         if (self.poisoned) return error.VectorBlockStoreRequiresReopen;
         if (staged.len == 0) return error.EmptyVectorBlockGeneration;
@@ -418,6 +446,12 @@ pub const Store = struct {
         errdefer self.alloc.free(next_segments);
         if (retained_count != 0) @memcpy(next_segments[0..retained_count], self.manifest_segments[0..retained_count]);
         for (staged, next_segments[retained_count..]) |receipt, *descriptor| descriptor.* = stagedDescriptor(receipt);
+        const coverage_source = if (replace_base)
+            replacement_coverages orelse &.{}
+        else
+            self.manifest_coverages;
+        const next_coverages = try self.alloc.dupe(vector_manifest.Coverage, coverage_source);
+        errdefer self.alloc.free(next_coverages);
         const next_wal_generation = std.math.add(u64, self.wal_generation, 1) catch return error.VectorWalGenerationOverflow;
         const next_manifest: vector_manifest.Manifest = .{
             .base_generation = if (replace_base) generation else self.manifest.?.base_generation,
@@ -427,18 +461,24 @@ pub const Store = struct {
             .covered_source_sequence = covered_source_sequence,
             .shard_count = shard_count,
             .segments = next_segments,
+            .coverages = next_coverages,
         };
         try next_manifest.validate();
         const encoded = try next_manifest.encodeAlloc(self.alloc);
         defer self.alloc.free(encoded);
         const next_wal_path = try self.walPathAlloc(next_wal_generation);
         defer self.alloc.free(next_wal_path);
+        // Allocate every piece of post-publication cleanup state before the
+        // CURRENT commit point. Once CURRENT is replaced, returning an
+        // allocator error would report failure for a generation that is
+        // already the crash-recovery authority and invite an unsafe retry.
+        const previous_wal_path = try self.walPathAlloc(self.wal_generation);
+        defer self.alloc.free(previous_wal_path);
         try atomicReplace(self.alloc, self.storage, next_wal_path, &.{});
         const current_path = try self.currentPathAlloc();
         defer self.alloc.free(current_path);
         try atomicReplace(self.alloc, self.storage, current_path, encoded);
 
-        const previous_wal_generation = self.wal_generation;
         // CURRENT is now the crash-recovery authority. Replacement bases do
         // not reference any prior block, so unlink those generations before
         // releasing their descriptors. Existing POSIX mmap leases remain
@@ -455,9 +495,12 @@ pub const Store = struct {
             self.storage.deleteFileAbsolute(obsolete_path) catch {};
         }
         if (self.manifest_segments.len != 0) self.alloc.free(self.manifest_segments);
+        if (self.manifest_coverages.len != 0) self.alloc.free(self.manifest_coverages);
         self.manifest_segments = next_segments;
+        self.manifest_coverages = next_coverages;
         self.manifest = next_manifest;
         self.manifest.?.segments = self.manifest_segments;
+        self.manifest.?.coverages = self.manifest_coverages;
         self.wal_generation = next_wal_generation;
         self.wal_committed_bytes = 0;
         self.wal_has_mutations = false;
@@ -465,8 +508,6 @@ pub const Store = struct {
         self.last_committed_batch = null;
         self.covered_source_sequence = covered_source_sequence;
         self.segment_covered_source_sequence = covered_source_sequence;
-        const previous_wal_path = try self.walPathAlloc(previous_wal_generation);
-        defer self.alloc.free(previous_wal_path);
         self.storage.deleteFileAbsolute(previous_wal_path) catch {};
     }
 
@@ -509,6 +550,19 @@ pub const Store = struct {
         {
             return error.InvalidVectorBlockBuildOptions;
         }
+        var previous_scope: ?u64 = null;
+        for (options.artifact_scope_hashes) |scope_hash| {
+            if (previous_scope) |previous| if (scope_hash <= previous) return error.InvalidVectorBlockBuildOptions;
+            previous_scope = scope_hash;
+        }
+        const coverages = try self.alloc.alloc(vector_manifest.Coverage, options.artifact_scope_hashes.len);
+        defer self.alloc.free(coverages);
+        for (coverages, options.artifact_scope_hashes) |*coverage, scope_hash| coverage.* = .{
+            .scope_hash = scope_hash,
+            .vector_count = 0,
+            .key_hash_xor = 0,
+            .key_hash_sum = 0,
+        };
         const buffers = try self.alloc.alloc(std.ArrayListUnmanaged(u8), options.shard_count);
         defer self.alloc.free(buffers);
         for (buffers) |*buffer| buffer.* = .empty;
@@ -541,6 +595,7 @@ pub const Store = struct {
             flush_bytes: usize,
             encoding: vector_block.Encoding,
             stats: *BaseBuildStats,
+            coverages: []vector_manifest.Coverage,
 
             fn flush(ctx: *@This(), shard: usize) !void {
                 const buffer = &ctx.buffers[shard];
@@ -578,6 +633,16 @@ pub const Store = struct {
                 // query projection use a narrower encoding.
                 ctx.stats.vector_bytes += source_vector_bytes;
                 ctx.stats.artifact_bytes_scanned += artifact.len;
+                if (internal_keys.embeddingArtifactScopeHash(key)) |scope_hash| {
+                    for (ctx.coverages) |*coverage| {
+                        if (coverage.scope_hash < scope_hash) continue;
+                        if (coverage.scope_hash > scope_hash) break;
+                        coverage.vector_count +|= 1;
+                        coverage.key_hash_xor ^= hash;
+                        coverage.key_hash_sum +%= hash;
+                        break;
+                    }
+                }
                 if (ctx.buffers[shard].items.len >= ctx.flush_bytes) try ctx.flush(shard);
             }
 
@@ -608,6 +673,7 @@ pub const Store = struct {
             .flush_bytes = options.spool_buffer_bytes,
             .encoding = options.encoding,
             .stats = &stats,
+            .coverages = coverages,
         };
         try doc_store.scanReadTxnWithContext(txn, "", "", .{}, &scan_context, ScanContext.scan);
         for (0..options.shard_count) |shard| {
@@ -652,7 +718,7 @@ pub const Store = struct {
             stats.block_bytes += block.len;
             staged[shard] = try self.stageBlock(generation, covered_source_sequence, @intCast(shard), block);
         }
-        try self.publishStagedGeneration(generation, covered_source_sequence, staged, true);
+        try self.publishStagedBaseWithCoverage(generation, covered_source_sequence, staged, coverages);
         return stats;
     }
 
@@ -725,6 +791,23 @@ pub const Opened = struct {
         return self.baseVectorCount();
     }
 
+    /// Returns the complete-base certificate for one configured artifact
+    /// family. Sparse overlays remain transactionally authoritative but do not
+    /// have an additive physical-count interpretation, matching
+    /// baseOnlyVectorCount's readiness contract.
+    pub fn baseOnlyCoverage(self: *const Opened, scope_hash: u64) ?vector_manifest.Coverage {
+        const manifest = self.store.manifest orelse return null;
+        if (self.store.wal_has_mutations or manifest.segments.len != @as(usize, @intCast(manifest.shard_count))) return null;
+        var lo: usize = 0;
+        var hi = manifest.coverages.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (manifest.coverages[mid].scope_hash < scope_hash) lo = mid + 1 else hi = mid;
+        }
+        if (lo >= manifest.coverages.len or manifest.coverages[lo].scope_hash != scope_hash) return null;
+        return manifest.coverages[lo];
+    }
+
     /// Counts the immutable base without reconciling its WAL/delta overlays.
     /// This distinguishes an empty bootstrap base from an established base
     /// that is serving ordinary online mutations.
@@ -756,6 +839,14 @@ pub const Opened = struct {
         const encoding = self.baseEncoding() orelse return error.InconsistentVectorBlockEncoding;
         const staged = try self.store.alloc.alloc(StagedBlock, shard_count);
         defer self.store.alloc.free(staged);
+        const coverages = try self.store.alloc.alloc(vector_manifest.Coverage, manifest.coverages.len);
+        defer self.store.alloc.free(coverages);
+        for (coverages, manifest.coverages) |*coverage, existing| coverage.* = .{
+            .scope_hash = existing.scope_hash,
+            .vector_count = 0,
+            .key_hash_xor = 0,
+            .key_hash_sum = 0,
+        };
         var staged_count: usize = 0;
         var records = std.ArrayListUnmanaged(CompactionRecord).empty;
         defer records.deinit(self.store.alloc);
@@ -786,7 +877,9 @@ pub const Opened = struct {
             while (pos < records.items.len) {
                 var record_end = pos + 1;
                 while (record_end < records.items.len and records.items[pos].sameKey(records.items[record_end])) : (record_end += 1) {}
-                try records.items[record_end - 1].appendLiveBlockVectorTo(&writer, encoding);
+                const latest = records.items[record_end - 1];
+                if (latest.isLive()) noteCoverage(coverages, latest.key);
+                try latest.appendLiveBlockVectorTo(&writer, encoding);
                 pos = record_end;
             }
             const bytes = try writer.build();
@@ -803,11 +896,11 @@ pub const Opened = struct {
             // accumulate a corpus-sized RSS high-water.
             self.discardShardResidentPages(shard, true);
         }
-        try self.store.publishStagedGeneration(
+        try self.store.publishStagedBaseWithCoverage(
             generation,
             self.store.covered_source_sequence,
             staged[0..staged_count],
-            true,
+            coverages,
         );
         return true;
     }
@@ -1049,6 +1142,13 @@ const CompactionRecord = struct {
         return self.hash == other.hash and std.mem.eql(u8, self.key, other.key);
     }
 
+    fn isLive(self: CompactionRecord) bool {
+        return switch (self.payload) {
+            .tombstone => false,
+            .block_vector, .wal_vector => true,
+        };
+    }
+
     fn lessThan(_: void, lhs: CompactionRecord, rhs: CompactionRecord) bool {
         if (lhs.hash != rhs.hash) return lhs.hash < rhs.hash;
         const key_order = std.mem.order(u8, lhs.key, rhs.key);
@@ -1147,8 +1247,11 @@ fn openInternal(
         var decoded = try vector_manifest.decodeAlloc(alloc, current);
         store.manifest_segments = decoded.owned_segments;
         decoded.owned_segments = &.{};
+        store.manifest_coverages = decoded.owned_coverages;
+        decoded.owned_coverages = &.{};
         store.manifest = decoded.manifest;
         store.manifest.?.segments = store.manifest_segments;
+        store.manifest.?.coverages = store.manifest_coverages;
         store.wal_generation = store.manifest.?.wal_generation;
         store.wal_committed_bytes = store.manifest.?.wal_committed_bytes;
         store.covered_source_sequence = store.manifest.?.covered_source_sequence;
@@ -1279,6 +1382,19 @@ fn stagedDescriptor(staged: StagedBlock) vector_manifest.Segment {
         .bytes = staged.bytes,
         .admission_checksum = staged.admission_checksum,
     };
+}
+
+fn noteCoverage(coverages: []vector_manifest.Coverage, key: []const u8) void {
+    const scope_hash = internal_keys.embeddingArtifactScopeHash(key) orelse return;
+    const key_hash = vector_block.keyHash(key);
+    for (coverages) |*coverage| {
+        if (coverage.scope_hash < scope_hash) continue;
+        if (coverage.scope_hash > scope_hash) return;
+        coverage.vector_count +|= 1;
+        coverage.key_hash_xor ^= key_hash;
+        coverage.key_hash_sum +%= key_hash;
+        return;
+    }
 }
 
 const SpoolEntry = struct {
@@ -1661,25 +1777,32 @@ test "vector block store bulk builder stages bounded shared shards" {
     defer alloc.free(key_a);
     const key_b = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-b", "embedding-v1");
     defer alloc.free(key_b);
+    const key_c = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc-c", "embedding-v2");
+    defer alloc.free(key_c);
     const payload_a = try artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 1.0, 2.0, 3.0 });
     defer alloc.free(payload_a);
     const payload_b = try artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 100_000.0, -250_000.0, 6.0 });
     defer alloc.free(payload_b);
+    const payload_c = try artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &.{ 4.0, 5.0, 6.0 });
+    defer alloc.free(payload_c);
     try primary.put(key_a, payload_a);
     try primary.put(key_b, payload_b);
+    try primary.put(key_c, payload_c);
     try primary.put("ordinary-document", "{\"body\":\"not an artifact\"}");
 
     var memory = lsm_backend.MemoryStorage.init(alloc);
     defer memory.deinit();
     var store = try Store.open(alloc, memory.storage(), "/vector-block-builder");
     defer store.deinit();
+    const embedding_v1_scope = internal_keys.embeddingArtifactScopeHashForName("embedding-v1");
     const stats = try store.buildBaseFromArtifacts(&primary, 1, 9, .{
         .shard_count = 4,
         .spool_buffer_bytes = 32,
         .encoding = .float16,
+        .artifact_scope_hashes = &.{embedding_v1_scope},
     });
-    try std.testing.expectEqual(@as(u64, 2), stats.vectors);
-    try std.testing.expectEqual(@as(u64, 24), stats.vector_bytes);
+    try std.testing.expectEqual(@as(u64, 3), stats.vectors);
+    try std.testing.expectEqual(@as(u64, 36), stats.vector_bytes);
 
     // An authoritative snapshot may advance an older base directly when its
     // WAL is empty. This is the safe bootstrap/migration replacement path.
@@ -1692,6 +1815,7 @@ test "vector block store bulk builder stages bounded shared shards" {
         .shard_count = 8,
         .spool_buffer_bytes = 32,
         .encoding = .float16,
+        .artifact_scope_hashes = &.{embedding_v1_scope},
     });
     for (0..8) |shard| {
         if (shard < 4) {
@@ -1707,6 +1831,9 @@ test "vector block store bulk builder stages bounded shared shards" {
     var opened = try Store.openWithBlocks(alloc, memory.storage(), "/vector-block-builder");
     defer opened.deinit();
     try std.testing.expectEqual(Encoding.float16, opened.baseEncoding().?);
+    try std.testing.expectEqual(@as(?u64, 3), opened.baseOnlyVectorCount());
+    try std.testing.expectEqual(@as(u64, 2), opened.baseOnlyCoverage(embedding_v1_scope).?.vector_count);
+    try std.testing.expect(opened.baseOnlyCoverage(internal_keys.embeddingArtifactScopeHashForName("embedding-v2")) == null);
     const revision_a = std.hash.XxHash64.hash(0, payload_a2);
     const projected = (try opened.get(key_a, 10, revision_a)).vector;
     var decoded: [3]f32 = undefined;

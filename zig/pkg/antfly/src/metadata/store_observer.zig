@@ -466,6 +466,7 @@ fn runtimeStatusEqual(
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required or
             left.dense_vector_projection_pending != right.dense_vector_projection_pending or
+            left.dense_native_storage_phase != right.dense_native_storage_phase or
             (include_repair_status and (left.repair_status != right.repair_status or
                 left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)))
         {

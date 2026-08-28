@@ -9459,6 +9459,13 @@ pub fn build(b: *std.Build) void {
         .root_module = hbc_read_bench_mod,
     });
 
+    const install_hbc_read_bench = b.addInstallArtifact(hbc_read_bench, .{});
+    const hbc_read_bench_build_step = b.step(
+        "hbc-read-bench-build",
+        "Compile the HBC query/read benchmark without executing it",
+    );
+    hbc_read_bench_build_step.dependOn(&install_hbc_read_bench.step);
+
     const run_hbc_read_bench = b.addRunArtifact(hbc_read_bench);
     if (b.args) |args| {
         run_hbc_read_bench.addArgs(args);

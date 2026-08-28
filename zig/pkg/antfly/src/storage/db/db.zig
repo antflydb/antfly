@@ -22540,6 +22540,9 @@ pub const DB = struct {
             };
             errdefer freeDBIndexStatsItem(alloc, item);
             initializeDerivedCoverageIdentity(cfg, &item);
+            if (cfg.kind == .dense_vector) {
+                item.dense_native_storage_phase = self.core.index_manager.denseNativeStoragePhase(cfg.name);
+            }
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             try self.applyDurableIndexRepairStats(
                 alloc,
@@ -22723,6 +22726,9 @@ pub const DB = struct {
             };
             errdefer freeDBIndexStatsItem(alloc, item);
             initializeDerivedCoverageIdentity(cfg, &item);
+            if (cfg.kind == .dense_vector) {
+                item.dense_native_storage_phase = self.core.index_manager.denseNativeStoragePhase(cfg.name);
+            }
             if (self.core.index_manager.loadFailure(cfg.name)) |load_error| {
                 item.load_error = try alloc.dupe(u8, load_error);
                 applyTerminalLoadFailureStatus(&item);
@@ -22978,6 +22984,9 @@ pub const DB = struct {
             };
             errdefer freeDBIndexStatsItem(alloc, item);
             initializeDerivedCoverageIdentity(cfg, &item);
+            if (cfg.kind == .dense_vector) {
+                item.dense_native_storage_phase = self.core.index_manager.denseNativeStoragePhase(cfg.name);
+            }
             try self.applyStatusOnlyRebuildStateStats(alloc, cfg, &item);
             applyProjectionCheckpointStats(&item, projection_checkpoint, target_sequence);
             try self.applyDurableIndexRepairStats(

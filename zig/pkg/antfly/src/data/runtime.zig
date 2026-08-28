@@ -14332,6 +14332,8 @@ pub const DataServer = struct {
         if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
             if (index.dense_vector_projection_pending) return true;
+            if (index.dense_native_storage_phase == .native_building or
+                index.dense_native_storage_phase == .native_validating) return true;
             if (index.backfill_active) return true;
             if (index.catch_up_active) return true;
             if (index.replay_catch_up_required) return true;
@@ -16812,6 +16814,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
         .dense_vector_projection_pending = index.dense_vector_projection_pending,
+        .dense_native_storage_phase = index.dense_native_storage_phase,
         .repair_status = index.index_repair_status,
         .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
@@ -16825,18 +16828,20 @@ test "data runtime report preserves compact managed repair admission state" {
         .index_repair_status = .waiting,
         .index_repair_active_generation_serviceable = false,
         .dense_vector_projection_pending = true,
+        .dense_native_storage_phase = .native_validating,
     });
     defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
 
     try std.testing.expectEqual(antfly.metadata.table_manager.IndexRepairStatus.waiting, report.repair_status.?);
     try std.testing.expect(!report.repair_active_generation_serviceable);
     try std.testing.expect(report.dense_vector_projection_pending);
+    try std.testing.expectEqual(antfly.metadata.table_manager.DenseNativeStoragePhase.native_validating, report.dense_native_storage_phase);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, report, .{});
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false,\"dense_vector_projection_pending\":true}",
+        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false,\"dense_vector_projection_pending\":true,\"dense_native_storage_phase\":\"native_validating\"}",
         encoded,
     );
 }

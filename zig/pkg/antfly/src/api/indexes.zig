@@ -1611,6 +1611,7 @@ const AggregatedIndexStatus = struct {
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
     dense_vector_projection_pending: bool = false,
+    dense_native_storage_phase: db_mod.types.DenseNativeStoragePhase = .legacy,
     enrichment_failed: bool = false,
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,
@@ -1812,6 +1813,13 @@ fn aggregateIndexStatusIndexed(
             continue;
         }
         materialization_count += 1;
+        aggregate.dense_native_storage_phase = if (materialization_count == 1)
+            item.dense_native_storage_phase
+        else
+            @enumFromInt(@min(
+                @intFromEnum(aggregate.dense_native_storage_phase),
+                @intFromEnum(item.dense_native_storage_phase),
+            ));
         if (publicIndexRepairState(item)) |state| {
             aggregate.repair_active_generation_serviceable = if (aggregate.repair_state == null)
                 item.index_repair_active_generation_serviceable
@@ -1903,6 +1911,12 @@ fn aggregateIndexStatusIndexed(
         aggregate.coverage_identity_ready = coverage_generation != 0;
     }
     aggregate.missing_group_count = aggregate.expected_group_count -| aggregate.reported_group_count;
+    // Authority is a whole-index claim. A missing, stale, or wrong-incarnation
+    // shard has no phase proof, so the distributed view must not inherit a
+    // more advanced phase from the shards that happened to answer.
+    if (@as(u64, @intCast(materialization_count)) != aggregate.expected_group_count) {
+        aggregate.dense_native_storage_phase = .legacy;
+    }
     if (aggregate.expected_group_count != aggregate.fresh_group_count) {
         aggregate.enrichment.projection_checkpoint_identity_consistent = false;
         aggregate.enrichment.projection_checkpoint_generation = 0;
@@ -2387,6 +2401,63 @@ test "derived coverage source totals ignore derived index fan out" {
     const view = embeddingsRuntimeView(aggregate, aggregate.table_doc_count, .partial, false, 42, 99, null, true);
     try std.testing.expect(!view.backfill_active);
     try std.testing.expectEqual(@as(f64, 1.0), view.backfill_progress);
+}
+
+test "dense native storage status aggregates conservatively and is public" {
+    var indexes_a = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .dense_native_storage_phase = .native_authoritative,
+    }};
+    var indexes_b = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .dense_native_storage_phase = .native_building,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{
+        .{ .group_id = 1, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = indexes_a[0..] } },
+        .{ .group_id = 2, .metadata = .{ .source = .remote_store, .freshness = .fresh }, .stats = .{ .index_count = 1, .indexes = indexes_b[0..] } },
+    };
+
+    const aggregate = aggregateIndexStatus(&runtimes, "visual", &.{ 1, 2 }, 0) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        db_mod.types.DenseNativeStoragePhase.native_building,
+        aggregate.dense_native_storage_phase,
+    );
+    const missing_shard = aggregateIndexStatus(&runtimes, "visual", &.{ 1, 2, 3 }, 0) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(
+        db_mod.types.DenseNativeStoragePhase.legacy,
+        missing_shard.dense_native_storage_phase,
+    );
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        aggregate,
+        0,
+        .external,
+        false,
+        0,
+        0,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        encoded.items,
+        "\"dense_native_storage_phase\":\"native_building\"",
+    ) != null);
 }
 
 test "derived coverage aggregation rejects mixed config observations" {
@@ -3804,6 +3875,8 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required or artifact_publish_pending or vector_projection_pending) "true" else "false");
         try out.appendSlice(alloc, ",\"dense_vector_projection_pending\":");
         try out.appendSlice(alloc, if (vector_projection_pending) "true" else "false");
+        try out.appendSlice(alloc, ",\"dense_native_storage_phase\":");
+        try appendJsonString(alloc, out, @tagName(item.dense_native_storage_phase));
         try out.appendSlice(alloc, ",\"coverage\":{");
         try appendJsonString(alloc, out, "policy");
         try out.append(alloc, ':');

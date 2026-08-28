@@ -27,9 +27,11 @@ const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 const index_repair_status = @import("../../common/index_repair_status.zig");
+const dense_native_storage_phase = @import("../../common/dense_native_storage_phase.zig");
 const document_content_hash = @import("document_content_hash.zig");
 pub const CancellationToken = @import("../../common/cancellation.zig").CancellationToken;
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
+pub const DenseNativeStoragePhase = dense_native_storage_phase.DenseNativeStoragePhase;
 pub const DocumentContentHash = document_content_hash.Digest;
 
 pub const GeoPoint = struct {
@@ -2870,6 +2872,11 @@ pub const DBIndexStats = struct {
     /// from generic backfill because public coverage normalization may clear
     /// stale replay activity once external artifacts are complete.
     dense_vector_projection_pending: bool = false,
+    /// Durable native-storage rollout state. Authority is published only after
+    /// both the HBC generation and its shared exact-vector projection validate
+    /// at one source boundary; mixed-shard aggregation reports the least
+    /// advanced observed phase.
+    dense_native_storage_phase: DenseNativeStoragePhase = .legacy,
     enrichment_failed: bool = false,
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,

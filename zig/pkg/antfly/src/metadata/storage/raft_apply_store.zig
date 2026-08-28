@@ -4370,9 +4370,19 @@ fn storeHasVectorProjectionStatus(record: metadata.StoreRecord) bool {
     return false;
 }
 
+fn storeHasDenseNativeStorageStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.dense_native_storage_phase != .legacy) return true;
+        }
+    }
+    return false;
+}
+
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     if (record.reporter_incarnation != 0 or record.status_generation != 0)
         return runtime_status_protocol.current_record_version;
+    if (storeHasDenseNativeStorageStatus(record)) return runtime_status_protocol.dense_native_storage_record_version;
     if (storeHasVectorProjectionStatus(record)) return runtime_status_protocol.vector_projection_record_version;
     if (storeHasRuntimeRepairStatus(record)) return runtime_status_protocol.repair_status_record_version;
     return null;
@@ -5367,6 +5377,8 @@ fn appendRuntimeGroupStatusRecord(
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
     for (record.indexes) |index| {
+        if (index.dense_native_storage_phase != .legacy)
+            return runtime_status_protocol.dense_native_storage_record_version;
         if (index.dense_vector_projection_pending)
             return runtime_status_protocol.vector_projection_record_version;
         if (index.repair_status != null) return runtime_status_protocol.repair_status_record_version;
@@ -5803,6 +5815,9 @@ fn appendRuntimeIndexStatusRecord(
     if (version >= runtime_status_protocol.vector_projection_record_version) {
         try out.append(alloc, if (record.dense_vector_projection_pending) 1 else 0);
     }
+    if (version >= runtime_status_protocol.dense_native_storage_record_version) {
+        try out.append(alloc, @intFromEnum(record.dense_native_storage_phase));
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -5875,6 +5890,13 @@ fn readRuntimeIndexStatusRecord(
         if (value > 1) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
+    const dense_native_storage_phase: metadata.DenseNativeStoragePhase = if (version >= runtime_status_protocol.dense_native_storage_record_version) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*];
+        pos.* += 1;
+        break :blk std.enums.fromInt(metadata.DenseNativeStoragePhase, value) orelse
+            return error.InvalidMetadataTransitionEncoding;
+    } else .legacy;
     return .{
         .name = name,
         .kind = kind,
@@ -5897,6 +5919,7 @@ fn readRuntimeIndexStatusRecord(
         .replay_target_sequence = replay_target_sequence,
         .replay_catch_up_required = replay_catch_up_required,
         .dense_vector_projection_pending = dense_vector_projection_pending,
+        .dense_native_storage_phase = dense_native_storage_phase,
         .repair_status = repair_status,
         .repair_active_generation_serviceable = repair_active_generation_serviceable,
     };
@@ -11333,6 +11356,27 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
     );
     defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, current);
     try std.testing.expect(current.indexes[0].dense_vector_projection_pending);
+
+    encoded.clearRetainingCapacity();
+    indexes[0].dense_native_storage_phase = .native_validating;
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
+    version_pos = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.dense_native_storage_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    current_pos = 0;
+    const native_current = try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded.items,
+        &current_pos,
+        runtime_status_protocol.current_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, native_current);
+    try std.testing.expectEqual(
+        metadata.DenseNativeStoragePhase.native_validating,
+        native_current.indexes[0].dense_native_storage_phase,
+    );
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

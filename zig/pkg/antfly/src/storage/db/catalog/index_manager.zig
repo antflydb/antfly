@@ -2587,6 +2587,23 @@ pub const IndexManager = struct {
         return try std.fs.path.join(self.alloc, &.{ self.base_path, "vector-blocks" });
     }
 
+    fn denseVectorArtifactScopeHash(entry: *const DenseIndex) u64 {
+        return internal_keys.embeddingArtifactScopeHashForName(entry.embedding_name orelse entry.config.name);
+    }
+
+    fn vectorBlockArtifactScopeHashesAlloc(self: *const IndexManager) ![]u64 {
+        const hashes = try self.alloc.alloc(u64, self.dense_indexes.items.len);
+        for (self.dense_indexes.items, hashes) |*entry, *hash| hash.* = denseVectorArtifactScopeHash(entry);
+        std.mem.sort(u64, hashes, {}, std.sort.asc(u64));
+        var unique_count: usize = 0;
+        for (hashes) |hash| {
+            if (unique_count != 0 and hashes[unique_count - 1] == hash) continue;
+            hashes[unique_count] = hash;
+            unique_count += 1;
+        }
+        return try self.alloc.realloc(hashes, unique_count);
+    }
+
     fn acquireVectorBlockGeneration(self: *IndexManager) ?*SharedVectorBlockGeneration {
         lockAtomicWithBackoff(&self.vector_block_generation_mu);
         defer self.vector_block_generation_mu.unlock();
@@ -2627,6 +2644,7 @@ pub const IndexManager = struct {
     fn vectorBlockReadyAtSequenceAndCount(
         self: *IndexManager,
         source_sequence: u64,
+        artifact_scope_hash: u64,
         expected_count: u64,
     ) bool {
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
@@ -2638,8 +2656,9 @@ pub const IndexManager = struct {
         // current after vector writes. Mutation-WAL and sparse-delta layouts
         // are already transactionally authoritative and intentionally have no
         // additive physical-count shortcut.
-        if (generation.opened.baseOnlyVectorCount()) |actual_count| {
-            return actual_count == expected_count;
+        if (generation.opened.baseOnlyVectorCount() != null) {
+            const coverage = generation.opened.baseOnlyCoverage(artifact_scope_hash) orelse return false;
+            return coverage.vector_count == expected_count;
         }
         // An empty structural base followed only by WAL/delta records is
         // transactionally queryable, but it has not completed initial
@@ -2660,7 +2679,20 @@ pub const IndexManager = struct {
         // generation lease, whose durable posting boundary is the sequence
         // passed to the query scorer.
         const source_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse return false;
-        return self.vectorBlockReadyAtSequenceAndCount(source_sequence, entry.index.stats().active_count);
+        return self.vectorBlockReadyAtSequenceAndCount(
+            source_sequence,
+            denseVectorArtifactScopeHash(entry),
+            entry.index.stats().active_count,
+        );
+    }
+
+    pub fn denseNativeStoragePhase(self: *IndexManager, name: []const u8) types.DenseNativeStoragePhase {
+        const entry = self.denseIndex(name) orelse return .legacy;
+        const posting_authoritative = entry.index.experimentalPostingWalAuthoritative();
+        if (posting_authoritative and self.vectorBlockReadyForDenseIndex(name)) return .native_authoritative;
+        if (posting_authoritative or entry.index.experimentalPostingReadsEnabled()) return .native_validating;
+        if (self.vector_block_storage != null or densePostingSidecarEnabled()) return .native_building;
+        return .legacy;
     }
 
     /// Status/readiness already owns an explicit replay boundary. Check the
@@ -2677,8 +2709,12 @@ pub const IndexManager = struct {
     ) bool {
         if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
         if (self.vector_block_stable_tip_finalizing.load(.acquire)) return false;
-        _ = self.denseIndex(name) orelse return false;
-        return self.vectorBlockReadyAtSequenceAndCount(source_sequence, expected_count);
+        const entry = self.denseIndex(name) orelse return false;
+        return self.vectorBlockReadyAtSequenceAndCount(
+            source_sequence,
+            denseVectorArtifactScopeHash(entry),
+            expected_count,
+        );
     }
 
     pub fn vectorBlockBaseMaintenanceNeeded(self: *IndexManager) bool {
@@ -2898,8 +2934,9 @@ pub const IndexManager = struct {
 
         var compacted = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &opened);
         errdefer compacted.deinit();
+        const coverage = compacted.baseOnlyCoverage(denseVectorArtifactScopeHash(entry));
         if (compacted.store.covered_source_sequence != covered_source_sequence or
-            compacted.baseOnlyVectorCount() != entry.index.stats().active_count)
+            coverage == null or coverage.?.vector_count != entry.index.stats().active_count)
         {
             return error.VectorBlockPublishedGenerationNotReady;
         }
@@ -2966,10 +3003,12 @@ pub const IndexManager = struct {
             const current_coverage = current.opened.store.covered_source_sequence;
             const preferred_encoding = current.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding());
             const preferred_layout = current.opened.store.manifest.?.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
-            const certified_count = current.opened.baseOnlyVectorCount();
+            const base_only = current.opened.baseOnlyVectorCount() != null;
+            const certified_coverage = current.opened.baseOnlyCoverage(denseVectorArtifactScopeHash(entry));
             current.release();
             if (current_coverage == applied_sequence and preferred_encoding and preferred_layout and
-                (certified_count == null or certified_count.? == entry.index.stats().active_count))
+                (!base_only or
+                    (certified_coverage != null and certified_coverage.?.vector_count == entry.index.stats().active_count)))
             {
                 self.vector_block_projection_dirty.store(false, .release);
                 return;
@@ -3041,7 +3080,11 @@ pub const IndexManager = struct {
         defer store.deinit();
         if (store.manifest != null and store.covered_source_sequence == applied_sequence and !requires_projection_rewrite) {
             try self.loadVectorBlockGenerationIfPresent();
-            if (self.vectorBlockReadyAtSequenceAndCount(applied_sequence, entry.index.stats().active_count)) {
+            if (self.vectorBlockReadyAtSequenceAndCount(
+                applied_sequence,
+                denseVectorArtifactScopeHash(entry),
+                entry.index.stats().active_count,
+            )) {
                 self.vector_block_projection_dirty.store(false, .release);
                 keep_native_cache_bypass = true;
                 return;
@@ -3056,8 +3099,11 @@ pub const IndexManager = struct {
         else
             1;
         const started = platform_time.monotonicNs();
+        const artifact_scope_hashes = try self.vectorBlockArtifactScopeHashesAlloc();
+        defer self.alloc.free(artifact_scope_hashes);
         const stats = store.buildBaseFromArtifactsTxn(primary, &source_txn, generation, applied_sequence, .{
             .encoding = denseVectorBlockPreferredEncoding(),
+            .artifact_scope_hashes = artifact_scope_hashes,
         }) catch |err| {
             if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
                 return error.ResourceBudgetExceeded;
@@ -3076,7 +3122,11 @@ pub const IndexManager = struct {
             },
         );
         try self.loadVectorBlockGenerationIfPresent();
-        if (!self.vectorBlockReadyAtSequenceAndCount(applied_sequence, entry.index.stats().active_count))
+        if (!self.vectorBlockReadyAtSequenceAndCount(
+            applied_sequence,
+            denseVectorArtifactScopeHash(entry),
+            entry.index.stats().active_count,
+        ))
             return error.VectorBlockPublishedGenerationNotReady;
         self.vector_block_projection_dirty.store(false, .release);
         keep_native_cache_bypass = true;
@@ -3243,7 +3293,9 @@ pub const IndexManager = struct {
             defer generation.release();
             if (!vectorBlockGenerationReadyAtSequence(generation, source_sequence)) break :blk false;
             const base_only_count = generation.opened.baseOnlyVectorCount();
-            break :blk base_only_count == null or base_only_count.? == entry.index.stats().active_count;
+            if (base_only_count == null) break :blk true;
+            const coverage = generation.opened.baseOnlyCoverage(denseVectorArtifactScopeHash(entry)) orelse break :blk false;
+            break :blk coverage.vector_count == entry.index.stats().active_count;
         };
 
         const since = self.vector_block_candidate_since_ns.load(.acquire);
@@ -5406,10 +5458,15 @@ pub const IndexManager = struct {
             }
             const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
             if (posting_sequence != source_sequence) continue;
-            if (!self.vectorBlockReadyAtSequenceAndCount(source_sequence, entry.index.stats().active_count)) {
+            if (!self.vectorBlockReadyAtSequenceAndCount(
+                source_sequence,
+                denseVectorArtifactScopeHash(entry),
+                entry.index.stats().active_count,
+            )) {
                 try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
                 changed = self.vectorBlockReadyAtSequenceAndCount(
                     source_sequence,
+                    denseVectorArtifactScopeHash(entry),
                     entry.index.stats().active_count,
                 ) or changed;
             }
@@ -8847,27 +8904,36 @@ pub const IndexManager = struct {
         return entry.index.getWriteProfile();
     }
 
-    fn enabledEnvironmentFlag(name: [*:0]const u8) bool {
-        const raw_z = getenv(name) orelse return false;
+    fn environmentFlag(name: [*:0]const u8, default_value: bool) bool {
+        const raw_z = getenv(name) orelse return default_value;
         const raw = std.mem.span(raw_z);
-        return raw.len == 0 or
+        if (raw.len == 0 or
             std.ascii.eqlIgnoreCase(raw, "1") or
             std.ascii.eqlIgnoreCase(raw, "true") or
             std.ascii.eqlIgnoreCase(raw, "yes") or
-            std.ascii.eqlIgnoreCase(raw, "on");
+            std.ascii.eqlIgnoreCase(raw, "on")) return true;
+        if (std.ascii.eqlIgnoreCase(raw, "0") or
+            std.ascii.eqlIgnoreCase(raw, "false") or
+            std.ascii.eqlIgnoreCase(raw, "no") or
+            std.ascii.eqlIgnoreCase(raw, "off")) return false;
+        return default_value;
     }
 
     fn densePostingWalMutationStoreEnabled() bool {
-        return enabledEnvironmentFlag("ANTFLY_HBC_POSTING_WAL_STORE");
+        // Native storage is the production format for new/migrating indexes.
+        // The durable authority marker remains the runtime truth after
+        // activation; this process flag is only an emergency pre-authority
+        // rollout brake and may never downgrade an authoritative index.
+        return environmentFlag("ANTFLY_HBC_POSTING_WAL_STORE", true);
     }
 
     fn densePostingSidecarEnabled() bool {
         return densePostingWalMutationStoreEnabled() or
-            enabledEnvironmentFlag("ANTFLY_HBC_POSTING_SIDECAR");
+            environmentFlag("ANTFLY_HBC_POSTING_SIDECAR", false);
     }
 
     fn denseVectorBlockStoreEnabled() bool {
-        return enabledEnvironmentFlag("ANTFLY_HBC_VECTOR_BLOCK_STORE");
+        return environmentFlag("ANTFLY_HBC_VECTOR_BLOCK_STORE", true);
     }
 
     fn denseVectorBlockPreferredEncoding() vector_block_store_mod.Encoding {
@@ -30123,7 +30189,7 @@ test "dense vector block physical order drains one low-bit shard at a time" {
     });
 }
 
-test "attached vector block storage is sticky runtime readiness authority" {
+test "native vector block readiness fails closed when storage is detached" {
     const alloc = std.testing.allocator;
     var memory = lsm_backend_mod.MemoryStorage.init(alloc);
     defer memory.deinit();
@@ -30136,6 +30202,10 @@ test "attached vector block storage is sticky runtime readiness authority" {
     // fail closed regardless of the bootstrap environment's current value.
     try std.testing.expect(!manager.vectorBlockReadyAtSequence(7));
     manager.setVectorBlockStorage(null);
-    try std.testing.expect(manager.vectorBlockReadyAtSequence(7));
+    // Native storage is now the production default. Losing the attached
+    // storage lease must never make readiness silently revert to the primary
+    // artifact path; only an explicit pre-start rollout brake can select the
+    // legacy mode.
+    try std.testing.expect(!manager.vectorBlockReadyAtSequence(7));
 }
 const StoreBatchOptions = backend_types.BatchOptions;
