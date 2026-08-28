@@ -25,26 +25,7 @@ const query_contract = @import("query_contract.zig");
 pub fn rejectInternalDocIdentityFields(alloc: std.mem.Allocator, body: []const u8) !void {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidQueryRequest;
-    if (objectHasInternalDocIdentityField(parsed.value.object)) return error.InvalidQueryRequest;
-    try query_contract.validateRawGraphQueriesValueAlloc(alloc, parsed.value);
-}
-
-fn objectHasInternalDocIdentityField(object: std.json.ObjectMap) bool {
-    const internal_fields = [_][]const u8{
-        "identity_read_generation",
-        "allow_doc_identity_reassignment",
-        "_identity_read_generation",
-        "native_doc_id_constraints",
-        "_filter_doc_ids",
-        "_filter_doc_ids_positive",
-        "_exclude_doc_ids",
-        "_resolved_doc_filter",
-    };
-    inline for (internal_fields) |field| {
-        if (object.get(field) != null) return true;
-    }
-    return false;
+    try query_contract.validatePublicQueryEnvelopeValueAlloc(alloc, parsed.value);
 }
 
 pub fn parseSupportedGraphQueriesAlloc(
@@ -1126,6 +1107,24 @@ test "raw graph admission rejects recursive edge shapes above the contract budge
     try body.appendSlice(alloc, "}}}}}");
 
     try std.testing.expectError(error.InvalidQueryRequest, rejectInternalDocIdentityFields(alloc, body.items));
+
+    var parsed = try ant_json.parseFromSlice(std.json.Value, alloc,
+        \\{"graph_queries":{"walk":{"index":"graph","traverse":{"start":{"keys":["doc:a"]}}}}}
+    , .{});
+    defer parsed.deinit();
+
+    try query_contract.validatePublicQueryEnvelopeValueAlloc(alloc, parsed.value);
+    try parsed.value.object.put(alloc, "identity_read_generation", .{ .integer = 1 });
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        query_contract.validatePublicQueryEnvelopeValueAlloc(alloc, parsed.value),
+    );
+    _ = parsed.value.object.orderedRemove("identity_read_generation");
+    try parsed.value.object.put(alloc, "_distributed_text_stats", .null);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        query_contract.validatePublicQueryEnvelopeValueAlloc(alloc, parsed.value),
+    );
 }
 
 test "parse supported graph queries require document hydration for projected fields" {

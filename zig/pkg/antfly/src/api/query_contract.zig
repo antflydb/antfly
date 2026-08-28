@@ -2455,6 +2455,19 @@ pub fn validateRawGraphQueriesValueAlloc(
     }
 }
 
+/// Validate controls that must be rejected at every public query boundary.
+/// Routing layers should parse the request envelope once and borrow that tree
+/// here before selecting foreign, join, graph, or ordinary query execution.
+pub fn validatePublicQueryEnvelopeValueAlloc(
+    alloc: std.mem.Allocator,
+    root: std.json.Value,
+) !void {
+    if (root != .object) return error.InvalidQueryRequest;
+    if (objectHasForbiddenPublicQueryField(root.object))
+        return error.InvalidQueryRequest;
+    try validateRawGraphQueriesValueAlloc(alloc, root);
+}
+
 fn addRawGraphComplexity(total: *usize, amount: usize, limit: usize) !void {
     total.* = std.math.add(usize, total.*, amount) catch return error.InvalidQueryRequest;
     if (total.* > limit) return error.InvalidQueryRequest;
@@ -12052,9 +12065,7 @@ fn queryBodyHasForbiddenPublicDocIdentityControlFields(alloc: std.mem.Allocator,
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
-    return parsed.value.object.get("identity_read_generation") != null or
-        parsed.value.object.get("allow_doc_identity_reassignment") != null or
-        objectHasInternalShardField(parsed.value.object);
+    return objectHasForbiddenPublicQueryField(parsed.value.object);
 }
 
 fn queryBodyHasInternalShardFields(alloc: std.mem.Allocator, body: []const u8) !bool {
@@ -12123,6 +12134,12 @@ fn objectHasInternalShardField(object: std.json.ObjectMap) bool {
         if (isInternalShardFieldName(entry.key_ptr.*)) return true;
     }
     return false;
+}
+
+fn objectHasForbiddenPublicQueryField(object: std.json.ObjectMap) bool {
+    return object.get("identity_read_generation") != null or
+        object.get("allow_doc_identity_reassignment") != null or
+        objectHasInternalShardField(object);
 }
 
 fn objectHasNonNullField(object: std.json.ObjectMap, name: []const u8) bool {

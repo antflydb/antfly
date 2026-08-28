@@ -23,6 +23,7 @@ const indexes_api = @import("../../api/indexes.zig");
 const foreign_sources_api = @import("../../api/foreign_sources.zig");
 const join_model = @import("../../api/join_model.zig");
 const query_api = @import("../../api/query.zig");
+const query_contract = @import("../../api/query_contract.zig");
 const graph_wire_envelope = @import("../../api/graph_wire_envelope.zig");
 const public_graph_query = @import("../../api/public_graph_query.zig");
 const graph_query_diagnostic = @import("../../api/graph_query_diagnostic.zig");
@@ -178,10 +179,9 @@ const JoinedQueryStats = query_execution.JoinedQueryStats;
 const JoinTableStats = query_execution.JoinTableStats;
 const PlannedJoinExecution = query_execution.PlannedJoinExecution;
 const RightJoinQueryResult = query_execution.RightJoinQueryResult;
-const ParsedSupportedJoinRequest = query_execution.ParsedSupportedJoinRequest;
 const freeSupportedJoinRequest = query_execution.freeSupportedJoinRequest;
 const joinUsesForeignSource = query_execution.joinUsesForeignSource;
-const parseSupportedJoinRequest = query_execution.parseSupportedJoinRequest;
+const parseSupportedJoinRequestValueAlloc = query_execution.parseSupportedJoinRequestValueAlloc;
 const parseSupportedJoinClauseValue = query_execution.parseSupportedJoinClauseValue;
 
 fn normalizeServerlessCreateIndexConfig(
@@ -1185,14 +1185,29 @@ pub const HttpHandler = struct {
 
     fn executePublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
         try cancellation.check();
-        if (self.executeForeignPublicTableQueryJsonAlloc(table_name, body, cancellation) catch |err| switch (err) {
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
+            return error.InvalidQueryRequest;
+        defer raw_request.deinit();
+        if (raw_request.value != .object) return error.InvalidQueryRequest;
+        try query_contract.validatePublicQueryEnvelopeValueAlloc(self.alloc, raw_request.value);
+
+        if (public_search_request.hasNonNullField(raw_request.value.object, "graph_searches")) {
+            graph_query_diagnostic.record(
+                "$request",
+                "graph_searches",
+                .legacy_graph_searches_not_supported,
+            );
+            return error.GraphQueryModeUnsupported;
+        }
+
+        if (self.executeForeignPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => return err,
         }) |json| {
             return json;
         }
 
-        const join_req = parseSupportedJoinRequest(self.alloc, body) catch |err| switch (err) {
+        const join_req = parseSupportedJoinRequestValueAlloc(self.alloc, body, raw_request.value) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
             else => return err,
         };
@@ -1204,21 +1219,19 @@ pub const HttpHandler = struct {
             return try self.executeSupportedJoinedPublicTableQueryRequest(table_name, body, parsed_join.join, parsed_join.foreign_sources, cancellation);
         }
 
-        return try self.executePlainPublicTableQueryJsonAlloc(table_name, body, cancellation);
+        return try self.executePlainPublicTableQueryJsonValueAlloc(table_name, body, raw_request.value, cancellation);
     }
 
-    fn executeForeignPublicTableQueryJsonAlloc(
+    fn executeForeignPublicTableQueryJsonValueAlloc(
         self: *HttpHandler,
         table_name: []const u8,
         body: []const u8,
+        raw_request: std.json.Value,
         cancellation: CancellationToken,
     ) anyerror!?[]u8 {
         try cancellation.check();
-        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
-            return error.InvalidQueryRequest;
-        defer raw_request.deinit();
-        if (raw_request.value != .object) return error.InvalidQueryRequest;
-        if (!public_search_request.hasNonNullField(raw_request.value.object, "foreign_sources"))
+        if (raw_request != .object) return error.InvalidQueryRequest;
+        if (!public_search_request.hasNonNullField(raw_request.object, "foreign_sources"))
             return null;
 
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
@@ -1237,17 +1250,15 @@ pub const HttpHandler = struct {
         try validateSupportedForeignPublicQueryRequest(request);
 
         if (request.join != null) {
-            const parsed_join = (try parseSupportedJoinRequest(self.alloc, body)) orelse return error.InvalidQueryRequest;
-            defer {
-                var owned = parsed_join;
-                owned.deinit(self.alloc);
-            }
+            const join_value = raw_request.object.get("join") orelse return error.InvalidQueryRequest;
+            var parsed_join = try parseSupportedJoinClauseValue(self.alloc, join_value);
+            defer parsed_join.deinit(self.alloc);
             return try self.executeSupportedJoinedForeignPublicTableQueryJsonAlloc(
                 table_name,
                 body,
                 foreign_source,
-                parsed_join.join,
-                parsed_join.foreign_sources,
+                parsed_join,
+                foreign_sources,
                 cancellation,
             );
         }
@@ -1566,11 +1577,30 @@ pub const HttpHandler = struct {
     }
 
     fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
+            return error.InvalidQueryRequest;
+        defer raw_request.deinit();
+        try query_contract.validatePublicQueryEnvelopeValueAlloc(self.alloc, raw_request.value);
+        return self.executePlainPublicTableQueryJsonValueAlloc(
+            table_name,
+            body,
+            raw_request.value,
+            cancellation,
+        );
+    }
+
+    fn executePlainPublicTableQueryJsonValueAlloc(
+        self: *HttpHandler,
+        table_name: []const u8,
+        body: []const u8,
+        raw_request: std.json.Value,
+        cancellation: CancellationToken,
+    ) anyerror![]u8 {
         try cancellation.check();
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
-        const graph_response = self.handleTablePublicGraphQueryRequest(table_name, namespace, body, cancellation) catch |err| switch (err) {
+        const graph_response = self.handleTablePublicGraphQueryRequestValue(table_name, namespace, body, raw_request, cancellation) catch |err| switch (err) {
             // Once the graph boundary has recognized the request, unsupported
             // semantics are an exact-execution capability response, not a
             // malformed request or an internal server failure.
@@ -2653,11 +2683,31 @@ pub const HttpHandler = struct {
         body: []const u8,
         cancellation: CancellationToken,
     ) !?HttpResponse {
-        try cancellation.check();
-        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
+            return error.InvalidQueryRequest;
         defer raw_request.deinit();
-        const has_legacy_graph_request = raw_request.value == .object and
-            public_search_request.hasNonNullField(raw_request.value.object, "graph_searches");
+        try query_contract.validatePublicQueryEnvelopeValueAlloc(self.alloc, raw_request.value);
+        return self.handleTablePublicGraphQueryRequestValue(
+            table_name,
+            namespace,
+            body,
+            raw_request.value,
+            cancellation,
+        );
+    }
+
+    fn handleTablePublicGraphQueryRequestValue(
+        self: *HttpHandler,
+        table_name: []const u8,
+        namespace: []const u8,
+        body: []const u8,
+        raw_request: std.json.Value,
+        cancellation: CancellationToken,
+    ) !?HttpResponse {
+        try cancellation.check();
+        if (raw_request != .object) return error.InvalidQueryRequest;
+        const has_legacy_graph_request =
+            public_search_request.hasNonNullField(raw_request.object, "graph_searches");
         if (has_legacy_graph_request) {
             graph_query_diagnostic.record(
                 "$request",
@@ -2666,50 +2716,43 @@ pub const HttpHandler = struct {
             );
             return error.UnsupportedQueryRequest;
         }
-        public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
-            error.InvalidQueryRequest => return error.InvalidQueryRequest,
-            error.OutOfMemory => return error.OutOfMemory,
+        const has_graph_request =
+            public_search_request.hasNonNullField(raw_request.object, "graph_queries");
+        if (!has_graph_request) return null;
+
+        const unsupported_controls = [_][]const u8{
+            "aggregations",
+            "analyses",
+            "order_by",
+            "search_after",
+            "search_before",
+            "document_renderer",
+            "join",
+            "foreign_sources",
+            "merge_config",
+            "pruner",
+            "reranker",
+            "expand_strategy",
+            "distance_over",
+            "distance_under",
         };
-        const has_graph_request = raw_request.value == .object and
-            (public_search_request.hasNonNullField(raw_request.value.object, "graph_queries") or
-                public_search_request.hasNonNullField(raw_request.value.object, "graph_searches"));
-        if (has_graph_request) {
-            const unsupported_controls = [_][]const u8{
-                "aggregations",
-                "analyses",
-                "order_by",
-                "search_after",
-                "search_before",
-                "document_renderer",
-                "join",
-                "foreign_sources",
-                "merge_config",
-                "pruner",
-                "reranker",
-                "expand_strategy",
-                "distance_over",
-                "distance_under",
-            };
-            for (unsupported_controls) |field| {
-                if (public_search_request.hasNonNullField(raw_request.value.object, field)) {
-                    graph_query_diagnostic.record(
-                        "$request",
-                        field,
-                        .request_control_not_supported,
-                    );
-                    return error.UnsupportedQueryRequest;
-                }
+        for (unsupported_controls) |field| {
+            if (public_search_request.hasNonNullField(raw_request.object, field)) {
+                graph_query_diagnostic.record(
+                    "$request",
+                    field,
+                    .request_control_not_supported,
+                );
+                return error.UnsupportedQueryRequest;
             }
         }
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
-        }) catch {
-            if (has_graph_request) return error.InvalidQueryRequest;
-            return null;
-        };
+        }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = parsed_request.value;
-        if (request.graph_queries == null and request.graph_searches == null) return null;
+        if (request.graph_queries == null or request.graph_searches != null)
+            return error.InvalidQueryRequest;
 
         const started_ns = platform_time.monotonicNs();
         const graph_queries = public_graph_query.parseSupportedGraphQueriesAlloc(self.alloc, request) catch |err| {
@@ -2726,7 +2769,7 @@ pub const HttpHandler = struct {
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
             .cancellation = cancellation,
         };
-        const canonical_operations = raw_request.value.object.get("graph_queries") orelse
+        const canonical_operations = raw_request.object.get("graph_queries") orelse
             return error.InvalidQueryRequest;
         req.graph_query_transport = graph_wire_envelope.captureCanonicalOperationsAlloc(
             self.alloc,
@@ -9023,7 +9066,9 @@ test "http handler join parser accepts foreign source maps" {
     const body =
         \\{"fields":["title"],"join":{"right_table":"customers","join_type":"inner","on":{"left_field":"customer_id","right_field":"_id","operator":"eq"}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers"}}}
     ;
-    const parsed = (try parseSupportedJoinRequest(alloc, body)).?;
+    var raw = try ant_json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw.deinit();
+    const parsed = (try parseSupportedJoinRequestValueAlloc(alloc, body, raw.value)).?;
     defer {
         var owned = parsed;
         owned.deinit(alloc);
@@ -9184,7 +9229,14 @@ test "http handler executes direct foreign table query through registry" {
         \\{"fields":["name"],"limit":1,"offset":2,"order_by":[{"field":"name"}],"filter_query":{"term":"active","field":"status"},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"${secret:pg_dsn}","postgres_table":"customers","columns":[{"name":"status","type":"text"}]}}}
     ;
 
-    const json = (try handler.executeForeignPublicTableQueryJsonAlloc("pg_customers", body, .none)).?;
+    var raw_request = try ant_json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer raw_request.deinit();
+    const json = (try handler.executeForeignPublicTableQueryJsonValueAlloc(
+        "pg_customers",
+        body,
+        raw_request.value,
+        .none,
+    )).?;
     defer alloc.free(json);
 
     var parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, json, .{});
@@ -11591,6 +11643,41 @@ test "http handler serves published graph query endpoints" {
         "legacy_graph_searches_not_supported",
         parsed_legacy_pattern.value.reason,
     );
+
+    // Legacy rejection is a request-envelope invariant. Feature routing must
+    // not let a foreign-source control claim the request first.
+    var mixed_legacy_pattern = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"graph_searches":{"two_hop":{"type":"neighbors","index":"graph_idx","start_nodes":{"keys":["doc-a"]}}},"foreign_sources":{"ignored":{"type":"unsupported"}}}
+        ,
+    });
+    defer mixed_legacy_pattern.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), mixed_legacy_pattern.status);
+    var parsed_mixed_legacy = try parseJsonTestBody(
+        metadata_openapi.GraphQueryUnsupportedError,
+        alloc,
+        mixed_legacy_pattern.body,
+    );
+    defer parsed_mixed_legacy.deinit();
+    try std.testing.expectEqualStrings("graph_searches", parsed_mixed_legacy.value.feature);
+    try std.testing.expectEqualStrings(
+        "legacy_graph_searches_not_supported",
+        parsed_mixed_legacy.value.reason,
+    );
+
+    // Internal storage controls are rejected by the common raw envelope before
+    // foreign, join, graph, or ordinary retrieval routing can consume them.
+    var internal_foreign = try handler.handle(.{
+        .method = .post,
+        .path = "/tables/docs/query",
+        .body =
+        \\{"foreign_sources":{"ignored":{"type":"unsupported"}},"identity_read_generation":1}
+        ,
+    });
+    defer internal_foreign.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), internal_foreign.status);
 
     var unsupported_control = try handler.handle(.{
         .method = .post,
