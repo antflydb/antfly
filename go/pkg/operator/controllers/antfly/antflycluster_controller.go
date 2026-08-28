@@ -2899,6 +2899,14 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	// Colony's deprovisioner persists an immutable, digest-bound request on the
+	// current primary before Namespace deletion. Reconcile it ahead of ordinary
+	// cluster validation so cleanup cannot deadlock behind unrelated runtime
+	// readiness or a transient topology handoff.
+	if result, handled, err := r.reconcileHASeedPrefixCleanup(ctx, &antflyCluster); handled {
+		return result, err
+	}
+
 	// Ensure finalizer is present when WhenDeleted=Delete.
 	// The finalizer is only removed inside the deletion handler (above) after
 	// cleanup completes. Removing it here on policy change would race with

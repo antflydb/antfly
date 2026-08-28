@@ -2052,6 +2052,46 @@ type HAStatus struct {
 	// never appears in spec and cannot be self-asserted by a caller.
 	// +optional
 	StartupGate *HAStartupGateStatus `json:"startupGate,omitempty"`
+
+	// SeedPrefixCleanup is the operator-observed result of the immutable,
+	// digest-bound deprovision cleanup request carried by the Colony annotation.
+	// +optional
+	SeedPrefixCleanup *HASeedPrefixCleanupStatus `json:"seedPrefixCleanup,omitempty"`
+}
+
+// HASeedPrefixCleanupStatus binds an operator Job observation to Colony's exact
+// request identity. The snake_case field contract is shared with the runtime
+// receipt and is intentionally distinct from the Kubernetes API's usual style.
+type HASeedPrefixCleanupStatus struct {
+	Phase         string                      `json:"phase"`
+	OperationID   string                      `json:"operation_id"`
+	RetryToken    string                      `json:"retry_token"`
+	RequestSHA256 string                      `json:"request_sha256"`
+	AttemptCount  int32                       `json:"attempt_count"`
+	LastError     string                      `json:"last_error,omitempty"`
+	Receipt       *HASeedPrefixCleanupReceipt `json:"receipt,omitempty"`
+}
+
+// HASeedPrefixCleanupReceipt is the canonical runtime proof that the exact
+// instance-owned HA seed prefix was deleted and independently observed empty.
+type HASeedPrefixCleanupReceipt struct {
+	Version            int32  `json:"version"`
+	Kind               string `json:"kind"`
+	OperationID        string `json:"operation_id"`
+	RetryToken         string `json:"retry_token"`
+	InstanceID         string `json:"instance_id"`
+	TopologyID         string `json:"topology_id"`
+	TopologyGeneration int64  `json:"topology_generation"`
+	Location           string `json:"location"`
+	PrefixSHA256       string `json:"prefix_sha256"`
+	RequestSHA256      string `json:"request_sha256"`
+	DeletedGenerations int64  `json:"deleted_generations"`
+	DeletedObjects     int64  `json:"deleted_objects"`
+	RetainedObjects    int64  `json:"retained_objects"`
+	PrefixEmpty        bool   `json:"prefix_empty"`
+	Complete           bool   `json:"complete"`
+	CompletedAt        string `json:"completed_at"`
+	ReceiptSHA256      string `json:"receipt_sha256"`
 }
 
 // HAWatchdogProofStatus records an authenticated runtime observation. It is not
