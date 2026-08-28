@@ -27,6 +27,36 @@ pub const Error = error{
 
 const ParseError = Error || std.mem.Allocator.Error;
 
+fn exactI32FromFloat(value: f64) Error!i32 {
+    if (!std.math.isFinite(value) or
+        @trunc(value) != value or
+        value < @as(f64, @floatFromInt(std.math.minInt(i32))) or
+        value > @as(f64, @floatFromInt(std.math.maxInt(i32))))
+    {
+        return error.InvalidCff;
+    }
+    return @intFromFloat(value);
+}
+
+fn boundedUsizeFromFloat(value: f64) Error!usize {
+    // Use max + 1 as an exclusive bound. On 64-bit targets maxInt rounds to
+    // 2^64 in f64 already; on narrower targets the addition preserves the
+    // representable maximum instead of rejecting it.
+    const upper_bound: f64 = @as(f64, @floatFromInt(std.math.maxInt(usize))) + 1.0;
+    if (!std.math.isFinite(value) or value < 0 or value >= upper_bound)
+        return error.InvalidCff;
+    return @intFromFloat(value);
+}
+
+fn roundedIsizeFromFloat(value: f64) Error!isize {
+    if (!std.math.isFinite(value)) return error.InvalidCff;
+    const rounded = @round(value);
+    const lower_bound: f64 = @floatFromInt(std.math.minInt(isize));
+    const upper_bound: f64 = @as(f64, @floatFromInt(std.math.maxInt(isize))) + 1.0;
+    if (rounded < lower_bound or rounded >= upper_bound) return error.InvalidCff;
+    return @intFromFloat(rounded);
+}
+
 pub const GlyphPoint = @import("sfnt.zig").GlyphPoint;
 pub const GlyphContour = @import("sfnt.zig").GlyphContour;
 pub const GlyphOutline = @import("sfnt.zig").GlyphOutline;
@@ -438,7 +468,7 @@ fn parseTopDictOffset(dict_bytes: []const u8, target_operator: DictOperator) Err
                 };
                 if (matched) {
                     if (operands_len == 0) return error.InvalidCff;
-                    return @intFromFloat(operands[operands_len - 1]);
+                    return try boundedUsizeFromFloat(operands[operands_len - 1]);
                 }
                 operands_len = 0;
             },
@@ -554,8 +584,8 @@ fn parseTopDictPrivate(dict_bytes: []const u8) Error!PrivateDictRef {
                 if (matched) {
                     if (operands_len < 2) return error.InvalidCff;
                     return .{
-                        .size = @intFromFloat(operands[operands_len - 2]),
-                        .offset = @intFromFloat(operands[operands_len - 1]),
+                        .size = try boundedUsizeFromFloat(operands[operands_len - 2]),
+                        .offset = try boundedUsizeFromFloat(operands[operands_len - 1]),
                     };
                 }
                 operands_len = 0;
@@ -644,7 +674,8 @@ fn subroutineBias(count: u16) i32 {
 }
 
 fn subroutineIndex(operand: f64, count: u16) Error!usize {
-    const index = @as(i32, @intFromFloat(operand)) + subroutineBias(count);
+    const raw_index = try exactI32FromFloat(operand);
+    const index = std.math.add(i32, raw_index, subroutineBias(count)) catch return error.InvalidGlyphIndex;
     if (index < 0 or index >= count) return error.InvalidGlyphIndex;
     return @intCast(index);
 }
@@ -1174,7 +1205,8 @@ fn exchStack(stack: *std.ArrayList(f64)) Error!void {
 fn indexStack(alloc: std.mem.Allocator, stack: *std.ArrayList(f64)) ParseError!void {
     if (stack.items.len == 0) return error.InvalidCff;
     const idx_value = stack.pop().?;
-    const idx: usize = if (idxValueToSigned(idx_value) < 0) 0 else @intCast(idxValueToSigned(idx_value));
+    const idx_signed = try roundedIsizeFromFloat(idx_value);
+    const idx: usize = if (idx_signed < 0) 0 else @intCast(idx_signed);
     if (stack.items.len == 0) return error.InvalidCff;
     const from_top = if (idx >= stack.items.len) stack.items.len - 1 else idx;
     const value = stack.items[stack.items.len - 1 - from_top];
@@ -1185,11 +1217,11 @@ fn rollStack(alloc: std.mem.Allocator, stack: *std.ArrayList(f64)) ParseError!vo
     if (stack.items.len < 2) return error.InvalidCff;
     const j_value = stack.pop().?;
     const n_value = stack.pop().?;
-    const n_signed = idxValueToSigned(n_value);
+    const n_signed = try roundedIsizeFromFloat(n_value);
     if (n_signed < 0) return error.InvalidCff;
     const n: usize = @intCast(n_signed);
     if (n == 0 or n > stack.items.len) return error.InvalidCff;
-    var j = idxValueToSigned(j_value);
+    var j = try roundedIsizeFromFloat(j_value);
     const n_i: isize = @intCast(n);
     j = @mod(j, n_i);
     if (j < 0) j += n_i;
@@ -1210,7 +1242,7 @@ fn putTransient(stack: *std.ArrayList(f64), transient: *[32]f64) Error!void {
     if (stack.items.len < 2) return error.InvalidCff;
     const idx_value = stack.pop().?;
     const value = stack.pop().?;
-    const idx_signed = idxValueToSigned(idx_value);
+    const idx_signed = try roundedIsizeFromFloat(idx_value);
     if (idx_signed < 0 or idx_signed >= transient.len) return error.InvalidCff;
     transient[@intCast(idx_signed)] = value;
 }
@@ -1218,7 +1250,7 @@ fn putTransient(stack: *std.ArrayList(f64), transient: *[32]f64) Error!void {
 fn getTransient(alloc: std.mem.Allocator, stack: *std.ArrayList(f64), transient: *const [32]f64) ParseError!void {
     if (stack.items.len == 0) return error.InvalidCff;
     const idx_value = stack.pop().?;
-    const idx_signed = idxValueToSigned(idx_value);
+    const idx_signed = try roundedIsizeFromFloat(idx_value);
     if (idx_signed < 0 or idx_signed >= transient.len) return error.InvalidCff;
     try stack.append(alloc, transient[@intCast(idx_signed)]);
 }
@@ -1231,10 +1263,6 @@ fn ifelseStack(alloc: std.mem.Allocator, stack: *std.ArrayList(f64)) ParseError!
     const v1 = stack.pop().?;
     const chosen = if (v1 <= v2) s1 else s2;
     try stack.append(alloc, chosen);
-}
-
-fn idxValueToSigned(value: f64) isize {
-    return @intFromFloat(@round(value));
 }
 
 fn absFloat(v: f64) f64 {
@@ -1476,6 +1504,14 @@ test "cff parses dict real operands" {
         };
     try std.testing.expectEqual(@as(usize, 1), try parseTopDictOffset(&dict, .{ .primary = 17 }));
     try std.testing.expectEqual(@as(usize, 20), try parseTopDictOffset(&dict, .{ .primary = 15 }));
+}
+
+test "cff rejects unsafe float-to-integer control operands" {
+    try std.testing.expectError(error.InvalidCff, boundedUsizeFromFloat(std.math.nan(f64)));
+    try std.testing.expectError(error.InvalidCff, boundedUsizeFromFloat(std.math.inf(f64)));
+    try std.testing.expectError(error.InvalidCff, exactI32FromFloat(0.5));
+    try std.testing.expectError(error.InvalidCff, subroutineIndex(std.math.inf(f64), 1));
+    try std.testing.expectError(error.InvalidCff, roundedIsizeFromFloat(std.math.nan(f64)));
 }
 
 test "cff parses charset format 1" {

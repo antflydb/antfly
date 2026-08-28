@@ -27,6 +27,17 @@ pub const Error = error{
 
 const ParseError = Error || std.mem.Allocator.Error;
 
+fn exactIntFromFloat(comptime T: type, value: f64) Error!T {
+    if (!std.math.isFinite(value) or
+        @trunc(value) != value or
+        value < @as(f64, @floatFromInt(std.math.minInt(T))) or
+        value > @as(f64, @floatFromInt(std.math.maxInt(T))))
+    {
+        return error.InvalidType1;
+    }
+    return @intFromFloat(value);
+}
+
 pub const SeacComponents = struct {
     asb: f64,
     adx: f64,
@@ -175,7 +186,7 @@ fn executeCharStringAlloc(
             },
             10 => {
                 if (local_subrs == null or stack.items.len == 0) return error.UnsupportedType1;
-                const raw_idx = @as(i32, @intFromFloat(stack.pop().?));
+                const raw_idx = try exactIntFromFloat(i32, stack.pop().?);
                 if (raw_idx < 0 or raw_idx >= local_subrs.?.len) return error.InvalidSubroutine;
                 try executeCharStringAlloc(alloc, local_subrs.?[@intCast(raw_idx)], local_subrs, stack, othersubr_results, current, contours, x, y, width_seen, seac_out, depth + 1);
             },
@@ -206,8 +217,8 @@ fn executeCharStringAlloc(
                                 .asb = stack.items[stack.items.len - 5],
                                 .adx = stack.items[stack.items.len - 4],
                                 .ady = stack.items[stack.items.len - 3],
-                                .bchar = @intFromFloat(stack.items[stack.items.len - 2]),
-                                .achar = @intFromFloat(stack.items[stack.items.len - 1]),
+                                .bchar = try exactIntFromFloat(u8, stack.items[stack.items.len - 2]),
+                                .achar = try exactIntFromFloat(u8, stack.items[stack.items.len - 1]),
                             };
                             stack.clearRetainingCapacity();
                             if (current.items.len > 0) try flushContour(alloc, contours, current);
@@ -230,18 +241,14 @@ fn executeCharStringAlloc(
                         if (stack.items.len < 2) return error.InvalidType1;
                         const subr_number_f = stack.pop().?;
                         const argument_count_f = stack.pop().?;
-                        if (!std.math.isFinite(subr_number_f) or
-                            @trunc(subr_number_f) != subr_number_f or
-                            subr_number_f < @as(f64, @floatFromInt(std.math.minInt(i32))) or
-                            subr_number_f > @as(f64, @floatFromInt(std.math.maxInt(i32))) or
-                            !std.math.isFinite(argument_count_f) or
+                        const subr_number = try exactIntFromFloat(i32, subr_number_f);
+                        if (!std.math.isFinite(argument_count_f) or
                             @trunc(argument_count_f) != argument_count_f or
                             argument_count_f < 0 or
                             argument_count_f > @as(f64, @floatFromInt(stack.items.len)))
                         {
                             return error.InvalidType1;
                         }
-                        const subr_number: i32 = @intFromFloat(subr_number_f);
                         const argument_count: usize = @intFromFloat(argument_count_f);
                         const first = stack.items.len - argument_count;
                         switch (subr_number) {
@@ -532,6 +539,21 @@ test "type1 rejects non-integral and out-of-range othersubr operands" {
     // Fractional argument counts are invalid rather than implicitly truncated.
     const fractional_count = [_]u8{ 141, 143, 12, 12, 139, 12, 16, 14 };
     try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &fractional_count, null));
+}
+
+test "type1 rejects unsafe subroutine and seac integer operands" {
+    const alloc = std.testing.allocator;
+    const return_subr = [_]u8{11};
+    const local_subrs = [_][]const u8{&return_subr};
+
+    // 0 0 div produces NaN. Conversion must return a parse error rather than
+    // reaching Zig's safety panic for a non-finite float-to-integer cast.
+    const non_finite_callsubr = [_]u8{ 139, 139, 12, 12, 10, 14 };
+    try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &non_finite_callsubr, &local_subrs));
+
+    // bchar is 256, outside the byte range required by seac.
+    const out_of_range_seac = [_]u8{ 139, 139, 139, 247, 148, 139, 12, 6, 14 };
+    try std.testing.expectError(error.InvalidType1, seacComponentsAlloc(alloc, &out_of_range_seac, null));
 }
 
 test "type1 decrypts charstring with lenIV" {

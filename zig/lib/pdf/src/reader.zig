@@ -3204,8 +3204,10 @@ pub const Reader = struct {
             try starts.append(alloc, points.items.len);
             try points.appendSlice(alloc, contour_points);
         }
+        const owned_points = try points.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_points);
         return .{
-            .points = try points.toOwnedSlice(alloc),
+            .points = owned_points,
             .subpath_starts = try starts.toOwnedSlice(alloc),
         };
     }
@@ -3508,20 +3510,11 @@ pub const Reader = struct {
 
     fn collectPageContentAlloc(self: *const Reader, page: *const syntax.Object) ![]u8 {
         const contents = page.get("Contents") orelse return try self.alloc.alloc(u8, 0);
-        const streams = try self.collectContentStreamsAlloc(contents);
-        defer {
-            for (streams) |*stream| stream.deinit(self.alloc);
-            self.alloc.free(streams);
-        }
-        var content = std.ArrayList(u8).empty;
-        defer content.deinit(self.alloc);
-        for (streams) |*stream| {
-            const decoded = try self.readDecodedStreamData(stream);
-            defer self.alloc.free(decoded);
-            try content.appendSlice(self.alloc, decoded);
-            try content.append(self.alloc, '\n');
-        }
-        return try content.toOwnedSlice(self.alloc);
+        // Resource discovery needs the same logical concatenation as the
+        // content parsers. Reuse the bounded implementation so a page split
+        // across many individually valid streams cannot bypass the document
+        // working-set ceiling while we determine resource reachability.
+        return try self.readCombinedContentStreamsAlloc(contents);
     }
 
     fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object) ![]PageFont {
@@ -5810,7 +5803,10 @@ pub const Reader = struct {
             if (identity_encoding) {
                 cid_widths = self.parseCidWidthsAlloc(&descendant) catch |err| switch (err) {
                     error.OutOfMemory => return err,
-                    else => CidWidths{ .default_width = cidDefaultWidth(&descendant) },
+                    else => CidWidths{ .default_width = self.cidDefaultWidthAlloc(&descendant) catch |default_err| switch (default_err) {
+                        error.OutOfMemory => return default_err,
+                        else => 1000,
+                    } },
                 };
                 if (descendant.get("CIDToGIDMap")) |mapping_obj| {
                     var mapping = try self.resolveValue(mapping_obj);
@@ -5951,7 +5947,10 @@ pub const Reader = struct {
         if (composite) {
             var cid_widths = self.parseCidWidthsAlloc(descriptor_owner) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                else => CidWidths{ .default_width = cidDefaultWidth(descriptor_owner) },
+                else => CidWidths{ .default_width = self.cidDefaultWidthAlloc(descriptor_owner) catch |default_err| switch (default_err) {
+                    error.OutOfMemory => return default_err,
+                    else => 1000,
+                } },
             };
             defer cid_widths.deinit(self.alloc);
             var glyph_index: usize = 0;
@@ -6015,9 +6014,30 @@ pub const Reader = struct {
         };
     }
 
+    fn resolvedIntegerObjectValue(self: *const Reader, obj: *const syntax.Object) !?i64 {
+        if (obj.asInteger()) |value| return value;
+        if (obj.* != .obj_ref) return null;
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        return resolved.asInteger();
+    }
+
+    fn resolvedNumericObjectValue(self: *const Reader, obj: *const syntax.Object) !?f64 {
+        if (numericObjectValue(obj)) |value| return value;
+        if (obj.* != .obj_ref) return null;
+        var resolved = try self.resolveValue(obj);
+        defer resolved.deinit(self.alloc);
+        return numericObjectValue(&resolved);
+    }
+
+    fn cidDefaultWidthAlloc(self: *const Reader, descendant: *const syntax.Object) !f64 {
+        const width_obj = descendant.get("DW") orelse return 1000;
+        return (try self.resolvedNumericObjectValue(width_obj)) orelse 1000;
+    }
+
     fn parseCidWidthsAlloc(self: *const Reader, descendant: *const syntax.Object) !CidWidths {
         var result = CidWidths{
-            .default_width = cidDefaultWidth(descendant),
+            .default_width = try self.cidDefaultWidthAlloc(descendant),
         };
         errdefer result.deinit(self.alloc);
         const widths_obj = descendant.get("W") orelse return result;
@@ -6031,7 +6051,7 @@ pub const Reader = struct {
         const entries = resolved_widths.array;
         var i: usize = 0;
         while (i < entries.len) {
-            const first_i64 = entries[i].asInteger() orelse return error.InvalidPdf;
+            const first_i64 = (try self.resolvedIntegerObjectValue(&entries[i])) orelse return error.InvalidPdf;
             if (first_i64 < 0 or first_i64 > std.math.maxInt(u16)) return error.InvalidPdf;
             const first: u16 = @intCast(first_i64);
             i += 1;
@@ -6043,7 +6063,7 @@ pub const Reader = struct {
                 const values = try self.alloc.alloc(f64, resolved_entry.array.len);
                 errdefer self.alloc.free(values);
                 for (resolved_entry.array, 0..) |width_obj, index| {
-                    values[index] = numericObjectValue(&width_obj) orelse return error.InvalidPdf;
+                    values[index] = (try self.resolvedNumericObjectValue(&width_obj)) orelse return error.InvalidPdf;
                 }
                 try ranges.append(self.alloc, .{
                     .first = first,
@@ -6053,11 +6073,11 @@ pub const Reader = struct {
                 i += 1;
                 continue;
             }
-            const last_i64 = entries[i].asInteger() orelse return error.InvalidPdf;
+            const last_i64 = resolved_entry.asInteger() orelse return error.InvalidPdf;
             if (last_i64 < first_i64 or last_i64 > std.math.maxInt(u16)) return error.InvalidPdf;
             i += 1;
             if (i >= entries.len) return error.InvalidPdf;
-            const width = numericObjectValue(&entries[i]) orelse return error.InvalidPdf;
+            const width = (try self.resolvedNumericObjectValue(&entries[i])) orelse return error.InvalidPdf;
             i += 1;
             try ranges.append(self.alloc, .{
                 .first = first,
@@ -10867,10 +10887,6 @@ fn numericObjectValue(obj: *const syntax.Object) ?f64 {
     };
 }
 
-fn cidDefaultWidth(descendant: *const syntax.Object) f64 {
-    return if (descendant.get("DW")) |obj| numericObjectValue(obj) orelse 1000 else 1000;
-}
-
 fn alphaByteFromNumber(alpha: f64) u8 {
     return floatChannel(alpha);
 }
@@ -13536,6 +13552,46 @@ test "reader combines content arrays beyond the per-stream decode limit" {
     try std.testing.expectEqualSlices(u8, &first_content, combined[0..first_content.len]);
     try std.testing.expectEqual(@as(u8, '\n'), combined[first_content.len]);
     try std.testing.expectEqualSlices(u8, &second_content, combined[first_content.len + 1 ..]);
+}
+
+test "page resource discovery enforces the combined content working set" {
+    const alloc = std.testing.allocator;
+    var first_content: [48]u8 = @splat(' ');
+    var second_content: [48]u8 = @splat(' ');
+    @memcpy(first_content[0..6], "/Im1 D");
+    @memcpy(second_content[0..1], "o");
+    const first_stream = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ first_content.len, &first_content },
+    );
+    defer alloc.free(first_stream);
+    const second_stream = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ second_content.len, &second_content },
+    );
+    defer alloc.free(second_stream);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents [4 0 R 5 0 R] >>\nendobj\n",
+        first_stream,
+        second_stream,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    // Both physical streams fit independently, but their 97-byte logical
+    // stream exceeds this page's working-set envelope.
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 48,
+        .max_working_set_bytes = 80,
+    });
+    defer reader.deinit();
+    var page = try reader.readPageObject(1);
+    defer page.deinit(alloc);
+    try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, reader.collectPageContentAlloc(&page));
 }
 
 test "graphics matrices pre-concatenate PDF cm operators" {
@@ -18905,6 +18961,61 @@ test "CID widths use sparse arrays ranges and defaults" {
     try std.testing.expectEqual(@as(f64, 520), widths.width(12));
     try std.testing.expectEqual(@as(f64, 700), widths.width(25));
     try std.testing.expectEqual(@as(f64, 1000), widths.width(19));
+}
+
+test "CID widths resolve indirect defaults ranges and array members" {
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\n<< /DW 3 0 R /W [4 0 R 5 0 R 6 0 R 7 0 R 8 0 R] >>\nendobj\n",
+        "3 0 obj\n900\nendobj\n",
+        "4 0 obj\n10\nendobj\n",
+        "5 0 obj\n[500 9 0 R]\nendobj\n",
+        "6 0 obj\n20\nendobj\n",
+        "7 0 obj\n22\nendobj\n",
+        "8 0 obj\n700\nendobj\n",
+        "9 0 obj\n510\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    var descendant = try reader.readIndirectObject(.{ .id = 2, .gen = 0 });
+    defer descendant.deinit(alloc);
+    var widths = try reader.parseCidWidthsAlloc(&descendant);
+    defer widths.deinit(alloc);
+
+    try std.testing.expectEqual(@as(f64, 900), widths.default_width);
+    try std.testing.expectEqual(@as(f64, 500), widths.width(10));
+    try std.testing.expectEqual(@as(f64, 510), widths.width(11));
+    try std.testing.expectEqual(@as(f64, 700), widths.width(21));
+    try std.testing.expectEqual(@as(f64, 900), widths.width(19));
+}
+
+test "flattened glyph ownership transfer is allocation-failure safe" {
+    const Runner = struct {
+        fn run(alloc: Allocator) !void {
+            var glyph_points = [_]font_lib.sfnt.GlyphPoint{
+                .{ .x = 0, .y = 0, .on_curve = true },
+                .{ .x = 10, .y = 0, .on_curve = true },
+                .{ .x = 10, .y = 10, .on_curve = true },
+            };
+            var contours = [_]font_lib.sfnt.GlyphContour{.{ .points = &glyph_points }};
+            const outline = font_lib.sfnt.GlyphOutline{
+                .contours = &contours,
+                .x_min = 0,
+                .y_min = 0,
+                .x_max = 10,
+                .y_max = 10,
+            };
+            const text_run = TextRun{ .text = "", .x = 0, .y = 0, .font_size = 10 };
+            var flattened = try Reader.flattenGlyphOutlineAlloc(alloc, outline, text_run, 0, 1, 0);
+            defer flattened.deinit(alloc);
+            try std.testing.expect(flattened.points.len >= 3);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader vectorizes Type1C standard SID glyphs with StandardEncoding" {
