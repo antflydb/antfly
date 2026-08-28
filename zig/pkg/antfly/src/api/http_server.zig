@@ -9604,7 +9604,7 @@ pub const ApiHttpServer = struct {
             error.BackupManifestTooLarge => return error.BackupManifestTooLarge,
             error.TableNotFound => return error.NotFound,
             error.UnsupportedOperation => return error.MethodNotAllowed,
-            error.NativeBackupProjectionBackendUnsupported => return error.UnsupportedBackupFormat,
+            error.NativeBackupStorageBackendUnsupported, error.NativeBackupProjectionBackendUnsupported => return error.UnsupportedBackupFormat,
             error.UnsupportedBackupMigrationState => return error.UnsupportedBackupMigrationState,
             error.UnsupportedMultiRangeTable => return error.UnsupportedMultiRangeTable,
             else => {
@@ -11492,6 +11492,8 @@ pub const ApiHttpServer = struct {
                 repair_cancellation,
             ) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
+                if (err == error.NativeBackupProjectionValidationIndeterminate)
+                    return error.RestoreValidationPending;
                 if (err == error.RestoreDestinationReauthorizationRequired or
                     err == error.StoredDestinationAuthorizationRevoked)
                     return error.RestoreDestinationReauthorizationRequired;
@@ -13476,7 +13478,7 @@ pub const ApiHttpServer = struct {
                         },
                         else => {
                             if (restoreJobErrorIsFenced(err)) return error.RestoreJobFenced;
-                            if (err == error.RestoreValidationPending) {
+                            if (restoreJobErrorIsRetryable(err)) {
                                 const retry_delay_ns = restoreRepositoryRetryDelayNs(
                                     state.job_id,
                                     state.attempt_id,
@@ -13541,7 +13543,7 @@ pub const ApiHttpServer = struct {
                 .table_names = state.table_names,
                 .restore_mode = state.restore_mode,
             }, &location, state.restore_mode, state.destination_authorization_principal, .{ .job_id = state.job_id, .attempt_id = state.attempt_id }, state.active_table_index, state.durability_pending_table_ranges orelse &.{}, state.published_table_ranges orelse &.{}) catch |err| {
-                if (err == error.BackupRepositoryBusy) {
+                if (restoreJobErrorIsRetryable(err)) {
                     const retry_delay_ns = restoreRepositoryRetryDelayNs(
                         state.job_id,
                         state.attempt_id,
@@ -14027,6 +14029,11 @@ fn restoreJobErrorIsFenced(err: anyerror) bool {
         metadata_authority.isRetryableError(err);
 }
 
+fn restoreJobErrorIsRetryable(err: anyerror) bool {
+    return err == error.BackupRepositoryBusy or
+        err == error.RestoreValidationPending;
+}
+
 fn restoreJobFailureRequiresRecovery(begin_established: bool, err: anyerror) bool {
     return !begin_established or restoreJobErrorIsFenced(err);
 }
@@ -14046,6 +14053,9 @@ test "native restore validation uncertainty remains an asynchronous retry" {
         ApiHttpServer.mapExecuteRestoreError(error.NativeBackupProjectionValidationIndeterminate),
     );
     try std.testing.expect(!restoreJobErrorIsFenced(error.RestoreValidationPending));
+    try std.testing.expect(restoreJobErrorIsRetryable(error.RestoreValidationPending));
+    try std.testing.expect(restoreJobErrorIsRetryable(error.BackupRepositoryBusy));
+    try std.testing.expect(!restoreJobErrorIsRetryable(error.BackupIntegrityFailure));
 }
 
 test "restore worker authority is fenced across leadership reacquisition" {

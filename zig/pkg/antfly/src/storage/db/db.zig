@@ -15628,6 +15628,16 @@ pub const DB = struct {
             return total;
         }
 
+        if (self.primary_lsm_storage) |storage| {
+            if (!storage.supportsNativePathLocks()) {
+                std.log.err(
+                    "native backup requires atomic host-path generation publication for primary storage",
+                    .{},
+                );
+                return error.NativeBackupStorageBackendUnsupported;
+            }
+        }
+
         // Close primary/catalog admission before selecting the target. The
         // barrier is writer preferring, so continuous client traffic cannot
         // starve capture. Internal enrichment and resolution callbacks remain
@@ -15691,7 +15701,6 @@ pub const DB = struct {
 
         try self.core.syncStore(true);
         try self.core.index_manager.syncAll(true);
-        try self.core.index_manager.checkpointAllLsmWalsAfterDurableBoundary();
         if (self.loadIndexRepairState(self.alloc)) |repair_state_value| {
             var repair_state = repair_state_value;
             defer repair_state.deinit(self.alloc);
@@ -15769,20 +15778,21 @@ pub const DB = struct {
             }
         }.lessThan);
 
-        // Pin the exact generated-file generation while mutations remain
-        // excluded. This is metadata work only: corpus-sized reads happen
-        // after every capture fence has been released.
-        const generated_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-pin", .{staging_root});
-        defer self.alloc.free(generated_pin_root);
-        var generated_snapshot = try native_backup.pinGeneratedArtifactsForProjections(
+        // Ask each backend to retain its exact manifested generation. Pinning
+        // is bounded by backend/run metadata and does not walk or hardlink the
+        // corpus while revision and mutation fences remain held.
+        var generated_checkpoints = try self.core.index_manager.pinNativeBackupCheckpoints();
+        defer generated_checkpoints.deinit();
+        const generated_metadata_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-metadata-pin", .{staging_root});
+        defer self.alloc.free(generated_metadata_pin_root);
+        var generated_metadata = try native_backup.pinGeneratedCheckpointMetadata(
             self.alloc,
             io,
             self.core.path,
-            generated_pin_root,
-            projections,
+            generated_metadata_pin_root,
             cancellation,
         );
-        defer generated_snapshot.deinit();
+        defer generated_metadata.deinit();
 
         // The primary store and hardlink-pinned generated files now form one
         // stable generation. Release the latency-sensitive apply lock first,
@@ -15809,7 +15819,12 @@ pub const DB = struct {
                 if (hook.before_artifact_materialize) |run| run(hook.ptr);
             }
         }
-        var total = try generated_snapshot.materialize(staging_root, cancellation);
+        var total = try generated_checkpoints.materialize(io, staging_root, cancellation);
+        total = std.math.add(
+            u64,
+            total,
+            try generated_metadata.materialize(staging_root, cancellation),
+        ) catch return error.FileTooBig;
         total = std.math.add(u64, total, try primary_snapshot.materialize(
             self.alloc,
             io,
@@ -92657,6 +92672,26 @@ test "db native snapshot rejects projections without immutable checkpoints" {
     );
 }
 
+test "db native snapshot rejects storage without atomic host generation publication" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var memory_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .storage = memory_storage.storage(),
+    });
+    defer db.close();
+    try db.batch(.{ .writes = &.{.{ .key = "doc:one", .value = "{\"title\":\"one\"}" }} });
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        db.snapshotNative("unsupported-storage-publication"),
+    );
+}
+
 test "db native snapshot admission bounds capture under concurrent writes" {
     const alloc = std.heap.page_allocator;
     var path_buf: [256]u8 = undefined;
@@ -92910,10 +92945,15 @@ test "db native deferred restore preserves generated dense generation without em
             .kind = .dense_vector,
             .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
         });
+        try source.addIndex(.{
+            .name = "text_idx",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        });
         try source.batch(.{
             .writes = &.{.{
                 .key = "doc:native",
-                .value = "{\"body\":\"abcdefghijklmno\"}",
+                .value = "{\"body\":\"abcdefghijklmno\",\"title\":\"portable native generation\"}",
             }},
             .sync_level = .full_index,
         });
@@ -92986,6 +93026,14 @@ test "db native deferred restore preserves generated dense generation without em
     defer result.deinit();
     try std.testing.expect(result.hits.len > 0);
     try std.testing.expectEqualStrings("doc:native", result.hits[0].id);
+
+    var text_result = try restored.search(alloc, .{
+        .index_name = "text_idx",
+        .full_text = .{ .match = .{ .field = "title", .text = "generation" } },
+    });
+    defer text_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), text_result.total_hits);
+    try std.testing.expectEqualStrings("doc:native", text_result.hits[0].id);
 }
 
 test "db native restore preserves primary generation and repairs only a missing projection" {

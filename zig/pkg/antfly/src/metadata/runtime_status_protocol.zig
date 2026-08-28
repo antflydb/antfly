@@ -20,4 +20,9 @@ pub const legacy_record_version: u16 = 12;
 /// V13 is the first (unreleased) format carrying both compact repair state and
 /// the store reporter-incarnation fence.
 pub const repair_status_record_version: u16 = 13;
-pub const current_record_version: u16 = repair_status_record_version;
+/// V14 gates metadata transitions whose trailing native-restore identity is
+/// mandatory. Older replicas can decode and then re-encode those records
+/// without the trailing identity, so admission waits until every metadata
+/// voter advertises V14 support.
+pub const native_restore_identity_record_version: u16 = 14;
+pub const current_record_version: u16 = native_restore_identity_record_version;

@@ -263,6 +263,13 @@ const StoreOwner = union(enum) {
         }
     }
 
+    fn pinNativeCheckpoint(self: *StoreOwner) !lsm_backend.Backend.NativeCheckpoint {
+        return switch (self.*) {
+            .lmdb => error.Unsupported,
+            .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
+        };
+    }
+
     fn syncCommitDurability(self: *StoreOwner) !DurabilitySyncStats {
         return switch (self.*) {
             .lmdb => |backend| blk: {
@@ -686,6 +693,19 @@ pub const WAL = struct {
             lockAtomic(&self.mutex);
         }
         try self.store_owner.checkpointLsmWalAfterDurableBoundary();
+    }
+
+    /// Retains an immutable physical generation after all logical WAL writes
+    /// admitted before the caller's revision fence have completed.
+    pub fn pinNativeCheckpoint(self: *WAL) !lsm_backend.Backend.NativeCheckpoint {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        // Native capture reaches this method only after backend-runtime replay
+        // admission and the DB revision fence have drained prior append work.
+        // Never spin or sleep an OS thread if that contract is violated.
+        if (self.coordinator_active or self.pending_head != null)
+            return error.WalAppendInProgress;
+        return try self.store_owner.pinNativeCheckpoint();
     }
 
     /// Truncate all entries with LSN <= the given value.

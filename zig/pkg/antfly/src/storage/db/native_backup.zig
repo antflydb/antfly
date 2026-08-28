@@ -265,6 +265,71 @@ pub fn pinGeneratedArtifacts(
     );
 }
 
+/// Pins only the small generation checkpoints which are not owned by a
+/// physical index backend. This operation is constant in corpus and segment
+/// count and is safe to perform while the revision fence is held.
+pub fn pinGeneratedCheckpointMetadata(
+    alloc: Allocator,
+    io: Io,
+    source_root: []const u8,
+    pin_root: []const u8,
+    cancellation: CancellationToken,
+) !PinnedGeneratedArtifacts {
+    try ensureActive(cancellation);
+    try fs_paths.createDirPathPortable(io, pin_root);
+    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
+    errdefer {
+        for (files.items) |*file| file.deinit(alloc);
+        files.deinit(alloc);
+    }
+    inline for (.{ applied_checkpoint_file_name, repair_checkpoint_file_name }) |name| {
+        try ensureActive(cancellation);
+        const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_root, name });
+        defer alloc.free(source);
+        if (try pathExists(io, source)) {
+            const relative = try alloc.dupe(u8, name);
+            const pinned_path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ pin_root, relative }) catch |err| {
+                alloc.free(relative);
+                return err;
+            };
+            const stat = pinArtifactFile(io, source, pinned_path) catch |err| {
+                alloc.free(pinned_path);
+                alloc.free(relative);
+                return err;
+            };
+            files.append(alloc, .{ .relative_path = relative, .pinned_path = pinned_path, .stat = stat }) catch |err| {
+                alloc.free(pinned_path);
+                alloc.free(relative);
+                return err;
+            };
+        }
+    }
+    return try finishPinnedArtifacts(alloc, io, pin_root, &files);
+}
+
+fn finishPinnedArtifacts(
+    alloc: Allocator,
+    io: Io,
+    pin_root: []const u8,
+    files: *std.ArrayListUnmanaged(PinnedArtifactFile),
+) !PinnedGeneratedArtifacts {
+    std.mem.sort(PinnedArtifactFile, files.items, {}, struct {
+        fn lessThan(_: void, lhs: PinnedArtifactFile, rhs: PinnedArtifactFile) bool {
+            return std.mem.order(u8, lhs.relative_path, rhs.relative_path) == .lt;
+        }
+    }.lessThan);
+    const owned_pin_root = try alloc.dupe(u8, pin_root);
+    errdefer alloc.free(owned_pin_root);
+    const owned_files = try files.toOwnedSlice(alloc);
+    return .{
+        .alloc = alloc,
+        .io = io,
+        .pin_root = owned_pin_root,
+        .files = owned_files,
+    };
+}
+
 /// Pins only projection generations whose physical backend has an immutable
 /// native checkpoint. Omitted projections remain represented in the manifest
 /// as durable repair work; their live mutable files are never hardlinked.
@@ -352,20 +417,7 @@ pub fn pinGeneratedArtifactsForProjections(
         }
     }
 
-    std.mem.sort(PinnedArtifactFile, files.items, {}, struct {
-        fn lessThan(_: void, lhs: PinnedArtifactFile, rhs: PinnedArtifactFile) bool {
-            return std.mem.order(u8, lhs.relative_path, rhs.relative_path) == .lt;
-        }
-    }.lessThan);
-    const owned_pin_root = try alloc.dupe(u8, pin_root);
-    errdefer alloc.free(owned_pin_root);
-    const owned_files = try files.toOwnedSlice(alloc);
-    return .{
-        .alloc = alloc,
-        .io = io,
-        .pin_root = owned_pin_root,
-        .files = owned_files,
-    };
+    return try finishPinnedArtifacts(alloc, io, pin_root, &files);
 }
 
 pub fn capture(

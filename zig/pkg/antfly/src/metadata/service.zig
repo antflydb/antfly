@@ -842,6 +842,11 @@ fn runtimeStatusProtocolSafeCommand(
     command: metadata_storage.TransitionCommand,
     owned_legacy_store: *?metadata_table_manager.StoreRecord,
 ) !metadata_storage.TransitionCommand {
+    if (transitionCarriesNativeRestoreIdentity(command) and
+        !nativeRestoreIdentityProtocolReady(service))
+    {
+        return error.NativeRestoreIdentityProtocolUnavailable;
+    }
     switch (command) {
         .upsert_store => |record| {
             if (!metadata_table_manager.reporterFenceValid(
@@ -877,6 +882,29 @@ fn runtimeStatusProtocolSafeCommand(
         },
         else => return command,
     }
+}
+
+fn transitionCarriesNativeRestoreIdentity(command: metadata_storage.TransitionCommand) bool {
+    return switch (command) {
+        .upsert_range => |record| record.restore_native_manifest_size_bytes != 0 or
+            record.restore_native_manifest_sha256.len != 0,
+        .complete_restore_range => |identity| identity.native_manifest_size_bytes != 0 or
+            identity.native_manifest_sha256.len != 0,
+        .upsert_restore_progress => |record| record.native_manifest_size_bytes != 0 or
+            record.native_manifest_sha256.len != 0,
+        .upsert_replica_intent => |replacement| if (replacement.replacement.record.backup_restore_bootstrap) |restore|
+            restore.native_manifest_size_bytes != 0 or restore.native_manifest_sha256.len != 0
+        else
+            false,
+        else => false,
+    };
+}
+
+fn nativeRestoreIdentityProtocolReady(service: anytype) bool {
+    const Service = @TypeOf(service.*);
+    if (comptime @hasDecl(Service, "nativeRestoreIdentityProtocolReady"))
+        return service.nativeRestoreIdentityProtocolReady();
+    return service.runtimeStatusRepairProtocolReady();
 }
 
 pub const MetadataServiceDeps = struct {
@@ -2268,6 +2296,12 @@ pub const MetadataService = struct {
             }
         }
         return local_member;
+    }
+
+    fn nativeRestoreIdentityProtocolReady(self: *MetadataService) bool {
+        // The in-process service supports only a local metadata membership;
+        // the same proof that admits V13 therefore proves every applier is V14.
+        return self.runtimeStatusRepairProtocolReady();
     }
 
     pub fn registerStore(self: *MetadataService, record: metadata_table_manager.StoreRecord) !void {
@@ -4269,13 +4303,32 @@ pub const MetadataHttpService = struct {
 
     fn runtimeStatusProtocolActivationVersion(self: *MetadataHttpService) u16 {
         const cached = self.runtime_status_protocol_activated_version.load(.acquire);
-        if (cached >= metadata_runtime_status_protocol.repair_status_record_version) return cached;
-        const store = self.projectedStore() orelse return 0;
-        const version = store.getRuntimeStatusProtocolActivationVersion(self.metadata_group_id) catch return 0;
-        if (version >= metadata_runtime_status_protocol.repair_status_record_version) {
+        if (cached >= metadata_runtime_status_protocol.current_record_version) return cached;
+        const store = self.projectedStore() orelse return cached;
+        const version = store.getRuntimeStatusProtocolActivationVersion(self.metadata_group_id) catch return cached;
+        if (version > cached) {
             self.runtime_status_protocol_activated_version.store(version, .release);
         }
-        return version;
+        return @max(cached, version);
+    }
+
+    fn nativeRestoreIdentityProtocolReady(self: *MetadataHttpService) bool {
+        if (self.runtimeStatusProtocolActivationVersion() >=
+            metadata_runtime_status_protocol.native_restore_identity_record_version) return true;
+
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse return false;
+        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
+        if (runtimeStatusProtocolMembershipIsLocalOnly(
+            raft_status.conf_state,
+            self.reallocation_protocol_peers,
+            local_node_id,
+        )) return true;
+
+        // Drive the existing asynchronous all-voter probe. Native identity is
+        // admitted only after a V14 store transition has durably activated the
+        // protocol, never from the process-local probe cache alone.
+        _ = self.runtimeStatusRepairProtocolReady();
+        return false;
     }
 
     fn scheduleRuntimeStatusProtocolProbe(
@@ -6923,6 +6976,40 @@ test "metadata service transition commands downgrade runtime repair status until
     try std.testing.expect(unexpectedly_owned == null);
     try std.testing.expect(storeHasRuntimeRepairStatus(current_command.upsert_store));
     try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
+}
+
+test "metadata service gates mandatory native restore identity until protocol activation" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        ready: bool,
+
+        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+            return true;
+        }
+
+        fn nativeRestoreIdentityProtocolReady(self: *@This()) bool {
+            return self.ready;
+        }
+    };
+    const command: metadata_storage.TransitionCommand = .{ .upsert_restore_progress = .{
+        .table_id = 7,
+        .node_id = 9,
+        .group_id = 11,
+        .backup_id = "backup",
+        .native_manifest_size_bytes = 42,
+        .native_manifest_sha256 = "manifest-sha256",
+    } };
+    var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
+    var legacy = FakeService{ .alloc = std.testing.allocator, .ready = false };
+    try std.testing.expectError(
+        error.NativeRestoreIdentityProtocolUnavailable,
+        runtimeStatusProtocolSafeCommand(&legacy, command, &owned_legacy_store),
+    );
+    try std.testing.expect(owned_legacy_store == null);
+
+    var current = FakeService{ .alloc = std.testing.allocator, .ready = true };
+    const admitted = try runtimeStatusProtocolSafeCommand(&current, command, &owned_legacy_store);
+    try std.testing.expectEqual(@as(u64, 42), admitted.upsert_restore_progress.native_manifest_size_bytes);
 }
 
 test "metadata service defers reporter fence transitions while activation is unknown" {
