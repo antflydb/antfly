@@ -13439,16 +13439,56 @@ pub const DB = struct {
                 return result;
             }
         }
-        if (self.core.index_manager.recoveryActionForIndex(entry.intent.index_name) == .rebuild_from_artifacts) {
+        // Only startup discovery creates incomplete_bulk_publish intents, so
+        // this durable provenance is the authority to reclaim quarantine
+        // ownership. Operator and generation-health intents may coexist with
+        // retry/manual load failures but must not be reclassified as automatic
+        // destructive recovery merely because they share an index name.
+        if (entry.intent.trigger == .incomplete_bulk_publish) {
             // Retryable terminal phases release their quarantine claim so an
-            // operator may intervene. Once durable execution resumes, reclaim
-            // the current same-config incarnation explicitly; completed
-            // discovery epochs no longer rescan merely to provide this side
-            // effect.
-            _ = self.core.index_manager.claimFailedIndexLoadRepair(
+            // operator may intervene. Reclaiming classifies action/config and
+            // claims the current incarnation in one catalog-locked operation.
+            // Policy or identity drift is terminal for this durable intent: a
+            // fresh audit must authorize any different action.
+            switch (self.core.index_manager.claimFailedIndexLoadRepair(
                 entry.intent.index_name,
-                entry.intent.config_hash,
-            );
+                .{
+                    .action = .rebuild_from_artifacts,
+                    .config_hash = entry.intent.config_hash,
+                },
+            )) {
+                .claimed, .already_claimed, .absent => {},
+                .wrong_action => {
+                    try self.recordIndexRepairAttemptFailure(
+                        alloc,
+                        repair_id,
+                        "quarantine_recovery_policy_changed",
+                        true,
+                    );
+                    result.terminal = true;
+                    return result;
+                },
+                .config_changed => {
+                    try self.recordIndexRepairAttemptFailure(
+                        alloc,
+                        repair_id,
+                        "quarantine_config_changed",
+                        true,
+                    );
+                    result.terminal = true;
+                    return result;
+                },
+                .stale => {
+                    try self.recordIndexRepairAttemptFailure(
+                        alloc,
+                        repair_id,
+                        "quarantine_claim_stale",
+                        true,
+                    );
+                    result.terminal = true;
+                    return result;
+                },
+            }
         }
         // A candidate which already failed coverage cannot manufacture an
         // artifact missing below its snapshot floor. Discard only that
@@ -14284,9 +14324,12 @@ pub const DB = struct {
             return result;
         }
 
-        const had_load_failure = self.core.index_manager.loadFailure(cfg.name) != null;
+        const initial_load_failure = self.core.index_manager.failedIndexLoadSnapshot(cfg.name);
+        const had_load_failure = initial_load_failure != null;
         var durable_repair_id = try self.indexRepairIdForIndex(alloc, cfg.name);
-        if (had_load_failure and self.core.index_manager.recoveryActionForIndex(cfg.name) == .rebuild_from_artifacts) {
+        if (initial_load_failure != null and
+            initial_load_failure.?.token.action == .rebuild_from_artifacts)
+        {
             _ = try self.discoverRecoverableStartupIndexFailures(alloc, 1);
             durable_repair_id = try self.indexRepairIdForIndex(alloc, cfg.name);
         }
@@ -14446,19 +14489,47 @@ pub const DB = struct {
         }
         result.indexes_degraded_before = @intFromBool(repair_required);
         result.indexes_degraded_after = 1;
-        if (self.core.index_manager.loadFailure(cfg.name) != null) {
-            const recovery_action = self.core.index_manager.recoveryActionForIndex(cfg.name).?;
+        if (self.core.index_manager.failedIndexLoadSnapshot(cfg.name)) |failure| {
+            const recovery_action = failure.token.action;
             switch (recovery_action) {
                 .retry_open, .manual_intervention => {
                     // Explicit named operator repair may first retry that
-                    // exact quarantined index. This does not broaden either
-                    // its scope or the automatic destructive-rebuild allowlist.
-                    _ = try self.retryQuarantinedIndexLoad(cfg.name, true);
-                    if (self.core.index_manager.loadFailure(cfg.name) != null and recovery_action == .retry_open) {
-                        result.failed += 1;
-                        result.unresolved += 1;
-                        result.debt_remaining = true;
-                        return result;
+                    // exact quarantined incarnation. If its identity changes,
+                    // defer so the next pass re-audits the new policy instead
+                    // of carrying stale authorization into reconstruction.
+                    const retry_result = try self.retryQuarantinedIndexLoadTarget(.{
+                        .name = cfg.name,
+                        .token = failure.token,
+                    }, true);
+                    switch (retry_result.target_outcome) {
+                        .stale, .repair_claimed, .backoff => {
+                            result.in_progress += 1;
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                            return result;
+                        },
+                        .not_targeted => unreachable,
+                        .absent, .attempted_failed, .recovered => {},
+                    }
+                    const remaining_failure = self.core.index_manager.failedIndexLoadSnapshot(cfg.name);
+                    if (remaining_failure) |current| {
+                        // A failed open advances the resident revision by
+                        // design. Re-audit its policy, but retain operator
+                        // authorization only for the same durable config.
+                        if (current.token.config_hash != failure.token.config_hash) {
+                            result.in_progress += 1;
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                            return result;
+                        }
+                        if (recovery_action == .retry_open or
+                            current.token.action == .retry_open)
+                        {
+                            result.failed += 1;
+                            result.unresolved += 1;
+                            result.debt_remaining = true;
+                            return result;
+                        }
                     }
                 },
                 .rebuild_from_artifacts => {
@@ -19984,12 +20055,28 @@ pub const DB = struct {
         index_name: []const u8,
         force: bool,
     ) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        const failure = self.core.index_manager.failedIndexLoadSnapshot(index_name) orelse
+            return .{
+                .remaining = self.core.index_manager.failedIndexLoadSummary().total,
+                .target_outcome = .absent,
+            };
+        return try self.retryQuarantinedIndexLoadTarget(.{
+            .name = index_name,
+            .token = failure.token,
+        }, force);
+    }
+
+    fn retryQuarantinedIndexLoadTarget(
+        self: *DB,
+        target: index_manager_mod.IndexManager.FailedIndexLoadRetryTarget,
+        force: bool,
+    ) !index_manager_mod.IndexManager.QuarantineRetryResult {
         var publication_fence = QuarantineIndexPublicationFence{ .db = self };
         return try self.core.index_manager.retryFailedIndexLoads(
             self.core.store,
             monotonicTimeNs(),
             force,
-            index_name,
+            target,
             1,
             publication_fence.iface(),
         );
@@ -62641,6 +62728,7 @@ test "db targeted quarantine retry does not open unrelated failed indexes" {
     const result = try db.retryQuarantinedIndexLoad("ft_target", true);
     try std.testing.expectEqual(@as(usize, 1), result.recovered);
     try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    try std.testing.expectEqual(.recovered, result.target_outcome);
     try std.testing.expect(db.core.index_manager.loadFailure("ft_target") == null);
     try std.testing.expect(db.core.textIndexEntry("ft_target") != null);
     try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
