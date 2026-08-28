@@ -65,6 +65,7 @@ comptime {
     _ = @import("db/doc_filter_wire.zig");
     _ = @import("db/doc_identity.zig");
     _ = @import("db/doc_set.zig");
+    _ = @import("db/document_content_hash.zig");
     _ = @import("db/document_mapper.zig");
     _ = @import("db/document_query.zig");
     _ = @import("db/enrichment/artifact_codec.zig");

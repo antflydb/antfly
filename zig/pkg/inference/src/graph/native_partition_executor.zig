@@ -480,6 +480,7 @@ fn executeNativePlannedNode(
             );
         },
         .reshape => |attrs| blk: {
+            if (attrs.runtime_shape) return null;
             const rank = attrs.new_shape.rank();
             var dims: [8]i64 = undefined;
             for (0..rank) |d| dims[d] = attrs.new_shape.dim(@intCast(d));

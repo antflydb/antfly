@@ -400,6 +400,16 @@ pub const ManagedHostService = struct {
         self.metrics.sync_rounds += 1;
     }
 
+    /// Processes inbound and Ready work without advancing Raft time. Request
+    /// paths use this while a cadence driver owns all election and heartbeat
+    /// ticks.
+    pub fn runRaftProgressOnly(self: *ManagedHostService) !void {
+        _ = try self.host.runProgressRoundBounded(
+            self.cfg.max_inbound_messages,
+            self.cfg.max_ready_steps,
+        );
+    }
+
     pub fn stepTransitions(self: *ManagedHostService) !transition_service.TransitionStepResult {
         if (self.transition_svc) |*transition_svc| {
             if (!self.holdsTransitionAuthority()) {
@@ -794,6 +804,17 @@ pub const ManagedHttpHostService = struct {
         return result;
     }
 
+    pub fn syncPendingRaftProgressOnly(self: *ManagedHttpHostService) !managed_host.ManagedSyncResult {
+        const result = try self.host.syncOnceProgressBounded(
+            self.pending_updates.items,
+            self.cfg.max_inbound_messages,
+            self.cfg.max_ready_steps,
+        );
+        self.last_runtime_round = result.runtime;
+        try self.finishPendingSync(.raft);
+        return result;
+    }
+
     pub fn runRound(self: *ManagedHttpHostService) !void {
         self.last_runtime_round = try self.host.runRoundBounded(
             self.cfg.max_inbound_messages,
@@ -811,6 +832,16 @@ pub const ManagedHttpHostService = struct {
             self.cfg.max_ready_steps,
         );
         self.metrics.sync_rounds += 1;
+    }
+
+    /// Processes inbound and Ready work without advancing Raft time. Request
+    /// paths use this while a cadence driver owns all election and heartbeat
+    /// ticks.
+    pub fn runRaftProgressOnly(self: *ManagedHttpHostService) !void {
+        self.last_runtime_round = try self.host.runProgressRoundBounded(
+            self.cfg.max_inbound_messages,
+            self.cfg.max_ready_steps,
+        );
     }
 
     pub fn lastRuntimeRound(self: *const ManagedHttpHostService) ?raft_engine.runtime.multi_raft.HostRound {
