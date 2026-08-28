@@ -333,6 +333,7 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
 
             // ── reshape(x, same_shape) -> x ───────────────────────
             .reshape => |attrs| {
+                if (attrs.runtime_shape) continue;
                 if (in0 == null_node) continue;
                 const input_shape = work.node(in0).output_shape;
                 if (shapesEqual(input_shape, attrs.new_shape)) {
@@ -1964,10 +1965,12 @@ fn fuseChainReshape(allocator: std.mem.Allocator, work: *Graph, reachable: []con
             .reshape => |a| a,
             else => continue,
         };
+        if (outer_attrs.runtime_shape) continue;
         const inner_id = outer.inputs[0];
         if (inner_id == null_node or inner_id >= count) continue;
         const inner = work.node(inner_id);
         if (std.meta.activeTag(inner.op) != .reshape) continue;
+        if (inner.op.reshape.runtime_shape) continue;
 
         const new_id = try work.addNode(.{
             .op = .{ .reshape = .{ .new_shape = outer_attrs.new_shape } },
