@@ -404,14 +404,12 @@ fn scalePageRenderRuns(runs: *reader.PageRenderRuns, scale: f64) void {
 }
 
 fn rasterAxisExtent(min_value: f64, max_value: f64, scale: f64) f64 {
-    return @max(1.0, @ceil(max_value * scale) - @floor(min_value * scale));
+    return @max(1.0, @ceil((max_value - min_value) * scale));
 }
 
 fn alignPageBoxToPixelGrid(box: *reader.PageBox) void {
-    box.min_x = @floor(box.min_x);
-    box.min_y = @floor(box.min_y);
-    box.max_x = @max(box.min_x + 1.0, @ceil(box.max_x));
-    box.max_y = @max(box.min_y + 1.0, @ceil(box.max_y));
+    box.max_x = box.min_x + @max(1.0, @ceil(box.max_x - box.min_x));
+    box.max_y = box.min_y + @max(1.0, @ceil(box.max_y - box.min_y));
 }
 
 test "raster extents include fractional crop-box edges" {
@@ -422,16 +420,16 @@ test "raster extents include fractional crop-box edges" {
         .max_y = 842.16,
     };
     const scale = 150.0 / 72.0;
-    try std.testing.expectEqual(@as(f64, 1241), rasterAxisExtent(box.min_x, box.max_x, scale));
-    try std.testing.expectEqual(@as(f64, 1755), rasterAxisExtent(box.min_y, box.max_y, scale));
+    try std.testing.expectEqual(@as(f64, 1240), rasterAxisExtent(box.min_x, box.max_x, scale));
+    try std.testing.expectEqual(@as(f64, 1754), rasterAxisExtent(box.min_y, box.max_y, scale));
 
     var scaled = box;
     scaleBox(&scaled, scale);
     alignPageBoxToPixelGrid(&scaled);
-    try std.testing.expectEqual(@as(f64, 1), scaled.min_x);
-    try std.testing.expectEqual(@as(f64, 0), scaled.min_y);
-    try std.testing.expectEqual(@as(f64, 1242), scaled.max_x);
-    try std.testing.expectEqual(@as(f64, 1755), scaled.max_y);
+    try std.testing.expectApproxEqAbs(1.500002083, scaled.min_x, 0.000001);
+    try std.testing.expectApproxEqAbs(0.999991667, scaled.min_y, 0.000001);
+    try std.testing.expectApproxEqAbs(1241.500002083, scaled.max_x, 0.000001);
+    try std.testing.expectApproxEqAbs(1754.999991667, scaled.max_y, 0.000001);
 }
 
 fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
@@ -476,11 +474,13 @@ fn dupShapeRunAlloc(alloc: Allocator, run: reader.ShapeRun) !reader.ShapeRun {
     out.dash_array = null;
     out.clip_points = null;
     out.points = &.{};
+    out.subpath_starts = null;
     errdefer out.deinit(alloc);
 
     if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
     if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
     out.points = try alloc.dupe([2]f64, run.points);
+    if (run.subpath_starts) |starts| out.subpath_starts = try alloc.dupe(usize, starts);
     return out;
 }
 
@@ -489,6 +489,7 @@ fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternR
     out.dash_array = null;
     out.clip_points = null;
     out.points = &.{};
+    out.subpath_starts = null;
     out.shading = null;
     out.tile_text_runs = &.{};
     out.tile_image_runs = &.{};
@@ -500,6 +501,7 @@ fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternR
     if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
     if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
     out.points = try alloc.dupe([2]f64, run.points);
+    if (run.subpath_starts) |starts| out.subpath_starts = try alloc.dupe(usize, starts);
     if (run.shading) |shading| out.shading = try dupShadingRunAlloc(alloc, shading);
 
     if (run.tile_text_runs.len > 0) {

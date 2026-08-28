@@ -50,6 +50,7 @@ pub const Font = struct {
     bytes: []const u8,
     charstrings: Index,
     charset: []u16,
+    string_index: Index = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
     global_subrs: Index,
     local_subrs: ?Index,
     fd_array: ?[]FontDict,
@@ -102,6 +103,7 @@ pub const Font = struct {
             .bytes = bytes,
             .charstrings = charstrings,
             .charset = charset,
+            .string_index = string_index,
             .global_subrs = global_subrs,
             .local_subrs = local_subrs,
             .fd_array = fd_array,
@@ -146,6 +148,31 @@ pub const Font = struct {
             .x_max = 0,
             .y_max = 0,
         };
+    }
+
+    pub fn glyphCount(self: Font) usize {
+        return self.charstrings.count;
+    }
+
+    /// CFF charsets contain SIDs for name-keyed fonts and CIDs for CID-keyed
+    /// fonts. This lookup supports the latter without assuming CID == GID.
+    pub fn glyphIndexForCharsetValue(self: Font, value: u16) ?u16 {
+        for (self.charset, 0..) |candidate, glyph_index| {
+            if (candidate == value) return @intCast(glyph_index);
+        }
+        return null;
+    }
+
+    /// Resolve names introduced in the CFF String INDEX. PDF subset fonts
+    /// commonly use generated names (G21, G35, ...), all of which live there.
+    pub fn glyphIndexForCustomName(self: Font, name: []const u8) ?u16 {
+        if (std.mem.eql(u8, name, ".notdef")) return 0;
+        for (self.charset, 0..) |sid, glyph_index| {
+            if (sid < 391) continue;
+            const object = self.string_index.getObject(self.bytes, sid - 391) catch continue;
+            if (std.mem.eql(u8, object, name)) return @intCast(glyph_index);
+        }
+        return null;
     }
 
     fn executeCharStringAlloc(

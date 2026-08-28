@@ -70,11 +70,13 @@ pub fn glyphOutlineAlloc(alloc: std.mem.Allocator, charstring: []const u8, local
     defer current.deinit(alloc);
     var stack = std.ArrayList(f64).empty;
     defer stack.deinit(alloc);
+    var othersubr_results = std.ArrayList(f64).empty;
+    defer othersubr_results.deinit(alloc);
 
     var x: f64 = 0;
     var y: f64 = 0;
     var width_seen = false;
-    try executeCharStringAlloc(alloc, charstring, local_subrs, &stack, &current, &contours, &x, &y, &width_seen, null, 0);
+    try executeCharStringAlloc(alloc, charstring, local_subrs, &stack, &othersubr_results, &current, &contours, &x, &y, &width_seen, null, 0);
 
     if (contours.items.len == 0) return null;
     return .{
@@ -91,6 +93,8 @@ pub fn seacComponentsAlloc(alloc: std.mem.Allocator, charstring: []const u8, loc
 
     var stack = std.ArrayList(f64).empty;
     defer stack.deinit(alloc);
+    var othersubr_results = std.ArrayList(f64).empty;
+    defer othersubr_results.deinit(alloc);
     var current = std.ArrayList(GlyphPoint).empty;
     defer current.deinit(alloc);
     var contours = std.ArrayList(GlyphContour).empty;
@@ -107,6 +111,7 @@ pub fn seacComponentsAlloc(alloc: std.mem.Allocator, charstring: []const u8, loc
         charstring,
         local_subrs,
         &stack,
+        &othersubr_results,
         &current,
         &contours,
         &x,
@@ -123,6 +128,7 @@ fn executeCharStringAlloc(
     program: []const u8,
     local_subrs: ?[]const []const u8,
     stack: *std.ArrayList(f64),
+    othersubr_results: *std.ArrayList(f64),
     current: *std.ArrayList(GlyphPoint),
     contours: *std.ArrayList(GlyphContour),
     x: *f64,
@@ -171,7 +177,7 @@ fn executeCharStringAlloc(
                 if (local_subrs == null or stack.items.len == 0) return error.UnsupportedType1;
                 const raw_idx = @as(i32, @intFromFloat(stack.pop().?));
                 if (raw_idx < 0 or raw_idx >= local_subrs.?.len) return error.InvalidSubroutine;
-                try executeCharStringAlloc(alloc, local_subrs.?[@intCast(raw_idx)], local_subrs, stack, current, contours, x, y, width_seen, seac_out, depth + 1);
+                try executeCharStringAlloc(alloc, local_subrs.?[@intCast(raw_idx)], local_subrs, stack, othersubr_results, current, contours, x, y, width_seen, seac_out, depth + 1);
             },
             11 => return,
             12 => {
@@ -179,6 +185,11 @@ fn executeCharStringAlloc(
                 const escaped = program[i];
                 i += 1;
                 switch (escaped) {
+                    0, 1, 2 => {
+                        // dotsection, vstem3, and hstem3 only affect the Type 1
+                        // rasterizer's hinting state, not outline geometry.
+                        stack.clearRetainingCapacity();
+                    },
                     7 => {
                         if (stack.items.len < 4) return error.InvalidType1;
                         x.* = stack.items[0];
@@ -209,6 +220,34 @@ fn executeCharStringAlloc(
                         const b = stack.pop().?;
                         const a = stack.pop().?;
                         try stack.append(alloc, a / b);
+                    },
+                    16 => {
+                        // callothersubr bridges to a PostScript procedure. The
+                        // standard flex and hint-replacement procedures may
+                        // return values consumed by the following `pop`
+                        // operators. Preserve those values while keeping the
+                        // geometric moves in the charstring authoritative.
+                        if (stack.items.len < 2) return error.InvalidType1;
+                        const subr_number_f = stack.pop().?;
+                        const argument_count_f = stack.pop().?;
+                        if (!std.math.isFinite(subr_number_f) or !std.math.isFinite(argument_count_f) or argument_count_f < 0) return error.InvalidType1;
+                        const subr_number: i32 = @intFromFloat(subr_number_f);
+                        const argument_count: usize = @intFromFloat(argument_count_f);
+                        if (argument_count > stack.items.len) return error.InvalidType1;
+                        const first = stack.items.len - argument_count;
+                        switch (subr_number) {
+                            // Flex termination returns the final current point
+                            // to the customary `pop pop setcurrentpoint` tail.
+                            0 => try othersubr_results.appendSlice(alloc, &.{ y.*, x.* }),
+                            // Hint replacement returns its sole argument.
+                            3 => if (argument_count > 0) try othersubr_results.append(alloc, stack.items[stack.items.len - 1]),
+                            else => {},
+                        }
+                        stack.shrinkRetainingCapacity(first);
+                    },
+                    17 => {
+                        const value = othersubr_results.pop() orelse 0;
+                        try stack.append(alloc, value);
                     },
                     33 => {
                         if (stack.items.len < 2) return error.InvalidType1;
@@ -456,6 +495,21 @@ test "type1 executes local subroutine outline" {
     defer outline.deinit(alloc);
     try std.testing.expectApproxEqAbs(@as(f64, 50), outline.contours[0].points[1].x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 0), outline.contours[0].points[1].y, 0.001);
+}
+
+test "type1 accepts standard othersubr and pop operators" {
+    const alloc = std.testing.allocator;
+    const charstring = [_]u8{
+        139, 139, 21, // 0 0 rmoveto
+        189, 139, 5, // 50 0 rlineto
+        149, 140, 142, 12, 16, // 10 1 3 callothersubr
+        12, 17, 159, 12, 33, // pop 20 setcurrentpoint
+        139, 189, 5, 14, // 0 50 rlineto endchar
+    };
+
+    var outline = (try glyphOutlineAlloc(alloc, &charstring, null)).?;
+    defer outline.deinit(alloc);
+    try std.testing.expect(outline.contours.len >= 1);
 }
 
 test "type1 decrypts charstring with lenIV" {

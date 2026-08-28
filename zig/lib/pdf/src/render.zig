@@ -626,6 +626,11 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
     const y0 = floorToCanvas(margin_f + max_y - bounds.max_y, canvas_h);
     const y1 = ceilToCanvas(margin_f + max_y - bounds.min_y, canvas_h);
     const has_clip = run.clip_box != null or run.clip_points != null;
+    const projected_width = @sqrt(run.a * run.a + run.b * run.b);
+    const projected_height = @sqrt(run.c * run.c + run.d * run.d);
+    const filtered = run.interpolate or
+        @as(f64, @floatFromInt(run.width)) > projected_width + 0.01 or
+        @as(f64, @floatFromInt(run.height)) > projected_height + 0.01;
 
     var py = y0;
     while (py < y1) : (py += 1) {
@@ -640,14 +645,53 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
             const v = inv_b * dx + inv_d * dy;
             if (!finite(u) or !finite(v) or u < 0 or u > 1 or v < 0 or v > 1) continue;
 
-            const sx = @min(run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(run.width))))));
-            const sy = @min(run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(run.height))))));
-            const src = (@as(usize, sy) * @as(usize, run.width) + @as(usize, sx)) * 4;
             const dst = (py * canvas_w + px) * 4;
-            const alpha = @as(u8, @intCast((@as(u16, run.rgba[src + 3]) * @as(u16, run.alpha) + 127) / 255));
-            blendPixelMode(canvas, dst, .{ run.rgba[src + 0], run.rgba[src + 1], run.rgba[src + 2], alpha }, run.blend_mode);
+            var sample: [4]u8 = undefined;
+            if (filtered) {
+                sample = bilinearImageSample(run, u, 1.0 - v);
+            } else {
+                const sx = @min(run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(run.width))))));
+                const sy = @min(run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(run.height))))));
+                const src = (@as(usize, sy) * @as(usize, run.width) + @as(usize, sx)) * 4;
+                sample = .{ run.rgba[src], run.rgba[src + 1], run.rgba[src + 2], run.rgba[src + 3] };
+            }
+            sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, run.alpha) + 127) / 255);
+            blendPixelMode(canvas, dst, sample, run.blend_mode);
         }
     }
+}
+
+fn bilinearImageSample(run: reader.ImageRun, u: f64, v: f64) [4]u8 {
+    const width_f: f64 = @floatFromInt(run.width);
+    const height_f: f64 = @floatFromInt(run.height);
+    const x = std.math.clamp(u * width_f - 0.5, 0.0, @max(0.0, width_f - 1.0));
+    const y = std.math.clamp(v * height_f - 0.5, 0.0, @max(0.0, height_f - 1.0));
+    const x0: u32 = @intFromFloat(@floor(x));
+    const y0: u32 = @intFromFloat(@floor(y));
+    const x1 = @min(run.width - 1, x0 + 1);
+    const y1 = @min(run.height - 1, y0 + 1);
+    const tx = x - @as(f64, @floatFromInt(x0));
+    const ty = y - @as(f64, @floatFromInt(y0));
+    const weights = [4]f64{ (1.0 - tx) * (1.0 - ty), tx * (1.0 - ty), (1.0 - tx) * ty, tx * ty };
+    const indices = [4]usize{
+        (@as(usize, y0) * @as(usize, run.width) + @as(usize, x0)) * 4,
+        (@as(usize, y0) * @as(usize, run.width) + @as(usize, x1)) * 4,
+        (@as(usize, y1) * @as(usize, run.width) + @as(usize, x0)) * 4,
+        (@as(usize, y1) * @as(usize, run.width) + @as(usize, x1)) * 4,
+    };
+    var alpha: f64 = 0;
+    for (weights, indices) |weight, index| alpha += weight * @as(f64, @floatFromInt(run.rgba[index + 3]));
+    var out: [4]u8 = .{ 0, 0, 0, @intFromFloat(@round(std.math.clamp(alpha, 0.0, 255.0))) };
+    if (alpha > 0.000001) {
+        for (0..3) |channel| {
+            var premultiplied: f64 = 0;
+            for (weights, indices) |weight, index| {
+                premultiplied += weight * @as(f64, @floatFromInt(run.rgba[index + channel])) * @as(f64, @floatFromInt(run.rgba[index + 3]));
+            }
+            out[channel] = @intFromFloat(@round(std.math.clamp(premultiplied / alpha, 0.0, 255.0)));
+        }
+    }
+    return out;
 }
 
 fn imageRunBounds(run: reader.ImageRun) struct { min_x: f64, max_x: f64, min_y: f64, max_y: f64 } {
@@ -747,6 +791,7 @@ fn drawPatternRun(
         .clip_points = run.clip_points,
         .clip_fill_rule = run.clip_fill_rule,
         .points = run.points,
+        .subpath_starts = run.subpath_starts,
     });
     const x0 = floorToCanvas(bounds.min_x - min_x, canvas_w);
     const x1 = ceilToCanvas(bounds.max_x - min_x, canvas_w);
@@ -764,10 +809,15 @@ fn drawPatternRun(
                 const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
                 if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
                 const target_hit = if (run.kind == .fill)
-                    switch (run.fill_rule) {
-                        .even_odd => pointInPolygonEvenOdd(world_x, world_y, run.points),
-                        .nonzero => pointInPolygonNonZero(world_x, world_y, run.points),
-                    }
+                    pointInShape(world_x, world_y, .{
+                        .kind = .fill,
+                        .color = .{ 0, 0, 0, 0 },
+                        .stroke_width = 0,
+                        .closed = true,
+                        .fill_rule = run.fill_rule,
+                        .points = run.points,
+                        .subpath_starts = run.subpath_starts,
+                    })
                 else blk: {
                     const tmp: reader.ShapeRun = .{
                         .kind = .stroke,
@@ -790,6 +840,7 @@ fn drawPatternRun(
                         .clip_points = run.clip_points,
                         .clip_fill_rule = run.clip_fill_rule,
                         .points = run.points,
+                        .subpath_starts = run.subpath_starts,
                     };
                     break :blk pointInStrokeShape(world_x, world_y, tmp);
                 };
@@ -823,10 +874,15 @@ fn drawPatternRun(
             const world_y = max_y - (@as(f64, @floatFromInt(py)) + 0.5);
             if (has_clip and !pointPassesClip(world_x, world_y, run.clip_box, run.clip_points, run.clip_fill_rule)) continue;
             const target_hit = if (run.kind == .fill)
-                switch (run.fill_rule) {
-                    .even_odd => pointInPolygonEvenOdd(world_x, world_y, run.points),
-                    .nonzero => pointInPolygonNonZero(world_x, world_y, run.points),
-                }
+                pointInShape(world_x, world_y, .{
+                    .kind = .fill,
+                    .color = .{ 0, 0, 0, 0 },
+                    .stroke_width = 0,
+                    .closed = true,
+                    .fill_rule = run.fill_rule,
+                    .points = run.points,
+                    .subpath_starts = run.subpath_starts,
+                })
             else blk: {
                 const tmp: reader.ShapeRun = .{
                     .kind = .stroke,
@@ -849,6 +905,7 @@ fn drawPatternRun(
                     .clip_points = run.clip_points,
                     .clip_fill_rule = run.clip_fill_rule,
                     .points = run.points,
+                    .subpath_starts = run.subpath_starts,
                 };
                 break :blk pointInStrokeShape(world_x, world_y, tmp);
             };
@@ -985,6 +1042,22 @@ fn shapeRunBounds(run: reader.ShapeRun) struct { min_x: f64, max_x: f64, min_y: 
 }
 
 fn pointInShape(x: f64, y: f64, run: reader.ShapeRun) bool {
+    if (run.subpath_starts) |starts| {
+        if (run.fill_rule == .even_odd) {
+            var inside = false;
+            for (starts, 0..) |start, i| {
+                const end = if (i + 1 < starts.len) starts[i + 1] else run.points.len;
+                if (end > start + 2 and pointInPolygonEvenOdd(x, y, run.points[start..end])) inside = !inside;
+            }
+            return inside;
+        }
+        var winding: i32 = 0;
+        for (starts, 0..) |start, i| {
+            const end = if (i + 1 < starts.len) starts[i + 1] else run.points.len;
+            if (end > start + 2) winding += polygonWindingNumber(x, y, run.points[start..end]);
+        }
+        return winding != 0;
+    }
     return switch (run.fill_rule) {
         .even_odd => pointInPolygonEvenOdd(x, y, run.points),
         .nonzero => pointInPolygonNonZero(x, y, run.points),
@@ -1005,6 +1078,10 @@ fn pointInPolygonEvenOdd(x: f64, y: f64, points: []const [2]f64) bool {
 }
 
 fn pointInPolygonNonZero(x: f64, y: f64, points: []const [2]f64) bool {
+    return polygonWindingNumber(x, y, points) != 0;
+}
+
+fn polygonWindingNumber(x: f64, y: f64, points: []const [2]f64) i32 {
     var winding: i32 = 0;
     var j = points.len - 1;
     for (points, 0..) |point, i| {
@@ -1016,7 +1093,7 @@ fn pointInPolygonNonZero(x: f64, y: f64, points: []const [2]f64) bool {
         }
         j = i;
     }
-    return winding != 0;
+    return winding;
 }
 
 fn isLeft(a: [2]f64, b: [2]f64, x: f64, y: f64) f64 {
@@ -1039,6 +1116,21 @@ fn polygonEdgeDistance(x: f64, y: f64, points: []const [2]f64, closed: bool) f64
 }
 
 fn pointInStrokeShape(x: f64, y: f64, run: reader.ShapeRun) bool {
+    if (run.subpath_starts) |starts| {
+        for (starts, 0..) |start, i| {
+            const end = if (i + 1 < starts.len) starts[i + 1] else run.points.len;
+            if (end <= start + 1) continue;
+            var subpath = run;
+            subpath.points = run.points[start..end];
+            subpath.subpath_starts = null;
+            if (pointInStrokeShapeSingle(x, y, subpath)) return true;
+        }
+        return false;
+    }
+    return pointInStrokeShapeSingle(x, y, run);
+}
+
+fn pointInStrokeShapeSingle(x: f64, y: f64, run: reader.ShapeRun) bool {
     const radius = run.stroke_width / 2.0;
     if (strokeContainsPoint(x, y, run, radius)) return true;
 
@@ -2660,4 +2752,22 @@ test "draw pattern run recolors uncolored cell content" {
     const green_px = ((2 * 4) + 1) * 4;
     try std.testing.expectEqual(@as(u8, 0x00), canvas[green_px + 0]);
     try std.testing.expect(canvas[green_px + 1] > 0x80);
+}
+
+test "nonzero glyph paths preserve counter contours" {
+    var points = [_][2]f64{
+        .{ 0, 0 }, .{ 10, 0 }, .{ 10, 10 }, .{ 0, 10 },
+        .{ 3, 3 }, .{ 3, 7 },  .{ 7, 7 },   .{ 7, 3 },
+    };
+    var starts = [_]usize{ 0, 4 };
+    const run: reader.ShapeRun = .{
+        .kind = .fill,
+        .color = .{ 0, 0, 0, 255 },
+        .stroke_width = 0,
+        .closed = true,
+        .points = &points,
+        .subpath_starts = &starts,
+    };
+    try std.testing.expect(pointInShape(1, 1, run));
+    try std.testing.expect(!pointInShape(5, 5, run));
 }
