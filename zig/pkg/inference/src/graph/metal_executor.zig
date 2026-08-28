@@ -15,6 +15,7 @@
 const build_options = @import("build_options");
 const std = @import("std");
 const platform = @import("antfly_platform");
+const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const backends = @import("../backends/backends.zig");
 const decoder_bitnet_runtime = @import("../backends/decoder_bitnet_runtime.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
@@ -849,6 +850,60 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     const gpt_stats = gpt_arch.getDebugTimingStats();
+    std.debug.print(
+        "gpt_timing_ms: attention={d} attn_norm={d} attn_qkv={d} attn_core={d} attn_rope={d} attn_gqa={d} attn_out_proj={d} ffn={d} moe_router_weight_fetch={d} moe_router_proj={d} moe_route_select={d} moe_router_download={d} moe_expert_scale_download={d} moe_expert_weight_fetch={d} moe_input_download={d} moe_prepare_layer={d} moe_append_route={d} moe_finalize_layer={d} moe_prefetch_hint={d}\n",
+        .{
+            @divTrunc(gpt_stats.attention_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_norm_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_qkv_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_core_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_rope_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_gqa_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.attention_out_proj_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.ffn_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_router_weight_fetch_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_router_proj_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_route_select_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_router_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_expert_scale_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_expert_weight_fetch_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_input_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_prepare_layer_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_append_route_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_finalize_layer_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_prefetch_hint_nanos, std.time.ns_per_ms),
+        },
+    );
+    std.debug.print(
+        "gpt_moe_timing_ms: grouped_attempts={d} grouped_successes={d} moe_grouped={d} moe_fallback={d} moe_grouped_input_copy={d} moe_grouped_input_upload={d} moe_grouped_ops={d} moe_grouped_sync_w1={d} moe_grouped_sync_w3={d} moe_grouped_sync_gate={d} moe_grouped_sync_w2={d} moe_grouped_sync_ops={d} moe_grouped_output_download={d} moe_grouped_scatter={d} moe_grouped_sync_scatter={d} moe_grouped_cleanup={d}\n",
+        .{
+            gpt_stats.moe_grouped_attempts,
+            gpt_stats.moe_grouped_successes,
+            @divTrunc(gpt_stats.moe_grouped_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_fallback_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_input_copy_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_input_upload_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_ops_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_w1_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_w3_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_gate_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_w2_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_ops_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_output_download_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_scatter_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_sync_scatter_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.moe_grouped_cleanup_nanos, std.time.ns_per_ms),
+        },
+    );
+    std.debug.print(
+        "gpt_overhead_ms: eval={d} eval_count={d} shared_expert_ffn={d} norm={d}\n",
+        .{
+            @divTrunc(gpt_stats.eval_nanos, std.time.ns_per_ms),
+            gpt_stats.eval_count,
+            @divTrunc(gpt_stats.shared_expert_ffn_nanos, std.time.ns_per_ms),
+            @divTrunc(gpt_stats.norm_nanos, std.time.ns_per_ms),
+        },
+    );
     std.debug.print(
         "gpt_block_counts: dense_attempts={d} dense_successes={d} gated_attempts={d} gated_successes={d} gated_input_attempts={d} gated_input_successes={d} gated_input_prefill={d} gated_input_decode={d} gated_qkv_attempts={d} gated_qkv_successes={d}\n",
         .{
@@ -1983,8 +2038,28 @@ fn envFlag(name: [:0]const u8) bool {
     return slice.len > 0 and !std.mem.eql(u8, slice, "0");
 }
 
-fn pipelinedDecodeFrameEnabled() bool {
-    return metal_runtime.pipelinedDecodeFrameEnabled();
+fn pipelinedDecodeFrameEnabledForFlags(
+    enable_requested: bool,
+    disable_requested: bool,
+    a4b_high_memory_requested: bool,
+    qualified_a4b: bool,
+    prepared_a4b: bool,
+) bool {
+    if (disable_requested) return false;
+    if (!qualified_a4b) return enable_requested;
+    return prepared_a4b and (enable_requested or a4b_high_memory_requested);
+}
+
+fn pipelinedDecodeFrameEnabled(gpt_config: gpt_mod.Config) bool {
+    const qualified_a4b = gemma4_runtime.isQualifiedA4bArchitecture(gpt_config);
+    if (!qualified_a4b) return metal_runtime.pipelinedDecodeFrameEnabled();
+    return pipelinedDecodeFrameEnabledForFlags(
+        platform.env.getenvBool("TERMITE_METAL_ENABLE_PIPELINED_DECODE_FRAME"),
+        platform.env.getenvBool("TERMITE_METAL_DISABLE_PIPELINED_DECODE_FRAME"),
+        a4b_feature_flags.highMemoryFastPathEnabled(),
+        qualified_a4b,
+        qualified_a4b and gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config),
+    );
 }
 
 fn decoderRuntimePrefillAfterPrepareRequested() bool {
@@ -2017,6 +2092,44 @@ fn prewarmEmbeddingWeight(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Con
     defer cb.free(embedded);
 }
 
+fn a4bMappedLayer0PrewarmEnabled(gpt_config: gpt_mod.Config) bool {
+    return gemma4_runtime.isQualifiedA4bArchitecture(gpt_config) and
+        gemma4_runtime.getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_MOE") and
+        gemma4_runtime.getenvBool("TERMITE_METAL_ENABLE_A4B_LAYER0_DEVICE_MAPPED_PREWARM");
+}
+
+fn prewarmA4bMappedLayer0(cb: *const ops.ComputeBackend, gpt_config: gpt_mod.Config) !void {
+    if (!a4bMappedLayer0PrewarmEnabled(gpt_config)) return;
+    const w1 = try gpt_arch.getModelWeight(
+        cb,
+        gpt_config,
+        "model.layers.0.block_sparse_moe.packed.w1.weight",
+    );
+    defer cb.free(w1);
+    const w3 = try gpt_arch.getModelWeight(
+        cb,
+        gpt_config,
+        "model.layers.0.block_sparse_moe.packed.w3.weight",
+    );
+    defer cb.free(w3);
+    const w2 = try gpt_arch.getModelWeight(
+        cb,
+        gpt_config,
+        "model.layers.0.block_sparse_moe.packed.w2.weight",
+    );
+    defer cb.free(w2);
+    const result = (try cb.prewarmA4bMappedLayer0(&.{
+        .layer_index = 0,
+        .w1 = w1,
+        .w3 = w3,
+        .w2 = w2,
+    })) orelse return error.A4bMetalMappedLayer0PrewarmUnavailable;
+    std.log.info(
+        "A4B Metal layer-0 mapped prewarm complete: logical_bytes={d} page_touches={d}",
+        .{ result.logical_bytes, result.page_touches },
+    );
+}
+
 pub fn prewarmSharedDecoderRuntime(
     allocator: std.mem.Allocator,
     session: backends.Session,
@@ -2028,6 +2141,18 @@ pub fn prewarmSharedDecoderRuntime(
     var cb = try session_factory.getComputeBackend(session, allocator);
     defer cb.deinit();
 
+    // A4B uses the graph fallback rather than the prepared dense-family
+    // decoder, so its bounded mapped-page warmup is the complete shared
+    // pre-publication prepare operation when explicitly enabled.
+    if (a4bMappedLayer0PrewarmEnabled(gpt_config)) {
+        try prewarmA4bMappedLayer0(&cb, gpt_config);
+        return true;
+    }
+    // Multi-row prefill and the prepared A4B decoder share the provider's
+    // fixed-capacity weight-slot directory. Install A4B only after canonical
+    // prefill has published its dynamic slots.
+    if (gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config)) return false;
+
     const configured_layer_count = gpt_config.num_hidden_layers;
     const prepare = try cb.decoderRuntimePrepareOrReuseFamily(
         allocator,
@@ -2037,6 +2162,7 @@ pub fn prewarmSharedDecoderRuntime(
     );
     if (prepare.prepared) {
         try prewarmEmbeddingWeight(&cb, gpt_config);
+        try prewarmA4bMappedLayer0(&cb, gpt_config);
     }
     return prepare.prepared;
 }
@@ -2098,11 +2224,23 @@ fn runtimePrepare(
     request: model_runtime.PrepareRequest,
 ) !bool {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
-    if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
-
     timing_stats.runtime_prepare_calls += 1;
     const started_at = monotonicNowNs();
     defer timing_stats.runtime_prepare_nanos += @intCast(monotonicNowNs() - started_at);
+
+    // Operational rollback must dominate every prepared-runtime branch,
+    // including A4B's mapped-layer warmup, because that warmup dispatches GPU
+    // work of its own.
+    if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
+
+    // Qualified A4B currently executes through the graph fallback, not the
+    // prepared dense-family decoder. Treat its explicitly requested bounded
+    // page warmup as a complete prepare operation before probing that family.
+    if (a4bMappedLayer0PrewarmEnabled(runtime_ctx.gpt_config)) {
+        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.gpt_config);
+        return true;
+    }
+    if (gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.gpt_config)) return false;
 
     const configured_layer_count = runtime_ctx.decoderRuntimeConfiguredLayerCount();
     const prepare_started_at = monotonicNowNs();
@@ -2121,6 +2259,7 @@ fn runtimePrepare(
     }
     if (prepare.prepared) {
         prewarmEmbeddingWeight(&runtime_ctx.cb, runtime_ctx.gpt_config) catch {};
+        try prewarmA4bMappedLayer0(&runtime_ctx.cb, runtime_ctx.gpt_config);
         _ = decoder_gated_runtime.preplanPrefillFrame(
             &runtime_ctx.cb,
             allocator,
@@ -2186,8 +2325,16 @@ fn runtimePrefill(
     const prepare_started_at = monotonicNowNs();
     const decode_context = try runtime_ctx.preparePrefill(request.seq_len, request.query_seq_len, request.attention_mode);
     timing_stats.prefill_prepare_nanos += @intCast(monotonicNowNs() - prepare_started_at);
+    // The qualified A4B fast path owns qLen=1 decode only. Let canonical
+    // prefill establish its dynamic packed-weight slots first, then install
+    // the fixed decode plan on the first generated token. Preparing in the
+    // opposite order leaves too little shared slot-directory capacity for
+    // the canonical multi-row MoE prefill.
+    const defer_a4b_decode_prepare = gemma4_runtime.supportsPreparedA4bRuntimeConfig(runtime_ctx.gpt_config);
     const decoder_runtime_ready = if (request.force_host_logits)
         false
+    else if (defer_a4b_decode_prepare)
+        runtime_ctx.decoderRuntimeExecutorEnabled()
     else if (decoderRuntimePrefillAfterPrepareRequested())
         runtime_ctx.decoderRuntimeExecutorEnabled() and (try runtime_ctx.ensureDecoderRuntimePrepared())
     else blk: {
@@ -2380,7 +2527,7 @@ fn runtimeDecodeGreedy(
 ) !model_runtime.GreedyDecodeOutput {
     const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
     timing_stats.decode_greedy_calls += 1;
-    if (pipelinedDecodeFrameEnabled()) {
+    if (pipelinedDecodeFrameEnabled(runtime_ctx.gpt_config)) {
         const pipelined_started_at = monotonicNowNs();
         if (try runtime_ctx.decodeGreedyPipelined(allocator, request)) |token_id| {
             timing_stats.decode_greedy_direct_nanos += @intCast(monotonicNowNs() - pipelined_started_at);
@@ -2576,4 +2723,14 @@ test "metal executor only enables split KV policy for mixed local and global Gem
 
 test "metal executor pipelined decode frames delegate to the shared policy" {
     try std.testing.expect(metal_runtime.pipelinedDecodeFrameEnabledForFlags(false, false, true));
+}
+
+test "metal executor keeps speculative decode frames opt in" {
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, false, true, true));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(true, false, false, false, false));
+    try std.testing.expect(pipelinedDecodeFrameEnabledForFlags(false, false, true, true, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, true, true, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, true, false, false));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true, true, true, true));
+    try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true, false, false, false));
 }

@@ -410,7 +410,14 @@ pub fn BoundStore(comptime BackendType: type) type {
             ctx: *anyopaque,
             callback: backend_erased.Store.ReplayCallback,
         ) !backend_types.ReplayLaneIterationStats {
-            var scan = try LocalCurrentScanTxn.open(self.backend, self.namespace);
+            // Replay is a sequential, one-shot scan. It must neither retain
+            // the scanned data blocks in the shared cache nor clone an entire
+            // bulk-ingest mutable generation merely to establish visibility.
+            // A replay boundary freezes the current generation instead; the
+            // upstream replay window owns the byte/dimension bound.
+            var namespace = self.namespace;
+            namespace.block_cache_admission = .transient;
+            var scan = try LocalCurrentScanTxn.openReplay(self.backend, namespace);
             defer scan.abort();
 
             var cursor = try scan.openCursor();
@@ -3154,7 +3161,17 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
         l0_groups: []RunGroup = &.{},
         levels: []RunLevel = &.{},
 
+        const Purpose = enum { general, replay };
+
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
+            return try openWithPurpose(backend, namespace, .general);
+        }
+
+        pub fn openReplay(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
+            return try openWithPurpose(backend, namespace, .replay);
+        }
+
+        fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
@@ -3169,7 +3186,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
             var bulk_current_scan_clone_denied = false;
-            if (@hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
+            if (purpose == .general and @hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
                 if (try backend.cloneCurrentScanMutableStateForBulkIngest()) |snapshot| {
                     const owned = try backend.allocator.create(State);
                     errdefer backend.allocator.destroy(owned);
@@ -3179,6 +3196,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 } else if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
                     bulk_current_scan_clone_denied = true;
                 }
+            } else if (purpose == .replay and @hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
+                bulk_current_scan_clone_denied = true;
             }
             errdefer {
                 if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {

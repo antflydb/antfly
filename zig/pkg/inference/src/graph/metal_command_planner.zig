@@ -109,6 +109,13 @@ pub const OpKind = enum(u16) {
     attention_flash,
     attention_paged,
     attention_quantized_kv,
+    a4b_ffn_prefix,
+    a4b_shared_gate_up,
+    a4b_router_select,
+    a4b_routed_gate_up,
+    a4b_shared_down,
+    a4b_routed_down,
+    a4b_post_join,
 };
 
 pub const Op = struct {
@@ -728,6 +735,233 @@ pub fn BoundedGraphCommandPlan(
         }
     };
 }
+
+/// A logical lane in a statically lowered command DAG. Lanes are descriptive:
+/// runtime scheduling can map them to command encoders once that integration is
+/// qualified without recovering fork/join structure from a linear op stream.
+pub const StaticDagLane = enum(u8) {
+    prefix,
+    shared,
+    routed,
+    post_join,
+};
+
+/// One read-after-write dependency, retaining the exact resource that caused
+/// the edge. Independent branch resources therefore do not create a global
+/// barrier merely because their ops are adjacent in the lowered order.
+pub const ResourceDependency = struct {
+    producer_op_index: usize,
+    consumer_op_index: usize,
+    resource: ResourceRange,
+};
+
+pub const StaticDagNode = struct {
+    kind: OpKind,
+    op_index: usize,
+    lane: StaticDagLane,
+    /// Earliest deterministic readiness wave. Nodes in the same wave have no
+    /// resource dependency on each other and are candidates for concurrency.
+    wave_index: usize,
+    dependency_start: usize,
+    dependency_count: usize,
+};
+
+pub const StaticDagPlanView = struct {
+    ops: []const Op,
+    nodes: []const StaticDagNode,
+    dependencies: []const ResourceDependency,
+    wave_count: usize,
+
+    pub fn dependenciesFor(self: StaticDagPlanView, node_index: usize) []const ResourceDependency {
+        const node = self.nodes[node_index];
+        return self.dependencies[node.dependency_start..][0..node.dependency_count];
+    }
+};
+
+/// Lowers an already topologically ordered op list into a deterministic static
+/// DAG. Each read is attached to the nearest preceding overlapping writer. The
+/// resulting resource edges are sufficient to preserve fork/join barriers while
+/// leaving independent resources unordered.
+pub fn lowerStaticDagInto(
+    ops: []const Op,
+    lanes: []const StaticDagLane,
+    nodes_buffer: []StaticDagNode,
+    dependencies_buffer: []ResourceDependency,
+) !StaticDagPlanView {
+    if (ops.len != lanes.len) return error.InvalidStaticDag;
+    if (ops.len > nodes_buffer.len) return error.OutOfMemory;
+
+    var dependency_count: usize = 0;
+    var wave_count: usize = 0;
+    for (ops, lanes, 0..) |op, lane, consumer_index| {
+        const dependency_start = dependency_count;
+        var wave_index: usize = 0;
+
+        for (op.resources) |resource_use| {
+            if (!resource_use.access.reads()) continue;
+
+            var preceding_index = consumer_index;
+            var producer_index: ?usize = null;
+            while (preceding_index > 0) {
+                preceding_index -= 1;
+                const preceding_op = ops[preceding_index];
+                var has_writer = false;
+                for (preceding_op.resources) |preceding_use| {
+                    if (!preceding_use.access.writes()) continue;
+                    if (!preceding_use.range.overlaps(resource_use.range)) continue;
+                    has_writer = true;
+                    break;
+                }
+                if (has_writer) {
+                    producer_index = preceding_index;
+                    break;
+                }
+            }
+
+            if (producer_index) |producer| {
+                if (dependency_count >= dependencies_buffer.len) return error.OutOfMemory;
+                dependencies_buffer[dependency_count] = .{
+                    .producer_op_index = producer,
+                    .consumer_op_index = consumer_index,
+                    .resource = resource_use.range,
+                };
+                dependency_count += 1;
+                wave_index = @max(wave_index, nodes_buffer[producer].wave_index + 1);
+            }
+        }
+
+        nodes_buffer[consumer_index] = .{
+            .kind = op.kind,
+            .op_index = consumer_index,
+            .lane = lane,
+            .wave_index = wave_index,
+            .dependency_start = dependency_start,
+            .dependency_count = dependency_count - dependency_start,
+        };
+        wave_count = @max(wave_count, wave_index + 1);
+    }
+
+    return .{
+        .ops = ops,
+        .nodes = nodes_buffer[0..ops.len],
+        .dependencies = dependencies_buffer[0..dependency_count],
+        .wave_count = wave_count,
+    };
+}
+
+/// Static Gemma 4 A4B decode-FFN fork/join description. It deliberately stops
+/// at planning: no Metal encoder or runtime policy consumes this view yet.
+pub const A4bForkJoinCommandLowerer = struct {
+    pub const Resource = enum(usize) {
+        input,
+        normalized,
+        route_plan,
+        shared_gated,
+        routed_gated,
+        shared_projected,
+        routed_projected,
+        output,
+    };
+
+    prefix_resources: [3]ResourceUse = undefined,
+    shared_gate_up_resources: [4]ResourceUse = undefined,
+    router_resources: [3]ResourceUse = undefined,
+    routed_gate_up_resources: [5]ResourceUse = undefined,
+    shared_down_resources: [3]ResourceUse = undefined,
+    routed_down_resources: [4]ResourceUse = undefined,
+    post_join_resources: [5]ResourceUse = undefined,
+    ops: [7]Op = undefined,
+    lanes: [7]StaticDagLane = .{
+        .prefix,
+        .shared,
+        .routed,
+        .routed,
+        .shared,
+        .routed,
+        .post_join,
+    },
+    nodes: [7]StaticDagNode = undefined,
+    dependencies: [9]ResourceDependency = undefined,
+    plan_view: StaticDagPlanView = .{
+        .ops = &.{},
+        .nodes = &.{},
+        .dependencies = &.{},
+        .wave_count = 0,
+    },
+
+    pub const BuildOptions = struct {
+        pre_norm_slot: usize,
+        shared_gate_slot: usize,
+        shared_up_slot: usize,
+        router_slot: usize,
+        routed_gate_slot: usize,
+        routed_up_slot: usize,
+        shared_down_slot: usize,
+        routed_down_slot: usize,
+        post_norm_slot: usize,
+        source: usize,
+        region: usize,
+    };
+
+    pub fn build(self: *A4bForkJoinCommandLowerer, options: BuildOptions) !void {
+        self.prefix_resources = .{
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.input)), .access = .read },
+            .{ .range = .whole(.norm_slot, options.pre_norm_slot), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .write },
+        };
+        self.shared_gate_up_resources = .{
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read },
+            .{ .range = .whole(.quant_slot, options.shared_gate_slot), .access = .read },
+            .{ .range = .whole(.quant_slot, options.shared_up_slot), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_gated)), .access = .write },
+        };
+        self.router_resources = .{
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read },
+            .{ .range = .whole(.quant_slot, options.router_slot), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.route_plan)), .access = .write },
+        };
+        self.routed_gate_up_resources = .{
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.route_plan)), .access = .read },
+            .{ .range = .whole(.quant_slot, options.routed_gate_slot), .access = .read },
+            .{ .range = .whole(.quant_slot, options.routed_up_slot), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_gated)), .access = .write },
+        };
+        self.shared_down_resources = .{
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_gated)), .access = .read },
+            .{ .range = .whole(.quant_slot, options.shared_down_slot), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_projected)), .access = .write },
+        };
+        self.routed_down_resources = .{
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_gated)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.route_plan)), .access = .read },
+            .{ .range = .whole(.quant_slot, options.routed_down_slot), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_projected)), .access = .write },
+        };
+        self.post_join_resources = .{
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_projected)), .access = .read },
+            .{ .range = .whole(.norm_slot, options.post_norm_slot), .access = .read },
+            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.output)), .access = .write },
+        };
+
+        self.ops = .{
+            .{ .kind = .a4b_ffn_prefix, .source = options.source, .region = options.region, .resources = &self.prefix_resources },
+            .{ .kind = .a4b_shared_gate_up, .source = options.source, .region = options.region, .resources = &self.shared_gate_up_resources },
+            .{ .kind = .a4b_router_select, .source = options.source, .region = options.region, .resources = &self.router_resources },
+            .{ .kind = .a4b_routed_gate_up, .source = options.source, .region = options.region, .resources = &self.routed_gate_up_resources },
+            .{ .kind = .a4b_shared_down, .source = options.source, .region = options.region, .resources = &self.shared_down_resources },
+            .{ .kind = .a4b_routed_down, .source = options.source, .region = options.region, .resources = &self.routed_down_resources },
+            .{ .kind = .a4b_post_join, .source = options.source, .region = options.region, .resources = &self.post_join_resources },
+        };
+        self.plan_view = try lowerStaticDagInto(&self.ops, &self.lanes, &self.nodes, &self.dependencies);
+    }
+
+    pub fn view(self: *const A4bForkJoinCommandLowerer) StaticDagPlanView {
+        return self.plan_view;
+    }
+};
 
 pub const AttentionSetupCommandLowerer = struct {
     const Resource = enum(usize) {
@@ -2139,6 +2373,117 @@ test "metal command planner bounded plan owns hot-path storage" {
     try std.testing.expectEqual(@as(usize, 1), plan.scopes.len);
     try std.testing.expectEqual(@as(usize, 1), plan.barrier_count);
     try std.testing.expectEqual(plan.planned_ops.ptr, bounded.view().planned_ops.ptr);
+}
+
+test "metal command planner lowers A4B static fork join deterministically" {
+    const options: A4bForkJoinCommandLowerer.BuildOptions = .{
+        .pre_norm_slot = 10,
+        .shared_gate_slot = 20,
+        .shared_up_slot = 21,
+        .router_slot = 22,
+        .routed_gate_slot = 23,
+        .routed_up_slot = 24,
+        .shared_down_slot = 25,
+        .routed_down_slot = 26,
+        .post_norm_slot = 11,
+        .source = 7,
+        .region = 9,
+    };
+    var first = A4bForkJoinCommandLowerer{};
+    var second = A4bForkJoinCommandLowerer{};
+    try first.build(options);
+    try second.build(options);
+
+    const plan = first.view();
+    const expected_kinds = [_]OpKind{
+        .a4b_ffn_prefix,
+        .a4b_shared_gate_up,
+        .a4b_router_select,
+        .a4b_routed_gate_up,
+        .a4b_shared_down,
+        .a4b_routed_down,
+        .a4b_post_join,
+    };
+    const expected_lanes = [_]StaticDagLane{
+        .prefix,
+        .shared,
+        .routed,
+        .routed,
+        .shared,
+        .routed,
+        .post_join,
+    };
+    const expected_waves = [_]usize{ 0, 1, 1, 2, 2, 3, 4 };
+    const expected_dependency_counts = [_]usize{ 0, 1, 1, 2, 1, 2, 2 };
+
+    try std.testing.expectEqual(@as(usize, 7), plan.ops.len);
+    try std.testing.expectEqual(@as(usize, 7), plan.nodes.len);
+    try std.testing.expectEqual(@as(usize, 9), plan.dependencies.len);
+    try std.testing.expectEqual(@as(usize, 5), plan.wave_count);
+    for (plan.nodes, 0..) |node, index| {
+        try std.testing.expectEqual(expected_kinds[index], node.kind);
+        try std.testing.expectEqual(expected_kinds[index], plan.ops[index].kind);
+        try std.testing.expectEqual(expected_lanes[index], node.lane);
+        try std.testing.expectEqual(expected_waves[index], node.wave_index);
+        try std.testing.expectEqual(expected_dependency_counts[index], node.dependency_count);
+        try std.testing.expectEqual(index, node.op_index);
+    }
+
+    const repeated = second.view();
+    try std.testing.expectEqualDeep(plan.nodes, repeated.nodes);
+    try std.testing.expectEqualDeep(plan.dependencies, repeated.dependencies);
+}
+
+test "metal command planner keeps A4B branch and join hazards resource specific" {
+    var lowerer = A4bForkJoinCommandLowerer{};
+    try lowerer.build(.{
+        .pre_norm_slot = 10,
+        .shared_gate_slot = 20,
+        .shared_up_slot = 21,
+        .router_slot = 22,
+        .routed_gate_slot = 23,
+        .routed_up_slot = 24,
+        .shared_down_slot = 25,
+        .routed_down_slot = 26,
+        .post_norm_slot = 11,
+        .source = 7,
+        .region = 9,
+    });
+    const plan = lowerer.view();
+
+    const expected_dependencies = [_]ResourceDependency{
+        .{ .producer_op_index = 0, .consumer_op_index = 1, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.normalized)) },
+        .{ .producer_op_index = 0, .consumer_op_index = 2, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.normalized)) },
+        .{ .producer_op_index = 0, .consumer_op_index = 3, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.normalized)) },
+        .{ .producer_op_index = 2, .consumer_op_index = 3, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.route_plan)) },
+        .{ .producer_op_index = 1, .consumer_op_index = 4, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.shared_gated)) },
+        .{ .producer_op_index = 3, .consumer_op_index = 5, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.routed_gated)) },
+        .{ .producer_op_index = 2, .consumer_op_index = 5, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.route_plan)) },
+        .{ .producer_op_index = 4, .consumer_op_index = 6, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.shared_projected)) },
+        .{ .producer_op_index = 5, .consumer_op_index = 6, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.routed_projected)) },
+    };
+    try std.testing.expectEqualDeep(&expected_dependencies, plan.dependencies);
+
+    const shared_gate_dependencies = plan.dependenciesFor(1);
+    try std.testing.expectEqual(@as(usize, 1), shared_gate_dependencies.len);
+    try std.testing.expectEqual(@as(usize, 0), shared_gate_dependencies[0].producer_op_index);
+    const router_dependencies = plan.dependenciesFor(2);
+    try std.testing.expectEqual(@as(usize, 1), router_dependencies.len);
+    try std.testing.expectEqual(@as(usize, 0), router_dependencies[0].producer_op_index);
+
+    // The shared and routed chains have no cross-branch data edge. Only the
+    // final post op joins their distinct projected scratch resources.
+    for (plan.dependencies) |dependency| {
+        const producer_lane = plan.nodes[dependency.producer_op_index].lane;
+        const consumer_lane = plan.nodes[dependency.consumer_op_index].lane;
+        try std.testing.expect(!(producer_lane == .shared and consumer_lane == .routed));
+        try std.testing.expect(!(producer_lane == .routed and consumer_lane == .shared));
+    }
+    const join_dependencies = plan.dependenciesFor(6);
+    try std.testing.expectEqual(@as(usize, 2), join_dependencies.len);
+    try std.testing.expectEqual(StaticDagLane.shared, plan.nodes[join_dependencies[0].producer_op_index].lane);
+    try std.testing.expectEqual(StaticDagLane.routed, plan.nodes[join_dependencies[1].producer_op_index].lane);
+    try std.testing.expect(!join_dependencies[0].resource.overlaps(join_dependencies[1].resource));
 }
 
 test "metal command planner handles row-1 attention setup dependency shape" {

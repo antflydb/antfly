@@ -107,6 +107,26 @@ pub const ScanResponse = struct {
     }
 };
 
+pub const ContentHashEntry = struct {
+    id: []u8,
+    hash: db_types.DocumentContentHash,
+
+    pub fn deinit(self: *ContentHashEntry, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        self.* = undefined;
+    }
+};
+
+pub const ContentHashScanResponse = struct {
+    entries: []ContentHashEntry,
+
+    pub fn deinit(self: *ContentHashScanResponse, alloc: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(alloc);
+        if (self.entries.len > 0) alloc.free(self.entries);
+        self.* = undefined;
+    }
+};
+
 pub const TextStatsResponse = struct {
     fields: []const distributed_stats_mod.TextFieldStats,
 
@@ -400,6 +420,61 @@ pub const TableReadSource = struct {
         consistency: read_gate.ReadConsistency,
     ) !?ScanResponse {
         return try BoundaryAbi.call("scan", self.boundary_dispatch, self.vtable.scan, .{ self.ptr, alloc, table_name, from_key, to_key, opts, consistency });
+    }
+
+    /// Return a compact ordered stream of document identities and canonical
+    /// content hashes. The internal wire representation remains an
+    /// implementation detail of the routing-aware scan source.
+    pub fn scanContentHashes(
+        self: TableReadSource,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        from_key: []const u8,
+        to_key: []const u8,
+        opts: db_types.ScanOptions,
+        consistency: read_gate.ReadConsistency,
+    ) !?ContentHashScanResponse {
+        var hash_opts = opts;
+        hash_opts.include_documents = false;
+        hash_opts.fields = &.{};
+        hash_opts.include_all_fields = false;
+        hash_opts.include_content_hashes = true;
+
+        var scanned = (try self.scan(alloc, table_name, from_key, to_key, hash_opts, consistency)) orelse return null;
+        defer scanned.deinit(alloc);
+
+        var entries = std.ArrayListUnmanaged(ContentHashEntry).empty;
+        errdefer {
+            for (entries.items) |*entry| entry.deinit(alloc);
+            entries.deinit(alloc);
+        }
+
+        var lines = std.mem.splitScalar(u8, scanned.ndjson, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch
+                return error.InvalidContentHashScanResponse;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidContentHashScanResponse;
+            const id_value = parsed.value.object.get("_id") orelse return error.InvalidContentHashScanResponse;
+            const hash_value = parsed.value.object.get("_content_hash") orelse return error.InvalidContentHashScanResponse;
+            if (id_value != .string or hash_value != .string) return error.InvalidContentHashScanResponse;
+            if (hash_value.string.len != @sizeOf(db_types.DocumentContentHash) * 2) return error.InvalidContentHashScanResponse;
+
+            var digest: db_types.DocumentContentHash = undefined;
+            _ = std.fmt.hexToBytes(&digest, hash_value.string) catch
+                return error.InvalidContentHashScanResponse;
+            if (entries.items.len > 0 and !std.mem.lessThan(u8, entries.items[entries.items.len - 1].id, id_value.string)) {
+                return error.InvalidContentHashScanResponse;
+            }
+            const owned_id = try alloc.dupe(u8, id_value.string);
+            errdefer alloc.free(owned_id);
+            try entries.append(alloc, .{
+                .id = owned_id,
+                .hash = digest,
+            });
+        }
+        return .{ .entries = try entries.toOwnedSlice(alloc) };
     }
 
     pub fn documentArtifactManifest(

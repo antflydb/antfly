@@ -22,12 +22,15 @@ class InferenceGenerateMessage:
     Attributes:
         role (InferenceRole): Role of the message sender in a generation/chat conversation
         content (None | str | Unset): The generated message content (null when tool_calls is present)
+        reasoning_content (None | str | Unset): Model reasoning emitted on a private reasoning channel, separate from
+            public content
         tool_calls (list[ToolCall] | Unset): Tool calls made by the model (only present when finish_reason is
             tool_calls)
     """
 
     role: InferenceRole
     content: None | str | Unset = UNSET
+    reasoning_content: None | str | Unset = UNSET
     tool_calls: list[ToolCall] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -39,6 +42,12 @@ class InferenceGenerateMessage:
             content = UNSET
         else:
             content = self.content
+
+        reasoning_content: None | str | Unset
+        if isinstance(self.reasoning_content, Unset):
+            reasoning_content = UNSET
+        else:
+            reasoning_content = self.reasoning_content
 
         tool_calls: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.tool_calls, Unset):
@@ -56,6 +65,8 @@ class InferenceGenerateMessage:
         )
         if content is not UNSET:
             field_dict["content"] = content
+        if reasoning_content is not UNSET:
+            field_dict["reasoning_content"] = reasoning_content
         if tool_calls is not UNSET:
             field_dict["tool_calls"] = tool_calls
 
@@ -77,6 +88,15 @@ class InferenceGenerateMessage:
 
         content = _parse_content(d.pop("content", UNSET))
 
+        def _parse_reasoning_content(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        reasoning_content = _parse_reasoning_content(d.pop("reasoning_content", UNSET))
+
         _tool_calls = d.pop("tool_calls", UNSET)
         tool_calls: list[ToolCall] | Unset = UNSET
         if _tool_calls is not UNSET:
@@ -89,6 +109,7 @@ class InferenceGenerateMessage:
         inference_generate_message = cls(
             role=role,
             content=content,
+            reasoning_content=reasoning_content,
             tool_calls=tool_calls,
         )
 

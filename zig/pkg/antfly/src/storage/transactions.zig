@@ -129,12 +129,27 @@ pub const TxnSummaryPage = struct {
 pub const ResolutionExtraBatch = struct {
     writes: []const docstore.KVPair = &.{},
     deletes: []const []const u8 = &.{},
+    /// Completion writes are safe and required even when the transaction
+    /// decision was already durable. Raft entry markers belong here; replay and
+    /// derived mutations remain in `writes` so terminal retries cannot reapply
+    /// them over newer document state.
+    completion_writes: []const docstore.KVPair = &.{},
+    completion_deletes: []const []const u8 = &.{},
+    resolved_participant: ?[]const u8 = null,
     replay: ?ReplayAppend = null,
     expected_intent_revision: ?u64 = null,
     /// Exact user keys captured from a validated intent snapshot. Ordinary
     /// commits can point-read these keys instead of prefix-scanning (and
     /// cloning) the whole mutable memtable. Recovery leaves this null.
     known_intent_keys: ?[]const []const u8 = null,
+};
+
+/// Additional primary-store mutations that must commit atomically with a
+/// transaction metadata transition. Raft apply uses this to fence the exact log
+/// entry without a crash window between the transaction and its replay marker.
+pub const MutationExtraBatch = struct {
+    writes: []const docstore.KVPair = &.{},
+    deletes: []const []const u8 = &.{},
 };
 
 pub const ResolutionOutcome = struct {
@@ -316,6 +331,27 @@ pub const TxnManager = struct {
         coordinator: bool,
         retain_terminal: bool,
     ) !void {
+        try self.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
+            txn_id,
+            timestamp,
+            created_at,
+            participants,
+            coordinator,
+            retain_terminal,
+            .{},
+        );
+    }
+
+    pub fn initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
+        self: *TxnManager,
+        txn_id: TxnId,
+        timestamp: u64,
+        created_at: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+        extra_batch: MutationExtraBatch,
+    ) !void {
         const key = makeRecordKey(txn_id);
         const existing = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
             TxnError.TxnNotFound => null,
@@ -337,7 +373,15 @@ pub const TxnManager = struct {
                 upgraded.coordinator_known = true;
                 upgraded.retain_terminal = retain_terminal;
                 upgraded.retain_terminal_known = true;
-                try self.saveTransactionRecord(key, upgraded);
+                const upgraded_value = try self.encodeRecord(upgraded);
+                defer self.alloc.free(upgraded_value);
+                var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+                defer writes.deinit(self.alloc);
+                try writes.append(self.alloc, .{ .key = &key, .value = upgraded_value });
+                try writes.appendSlice(self.alloc, extra_batch.writes);
+                try self.applyBatch(writes.items, extra_batch.deletes, null);
+            } else {
+                try self.applyMutationExtraBatch(extra_batch);
             }
             return;
         }
@@ -356,18 +400,22 @@ pub const TxnManager = struct {
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
         const participant_value = if (participants.len > 0) try encodeParticipantList(self.alloc, participants) else null;
         defer if (participant_value) |value| self.alloc.free(value);
-        var writes: [2]docstore.KVPair = undefined;
-        writes[0] = .{ .key = &key, .value = record_value };
-        var write_count: usize = 1;
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        try writes.append(self.alloc, .{ .key = &key, .value = record_value });
         if (participant_value) |value| {
-            writes[1] = .{ .key = &participant_key, .value = value };
-            write_count += 1;
+            try writes.append(self.alloc, .{ .key = &participant_key, .value = value });
         }
-        const deletes: []const []const u8 = if (participants.len > 0)
-            &.{&resolved_key}
-        else
-            &.{ &participant_key, &resolved_key };
-        try self.applyBatch(writes[0..write_count], deletes, null);
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        if (participants.len > 0) {
+            try deletes.append(self.alloc, &resolved_key);
+        } else {
+            try deletes.appendSlice(self.alloc, &.{ &participant_key, &resolved_key });
+        }
+        try deletes.appendSlice(self.alloc, extra_batch.deletes);
+        try self.applyBatch(writes.items, deletes.items, null);
         if (self.trace_writer) |tw| {
             tw.traceEvent(&.{
                 .name = "InitTransaction",
@@ -384,6 +432,16 @@ pub const TxnManager = struct {
         txn_id: TxnId,
         intents: []const WriteIntent,
         predicates: []const VersionPredicate,
+    ) !void {
+        try self.writeIntentsExtraBatch(txn_id, intents, predicates, .{});
+    }
+
+    pub fn writeIntentsExtraBatch(
+        self: *TxnManager,
+        txn_id: TxnId,
+        intents: []const WriteIntent,
+        predicates: []const VersionPredicate,
+        extra_batch: MutationExtraBatch,
     ) !void {
         var record = try self.loadTransactionRecord(txn_id);
         if (record.status != .pending) return TxnError.DecisionConflict;
@@ -483,7 +541,9 @@ pub const TxnManager = struct {
         try write_vals.append(self.alloc, intent_keys_value);
         try writes.append(self.alloc, .{ .key = &intent_keys_key, .value = intent_keys_value });
 
-        try self.applyBatch(writes.items, &.{}, null);
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+
+        try self.applyBatch(writes.items, extra_batch.deletes, null);
 
         self.traceWriteIntentSuccess(txn_id, intents, predicates);
     }
@@ -505,6 +565,39 @@ pub const TxnManager = struct {
     ) !ResolutionOutcome {
         const rec_key = makeRecordKey(txn_id);
         var record = try self.loadTransactionRecord(txn_id);
+        var resolved_participant_key: [resolved_participants_prefix.len + 16]u8 = undefined;
+        var resolved_participant_value: ?[]u8 = null;
+        defer if (resolved_participant_value) |value| self.alloc.free(value);
+        if (extra_batch.resolved_participant) |participant| {
+            const participants = try self.getParticipants(self.alloc, txn_id);
+            defer freeParticipantList(self.alloc, participants);
+            var enlisted = false;
+            for (participants) |existing| {
+                if (std.mem.eql(u8, existing, participant)) {
+                    enlisted = true;
+                    break;
+                }
+            }
+            if (!enlisted) return error.InvalidParticipant;
+
+            const resolved = try self.getResolvedParticipants(self.alloc, txn_id);
+            defer freeParticipantList(self.alloc, resolved);
+            var already_resolved = false;
+            for (resolved) |existing| {
+                if (std.mem.eql(u8, existing, participant)) {
+                    already_resolved = true;
+                    break;
+                }
+            }
+            if (!already_resolved) {
+                const next = try self.alloc.alloc([]const u8, resolved.len + 1);
+                defer self.alloc.free(next);
+                for (resolved, 0..) |existing, i| next[i] = existing;
+                next[resolved.len] = participant;
+                resolved_participant_key = makeSidecarKey(resolved_participants_prefix, txn_id);
+                resolved_participant_value = try encodeParticipantList(self.alloc, next);
+            }
+        }
         if (extra_batch.expected_intent_revision) |expected| {
             if (record.intent_revision != expected) return error.IntentSnapshotChanged;
         }
@@ -523,10 +616,21 @@ pub const TxnManager = struct {
             }
             return err;
         };
-        if (was_terminal and record.intents_resolved_known and record.intents_resolved) return .{
-            .applied = false,
-            .replay_sequence = record.replay_sequence,
-        };
+        if (was_terminal and record.intents_resolved_known and record.intents_resolved) {
+            var completion_writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+            defer completion_writes.deinit(self.alloc);
+            try completion_writes.appendSlice(self.alloc, extra_batch.completion_writes);
+            if (resolved_participant_value) |value| {
+                try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
+            }
+            if (completion_writes.items.len != 0 or extra_batch.completion_deletes.len != 0) {
+                try self.applyBatch(completion_writes.items, extra_batch.completion_deletes, null);
+            }
+            return .{
+                .applied = false,
+                .replay_sequence = record.replay_sequence,
+            };
+        }
 
         // Scan all intents for this txn
         var intent_prefix_buf: [intents_prefix.len + 17]u8 = undefined;
@@ -551,7 +655,18 @@ pub const TxnManager = struct {
             const marker_value = try self.encodeRecord(record);
             defer self.alloc.free(marker_value);
             const stale_manifest_key = makeSidecarKey(intent_keys_prefix, txn_id);
-            try self.applyBatch(&.{.{ .key = &rec_key, .value = marker_value }}, &.{&stale_manifest_key}, null);
+            var completion_writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+            defer completion_writes.deinit(self.alloc);
+            try completion_writes.append(self.alloc, .{ .key = &rec_key, .value = marker_value });
+            try completion_writes.appendSlice(self.alloc, extra_batch.completion_writes);
+            if (resolved_participant_value) |value| {
+                try completion_writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
+            }
+            var completion_deletes = std.ArrayListUnmanaged([]const u8).empty;
+            defer completion_deletes.deinit(self.alloc);
+            try completion_deletes.append(self.alloc, &stale_manifest_key);
+            try completion_deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
+            try self.applyBatch(completion_writes.items, completion_deletes.items, null);
             return .{
                 .applied = false,
                 .replay_sequence = record.replay_sequence,
@@ -620,7 +735,12 @@ pub const TxnManager = struct {
         defer self.alloc.free(rec_val);
         try writes.append(self.alloc, .{ .key = &rec_key, .value = rec_val });
         try writes.appendSlice(self.alloc, extra_batch.writes);
+        try writes.appendSlice(self.alloc, extra_batch.completion_writes);
+        if (resolved_participant_value) |value| {
+            try writes.append(self.alloc, .{ .key = &resolved_participant_key, .value = value });
+        }
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
+        try deletes.appendSlice(self.alloc, extra_batch.completion_deletes);
 
         try self.applyBatch(writes.items, deletes.items, extra_batch.replay);
 
@@ -801,6 +921,11 @@ pub const TxnManager = struct {
         return record.coordinator and record.retain_terminal and record.status == .committed;
     }
 
+    pub fn retainsCoordinatorAcknowledgement(self: *TxnManager, txn_id: TxnId) !bool {
+        const record = try self.loadTransactionRecord(txn_id);
+        return record.coordinator and record.retain_terminal;
+    }
+
     pub fn listTransactions(self: *TxnManager, alloc: Allocator) ![]TxnSummary {
         return (try self.listTransactionsPage(alloc, null, std.math.maxInt(usize))).items;
     }
@@ -903,6 +1028,15 @@ pub const TxnManager = struct {
     }
 
     pub fn markParticipantResolved(self: *TxnManager, txn_id: TxnId, participant: []const u8) !void {
+        try self.markParticipantResolvedExtraBatch(txn_id, participant, .{});
+    }
+
+    pub fn markParticipantResolvedExtraBatch(
+        self: *TxnManager,
+        txn_id: TxnId,
+        participant: []const u8,
+        extra_batch: MutationExtraBatch,
+    ) !void {
         // A replicated acknowledgement can be retried after the coordinator
         // has already cleaned the transaction. Do not recreate an orphaned
         // resolved-participants sidecar in that case, and reject corrupt
@@ -923,7 +1057,10 @@ pub const TxnManager = struct {
         defer freeParticipantList(self.alloc, resolved);
 
         for (resolved) |existing| {
-            if (std.mem.eql(u8, existing, participant)) return;
+            if (std.mem.eql(u8, existing, participant)) {
+                try self.applyMutationExtraBatch(extra_batch);
+                return;
+            }
         }
 
         var next = try self.alloc.alloc([]u8, resolved.len + 1);
@@ -939,7 +1076,14 @@ pub const TxnManager = struct {
         next[resolved.len] = try self.alloc.dupe(u8, participant);
         initialized += 1;
         defer freeParticipantList(self.alloc, next);
-        try self.saveOwnedParticipantSet(resolved_participants_prefix, txn_id, next);
+        const key = makeSidecarKey(resolved_participants_prefix, txn_id);
+        const encoded = try encodeParticipantList(self.alloc, next);
+        defer self.alloc.free(encoded);
+        var writes = std.ArrayListUnmanaged(docstore.KVPair).empty;
+        defer writes.deinit(self.alloc);
+        try writes.append(self.alloc, .{ .key = &key, .value = encoded });
+        try writes.appendSlice(self.alloc, extra_batch.writes);
+        try self.applyBatch(writes.items, extra_batch.deletes, null);
     }
 
     pub fn getParticipants(self: *TxnManager, alloc: Allocator, txn_id: TxnId) ![][]u8 {
@@ -1273,21 +1417,48 @@ pub const TxnManager = struct {
         cutoff_timestamp: u64,
         retained_cutoff_timestamp: u64,
     ) !bool {
+        return try self.cleanupTransactionMetadataIfEligibleExtraBatch(
+            txn_id,
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+            .{},
+        );
+    }
+
+    pub fn cleanupTransactionMetadataIfEligibleExtraBatch(
+        self: *TxnManager,
+        txn_id: TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+        extra_batch: MutationExtraBatch,
+    ) !bool {
         const record = self.loadTransactionRecord(txn_id) catch |err| switch (err) {
-            TxnError.TxnNotFound => return false,
+            TxnError.TxnNotFound => {
+                try self.applyMutationExtraBatch(extra_batch);
+                return false;
+            },
             else => return err,
         };
         const has_intents = if (record.intents_resolved_known and record.intents_resolved)
             false
         else
             try self.hasAnyIntents(txn_id);
-        if (record.status == .pending or has_intents or try self.hasHAOutbox(txn_id)) return false;
+        if (record.status == .pending or has_intents or try self.hasHAOutbox(txn_id)) {
+            try self.applyMutationExtraBatch(extra_batch);
+            return false;
+        }
         const cutoff = if (record.retain_terminal) retained_cutoff_timestamp else cutoff_timestamp;
-        if (record.finalized_at >= cutoff) return false;
+        if (record.finalized_at >= cutoff) {
+            try self.applyMutationExtraBatch(extra_batch);
+            return false;
+        }
         const unresolved = try self.getUnresolvedParticipants(self.alloc, txn_id);
         defer freeParticipantList(self.alloc, unresolved);
-        if (unresolved.len != 0) return false;
-        try self.deleteTransactionMetadata(txn_id);
+        if (unresolved.len != 0) {
+            try self.applyMutationExtraBatch(extra_batch);
+            return false;
+        }
+        try self.deleteTransactionMetadataExtraBatch(txn_id, extra_batch);
         return true;
     }
 
@@ -1406,13 +1577,25 @@ pub const TxnManager = struct {
     }
 
     fn deleteTransactionMetadata(self: *TxnManager, txn_id: TxnId) !void {
+        try self.deleteTransactionMetadataExtraBatch(txn_id, .{});
+    }
+
+    fn deleteTransactionMetadataExtraBatch(
+        self: *TxnManager,
+        txn_id: TxnId,
+        extra_batch: MutationExtraBatch,
+    ) !void {
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
         const ha_batch_key = makeTransactionHABatchOutboxKey(txn_id);
         const ha_replay_key = makeTransactionHAReplayOutboxKey(txn_id);
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
-        try self.applyBatch(&.{}, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key }, null);
+        var deletes = std.ArrayListUnmanaged([]const u8).empty;
+        defer deletes.deinit(self.alloc);
+        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key });
+        try deletes.appendSlice(self.alloc, extra_batch.deletes);
+        try self.applyBatch(extra_batch.writes, deletes.items, null);
     }
 
     fn saveParticipantSet(self: *TxnManager, comptime prefix: []const u8, txn_id: TxnId, participants: []const []const u8) !void {
@@ -1475,6 +1658,11 @@ pub const TxnManager = struct {
         errdefer txn.abort();
         try txn.put(key, value);
         try txn.commit();
+    }
+
+    fn applyMutationExtraBatch(self: *TxnManager, extra_batch: MutationExtraBatch) !void {
+        if (extra_batch.writes.len == 0 and extra_batch.deletes.len == 0) return;
+        try self.applyBatch(extra_batch.writes, extra_batch.deletes, null);
     }
 
     fn applyBatch(self: *TxnManager, writes: []const docstore.KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {

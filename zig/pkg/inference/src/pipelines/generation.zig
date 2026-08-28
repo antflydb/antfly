@@ -59,6 +59,28 @@ fn setWorkloadProfileRegime(cb: *const ComputeBackend, regime: ops.WorkloadRegim
     };
 }
 
+fn ordinaryMetalGemmaDraftNeedsContiguousState(
+    backend: ops.BackendKind,
+    config: gpt_mod.Config,
+    has_paged_kv_state: bool,
+) bool {
+    return backend == .metal and
+        config.family == .gemma and
+        !config.gemma4_mtp_assistant and
+        !has_paged_kv_state;
+}
+
+fn supportsSpeculativeTargetVerification(
+    backend: ops.BackendKind,
+    target_config: gpt_mod.Config,
+) bool {
+    // Qualified A4B Metal decode is qLen=1-only. Keep speculative decoding out
+    // of the request before either target or draft state is mutated; the
+    // reserve-time check remains as a fail-closed backstop.
+    return backend != .metal or
+        !gemma4_runtime.isQualifiedA4bArchitecture(target_config);
+}
+
 pub var gemma4_mtp_debug_override: bool = false;
 
 pub const Message = struct {
@@ -459,6 +481,7 @@ pub const ChatTemplate = struct {
 
 pub const GenerationResult = struct {
     text: []const u8,
+    reasoning_text: ?[]const u8 = null,
     token_ids: ?[]i32 = null,
     prompt_tokens: usize = 0,
     tokens_used: usize,
@@ -470,6 +493,7 @@ pub const GenerationResult = struct {
 
     pub fn deinit(self: *GenerationResult) void {
         self.allocator.free(self.text);
+        if (self.reasoning_text) |reasoning| self.allocator.free(reasoning);
         if (self.token_ids) |ids| self.allocator.free(ids);
     }
 };
@@ -682,6 +706,10 @@ fn promptOpensGemma4FinalChannel(prompt: []const u8) bool {
     );
 }
 
+fn configPromptOpensGemma4FinalChannel(config: gpt_mod.Config, prompt: []const u8) bool {
+    return config.usesGemma4Channels() and promptOpensGemma4FinalChannel(prompt);
+}
+
 /// Grammar-constrained generation must start in a public channel because the
 /// grammar applies to the first generated token. Leaving the normal private
 /// `thought` channel open would make the grammar reject the final-channel
@@ -868,6 +896,85 @@ fn finalResponseTokenSlice(
     // token is private regardless of whether generation ended by length,
     // EOS, cancellation, or a malformed protocol boundary.
     return token_ids[0..0];
+}
+
+/// Private thought-channel content, excluding protocol headers. This mirrors
+/// finalResponseTokenSlice so callers can expose reasoning separately without
+/// ever decoding channel-control tokens into public text.
+fn reasoningResponseTokenSlice(
+    token_ids: []const i64,
+    final_channel_required: bool,
+    final_channel_preopened: bool,
+    marker_id: ?i32,
+    final_header_token_ids: []const i32,
+    channel_start_id: ?i32,
+    turn_end_id: ?i32,
+) []const i64 {
+    if (!final_channel_required or final_channel_preopened) return token_ids[0..0];
+    const marker = marker_id orelse return token_ids[0..0];
+    const channel_start = channel_start_id orelse return token_ids[0..0];
+    const turn_end = turn_end_id orelse return token_ids[0..0];
+    if (final_header_token_ids.len == 0) return token_ids[0..0];
+
+    var reasoning_end = token_ids.len;
+    if (completeFinalChannelRange(
+        token_ids,
+        final_header_token_ids,
+        marker,
+        channel_start,
+        turn_end,
+    )) |range| {
+        reasoning_end = range.start - final_header_token_ids.len;
+    } else if (bareChannelCloseRange(
+        token_ids,
+        marker,
+        channel_start,
+        turn_end,
+    )) |range| {
+        reasoning_end = range.start - 1;
+    } else if (firstPublicChannelBoundary(
+        token_ids,
+        marker,
+        channel_start,
+        turn_end,
+    )) |boundary| {
+        reasoning_end = boundary;
+    }
+
+    // A model may explicitly open or reopen a private channel before
+    // transitioning to final. Keep only that channel's content, not its
+    // name/header tokens. A bare close or turn end is the first public
+    // boundary even if an explicit final header appears later: otherwise the
+    // marker and tentative public text would be decoded as reasoning.
+    var reasoning_start: usize = 0;
+    var idx: usize = 0;
+    while (idx < reasoning_end) {
+        if (token_ids[idx] == marker or token_ids[idx] == turn_end) {
+            reasoning_end = idx;
+            break;
+        }
+        if (token_ids[idx] != channel_start) {
+            idx += 1;
+            continue;
+        }
+        var close = idx + 1;
+        while (close < reasoning_end and token_ids[close] != marker) : (close += 1) {}
+        if (close >= reasoning_end) {
+            reasoning_end = idx;
+            break;
+        }
+        reasoning_start = close + 1;
+        idx = close + 1;
+    }
+    while (reasoning_end > reasoning_start and
+        (token_ids[reasoning_end - 1] == marker or
+            token_ids[reasoning_end - 1] == channel_start or
+            token_ids[reasoning_end - 1] == turn_end))
+    {
+        reasoning_end -= 1;
+    }
+    if (reasoning_end <= reasoning_start) return token_ids[0..0];
+    return token_ids[reasoning_start..reasoning_end];
 }
 
 fn generationResultTokenSlice(
@@ -2660,6 +2767,26 @@ const BorrowedDecodeStateRuntime = struct {
     }
 };
 
+fn reserveSpeculativeTargetVerification(
+    decode_runtime: *BorrowedDecodeStateRuntime,
+    backend: ops.BackendKind,
+    target_config: gpt_mod.Config,
+    query_len: usize,
+    draft_count: usize,
+) !void {
+    // The qualified resident A4B Metal runtime owns qLen=1 decode only. A
+    // speculative verification pass is genuinely multi-row; do not mutate KV
+    // state or disguise sequential decode as batched verification until the
+    // backend exposes a qualified multi-row verify operation.
+    if (backend == .metal and
+        query_len > 1 and
+        gemma4_runtime.isQualifiedA4bArchitecture(target_config))
+    {
+        return error.Gemma4A4bMetalSpeculativeVerificationNotQualified;
+    }
+    _ = try decode_runtime.appendGeneratedTokens(draft_count);
+}
+
 fn retryDirectPrefillAfterMemoryBudgetExceeded(
     decode_runtime: *BorrowedDecodeStateRuntime,
     reserved_tokens: usize,
@@ -3055,6 +3182,27 @@ pub const NativeGenerationPipeline = struct {
         return false;
     }
 
+    fn makeSpeculativeDraftPipeline(
+        self: *const NativeGenerationPipeline,
+        draft_cb: ComputeBackend,
+        draft_gpt_config: gpt_mod.Config,
+    ) NativeGenerationPipeline {
+        return .{
+            .allocator = self.allocator,
+            .cb = draft_cb,
+            .gpt_config = draft_gpt_config,
+            .tokenizer = self.tokenizer,
+            .artifact_dir = self.artifact_dir,
+            // Graph caches and compiled attachments are model-scoped. A draft
+            // model with different geometry must execute through its own
+            // backend rather than the target model's traced A4B graph.
+            .graph_cache = null,
+            .compiled_partition_backend = null,
+            .compiled_attachment_target = .partitioned,
+            .pjrt_client = null,
+        };
+    }
+
     const PendingDecodeBatchWork = struct {
         allocator: std.mem.Allocator,
         decode_state: *NativeDecodeState,
@@ -3102,8 +3250,7 @@ pub const NativeGenerationPipeline = struct {
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const grammar_opens_public_final_channel =
             config.grammar != null and
-            self.gpt_config.family == .gemma and
-            self.gpt_config.hasPle();
+            self.gpt_config.usesGemma4Channels();
         var fallback_decode_state = NativeDecodeState.initContiguous(allocator);
         defer fallback_decode_state.deinit();
         const decode_state = self.decode_state orelse &fallback_decode_state;
@@ -3139,9 +3286,7 @@ pub const NativeGenerationPipeline = struct {
             prompt_borrowed = false;
         }
         const prompt_opens_public_final_channel =
-            self.gpt_config.family == .gemma and
-            self.gpt_config.hasPle() and
-            promptOpensGemma4FinalChannel(prompt);
+            configPromptOpensGemma4FinalChannel(self.gpt_config, prompt);
         const formatted_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
 
         const has_images = messagesHaveImages(messages);
@@ -3185,10 +3330,13 @@ pub const NativeGenerationPipeline = struct {
             draft_is_gemma4_mtp and
             self.cb.kind() == .metal and
             !gemma4MtpMetalAutoEnabled();
+        const target_speculative_verification_unavailable =
+            !supportsSpeculativeTargetVerification(self.cb.kind(), self.gpt_config);
         const use_speculative = speculation_policy != .off and
             !mtp_auto_uncalibrated and
             !mtp_auto_too_short and
             !mtp_metal_auto_disabled and
+            !target_speculative_verification_unavailable and
             loaded_draft_requested and
             !disable_unshared_gemma4_mtp;
         if ((has_images or has_audio) and use_speculative) return error.MultimodalSpeculativeDecodingNotSupported;
@@ -3593,12 +3741,12 @@ pub const NativeGenerationPipeline = struct {
                 speculative_stats.mtp_disabled_reason = "mtp_auto_min_tokens";
             } else if (mtp_metal_auto_disabled) {
                 speculative_stats.mtp_disabled_reason = "metal_mtp_auto_disabled";
+            } else if (target_speculative_verification_unavailable) {
+                speculative_stats.mtp_disabled_reason = "a4b_metal_speculative_verify_unqualified";
             }
         }
         const stream_enabled = on_token_fn != null and on_token_ctx != null;
-        const final_channel_required =
-            self.gpt_config.family == .gemma and
-            self.gpt_config.hasPle();
+        const final_channel_required = self.gpt_config.usesGemma4Channels();
         // Resolve the channel protocol once for the whole request. Buffered and
         // streaming callers must use the same exact final-header projection;
         // resolving only the generic terminator at completion can expose a
@@ -3720,23 +3868,23 @@ pub const NativeGenerationPipeline = struct {
             // Create a temporary draft pipeline (borrows self's allocator/tokenizer)
             var draft_fallback_state = NativeDecodeState.initContiguous(allocator);
             defer draft_fallback_state.deinit();
-            const draft_ds = self.draft_decode_state orelse &draft_fallback_state;
+            const attached_draft_state = self.draft_decode_state;
+            const use_contiguous_draft_state = ordinaryMetalGemmaDraftNeedsContiguousState(
+                draft_cb.kind(),
+                draft_gpt_config,
+                if (attached_draft_state) |state| state.isPaged() else false,
+            );
+            const draft_ds = if (use_contiguous_draft_state)
+                &draft_fallback_state
+            else
+                attached_draft_state orelse &draft_fallback_state;
             var draft_runtime = BorrowedDecodeStateRuntime.init(draft_ds);
             var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
 
             // Prefill draft model with the same prompt
             try draft_runtime.notePrefill(seq_len);
 
-            var draft_pipeline = NativeGenerationPipeline{
-                .allocator = allocator,
-                .cb = draft_cb,
-                .gpt_config = draft_gpt_config,
-                .tokenizer = self.tokenizer,
-                .artifact_dir = self.artifact_dir,
-                .graph_cache = self.graph_cache,
-                .compiled_partition_backend = self.compiled_partition_backend,
-                .pjrt_client = self.pjrt_client,
-            };
+            var draft_pipeline = self.makeSpeculativeDraftPipeline(draft_cb, draft_gpt_config);
             var mtp_activation = Gemma4MtpActivationState{
                 .allocator = allocator,
                 .draft_cb = &draft_pipeline.cb,
@@ -4274,6 +4422,15 @@ pub const NativeGenerationPipeline = struct {
             turn_end_token_id,
         );
         const raw_gen_token_ids = token_ids[gen_start..seq_len];
+        const reasoning_gen_token_ids = reasoningResponseTokenSlice(
+            raw_gen_token_ids,
+            streaming_text.final_channel_required,
+            streaming_text.final_channel_preopened,
+            final_channel_end_token_id,
+            streaming_text.final_channel_header_token_ids,
+            streaming_text.channel_start_token_id,
+            turn_end_token_id,
+        );
         const result_gen_token_ids = generationResultTokenSlice(
             raw_gen_token_ids,
             projected_gen_token_ids,
@@ -4310,6 +4467,14 @@ pub const NativeGenerationPipeline = struct {
 
         const text_decode_started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         const text = try self.tokenizer.decode(allocator, text_gen_ids);
+        errdefer allocator.free(text);
+        const reasoning_text = if (reasoning_gen_token_ids.len > 0) blk: {
+            const reasoning_ids = try allocator.alloc(i32, reasoning_gen_token_ids.len);
+            defer allocator.free(reasoning_ids);
+            for (reasoning_gen_token_ids, 0..) |token_id, idx| reasoning_ids[idx] = @intCast(token_id);
+            break :blk try self.tokenizer.decode(allocator, reasoning_ids);
+        } else null;
+        errdefer if (reasoning_text) |reasoning| allocator.free(reasoning);
         if (stream_enabled) {
             _ = emitCompletedProjectionDelta(
                 &streaming_text,
@@ -4374,6 +4539,7 @@ pub const NativeGenerationPipeline = struct {
         }
         return .{
             .text = text,
+            .reasoning_text = reasoning_text,
             .token_ids = result_gen_ids,
             .prompt_tokens = prompt_token_count,
             .tokens_used = tokens_generated,
@@ -5207,7 +5373,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn resolveFinalChannelEndTokenId(self: *NativeGenerationPipeline) !?i32 {
-        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        if (!self.gpt_config.usesGemma4Channels()) return null;
         return resolveTokenId(self.tokenizer, self.allocator, "<channel|>");
     }
 
@@ -5232,7 +5398,7 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn resolveTurnEndTokenId(self: *NativeGenerationPipeline) !?i32 {
-        if (self.gpt_config.family != .gemma or !self.gpt_config.hasPle()) return null;
+        if (!self.gpt_config.usesGemma4Channels()) return null;
         return resolveTokenId(self.tokenizer, self.allocator, "<turn|>");
     }
 
@@ -7679,10 +7845,16 @@ pub const NativeGenerationPipeline = struct {
         const verify_len = draft_count + 1; // +1 so we get logits for the last draft token too
         const verify_seq = seq_len.* + draft_count;
 
-        // Temporarily extend the target KV cache for verification
-        _ = try decode_runtime.appendGeneratedTokens(draft_count);
-
         const target_query_len: usize = if (decode_runtime.kvView() != null) verify_len else verify_seq;
+        // Validate the real batched shape before extending target KV. The A4B
+        // prepared decoder is currently qLen=1-only and must fail closed here.
+        try reserveSpeculativeTargetVerification(
+            &decode_runtime,
+            self.cb.kind(),
+            self.gpt_config,
+            target_query_len,
+            draft_count,
+        );
         const target_ctx = decode_runtime.makeDecodeContext(verify_seq, target_query_len);
         // Input: the last token before drafts + all draft tokens
         const verify_start = if (target_query_len == verify_seq) 0 else verify_seq - target_query_len;
@@ -10653,6 +10825,13 @@ test "chat template enable_thinking false opens an explicit final channel" {
     try std.testing.expect(promptOpensGemma4FinalChannel(
         "<bos><|channel>final\n<channel|>\n",
     ));
+    try std.testing.expect(configPromptOpensGemma4FinalChannel(.{
+        .family = .gemma,
+        .gemma4_channel_protocol = true,
+    }, final_prompt));
+    try std.testing.expect(!configPromptOpensGemma4FinalChannel(.{
+        .family = .gemma,
+    }, final_prompt));
 }
 
 test "final channel projection requires exact header and stops before trailing channels" {
@@ -10764,6 +10943,55 @@ test "bare channel close projects public content when no final header exists" {
         i64,
         &.{},
         finalResponseTokenSlice(&.{ 102, 103, 7, 8 }, true, false, 101, &header, 102, 106),
+    );
+}
+
+test "reasoning channel projection separates private thought from public content" {
+    const header = [_]i32{ 102, 103, 104, 101 };
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8, 9 },
+        reasoningResponseTokenSlice(&.{ 7, 8, 9, 101, 20, 21, 106 }, true, false, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 7, 8, 102, 103, 104, 101, 20, 106 }, true, false, 101, &header, 102, 106),
+    );
+    // A late explicit final header must not retroactively classify the prior
+    // bare-close marker or tentative public text as private reasoning.
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 7, 8, 101, 20, 102, 103, 104, 101, 21, 106 }, true, false, 101, &header, 102, 106),
+    );
+    // The same malformed transition remains bounded when reasoning begins
+    // with an explicit private-channel header.
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 102, 103, 105, 101, 7, 8, 101, 20, 102, 103, 104, 101, 21, 106 }, true, false, 101, &header, 102, 106),
+    );
+    // An explicitly emitted private header is protocol, not reasoning text.
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 102, 103, 105, 101, 7, 8, 101, 20, 106 }, true, false, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{ 7, 8 },
+        reasoningResponseTokenSlice(&.{ 7, 8 }, true, false, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        reasoningResponseTokenSlice(&.{ 20, 21 }, true, true, 101, &header, 102, 106),
+    );
+    try std.testing.expectEqualSlices(
+        i64,
+        &.{},
+        reasoningResponseTokenSlice(&.{ 7, 8 }, false, false, null, &.{}, null, null),
     );
 }
 
@@ -12248,6 +12476,119 @@ test "native generation pipeline rejects speculative decoding when draft require
 
     pipeline.draft_gpt_config = null;
     try std.testing.expect(!pipeline.speculativeUsesDeepSeekV4CompressedCache());
+}
+
+test "speculative draft pipeline does not inherit target execution attachments" {
+    var target_graph_cache: graph_mod.cache.GraphCache = undefined;
+    var pjrt_sentinel: u8 = 0;
+    const draft_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2048,
+        .num_hidden_layers = 26,
+    };
+    const target = NativeGenerationPipeline{
+        .allocator = std.testing.allocator,
+        .cb = undefined,
+        .gpt_config = .{
+            .family = .gemma,
+            .hidden_size = 2816,
+            .num_hidden_layers = 30,
+        },
+        .tokenizer = undefined,
+        .graph_cache = &target_graph_cache,
+        .compiled_partition_backend = .metal,
+        .compiled_attachment_target = .whole_model,
+        .pjrt_client = @ptrCast(&pjrt_sentinel),
+    };
+
+    const draft = target.makeSpeculativeDraftPipeline(undefined, draft_config);
+    try std.testing.expectEqual(@as(u32, 2048), draft.gpt_config.hidden_size);
+    try std.testing.expect(draft.graph_cache == null);
+    try std.testing.expect(draft.compiled_partition_backend == null);
+    try std.testing.expectEqual(
+        graph_mod.compiled_backend.AttachmentTarget.partitioned,
+        draft.compiled_attachment_target,
+    );
+    try std.testing.expect(draft.pjrt_client == null);
+}
+
+test "speculative draft Metal Gemma uses contiguous state until KV storage is attached" {
+    var config = gpt_mod.Config{ .family = .gemma };
+    try std.testing.expect(ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, true));
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.cuda, config, false));
+
+    config.gemma4_mtp_assistant = true;
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
+    config = .{ .family = .llama };
+    try std.testing.expect(!ordinaryMetalGemmaDraftNeedsContiguousState(.metal, config, false));
+}
+
+test "qualified A4B Metal target disables speculative verification upfront" {
+    const a4b_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    try std.testing.expect(!supportsSpeculativeTargetVerification(.metal, a4b_config));
+    try std.testing.expect(supportsSpeculativeTargetVerification(.cuda, a4b_config));
+    try std.testing.expect(supportsSpeculativeTargetVerification(.metal, .{
+        .family = .gemma,
+        .hidden_size = 2048,
+        .num_hidden_layers = 26,
+    }));
+}
+
+test "contiguous speculative draft state keeps full-recompute query shape in sync" {
+    var state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer state.deinit();
+    var draft_runtime = BorrowedDecodeStateRuntime.init(&state);
+
+    try draft_runtime.notePrefill(2);
+    const prefill_ctx = draft_runtime.makeDecodeContext(2, 2);
+    try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.full_recompute, prefill_ctx.attention_mode);
+    try std.testing.expectEqual(@as(usize, 2), prefill_ctx.query_sequence_len);
+    try std.testing.expect(prefill_ctx.kv_cache == null);
+
+    _ = try draft_runtime.appendGeneratedToken();
+    const next_ctx = draft_runtime.makeDecodeContext(3, 3);
+    try std.testing.expectEqual(gpt_arch.DecodeContext.AttentionMode.full_recompute, next_ctx.attention_mode);
+    try std.testing.expectEqual(@as(usize, 3), next_ctx.query_sequence_len);
+    try std.testing.expectEqual(@as(usize, 3), state.total_tokens);
+}
+
+test "speculative draft A4B multi-row verification fails before target state mutation" {
+    const a4b_config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    try std.testing.expect(gemma4_runtime.isQualifiedA4bArchitecture(a4b_config));
+
+    var blocked_state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer blocked_state.deinit();
+    try blocked_state.notePrefill(2);
+    var blocked_runtime = BorrowedDecodeStateRuntime.init(&blocked_state);
+    try std.testing.expectError(
+        error.Gemma4A4bMetalSpeculativeVerificationNotQualified,
+        reserveSpeculativeTargetVerification(&blocked_runtime, .metal, a4b_config, 5, 4),
+    );
+    try std.testing.expectEqual(@as(usize, 2), blocked_state.total_tokens);
+
+    var allowed_state = NativeDecodeState.initContiguous(std.testing.allocator);
+    defer allowed_state.deinit();
+    try allowed_state.notePrefill(2);
+    var allowed_runtime = BorrowedDecodeStateRuntime.init(&allowed_state);
+    try reserveSpeculativeTargetVerification(&allowed_runtime, .cuda, a4b_config, 5, 4);
+    try std.testing.expectEqual(@as(usize, 6), allowed_state.total_tokens);
 }
 
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

@@ -14,7 +14,7 @@
 
 """GLiNER2 LoRA fine-tuning Python/Zig parity gate.
 
-Shells out to scripts/compare_gliner2_lora_python_zig.py with --strict on the
+Shells out to scripts/gliner2/compare_gliner2_lora_python_zig.py with --strict on the
 small NER smoke fixture. The compare harness trains the same model with the
 same seed/data/LoRA-init on both the upstream Python GLiNER2 trainer and the
 Zig train-gliner2-autodiff CLI, then asserts per-component and per-step loss

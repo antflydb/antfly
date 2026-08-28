@@ -45,6 +45,8 @@ const RunConfig = struct {
         backend: ?[]const u8 = null,
         format: ?[]const u8 = null,
         quantization: ?[]const u8 = null,
+        residency_mode: ?inference.ops.A4bResidencyMode = null,
+        memory_budget_mb: ?u32 = null,
     };
 
     const PromptCacheConfig = struct {
@@ -186,6 +188,8 @@ fn parsePreloadModelFlag(value: []const u8) !inference.server.WarmModel {
         .backend = backend,
         .format = null,
         .quantization = null,
+        .residency_mode = null,
+        .memory_budget_mb = null,
     };
 }
 
@@ -243,6 +247,8 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .backend = try parseOptionalBackendType(value.backend),
             .format = value.format,
             .quantization = value.quantization,
+            .residency_mode = value.residency_mode,
+            .memory_budget_mb = value.memory_budget_mb,
         };
     }
     return out;

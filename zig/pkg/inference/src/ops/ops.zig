@@ -80,6 +80,26 @@ pub const LinearNoBiasTripleResult = struct {
     third: CT,
 };
 
+pub const RmsNormTripleResult = struct {
+    first: CT,
+    second: CT,
+    third: CT,
+};
+
+/// Gemma 4's parallel FFN epilogue normalizes the shared and routed branches,
+/// adds them, normalizes the sum, then adds the attention residual. Backends
+/// may execute the full chain without materializing its four intermediates.
+pub const ParallelFfnPostResidualRequest = struct {
+    shared: CT,
+    shared_weight: CT,
+    routed: CT,
+    routed_weight: CT,
+    combined_weight: CT,
+    residual: CT,
+    dim: usize,
+    eps: f32,
+};
+
 pub const DotGeneral2DManyRequest = struct {
     allocator: std.mem.Allocator,
     lhs: []const CT,
@@ -455,6 +475,7 @@ pub const DebertaEmbeddingsRequest = struct {
 /// Fused MoE forward: route selection + expert compute + scatter-add,
 /// entirely on GPU with no CPU round-trips for routing.
 pub const MoeForwardFusedRequest = struct {
+    layer_index: usize,
     input: CT, // [total, hidden_size]
     router_logits: CT, // [total, num_experts]
     w1: CT, // gate weight (packed experts)
@@ -466,9 +487,31 @@ pub const MoeForwardFusedRequest = struct {
     inter_size: usize,
     num_experts: usize,
     top_k: usize,
+    router_logit_scale: f32 = 1.0,
+    activation: DecoderRuntimeActivationKind,
 };
 
 pub const RunMoeBlockRequest = MoeForwardFusedRequest;
+
+/// Prepare the page-backed packed projections consumed by the qualified A4B
+/// layer-0 device-mapped MoE path. The backend must keep this bounded to the
+/// three supplied projection spans and complete the touch before returning.
+pub const A4bMappedLayer0PrewarmRequest = struct {
+    layer_index: usize,
+    w1: CT,
+    w3: CT,
+    w2: CT,
+};
+
+pub const A4bMappedLayer0PrewarmResult = struct {
+    logical_bytes: u64,
+    page_touches: u64,
+};
+
+pub const A4bResidencyMode = backend_contracts.A4bResidencyMode;
+pub const A4bInferenceRequest = backend_contracts.A4bInferenceRequest;
+pub const A4bExpertGeometry = backend_contracts.A4bExpertGeometry;
+pub const A4bInferenceConfig = backend_contracts.A4bInferenceConfig;
 
 pub const DecoderRuntimeGreedyRequest = backend_contracts.DecoderRuntimeGreedyRequest;
 pub const DecoderRuntimePrepareAbsoluteEmbeddingsRequest = backend_contracts.DecoderRuntimePrepareAbsoluteEmbeddingsRequest;
@@ -507,6 +550,7 @@ pub const DecoderRuntimeApplyMultiplyAddRequest = backend_contracts.DecoderRunti
 pub const DecoderRuntimeApplyMultiplyAdd2Request = backend_contracts.DecoderRuntimeApplyMultiplyAdd2Request;
 pub const RunDenseFfnResidualRequest = backend_contracts.RunDenseFfnResidualRequest;
 pub const RunGatedFfnResidualRequest = backend_contracts.RunGatedFfnResidualRequest;
+pub const GatedFfnNoBiasRequest = backend_contracts.GatedFfnNoBiasRequest;
 pub const RunAttentionRequest = backend_contracts.RunAttentionRequest;
 pub const DeepSeekV4CompressedAttentionPath = backend_contracts.DeepSeekV4CompressedAttentionPath;
 pub const DeepSeekV4CompressedComponentRequest = backend_contracts.DeepSeekV4CompressedComponentRequest;
@@ -562,10 +606,113 @@ pub const DecoderRuntimeFrameRegime = enum(u8) {
     decode = 2,
 };
 
+/// Semantic region for operations encoded into a backend-owned decoder frame.
+/// Backends may use this for profiling and workload-specific kernel policy; it
+/// must not change results or require callers to know backend implementation
+/// details.
+pub const DecoderRuntimeComputeRegion = enum(u8) {
+    attention = 0,
+    attention_project = 1,
+    ffn_norm = 2,
+    ffn = 3,
+    ple = 4,
+    tail = 5,
+    embedding = 6,
+    layer = 7,
+    other = 8,
+};
+
+pub const DecoderRuntimeComputeRegionScope = struct {
+    backend: ?*const ComputeBackend = null,
+    previous: usize = @intFromEnum(DecoderRuntimeComputeRegion.other),
+    active: bool = false,
+
+    pub fn deinit(self: *DecoderRuntimeComputeRegionScope) void {
+        if (!self.active) return;
+        self.active = false;
+        const backend = self.backend orelse return;
+        backend.decoderRuntimePopComputeRegion(self.previous) catch {};
+    }
+};
+
+/// Candidate bounded expert-arena capacities evaluated by the Metal route
+/// shadow. These counters are diagnostic only: the authoritative route and
+/// weight path are unchanged.
+pub const a4b_projected_slot_capacities = [_]u8{ 8, 12, 16, 24 };
+
 pub const NativeQuantTimingStats = struct {
     calls: u64 = 0,
     pair_calls: u64 = 0,
     grouped_calls: u64 = 0,
+    a4b_moe_route_select_attempts: u64 = 0,
+    a4b_moe_route_select_successes: u64 = 0,
+    a4b_moe_route_select_fallbacks: u64 = 0,
+    a4b_moe_slot_lookup_attempts: u64 = 0,
+    a4b_moe_slot_route_hits: u64 = 0,
+    a4b_moe_slot_route_misses: u64 = 0,
+    a4b_moe_slot_all_hit_layers: u64 = 0,
+    a4b_moe_slot_map_publications: u64 = 0,
+    a4b_moe_slot_map_publish_failures: u64 = 0,
+    a4b_moe_slot_arena_attempts: u64 = 0,
+    a4b_moe_slot_arena_successes: u64 = 0,
+    a4b_moe_slot_arena_failures: u64 = 0,
+    a4b_moe_selected_page_attempts: u64 = 0,
+    a4b_moe_selected_page_successes: u64 = 0,
+    a4b_moe_selected_page_failures: u64 = 0,
+    a4b_moe_selected_page_logical_bytes: u64 = 0,
+    a4b_moe_selected_page_mapped_bytes: u64 = 0,
+    a4b_moe_selected_page_allocations: u64 = 0,
+    a4b_moe_mapped_layer0_attempts: u64 = 0,
+    a4b_moe_mapped_layer0_successes: u64 = 0,
+    a4b_moe_mapped_layer0_failures: u64 = 0,
+    a4b_moe_resident_mapped_attempts: u64 = 0,
+    a4b_moe_resident_mapped_successes: u64 = 0,
+    a4b_moe_resident_mapped_failures: u64 = 0,
+    a4b_moe_resident_fused_gate_up_attempts: u64 = 0,
+    a4b_moe_resident_fused_gate_up_successes: u64 = 0,
+    a4b_moe_resident_fused_gate_up_failures: u64 = 0,
+    a4b_moe_resident_split_gate_up_attempts: u64 = 0,
+    a4b_moe_resident_split_gate_up_successes: u64 = 0,
+    a4b_moe_resident_split_gate_up_failures: u64 = 0,
+    a4b_moe_mapped_layer0_selected_prefetch_attempts: u64 = 0,
+    a4b_moe_mapped_layer0_selected_prefetch_successes: u64 = 0,
+    a4b_moe_mapped_layer0_selected_prefetch_failures: u64 = 0,
+    a4b_moe_mapped_layer0_selected_prefetch_logical_bytes: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_attempts: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_successes: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_failures: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_logical_bytes: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_page_touches: u64 = 0,
+    a4b_moe_mapped_layer0_prewarm_nanos: u64 = 0,
+    a4b_moe_checkpoint_attempts: u64 = 0,
+    a4b_moe_checkpoint_all_hit_tokens: u64 = 0,
+    a4b_moe_checkpoint_miss_tokens: u64 = 0,
+    a4b_moe_checkpoint_replays: u64 = 0,
+    a4b_moe_slot_upload_batches: u64 = 0,
+    a4b_moe_slot_uploads: u64 = 0,
+    a4b_moe_slot_upload_bytes: u64 = 0,
+    a4b_moe_projected_enabled: u64 = 0,
+    a4b_moe_projected_layer_attempts: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_route_hits: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_route_misses: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_all_hit_layers: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_token_attempts: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_moe_projected_all_hit_tokens: [a4b_projected_slot_capacities.len]u64 =
+        [_]u64{0} ** a4b_projected_slot_capacities.len,
+    a4b_packed_q4_0_linear_attempts: u64 = 0,
+    a4b_packed_q4_0_linear_successes: u64 = 0,
+    a4b_packed_q4_0_linear_fallbacks: u64 = 0,
+    a4b_packed_q4_0_pair_attempts: u64 = 0,
+    a4b_packed_q4_0_pair_successes: u64 = 0,
+    a4b_packed_q4_0_pair_fallbacks: u64 = 0,
+    a4b_moe_scatter_attempts: u64 = 0,
+    a4b_moe_scatter_successes: u64 = 0,
+    a4b_moe_scatter_fallbacks: u64 = 0,
     grouped_q5_k_calls: u64 = 0,
     grouped_q6_k_calls: u64 = 0,
     grouped_q5_k_expand_calls: u64 = 0,
@@ -640,6 +787,20 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_dense_linear_f16_slots: u64 = 0,
     metal_runtime_dense_qkv_packed_bytes: u64 = 0,
     metal_runtime_quant_linear_bytes: u64 = 0,
+    metal_runtime_mapped_moe_split_gate_up_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_fused_gate_up_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_down_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_reduce_dispatches: u64 = 0,
+    metal_runtime_mapped_moe_broadcast_dispatches: u64 = 0,
+    metal_runtime_mapped_model_prepare_attempts: u64 = 0,
+    metal_runtime_mapped_model_prepare_successes: u64 = 0,
+    metal_runtime_mapped_model_prepare_failures: u64 = 0,
+    metal_runtime_mapped_model_logical_bytes: u64 = 0,
+    metal_runtime_mapped_model_allocated_bytes: u64 = 0,
+    metal_runtime_mapped_moe_residency_allocation_count: u64 = 0,
+    metal_runtime_mapped_moe_residency_allocated_bytes: u64 = 0,
+    metal_runtime_mapped_moe_residency_commit_count: u64 = 0,
+    metal_runtime_mapped_moe_residency_request_count: u64 = 0,
     metal_runtime_scratch_bytes: u64 = 0,
     metal_runtime_scratch_pool_bytes: u64 = 0,
     metal_runtime_scratch_pool_slots: u64 = 0,
@@ -1439,6 +1600,14 @@ pub const ComputeBackend = struct {
         /// Backends may fuse Gemma/Qwen Q/K head norm immediately followed by RoPE.
         rmsNormHeadsRope: ?*const fn (ctx: *anyopaque, input: CT, weight: CT, rows: usize, total_dim: usize, head_dim: usize, rope_dim: usize, eps: f32, theta: f32, freq_scale: f32, position_offset: usize, seq_len: usize, consecutive_pairs: bool, scale: f32) anyerror!?CT = null,
 
+        /// Applies three RMSNorm weights to the same input. Backends may share
+        /// the denominator reduction used by parallel FFN/router branches.
+        rmsNormTriple: ?*const fn (ctx: *anyopaque, input: CT, first_weight: CT, second_weight: CT, third_weight: CT, dim: usize, eps: f32) anyerror!?RmsNormTripleResult = null,
+
+        /// Fuses the parallel-FFN post norms, branch add, final RMSNorm, and
+        /// residual add used by Gemma 4 A4B decode.
+        parallelFfnPostResidual: ?*const fn (ctx: *anyopaque, request: *const ParallelFfnPostResidualRequest) anyerror!?CT = null,
+
         /// Y = layer_norm(A + B). Backends may fuse residual add and layer norm;
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
@@ -1605,7 +1774,7 @@ pub const ComputeBackend = struct {
 
         /// Select top-k expert ids and normalized routing weights from router
         /// logits. Returns flat row-major arrays of length rows * top_k.
-        moeSelectRoutes: ?*const fn (ctx: *anyopaque, logits: CT, rows: usize, num_experts: usize, top_k: usize, allocator: std.mem.Allocator) anyerror!?MoeRouteSelection = null,
+        moeSelectRoutes: ?*const fn (ctx: *anyopaque, layer_index: usize, logits: CT, rows: usize, num_experts: usize, top_k: usize, logit_scale: f32, allocator: std.mem.Allocator) anyerror!?MoeRouteSelection = null,
 
         /// Fused MoE forward: route selection + expert compute + scatter-add,
         /// entirely on GPU with no CPU round-trips for routing. Backends that
@@ -1617,6 +1786,14 @@ pub const ComputeBackend = struct {
         /// the dense/gated decoder-block contracts and should only exist where
         /// routed-expert execution is structurally distinct.
         runMoeBlock: ?*const fn (ctx: *anyopaque, request: *const RunMoeBlockRequest) anyerror!?CT = null,
+
+        /// Synchronously make the qualified layer-0 mapped expert projections
+        /// GPU-visible during model preparation. Backends return null when the
+        /// path is disabled or unsupported.
+        prewarmA4bMappedLayer0: ?*const fn (
+            ctx: *anyopaque,
+            request: *const A4bMappedLayer0PrewarmRequest,
+        ) anyerror!?A4bMappedLayer0PrewarmResult = null,
 
         /// Store a per-expert output scale tensor for the current MoE layer.
         /// The graph backend threads this into fused_moe_scatter_add so the
@@ -2083,8 +2260,25 @@ pub const ComputeBackend = struct {
         /// This must not alter dispatch or command-buffer topology.
         decoderRuntimeSetActiveFrameRegime: ?*const fn (ctx: *anyopaque, regime: DecoderRuntimeFrameRegime) anyerror!void = null,
 
+        /// Push/pop a semantic region for work encoded into an active decoder
+        /// frame. The returned token restores the prior nested region.
+        decoderRuntimePushComputeRegion: ?*const fn (ctx: *anyopaque, region: DecoderRuntimeComputeRegion) anyerror!?usize = null,
+        decoderRuntimePopComputeRegion: ?*const fn (ctx: *anyopaque, previous: usize) anyerror!void = null,
+
         /// Return true when a backend-owned decoder frame is already active.
         decoderRuntimeHasActiveFrame: ?*const fn (ctx: *anyopaque) bool = null,
+
+        /// Arm a per-layer MoE miss ledger for an optimistic decode frame.
+        /// Returns false before encoding when the arena is not fully warm.
+        decoderRuntimeBeginMoeCheckpoint: ?*const fn (ctx: *anyopaque, layer_count: usize, top_k: usize) anyerror!bool = null,
+
+        /// Inspect the armed ledger after the frame's terminal wait. Returns
+        /// true when the token must be replayed through synchronized repair.
+        decoderRuntimeFinishMoeCheckpoint: ?*const fn (ctx: *anyopaque) anyerror!bool = null,
+
+        /// Force the bounded replay through the synchronized route/repair
+        /// path. Backends without optimistic MoE routing ignore this.
+        decoderRuntimeSetMoeReplayMode: ?*const fn (ctx: *anyopaque, enabled: bool) anyerror!void = null,
 
         /// Submit and wait for the active backend-owned decoder frame.
         decoderRuntimeSubmitAndWaitFrame: ?*const fn (ctx: *anyopaque) anyerror!void = null,
@@ -2284,6 +2478,10 @@ pub const ComputeBackend = struct {
         /// owned whole-token submission and return the post-residual
         /// [1, hidden_size] tensor.
         runGatedFfnResidual: ?*const fn (ctx: *anyopaque, request: *const RunGatedFfnResidualRequest) anyerror!?CT = null,
+
+        /// Apply a gated FFN strip without a residual epilogue. Backends may
+        /// fuse gate/up projection, activation/multiply, and down projection.
+        gatedFfnNoBias: ?*const fn (ctx: *anyopaque, request: *const GatedFfnNoBiasRequest) anyerror!?CT = null,
 
         /// Execute a qLen=1 decoder attention step for the backend-owned
         /// path. Backends may return null to fall back to the ordinary
@@ -3086,14 +3284,16 @@ pub const ComputeBackend = struct {
 
     pub fn moeSelectRoutes(
         self: *const ComputeBackend,
+        layer_index: usize,
         logits: CT,
         rows: usize,
         num_experts: usize,
         top_k: usize,
+        logit_scale: f32,
         allocator: std.mem.Allocator,
     ) !?MoeRouteSelection {
         if (self.vtable.moeSelectRoutes) |moe_select_routes| {
-            return moe_select_routes(self.ptr, logits, rows, num_experts, top_k, allocator);
+            return moe_select_routes(self.ptr, layer_index, logits, rows, num_experts, top_k, logit_scale, allocator);
         }
         return null;
     }
@@ -3134,6 +3334,18 @@ pub const ComputeBackend = struct {
 
     pub fn rmsNormConsumeInput(self: *const ComputeBackend, input: CT, weight: CT, dim: usize, eps: f32) !?CT {
         if (self.vtable.rmsNormConsumeInput) |f| return f(self.ptr, input, weight, dim, eps);
+        return null;
+    }
+
+    pub fn rmsNormTriple(self: *const ComputeBackend, input: CT, first_weight: CT, second_weight: CT, third_weight: CT, dim: usize, eps: f32) !?RmsNormTripleResult {
+        if (self.vtable.rmsNormTriple) |f| {
+            return f(self.ptr, input, first_weight, second_weight, third_weight, dim, eps);
+        }
+        return null;
+    }
+
+    pub fn parallelFfnPostResidual(self: *const ComputeBackend, request: *const ParallelFfnPostResidualRequest) !?CT {
+        if (self.vtable.parallelFfnPostResidual) |f| return f(self.ptr, request);
         return null;
     }
 
@@ -3892,11 +4104,46 @@ pub const ComputeBackend = struct {
         }
     }
 
+    pub fn decoderRuntimePushComputeRegion(
+        self: *const ComputeBackend,
+        region: DecoderRuntimeComputeRegion,
+    ) !DecoderRuntimeComputeRegionScope {
+        const op = self.vtable.decoderRuntimePushComputeRegion orelse return .{};
+        const previous = (try op(self.ptr, region)) orelse return .{};
+        return .{ .backend = self, .previous = previous, .active = true };
+    }
+
+    pub fn decoderRuntimePopComputeRegion(self: *const ComputeBackend, previous: usize) !void {
+        if (self.vtable.decoderRuntimePopComputeRegion) |op| {
+            try op(self.ptr, previous);
+        }
+    }
+
     pub fn decoderRuntimeHasActiveFrame(self: *const ComputeBackend) bool {
         if (self.vtable.decoderRuntimeHasActiveFrame) |op| {
             return op(self.ptr);
         }
         return false;
+    }
+
+    pub fn decoderRuntimeBeginMoeCheckpoint(self: *const ComputeBackend, layer_count: usize, top_k: usize) !bool {
+        if (self.vtable.decoderRuntimeBeginMoeCheckpoint) |op| {
+            return op(self.ptr, layer_count, top_k);
+        }
+        return false;
+    }
+
+    pub fn decoderRuntimeFinishMoeCheckpoint(self: *const ComputeBackend) !bool {
+        if (self.vtable.decoderRuntimeFinishMoeCheckpoint) |op| {
+            return op(self.ptr);
+        }
+        return false;
+    }
+
+    pub fn decoderRuntimeSetMoeReplayMode(self: *const ComputeBackend, enabled: bool) !void {
+        if (self.vtable.decoderRuntimeSetMoeReplayMode) |op| {
+            try op(self.ptr, enabled);
+        }
     }
 
     pub fn decoderRuntimeSubmitAndWaitFrame(self: *const ComputeBackend) !void {
@@ -4248,6 +4495,13 @@ pub const ComputeBackend = struct {
         return null;
     }
 
+    pub fn gatedFfnNoBias(self: *const ComputeBackend, request: *const GatedFfnNoBiasRequest) !?CT {
+        if (self.vtable.gatedFfnNoBias) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
     pub fn runAttention(self: *const ComputeBackend, request: *const RunAttentionRequest) !?CT {
         if (self.vtable.runAttention) |op| {
             return op(self.ptr, request);
@@ -4299,6 +4553,16 @@ pub const ComputeBackend = struct {
 
     pub fn runMoeBlock(self: *const ComputeBackend, request: *const RunMoeBlockRequest) !?CT {
         if (self.vtable.runMoeBlock) |op| {
+            return op(self.ptr, request);
+        }
+        return null;
+    }
+
+    pub fn prewarmA4bMappedLayer0(
+        self: *const ComputeBackend,
+        request: *const A4bMappedLayer0PrewarmRequest,
+    ) !?A4bMappedLayer0PrewarmResult {
+        if (self.vtable.prewarmA4bMappedLayer0) |op| {
             return op(self.ptr, request);
         }
         return null;

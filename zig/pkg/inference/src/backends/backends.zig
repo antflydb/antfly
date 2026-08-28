@@ -17,6 +17,7 @@ const build_options = @import("build_options");
 const manifest_mod = @import("../models/manifest.zig");
 const c_file = @import("../util/c_file.zig");
 const kernel_jit_mod = @import("../graph/kernel_jit.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_runtime_mod = @import("../graph/runtime.zig");
 const backend_runtime_mod = @import("backend_runtime.zig");
 
@@ -134,6 +135,9 @@ pub const SessionManager = struct {
     graph_runtime_strategy: ?graph_runtime_mod.Strategy = null,
     kernel_jit: kernel_jit_mod.Config = .{},
     kernel_jit_load_context: kernel_jit_mod.LoadContext = .dynamic,
+    /// Load-time A4B policy. It is copied into the created session and is
+    /// never consulted as mutable process-global state during inference.
+    a4b_inference_request: ?backend_contracts.A4bInferenceRequest = null,
     /// Provider preference for the external ONNX Runtime backend. Automatic is
     /// resolved before admission; candidate SessionManagers then carry only
     /// the resolved CPU/CUDA value through construction.
@@ -221,6 +225,20 @@ pub const SessionManager = struct {
         var first_err: ?anyerror = null;
 
         for (effective_backends) |backend| {
+            if (!backendAcceptsA4bRequest(backend, self.a4b_inference_request)) {
+                first_err = first_err orelse error.A4bRequiresMetal;
+                continue;
+            }
+            // The imported-ONNX graph runtime has no A4B residency contract.
+            // Reject the artifact at the route boundary instead of silently
+            // dropping the caller's memory envelope. Metal uses model_path
+            // directly, so this check does not depend on manifest fallback.
+            if (self.a4b_inference_request != null and
+                backend == .metal and
+                self.shouldUseImportedOnnxGraphRuntime(model_path))
+            {
+                return error.A4bUnsupportedArtifact;
+            }
             if (!backend.available()) continue;
             if (!backend.supportsDirectSessionLoad()) {
                 std.log.err(
@@ -267,11 +285,12 @@ pub const SessionManager = struct {
                         continue;
                     }
                 else if (build_options.enable_metal)
-                    session_factory.createMetalSessionWithKernelJitAndLoadContext(
+                    session_factory.createMetalSessionWithKernelJitAndLoadContextAndA4bRequest(
                         self.allocator,
                         model_path,
                         self.kernel_jit,
                         self.kernel_jit_load_context,
+                        self.a4b_inference_request,
                     ) catch |err| {
                         std.log.err("Metal session create failed for {s}: {s}", .{ model_path, @errorName(err) });
                         if (self.kernel_jit.qualified_profile_path != null or self.kernel_jit.profile_capture_only) return err;
@@ -482,6 +501,13 @@ fn backendAcceptsQualifiedProfile(backend: BackendType, model_path: []const u8) 
     return backend == .metal and !isOnnxFilePath(model_path);
 }
 
+fn backendAcceptsA4bRequest(
+    backend: BackendType,
+    request: ?backend_contracts.A4bInferenceRequest,
+) bool {
+    return request == null or backend == .metal;
+}
+
 test "onnx artifact routes graph execution for direct compute backends" {
     try std.testing.expect(isOnnxFilePath("model.onnx"));
     try std.testing.expect(!isOnnxFilePath("model.gguf"));
@@ -491,6 +517,13 @@ test "qualified workload profiles select direct Metal sessions only" {
     try std.testing.expect(backendAcceptsQualifiedProfile(.metal, "model.gguf"));
     try std.testing.expect(!backendAcceptsQualifiedProfile(.metal, "model.onnx"));
     try std.testing.expect(!backendAcceptsQualifiedProfile(.cuda, "model.gguf"));
+}
+
+test "explicit A4B requests select Metal without generic backend fallback" {
+    try std.testing.expect(backendAcceptsA4bRequest(.metal, .{}));
+    try std.testing.expect(!backendAcceptsA4bRequest(.native, .{}));
+    try std.testing.expect(!backendAcceptsA4bRequest(.cuda, .{}));
+    try std.testing.expect(backendAcceptsA4bRequest(.native, null));
 }
 
 test "onnx backend availability follows linked onnx runtime" {
@@ -521,6 +554,13 @@ test "explicit graph runtime is independent from onnx runtime backend availabili
     try std.testing.expect(!manager.shouldUseExternalOnnxRuntime("model.gguf"));
 }
 
+test "A4B request rejects imported ONNX Metal artifact before session creation" {
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = &.{.metal};
+    manager.a4b_inference_request = .{ .residency_mode = .streamed, .memory_budget_mb = 2048 };
+    try std.testing.expectError(error.A4bUnsupportedArtifact, manager.loadModel("model.onnx"));
+}
+
 test "session manager defaults runtime kernel JIT off" {
     const manager = SessionManager.init(std.testing.allocator);
     try std.testing.expectEqual(kernel_jit_mod.Mode.off, manager.kernel_jit.mode);
@@ -549,6 +589,7 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
         .preload_budget_ms = 120_000,
     };
     source.kernel_jit_load_context = .startup_preload;
+    source.a4b_inference_request = .{ .residency_mode = .streamed, .memory_budget_mb = 4096 };
     const preferred = [_]BackendType{.onnx};
 
     const cloned = source.withPreferredBackends(std.testing.allocator, &preferred);
@@ -559,6 +600,7 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     try std.testing.expectEqual(source.kernel_jit.max_cache_bytes_mb, cloned.kernel_jit.max_cache_bytes_mb);
     try std.testing.expectEqual(source.kernel_jit.preload_budget_ms, cloned.kernel_jit.preload_budget_ms);
     try std.testing.expectEqual(source.kernel_jit_load_context, cloned.kernel_jit_load_context);
+    try std.testing.expectEqual(source.a4b_inference_request, cloned.a4b_inference_request);
     try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 

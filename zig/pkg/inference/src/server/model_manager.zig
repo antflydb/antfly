@@ -57,6 +57,7 @@ const GlinerConfig = @import("../pipelines/gliner.zig").GlinerConfig;
 const generation = @import("../pipelines/generation.zig");
 const ChatTemplate = generation.ChatTemplate;
 const session_factory = @import("../architectures/session_factory.zig");
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const graph_mod = @import("../graph/root.zig");
 const kernel_jit_profile_output = @import("../kernel_jit_profile_output.zig");
 const runtime = @import("../runtime/root.zig");
@@ -5595,7 +5596,12 @@ pub const ModelManager = struct {
     /// Acquire a model for the duration of one operation. The returned handle
     /// prevents eviction until release.
     pub fn acquireFromDir(self: *ModelManager, model_dir: []const u8) !ModelHandle {
-        return self.loadFromDirCoordinated(model_dir, self.session_manager.preferred_backends, true);
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, false),
+        );
     }
 
     pub fn acquireFromDirWithPreferredBackends(
@@ -5604,7 +5610,46 @@ pub const ModelManager = struct {
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
     ) !ModelHandle {
-        return self.loadFromDirCoordinated(model_dir, preferred_backends, cache_default_alias);
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            inheritedA4bCachePolicy(self.session_manager.a4b_inference_request, true),
+        );
+    }
+
+    /// Acquire a model using an immutable A4B policy for this load. Explicit
+    /// policies do not accept an existing unqualified alias: the qualified
+    /// cache key must match before a model can be reused. A newly qualified
+    /// preload may still publish the default alias so later policy-free
+    /// requests reuse the warmed session; its policy-specific variant key
+    /// remains the ownership key.
+    pub fn acquireFromDirWithA4bRequest(
+        self: *ModelManager,
+        model_dir: []const u8,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            self.session_manager.preferred_backends,
+            true,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+        );
+    }
+
+    pub fn acquireFromDirWithPreferredBackendsAndA4bRequest(
+        self: *ModelManager,
+        model_dir: []const u8,
+        preferred_backends: []const backends.BackendType,
+        cache_default_alias: bool,
+        a4b_request: backend_contracts.A4bInferenceRequest,
+    ) !ModelHandle {
+        return self.loadFromDirCoordinated(
+            model_dir,
+            preferred_backends,
+            cache_default_alias,
+            .{ .a4b_request = a4b_request, .accept_default_alias = false },
+        );
     }
 
     /// Compatibility API for offline tools that keep a raw model pointer. Such
@@ -5639,18 +5684,28 @@ pub const ModelManager = struct {
         self: *ModelManager,
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
-        cache_default_alias: bool,
+        _: bool,
+        policy: ModelLoadCachePolicy,
     ) !?*LoadedModel {
-        if (cache_default_alias) {
-            if (self.loaded.get(model_dir)) |model| return model;
-            if (self.loaded_aliases.get(model_dir)) |model| return model;
-        }
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
-            const variant_key = try backendVariantCacheKey(self.allocator, model_dir, backend);
+            const variant_key = try backendVariantCacheKey(
+                self.allocator,
+                model_dir,
+                backend,
+                policy.a4b_request,
+            );
             defer self.allocator.free(variant_key);
             if (self.loaded.get(variant_key)) |model| return model;
             if (self.loaded_aliases.get(variant_key)) |model| return model;
+        }
+        if (policy.accept_default_alias) {
+            if (self.loaded.get(model_dir)) |model|
+                if (!policy.require_default_alias_backend_match or
+                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
+            if (self.loaded_aliases.get(model_dir)) |model|
+                if (!policy.require_default_alias_backend_match or
+                    loadedModelUsesPreferredBackend(model, preferred_backends)) return model;
         }
         return null;
     }
@@ -5660,12 +5715,34 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
+        policy: ModelLoadCachePolicy,
     ) ![]u8 {
-        const prefix = try std.fmt.allocPrint(
-            self.allocator,
-            "{d}:{s}:{d}:",
-            .{ model_dir.len, model_dir, @intFromBool(cache_default_alias) },
-        );
+        const prefix = if (policy.a4b_request) |request|
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{d}:{s}:{d}:{d}:{d}:a4b={s}:{d}:",
+                .{
+                    model_dir.len,
+                    model_dir,
+                    @intFromBool(cache_default_alias),
+                    @intFromBool(policy.accept_default_alias),
+                    @intFromBool(policy.require_default_alias_backend_match),
+                    @tagName(request.residency_mode),
+                    request.memory_budget_mb,
+                },
+            )
+        else
+            try std.fmt.allocPrint(
+                self.allocator,
+                "{d}:{s}:{d}:{d}:{d}:a4b=none:",
+                .{
+                    model_dir.len,
+                    model_dir,
+                    @intFromBool(cache_default_alias),
+                    @intFromBool(policy.accept_default_alias),
+                    @intFromBool(policy.require_default_alias_backend_match),
+                },
+            );
         defer self.allocator.free(prefix);
         const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
         @memcpy(key[0..prefix.len], prefix);
@@ -5756,13 +5833,19 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         preferred_backends: []const backends.BackendType,
         cache_default_alias: bool,
+        policy: ModelLoadCachePolicy,
     ) !ModelHandle {
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try self.session_manager.requiredBackendCandidates(
             preferred_backends,
             &required_backend_scratch,
         );
-        const flight_key = try self.loadFlightKey(model_dir, effective_backends, cache_default_alias);
+        const flight_key = try self.loadFlightKey(
+            model_dir,
+            effective_backends,
+            cache_default_alias,
+            policy,
+        );
         defer self.allocator.free(flight_key);
 
         self.lockLoadedModels();
@@ -5770,6 +5853,7 @@ pub const ModelManager = struct {
             model_dir,
             effective_backends,
             cache_default_alias,
+            policy,
         ) catch |err| {
             self.unlockLoadedModels();
             return err;
@@ -5818,9 +5902,15 @@ pub const ModelManager = struct {
             effective_backends,
             &self.session_manager,
         );
+        session_manager.a4b_inference_request = policy.a4b_request;
         self.unlockLoadedModels();
 
-        var handle = self.loadFromDirUncached(model_dir, &session_manager, cache_default_alias) catch |err| {
+        var handle = self.loadFromDirUncached(
+            model_dir,
+            &session_manager,
+            cache_default_alias,
+            policy.a4b_request,
+        ) catch |err| {
             self.finishLoadFlight(flight, null, err);
             self.releaseLoadFlight(flight_key, flight);
             return err;
@@ -5835,6 +5925,7 @@ pub const ModelManager = struct {
         model_dir: []const u8,
         sm: *backends.SessionManager,
         cache_default_alias: bool,
+        a4b_request: ?backend_contracts.A4bInferenceRequest,
     ) !ModelHandle {
 
         // Load manifest
@@ -6083,7 +6174,7 @@ pub const ModelManager = struct {
         model.kernel_jit_profile_bundle = qualified_profile_bundle;
         qualified_profile_bundle = null;
 
-        return self.publishLoadedModel(model, cache_default_alias);
+        return self.publishLoadedModel(model, cache_default_alias, a4b_request);
     }
 
     /// Publish a fully constructed model with only a short map critical section.
@@ -6094,6 +6185,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         model: *LoadedModel,
         cache_default_alias: bool,
+        a4b_request: ?backend_contracts.A4bInferenceRequest,
     ) !ModelHandle {
         var model_owned = true;
         errdefer if (model_owned) {
@@ -6106,6 +6198,7 @@ pub const ModelManager = struct {
             self.allocator,
             model.model_dir,
             model.session.backend(),
+            a4b_request,
         );
         var variant_key_owned = true;
         defer if (variant_key_owned) self.allocator.free(variant_key);
@@ -6196,11 +6289,59 @@ fn modelCacheHasPublicationCapacity(loaded_count: usize, max_loaded_models: usiz
     return max_loaded_models == 0 or loaded_count < max_loaded_models;
 }
 
+const ModelLoadCachePolicy = struct {
+    a4b_request: ?backend_contracts.A4bInferenceRequest = null,
+    accept_default_alias: bool = true,
+    /// Policy-free acquisition consumes the model's explicitly published
+    /// default alias regardless of current node preference. A caller that
+    /// supplied an explicit backend order still requires an exact match.
+    require_default_alias_backend_match: bool = true,
+};
+
+fn inheritedA4bCachePolicy(
+    request: ?backend_contracts.A4bInferenceRequest,
+    require_default_alias_backend_match: bool,
+) ModelLoadCachePolicy {
+    return .{
+        .a4b_request = request,
+        // Publishing a new default alias and consuming an existing one are
+        // separate decisions. Policy-free requests may reuse a matching
+        // qualified preload even when their call site does not publish new
+        // aliases. Explicit A4B policies still require their exact variant key.
+        .accept_default_alias = request == null,
+        .require_default_alias_backend_match = require_default_alias_backend_match,
+    };
+}
+
+fn loadedModelUsesPreferredBackend(
+    model: *const LoadedModel,
+    preferred_backends: []const backends.BackendType,
+) bool {
+    const actual = model.session.backend();
+    for (preferred_backends) |preferred| {
+        if (preferred == actual) return true;
+    }
+    return false;
+}
+
 fn backendVariantCacheKey(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     backend: backends.BackendType,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) ![]u8 {
+    if (a4b_request) |request| {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}\nbackend={s}\na4b={s}:{d}",
+            .{
+                model_dir,
+                @tagName(backend),
+                @tagName(request.residency_mode),
+                request.memory_budget_mb,
+            },
+        );
+    }
     return std.fmt.allocPrint(allocator, "{s}\nbackend={s}", .{ model_dir, @tagName(backend) });
 }
 
@@ -6209,6 +6350,164 @@ test "model prewarm defers while max-loaded eviction is pending" {
     try std.testing.expect(modelCacheHasPublicationCapacity(0, 1));
     try std.testing.expect(!modelCacheHasPublicationCapacity(1, 1));
     try std.testing.expect(!modelCacheHasPublicationCapacity(2, 1));
+}
+
+test "A4B model cache keys isolate residency policies" {
+    const allocator = std.testing.allocator;
+    const default_key = try backendVariantCacheKey(allocator, "model", .metal, null);
+    defer allocator.free(default_key);
+    const streamed_key = try backendVariantCacheKey(
+        allocator,
+        "model",
+        .metal,
+        .{ .residency_mode = .streamed, .memory_budget_mb = 4096 },
+    );
+    defer allocator.free(streamed_key);
+    const resident_key = try backendVariantCacheKey(
+        allocator,
+        "model",
+        .metal,
+        .{ .residency_mode = .resident, .memory_budget_mb = 16384 },
+    );
+    defer allocator.free(resident_key);
+
+    try std.testing.expect(!std.mem.eql(u8, default_key, streamed_key));
+    try std.testing.expect(!std.mem.eql(u8, streamed_key, resident_key));
+    try std.testing.expect(std.mem.endsWith(u8, streamed_key, "a4b=streamed:4096"));
+}
+
+test "inherited A4B policy isolates explicit loads but reuses policy-free aliases" {
+    const request = backend_contracts.A4bInferenceRequest{
+        .residency_mode = .streamed,
+        .memory_budget_mb = 4096,
+    };
+    const isolated = inheritedA4bCachePolicy(request, false);
+    try std.testing.expectEqual(request, isolated.a4b_request.?);
+    try std.testing.expect(!isolated.accept_default_alias);
+    try std.testing.expect(inheritedA4bCachePolicy(null, false).accept_default_alias);
+}
+
+test "explicit backend lookup reuses only a matching default alias" {
+    const BackendProbe = struct {
+        backend_type: backends.BackendType,
+
+        fn run(_: *anyopaque, _: []const backends.Tensor, allocator: std.mem.Allocator) ![]backends.Tensor {
+            return allocator.alloc(backends.Tensor, 0);
+        }
+        fn inputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn outputInfo(_: *anyopaque) []const backends.TensorInfo {
+            return &.{};
+        }
+        fn backend(ptr: *anyopaque) backends.BackendType {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.backend_type;
+        }
+        fn close(_: *anyopaque) void {}
+        fn session(self: *@This()) backends.Session {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        const vtable = backends.Session.VTable{
+            .run = run,
+            .inputInfo = inputInfo,
+            .outputInfo = outputInfo,
+            .backend = backend,
+            .close = close,
+        };
+    };
+
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var aliases = manager.loaded_aliases.iterator();
+        while (aliases.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded_aliases.deinit(allocator);
+        manager.loaded.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    var probe = BackendProbe{ .backend_type = .metal };
+    var model: LoadedModel = undefined;
+    model.session = probe.session();
+    try manager.loaded_aliases.put(
+        allocator,
+        try allocator.dupe(u8, "model"),
+        &model,
+    );
+
+    manager.lockLoadedModels();
+    const matching = try manager.lookupLoadedModelLocked(
+        "model",
+        &.{.metal},
+        false,
+        inheritedA4bCachePolicy(null, true),
+    );
+    const mismatching = try manager.lookupLoadedModelLocked(
+        "model",
+        &.{.native},
+        false,
+        inheritedA4bCachePolicy(null, true),
+    );
+    const policy_free = try manager.lookupLoadedModelLocked(
+        "model",
+        &.{.native},
+        true,
+        inheritedA4bCachePolicy(null, false),
+    );
+    manager.unlockLoadedModels();
+
+    try std.testing.expect(matching == &model);
+    try std.testing.expect(mismatching == null);
+    try std.testing.expect(policy_free == &model);
+}
+
+test "explicit A4B loads ignore unqualified model aliases" {
+    const allocator = std.testing.allocator;
+    var manager = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+    defer {
+        var loaded = manager.loaded.iterator();
+        while (loaded.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded.deinit(allocator);
+        var aliases = manager.loaded_aliases.iterator();
+        while (aliases.next()) |entry| allocator.free(entry.key_ptr.*);
+        manager.loaded_aliases.deinit(allocator);
+        manager.in_flight_loads.deinit(allocator);
+    }
+
+    var default_model: LoadedModel = undefined;
+    try manager.loaded_aliases.put(
+        allocator,
+        try allocator.dupe(u8, "model"),
+        &default_model,
+    );
+    const request = backend_contracts.A4bInferenceRequest{
+        .residency_mode = .streamed,
+        .memory_budget_mb = 4096,
+    };
+    manager.lockLoadedModels();
+    const alias_miss = try manager.lookupLoadedModelLocked(
+        "model",
+        &.{.metal},
+        true,
+        .{ .a4b_request = request, .accept_default_alias = false },
+    );
+    manager.unlockLoadedModels();
+    try std.testing.expect(alias_miss == null);
+
+    var streamed_model: LoadedModel = undefined;
+    const streamed_key = try backendVariantCacheKey(allocator, "model", .metal, request);
+    try manager.loaded.put(allocator, streamed_key, &streamed_model);
+    manager.lockLoadedModels();
+    const qualified_hit = try manager.lookupLoadedModelLocked(
+        "model",
+        &.{.metal},
+        true,
+        .{ .a4b_request = request, .accept_default_alias = false },
+    );
+    manager.unlockLoadedModels();
+    try std.testing.expect(qualified_hit == &streamed_model);
 }
 
 fn admissionEvictionTestModel(last_used_ns: u64) LoadedModel {
@@ -6273,6 +6572,7 @@ test "model cache eviction skips active and pinned models and removes aliases" {
         "idle-alias",
         manager.session_manager.preferred_backends,
         true,
+        .{},
     );
     manager.unlockLoadedModels();
     try std.testing.expect(after_eviction == null);
@@ -6512,6 +6812,7 @@ fn sessionManagerForPreferredBackends(
         .graph_runtime_strategy = source.graph_runtime_strategy,
         .kernel_jit = source.kernel_jit,
         .kernel_jit_load_context = source.kernel_jit_load_context,
+        .a4b_inference_request = source.a4b_inference_request,
         .onnx_execution_provider = source.onnx_execution_provider,
         .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
@@ -6895,17 +7196,52 @@ pub fn projectorRunAdmissionAmounts(
 }
 
 fn estimateModelLoadAdmission(
+    model_path: []const u8,
     man: manifest_mod.ModelManifest,
     backend_runtime: backends.BackendRuntime,
+    a4b_request: ?backend_contracts.A4bInferenceRequest,
 ) !ModelLoadAdmissionPlan {
     const weights = try estimateModelArtifactBytes(man, backend_runtime.backend);
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
+    if (backend_runtime.backend == .metal) {
+        if (try session_factory.resolveA4bInferenceConfigForModelListing(
+            man.allocator,
+            model_path,
+            man,
+            a4b_request,
+        )) |config| {
+            return a4bMetalModelLoadAdmission(config);
+        }
+    }
     const extra_backend_resident = if (backend_runtime.backend == .metal)
         session_factory.metalDebertaFastPathAdmissionAmounts(man)
     else
         runtime.tier.memory.AdmissionAmounts{};
     return nativeModelLoadAdmission(weights, backend_runtime.backend, extra_backend_resident);
+}
+
+fn a4bMetalModelLoadAdmission(config: backend_contracts.A4bInferenceConfig) ModelLoadAdmissionPlan {
+    const budget: usize = @intCast(config.memory_budget_bytes);
+    const kv: usize = @intCast(config.kv_budget_bytes);
+    const scratch: usize = @intCast(config.safety_reserve_bytes);
+    const weights = budget -| kv -| scratch;
+    const resident = runtime.tier.memory.AdmissionAmounts{
+        .backend_weight_bytes = weights,
+        .backend_kv_bytes = kv,
+        .backend_scratch_bytes = scratch,
+    };
+    return .{ .peak = resident, .resident = resident };
+}
+
+test "A4B Metal admission lease equals the configured memory envelope" {
+    const config = try backend_contracts.buildA4bInferenceConfig(
+        .{},
+        backend_contracts.qualified_a4b_geometries[0],
+    );
+    const plan = a4bMetalModelLoadAdmission(config);
+    try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), plan.resident.backendTotalBytes());
+    try std.testing.expectEqual(plan.resident, plan.peak);
 }
 
 fn onnxModelLoadAdmission(
@@ -7025,6 +7361,10 @@ fn loadSessionForPreferredBackends(
     var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
         if (!backend.supportsDirectSessionLoad()) continue;
+        if (source_session_manager.a4b_inference_request != null and backend != .metal) {
+            rememberPreferredLoadError(&first_err, error.A4bRequiresMetal);
+            continue;
+        }
         if (source_session_manager.kernel_jit.mode.failClosed() and
             !backend.supportsKernelJitSession()) continue;
         const candidate_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
@@ -7041,7 +7381,12 @@ fn loadSessionForPreferredBackends(
         var resident_amounts = runtime.tier.memory.AdmissionAmounts{};
         var admission_limits = runtime.tier.memory.Limits{};
         if (manager.admission_enabled) {
-            const admission_plan = estimateModelLoadAdmission(man, backend_runtime) catch |err| {
+            const admission_plan = estimateModelLoadAdmission(
+                model_dir,
+                man,
+                backend_runtime,
+                source_session_manager.a4b_inference_request,
+            ) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             };

@@ -64,6 +64,7 @@ comptime {
     _ = @import("db/doc_filter_wire.zig");
     _ = @import("db/doc_identity.zig");
     _ = @import("db/doc_set.zig");
+    _ = @import("db/document_content_hash.zig");
     _ = @import("db/document_mapper.zig");
     _ = @import("db/document_query.zig");
     _ = @import("db/enrichment/artifact_codec.zig");
@@ -81,6 +82,7 @@ comptime {
     _ = @import("db/enrichment/utf8_text.zig");
     _ = @import("db/generation_lifecycle.zig");
     _ = @import("db/lease.zig");
+    _ = @import("db/maintenance/sparse_compaction_runtime.zig");
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
     _ = @import("db/mod.zig");

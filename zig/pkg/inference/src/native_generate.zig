@@ -23,6 +23,7 @@ const decoder_gated_runtime = @import("backends/decoder_gated_runtime.zig");
 const debug_timing = @import("debug_timing.zig");
 const ops = @import("ops/ops.zig");
 const gpt_arch = @import("architectures/gpt.zig");
+const gemma4_runtime = @import("architectures/gemma4_runtime.zig");
 const session_factory = @import("architectures/session_factory.zig");
 const generation = @import("pipelines/generation.zig");
 const graph_mod = @import("graph/root.zig");
@@ -119,6 +120,9 @@ const Options = struct {
     combined_budget_mb: usize = 0,
     kv_budget_mb: usize = 0,
     scratch_budget_mb: usize = 0,
+    a4b_residency_mode: ops.A4bResidencyMode = .auto,
+    a4b_memory_budget_mb: u32 = 0,
+    a4b_options_explicit: bool = false,
     raw_prompt: bool = false,
     no_bos: bool = false,
     raw_decode_bench: bool = false,
@@ -407,6 +411,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&session_manager, if (route_onnx_whole_model_graph) .native else opts.backend);
+    session_manager.a4b_inference_request = a4bInferenceRequest(opts);
     session_manager.kernel_jit = jit_config;
     session_manager.kernel_jit_load_context = .startup_preload;
 
@@ -794,7 +799,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         compiled_attachment_target == .whole_model and
         backend_kind == .metal and
         graph_mod.metal_executor.supportsSession(model.session);
-    const live_whole_model_route = liveWholeModelExecutorRequested(&opts) and
+    const live_whole_model_route = liveWholeModelExecutorRequested(&opts, gpt_config) and
         backend_kind == .metal and
         !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
         config.draft_model == null and
@@ -3731,6 +3736,159 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
+        \\"projected_expert_arena":{{
+        \\"enabled":{d},
+        \\"capacities":[{d},{d},{d},{d}],
+        \\"layer_attempts":[{d},{d},{d},{d}],
+        \\"route_hits":[{d},{d},{d},{d}],
+        \\"route_misses":[{d},{d},{d},{d}],
+        \\"all_hit_layers":[{d},{d},{d},{d}],
+        \\"token_attempts":[{d},{d},{d},{d}],
+        \\"all_hit_tokens":[{d},{d},{d},{d}]
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_projected_enabled,
+            ops.a4b_projected_slot_capacities[0],
+            ops.a4b_projected_slot_capacities[1],
+            ops.a4b_projected_slot_capacities[2],
+            ops.a4b_projected_slot_capacities[3],
+            provider.a4b_moe_projected_layer_attempts[0],
+            provider.a4b_moe_projected_layer_attempts[1],
+            provider.a4b_moe_projected_layer_attempts[2],
+            provider.a4b_moe_projected_layer_attempts[3],
+            provider.a4b_moe_projected_route_hits[0],
+            provider.a4b_moe_projected_route_hits[1],
+            provider.a4b_moe_projected_route_hits[2],
+            provider.a4b_moe_projected_route_hits[3],
+            provider.a4b_moe_projected_route_misses[0],
+            provider.a4b_moe_projected_route_misses[1],
+            provider.a4b_moe_projected_route_misses[2],
+            provider.a4b_moe_projected_route_misses[3],
+            provider.a4b_moe_projected_all_hit_layers[0],
+            provider.a4b_moe_projected_all_hit_layers[1],
+            provider.a4b_moe_projected_all_hit_layers[2],
+            provider.a4b_moe_projected_all_hit_layers[3],
+            provider.a4b_moe_projected_token_attempts[0],
+            provider.a4b_moe_projected_token_attempts[1],
+            provider.a4b_moe_projected_token_attempts[2],
+            provider.a4b_moe_projected_token_attempts[3],
+            provider.a4b_moe_projected_all_hit_tokens[0],
+            provider.a4b_moe_projected_all_hit_tokens[1],
+            provider.a4b_moe_projected_all_hit_tokens[2],
+            provider.a4b_moe_projected_all_hit_tokens[3],
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"mapped_layer0_selected_prefetch":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d},
+        \\"logical_bytes":{d}
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_mapped_layer0_selected_prefetch_attempts,
+            provider.a4b_moe_mapped_layer0_selected_prefetch_successes,
+            provider.a4b_moe_mapped_layer0_selected_prefetch_failures,
+            provider.a4b_moe_mapped_layer0_selected_prefetch_logical_bytes,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"mapped_layer0_prewarm":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d},
+        \\"logical_bytes":{d},
+        \\"page_touches":{d},
+        \\"nanos":{d}
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_mapped_layer0_prewarm_attempts,
+            provider.a4b_moe_mapped_layer0_prewarm_successes,
+            provider.a4b_moe_mapped_layer0_prewarm_failures,
+            provider.a4b_moe_mapped_layer0_prewarm_logical_bytes,
+            provider.a4b_moe_mapped_layer0_prewarm_page_touches,
+            provider.a4b_moe_mapped_layer0_prewarm_nanos,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
+        \\"resident_mapped":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d},
+        \\"fused_gate_up":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d}
+        \\}},
+        \\"split_gate_up":{{
+        \\"attempts":{d},
+        \\"successes":{d},
+        \\"failures":{d}
+        \\}},
+        \\"dispatches":{{
+        \\"split_gate_up":{d},
+        \\"fused_gate_up":{d},
+        \\"down":{d},
+        \\"reduce":{d},
+        \\"broadcast":{d}
+        \\}},
+        \\"model_buffer":{{
+        \\"prepare_attempts":{d},
+        \\"prepare_successes":{d},
+        \\"prepare_failures":{d},
+        \\"logical_bytes":{d},
+        \\"allocated_bytes":{d}
+        \\}},
+        \\"residency_set":{{
+        \\"allocation_count":{d},
+        \\"allocated_bytes":{d},
+        \\"commit_count":{d},
+        \\"request_count":{d}
+        \\}}
+        \\}}
+    ,
+        .{
+            provider.a4b_moe_resident_mapped_attempts,
+            provider.a4b_moe_resident_mapped_successes,
+            provider.a4b_moe_resident_mapped_failures,
+            provider.a4b_moe_resident_fused_gate_up_attempts,
+            provider.a4b_moe_resident_fused_gate_up_successes,
+            provider.a4b_moe_resident_fused_gate_up_failures,
+            provider.a4b_moe_resident_split_gate_up_attempts,
+            provider.a4b_moe_resident_split_gate_up_successes,
+            provider.a4b_moe_resident_split_gate_up_failures,
+            provider.metal_runtime_mapped_moe_split_gate_up_dispatches,
+            provider.metal_runtime_mapped_moe_fused_gate_up_dispatches,
+            provider.metal_runtime_mapped_moe_down_dispatches,
+            provider.metal_runtime_mapped_moe_reduce_dispatches,
+            provider.metal_runtime_mapped_moe_broadcast_dispatches,
+            provider.metal_runtime_mapped_model_prepare_attempts,
+            provider.metal_runtime_mapped_model_prepare_successes,
+            provider.metal_runtime_mapped_model_prepare_failures,
+            provider.metal_runtime_mapped_model_logical_bytes,
+            provider.metal_runtime_mapped_model_allocated_bytes,
+            provider.metal_runtime_mapped_moe_residency_allocation_count,
+            provider.metal_runtime_mapped_moe_residency_allocated_bytes,
+            provider.metal_runtime_mapped_moe_residency_commit_count,
+            provider.metal_runtime_mapped_moe_residency_request_count,
+        },
+    );
+    try appendFmt(
+        allocator,
+        &out,
+        \\,
         \\"residency":{{
         \\"quantized_slots":{d},
         \\"quantized_prepared_bytes":{d},
@@ -3743,6 +3901,24 @@ fn metalStatsCompactJson(
         \\"runtime_mapped_attempts":{d},
         \\"runtime_mapped_fallbacks":{d},
         \\"runtime_mapped_failures":{d},
+        \\"a4b_linear_attempts":{d},
+        \\"a4b_linear_successes":{d},
+        \\"a4b_linear_fallbacks":{d},
+        \\"a4b_pair_attempts":{d},
+        \\"a4b_pair_successes":{d},
+        \\"a4b_pair_fallbacks":{d},
+        \\"a4b_scatter_attempts":{d},
+        \\"a4b_scatter_successes":{d},
+        \\"a4b_scatter_fallbacks":{d},
+        \\"a4b_slot_arena_attempts":{d},
+        \\"a4b_slot_arena_successes":{d},
+        \\"a4b_slot_arena_failures":{d},
+        \\"a4b_checkpoint_attempts":{d},
+        \\"a4b_checkpoint_all_hit_tokens":{d},
+        \\"a4b_checkpoint_miss_tokens":{d},
+        \\"a4b_checkpoint_replays":{d},
+        \\"a4b_slot_uploads":{d},
+        \\"a4b_slot_upload_bytes":{d},
         \\"active_frame_bootstrap_misses":{d},
         \\"misses":{d}
         \\}}
@@ -3760,6 +3936,24 @@ fn metalStatsCompactJson(
             provider.metal_provider_quantized_runtime_mapped_attempts,
             provider.metal_provider_quantized_runtime_mapped_fallbacks,
             provider.metal_provider_quantized_runtime_mapped_failures,
+            provider.a4b_packed_q4_0_linear_attempts,
+            provider.a4b_packed_q4_0_linear_successes,
+            provider.a4b_packed_q4_0_linear_fallbacks,
+            provider.a4b_packed_q4_0_pair_attempts,
+            provider.a4b_packed_q4_0_pair_successes,
+            provider.a4b_packed_q4_0_pair_fallbacks,
+            provider.a4b_moe_scatter_attempts,
+            provider.a4b_moe_scatter_successes,
+            provider.a4b_moe_scatter_fallbacks,
+            provider.a4b_moe_slot_arena_attempts,
+            provider.a4b_moe_slot_arena_successes,
+            provider.a4b_moe_slot_arena_failures,
+            provider.a4b_moe_checkpoint_attempts,
+            provider.a4b_moe_checkpoint_all_hit_tokens,
+            provider.a4b_moe_checkpoint_miss_tokens,
+            provider.a4b_moe_checkpoint_replays,
+            provider.a4b_moe_slot_uploads,
+            provider.a4b_moe_slot_upload_bytes,
             provider.compressed_block_active_frame_bootstrap_misses,
             metalResidencyMisses(provider),
         },
@@ -5509,6 +5703,90 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
     const top_fallback = graph_mod.executor_stats.quantKernelTopFallbackReason(plan_stats);
     const fast_path_misses = graph_mod.executor_stats.quantKernelFastPathMisses(plan_stats);
     print(
+        "metal_a4b_moe: linear_attempts={d} linear_successes={d} linear_fallbacks={d} pair_attempts={d} pair_successes={d} pair_fallbacks={d} scatter_attempts={d} scatter_successes={d} scatter_fallbacks={d} slot_arena_attempts={d} slot_arena_successes={d} slot_arena_failures={d} mapped_layer0_attempts={d} mapped_layer0_successes={d} mapped_layer0_failures={d} selected_prefetch_attempts={d} selected_prefetch_successes={d} selected_prefetch_failures={d} selected_prefetch_logical_bytes={d} prewarm_attempts={d} prewarm_successes={d} prewarm_failures={d} prewarm_logical_bytes={d} prewarm_page_touches={d} prewarm_ms={d} checkpoint_attempts={d} checkpoint_all_hit_tokens={d} checkpoint_miss_tokens={d} checkpoint_replays={d} slot_uploads={d} slot_upload_bytes={d}\n",
+        .{
+            metal_snapshot.provider.a4b_packed_q4_0_linear_attempts,
+            metal_snapshot.provider.a4b_packed_q4_0_linear_successes,
+            metal_snapshot.provider.a4b_packed_q4_0_linear_fallbacks,
+            metal_snapshot.provider.a4b_packed_q4_0_pair_attempts,
+            metal_snapshot.provider.a4b_packed_q4_0_pair_successes,
+            metal_snapshot.provider.a4b_packed_q4_0_pair_fallbacks,
+            metal_snapshot.provider.a4b_moe_scatter_attempts,
+            metal_snapshot.provider.a4b_moe_scatter_successes,
+            metal_snapshot.provider.a4b_moe_scatter_fallbacks,
+            metal_snapshot.provider.a4b_moe_slot_arena_attempts,
+            metal_snapshot.provider.a4b_moe_slot_arena_successes,
+            metal_snapshot.provider.a4b_moe_slot_arena_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_attempts,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_successes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_attempts,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_successes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_selected_prefetch_logical_bytes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_attempts,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_successes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_failures,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_logical_bytes,
+            metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_page_touches,
+            @divTrunc(metal_snapshot.provider.a4b_moe_mapped_layer0_prewarm_nanos, std.time.ns_per_ms),
+            metal_snapshot.provider.a4b_moe_checkpoint_attempts,
+            metal_snapshot.provider.a4b_moe_checkpoint_all_hit_tokens,
+            metal_snapshot.provider.a4b_moe_checkpoint_miss_tokens,
+            metal_snapshot.provider.a4b_moe_checkpoint_replays,
+            metal_snapshot.provider.a4b_moe_slot_uploads,
+            metal_snapshot.provider.a4b_moe_slot_upload_bytes,
+        },
+    );
+    print(
+        "metal_a4b_resident_mapped: attempts={d} successes={d} failures={d} fused_attempts={d} fused_successes={d} fused_failures={d} split_attempts={d} split_successes={d} split_failures={d}\n",
+        .{
+            metal_snapshot.provider.a4b_moe_resident_mapped_attempts,
+            metal_snapshot.provider.a4b_moe_resident_mapped_successes,
+            metal_snapshot.provider.a4b_moe_resident_mapped_failures,
+            metal_snapshot.provider.a4b_moe_resident_fused_gate_up_attempts,
+            metal_snapshot.provider.a4b_moe_resident_fused_gate_up_successes,
+            metal_snapshot.provider.a4b_moe_resident_fused_gate_up_failures,
+            metal_snapshot.provider.a4b_moe_resident_split_gate_up_attempts,
+            metal_snapshot.provider.a4b_moe_resident_split_gate_up_successes,
+            metal_snapshot.provider.a4b_moe_resident_split_gate_up_failures,
+        },
+    );
+    print(
+        "metal_a4b_resident_runtime: split_gate_up_dispatches={d} fused_gate_up_dispatches={d} down_dispatches={d} reduce_dispatches={d} broadcast_dispatches={d} model_prepare_attempts={d} model_prepare_successes={d} model_prepare_failures={d} model_logical_bytes={d} model_allocated_bytes={d} residency_allocations={d} residency_allocated_bytes={d} residency_commits={d} residency_requests={d}\n",
+        .{
+            metal_snapshot.provider.metal_runtime_mapped_moe_split_gate_up_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_fused_gate_up_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_down_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_reduce_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_moe_broadcast_dispatches,
+            metal_snapshot.provider.metal_runtime_mapped_model_prepare_attempts,
+            metal_snapshot.provider.metal_runtime_mapped_model_prepare_successes,
+            metal_snapshot.provider.metal_runtime_mapped_model_prepare_failures,
+            metal_snapshot.provider.metal_runtime_mapped_model_logical_bytes,
+            metal_snapshot.provider.metal_runtime_mapped_model_allocated_bytes,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_allocation_count,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_allocated_bytes,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_commit_count,
+            metal_snapshot.provider.metal_runtime_mapped_moe_residency_request_count,
+        },
+    );
+    for (ops.a4b_projected_slot_capacities, 0..) |capacity, projection| {
+        print(
+            "metal_a4b_moe_projected_arena: enabled={d} slots={d} layer_attempts={d} route_hits={d} route_misses={d} all_hit_layers={d} token_attempts={d} all_hit_tokens={d}\n",
+            .{
+                metal_snapshot.provider.a4b_moe_projected_enabled,
+                capacity,
+                metal_snapshot.provider.a4b_moe_projected_layer_attempts[projection],
+                metal_snapshot.provider.a4b_moe_projected_route_hits[projection],
+                metal_snapshot.provider.a4b_moe_projected_route_misses[projection],
+                metal_snapshot.provider.a4b_moe_projected_all_hit_layers[projection],
+                metal_snapshot.provider.a4b_moe_projected_token_attempts[projection],
+                metal_snapshot.provider.a4b_moe_projected_all_hit_tokens[projection],
+            },
+        );
+    }
+    print(
         "metal_quant_kernel_plan: planned={d} handwritten_production={d} generated_production={d} unsupported_routes={d} fast_path_misses={d} generated_candidates={d} generated_artifact_missing={d} generated_runtime_not_wired={d} unsupported={d} unsupported_format={d} unsupported_shape={d} unsupported_epilogue={d} unsupported_backend={d} tensor_core_repack_required={d} top_fallback_reason={s} top_fallback_count={d}\n",
         .{
             plan_stats.quant_kernel_planned_ops,
@@ -5906,16 +6184,29 @@ fn liveWholeModelDeclineError(err: anyerror) bool {
     };
 }
 
-fn liveWholeModelExecutorRequested(opts: *const Options) bool {
+fn liveWholeModelExecutorRequestedForPreparedA4b(
+    opts: *const Options,
+    prepared_a4b: bool,
+) bool {
     if (envFlagEnabled("TERMITE_METAL_DISABLE_LIVE_WHOLE_MODEL_EXECUTOR")) return false;
     const explicit_whole_model = opts.mode != null and opts.mode.? == .compiled and
         opts.compiled_target != null and opts.compiled_target.? == .whole_model;
-    if (explicit_whole_model) return false;
+    if (explicit_whole_model and !prepared_a4b) return false;
     if (!explicit_whole_model and opts.backend != .metal) return false;
     return switch (opts.backend) {
         .auto, .native, .metal => true,
         else => false,
     };
+}
+
+fn liveWholeModelExecutorRequested(
+    opts: *const Options,
+    gpt_config: gpt_mod.Config,
+) bool {
+    return liveWholeModelExecutorRequestedForPreparedA4b(
+        opts,
+        gemma4_runtime.supportsPreparedA4bRuntimeConfig(gpt_config),
+    );
 }
 
 fn liveWholeModelShouldStopOnEos(gpt_config: gpt_mod.Config, ignore_eos: bool, token_id: i32) bool {
@@ -6020,7 +6311,7 @@ fn tryRunLiveWholeModelExecutorGenerate(
     loaded_model_at: std.Io.Timestamp,
     encoded_prompt_at: std.Io.Timestamp,
 ) !bool {
-    if (!liveWholeModelExecutorRequested(opts)) return false;
+    if (!liveWholeModelExecutorRequested(opts, gpt_config)) return false;
     if (generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config)) return false;
     if (config.draft_model != null or config.speculation_requested) return false;
     if (opts.image_count > 0 or opts.audio_count > 0) return false;
@@ -7197,6 +7488,7 @@ fn serverGenerateSupportsOptions(opts: Options) bool {
         opts.combined_budget_mb == 0 and
         opts.kv_budget_mb == 0 and
         opts.scratch_budget_mb == 0 and
+        !opts.a4b_options_explicit and
         opts.artifact_dir == null and
         opts.json_timing_path == null and
         !hasLocalKernelJitOptions(opts) and
@@ -7467,6 +7759,17 @@ fn parseArgs(args: []const []const u8) !Options {
             i += 1;
             if (i >= args.len) return error.MissingScratchBudget;
             opts.scratch_budget_mb = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--a4b-residency-mode")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bResidencyMode;
+            opts.a4b_residency_mode = std.meta.stringToEnum(ops.A4bResidencyMode, args[i]) orelse
+                return error.InvalidA4bResidencyMode;
+            opts.a4b_options_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--a4b-memory-budget-mb")) {
+            i += 1;
+            if (i >= args.len) return error.MissingA4bMemoryBudget;
+            opts.a4b_memory_budget_mb = try std.fmt.parseInt(u32, args[i], 10);
+            opts.a4b_options_explicit = true;
         } else if (std.mem.eql(u8, arg, "--server")) {
             i += 1;
             if (i >= args.len) return error.MissingServerUrl;
@@ -7740,12 +8043,34 @@ fn configureBackendPreference(session_manager: *backends.SessionManager, choice:
     native_backend_choice.configureSessionPreference(session_manager, choice);
 }
 
+fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
+    if (!opts.a4b_options_explicit) return null;
+    return .{
+        .residency_mode = opts.a4b_residency_mode,
+        .memory_budget_mb = opts.a4b_memory_budget_mb,
+    };
+}
+
 fn preflightModelLoadBudget(
     allocator: std.mem.Allocator,
     manifest: *const manifest_mod.ModelManifest,
     opts: Options,
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
+    const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
+    if (predicted_backend_type == .metal) {
+        if (try session_factory.resolveA4bInferenceConfigForModelListing(
+            allocator,
+            opts.model_dir,
+            manifest.*,
+            a4bInferenceRequest(opts),
+        ) != null) {
+            // Exact A4B loads are leased as one bounded weights+KV+scratch
+            // envelope by ModelManager. Reserving the full encoded GGUF here
+            // would reject the compact path before that authoritative gate.
+            return;
+        }
+    }
     const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, opts) catch 0;
     if (weight_bytes == 0) return;
 
@@ -7754,7 +8079,6 @@ fn preflightModelLoadBudget(
         .backend => .gpu,
         .disk => return,
     });
-    const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
     limits = try session_factory.widenBudgetLimitsForModelPath(
         allocator,
         opts.model_dir,
@@ -7853,7 +8177,7 @@ fn metalEagerDenseMaxBytes() u64 {
 
 fn printUsage() void {
     print(
-        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
+        \\usage: antfly inference generate <model-dir|model> <prompt> [--server http://host:port] [--require-server] [--stream] [--image path] [--audio path] [--backend auto|onnx|native|metal|xla|webgpu] [--mode eager|compiled] [--compiled-target partitioned|whole-model] [--max-tokens N] [--temperature V] [--top-p V] [--top-k N] [--repetition-penalty V] [--prefill-chunk-size N] [--draft-model path] [--speculative-k N] [--speculation-policy auto|force|off] [--speculation-calibration none|probe|positive] [--cache-dtype f16|f32|int8|fp8|int4|polar4|turbo3] [--a4b-residency-mode auto|streamed|resident] [--a4b-memory-budget-mb N] [--host-budget-mb N] [--backend-budget-mb N] [--combined-budget-mb N] [--kv-budget-mb N] [--scratch-budget-mb N] [--artifact-dir <path>] [--no-chat-template] [--enable-thinking|--disable-thinking] [--raw-prompt] [--no-bos] [--raw-decode-bench] [--ignore-eos] [--debug-mtp] [--debug-gemma4-target] [--disable-gemma-embedding-scale] [--print-finish-reason] [--print-token-count] [--print-token-ids] [--print-prompt-token-ids] [--print-prompt] [--print-chat-template-status] [--print-timing] [--json-timing path] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir path] [--kernel-jit-max-cache-mb N] [--kernel-jit-preload-budget-ms N] [--kernel-jit-profile-out path] [--kernel-jit-qualified-profile path] [--kernel-jit-draft-profile-out path] [--kernel-jit-draft-qualified-profile path]
         \\  Loads a native GGUF/SafeTensors model and prints generated text to stdout.
         \\  With --server or ANTFLY_INFERENCE_SERVER_URL, sends the request to an already-running inference server.
         \\  --stream prints generated text incrementally as token deltas arrive.
@@ -7972,6 +8296,17 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     snapshot.provider.metal_provider_quantized_runtime_mapped_fallbacks = 10;
     snapshot.provider.compressed_block_active_frame_bootstrap_misses = 11;
     snapshot.provider.metal_provider_quantized_runtime_mapped_failures = 12;
+    snapshot.provider.a4b_moe_checkpoint_attempts = 3;
+    snapshot.provider.a4b_moe_checkpoint_all_hit_tokens = 2;
+    snapshot.provider.a4b_moe_checkpoint_miss_tokens = 1;
+    snapshot.provider.a4b_moe_checkpoint_replays = 1;
+    snapshot.provider.a4b_moe_projected_enabled = 1;
+    snapshot.provider.a4b_moe_projected_layer_attempts = .{ 30, 30, 30, 30 };
+    snapshot.provider.a4b_moe_projected_route_hits = .{ 100, 120, 140, 160 };
+    snapshot.provider.a4b_moe_projected_route_misses = .{ 140, 120, 100, 80 };
+    snapshot.provider.a4b_moe_projected_all_hit_layers = .{ 1, 2, 3, 4 };
+    snapshot.provider.a4b_moe_projected_token_attempts = .{ 5, 5, 5, 5 };
+    snapshot.provider.a4b_moe_projected_all_hit_tokens = .{ 0, 1, 2, 3 };
 
     const graph_stats = graph_mod.executor_stats.ExecutionStats{
         .quant_kernel_planned_ops = 12,
@@ -8075,9 +8410,19 @@ test "metal stats compact json exposes generated quant and fallback counters" {
     try std.testing.expectEqual(@as(i64, 7), root.get("frame_fallbacks").?.object.get("decode_fallback").?.integer);
     try std.testing.expectEqual(@as(i64, 8), root.get("frame_fallbacks").?.object.get("prefill_execute").?.integer);
     try std.testing.expectEqual(@as(i64, 9), root.get("frame_fallbacks").?.object.get("prefill_execute_attempts").?.integer);
+    const projected_arena = root.get("projected_expert_arena").?.object;
+    try std.testing.expectEqual(@as(i64, 1), projected_arena.get("enabled").?.integer);
+    try std.testing.expectEqual(@as(i64, 12), projected_arena.get("capacities").?.array.items[1].integer);
+    try std.testing.expectEqual(@as(i64, 140), projected_arena.get("route_hits").?.array.items[2].integer);
+    try std.testing.expectEqual(@as(i64, 80), projected_arena.get("route_misses").?.array.items[3].integer);
+    try std.testing.expectEqual(@as(i64, 2), projected_arena.get("all_hit_tokens").?.array.items[2].integer);
     try std.testing.expectEqual(@as(i64, 10), root.get("residency").?.object.get("runtime_mapped_fallbacks").?.integer);
     try std.testing.expectEqual(@as(i64, 11), root.get("residency").?.object.get("active_frame_bootstrap_misses").?.integer);
     try std.testing.expectEqual(@as(i64, 12), root.get("residency").?.object.get("runtime_mapped_failures").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), root.get("residency").?.object.get("a4b_checkpoint_attempts").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), root.get("residency").?.object.get("a4b_checkpoint_all_hit_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), root.get("residency").?.object.get("a4b_checkpoint_miss_tokens").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), root.get("residency").?.object.get("a4b_checkpoint_replays").?.integer);
     try std.testing.expectEqual(@as(i64, 33), root.get("residency").?.object.get("misses").?.integer);
 
     const null_json = try metalStatsCompactJson(std.testing.allocator, null, .{});
@@ -8266,6 +8611,28 @@ test "parseArgs accepts artifact dir" {
     try std.testing.expectEqualStrings("/tmp/artifacts", opts.artifact_dir.?);
     try std.testing.expectEqual(@as(i32, 1), opts.max_tokens);
     try std.testing.expect(opts.raw_prompt);
+}
+
+test "parseArgs builds the explicit A4B residency request" {
+    const opts = try parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--a4b-residency-mode",
+        "streamed",
+        "--a4b-memory-budget-mb",
+        "4096",
+    });
+    const request = a4bInferenceRequest(opts).?;
+    try std.testing.expectEqual(ops.A4bResidencyMode.streamed, request.residency_mode);
+    try std.testing.expectEqual(@as(u32, 4096), request.memory_budget_mb);
+    try std.testing.expect(!serverGenerateSupportsOptions(opts));
+
+    try std.testing.expectError(error.InvalidA4bResidencyMode, parseArgs(&.{
+        "/tmp/model",
+        "hello",
+        "--a4b-residency-mode",
+        "partial",
+    }));
 }
 
 test "parseArgs preserves explicit chat template thinking mode" {
@@ -8767,7 +9134,7 @@ test "server model name strips local models dir prefix" {
     ) == null);
 }
 
-test "explicit compiled whole model does not route through live executor" {
+test "only explicit prepared A4B may route compiled whole model through live executor" {
     const opts = Options{
         .model_dir = "/tmp/model",
         .prompt = "hello",
@@ -8775,7 +9142,8 @@ test "explicit compiled whole model does not route through live executor" {
         .mode = .compiled,
         .compiled_target = .whole_model,
     };
-    try std.testing.expect(!liveWholeModelExecutorRequested(&opts));
+    try std.testing.expect(!liveWholeModelExecutorRequestedForPreparedA4b(&opts, false));
+    try std.testing.expect(liveWholeModelExecutorRequestedForPreparedA4b(&opts, true));
 }
 
 test "live whole-model route uses the shared KV capacity policy" {

@@ -36,6 +36,7 @@ const db_core = @import("core.zig");
 const internal_keys = @import("../internal_keys.zig");
 const hierarchy_navigation = @import("../hierarchy_navigation.zig");
 const doc_identity = @import("doc_identity.zig");
+const document_content_hash = @import("document_content_hash.zig");
 const range_cardinality = @import("range_cardinality.zig");
 pub const DocIdentityNamespace = doc_identity.Namespace;
 const doc_set = @import("doc_set.zig");
@@ -1573,6 +1574,7 @@ const BatchExecutionOptions = struct {
     document_child_range_dispatcher: ?DocumentArtifactChildRangeDispatcher = null,
     bypass_ha_write_gate: bool = false,
     ha_applied_lsn_marker: ?u64 = null,
+    raft_applied_entry_marker: ?RaftAppliedEntryIdentity = null,
     suppress_derived_replay_append: bool = false,
     extra_store_writes: []const docstore_mod.KVPair = &.{},
     transaction_resolution: ?TransactionResolution = null,
@@ -1581,12 +1583,64 @@ const BatchExecutionOptions = struct {
     visibility_cancellation: types.CancellationToken = .none,
 };
 
+pub const RaftAppliedEntryIdentity = struct {
+    term: u64,
+    index: u64,
+};
+
+const raft_applied_entry_value_len = 2 * @sizeOf(u64);
+
+fn raftAppliedEntryWrite(
+    identity: RaftAppliedEntryIdentity,
+    value_buf: *[raft_applied_entry_value_len]u8,
+) docstore_mod.KVPair {
+    std.mem.writeInt(u64, value_buf[0..8], identity.term, .little);
+    std.mem.writeInt(u64, value_buf[8..16], identity.index, .little);
+    return .{
+        .key = internal_keys.raft_document_applied_entry_key[0..],
+        .value = value_buf[0..],
+    };
+}
+
+fn readRaftAppliedEntry(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+) !?RaftAppliedEntryIdentity {
+    const raw = store.get(alloc, internal_keys.raft_document_applied_entry_key[0..]) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (raw.len != raft_applied_entry_value_len) return error.CorruptRaftAppliedEntry;
+    const identity: RaftAppliedEntryIdentity = .{
+        .term = std.mem.readInt(u64, raw[0..8], .little),
+        .index = std.mem.readInt(u64, raw[8..16], .little),
+    };
+    if (identity.term == 0 or identity.index == 0) return error.CorruptRaftAppliedEntry;
+    return identity;
+}
+
+const RaftAppliedEntryDisposition = enum { apply, already_applied };
+
+fn raftAppliedEntryDisposition(
+    persisted: ?RaftAppliedEntryIdentity,
+    incoming: RaftAppliedEntryIdentity,
+) !RaftAppliedEntryDisposition {
+    if (incoming.term == 0 or incoming.index == 0) return error.InvalidRaftAppliedEntry;
+    const current = persisted orelse return .apply;
+    if (current.index > incoming.index) return .already_applied;
+    if (current.index < incoming.index) return .apply;
+    if (current.term != incoming.term) return error.ConflictingRaftAppliedEntry;
+    return .already_applied;
+}
+
 const TransactionResolution = struct {
     txn_id: transactions_mod.TxnId,
     status: transactions_mod.TxnStatus,
     commit_version: u64,
     expected_intent_revision: u64,
     intent_keys: []const []const u8,
+    resolved_participant: ?[]const u8 = null,
 };
 
 const ha_applied_lsn_value_len: usize = @sizeOf(u64);
@@ -3070,10 +3124,11 @@ pub const DB = struct {
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
-    // Spawned at open only when the load left failures behind; exits once all
+    // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
     quarantine_retry_thread: ?std.Thread = null,
     quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    quarantine_retry_start_address_for_test: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     artifact_repair_metadata_future: ?Io.Future(void) = null,
     artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     shadow: ?ShadowState,
@@ -3303,6 +3358,11 @@ pub const DB = struct {
         .run_until_idle = maintenanceDriverRunUntilIdle,
     };
 
+    /// Low-level value-returning open. A returned value may move before its
+    /// owner installs it, so this function cannot safely launch workers that
+    /// retain `self`. Long-lived public owners should use `openOwned`; internal
+    /// containers must call `startQuarantineRetryWorkerIfNeeded` only after
+    /// installing the value at its final address.
     pub fn open(alloc: Allocator, path: []const u8, requested_opts: OpenOptions) !DB {
         return blk: {
             var opts = requested_opts;
@@ -3645,9 +3705,6 @@ pub const DB = struct {
                 try db.startOptionalRuntimes();
                 profile.start_optional_runtimes_ns = elapsedSince(start_optional_started_ns);
             }
-            if (optional_runtime_workers_enabled and opts.open_mode == .writer) {
-                db.startQuarantineRetryWorkerIfNeeded();
-            }
             if (!openModeRequiresReadOnlyBackends(opts.open_mode)) {
                 // Cleanup jobs can call back into repair/coverage state. Submit
                 // them only after startup replay and optional runtimes have
@@ -3666,6 +3723,24 @@ pub const DB = struct {
         if (self.closed) return;
         self.closed = true;
         self.deinitWrapperState(true);
+    }
+
+    /// Opens a DB in stable allocator-owned storage. Callers that retain the DB
+    /// should prefer this form whenever background workers are enabled: worker
+    /// callbacks may retain the DB address until `closeOwned` joins them.
+    pub fn openOwned(alloc: Allocator, path: []const u8, opts: OpenOptions) !*DB {
+        const owned = try alloc.create(DB);
+        errdefer alloc.destroy(owned);
+        owned.* = try open(alloc, path, opts);
+        errdefer owned.close();
+        owned.startQuarantineRetryWorkerIfNeeded();
+        return owned;
+    }
+
+    pub fn closeOwned(self: *DB) void {
+        const owner_alloc = self.alloc;
+        self.close();
+        owner_alloc.destroy(self);
     }
 
     pub fn isClosed(self: *const DB) bool {
@@ -4820,6 +4895,71 @@ pub const DB = struct {
         return self.snapshotLsmMaintenanceStatsLocked();
     }
 
+    pub const LsmOwnerKind = background_runtime_mod.LsmOwnerKind;
+
+    pub const LsmOwnerStats = struct {
+        kind: LsmOwnerKind,
+        name: []u8,
+        maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+        owner_overflow: bool = false,
+        retired_labels_collapsed_total: u64 = 0,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.name);
+            self.* = undefined;
+        }
+    };
+
+    fn snapshotLsmOwnerStatsLockedAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats {
+        var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
+        errdefer {
+            for (owners.items) |*owner| owner.deinit(alloc);
+            owners.deinit(alloc);
+        }
+        if (self.core.primary_store_owner.snapshotLsmMaintenanceStats()) |maintenance| {
+            try owners.ensureUnusedCapacity(alloc, 1);
+            const primary_name = try alloc.dupe(u8, "primary");
+            owners.appendAssumeCapacity(.{
+                .kind = .primary,
+                .name = primary_name,
+                .maintenance = maintenance,
+            });
+        }
+        var index_owners = try self.core.index_manager.snapshotLsmOwnerStatsAlloc(alloc);
+        var transferred: usize = 0;
+        defer {
+            for (index_owners[transferred..]) |*owner| owner.deinit(alloc);
+            alloc.free(index_owners);
+        }
+        for (index_owners) |owner| {
+            try owners.append(alloc, .{
+                .kind = switch (owner.kind) {
+                    .full_text => .full_text,
+                    .dense_vector => .dense_vector,
+                    else => unreachable,
+                },
+                .name = owner.name,
+                .maintenance = owner.maintenance,
+                .owner_overflow = owner.owner_overflow,
+                .retired_labels_collapsed_total = owner.retired_labels_collapsed_total,
+            });
+            transferred += 1;
+        }
+        return try owners.toOwnedSlice(alloc);
+    }
+
+    pub fn snapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) ![]LsmOwnerStats {
+        lockApplyShared(self);
+        defer self.core.unlockApplyShared();
+        return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
+    }
+
+    pub fn trySnapshotLsmOwnerStatsAlloc(self: *DB, alloc: Allocator) !?[]LsmOwnerStats {
+        if (!self.core.tryLockApplyShared()) return null;
+        defer self.core.unlockApplyShared();
+        return try self.snapshotLsmOwnerStatsLockedAlloc(alloc);
+    }
+
     pub fn trySnapshotLsmMaintenanceStats(self: *DB) ?lsm_backend_mod.Backend.MaintenanceStats {
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
@@ -5394,6 +5534,72 @@ pub const DB = struct {
         try self.batchReplicatedApplyWithMarker(req, null);
     }
 
+    /// Applies one exact data-Raft log entry and persists its identity in the
+    /// same primary-store batch. Replaying the entry after a crash becomes an
+    /// allocation-light no-op before transforms or derived work execute.
+    pub fn batchRaftReplicatedApply(
+        self: *DB,
+        req: types.BatchRequest,
+        identity: RaftAppliedEntryIdentity,
+    ) anyerror!void {
+        // Most restart replays should avoid executor health checks, resource
+        // admission, transform expansion, and derived-payload construction.
+        // batchInternal repeats this check under the mutation lock, which is
+        // the correctness fence if another caller advances the marker here.
+        if (try self.raftEntryAlreadyApplied(identity)) return;
+        var apply_req = req;
+        apply_req.sync_level = .write;
+        try self.batchInternal(apply_req, null, .{
+            .validate_range_ownership = false,
+            .wait_for_sync_level = false,
+            .bypass_ha_write_gate = true,
+            .raft_applied_entry_marker = identity,
+        });
+    }
+
+    pub fn raftAppliedEntry(self: *DB) !?RaftAppliedEntryIdentity {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return try readRaftAppliedEntry(self.alloc, self.core.store);
+    }
+
+    pub fn raftEntryAlreadyApplied(self: *DB, identity: RaftAppliedEntryIdentity) !bool {
+        lockApply(self);
+        defer self.core.unlockApply();
+        return switch (try raftAppliedEntryDisposition(
+            try readRaftAppliedEntry(self.alloc, self.core.store),
+            identity,
+        )) {
+            .apply => false,
+            .already_applied => true,
+        };
+    }
+
+    pub fn markRaftEntryApplied(self: *DB, identity: RaftAppliedEntryIdentity) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        switch (try raftAppliedEntryDisposition(
+            try readRaftAppliedEntry(self.alloc, self.core.store),
+            identity,
+        )) {
+            .already_applied => return,
+            .apply => {},
+        }
+        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        try self.core.store.putBatch(&.{marker}, &.{});
+    }
+
+    /// Removes group-local apply history when this document generation is
+    /// materialized for a different Raft history (for example restore or the
+    /// destination side of a split). The caller must hold structural ownership
+    /// of the generation; ordinary Raft apply must never clear this fence.
+    pub fn clearRaftAppliedEntry(self: *DB) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        try self.core.store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
+    }
+
     fn batchReplicatedApplyWithMarker(self: *DB, req: types.BatchRequest, applied_lsn_marker: ?u64) anyerror!void {
         var apply_req = req;
         apply_req.sync_level = .write;
@@ -5736,6 +5942,20 @@ pub const DB = struct {
         var apply_mutex_held = true;
         errdefer if (apply_mutex_held) self.core.unlockApply();
 
+        if (opts.raft_applied_entry_marker) |identity| {
+            switch (try raftAppliedEntryDisposition(
+                try readRaftAppliedEntry(self.alloc, self.core.store),
+                identity,
+            )) {
+                .apply => {},
+                .already_applied => {
+                    self.core.unlockApply();
+                    apply_mutex_held = false;
+                    return;
+                },
+            }
+        }
+
         if (opts.transaction_resolution) |resolution| {
             const intent_snapshot = try self.core.validateTransactionIntentSnapshot(
                 resolution.txn_id,
@@ -5743,12 +5963,24 @@ pub const DB = struct {
             );
             if (!intent_snapshot.has_intents) {
                 // Validate the requested decision while still avoiding mapper
-                // and index preparation on an idempotent resolve retry.
+                // and index preparation on an idempotent resolve retry. Intent
+                // resolution does not advance the prepare revision, so another
+                // resolver can legitimately remove the intents between the
+                // optimistic collection and this apply fence. The replicated
+                // receipt and coordinator acknowledgement must still commit in
+                // the same terminal batch before Raft advances this entry.
+                var raft_marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+                const completion_writes: []const docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
+                    &.{raftAppliedEntryWrite(identity, &raft_marker_value_buf)}
+                else
+                    &.{};
                 const outcome = try self.core.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,
                     resolution.status,
                     resolution.commit_version,
                     .{
+                        .completion_writes = completion_writes,
+                        .resolved_participant = resolution.resolved_participant,
                         .expected_intent_revision = resolution.expected_intent_revision,
                         .known_intent_keys = resolution.intent_keys,
                     },
@@ -6267,6 +6499,7 @@ pub const DB = struct {
             opts.extra_store_writes.len == 0 and
             opts.transaction_resolution == null and
             opts.ha_applied_lsn_marker == null and
+            opts.raft_applied_entry_marker == null and
             !thinReplayInputsHaveDerivedWork(
                 effective_req,
                 deleted_artifact_keys,
@@ -6393,6 +6626,18 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, haAppliedReplicationLsnWrite(lsn, &ha_applied_lsn_value_buf));
             }
         }
+        var raft_applied_entry_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const raft_applied_entry_write: ?docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
+            raftAppliedEntryWrite(identity, &raft_applied_entry_value_buf)
+        else
+            null;
+        // A transaction resolution owns a second idempotency boundary: normal
+        // document writes must not be replayed once its decision is terminal,
+        // while the command receipt and participant acknowledgement still
+        // must be completed. Keep those completion writes separate.
+        if (raft_applied_entry_write) |write| {
+            if (opts.transaction_resolution == null) try store_writes.append(self.alloc, write);
+        }
         var split_range_value: ?[]u8 = null;
         defer if (split_range_value) |value| self.alloc.free(value);
         var split_sequence_buf: [8]u8 = undefined;
@@ -6492,6 +6737,8 @@ pub const DB = struct {
                     .replay = if (replay_append) |entry| .{ .sequence = entry.sequence, .payload = entry.payload } else null,
                     .expected_intent_revision = resolution.expected_intent_revision,
                     .known_intent_keys = resolution.intent_keys,
+                    .completion_writes = if (raft_applied_entry_write) |write| &.{write} else &.{},
+                    .resolved_participant = resolution.resolved_participant,
                 },
             );
             if (outcome.applied) {
@@ -13498,6 +13745,12 @@ pub const DB = struct {
         shadow_manager.setIo(self.backend_runtime.io());
         shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |transfer_err| {
+                std.log.warn("failed to preserve unopened shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(transfer_err),
+                });
+            };
             shadow_manager.deinit();
             if (resume_candidate) {
                 candidate_reopenable = false;
@@ -13507,7 +13760,15 @@ pub const DB = struct {
             return err;
         };
         var shadow_manager_open = true;
-        defer if (shadow_manager_open) shadow_manager.deinit();
+        defer if (shadow_manager_open) {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |err| {
+                std.log.warn("failed to preserve shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(err),
+                });
+            };
+            shadow_manager.deinit();
+        };
 
         // A scan cursor is useful only when there is a durable intent to own
         // it. Non-durable/internal one-shot rebuild callers retain the existing
@@ -14068,6 +14329,12 @@ pub const DB = struct {
             retired_generation = null;
         }
         if (shadow_manager_open) {
+            shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |err| {
+                std.log.warn("failed to preserve activated shadow LSM clone attribution index={s} err={s}", .{
+                    cfg.name,
+                    @errorName(err),
+                });
+            };
             shadow_manager.deinit();
             shadow_manager_open = false;
         }
@@ -15777,6 +16044,35 @@ pub const DB = struct {
         );
     }
 
+    pub fn beginReplicatedTransactionAtRaftEntry(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+        identity: RaftAppliedEntryIdentity,
+    ) !transactions_mod.TxnId {
+        lockApply(self);
+        defer self.core.unlockApply();
+        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+            .already_applied => return txn_id,
+            .apply => {},
+        }
+        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        return try self.core.beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
+            .{ .writes = &.{marker} },
+        );
+    }
+
     pub fn writeIntents(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -15800,6 +16096,24 @@ pub const DB = struct {
     }
 
     pub fn writeTransaction(self: *DB, txn_id: types.TxnId, req: types.TransactionIntentRequest) !void {
+        try self.writeTransactionInternal(txn_id, req, null);
+    }
+
+    pub fn writeReplicatedTransactionAtRaftEntry(
+        self: *DB,
+        txn_id: types.TxnId,
+        req: types.TransactionIntentRequest,
+        identity: RaftAppliedEntryIdentity,
+    ) !void {
+        try self.writeTransactionInternal(txn_id, req, identity);
+    }
+
+    fn writeTransactionInternal(
+        self: *DB,
+        txn_id: types.TxnId,
+        req: types.TransactionIntentRequest,
+        raft_entry: ?RaftAppliedEntryIdentity,
+    ) !void {
         // Transform expansion is a read-modify-write operation. Hold the same
         // apply fence used by ordinary batches from the source read through
         // predicate validation and durable intent installation; otherwise a
@@ -15846,7 +16160,22 @@ pub const DB = struct {
             try identity_upsert_keys.append(self.alloc, intent.key);
         }
         try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
-        try self.core.writeIntents(txn_id, intents.items, predicates.items);
+        if (raft_entry) |identity| {
+            switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+                .already_applied => return,
+                .apply => {},
+            }
+            var value_buf: [raft_applied_entry_value_len]u8 = undefined;
+            const marker = raftAppliedEntryWrite(identity, &value_buf);
+            try self.core.writeIntentsExtraBatch(
+                txn_id,
+                intents.items,
+                predicates.items,
+                .{ .writes = &.{marker} },
+            );
+        } else {
+            try self.core.writeIntents(txn_id, intents.items, predicates.items);
+        }
     }
 
     // resolveTransactionTransforms, removePendingTransactionWrite, and freeTransactionWritesOwned
@@ -15881,17 +16210,73 @@ pub const DB = struct {
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
     ) !void {
-        var ha_mutation = self.acquireHAMutationShared();
+        try self.resolveTransactionIntentsInternal(
+            txn_id,
+            status,
+            commit_version,
+            sync_level,
+            visibility_cancellation,
+            null,
+            null,
+        );
+    }
+
+    pub fn resolveReplicatedTransactionAtRaftEntry(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        sync_level: types.SyncLevel,
+        visibility_cancellation: types.CancellationToken,
+        identity: RaftAppliedEntryIdentity,
+        resolved_participant: ?[]const u8,
+    ) !void {
+        try self.resolveTransactionIntentsInternal(
+            txn_id,
+            status,
+            commit_version,
+            sync_level,
+            visibility_cancellation,
+            identity,
+            resolved_participant,
+        );
+    }
+
+    fn resolveTransactionIntentsInternal(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        status: transactions_mod.TxnStatus,
+        commit_version: u64,
+        sync_level: types.SyncLevel,
+        visibility_cancellation: types.CancellationToken,
+        raft_entry: ?RaftAppliedEntryIdentity,
+        resolved_participant: ?[]const u8,
+    ) !void {
+        var ha_mutation = if (raft_entry == null) self.acquireHAMutationShared() else null;
         defer if (ha_mutation) |*lease| lease.release();
-        try self.enforceHAWriteGate();
+        if (raft_entry == null) try self.enforceHAWriteGate();
         if (status != .committed) {
             lockApply(self);
             defer self.core.unlockApply();
-            _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{}) catch |err| switch (err) {
+            var marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+            const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
+                switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+                    .already_applied => return,
+                    .apply => {},
+                }
+                break :blk &.{raftAppliedEntryWrite(identity, &marker_value_buf)};
+            } else &.{};
+            _ = self.core.resolveTransactionIntentsWithExtraBatch(txn_id, status, commit_version, .{
+                .completion_writes = marker_writes,
+                .resolved_participant = resolved_participant,
+            }) catch |err| switch (err) {
                 // An abort decision for a participant that was declared but
                 // never enlisted is already satisfied. Treat it as an
                 // idempotent no-op so coordinator recovery can acknowledge it.
-                transactions_mod.TxnError.TxnNotFound => return,
+                transactions_mod.TxnError.TxnNotFound => {
+                    if (marker_writes.len != 0) try self.core.store.putBatch(marker_writes, &.{});
+                    return;
+                },
                 else => return err,
             };
             return;
@@ -15907,11 +16292,24 @@ pub const DB = struct {
             for (intents.deletes, 0..) |key, i| intent_keys[intents.writes.len + i] = key;
             if (intents.writes.len == 0 and intents.deletes.len == 0) {
                 lockApply(self);
+                var marker_value_buf: [raft_applied_entry_value_len]u8 = undefined;
+                const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
+                    switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+                        .already_applied => {
+                            self.core.unlockApply();
+                            return;
+                        },
+                        .apply => {},
+                    }
+                    break :blk &.{raftAppliedEntryWrite(identity, &marker_value_buf)};
+                } else &.{};
                 const outcome = self.core.resolveTransactionIntentsWithExtraBatch(
                     txn_id,
                     status,
                     commit_version,
                     .{
+                        .completion_writes = marker_writes,
+                        .resolved_participant = resolved_participant,
                         .expected_intent_revision = intents.revision,
                         .known_intent_keys = intent_keys,
                     },
@@ -15936,12 +16334,15 @@ pub const DB = struct {
                 .sync_level = sync_level,
             }, null, .{
                 .visibility_cancellation = visibility_cancellation,
+                .bypass_ha_write_gate = raft_entry != null,
+                .raft_applied_entry_marker = raft_entry,
                 .transaction_resolution = .{
                     .txn_id = txn_id,
                     .status = status,
                     .commit_version = commit_version,
                     .expected_intent_revision = intents.revision,
                     .intent_keys = intent_keys,
+                    .resolved_participant = resolved_participant,
                 },
             }) catch |err| {
                 if (err == error.IntentSnapshotChanged) continue;
@@ -15968,6 +16369,10 @@ pub const DB = struct {
         return try self.core.transactionDefersCoordinatorAcknowledgement(txn_id);
     }
 
+    pub fn transactionRetainsCoordinatorAcknowledgement(self: *DB, txn_id: transactions_mod.TxnId) !bool {
+        return try self.core.transactionRetainsCoordinatorAcknowledgement(txn_id);
+    }
+
     /// Returns whether split or merge handoff would strand a pending decision,
     /// unresolved participant, intent, or HA recovery outbox.
     pub fn hasTopologySensitiveTransactions(self: *DB) !bool {
@@ -15983,6 +16388,30 @@ pub const DB = struct {
         try self.core.markTransactionParticipantResolved(txn_id, participant);
     }
 
+    pub fn markReplicatedTransactionParticipantResolvedAtRaftEntry(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        participant: []const u8,
+        identity: RaftAppliedEntryIdentity,
+    ) !void {
+        lockApply(self);
+        defer self.core.unlockApply();
+        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+            .already_applied => return,
+            .apply => {},
+        }
+        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        self.core.markTransactionParticipantResolvedExtraBatch(
+            txn_id,
+            participant,
+            .{ .writes = &.{marker} },
+        ) catch |err| switch (err) {
+            transactions_mod.TxnError.TxnNotFound => try self.core.store.putBatch(&.{marker}, &.{}),
+            else => return err,
+        };
+    }
+
     pub fn cleanupTransactionMetadataIfEligible(
         self: *DB,
         txn_id: transactions_mod.TxnId,
@@ -15992,6 +16421,29 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
+    }
+
+    pub fn cleanupReplicatedTransactionAtRaftEntry(
+        self: *DB,
+        txn_id: transactions_mod.TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+        identity: RaftAppliedEntryIdentity,
+    ) !bool {
+        lockApply(self);
+        defer self.core.unlockApply();
+        switch (try raftAppliedEntryDisposition(try readRaftAppliedEntry(self.alloc, self.core.store), identity)) {
+            .already_applied => return false,
+            .apply => {},
+        }
+        var value_buf: [raft_applied_entry_value_len]u8 = undefined;
+        const marker = raftAppliedEntryWrite(identity, &value_buf);
+        return try self.core.cleanupTransactionMetadataIfEligibleExtraBatch(
+            txn_id,
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+            .{ .writes = &.{marker} },
+        );
     }
 
     pub fn getTransactionParticipants(self: *DB, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {
@@ -18681,12 +19133,21 @@ pub const DB = struct {
         }
     }
 
-    fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
-        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+    /// Start only after the DB has reached its final address. The spawned
+    /// thread retains `self` after this call returns.
+    pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
         // Tests drive retries deterministically via retryQuarantinedIndexLoads;
         // a background worker racing them turns every quarantine-shaped test
         // into a timing assumption.
-        if (comptime builtin.is_test) return;
+        if (comptime builtin.is_test) {
+            if (self.quarantine_retry_start_address_for_test == 0) {
+                self.quarantine_retry_start_address_for_test = @intFromPtr(self);
+            }
+            return;
+        }
+        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
+        if (!self.optional_runtime_workers_enabled or self.open_mode != .writer) return;
+        if (self.quarantine_retry_thread != null) return;
         if (!self.core.index_manager.hasLoadFailures()) return;
         self.quarantine_retry_thread = std.Thread.spawn(.{}, quarantineRetryWorkerMain, .{self}) catch |err| {
             // Self-healing is best-effort: the quarantine still recovers on
@@ -18694,6 +19155,14 @@ pub const DB = struct {
             std.log.warn("quarantine retry worker spawn failed: {}", .{err});
             return;
         };
+    }
+
+    pub fn quarantineRetryWorkerStartedAtCurrentAddressForTest(self: *const DB) bool {
+        if (comptime builtin.is_test) {
+            return self.quarantine_retry_start_address_for_test == @intFromPtr(self);
+        } else {
+            return false;
+        }
     }
 
     fn stopQuarantineRetryWorker(self: *DB) void {
@@ -19604,6 +20073,7 @@ pub const DB = struct {
 
         for (self.core.index_manager.dense_indexes.items, 0..) |*entry, dense_index_idx| {
             const artifact_backed = entry.external or entry.chunk_name != null or entry.embedding_name != null;
+            const generation_repair_pending = entry.index.generationRepairPending();
             const artifact_counter_required = try index_manager_mod.denseConfigRequiresArtifactCoverage(alloc, entry.config);
             const status_snapshot = try self.loadIndexStatusSnapshot(alloc, entry.config.name);
             const watermark_count = if (status_snapshot) |status_value|
@@ -19611,7 +20081,7 @@ pub const DB = struct {
             else
                 0;
             const watermark_regressed = watermark_count > entry.index.stats().active_count;
-            if (!artifact_backed and !watermark_regressed) continue;
+            if (!artifact_backed and !watermark_regressed and !generation_repair_pending) continue;
 
             const rebuild_root_path = try self.denseIndexRebuildStatePathAlloc(alloc, entry.config.name);
             defer alloc.free(rebuild_root_path);
@@ -19642,6 +20112,7 @@ pub const DB = struct {
                 applied_sequence,
             );
             if (persisted_resume == null and
+                !generation_repair_pending and
                 !checkpoint_config_mismatch and
                 applied_sequence < target_sequence and
                 projection_checkpoint.status != .rebuilding and
@@ -19650,6 +20121,7 @@ pub const DB = struct {
                 continue;
             }
             const invalid_generation_error: ?[]const u8 = blk: {
+                if (generation_repair_pending) break :blk "dense_hbc_published_snapshot_incomplete";
                 if (checkpoint_config_mismatch) break :blk "dense_projection_config_mismatch";
                 if (projection_checkpoint.status == .repair_required) break :blk "dense_projection_checkpoint_repair_required";
                 if (entry.index.stats().active_count == 0) break :blk null;
@@ -22851,6 +23323,10 @@ pub const DB = struct {
             try hashes.append(alloc, .{
                 .id = try alloc.dupe(u8, raw_key),
                 .hash = hash,
+                .content_hash = if (opts.include_content_hashes)
+                    try document_content_hash.hashJson(alloc, doc.value)
+                else
+                    null,
             });
 
             if (opts.include_documents) {
@@ -23982,13 +24458,46 @@ pub const DB = struct {
         try self.applyGraphExpandStrategy(alloc, base, req.expand_strategy);
     }
 
+    /// Persist the fail-closed repair decision before reporting that the index
+    /// is rebuilding. The HBC marker is generation-scoped, so a failure from a
+    /// snapshot superseded before this callback arrived cannot quarantine the
+    /// current serving generation.
+    fn persistIncompleteHbcSnapshotRepair(
+        self: *DB,
+        entry: *index_manager_mod.IndexManager.DenseIndex,
+    ) !bool {
+        if (!entry.index.generationRepairPending()) return false;
+        _ = self.ensureAutomaticDenseGenerationRepairIntent(
+            self.alloc,
+            entry.config,
+            .projection_generation_invalid,
+            "dense_hbc_published_snapshot_incomplete",
+        ) catch |err| switch (err) {
+            error.DurableIndexRepairStateUnavailable => {
+                // Embedded/Lite runtimes intentionally have no durable repair
+                // owner. The query gate is already closed; their maintenance
+                // pass performs the same synchronous shadow replacement used
+                // for other automatic generation repairs.
+                std.log.warn("incomplete dense index quarantined without durable repair owner name={s}", .{entry.config.name});
+            },
+            else => return err,
+        };
+        return true;
+    }
+
     fn hbcSearchCallback(
         ctx: ?*anyopaque,
         entry: *index_manager_mod.IndexManager.DenseIndex,
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.SearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryWithRequest(entry, req);
+        return self.core.index_manager.searchDenseEntryWithRequest(entry, req) catch |err| switch (err) {
+            error.IncompletePublishedSnapshot => {
+                if (!try self.persistIncompleteHbcSnapshotRepair(entry)) return err;
+                return error.IndexRebuilding;
+            },
+            else => return err,
+        };
     }
 
     fn hbcSearchProfiledCallback(
@@ -23997,7 +24506,13 @@ pub const DB = struct {
         req: vectorindex_mod.SearchRequest,
     ) anyerror!vectorindex_mod.ProfiledSearchResults {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req);
+        return self.core.index_manager.searchDenseEntryProfiledWithRequest(entry, req) catch |err| switch (err) {
+            error.IncompletePublishedSnapshot => {
+                if (!try self.persistIncompleteHbcSnapshotRepair(entry)) return err;
+                return error.IndexRebuilding;
+            },
+            else => return err,
+        };
     }
 
     fn exactDenseSearchCallback(
@@ -26933,6 +27448,18 @@ fn resolvedDocSetFromSearchHitOrdinalsAlloc(alloc: Allocator, hits: []const type
         ordinals[i] = hit.doc_ordinal orelse return null;
     }
     return try doc_set.fromOrdinalsAlloc(alloc, ordinals);
+}
+
+test "owned DB open starts self-retaining workers at the stable allocation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owned-db-worker", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const db = try DB.openOwned(alloc, path, .{});
+    defer db.closeOwned();
+    try std.testing.expect(db.quarantineRetryWorkerStartedAtCurrentAddressForTest());
 }
 
 test "resolved doc set from search hits uses complete hit ordinals" {
@@ -43042,6 +43569,10 @@ fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docsto
     const admission_prefix = try internal_keys.managedIndexAdmissionRootPrefixAlloc(alloc);
     defer alloc.free(admission_prefix);
     try deleteKeysWithPrefixFromStore(alloc, dest_store, admission_prefix);
+    // The destination owns an independent Raft log. A physical page split can
+    // copy the source's higher applied index; retaining it would suppress valid
+    // low-index entries in the new group.
+    try dest_store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
 }
 
 fn ensureReplayFloor(store: *docstore_mod.DocStore, next_sequence: u64) !void {
@@ -66052,6 +66583,18 @@ test "db batch persists per-index applied sequence watermark" {
     try std.testing.expectEqual(@as(u64, 0), index_lsm.immutable_memtables);
     try std.testing.expect(index_lsm.wal_checkpoint_current_segment > 0);
     try std.testing.expectEqual(@as(u64, 0), index_lsm.wal_checkpoint_lag_segments);
+
+    const owner_stats = (try db.trySnapshotLsmOwnerStatsAlloc(alloc)) orelse
+        return error.UnexpectedLsmOwnerStatsContention;
+    defer {
+        for (owner_stats) |*owner| owner.deinit(alloc);
+        alloc.free(owner_stats);
+    }
+    try std.testing.expectEqual(@as(usize, 2), owner_stats.len);
+    try std.testing.expectEqual(DB.LsmOwnerKind.primary, owner_stats[0].kind);
+    try std.testing.expectEqualStrings("primary", owner_stats[0].name);
+    try std.testing.expectEqual(DB.LsmOwnerKind.full_text, owner_stats[1].kind);
+    try std.testing.expectEqualStrings("ft_v1", owner_stats[1].name);
 }
 
 test "db managed projection checkpoints persist status and config identity" {
@@ -75749,6 +76292,58 @@ test "db forced generation repair completion is crash idempotent before api ackn
     try std.testing.expectEqual(@as(u64, 1), replayed.repaired);
     try std.testing.expectEqual(@as(u64, 1), replayed.indexes_rebuilt);
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+}
+
+test "db incomplete HBC snapshot persists generation repair before maintenance" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var repair_id: u128 = 0;
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        const dense = db.core.index_manager.denseIndex("dense_idx") orelse return error.TestUnexpectedResult;
+
+        const stale_generation = dense.index.publishedGeneration();
+        dense.index.refreshPublishedSearchState();
+        dense.index.noteIncompletePublishedSnapshotForGeneration(stale_generation);
+        try std.testing.expect(!try db.persistIncompleteHbcSnapshotRepair(dense));
+        try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
+        try std.testing.expect(!db.core.index_manager.repairUnavailable("dense_idx"));
+
+        dense.index.noteIncompletePublishedSnapshot();
+
+        try std.testing.expect(try db.persistIncompleteHbcSnapshotRepair(dense));
+        try std.testing.expect(db.core.index_manager.repairUnavailable("dense_idx"));
+        repair_id = (try db.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult;
+        var repair = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer repair.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Trigger.projection_generation_invalid, repair.intent.trigger);
+        try std.testing.expectEqualStrings("dense_hbc_published_snapshot_incomplete", repair.intent.last_error.?);
+    }
+
+    // The query-path decision must survive a process boundary even if the
+    // periodic repair-maintenance pass never ran in the detecting process.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reopened.close();
+    try std.testing.expectEqual(
+        repair_id,
+        (try reopened.indexRepairIdForIndex(alloc, "dense_idx")) orelse return error.TestUnexpectedResult,
+    );
+    try std.testing.expect(reopened.core.index_manager.repairUnavailable("dense_idx"));
 }
 
 test "db forced repair attaches to automatic generation intent idempotently" {
@@ -87775,6 +88370,145 @@ test "db explicit resolveTransactionIntents applies participant-style commit ver
     const raw = (try db.get(alloc, "doc:participant")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"replicated\"}", raw);
+}
+
+test "db replicated transaction commits each raft receipt atomically" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const txn_id: transactions_mod.TxnId = .{0x5a} ** 16;
+    const participant = "table:receipts:group:7";
+    const begin_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 11 };
+    const prepare_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 12 };
+    const resolve_entry: RaftAppliedEntryIdentity = .{ .term = 3, .index = 13 };
+
+    _ = try db.beginReplicatedTransactionAtRaftEntry(
+        txn_id,
+        12_000,
+        12_000,
+        &.{participant},
+        false,
+        false,
+        begin_entry,
+    );
+    try std.testing.expectEqualDeep(begin_entry, (try db.raftAppliedEntry()).?);
+
+    // An exact begin replay is fenced before it can alter the existing record.
+    _ = try db.beginReplicatedTransactionAtRaftEntry(
+        txn_id,
+        99_000,
+        99_000,
+        &.{participant},
+        false,
+        false,
+        begin_entry,
+    );
+    try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn_id));
+
+    try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
+        .writes = &.{.{ .key = "doc:receipt", .value = "{\"title\":\"transaction\"}" }},
+    }, prepare_entry);
+    try std.testing.expectEqualDeep(prepare_entry, (try db.raftAppliedEntry()).?);
+
+    try db.resolveReplicatedTransactionAtRaftEntry(
+        txn_id,
+        .committed,
+        15_000,
+        .write,
+        .none,
+        resolve_entry,
+        participant,
+    );
+    try std.testing.expectEqualDeep(resolve_entry, (try db.raftAppliedEntry()).?);
+    const unresolved = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved);
+    try std.testing.expectEqual(@as(usize, 0), unresolved.len);
+
+    // Replaying the terminal entry after a newer write must not replay the
+    // transaction's document batch. This also exercises the terminal
+    // completion path used after a crash between old non-atomic versions.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:receipt", .value = "{\"title\":\"newer\"}" }},
+        .timestamp_ns = 16_000,
+    });
+    try db.resolveReplicatedTransactionAtRaftEntry(
+        txn_id,
+        .committed,
+        15_000,
+        .write,
+        .none,
+        resolve_entry,
+        participant,
+    );
+    const raw = (try db.get(alloc, "doc:receipt")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"newer\"}", raw);
+    try std.testing.expectEqual(@as(u64, 16_000), try db.getTimestamp(alloc, "doc:receipt"));
+}
+
+test "db raced replicated transaction completion persists receipt and participant acknowledgement" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    const txn_id: transactions_mod.TxnId = .{0x6b} ** 16;
+    const participant = "table:receipts:group:8";
+    _ = try db.beginReplicatedTransactionAtRaftEntry(
+        txn_id,
+        20_000,
+        20_000,
+        &.{participant},
+        true,
+        true,
+        .{ .term = 4, .index = 21 },
+    );
+    try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
+        .writes = &.{.{ .key = "doc:raced-receipt", .value = "{\"title\":\"transaction\"}" }},
+    }, .{ .term = 4, .index = 22 });
+
+    var collected = try db.core.collectTransactionIntentBatch(alloc, txn_id);
+    defer collected.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), collected.writes.len);
+
+    // Model the production race: collection happened outside the apply fence,
+    // then recovery resolved the intents before the replicated entry acquired
+    // the lock. Resolution deliberately preserves intent_revision.
+    try db.resolveTransactionIntents(txn_id, .committed, 25_000);
+    const unresolved_before = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved_before);
+    try std.testing.expectEqual(@as(usize, 1), unresolved_before.len);
+
+    const resolve_entry: RaftAppliedEntryIdentity = .{ .term = 4, .index = 23 };
+    try db.batchInternal(.{
+        .writes = &.{.{ .key = "doc:raced-receipt", .value = "{\"title\":\"transaction\"}" }},
+        .timestamp_ns = 25_000,
+        .sync_level = .write,
+    }, null, .{
+        .bypass_ha_write_gate = true,
+        .raft_applied_entry_marker = resolve_entry,
+        .transaction_resolution = .{
+            .txn_id = txn_id,
+            .status = .committed,
+            .commit_version = 25_000,
+            .expected_intent_revision = collected.revision,
+            .intent_keys = &.{"doc:raced-receipt"},
+            .resolved_participant = participant,
+        },
+    });
+
+    try std.testing.expectEqualDeep(resolve_entry, (try db.raftAppliedEntry()).?);
+    const unresolved_after = try db.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved_after);
+    try std.testing.expectEqual(@as(usize, 0), unresolved_after.len);
 }
 
 test "db transaction repeated committed resolve cannot overwrite a newer write" {

@@ -21,6 +21,7 @@
 const std = @import("std");
 const ml = @import("ml");
 const runtime = @import("../runtime/root.zig");
+const a4b_qualification = @import("../runtime/moe/a4b_qualification.zig");
 const gguf_tensor_types = @import("../gguf/tensor_types.zig");
 const quant_matmul = @import("quant_matmul.zig");
 
@@ -38,6 +39,194 @@ pub const BackendKind = enum {
     webgpu,
     graph,
 };
+
+/// Public residency policy for the qualified Gemma 4 26B-A4B Q4_0 runtime.
+/// The execution backend resolves `auto` once, at model load, so a session
+/// cannot silently change its memory contract while serving requests.
+pub const A4bResidencyMode = enum(u8) {
+    auto,
+    streamed,
+    resident,
+};
+
+/// The complete caller-controlled A4B surface. Expert slots, prefetch depth,
+/// worker counts, and routing placement are intentionally backend-owned.
+pub const A4bInferenceRequest = struct {
+    residency_mode: A4bResidencyMode = .auto,
+    /// Total memory envelope in MiB. Zero selects the conservative 2 GiB
+    /// streamed floor; an explicitly smaller value is rejected.
+    memory_budget_mb: u32 = 0,
+};
+
+pub const A4bExpertGeometry = struct {
+    moe_layer_count: u16,
+    expert_count: u16,
+    top_k: u8,
+    hidden_size: u32,
+    expert_intermediate_size: u32,
+    /// Encoded Q4_0 bytes for gate, up, and down for one routed expert.
+    encoded_expert_bytes: u64,
+};
+
+/// This is deliberately a single-entry qualification table. Supporting a
+/// shape is a release claim, not a best-effort dispatch decision.
+pub const qualified_a4b_geometries = [_]A4bExpertGeometry{.{
+    .moe_layer_count = a4b_qualification.moe_layer_count,
+    .expert_count = a4b_qualification.expert_count,
+    .top_k = a4b_qualification.top_k,
+    .hidden_size = a4b_qualification.hidden_size,
+    .expert_intermediate_size = a4b_qualification.expert_intermediate_size,
+    .encoded_expert_bytes = a4b_qualification.encoded_expert_bytes,
+}};
+
+pub const A4bInferenceConfig = struct {
+    residency_mode: A4bResidencyMode,
+    memory_budget_bytes: u64,
+    kv_budget_bytes: u64,
+    safety_reserve_bytes: u64 = default_safety_reserve_bytes,
+    expert_cache_slots: u8,
+    geometry: A4bExpertGeometry,
+
+    pub const min_memory_budget_mb: u32 = 2048;
+    /// Unassigned headroom inside the public envelope. Sixty-four MiB is the
+    /// largest reserve that still admits one complete top-8 route at 2 GiB
+    /// with the qualified model's measured static footprint.
+    pub const default_safety_reserve_bytes: u64 = 64 * 1024 * 1024;
+    pub const static_overhead_bytes: u64 = 700 * 1024 * 1024;
+    pub const min_expert_cache_slots: u8 = 8;
+    pub const max_expert_cache_slots: u8 = 128;
+    pub const expert_arena_alignment: u64 = 16 * 1024;
+
+    pub fn softLimitBytes(self: A4bInferenceConfig) u64 {
+        return self.memory_budget_bytes -| self.safety_reserve_bytes;
+    }
+
+    pub fn fullResidencyFloorBytes(self: A4bInferenceConfig) u64 {
+        const arena_bytes = std.mem.alignForward(
+            u64,
+            self.geometry.encoded_expert_bytes,
+            expert_arena_alignment,
+        );
+        return static_overhead_bytes + self.kv_budget_bytes +
+            @as(u64, self.geometry.moe_layer_count) *
+                @as(u64, self.geometry.expert_count) * arena_bytes +
+            self.safety_reserve_bytes;
+    }
+
+    pub fn kvBudgetBytesForBudget(budget_bytes: u64) u64 {
+        const mib: u64 = 1024 * 1024;
+        const floor: u64 = 384 * mib;
+        const cap: u64 = 1024 * mib;
+        const quarter = (budget_bytes / 4 / mib) * mib;
+        return @max(floor, @min(quarter, cap));
+    }
+};
+
+pub const A4bConfigError = error{
+    A4bBudgetTooSmall,
+    A4bResidentBudgetTooSmall,
+    A4bUnsupportedArtifact,
+    A4bUnsupportedGeometry,
+};
+
+pub fn isQualifiedA4bGeometry(geometry: A4bExpertGeometry) bool {
+    return for (qualified_a4b_geometries) |candidate| {
+        if (std.meta.eql(candidate, geometry)) break true;
+    } else false;
+}
+
+/// Freeze the public request into a backend-neutral, fail-closed load-time
+/// contract. `auto` selects resident only when the complete expert set and
+/// reserves fit; there is no partially resident public mode.
+pub fn buildA4bInferenceConfig(
+    request: A4bInferenceRequest,
+    geometry: A4bExpertGeometry,
+) A4bConfigError!A4bInferenceConfig {
+    if (!isQualifiedA4bGeometry(geometry)) return error.A4bUnsupportedGeometry;
+    if (request.memory_budget_mb != 0 and
+        request.memory_budget_mb < A4bInferenceConfig.min_memory_budget_mb)
+    {
+        return error.A4bBudgetTooSmall;
+    }
+
+    const budget_mb = if (request.memory_budget_mb == 0)
+        A4bInferenceConfig.min_memory_budget_mb
+    else
+        request.memory_budget_mb;
+    const budget_bytes = @as(u64, budget_mb) * 1024 * 1024;
+    const kv_budget_bytes = A4bInferenceConfig.kvBudgetBytesForBudget(budget_bytes);
+    const arena_bytes = std.mem.alignForward(
+        u64,
+        geometry.encoded_expert_bytes,
+        A4bInferenceConfig.expert_arena_alignment,
+    );
+    const available = budget_bytes -| A4bInferenceConfig.static_overhead_bytes -|
+        kv_budget_bytes -| A4bInferenceConfig.default_safety_reserve_bytes;
+    const per_slot_bytes = @as(u64, geometry.moe_layer_count) * arena_bytes;
+    const slots: u8 = @intCast(std.math.clamp(
+        available / per_slot_bytes,
+        @as(u64, A4bInferenceConfig.min_expert_cache_slots),
+        @as(u64, A4bInferenceConfig.max_expert_cache_slots),
+    ));
+
+    var config = A4bInferenceConfig{
+        .residency_mode = .streamed,
+        .memory_budget_bytes = budget_bytes,
+        .kv_budget_bytes = kv_budget_bytes,
+        .expert_cache_slots = slots,
+        .geometry = geometry,
+    };
+    const full_resident = @as(u16, slots) == geometry.expert_count and
+        budget_bytes >= config.fullResidencyFloorBytes();
+    config.residency_mode = switch (request.residency_mode) {
+        .auto => if (full_resident) .resident else .streamed,
+        .streamed => .streamed,
+        .resident => if (full_resident) .resident else return error.A4bResidentBudgetTooSmall,
+    };
+    return config;
+}
+
+test "A4B inference contract is qualified and budget derived" {
+    const geometry = qualified_a4b_geometries[0];
+    const floor = try buildA4bInferenceConfig(.{}, geometry);
+    try std.testing.expectEqual(A4bResidencyMode.streamed, floor.residency_mode);
+    try std.testing.expectEqual(@as(u8, 8), floor.expert_cache_slots);
+    try std.testing.expectEqual(@as(u64, 2048) * 1024 * 1024, floor.memory_budget_bytes);
+    try std.testing.expectEqual(@as(u64, 512) * 1024 * 1024, floor.kv_budget_bytes);
+
+    try std.testing.expectEqual(@as(u8, 24), (try buildA4bInferenceConfig(.{ .memory_budget_mb = 4096 }, geometry)).expert_cache_slots);
+    try std.testing.expectEqual(@as(u8, 45), (try buildA4bInferenceConfig(.{ .memory_budget_mb = 6144 }, geometry)).expert_cache_slots);
+    try std.testing.expectEqual(@as(u8, 66), (try buildA4bInferenceConfig(.{ .memory_budget_mb = 8192 }, geometry)).expert_cache_slots);
+
+    const arena_bytes = std.mem.alignForward(
+        u64,
+        geometry.encoded_expert_bytes,
+        A4bInferenceConfig.expert_arena_alignment,
+    );
+    const tracked_floor = A4bInferenceConfig.static_overhead_bytes + floor.kv_budget_bytes +
+        @as(u64, geometry.moe_layer_count) * @as(u64, floor.expert_cache_slots) * arena_bytes;
+    try std.testing.expect(tracked_floor <= floor.softLimitBytes());
+
+    const resident = try buildA4bInferenceConfig(.{ .memory_budget_mb = 16384 }, geometry);
+    try std.testing.expectEqual(A4bResidencyMode.resident, resident.residency_mode);
+    try std.testing.expectEqual(@as(u8, 128), resident.expert_cache_slots);
+    try std.testing.expect(resident.memory_budget_bytes >= resident.fullResidencyFloorBytes());
+}
+
+test "A4B inference contract fails closed" {
+    const geometry = qualified_a4b_geometries[0];
+    try std.testing.expectError(
+        error.A4bBudgetTooSmall,
+        buildA4bInferenceConfig(.{ .memory_budget_mb = 2047 }, geometry),
+    );
+    try std.testing.expectError(
+        error.A4bResidentBudgetTooSmall,
+        buildA4bInferenceConfig(.{ .residency_mode = .resident }, geometry),
+    );
+    var wrong = geometry;
+    wrong.expert_count -= 1;
+    try std.testing.expectError(error.A4bUnsupportedGeometry, buildA4bInferenceConfig(.{}, wrong));
+}
 
 pub const TensorStorageClass = enum {
     unknown,
@@ -684,6 +873,20 @@ pub const RunGatedFfnResidualRequest = struct {
     planned_layer_contract: PlannedLayerContract = .{},
 };
 
+/// Backend-owned gated FFN without a residual epilogue. This is useful for
+/// parallel/shared-expert branches whose post norm and residual are applied
+/// only after multiple branches have been combined.
+pub const GatedFfnNoBiasRequest = struct {
+    input: CT,
+    gate_weight: CT,
+    up_weight: CT,
+    down_weight: CT,
+    rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    activation: DecoderRuntimeActivationKind,
+};
+
 pub const RunAttentionRequest = struct {
     q: CT,
     k: CT,
@@ -891,12 +1094,24 @@ pub const DecoderRuntimePrepareReuseResult = struct {
 
 pub const DecoderRuntimeDecodeContract = enum(u8) {
     gemma4_gated_ple_shared_kv,
+    /// Qualified Gemma 4 26B-A4B qLen=1 decode. The backend owns the packed
+    /// expert descriptors and immutable norm vectors for the full token
+    /// frame. This text-only GGUF has no per-layer embedding channel.
+    gemma4_a4b_shared_kv,
     gliner_deberta_encoder,
     qwen3_dense_text_embedding,
 };
 
 pub const DecoderRuntimeDecodeMode = enum(u8) {
     greedy_argmax,
+};
+
+pub const DecoderRuntimeMoeLayerSpec = struct {
+    expert_intermediate_size: usize,
+    num_experts: usize,
+    top_k: usize,
+    router_linear_slot: usize,
+    router_logit_scale: f32,
 };
 
 pub const DecoderRuntimeLayerSpec = struct {
@@ -930,6 +1145,7 @@ pub const DecoderRuntimeLayerSpec = struct {
     ple_proj_linear_slot: ?usize = null,
     ple_post_norm_slot: ?usize = null,
     output_scale_value: ?f32 = null,
+    moe: ?DecoderRuntimeMoeLayerSpec = null,
 };
 
 pub const DecoderRuntimeDecodeItem = struct {

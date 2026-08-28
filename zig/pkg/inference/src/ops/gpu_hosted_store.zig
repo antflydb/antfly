@@ -24,6 +24,7 @@ const tier_cache_mod = runtime.tier.cache;
 const prefetch_mod = runtime.tier.prefetch;
 const tier_shared_mod = runtime.tier.shared;
 const moe_residency = runtime.moe.residency;
+const backend_contracts = @import("../graph/backend_contracts.zig");
 const supports_native_metal_provider = build_options.enable_metal;
 const metal_native_provider_mod = if (supports_native_metal_provider) @import("../backends/metal_native_provider.zig") else struct {
     pub const MetalNativeProvider = void;
@@ -206,6 +207,7 @@ pub const WeightStore = struct {
     prefetch_initialized: bool = false,
     tensor_store: ?tensor_store_mod.TensorStore = null,
     moe_num_experts: usize = 0,
+    a4b_inference: ?backend_contracts.A4bInferenceConfig = null,
     residency: ?moe_residency.SharedResidency = null,
     tier_cache: ?tier_cache_mod.SharedCache = null,
     shared_prefetch: ?*tier_shared_mod.SharedPrefetchState = null,
@@ -320,6 +322,14 @@ fn expectedDenseCacheBytes(
     return entry.tensor_ref.byte_len;
 }
 
+fn rawPackedMmapBytesAreBorrowed(
+    has_packed_expert_view: bool,
+    raw_mmap_backed: bool,
+    raw_owned: bool,
+) bool {
+    return has_packed_expert_view and raw_mmap_backed and !raw_owned;
+}
+
 pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEntry) !void {
     if (entry.expert_coord) |coord| {
         if (data.residency) |*residency| {
@@ -334,7 +344,20 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
         if (try tensor_store.loadQuantizedStorageRef(&entry.tensor_ref)) |storage_value| {
             var loaded_storage = storage_value;
             errdefer loaded_storage.deinit();
-            entry.loaded_bytes = loaded_storage.raw_bytes.len + loaded_storage.prepared.ownedBytes();
+            // Packed expert entries borrow the same model mmap span. Charge
+            // owned preparation buffers here, not the full virtual tensor once
+            // per expert/projection alias. This is a storage property, not an
+            // A4B policy property; model/session admission accounts for the
+            // mmap-backed working set separately.
+            const mmap_borrowed_packed = rawPackedMmapBytesAreBorrowed(
+                loaded_storage.packed_expert != null,
+                loaded_storage.raw_mmap_backed,
+                loaded_storage.raw_owned,
+            );
+            entry.loaded_bytes = if (mmap_borrowed_packed)
+                loaded_storage.prepared.ownedBytes()
+            else
+                loaded_storage.raw_bytes.len + loaded_storage.prepared.ownedBytes();
             if (entry.loaded_bytes != 0) {
                 if (data.tier_cache) |*tier_cache| {
                     tier_cache.reserve(.host, entry.loaded_bytes) catch |err| {
@@ -412,6 +435,13 @@ pub fn ensureHostLazyWeightLoadedSimple(data: *WeightStore, entry: *LazyWeightEn
             cache_reserved_bytes = entry.loaded_bytes;
         }
     }
+}
+
+test "packed mmap admission is keyed to storage ownership rather than A4B policy" {
+    try std.testing.expect(rawPackedMmapBytesAreBorrowed(true, true, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(false, true, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, false, false));
+    try std.testing.expect(!rawPackedMmapBytesAreBorrowed(true, true, true));
 }
 
 test "jina adapter names map base weight to PEFT LoRA tensors" {

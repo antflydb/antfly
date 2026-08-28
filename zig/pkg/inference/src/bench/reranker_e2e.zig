@@ -104,7 +104,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (opts.format == .text and model.session.backend() != .onnx) {
-        var debug_backend = try session_factory.getComputeBackend(model.session, allocator);
+        var debug_backend = session_factory.getComputeBackend(model.session, allocator) catch |err| switch (err) {
+            error.NotArchSession => return,
+            else => return err,
+        };
         defer debug_backend.deinit();
         const provider_stats = debug_backend.debugTimingSnapshot().provider;
         print(
