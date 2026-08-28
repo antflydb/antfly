@@ -42,13 +42,13 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "inference",
+            .{ .json_name = "inference", .zig_name = "inference", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "inference",
+            .{ .json_name = "inference", .zig_name = "inference", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -81,23 +81,23 @@ pub const BackendRuntimes = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "cuda",
-            "metal",
-            "native",
-            "onnx",
-            "wasm",
-            "xla",
+            .{ .json_name = "native", .zig_name = "native", .rejects_null = true },
+            .{ .json_name = "onnx", .zig_name = "onnx", .rejects_null = true },
+            .{ .json_name = "metal", .zig_name = "metal", .rejects_null = true },
+            .{ .json_name = "cuda", .zig_name = "cuda", .rejects_null = true },
+            .{ .json_name = "xla", .zig_name = "xla", .rejects_null = true },
+            .{ .json_name = "wasm", .zig_name = "wasm", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "cuda",
-            "metal",
-            "native",
-            "onnx",
-            "wasm",
-            "xla",
+            .{ .json_name = "native", .zig_name = "native", .rejects_null = true },
+            .{ .json_name = "onnx", .zig_name = "onnx", .rejects_null = true },
+            .{ .json_name = "metal", .zig_name = "metal", .rejects_null = true },
+            .{ .json_name = "cuda", .zig_name = "cuda", .rejects_null = true },
+            .{ .json_name = "xla", .zig_name = "xla", .rejects_null = true },
+            .{ .json_name = "wasm", .zig_name = "wasm", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -141,17 +141,19 @@ pub const ChatMessage = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "content",
-            "tool_call_id",
-            "tool_calls",
+            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
+            .{ .json_name = "content", .zig_name = "content", .rejects_null = true },
+            .{ .json_name = "tool_calls", .zig_name = "tool_calls", .rejects_null = true },
+            .{ .json_name = "tool_call_id", .zig_name = "tool_call_id", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "content",
-            "tool_call_id",
-            "tool_calls",
+            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
+            .{ .json_name = "content", .zig_name = "content", .rejects_null = true },
+            .{ .json_name = "tool_calls", .zig_name = "tool_calls", .rejects_null = true },
+            .{ .json_name = "tool_call_id", .zig_name = "tool_call_id", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -207,15 +209,21 @@ pub const ClassifyRequest = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "hypothesis_template",
-            "multi_label",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "texts", .zig_name = "texts", .rejects_null = false },
+            .{ .json_name = "labels", .zig_name = "labels", .rejects_null = false },
+            .{ .json_name = "hypothesis_template", .zig_name = "hypothesis_template", .rejects_null = true },
+            .{ .json_name = "multi_label", .zig_name = "multi_label", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "hypothesis_template",
-            "multi_label",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "texts", .zig_name = "texts", .rejects_null = false },
+            .{ .json_name = "labels", .zig_name = "labels", .rejects_null = false },
+            .{ .json_name = "hypothesis_template", .zig_name = "hypothesis_template", .rejects_null = true },
+            .{ .json_name = "multi_label", .zig_name = "multi_label", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -297,47 +305,53 @@ pub const Config = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "admission",
-            "allow_downloads",
-            "api_key",
-            "backend_priority",
-            "keep_alive",
-            "kernel_jit",
-            "log",
-            "max_concurrent_requests",
-            "max_loaded_models",
-            "max_memory_mb",
-            "max_queue_size",
-            "ml_dir",
-            "model_strategies",
-            "models_dir",
-            "pool_size",
-            "preload",
-            "prompt_cache",
-            "request_timeout",
+            .{ .json_name = "max_concurrent_requests", .zig_name = "max_concurrent_requests", .rejects_null = true },
+            .{ .json_name = "api_url", .zig_name = "api_url", .rejects_null = false },
+            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
+            .{ .json_name = "models_dir", .zig_name = "models_dir", .rejects_null = true },
+            .{ .json_name = "ml_dir", .zig_name = "ml_dir", .rejects_null = true },
+            .{ .json_name = "content_security", .zig_name = "content_security", .rejects_null = false },
+            .{ .json_name = "s3_credentials", .zig_name = "s3_credentials", .rejects_null = false },
+            .{ .json_name = "keep_alive", .zig_name = "keep_alive", .rejects_null = true },
+            .{ .json_name = "max_loaded_models", .zig_name = "max_loaded_models", .rejects_null = true },
+            .{ .json_name = "pool_size", .zig_name = "pool_size", .rejects_null = true },
+            .{ .json_name = "prompt_cache", .zig_name = "prompt_cache", .rejects_null = true },
+            .{ .json_name = "kernel_jit", .zig_name = "kernel_jit", .rejects_null = true },
+            .{ .json_name = "backend_priority", .zig_name = "backend_priority", .rejects_null = true },
+            .{ .json_name = "max_queue_size", .zig_name = "max_queue_size", .rejects_null = true },
+            .{ .json_name = "request_timeout", .zig_name = "request_timeout", .rejects_null = true },
+            .{ .json_name = "preload", .zig_name = "preload", .rejects_null = true },
+            .{ .json_name = "max_memory_mb", .zig_name = "max_memory_mb", .rejects_null = true },
+            .{ .json_name = "model_strategies", .zig_name = "model_strategies", .rejects_null = true },
+            .{ .json_name = "allow_downloads", .zig_name = "allow_downloads", .rejects_null = true },
+            .{ .json_name = "log", .zig_name = "log", .rejects_null = true },
+            .{ .json_name = "admission", .zig_name = "admission", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "admission",
-            "allow_downloads",
-            "api_key",
-            "backend_priority",
-            "keep_alive",
-            "kernel_jit",
-            "log",
-            "max_concurrent_requests",
-            "max_loaded_models",
-            "max_memory_mb",
-            "max_queue_size",
-            "ml_dir",
-            "model_strategies",
-            "models_dir",
-            "pool_size",
-            "preload",
-            "prompt_cache",
-            "request_timeout",
+            .{ .json_name = "max_concurrent_requests", .zig_name = "max_concurrent_requests", .rejects_null = true },
+            .{ .json_name = "api_url", .zig_name = "api_url", .rejects_null = false },
+            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
+            .{ .json_name = "models_dir", .zig_name = "models_dir", .rejects_null = true },
+            .{ .json_name = "ml_dir", .zig_name = "ml_dir", .rejects_null = true },
+            .{ .json_name = "content_security", .zig_name = "content_security", .rejects_null = false },
+            .{ .json_name = "s3_credentials", .zig_name = "s3_credentials", .rejects_null = false },
+            .{ .json_name = "keep_alive", .zig_name = "keep_alive", .rejects_null = true },
+            .{ .json_name = "max_loaded_models", .zig_name = "max_loaded_models", .rejects_null = true },
+            .{ .json_name = "pool_size", .zig_name = "pool_size", .rejects_null = true },
+            .{ .json_name = "prompt_cache", .zig_name = "prompt_cache", .rejects_null = true },
+            .{ .json_name = "kernel_jit", .zig_name = "kernel_jit", .rejects_null = true },
+            .{ .json_name = "backend_priority", .zig_name = "backend_priority", .rejects_null = true },
+            .{ .json_name = "max_queue_size", .zig_name = "max_queue_size", .rejects_null = true },
+            .{ .json_name = "request_timeout", .zig_name = "request_timeout", .rejects_null = true },
+            .{ .json_name = "preload", .zig_name = "preload", .rejects_null = true },
+            .{ .json_name = "max_memory_mb", .zig_name = "max_memory_mb", .rejects_null = true },
+            .{ .json_name = "model_strategies", .zig_name = "model_strategies", .rejects_null = true },
+            .{ .json_name = "allow_downloads", .zig_name = "allow_downloads", .rejects_null = true },
+            .{ .json_name = "log", .zig_name = "log", .rejects_null = true },
+            .{ .json_name = "admission", .zig_name = "admission", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -542,17 +556,21 @@ pub const EmbedRequest = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "min_weight",
-            "top_k",
-            "truncate",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "input", .zig_name = "input", .rejects_null = false },
+            .{ .json_name = "truncate", .zig_name = "truncate", .rejects_null = true },
+            .{ .json_name = "top_k", .zig_name = "top_k", .rejects_null = true },
+            .{ .json_name = "min_weight", .zig_name = "min_weight", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "min_weight",
-            "top_k",
-            "truncate",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "input", .zig_name = "input", .rejects_null = false },
+            .{ .json_name = "truncate", .zig_name = "truncate", .rejects_null = true },
+            .{ .json_name = "top_k", .zig_name = "top_k", .rejects_null = true },
+            .{ .json_name = "min_weight", .zig_name = "min_weight", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -588,15 +606,17 @@ pub const EmbedResponse = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "embeddings",
-            "sparse_embeddings",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "embeddings", .zig_name = "embeddings", .rejects_null = true },
+            .{ .json_name = "sparse_embeddings", .zig_name = "sparse_embeddings", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "embeddings",
-            "sparse_embeddings",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "embeddings", .zig_name = "embeddings", .rejects_null = true },
+            .{ .json_name = "sparse_embeddings", .zig_name = "sparse_embeddings", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -669,17 +689,19 @@ pub const FunctionDefinition = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "description",
-            "parameters",
-            "strict",
+            .{ .json_name = "name", .zig_name = "name", .rejects_null = false },
+            .{ .json_name = "description", .zig_name = "description", .rejects_null = true },
+            .{ .json_name = "parameters", .zig_name = "parameters", .rejects_null = true },
+            .{ .json_name = "strict", .zig_name = "strict", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "description",
-            "parameters",
-            "strict",
+            .{ .json_name = "name", .zig_name = "name", .rejects_null = false },
+            .{ .json_name = "description", .zig_name = "description", .rejects_null = true },
+            .{ .json_name = "parameters", .zig_name = "parameters", .rejects_null = true },
+            .{ .json_name = "strict", .zig_name = "strict", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -711,13 +733,17 @@ pub const GenerateBatchError = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "retryable",
+            .{ .json_name = "code", .zig_name = "code", .rejects_null = false },
+            .{ .json_name = "message", .zig_name = "message", .rejects_null = false },
+            .{ .json_name = "retryable", .zig_name = "retryable", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "retryable",
+            .{ .json_name = "code", .zig_name = "code", .rejects_null = false },
+            .{ .json_name = "message", .zig_name = "message", .rejects_null = false },
+            .{ .json_name = "retryable", .zig_name = "retryable", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -764,13 +790,15 @@ pub const GenerateBatchRequest = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "mode",
+            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = true },
+            .{ .json_name = "requests", .zig_name = "requests", .rejects_null = false },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "mode",
+            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = true },
+            .{ .json_name = "requests", .zig_name = "requests", .rejects_null = false },
         }, allocator, source, options);
     }
 
@@ -807,15 +835,19 @@ pub const GenerateBatchResultItem = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "error",
-            "response",
+            .{ .json_name = "custom_id", .zig_name = "custom_id", .rejects_null = false },
+            .{ .json_name = "index", .zig_name = "index", .rejects_null = false },
+            .{ .json_name = "response", .zig_name = "response", .rejects_null = true },
+            .{ .json_name = "error", .zig_name = "error", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "error",
-            "response",
+            .{ .json_name = "custom_id", .zig_name = "custom_id", .rejects_null = false },
+            .{ .json_name = "index", .zig_name = "index", .rejects_null = false },
+            .{ .json_name = "response", .zig_name = "response", .rejects_null = true },
+            .{ .json_name = "error", .zig_name = "error", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -890,13 +922,17 @@ pub const GenerateChunkChoice = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "finish_reason",
+            .{ .json_name = "index", .zig_name = "index", .rejects_null = false },
+            .{ .json_name = "delta", .zig_name = "delta", .rejects_null = false },
+            .{ .json_name = "finish_reason", .zig_name = "finish_reason", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "finish_reason",
+            .{ .json_name = "index", .zig_name = "index", .rejects_null = false },
+            .{ .json_name = "delta", .zig_name = "delta", .rejects_null = false },
+            .{ .json_name = "finish_reason", .zig_name = "finish_reason", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -924,15 +960,17 @@ pub const GenerateDelta = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "role",
-            "tool_calls",
+            .{ .json_name = "role", .zig_name = "role", .rejects_null = true },
+            .{ .json_name = "content", .zig_name = "content", .rejects_null = false },
+            .{ .json_name = "tool_calls", .zig_name = "tool_calls", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "role",
-            "tool_calls",
+            .{ .json_name = "role", .zig_name = "role", .rejects_null = true },
+            .{ .json_name = "content", .zig_name = "content", .rejects_null = false },
+            .{ .json_name = "tool_calls", .zig_name = "tool_calls", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -970,13 +1008,17 @@ pub const GenerateMessage = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "tool_calls",
+            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
+            .{ .json_name = "content", .zig_name = "content", .rejects_null = false },
+            .{ .json_name = "tool_calls", .zig_name = "tool_calls", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "tool_calls",
+            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
+            .{ .json_name = "content", .zig_name = "content", .rejects_null = false },
+            .{ .json_name = "tool_calls", .zig_name = "tool_calls", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1029,29 +1071,33 @@ pub const GenerateRequest = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "max_tokens",
-            "prompt_cache",
-            "prompt_cache_key",
-            "stream",
-            "temperature",
-            "tool_choice",
-            "tools",
-            "top_k",
-            "top_p",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "messages", .zig_name = "messages", .rejects_null = false },
+            .{ .json_name = "max_tokens", .zig_name = "max_tokens", .rejects_null = true },
+            .{ .json_name = "temperature", .zig_name = "temperature", .rejects_null = true },
+            .{ .json_name = "top_p", .zig_name = "top_p", .rejects_null = true },
+            .{ .json_name = "top_k", .zig_name = "top_k", .rejects_null = true },
+            .{ .json_name = "stream", .zig_name = "stream", .rejects_null = true },
+            .{ .json_name = "tools", .zig_name = "tools", .rejects_null = true },
+            .{ .json_name = "prompt_cache_key", .zig_name = "prompt_cache_key", .rejects_null = true },
+            .{ .json_name = "prompt_cache", .zig_name = "prompt_cache", .rejects_null = true },
+            .{ .json_name = "tool_choice", .zig_name = "tool_choice", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "max_tokens",
-            "prompt_cache",
-            "prompt_cache_key",
-            "stream",
-            "temperature",
-            "tool_choice",
-            "tools",
-            "top_k",
-            "top_p",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "messages", .zig_name = "messages", .rejects_null = false },
+            .{ .json_name = "max_tokens", .zig_name = "max_tokens", .rejects_null = true },
+            .{ .json_name = "temperature", .zig_name = "temperature", .rejects_null = true },
+            .{ .json_name = "top_p", .zig_name = "top_p", .rejects_null = true },
+            .{ .json_name = "top_k", .zig_name = "top_k", .rejects_null = true },
+            .{ .json_name = "stream", .zig_name = "stream", .rejects_null = true },
+            .{ .json_name = "tools", .zig_name = "tools", .rejects_null = true },
+            .{ .json_name = "prompt_cache_key", .zig_name = "prompt_cache_key", .rejects_null = true },
+            .{ .json_name = "prompt_cache", .zig_name = "prompt_cache", .rejects_null = true },
+            .{ .json_name = "tool_choice", .zig_name = "tool_choice", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1128,13 +1174,19 @@ pub const GenerateUsage = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "cached_prompt_tokens",
+            .{ .json_name = "prompt_tokens", .zig_name = "prompt_tokens", .rejects_null = false },
+            .{ .json_name = "completion_tokens", .zig_name = "completion_tokens", .rejects_null = false },
+            .{ .json_name = "total_tokens", .zig_name = "total_tokens", .rejects_null = false },
+            .{ .json_name = "cached_prompt_tokens", .zig_name = "cached_prompt_tokens", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "cached_prompt_tokens",
+            .{ .json_name = "prompt_tokens", .zig_name = "prompt_tokens", .rejects_null = false },
+            .{ .json_name = "completion_tokens", .zig_name = "completion_tokens", .rejects_null = false },
+            .{ .json_name = "total_tokens", .zig_name = "total_tokens", .rejects_null = false },
+            .{ .json_name = "cached_prompt_tokens", .zig_name = "cached_prompt_tokens", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1178,19 +1230,19 @@ pub const KernelJitConfig = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "cache_dir",
-            "max_cache_bytes_mb",
-            "mode",
-            "preload_budget_ms",
+            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = true },
+            .{ .json_name = "cache_dir", .zig_name = "cache_dir", .rejects_null = true },
+            .{ .json_name = "max_cache_bytes_mb", .zig_name = "max_cache_bytes_mb", .rejects_null = true },
+            .{ .json_name = "preload_budget_ms", .zig_name = "preload_budget_ms", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "cache_dir",
-            "max_cache_bytes_mb",
-            "mode",
-            "preload_budget_ms",
+            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = true },
+            .{ .json_name = "cache_dir", .zig_name = "cache_dir", .rejects_null = true },
+            .{ .json_name = "max_cache_bytes_mb", .zig_name = "max_cache_bytes_mb", .rejects_null = true },
+            .{ .json_name = "preload_budget_ms", .zig_name = "preload_budget_ms", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1260,17 +1312,19 @@ pub const MediaContentPart = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "data",
-            "mime_type",
-            "url",
+            .{ .json_name = "type", .zig_name = "type", .rejects_null = false },
+            .{ .json_name = "data", .zig_name = "data", .rejects_null = true },
+            .{ .json_name = "url", .zig_name = "url", .rejects_null = true },
+            .{ .json_name = "mime_type", .zig_name = "mime_type", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "data",
-            "mime_type",
-            "url",
+            .{ .json_name = "type", .zig_name = "type", .rejects_null = false },
+            .{ .json_name = "data", .zig_name = "data", .rejects_null = true },
+            .{ .json_name = "url", .zig_name = "url", .rejects_null = true },
+            .{ .json_name = "mime_type", .zig_name = "mime_type", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1379,15 +1433,15 @@ pub const ModelInfo = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "capabilities",
-            "inputs",
+            .{ .json_name = "capabilities", .zig_name = "capabilities", .rejects_null = true },
+            .{ .json_name = "inputs", .zig_name = "inputs", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "capabilities",
-            "inputs",
+            .{ .json_name = "capabilities", .zig_name = "capabilities", .rejects_null = true },
+            .{ .json_name = "inputs", .zig_name = "inputs", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1496,21 +1550,25 @@ pub const ModelRef = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "backend",
-            "format",
-            "memory_budget_mb",
-            "quantization",
-            "residency_mode",
+            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = false },
+            .{ .json_name = "name", .zig_name = "name", .rejects_null = false },
+            .{ .json_name = "backend", .zig_name = "backend", .rejects_null = true },
+            .{ .json_name = "format", .zig_name = "format", .rejects_null = true },
+            .{ .json_name = "quantization", .zig_name = "quantization", .rejects_null = true },
+            .{ .json_name = "residency_mode", .zig_name = "residency_mode", .rejects_null = true },
+            .{ .json_name = "memory_budget_mb", .zig_name = "memory_budget_mb", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "backend",
-            "format",
-            "memory_budget_mb",
-            "quantization",
-            "residency_mode",
+            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = false },
+            .{ .json_name = "name", .zig_name = "name", .rejects_null = false },
+            .{ .json_name = "backend", .zig_name = "backend", .rejects_null = true },
+            .{ .json_name = "format", .zig_name = "format", .rejects_null = true },
+            .{ .json_name = "quantization", .zig_name = "quantization", .rejects_null = true },
+            .{ .json_name = "residency_mode", .zig_name = "residency_mode", .rejects_null = true },
+            .{ .json_name = "memory_budget_mb", .zig_name = "memory_budget_mb", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1587,21 +1645,21 @@ pub const PromptCacheConfig = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "enabled",
-            "max_bytes_mb",
-            "min_tokens",
-            "mode",
-            "ttl_ms",
+            .{ .json_name = "enabled", .zig_name = "enabled", .rejects_null = true },
+            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = true },
+            .{ .json_name = "max_bytes_mb", .zig_name = "max_bytes_mb", .rejects_null = true },
+            .{ .json_name = "min_tokens", .zig_name = "min_tokens", .rejects_null = true },
+            .{ .json_name = "ttl_ms", .zig_name = "ttl_ms", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "enabled",
-            "max_bytes_mb",
-            "min_tokens",
-            "mode",
-            "ttl_ms",
+            .{ .json_name = "enabled", .zig_name = "enabled", .rejects_null = true },
+            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = true },
+            .{ .json_name = "max_bytes_mb", .zig_name = "max_bytes_mb", .rejects_null = true },
+            .{ .json_name = "min_tokens", .zig_name = "min_tokens", .rejects_null = true },
+            .{ .json_name = "ttl_ms", .zig_name = "ttl_ms", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1643,15 +1701,19 @@ pub const ReadRequest = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "max_tokens",
-            "prompt",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "images", .zig_name = "images", .rejects_null = false },
+            .{ .json_name = "prompt", .zig_name = "prompt", .rejects_null = true },
+            .{ .json_name = "max_tokens", .zig_name = "max_tokens", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "max_tokens",
-            "prompt",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "images", .zig_name = "images", .rejects_null = false },
+            .{ .json_name = "prompt", .zig_name = "prompt", .rejects_null = true },
+            .{ .json_name = "max_tokens", .zig_name = "max_tokens", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1690,15 +1752,17 @@ pub const ReadResult = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "fields",
-            "regions",
+            .{ .json_name = "text", .zig_name = "text", .rejects_null = false },
+            .{ .json_name = "fields", .zig_name = "fields", .rejects_null = true },
+            .{ .json_name = "regions", .zig_name = "regions", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "fields",
-            "regions",
+            .{ .json_name = "text", .zig_name = "text", .rejects_null = false },
+            .{ .json_name = "fields", .zig_name = "fields", .rejects_null = true },
+            .{ .json_name = "regions", .zig_name = "regions", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1724,13 +1788,13 @@ pub const RequestAdmissionConfig = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "max_concurrent_requests",
+            .{ .json_name = "max_concurrent_requests", .zig_name = "max_concurrent_requests", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "max_concurrent_requests",
+            .{ .json_name = "max_concurrent_requests", .zig_name = "max_concurrent_requests", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -1849,45 +1913,51 @@ pub const RuntimeConfig = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "allow_downloads",
-            "api_key",
-            "backend_priority",
-            "keep_alive",
-            "kernel_jit",
-            "log",
-            "max_concurrent_requests",
-            "max_loaded_models",
-            "max_memory_mb",
-            "max_queue_size",
-            "ml_dir",
-            "model_strategies",
-            "models_dir",
-            "pool_size",
-            "preload",
-            "prompt_cache",
-            "request_timeout",
+            .{ .json_name = "max_concurrent_requests", .zig_name = "max_concurrent_requests", .rejects_null = true },
+            .{ .json_name = "api_url", .zig_name = "api_url", .rejects_null = false },
+            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
+            .{ .json_name = "models_dir", .zig_name = "models_dir", .rejects_null = true },
+            .{ .json_name = "ml_dir", .zig_name = "ml_dir", .rejects_null = true },
+            .{ .json_name = "content_security", .zig_name = "content_security", .rejects_null = false },
+            .{ .json_name = "s3_credentials", .zig_name = "s3_credentials", .rejects_null = false },
+            .{ .json_name = "keep_alive", .zig_name = "keep_alive", .rejects_null = true },
+            .{ .json_name = "max_loaded_models", .zig_name = "max_loaded_models", .rejects_null = true },
+            .{ .json_name = "pool_size", .zig_name = "pool_size", .rejects_null = true },
+            .{ .json_name = "prompt_cache", .zig_name = "prompt_cache", .rejects_null = true },
+            .{ .json_name = "kernel_jit", .zig_name = "kernel_jit", .rejects_null = true },
+            .{ .json_name = "backend_priority", .zig_name = "backend_priority", .rejects_null = true },
+            .{ .json_name = "max_queue_size", .zig_name = "max_queue_size", .rejects_null = true },
+            .{ .json_name = "request_timeout", .zig_name = "request_timeout", .rejects_null = true },
+            .{ .json_name = "preload", .zig_name = "preload", .rejects_null = true },
+            .{ .json_name = "max_memory_mb", .zig_name = "max_memory_mb", .rejects_null = true },
+            .{ .json_name = "model_strategies", .zig_name = "model_strategies", .rejects_null = true },
+            .{ .json_name = "allow_downloads", .zig_name = "allow_downloads", .rejects_null = true },
+            .{ .json_name = "log", .zig_name = "log", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "allow_downloads",
-            "api_key",
-            "backend_priority",
-            "keep_alive",
-            "kernel_jit",
-            "log",
-            "max_concurrent_requests",
-            "max_loaded_models",
-            "max_memory_mb",
-            "max_queue_size",
-            "ml_dir",
-            "model_strategies",
-            "models_dir",
-            "pool_size",
-            "preload",
-            "prompt_cache",
-            "request_timeout",
+            .{ .json_name = "max_concurrent_requests", .zig_name = "max_concurrent_requests", .rejects_null = true },
+            .{ .json_name = "api_url", .zig_name = "api_url", .rejects_null = false },
+            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
+            .{ .json_name = "models_dir", .zig_name = "models_dir", .rejects_null = true },
+            .{ .json_name = "ml_dir", .zig_name = "ml_dir", .rejects_null = true },
+            .{ .json_name = "content_security", .zig_name = "content_security", .rejects_null = false },
+            .{ .json_name = "s3_credentials", .zig_name = "s3_credentials", .rejects_null = false },
+            .{ .json_name = "keep_alive", .zig_name = "keep_alive", .rejects_null = true },
+            .{ .json_name = "max_loaded_models", .zig_name = "max_loaded_models", .rejects_null = true },
+            .{ .json_name = "pool_size", .zig_name = "pool_size", .rejects_null = true },
+            .{ .json_name = "prompt_cache", .zig_name = "prompt_cache", .rejects_null = true },
+            .{ .json_name = "kernel_jit", .zig_name = "kernel_jit", .rejects_null = true },
+            .{ .json_name = "backend_priority", .zig_name = "backend_priority", .rejects_null = true },
+            .{ .json_name = "max_queue_size", .zig_name = "max_queue_size", .rejects_null = true },
+            .{ .json_name = "request_timeout", .zig_name = "request_timeout", .rejects_null = true },
+            .{ .json_name = "preload", .zig_name = "preload", .rejects_null = true },
+            .{ .json_name = "max_memory_mb", .zig_name = "max_memory_mb", .rejects_null = true },
+            .{ .json_name = "model_strategies", .zig_name = "model_strategies", .rejects_null = true },
+            .{ .json_name = "allow_downloads", .zig_name = "allow_downloads", .rejects_null = true },
+            .{ .json_name = "log", .zig_name = "log", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -2008,15 +2078,19 @@ pub const TextRegion = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "confidence",
-            "label",
+            .{ .json_name = "text", .zig_name = "text", .rejects_null = false },
+            .{ .json_name = "bbox", .zig_name = "bbox", .rejects_null = false },
+            .{ .json_name = "confidence", .zig_name = "confidence", .rejects_null = true },
+            .{ .json_name = "label", .zig_name = "label", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "confidence",
-            "label",
+            .{ .json_name = "text", .zig_name = "text", .rejects_null = false },
+            .{ .json_name = "bbox", .zig_name = "bbox", .rejects_null = false },
+            .{ .json_name = "confidence", .zig_name = "confidence", .rejects_null = true },
+            .{ .json_name = "label", .zig_name = "label", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -2057,19 +2131,19 @@ pub const ToolCallDelta = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "function",
-            "id",
-            "index",
-            "type",
+            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
+            .{ .json_name = "id", .zig_name = "id", .rejects_null = true },
+            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
+            .{ .json_name = "function", .zig_name = "function", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "function",
-            "id",
-            "index",
-            "type",
+            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
+            .{ .json_name = "id", .zig_name = "id", .rejects_null = true },
+            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
+            .{ .json_name = "function", .zig_name = "function", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -2104,15 +2178,15 @@ pub const ToolCallFunctionDelta = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "arguments",
-            "name",
+            .{ .json_name = "name", .zig_name = "name", .rejects_null = true },
+            .{ .json_name = "arguments", .zig_name = "arguments", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "arguments",
-            "name",
+            .{ .json_name = "name", .zig_name = "name", .rejects_null = true },
+            .{ .json_name = "arguments", .zig_name = "arguments", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -2143,15 +2217,17 @@ pub const TranscribeRequest = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "language",
-            "model",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = true },
+            .{ .json_name = "audio", .zig_name = "audio", .rejects_null = false },
+            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "language",
-            "model",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = true },
+            .{ .json_name = "audio", .zig_name = "audio", .rejects_null = false },
+            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -2181,13 +2257,17 @@ pub const TranscribeResponse = struct {
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
         return try openApiParseObject(@This(), &.{
-            "language",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "text", .zig_name = "text", .rejects_null = false },
+            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
         }, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
         return try openApiParseObjectFromValue(@This(), &.{
-            "language",
+            .{ .json_name = "model", .zig_name = "model", .rejects_null = false },
+            .{ .json_name = "text", .zig_name = "text", .rejects_null = false },
+            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
         }, allocator, source, options);
     }
 
@@ -2252,17 +2332,25 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
     };
 }
 
+const OpenApiObjectField = struct {
+    json_name: []const u8,
+    zig_name: []const u8,
+    rejects_null: bool = false,
+};
+
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.
 fn openApiParseObject(
     comptime T: type,
-    comptime non_nullable_optional_fields: []const []const u8,
+    comptime openapi_fields: []const OpenApiObjectField,
     allocator: std.mem.Allocator,
     source: anytype,
     options: std.json.ParseOptions,
 ) !T {
+    @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (.object_begin != try source.next()) return error.UnexpectedToken;
 
     var result: T = undefined;
@@ -2274,14 +2362,14 @@ fn openApiParseObject(
             .object_end => break,
             else => return error.UnexpectedToken,
         };
-        const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);
 
-        inline for (struct_info.fields, 0..) |field, i| {
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (std.mem.eql(u8, field.name, field_name)) {
+            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
                 openApiFreeAllocatedToken(allocator, name_token.?);
                 name_token = null;
-                if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (openapi_field.rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
                 if (fields_seen[i]) {
                     switch (options.duplicate_field_behavior) {
                         .use_first => {
@@ -2301,46 +2389,46 @@ fn openApiParseObject(
             if (options.ignore_unknown_fields) try source.skipValue() else return error.UnknownField;
         }
     }
-    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
     return result;
 }
 
 fn openApiParseObjectFromValue(
     comptime T: type,
-    comptime non_nullable_optional_fields: []const []const u8,
+    comptime openapi_fields: []const OpenApiObjectField,
     allocator: std.mem.Allocator,
     source: std.json.Value,
     options: std.json.ParseOptions,
 ) !T {
+    @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
+    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (source != .object) return error.UnexpectedToken;
     var result: T = undefined;
     var fields_seen = [_]bool{false} ** struct_info.fields.len;
     var it = source.object.iterator();
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;
-        inline for (struct_info.fields, 0..) |field, i| {
+        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (std.mem.eql(u8, field.name, field_name)) {
+            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
+                if (openapi_field.rejects_null and entry.value_ptr.* == .null) return error.UnexpectedToken;
                 @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
                 fields_seen[i] = true;
                 break;
             }
         } else if (!options.ignore_unknown_fields) return error.UnknownField;
     }
-    try openApiFillDefaultStructValues(T, &result, &fields_seen);
+    try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);
     return result;
 }
 
-fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {
-    inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;
-    return false;
-}
-
-fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
-    inline for (@typeInfo(T).@"struct".fields, 0..) |field, i| {
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: []const OpenApiObjectField, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+    @setEvalBranchQuota(100_000);
+    inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
         if (!fields_seen[i]) {
             if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
         }

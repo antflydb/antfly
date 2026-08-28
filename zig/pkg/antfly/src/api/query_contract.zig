@@ -10164,7 +10164,7 @@ fn parseGraphPathQuery(
 
 fn parseGraphPathEndpointSelector(alloc: std.mem.Allocator, endpoint: anytype) !graph_query_mod.NodeSelector {
     if (endpoint.key.len == 0) return error.InvalidQueryRequest;
-    if (endpoint.table) |table| if (table.len == 0) return error.InvalidQueryRequest;
+    if (endpoint.table) |table| if (!graph_pattern_mod.isValidTableQualifier(table)) return error.InvalidQueryRequest;
     const identities = try alloc.alloc(graph_query_mod.NodeIdentity, 1);
     errdefer alloc.free(identities);
     const key = try alloc.dupe(u8, endpoint.key);
@@ -10314,7 +10314,7 @@ fn parseGraphMatchNodes(alloc: std.mem.Allocator, value: std.json.ArrayHashMap(i
         const alias = try alloc.dupe(u8, entry.key_ptr.*);
         errdefer alloc.free(alias);
         const table = if (entry.value_ptr.table) |table_name| blk: {
-            if (table_name.len == 0) return error.InvalidQueryRequest;
+            if (!graph_pattern_mod.isValidTableQualifier(table_name)) return error.InvalidQueryRequest;
             break :blk try alloc.dupe(u8, table_name);
         } else null;
         errdefer if (table) |table_name| alloc.free(table_name);
@@ -10502,6 +10502,10 @@ test "canonical graph path endpoints reject empty identities before allocation" 
     try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
         .key = "node",
         .table = @as(?[]const u8, ""),
+    }));
+    try std.testing.expectError(error.InvalidQueryRequest, parseGraphPathEndpointSelector(alloc, .{
+        .key = "node",
+        .table = @as(?[]const u8, " \t\r\n"),
     }));
 }
 

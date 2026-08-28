@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -96,6 +97,24 @@ type strictPresent[T any] struct {
 	present bool
 	null    bool
 	value   T
+}
+
+// memberPresence records only member presence and nullability. It is used for
+// structural-union selection without retaining or copying the member payload.
+type memberPresence struct {
+	present bool
+	null    bool
+}
+
+func (p *memberPresence) UnmarshalJSON(encoded []byte) error {
+	p.present = true
+	p.null = bytes.Equal(bytes.TrimSpace(encoded), []byte("null"))
+	return nil
+}
+
+func retainedUnionIsNull(encoded []byte) bool {
+	trimmed := bytes.TrimSpace(encoded)
+	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))
 }
 
 func (p *strictPresent[T]) UnmarshalJSON(encoded []byte) error {
@@ -253,6 +272,339 @@ func (t GraphReturn) DecodeStrictVariant() (DecodedGraphReturn, error) {
 	}
 	value := &GraphAggregatesReturn{Aggregates: envelope.Aggregates.value}
 	return DecodedGraphReturn{Kind: GraphReturnVariantAggregates, Aggregates: value}, nil
+}
+
+// GraphNodeSelectorVariantKind identifies the selected exact selector arm.
+type GraphNodeSelectorVariantKind uint8
+
+const (
+	GraphNodeSelectorVariantKeys GraphNodeSelectorVariantKind = iota + 1
+	GraphNodeSelectorVariantIdentities
+	GraphNodeSelectorVariantResultRef
+)
+
+// DecodedGraphNodeSelector is a presence-safe selector arm. Exactly one
+// pointer is non-nil.
+type DecodedGraphNodeSelector struct {
+	Kind       GraphNodeSelectorVariantKind
+	Keys       *GraphKeyNodeSelector
+	Identities *GraphIdentityNodeSelector
+	ResultRef  *GraphResultRefNodeSelector
+}
+
+type graphNodeSelectorStrictEnvelope struct {
+	Keys       strictPresent[[]string]            `json:"keys"`
+	Identities strictPresent[[]GraphPathEndpoint] `json:"identities"`
+	ResultRef  strictPresent[string]              `json:"result_ref"`
+	Binding    strictPresent[GraphIdentifier]     `json:"binding"`
+	Limit      strictPresent[int]                 `json:"limit"`
+}
+
+// DecodeStrictVariant selects and decodes one GraphNodeSelector arm in one
+// pass over the retained union. Result-reference-only options are rejected on
+// key and identity selectors rather than being silently ignored.
+func (t GraphNodeSelector) DecodeStrictVariant() (DecodedGraphNodeSelector, error) {
+	var envelope graphNodeSelectorStrictEnvelope
+	if err := decodeStrictJSON(t.union, &envelope); err != nil {
+		return DecodedGraphNodeSelector{}, err
+	}
+	forms := 0
+	for _, present := range []bool{envelope.Keys.present, envelope.Identities.present, envelope.ResultRef.present} {
+		if present {
+			forms++
+		}
+	}
+	if forms != 1 {
+		return DecodedGraphNodeSelector{}, errors.New("graph selector must contain exactly one selector form")
+	}
+	if envelope.Keys.present {
+		if envelope.Keys.null {
+			return DecodedGraphNodeSelector{}, errors.New("graph selector keys must not be null")
+		}
+		if envelope.Binding.present || envelope.Limit.present {
+			return DecodedGraphNodeSelector{}, errors.New("graph result-reference options require result_ref")
+		}
+		value := &GraphKeyNodeSelector{Keys: envelope.Keys.value}
+		return DecodedGraphNodeSelector{Kind: GraphNodeSelectorVariantKeys, Keys: value}, nil
+	}
+	if envelope.Identities.present {
+		if envelope.Identities.null {
+			return DecodedGraphNodeSelector{}, errors.New("graph selector identities must not be null")
+		}
+		if envelope.Binding.present || envelope.Limit.present {
+			return DecodedGraphNodeSelector{}, errors.New("graph result-reference options require result_ref")
+		}
+		value := &GraphIdentityNodeSelector{Identities: envelope.Identities.value}
+		return DecodedGraphNodeSelector{Kind: GraphNodeSelectorVariantIdentities, Identities: value}, nil
+	}
+	if envelope.ResultRef.null || envelope.Binding.null || envelope.Limit.null {
+		return DecodedGraphNodeSelector{}, errors.New("graph result-reference members must be omitted or non-null")
+	}
+	value := &GraphResultRefNodeSelector{
+		ResultRef: envelope.ResultRef.value,
+		Binding:   envelope.Binding.value,
+		Limit:     envelope.Limit.value,
+	}
+	return DecodedGraphNodeSelector{Kind: GraphNodeSelectorVariantResultRef, ResultRef: value}, nil
+}
+
+// GraphWhereVariantKind identifies one structural MATCH predicate arm.
+type GraphWhereVariantKind uint8
+
+const (
+	GraphWhereVariantAnd GraphWhereVariantKind = iota + 1
+	GraphWhereVariantNotEqual
+	GraphWhereVariantNotExists
+)
+
+// DecodedGraphWhereExpression contains exactly one strictly decoded arm.
+type DecodedGraphWhereExpression struct {
+	Kind      GraphWhereVariantKind
+	And       *GraphWhereAnd
+	NotEqual  *GraphWhereNotEqual
+	NotExists *GraphWhereNotExists
+}
+
+type graphWhereStrictEnvelope struct {
+	And       strictPresent[[]GraphWhereExpression] `json:"and"`
+	NotEqual  strictPresent[GraphNotEqualPredicate] `json:"not_equal"`
+	NotExists strictPresent[GraphNotExistsPattern]  `json:"not_exists"`
+}
+
+// DecodeStrictVariant preserves the distinction between an omitted optional
+// where expression and an invalid empty, null-member, or multi-arm object.
+func (t GraphWhereExpression) DecodeStrictVariant() (DecodedGraphWhereExpression, error) {
+	if retainedUnionIsNull(t.union) {
+		return DecodedGraphWhereExpression{}, nil
+	}
+	var envelope graphWhereStrictEnvelope
+	if err := decodeStrictJSON(t.union, &envelope); err != nil {
+		return DecodedGraphWhereExpression{}, err
+	}
+	forms := 0
+	for _, present := range []bool{envelope.And.present, envelope.NotEqual.present, envelope.NotExists.present} {
+		if present {
+			forms++
+		}
+	}
+	if forms != 1 {
+		return DecodedGraphWhereExpression{}, errors.New("graph where expression must contain exactly one predicate form")
+	}
+	if envelope.And.present {
+		if envelope.And.null {
+			return DecodedGraphWhereExpression{}, errors.New("graph where-and must not be null")
+		}
+		value := &GraphWhereAnd{And: envelope.And.value}
+		return DecodedGraphWhereExpression{Kind: GraphWhereVariantAnd, And: value}, nil
+	}
+	if envelope.NotEqual.present {
+		if envelope.NotEqual.null {
+			return DecodedGraphWhereExpression{}, errors.New("graph not_equal must not be null")
+		}
+		value := &GraphWhereNotEqual{NotEqual: envelope.NotEqual.value}
+		return DecodedGraphWhereExpression{Kind: GraphWhereVariantNotEqual, NotEqual: value}, nil
+	}
+	if envelope.NotExists.null {
+		return DecodedGraphWhereExpression{}, errors.New("graph not_exists must not be null")
+	}
+	value := &GraphWhereNotExists{NotExists: envelope.NotExists.value}
+	return DecodedGraphWhereExpression{Kind: GraphWhereVariantNotExists, NotExists: value}, nil
+}
+
+// DecodedGraphCountAggregate is the canonical count expression. Distinct is
+// represented only for alias counts; count(*) with a distinct member is
+// rejected even when the member is false.
+type DecodedGraphCountAggregate struct {
+	Count    string
+	Distinct bool
+}
+
+type graphCountAggregateStrictEnvelope struct {
+	Count    strictPresent[string] `json:"count"`
+	Distinct strictPresent[bool]   `json:"distinct"`
+}
+
+func (t GraphCountAggregate) DecodeStrictVariant() (DecodedGraphCountAggregate, error) {
+	var envelope graphCountAggregateStrictEnvelope
+	if err := decodeStrictJSON(t.union, &envelope); err != nil {
+		return DecodedGraphCountAggregate{}, err
+	}
+	if !envelope.Count.present || envelope.Count.null {
+		return DecodedGraphCountAggregate{}, errors.New("count expression requires a non-null count")
+	}
+	if envelope.Distinct.null {
+		return DecodedGraphCountAggregate{}, errors.New("count distinct must be omitted or non-null")
+	}
+	if envelope.Count.value == "*" && envelope.Distinct.present {
+		return DecodedGraphCountAggregate{}, errors.New("distinct is only valid for alias counts")
+	}
+	return DecodedGraphCountAggregate{Count: envelope.Count.value, Distinct: envelope.Distinct.value}, nil
+}
+
+// GraphDocumentFilterVariantKind identifies the selected closed, non-scoring
+// document-filter arm.
+type GraphDocumentFilterVariantKind uint8
+
+const (
+	GraphDocumentFilterVariantFuzzy GraphDocumentFilterVariantKind = iota + 1
+	GraphDocumentFilterVariantTerm
+	GraphDocumentFilterVariantPrefix
+	GraphDocumentFilterVariantRegexp
+	GraphDocumentFilterVariantWildcard
+	GraphDocumentFilterVariantNumericRange
+	GraphDocumentFilterVariantTermRange
+	GraphDocumentFilterVariantDateRange
+	GraphDocumentFilterVariantMatchAll
+	GraphDocumentFilterVariantMatchNone
+	GraphDocumentFilterVariantIDs
+	GraphDocumentFilterVariantBoolField
+	GraphDocumentFilterVariantBoolean
+	GraphDocumentFilterVariantConjunction
+	GraphDocumentFilterVariantDisjunction
+)
+
+// DecodedGraphDocumentFilter contains one strictly decoded concrete arm. The
+// boolean presence flags retain omission separately from generated zero values.
+type DecodedGraphDocumentFilter struct {
+	Kind        GraphDocumentFilterVariantKind
+	Fuzzy       *GraphDocumentFuzzyFilter
+	Term        *GraphDocumentTermFilter
+	Prefix      *GraphDocumentPrefixFilter
+	Regexp      *GraphDocumentRegexpFilter
+	Wildcard    *GraphDocumentWildcardFilter
+	Numeric     *GraphDocumentNumericRangeFilter
+	TermRange   *GraphDocumentTermRangeFilter
+	DateRange   *GraphDocumentDateRangeFilter
+	MatchAll    *GraphDocumentMatchAllFilter
+	MatchNone   *GraphDocumentMatchNoneFilter
+	IDs         *GraphDocumentIdsFilter
+	BoolField   *GraphDocumentBoolFieldFilter
+	Boolean     *GraphDocumentFilterBoolean
+	Conjunction *GraphDocumentFilterConjunction
+	Disjunction *GraphDocumentFilterDisjunction
+
+	BooleanFilterPresent  bool
+	BooleanMustPresent    bool
+	BooleanShouldPresent  bool
+	BooleanMustNotPresent bool
+}
+
+type graphDocumentFilterProbe struct {
+	Term         memberPresence `json:"term"`
+	Fuzziness    memberPresence `json:"fuzziness"`
+	Prefix       memberPresence `json:"prefix"`
+	Regexp       memberPresence `json:"regexp"`
+	Wildcard     memberPresence `json:"wildcard"`
+	NumericRange memberPresence `json:"numeric_range"`
+	TermRange    memberPresence `json:"term_range"`
+	DateRange    memberPresence `json:"date_range"`
+	MatchAll     memberPresence `json:"match_all"`
+	MatchNone    memberPresence `json:"match_none"`
+	IDs          memberPresence `json:"ids"`
+	BoolField    memberPresence `json:"bool_field"`
+	Filter       memberPresence `json:"filter"`
+	Must         memberPresence `json:"must"`
+	Should       memberPresence `json:"should"`
+	MustNot      memberPresence `json:"must_not"`
+	Conjuncts    memberPresence `json:"conjuncts"`
+	Disjuncts    memberPresence `json:"disjuncts"`
+}
+
+// DecodeStrictVariant uses a presence-only probe followed by one strict typed
+// decode. It never remarshal-copies the retained union or materializes a
+// RawMessage map containing potentially large recursive filter payloads.
+func (t GraphDocumentFilter) DecodeStrictVariant() (DecodedGraphDocumentFilter, error) {
+	if retainedUnionIsNull(t.union) {
+		return DecodedGraphDocumentFilter{}, nil
+	}
+	var probe graphDocumentFilterProbe
+	if err := json.Unmarshal(t.union, &probe); err != nil {
+		return DecodedGraphDocumentFilter{}, err
+	}
+	for _, member := range [...]struct {
+		name     string
+		presence memberPresence
+	}{
+		{name: "term", presence: probe.Term},
+		{name: "fuzziness", presence: probe.Fuzziness},
+		{name: "prefix", presence: probe.Prefix},
+		{name: "regexp", presence: probe.Regexp},
+		{name: "wildcard", presence: probe.Wildcard},
+		{name: "numeric_range", presence: probe.NumericRange},
+		{name: "term_range", presence: probe.TermRange},
+		{name: "date_range", presence: probe.DateRange},
+		{name: "match_all", presence: probe.MatchAll},
+		{name: "match_none", presence: probe.MatchNone},
+		{name: "ids", presence: probe.IDs},
+		{name: "bool_field", presence: probe.BoolField},
+		{name: "filter", presence: probe.Filter},
+		{name: "must", presence: probe.Must},
+		{name: "should", presence: probe.Should},
+		{name: "must_not", presence: probe.MustNot},
+		{name: "conjuncts", presence: probe.Conjuncts},
+		{name: "disjuncts", presence: probe.Disjuncts},
+	} {
+		if member.presence.present && member.presence.null {
+			return DecodedGraphDocumentFilter{}, fmt.Errorf("graph document filter %s must not be null", member.name)
+		}
+	}
+	decode := func(value any) error { return decodeStrictJSON(t.union, value) }
+	switch {
+	case probe.Term.present && probe.Fuzziness.present:
+		value := &GraphDocumentFuzzyFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantFuzzy, Fuzzy: value}, decode(value)
+	case probe.Term.present:
+		value := &GraphDocumentTermFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantTerm, Term: value}, decode(value)
+	case probe.Prefix.present:
+		value := &GraphDocumentPrefixFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantPrefix, Prefix: value}, decode(value)
+	case probe.Regexp.present:
+		value := &GraphDocumentRegexpFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantRegexp, Regexp: value}, decode(value)
+	case probe.Wildcard.present:
+		value := &GraphDocumentWildcardFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantWildcard, Wildcard: value}, decode(value)
+	case probe.NumericRange.present:
+		value := &GraphDocumentNumericRangeFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantNumericRange, Numeric: value}, decode(value)
+	case probe.TermRange.present:
+		value := &GraphDocumentTermRangeFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantTermRange, TermRange: value}, decode(value)
+	case probe.DateRange.present:
+		value := &GraphDocumentDateRangeFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantDateRange, DateRange: value}, decode(value)
+	case probe.MatchAll.present:
+		value := &GraphDocumentMatchAllFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantMatchAll, MatchAll: value}, decode(value)
+	case probe.MatchNone.present:
+		value := &GraphDocumentMatchNoneFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantMatchNone, MatchNone: value}, decode(value)
+	case probe.IDs.present:
+		value := &GraphDocumentIdsFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantIDs, IDs: value}, decode(value)
+	case probe.BoolField.present:
+		value := &GraphDocumentBoolFieldFilter{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantBoolField, BoolField: value}, decode(value)
+	case probe.Conjuncts.present:
+		value := &GraphDocumentFilterConjunction{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantConjunction, Conjunction: value}, decode(value)
+	case probe.Disjuncts.present:
+		value := &GraphDocumentFilterDisjunction{}
+		return DecodedGraphDocumentFilter{Kind: GraphDocumentFilterVariantDisjunction, Disjunction: value}, decode(value)
+	case probe.Filter.present || probe.Must.present || probe.Should.present || probe.MustNot.present:
+		value := &GraphDocumentFilterBoolean{}
+		return DecodedGraphDocumentFilter{
+			Kind:                  GraphDocumentFilterVariantBoolean,
+			Boolean:               value,
+			BooleanFilterPresent:  probe.Filter.present,
+			BooleanMustPresent:    probe.Must.present,
+			BooleanShouldPresent:  probe.Should.present,
+			BooleanMustNotPresent: probe.MustNot.present,
+		}, decode(value)
+	default:
+		return DecodedGraphDocumentFilter{}, errors.New("unsupported graph document filter variant")
+	}
 }
 
 type graphPathEndpointWire GraphPathEndpoint

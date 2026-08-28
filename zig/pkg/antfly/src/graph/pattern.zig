@@ -338,6 +338,21 @@ pub fn isValidIdentifier(value: []const u8) bool {
     return identifier_policy.isValid(value);
 }
 
+/// Table qualifiers preserve exact identity bytes but must contain at least
+/// one non-ASCII-whitespace byte. This matches the public graph schema and
+/// keeps omission distinct from an invalid present-but-blank qualifier.
+pub fn isValidTableQualifier(value: []const u8) bool {
+    return std.mem.trim(u8, value, " \t\r\n").len > 0;
+}
+
+test "graph table qualifiers preserve exact nonblank identity bytes" {
+    try std.testing.expect(isValidTableQualifier("docs"));
+    try std.testing.expect(isValidTableQualifier(" docs "));
+    try std.testing.expect(isValidTableQualifier("\u{00a0}"));
+    try std.testing.expect(!isValidTableQualifier(""));
+    try std.testing.expect(!isValidTableQualifier(" \t\r\n"));
+}
+
 test "graph identifiers match the versioned wire-policy conformance cases" {
     try std.testing.expectEqualStrings("15.0.0", identifier_policy.unicode_version);
     for (identifier_policy.conformance_cases) |case| {
@@ -2552,7 +2567,7 @@ pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
     }
 
     for (pattern.nodes, 0..) |node, i| {
-        if (!isValidIdentifier(node.alias) or (node.table != null and std.mem.trim(u8, node.table.?, " \t\r\n").len == 0)) return error.InvalidArgument;
+        if (!isValidIdentifier(node.alias) or (node.table != null and !isValidTableQualifier(node.table.?))) return error.InvalidArgument;
         for (pattern.nodes[0..i]) |prior| if (std.mem.eql(u8, prior.alias, node.alias)) return error.InvalidArgument;
     }
     if (pattern.anchor_alias) |anchor_alias| {
@@ -2564,7 +2579,7 @@ pub fn validateConjunctivePattern(pattern: ConjunctivePattern) !void {
     for (pattern.predicates) |predicate| try validateMatchPredicate(pattern.nodes, predicate);
     for (pattern.optional, 0..) |optional_pattern, optional_index| {
         for (optional_pattern.nodes, 0..) |node, node_index| {
-            if (!isValidIdentifier(node.alias) or (node.table != null and std.mem.trim(u8, node.table.?, " \t\r\n").len == 0) or
+            if (!isValidIdentifier(node.alias) or (node.table != null and !isValidTableQualifier(node.table.?)) or
                 findMatchNode(pattern.nodes, node.alias) != null)
                 return error.InvalidArgument;
             for (optional_pattern.nodes[0..node_index]) |prior| {

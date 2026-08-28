@@ -1285,6 +1285,25 @@ func TestGraphPathValidationDoesNotComputeUnusedProduct(t *testing.T) {
 	}
 }
 
+func TestGraphPathEndpointsRejectPresentBlankTable(t *testing.T) {
+	for _, table := range []string{"", " ", "\t\r\n"} {
+		t.Run(fmt.Sprintf("%q", table), func(t *testing.T) {
+			if _, err := NewGraphShortestPathQuery(GraphShortestPathQuery{
+				Index: "graph",
+				ShortestPath: GraphShortestPath{
+					From: GraphPathEndpoint{Key: "a", Table: &table},
+					To:   GraphPathEndpoint{Key: "b"},
+				},
+			}); err == nil {
+				t.Fatal("expected blank endpoint table to be rejected")
+			}
+			if _, err := NewGraphIdentity("a", table); err == nil {
+				t.Fatal("expected blank identity table to be rejected")
+			}
+		})
+	}
+}
+
 func TestGraphTraversalAndPathDirectionValidation(t *testing.T) {
 	start, err := NewGraphKeySelector("doc:a")
 	if err != nil {

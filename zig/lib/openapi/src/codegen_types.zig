@@ -159,20 +159,30 @@ pub const TypeGenerator = struct {
     }
 
     fn emitStrictOptionalObjectHelpers(self: *TypeGenerator) !void {
+        try self.w.line("const OpenApiObjectField = struct {{", .{});
+        self.w.indent();
+        try self.w.line("json_name: []const u8,", .{});
+        try self.w.line("zig_name: []const u8,", .{});
+        try self.w.line("rejects_null: bool = false,", .{});
+        self.w.dedent();
+        try self.w.line("}};", .{});
+        try self.w.blank();
         try self.w.line("/// Parse an OpenAPI object without materializing a second JSON tree while", .{});
         try self.w.line("/// rejecting explicit null for optional properties whose schemas are non-nullable.", .{});
         try self.w.line("fn openApiParseObject(", .{});
         self.w.indent();
         try self.w.line("comptime T: type,", .{});
-        try self.w.line("comptime non_nullable_optional_fields: []const []const u8,", .{});
+        try self.w.line("comptime openapi_fields: []const OpenApiObjectField,", .{});
         try self.w.line("allocator: std.mem.Allocator,", .{});
         try self.w.line("source: anytype,", .{});
         try self.w.line("options: std.json.ParseOptions,", .{});
         self.w.dedent();
         try self.w.line(") !T {{", .{});
         self.w.indent();
+        try self.w.line("@setEvalBranchQuota(100_000);", .{});
         try self.w.line("const struct_info = @typeInfo(T).@\"struct\";", .{});
         try self.w.line("if (struct_info.is_tuple) @compileError(\"OpenAPI object parser does not accept tuples\");", .{});
+        try self.w.line("if (openapi_fields.len != struct_info.fields.len) @compileError(\"OpenAPI object field descriptors must match the generated struct\");", .{});
         try self.w.line("if (.object_begin != try source.next()) return error.UnexpectedToken;", .{});
         try self.w.blank();
         try self.w.line("var result: T = undefined;", .{});
@@ -187,16 +197,16 @@ pub const TypeGenerator = struct {
         try self.w.line("else => return error.UnexpectedToken,", .{});
         self.w.dedent();
         try self.w.line("}};", .{});
-        try self.w.line("const rejects_null = openApiFieldRejectsNull(non_nullable_optional_fields, field_name);", .{});
         try self.w.blank();
-        try self.w.line("inline for (struct_info.fields, 0..) |field, i| {{", .{});
+        try self.w.line("inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {{", .{});
         self.w.indent();
         try self.w.line("if (field.is_comptime) @compileError(\"comptime fields are not supported: \" ++ @typeName(T) ++ \".\" ++ field.name);", .{});
-        try self.w.line("if (std.mem.eql(u8, field.name, field_name)) {{", .{});
+        try self.w.line("if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError(\"OpenAPI object field descriptor order does not match the generated struct\");", .{});
+        try self.w.line("if (std.mem.eql(u8, openapi_field.json_name, field_name)) {{", .{});
         self.w.indent();
         try self.w.line("openApiFreeAllocatedToken(allocator, name_token.?);", .{});
         try self.w.line("name_token = null;", .{});
-        try self.w.line("if (rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;", .{});
+        try self.w.line("if (openapi_field.rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;", .{});
         try self.w.line("if (fields_seen[i]) {{", .{});
         self.w.indent();
         try self.w.line("switch (options.duplicate_field_behavior) {{", .{});
@@ -227,7 +237,7 @@ pub const TypeGenerator = struct {
         try self.w.line("}}", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
-        try self.w.line("try openApiFillDefaultStructValues(T, &result, &fields_seen);", .{});
+        try self.w.line("try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);", .{});
         try self.w.line("return result;", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
@@ -236,15 +246,17 @@ pub const TypeGenerator = struct {
         try self.w.line("fn openApiParseObjectFromValue(", .{});
         self.w.indent();
         try self.w.line("comptime T: type,", .{});
-        try self.w.line("comptime non_nullable_optional_fields: []const []const u8,", .{});
+        try self.w.line("comptime openapi_fields: []const OpenApiObjectField,", .{});
         try self.w.line("allocator: std.mem.Allocator,", .{});
         try self.w.line("source: std.json.Value,", .{});
         try self.w.line("options: std.json.ParseOptions,", .{});
         self.w.dedent();
         try self.w.line(") !T {{", .{});
         self.w.indent();
+        try self.w.line("@setEvalBranchQuota(100_000);", .{});
         try self.w.line("const struct_info = @typeInfo(T).@\"struct\";", .{});
         try self.w.line("if (struct_info.is_tuple) @compileError(\"OpenAPI object parser does not accept tuples\");", .{});
+        try self.w.line("if (openapi_fields.len != struct_info.fields.len) @compileError(\"OpenAPI object field descriptors must match the generated struct\");", .{});
         try self.w.line("if (source != .object) return error.UnexpectedToken;", .{});
         try self.w.line("var result: T = undefined;", .{});
         try self.w.line("var fields_seen = [_]bool{{false}} ** struct_info.fields.len;", .{});
@@ -252,12 +264,13 @@ pub const TypeGenerator = struct {
         try self.w.line("while (it.next()) |entry| {{", .{});
         self.w.indent();
         try self.w.line("const field_name = entry.key_ptr.*;", .{});
-        try self.w.line("if (openApiFieldRejectsNull(non_nullable_optional_fields, field_name) and entry.value_ptr.* == .null) return error.UnexpectedToken;", .{});
-        try self.w.line("inline for (struct_info.fields, 0..) |field, i| {{", .{});
+        try self.w.line("inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {{", .{});
         self.w.indent();
         try self.w.line("if (field.is_comptime) @compileError(\"comptime fields are not supported: \" ++ @typeName(T) ++ \".\" ++ field.name);", .{});
-        try self.w.line("if (std.mem.eql(u8, field.name, field_name)) {{", .{});
+        try self.w.line("if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError(\"OpenAPI object field descriptor order does not match the generated struct\");", .{});
+        try self.w.line("if (std.mem.eql(u8, openapi_field.json_name, field_name)) {{", .{});
         self.w.indent();
+        try self.w.line("if (openapi_field.rejects_null and entry.value_ptr.* == .null) return error.UnexpectedToken;", .{});
         try self.w.line("@field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);", .{});
         try self.w.line("fields_seen[i] = true;", .{});
         try self.w.line("break;", .{});
@@ -267,23 +280,18 @@ pub const TypeGenerator = struct {
         try self.w.line("}} else if (!options.ignore_unknown_fields) return error.UnknownField;", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
-        try self.w.line("try openApiFillDefaultStructValues(T, &result, &fields_seen);", .{});
+        try self.w.line("try openApiFillDefaultStructValues(T, openapi_fields, &result, &fields_seen);", .{});
         try self.w.line("return result;", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
         try self.w.blank();
 
-        try self.w.line("fn openApiFieldRejectsNull(comptime fields: []const []const u8, field_name: []const u8) bool {{", .{});
+        try self.w.line("fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: []const OpenApiObjectField, result: *T, fields_seen: *[@typeInfo(T).@\"struct\".fields.len]bool) !void {{", .{});
         self.w.indent();
-        try self.w.line("inline for (fields) |field| if (std.mem.eql(u8, field, field_name)) return true;", .{});
-        try self.w.line("return false;", .{});
-        self.w.dedent();
-        try self.w.line("}}", .{});
-        try self.w.blank();
-        try self.w.line("fn openApiFillDefaultStructValues(comptime T: type, result: *T, fields_seen: *[@typeInfo(T).@\"struct\".fields.len]bool) !void {{", .{});
+        try self.w.line("@setEvalBranchQuota(100_000);", .{});
+        try self.w.line("inline for (@typeInfo(T).@\"struct\".fields, openapi_fields, 0..) |field, openapi_field, i| {{", .{});
         self.w.indent();
-        try self.w.line("inline for (@typeInfo(T).@\"struct\".fields, 0..) |field, i| {{", .{});
-        self.w.indent();
+        try self.w.line("if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError(\"OpenAPI object field descriptor order does not match the generated struct\");", .{});
         try self.w.line("if (!fields_seen[i]) {{", .{});
         self.w.indent();
         try self.w.line("if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;", .{});
@@ -600,7 +608,7 @@ pub const TypeGenerator = struct {
 
         var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
         try self.collectNonNullableOptionalFields(schema, &required_set, true, &strict_optional_fields);
-        try self.emitStrictOptionalObjectParsers(strict_optional_fields.keys());
+        try self.emitStrictOptionalObjectParsers(schema.properties.keys(), &strict_optional_fields);
 
         // Request serialization normally omits null optional fields. Generate a
         // required-aware serializer when a required field permits null or its
@@ -768,7 +776,7 @@ pub const TypeGenerator = struct {
 
         var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
         try self.collectNonNullableOptionalFields(schema, &all_required, true, &strict_optional_fields);
-        try self.emitStrictOptionalObjectParsers(strict_optional_fields.keys());
+        try self.emitStrictOptionalObjectParsers(emitted_props.keys(), &strict_optional_fields);
 
         if (strict_optional_fields.count() > 0 or
             self.schemaNeedsRequiredFieldSerializer(schema, &all_required, true))
@@ -809,7 +817,7 @@ pub const TypeGenerator = struct {
 
         var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
         try self.collectNonNullableOptionalFields(schema, &all_required, true, &strict_optional_fields);
-        try self.emitStrictOptionalObjectParsers(strict_optional_fields.keys());
+        try self.emitStrictOptionalObjectParsers(emitted_props.keys(), &strict_optional_fields);
 
         try self.w.blank();
         try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
@@ -852,17 +860,20 @@ pub const TypeGenerator = struct {
         }
     }
 
-    fn emitStrictOptionalObjectParsers(self: *TypeGenerator, field_names: []const []const u8) !void {
-        if (field_names.len == 0) return;
+    fn emitStrictOptionalObjectParsers(
+        self: *TypeGenerator,
+        property_names: []const []const u8,
+        strict_optional_fields: *const std.StringArrayHashMapUnmanaged(void),
+    ) !void {
+        if (strict_optional_fields.count() == 0) return;
         self.uses_strict_optional_object = true;
-        const sorted = try sortedStringKeys(self.arena, field_names);
 
         try self.w.blank();
         try self.w.line("pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {{", .{});
         self.w.indent();
         try self.w.line("return try openApiParseObject(@This(), &.{{", .{});
         self.w.indent();
-        for (sorted) |field_name| try self.w.line("\"{f}\",", .{std.zig.fmtString(field_name)});
+        try self.emitOpenApiObjectFieldDescriptors(property_names, strict_optional_fields);
         self.w.dedent();
         try self.w.line("}}, allocator, source, options);", .{});
         self.w.dedent();
@@ -872,11 +883,34 @@ pub const TypeGenerator = struct {
         self.w.indent();
         try self.w.line("return try openApiParseObjectFromValue(@This(), &.{{", .{});
         self.w.indent();
-        for (sorted) |field_name| try self.w.line("\"{f}\",", .{std.zig.fmtString(field_name)});
+        try self.emitOpenApiObjectFieldDescriptors(property_names, strict_optional_fields);
         self.w.dedent();
         try self.w.line("}}, allocator, source, options);", .{});
         self.w.dedent();
         try self.w.line("}}", .{});
+    }
+
+    fn emitOpenApiObjectFieldDescriptors(
+        self: *TypeGenerator,
+        property_names: []const []const u8,
+        strict_optional_fields: *const std.StringArrayHashMapUnmanaged(void),
+    ) !void {
+        for (property_names) |json_name| {
+            // @typeInfo reports the logical identifier without Zig's @"..."
+            // source escaping. Keep the wire name, reflection name, and emitted
+            // source spelling separate so reserved and otherwise escaped field
+            // names retain the same compile-time ordering check as ordinary
+            // identifiers.
+            const reflection_name = try naming.toFieldName(self.arena, json_name);
+            try self.w.line(
+                ".{{ .json_name = \"{f}\", .zig_name = \"{f}\", .rejects_null = {s} }},",
+                .{
+                    std.zig.fmtString(json_name),
+                    std.zig.fmtString(reflection_name),
+                    if (strict_optional_fields.contains(json_name)) "true" else "false",
+                },
+            );
+        }
     }
 
     fn emitFlattenedSchemaProperties(

@@ -89,7 +89,9 @@
           "metadata": {
             "type": "object",
             "additionalProperties": true
-          }
+          },
+          "audit.event": { "type": "string" },
+          "type": { "type": "string" }
         }
       },
       "NewPet": {

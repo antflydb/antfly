@@ -88,3 +88,96 @@ func TestCanonicalGraphOpaqueObjectsAcceptObjectOrOmission(t *testing.T) {
 		t.Fatalf("metadata = %#v", edge.Metadata)
 	}
 }
+
+func TestGraphRequestUnionExtensionsSelectStrictArms(t *testing.T) {
+	t.Run("selector", func(t *testing.T) {
+		var selector GraphNodeSelector
+		if err := json.Unmarshal([]byte(`{"keys":["a","b"]}`), &selector); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := selector.DecodeStrictVariant()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Kind != GraphNodeSelectorVariantKeys || len(decoded.Keys.Keys) != 2 {
+			t.Fatalf("decoded selector = %#v", decoded)
+		}
+
+		if err := json.Unmarshal([]byte(`{"keys":["a"],"limit":1}`), &selector); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := selector.DecodeStrictVariant(); err == nil {
+			t.Fatal("expected result-reference-only option to be rejected")
+		}
+	})
+
+	t.Run("where", func(t *testing.T) {
+		var where GraphWhereExpression
+		if err := json.Unmarshal([]byte(`{"not_equal":{"left":{"alias":"a"},"right":{"alias":"b"}}}`), &where); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := where.DecodeStrictVariant()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Kind != GraphWhereVariantNotEqual || decoded.NotEqual.NotEqual.Left.Alias != "a" {
+			t.Fatalf("decoded where = %#v", decoded)
+		}
+
+		if err := json.Unmarshal([]byte(`{"and":[],"not_exists":{"edges":[]}}`), &where); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := where.DecodeStrictVariant(); err == nil {
+			t.Fatal("expected multiple predicate arms to be rejected")
+		}
+	})
+
+	t.Run("count", func(t *testing.T) {
+		var aggregate GraphCountAggregate
+		if err := json.Unmarshal([]byte(`{"count":"a","distinct":true}`), &aggregate); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := aggregate.DecodeStrictVariant()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Count != "a" || !decoded.Distinct {
+			t.Fatalf("decoded count = %#v", decoded)
+		}
+
+		if err := json.Unmarshal([]byte(`{"count":"*","distinct":false}`), &aggregate); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := aggregate.DecodeStrictVariant(); err == nil {
+			t.Fatal("expected distinct count(*) member to be rejected")
+		}
+	})
+
+	t.Run("document filter", func(t *testing.T) {
+		var filter GraphDocumentFilter
+		if err := json.Unmarshal([]byte(`{"term":"beta","path":"/title"}`), &filter); err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := filter.DecodeStrictVariant()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decoded.Kind != GraphDocumentFilterVariantTerm || decoded.Term.Path != "/title" {
+			t.Fatalf("decoded filter = %#v", decoded)
+		}
+
+		if err := json.Unmarshal([]byte(`{"term":null,"path":"/title"}`), &filter); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filter.DecodeStrictVariant(); err == nil || !strings.Contains(err.Error(), "term must not be null") {
+			t.Fatalf("expected null term to be rejected, got %v", err)
+		}
+
+		if err := json.Unmarshal([]byte(`{"term":"beta","path":"/title","boost":2}`), &filter); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := filter.DecodeStrictVariant(); err == nil {
+			t.Fatal("expected unknown scoring option to be rejected")
+		}
+	})
+}

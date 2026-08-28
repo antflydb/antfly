@@ -126,3 +126,48 @@ test "optional non-nullable properties reject explicit null without losing omiss
         std.json.parseFromValueLeaky(types.Pet, alloc, null_tree, .{}),
     );
 }
+
+test "OpenAPI wire names remain distinct from ergonomic Zig field names" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const parsed = try std.json.parseFromSliceLeaky(
+        types.Pet,
+        alloc,
+        \\{"id":1,"name":"Mochi","audit.event":"created","type":"cat"}
+    ,
+        .{},
+    );
+    try std.testing.expectEqualStrings("created", parsed.audit_event.?);
+    try std.testing.expectEqualStrings("cat", parsed.type.?);
+
+    const tree = try std.json.parseFromSliceLeaky(
+        std.json.Value,
+        alloc,
+        \\{"id":1,"name":"Mochi","audit.event":"updated"}
+    ,
+        .{},
+    );
+    const from_value = try std.json.parseFromValueLeaky(types.Pet, alloc, tree, .{});
+    try std.testing.expectEqualStrings("updated", from_value.audit_event.?);
+
+    const encoded = try std.json.Stringify.valueAlloc(alloc, from_value, .{});
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"audit.event\":\"updated\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"audit_event\"") == null);
+
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(
+        types.Pet,
+        alloc,
+        \\{"id":1,"name":"Mochi","audit.event":null}
+    ,
+        .{},
+    ));
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(
+        types.Pet,
+        alloc,
+        \\{"id":1,"name":"Mochi","type":null}
+    ,
+        .{},
+    ));
+}

@@ -22965,7 +22965,7 @@ components:
         table:
           type: string
           minLength: 1
-          pattern: .*\S.*
+          pattern: '[^ \t\r\n]'
           description: Owning table for this alias. Omit for the queried table.
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
@@ -23305,6 +23305,7 @@ components:
           x-go-type-skip-optional-pointer: false
           type: string
           minLength: 1
+          pattern: '[^ \t\r\n]'
           description: Optional table qualifier for an exact cross-table node identity. Omit for the query
             table.
     GraphIdentityNodeSelector:
@@ -23867,6 +23868,7 @@ components:
           x-go-type-skip-optional-pointer: false
           type: string
           minLength: 1
+          pattern: '[^ \t\r\n]'
           description: Owning table for a cross-table binding; omitted for the queried table.
         document:
           type: object
@@ -24025,6 +24027,7 @@ components:
           x-go-type-skip-optional-pointer: false
           type: string
           minLength: 1
+          pattern: '[^ \t\r\n]'
           description: Owning table for a cross-table node; omitted for nodes in the queried table
         depth:
           x-go-type-skip-optional-pointer: true

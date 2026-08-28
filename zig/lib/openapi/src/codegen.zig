@@ -286,6 +286,12 @@ test "generate 3.1 types with nullable and ref siblings" {
             .description = "Current adoption status",
         },
     });
+    try pet_props.put(arena, "audit.event", types.SchemaOrRef{
+        .schema = types.Schema{ .schema_type = .{ .single = "string" } },
+    });
+    try pet_props.put(arena, "type", types.SchemaOrRef{
+        .schema = types.Schema{ .schema_type = .{ .single = "string" } },
+    });
 
     var err_props = std.StringArrayHashMapUnmanaged(types.SchemaOrRef){};
     try err_props.put(arena, "error", types.SchemaOrRef{
@@ -368,7 +374,9 @@ test "generate 3.1 types with nullable and ref siblings" {
     // Optional non-nullable properties keep ergonomic `?T` fields while their
     // generated object parser rejects explicit JSON null according to OpenAPI.
     try std.testing.expect(std.mem.indexOf(u8, out, "return try openApiParseObject(@This(), &.{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"status\",") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".json_name = \"status\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".json_name = \"audit.event\", .zig_name = \"audit_event\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".json_name = \"type\", .zig_name = \"type\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "fn openApiParseObject(") != null);
 }
 
