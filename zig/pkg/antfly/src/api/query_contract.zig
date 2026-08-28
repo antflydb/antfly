@@ -449,7 +449,8 @@ test "graph response format uses admitted metadata and fails closed on plan drif
             .graph_query_transport = .{
                 .dialect = .canonical,
                 .operations_json = "{\"walk\":{}}",
-                .operation_names = &.{"walk"},
+                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                .admitted_operations_len = queries.len,
             },
         },
     ));
@@ -459,7 +460,8 @@ test "graph response format uses admitted metadata and fails closed on plan drif
             .graph_query_transport = .{
                 .dialect = .legacy,
                 .operations_json = "{\"walk\":{}}",
-                .operation_names = &.{"walk"},
+                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                .admitted_operations_len = queries.len,
             },
         },
     ));
@@ -469,7 +471,22 @@ test "graph response format uses admitted metadata and fails closed on plan drif
             .graph_query_transport = .{
                 .dialect = .canonical,
                 .operations_json = "{}",
-                .operation_names = &.{},
+                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                .admitted_operations_len = 0,
+            },
+        },
+    ));
+
+    var same_name_different_plan = queries;
+    same_name_different_plan[0].query.index_name = "other_graph_idx";
+    try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
+        .{
+            .graph_queries = &same_name_different_plan,
+            .graph_query_transport = .{
+                .dialect = .canonical,
+                .operations_json = "{\"walk\":{}}",
+                .admitted_operations_ptr = @ptrCast(queries[0..].ptr),
+                .admitted_operations_len = queries.len,
             },
         },
     ));
@@ -6217,7 +6234,8 @@ test "deprecated graph search preserves its response envelope" {
                 .operations_json =
                 \\{"neighbors":{"type":"neighbors"}}
                 ,
-                .operation_names = &.{"neighbors"},
+                .admitted_operations_ptr = @ptrCast(named_queries[0..].ptr),
+                .admitted_operations_len = named_queries.len,
             },
         },
         .{ .took_ms = 3 },
@@ -11166,8 +11184,8 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     req.* = undefined;
 }
 
-/// Capture the admitted dialect, exact operation names, and normalized
-/// operation object once. This stays independent of generated OpenAPI
+/// Capture the admitted dialect, immutable canonical plan identity, and
+/// normalized operation object once. This stays independent of generated OpenAPI
 /// representation details and avoids a reverse serializer that would have to
 /// evolve with the DSL.
 fn captureGraphQueryTransportAlloc(

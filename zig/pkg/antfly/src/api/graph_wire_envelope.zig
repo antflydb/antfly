@@ -36,6 +36,31 @@ pub fn captureRequestTransportAlloc(
     const legacy = if (legacy_value != null and legacy_value.? != .null) legacy_value else null;
     if ((canonical == null) == (legacy == null)) return error.InvalidGraphWireEnvelope;
     const operations = canonical orelse legacy.?;
+    return captureOperationsAlloc(
+        alloc,
+        operations,
+        expected_operations,
+        if (legacy != null) .legacy else .canonical,
+    );
+}
+
+/// Capture an already-parsed canonical operation map. Serverless admission uses
+/// this after rejecting the legacy field, avoiding another parse of the public
+/// body while keeping canonical response encoding bound to the admitted plan.
+pub fn captureCanonicalOperationsAlloc(
+    alloc: std.mem.Allocator,
+    operations: std.json.Value,
+    expected_operations: anytype,
+) !db_mod.types.GraphQueryTransport {
+    return captureOperationsAlloc(alloc, operations, expected_operations, .canonical);
+}
+
+fn captureOperationsAlloc(
+    alloc: std.mem.Allocator,
+    operations: std.json.Value,
+    expected_operations: anytype,
+    dialect: Dialect,
+) !db_mod.types.GraphQueryTransport {
     if (operations != .object or operations.object.count() != expected_operations.len)
         return error.InvalidGraphWireEnvelope;
     for (expected_operations) |operation| {
@@ -45,19 +70,11 @@ pub fn captureRequestTransportAlloc(
     const operations_json = try std.json.Stringify.valueAlloc(alloc, operations, .{});
     errdefer alloc.free(operations_json);
 
-    const operation_names = try alloc.alloc([]const u8, expected_operations.len);
-    errdefer alloc.free(operation_names);
-    var initialized: usize = 0;
-    errdefer for (operation_names[0..initialized]) |name| alloc.free(@constCast(name));
-    for (expected_operations, 0..) |operation, index| {
-        operation_names[index] = try alloc.dupe(u8, operation.name);
-        initialized += 1;
-    }
-
     return .{
-        .dialect = if (legacy != null) .legacy else .canonical,
+        .dialect = dialect,
         .operations_json = operations_json,
-        .operation_names = operation_names,
+        .admitted_operations_ptr = @ptrCast(expected_operations.ptr),
+        .admitted_operations_len = expected_operations.len,
     };
 }
 
@@ -73,7 +90,11 @@ test "graph wire envelope capture normalizes nulls and escaped dialect names" {
     defer canonical.deinit(alloc);
     try std.testing.expectEqual(Dialect.canonical, canonical.dialect);
     try std.testing.expectEqualStrings("{\"walk\":{}}", canonical.operations_json);
-    try std.testing.expectEqualStrings("walk", canonical.operation_names[0]);
+    try std.testing.expectEqual(
+        @as(*const anyopaque, @ptrCast(expected[0..].ptr)),
+        canonical.admitted_operations_ptr,
+    );
+    try std.testing.expectEqual(expected.len, canonical.admitted_operations_len);
 
     var legacy = try captureRequestTransportAlloc(
         alloc,

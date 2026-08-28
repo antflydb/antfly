@@ -17001,7 +17001,8 @@ test "generic shard query wire preserves admitted canonical graph operations wit
         .graph_query_transport = .{
             .dialect = .canonical,
             .operations_json = graph_operations,
-            .operation_names = &.{"neighbors"},
+            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+            .admitted_operations_len = graph_queries.len,
         },
     });
     defer std.testing.allocator.free(encoded);
@@ -17050,7 +17051,8 @@ test "generic shard query wire never drops graph table authorization" {
             .operations_json =
             \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
             ,
-            .operation_names = &.{"neighbors"},
+            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+            .admitted_operations_len = graph_queries.len,
         },
         .graph_table_read_authorizer = .{
             .ctx = null,
@@ -26885,7 +26887,8 @@ test "graph coordinator base request avoids an implicit retrieval scan" {
         .graph_query_transport = .{
             .dialect = .canonical,
             .operations_json = "{\"links\":{}}",
-            .operation_names = &.{"links"},
+            .admitted_operations_ptr = @ptrCast(graph_queries[0..].ptr),
+            .admitted_operations_len = graph_queries.len,
         },
         .expand_strategy = .@"union",
     });

@@ -1312,30 +1312,20 @@ pub const GraphQueryTransport = struct {
     /// Owned, normalized JSON object containing only the admitted named graph
     /// operations. It is safe to embed directly after a JSON field name.
     operations_json: []const u8,
-    /// Owned copy of the admitted operation names. Keeping this small sidecar
-    /// lets proxy boundaries fail closed if an internal derived request changes
-    /// the execution plan, without reparsing the potentially large DSL body.
-    operation_names: []const []const u8,
+    /// Borrowed identity of the immutable canonical operation slice produced by
+    /// public admission. Derived requests may retain the complete admitted plan
+    /// or clear it, but replacing the operations requires re-admission. This
+    /// pointer is compared by identity only and is never dereferenced.
+    admitted_operations_ptr: *const anyopaque,
+    admitted_operations_len: usize,
 
     pub fn matchesOperations(self: GraphQueryTransport, operations: []const NamedGraphQuery) bool {
-        if (self.operation_names.len != operations.len) return false;
-        for (self.operation_names) |expected_name| {
-            var found = false;
-            for (operations) |operation| {
-                if (std.mem.eql(u8, expected_name, operation.name)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-        return true;
+        return self.admitted_operations_len == operations.len and
+            self.admitted_operations_ptr == @as(*const anyopaque, @ptrCast(operations.ptr));
     }
 
     pub fn deinit(self: *GraphQueryTransport, alloc: Allocator) void {
         alloc.free(@constCast(self.operations_json));
-        for (self.operation_names) |name| alloc.free(@constCast(name));
-        if (self.operation_names.len > 0) alloc.free(@constCast(self.operation_names));
         self.* = undefined;
     }
 };

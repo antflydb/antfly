@@ -23,6 +23,7 @@ const indexes_api = @import("../../api/indexes.zig");
 const foreign_sources_api = @import("../../api/foreign_sources.zig");
 const join_model = @import("../../api/join_model.zig");
 const query_api = @import("../../api/query.zig");
+const graph_wire_envelope = @import("../../api/graph_wire_envelope.zig");
 const public_graph_query = @import("../../api/public_graph_query.zig");
 const graph_query_diagnostic = @import("../../api/graph_query_diagnostic.zig");
 const graph_path_weight_diagnostic = @import("../../graph/path_weight_diagnostic.zig");
@@ -1213,6 +1214,13 @@ pub const HttpHandler = struct {
         cancellation: CancellationToken,
     ) anyerror!?[]u8 {
         try cancellation.check();
+        var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch
+            return error.InvalidQueryRequest;
+        defer raw_request.deinit();
+        if (raw_request.value != .object) return error.InvalidQueryRequest;
+        if (!public_search_request.hasNonNullField(raw_request.value.object, "foreign_sources"))
+            return null;
+
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
         }) catch return error.InvalidQueryRequest;
@@ -1559,12 +1567,6 @@ pub const HttpHandler = struct {
 
     fn executePlainPublicTableQueryJsonAlloc(self: *HttpHandler, table_name: []const u8, body: []const u8, cancellation: CancellationToken) anyerror![]u8 {
         try cancellation.check();
-        const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
-            error.InvalidQueryRequest => return error.InvalidQueryRequest,
-            else => return error.InternalQueryFailure,
-        };
-        defer if (aggregations_json) |json| self.alloc.free(json);
-
         const namespace = self.catalog.resolveTableNamespaceAlloc(table_name) catch return error.FileNotFound;
         defer self.alloc.free(namespace);
 
@@ -1585,6 +1587,12 @@ pub const HttpHandler = struct {
                 else => error.InternalQueryFailure,
             };
         }
+
+        const aggregations_json = parsePublicAggregationsJsonAlloc(self.alloc, body) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            else => return error.InternalQueryFailure,
+        };
+        defer if (aggregations_json) |json| self.alloc.free(json);
 
         var execution = self.executePublishedSearch(namespace, table_name, body, cancellation) catch |err| {
             switch (err) {
@@ -2646,10 +2654,6 @@ pub const HttpHandler = struct {
         cancellation: CancellationToken,
     ) !?HttpResponse {
         try cancellation.check();
-        public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
-            error.InvalidQueryRequest => return error.InvalidQueryRequest,
-            error.OutOfMemory => return error.OutOfMemory,
-        };
         var raw_request = ant_json.parseFromSlice(std.json.Value, self.alloc, body, .{}) catch return null;
         defer raw_request.deinit();
         const has_legacy_graph_request = raw_request.value == .object and
@@ -2662,6 +2666,10 @@ pub const HttpHandler = struct {
             );
             return error.UnsupportedQueryRequest;
         }
+        public_graph_query.rejectInternalDocIdentityFields(self.alloc, body) catch |err| switch (err) {
+            error.InvalidQueryRequest => return error.InvalidQueryRequest,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         const has_graph_request = raw_request.value == .object and
             (public_search_request.hasNonNullField(raw_request.value.object, "graph_queries") or
                 public_search_request.hasNonNullField(raw_request.value.object, "graph_searches"));
@@ -2718,6 +2726,17 @@ pub const HttpHandler = struct {
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
             .cancellation = cancellation,
         };
+        const canonical_operations = raw_request.value.object.get("graph_queries") orelse
+            return error.InvalidQueryRequest;
+        req.graph_query_transport = graph_wire_envelope.captureCanonicalOperationsAlloc(
+            self.alloc,
+            canonical_operations,
+            graph_queries,
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidQueryRequest,
+        };
+        defer req.graph_query_transport.?.deinit(self.alloc);
         var search_hits: []db_types.SearchHit = &.{};
         defer if (search_hits.len > 0) freeDbSearchHits(self.alloc, search_hits);
         var search_total_hits: u32 = 0;
@@ -2796,7 +2815,6 @@ pub const HttpHandler = struct {
             session_initialized = true;
             session.setCancellation(cancellation);
         }
-
         const results = self.executePublicGraphQueriesAlloc(&session, table_name, graph_queries, initial_sets.items) catch |err| {
             std.log.warn("serverless public graph request execution failed table={s} err={}", .{ table_name, err });
             return err;
@@ -11517,7 +11535,7 @@ test "http handler serves published graph query endpoints" {
     const generated_pattern_body = try std.json.Stringify.valueAlloc(
         alloc,
         typed_pattern_request.value,
-        .{},
+        .{ .emit_null_optional_fields = false },
     );
     defer alloc.free(generated_pattern_body);
     var generated_pattern_value = try ant_json.parseFromSlice(
@@ -11527,7 +11545,7 @@ test "http handler serves published graph query endpoints" {
         .{},
     );
     defer generated_pattern_value.deinit();
-    try std.testing.expect(generated_pattern_value.value.object.get("aggregations").? == .null);
+    try std.testing.expect(generated_pattern_value.value.object.get("aggregations") == null);
 
     var pattern = try handler.handle(.{
         .method = .post,

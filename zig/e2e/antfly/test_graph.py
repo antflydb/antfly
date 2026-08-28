@@ -675,6 +675,168 @@ def test_serverless_graph_pattern_two_hop_and_documents(serverless_api):
     assert count_result["aggregates"]["rows"] == {"value": "1", "exact": True}
 
 
+def test_serverless_graph_pattern_optional_inequality_and_antijoin(serverless_api):
+    """Cover storage-specific serverless integration for the hardest MATCH shapes."""
+    table_name = f"graph_pattern_joins_serverless_{time.time_ns()}"
+
+    def doc(doc_type: str, edges: list[dict] | None = None) -> str:
+        fields = {"type": doc_type}
+        if edges:
+            fields["graph_edges"] = edges
+        return json_doc(**fields)
+
+    def edge(target: str, edge_type: str) -> dict:
+        return {"target": target, "edge_type": edge_type, "weight": 1.0}
+
+    serverless_api.ensure_table(table_name, created_at_ns=200)
+    serverless_api.ingest_table(
+        table_name,
+        timestamp_ns=300,
+        mutations=[
+            upsert("tag-left", doc("Tag")),
+            upsert("tag-right", doc("Tag")),
+            upsert("message-q5", doc("Message", [edge("tag-left", "HAS_TAG")])),
+            upsert(
+                "comment-q5",
+                doc("Comment", [edge("message-q5", "REPLY_OF"), edge("tag-right", "HAS_TAG")]),
+            ),
+            upsert(
+                "comment-q8-blocked",
+                doc("Comment", [
+                    edge("message-q5", "REPLY_OF"),
+                    edge("tag-left", "HAS_TAG"),
+                    edge("tag-right", "HAS_TAG"),
+                ]),
+            ),
+            upsert("tag-q7", doc("Tag")),
+            upsert("creator", doc("Person")),
+            upsert("liker", doc("Person", [edge("message-optional", "LIKES")])),
+            upsert(
+                "message-optional",
+                doc("Message", [edge("tag-q7", "HAS_TAG"), edge("creator", "HAS_CREATOR")]),
+            ),
+            upsert(
+                "message-no-optional",
+                doc("Message", [edge("tag-q7", "HAS_TAG"), edge("creator", "HAS_CREATOR")]),
+            ),
+            upsert("comment-optional", doc("Comment", [edge("message-optional", "REPLY_OF")])),
+            upsert("person-1", doc("Person", [edge("person-2", "KNOWS")])),
+            upsert("person-2", doc("Person", [edge("person-3", "KNOWS")])),
+            upsert("person-3", doc("Person", [edge("interest-tag", "HAS_INTEREST")])),
+            upsert("interest-tag", doc("Tag")),
+        ],
+    )
+    try:
+        serverless_api.build_table(table_name)
+    except requests.HTTPError:
+        pass
+
+    def node(doc_type: str) -> dict:
+        return {"filter": {"term": doc_type, "path": "/type"}}
+
+    def neq(left: str, right: str) -> dict:
+        return {"not_equal": {"left": {"alias": left}, "right": {"alias": right}}}
+
+    def count_query(nodes: dict, edges: list, *, where=None, optional=None) -> dict:
+        match = {"anchor": next(iter(nodes)), "nodes": nodes, "edges": edges}
+        if where is not None:
+            match["where"] = where
+        if optional is not None:
+            match["optional"] = optional
+        return {
+            "index": "graph_idx",
+            "match": match,
+            "return": {"aggregates": {"count": {"count": "*"}}},
+        }
+
+    q5_nodes = {
+        "tag1": node("Tag"),
+        "message": node("Message"),
+        "comment": node("Comment"),
+        "tag2": node("Tag"),
+    }
+    q5_edges = [
+        {"from": "message", "to": "tag1", "types": ["HAS_TAG"]},
+        {"from": "comment", "to": "message", "types": ["REPLY_OF"]},
+        {"from": "comment", "to": "tag2", "types": ["HAS_TAG"]},
+    ]
+    q9_nodes = {
+        "person1": node("Person"),
+        "person2": node("Person"),
+        "person3": node("Person"),
+        "tag": node("Tag"),
+    }
+    q9_edges = [
+        {"from": "person1", "to": "person2", "direction": "both", "types": ["KNOWS"]},
+        {"from": "person2", "to": "person3", "direction": "both", "types": ["KNOWS"]},
+        {"from": "person3", "to": "tag", "types": ["HAS_INTEREST"]},
+    ]
+    queries = {
+        "q5_inequality": count_query(q5_nodes, q5_edges, where=neq("tag1", "tag2")),
+        "q7_optional": count_query(
+            {"tag": node("Tag"), "message": node("Message"), "creator": node("Person")},
+            [
+                {"from": "message", "to": "tag", "types": ["HAS_TAG"]},
+                {"from": "message", "to": "creator", "types": ["HAS_CREATOR"]},
+            ],
+            optional=[
+                {
+                    "nodes": {"liker": node("Person")},
+                    "edges": [{"from": "liker", "to": "message", "types": ["LIKES"]}],
+                },
+                {
+                    "nodes": {"reply": node("Comment")},
+                    "edges": [{"from": "reply", "to": "message", "types": ["REPLY_OF"]}],
+                },
+            ],
+        ),
+        "q8_antijoin": count_query(
+            q5_nodes,
+            q5_edges,
+            where={"and": [
+                {"not_exists": {"edges": [
+                    {"from": "comment", "to": "tag1", "types": ["HAS_TAG"]}
+                ]}},
+                neq("tag1", "tag2"),
+            ]},
+        ),
+        "q9_antijoin": count_query(
+            q9_nodes,
+            q9_edges,
+            where={"and": [
+                {"not_exists": {"edges": [{
+                    "from": "person1",
+                    "to": "person3",
+                    "direction": "both",
+                    "types": ["KNOWS"],
+                }]}},
+                neq("person1", "person3"),
+            ]},
+        ),
+    }
+    expected = {
+        "q5_inequality": "2",
+        "q7_optional": "2",
+        "q8_antijoin": "1",
+        "q9_antijoin": "1",
+    }
+    payload = {"graph_queries": queries, "limit": 10}
+
+    def exact_counts() -> dict | None:
+        response = serverless_api.query_table(table_name, payload)
+        results = response.get("responses", [{}])[0].get("graph_results", {})
+        actual = {
+            name: result.get("aggregates", {}).get("count")
+            for name, result in results.items()
+        }
+        if all(actual.get(name) == {"value": count, "exact": True} for name, count in expected.items()):
+            return actual
+        return None
+
+    counts = wait_until(exact_counts, timeout_s=30.0, interval_s=0.25)
+    assert counts == {name: {"value": count, "exact": True} for name, count in expected.items()}
+
+
 def test_multi_batch_graph_push_preserves_boundary_error_and_existing_edges(backup_api):
     table_name = f"graph_transform_boundary_{time.time_ns()}"
     _create_stateful_table(backup_api, table_name, num_shards=1)
