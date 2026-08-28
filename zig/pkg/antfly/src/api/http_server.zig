@@ -12307,6 +12307,18 @@ pub const ApiHttpServer = struct {
         };
         defer drop_result.deinit(self.alloc);
         var repair_required = false;
+        // The metadata commit can complete on a remote leader before this
+        // node applies the resulting catalog projection. Prefer observing the
+        // absence before consulting catalog ownership for destructive cleanup;
+        // the cleanup path still persists and retains repair debt if the wait
+        // times out or ownership remains inconclusive.
+        self.waitForTableVisibility(table_name, .absent) catch |err| {
+            repair_required = true;
+            std.log.warn(
+                "MCP drop table committed before local absence became observable table={s} err={s}",
+                .{ table_name, @errorName(err) },
+            );
+        };
         if (self.table_writes) |writes| {
             _ = writes.dropTable(self.alloc, table_name, drop_result.cleanupContract()) catch |err| switch (err) {
                 error.TableNotFound => null,
@@ -12327,10 +12339,6 @@ pub const ApiHttpServer = struct {
                 },
             };
         }
-        self.waitForTableVisibility(table_name, .absent) catch |err| switch (err) {
-            error.TableVisibilityTimeout => repair_required = true,
-            else => return err,
-        };
         if (repair_required) {
             const body = try std.json.Stringify.valueAlloc(
                 self.alloc,

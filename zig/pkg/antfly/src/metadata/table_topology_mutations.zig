@@ -28,16 +28,6 @@ fn afterAdmission(err: anyerror) anyerror {
     return error.MetadataMutationOutcomeUnknown;
 }
 
-fn findRangeByGroupId(
-    ranges: []const metadata_table_manager.RangeRecord,
-    group_id: u64,
-) ?*const metadata_table_manager.RangeRecord {
-    for (ranges) |*record| {
-        if (record.group_id == group_id) return record;
-    }
-    return null;
-}
-
 pub const DropResult = topology_protocol.DropResult;
 
 pub fn create(
@@ -86,18 +76,10 @@ pub fn create(
     svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
         return afterAdmission(err);
 
-    var snapshot = svc.adminSnapshot() catch |err| return afterAdmission(err);
-    defer svc.freeAdminSnapshot(&snapshot);
-    const projected = tables_api.findTableByName(&snapshot, table_name) orelse
-        return error.MetadataMutationOutcomeUnknown;
-    if (!metadata_table_manager.tableDefinitionsEqual(projected.*, table))
-        return error.TableAlreadyExists;
-    for (ranges) |expected| {
-        const projected_range = findRangeByGroupId(snapshot.ranges, expected.group_id) orelse
-            return error.MetadataMutationOutcomeUnknown;
-        if (!metadata_table_manager.rangeRecordsEqual(projected_range.*, expected))
-            return error.TableAlreadyExists;
-    }
+    svc.verifyTableCreateProjection(alloc, table, ranges) catch |err| switch (err) {
+        error.TableAlreadyExists => return err,
+        else => return afterAdmission(err),
+    };
     svc.unlockCatalogMutation();
     catalog_locked = false;
 }
@@ -132,10 +114,10 @@ pub fn drop(
     svc.waitForTransitionAppliedWithContext(receipt, request) catch |err|
         return afterAdmission(err);
 
-    var projected = svc.adminSnapshot() catch |err| return afterAdmission(err);
-    defer svc.freeAdminSnapshot(&projected);
-    if (tables_api.findTableByName(&projected, table_name) != null)
-        return error.TableTransitionActive;
+    svc.verifyTableDropProjection(alloc, admission.table_id) catch |err| switch (err) {
+        error.TableTransitionActive => return err,
+        else => return afterAdmission(err),
+    };
     svc.unlockCatalogMutation();
     catalog_locked = false;
     const result = DropResult{

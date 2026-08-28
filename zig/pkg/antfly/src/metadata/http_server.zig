@@ -2110,7 +2110,11 @@ pub const MetadataHttpServer = struct {
         request_context: operation.RequestContext,
         table_name: []const u8,
     ) !httpx.Response {
-        self.tableOperations().drop(ctx.allocator, request_context, table_name) catch |err| switch (err) {
+        var result = self.source.dropTableExactWithContext(
+            ctx.allocator,
+            request_context,
+            table_name,
+        ) catch |err| switch (err) {
             error.TableNotFound => return ctx.status(404).text("table not found"),
             error.TableTransitionActive => return ctx.status(409).text("table transition active"),
             error.ExtensionOwnedObject => {
@@ -2123,7 +2127,12 @@ pub const MetadataHttpServer = struct {
             error.UnsupportedOperation => return ctx.status(405).text("unsupported operation"),
             else => return metadataMutationError(ctx, err),
         };
-        return ctx.status(204).text("");
+        defer result.deinit(ctx.allocator);
+        return ctx.json(.{
+            .table_id = result.table_id,
+            .expected_transition_generation = result.expected_transition_generation,
+            .group_ids = result.group_ids,
+        });
     }
 
     fn executeMetadataDropTableForwarded(

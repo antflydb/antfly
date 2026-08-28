@@ -2593,6 +2593,36 @@ pub const MetadataService = struct {
         return fence.generation;
     }
 
+    pub fn verifyTableCreateProjection(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+        expected_table: metadata_table_manager.TableRecord,
+        expected_ranges: []const metadata_table_manager.RangeRecord,
+    ) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const projected_table = (try store.getTable(alloc, self.metadata_group_id, expected_table.table_id)) orelse
+            return error.MetadataMutationOutcomeUnknown;
+        defer metadata_table_manager.freeTable(alloc, projected_table);
+        if (!metadata_table_manager.tableDefinitionsEqual(projected_table, expected_table))
+            return error.TableAlreadyExists;
+        for (expected_ranges) |expected| {
+            const projected = (try store.getRange(alloc, self.metadata_group_id, expected.group_id)) orelse
+                return error.MetadataMutationOutcomeUnknown;
+            const matches = metadata_table_manager.rangeRecordsEqual(projected, expected);
+            metadata_table_manager.freeRange(alloc, projected);
+            if (!matches)
+                return error.TableAlreadyExists;
+        }
+    }
+
+    pub fn verifyTableDropProjection(self: *MetadataService, alloc: std.mem.Allocator, table_id: u64) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        if (try store.getTable(alloc, self.metadata_group_id, table_id)) |projected| {
+            metadata_table_manager.freeTable(alloc, projected);
+            return error.TableTransitionActive;
+        }
+    }
+
     pub fn lockCatalogMutation(self: *MetadataService) void {
         self.catalog_mutation_mutex.lockUncancelable(std.Options.debug_io);
     }
@@ -6396,6 +6426,36 @@ pub const MetadataHttpService = struct {
         const fence = try store.getTableTransitionFence(self.metadata_group_id, table_id);
         if (fence.active()) return error.TableTransitionActive;
         return fence.generation;
+    }
+
+    pub fn verifyTableCreateProjection(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+        expected_table: metadata_table_manager.TableRecord,
+        expected_ranges: []const metadata_table_manager.RangeRecord,
+    ) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        const projected_table = (try store.getTable(alloc, self.metadata_group_id, expected_table.table_id)) orelse
+            return error.MetadataMutationOutcomeUnknown;
+        defer metadata_table_manager.freeTable(alloc, projected_table);
+        if (!metadata_table_manager.tableDefinitionsEqual(projected_table, expected_table))
+            return error.TableAlreadyExists;
+        for (expected_ranges) |expected| {
+            const projected = (try store.getRange(alloc, self.metadata_group_id, expected.group_id)) orelse
+                return error.MetadataMutationOutcomeUnknown;
+            const matches = metadata_table_manager.rangeRecordsEqual(projected, expected);
+            metadata_table_manager.freeRange(alloc, projected);
+            if (!matches)
+                return error.TableAlreadyExists;
+        }
+    }
+
+    pub fn verifyTableDropProjection(self: *MetadataHttpService, alloc: std.mem.Allocator, table_id: u64) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        if (try store.getTable(alloc, self.metadata_group_id, table_id)) |projected| {
+            metadata_table_manager.freeTable(alloc, projected);
+            return error.TableTransitionActive;
+        }
     }
 
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {

@@ -444,6 +444,40 @@ pub const MetadataHttpClient = struct {
         try self.requestNoBody(base_uri, .DELETE, path, error.TableNotFound, null, error.TableTransitionActive);
     }
 
+    pub fn dropTableExact(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        table_name: []const u8,
+    ) !topology_protocol.DropResult {
+        const path = try std.fmt.allocPrint(self.alloc, "{s}{s}", .{
+            routes.Routes.internal_tables_prefix,
+            table_name,
+        });
+        defer self.alloc.free(path);
+        const uri = try join(self.alloc, base_uri, path);
+        defer self.alloc.free(uri);
+
+        var resp = try self.executeWithRetry(.{
+            .method = .DELETE,
+            .uri = uri,
+            .timeout_ms = default_request_timeout_ms,
+        });
+        defer resp.deinit(self.alloc);
+        try mapStatus(resp.status, null, error.TableNotFound, error.TableTransitionActive);
+        const WireResult = struct {
+            table_id: u64,
+            expected_transition_generation: u64,
+            group_ids: []const u64,
+        };
+        var parsed = try parseJson(WireResult, self.alloc, resp.body);
+        defer parsed.deinit();
+        return .{
+            .table_id = parsed.value.table_id,
+            .expected_transition_generation = parsed.value.expected_transition_generation,
+            .group_ids = try self.alloc.dupe(u64, parsed.value.group_ids),
+        };
+    }
+
     /// Forwards a public create to the current metadata leader's internal
     /// table route with at-most-once semantics. `error.NotLeader` proves the
     /// receiving node rejected the mutation before admission, so the caller

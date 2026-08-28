@@ -15027,6 +15027,26 @@ pub const ProvisionedTableWriteSource = struct {
         // on the same barrier and therefore starts only after old paths move.
         var current_catalog = try self.catalog.adminSnapshot();
         defer self.catalog.freeAdminSnapshot(&current_catalog);
+        var owned_groups = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer owned_groups.deinit(alloc);
+        try owned_groups.ensureTotalCapacity(alloc, @intCast(current_catalog.ranges.len));
+        for (current_catalog.ranges) |range| owned_groups.putAssumeCapacity(range.group_id, {});
+        for (group_ids) |group_id| {
+            if (!owned_groups.contains(group_id)) continue;
+            // Catalog ownership is a safety fence, not a successful cleanup.
+            // In particular, a follower may not have applied the drop yet.
+            // Retain the durable intent and retry after its projection catches
+            // up instead of silently converting a stale read into leaked data.
+            std.log.info(
+                "dropped-table cleanup deferred by current catalog ownership table={s} table_id={d} generation={d} group_id={d}",
+                .{ table_name, contract.table_id, contract.expected_transition_generation, group_id },
+            );
+            for (group_ids) |owned_group_id| {
+                self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .clear_cancel);
+                self.notifyLocalIndexRepairDebt(table_name, owned_group_id, .enqueue_runnable);
+            }
+            return error.DropCleanupOwnershipInconclusive;
+        }
         // Publication handoffs are name-scoped process state. Retire them only
         // while the committed catalog still confirms absence; a delayed
         // initial cleanup must not revoke authority from a replacement table.
@@ -15045,13 +15065,6 @@ pub const ProvisionedTableWriteSource = struct {
 
         var moved_any_group = false;
         for (group_ids) |group_id| {
-            if (metadata_mod.findAdminRange(&current_catalog, group_id) != null) {
-                std.log.info(
-                    "dropped-table cleanup fenced by current catalog ownership table={s} table_id={d} generation={d} group_id={d}",
-                    .{ table_name, contract.table_id, contract.expected_transition_generation, group_id },
-                );
-                continue;
-            }
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
             self.invalidateSharedPathCaches(path);
@@ -15074,16 +15087,8 @@ pub const ProvisionedTableWriteSource = struct {
         self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
         structural_mutation_active = false;
         for (group_ids) |group_id| {
-            if (metadata_mod.findAdminRange(&current_catalog, group_id) != null) {
-                // The cancellation may have raced a replacement-table repair
-                // before the post-barrier catalog fence identified ownership.
-                // Restore its runnable state instead of deleting live debt.
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue_runnable);
-            } else {
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
-                self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
-            }
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+            self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         }
         self.notifyLocalChange(table_name, .structural);
     }
@@ -18629,6 +18634,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return .{
             .ptr = self,
             .vtable = &.{
+                .drop_table = dropTable,
                 .create_index = createIndex,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
@@ -18671,6 +18677,29 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .local_runtime_statuses = localRuntimeStatuses,
             },
         };
+    }
+
+    fn dropTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        contract: metadata_topology_protocol.DropCleanupContract,
+    ) !?void {
+        const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (contract.group_ids.len == 0) return null;
+
+        // Hosted reads and writes share this process-wide cache. Serialize the
+        // eviction with every hosted open, then use the same crash-safe cleanup
+        // implementation as data nodes. Keep deletion synchronous because the
+        // adapter is request-scoped and must not escape into a background job.
+        const cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
+        lockAtomic(&cache.mutex);
+        defer cache.mutex.unlock();
+        var cleanup = ProvisionedTableWriteSource.init(self.replica_root_dir, self.catalog);
+        defer cleanup.deinit();
+        cleanup.write_cache = &cache.write_cache;
+        cleanup.runtime_status_cache = &cache.runtime_status_cache;
+        return try ProvisionedTableWriteSource.dropTable(&cleanup, alloc, table_name, contract);
     }
 
     fn createIndex(
@@ -27938,9 +27967,9 @@ test "provisioned native backup restore repeats through shared read and write ow
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), root) catch {};
 
     const FakeCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        fn iface(active: *bool) table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = active,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -27948,7 +27977,19 @@ test "provisioned native backup restore repeats through shared read and write ow
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const active: *bool = @ptrCast(@alignCast(ptr));
+            if (!active.*) {
+                return .{
+                    .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                    .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                    .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                    .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                    .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                    .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                    .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                };
+            }
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
@@ -27978,9 +28019,9 @@ test "provisioned native backup restore repeats through shared read and write ow
     };
 
     const FakeStatusSource = struct {
-        fn iface() http_server.StatusSource {
+        fn iface(active: *bool) http_server.StatusSource {
             return .{
-                .ptr = undefined,
+                .ptr = active,
                 .vtable = &.{
                     .status = status,
                     .admin_snapshot = adminSnapshot,
@@ -27993,8 +28034,8 @@ test "provisioned native backup restore repeats through shared read and write ow
             return .{ .metadata_group_id = 1, .metrics = .{} };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return try FakeCatalog.adminSnapshot(undefined);
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            return try FakeCatalog.adminSnapshot(ptr);
         }
 
         fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
@@ -28012,7 +28053,8 @@ test "provisioned native backup restore repeats through shared read and write ow
     defer read_cache.deinit();
     read_cache.backend_runtime = backend_runtime.ptr();
 
-    var source = ProvisionedTableWriteSource.init(root, FakeCatalog.iface());
+    var catalog_active = true;
+    var source = ProvisionedTableWriteSource.init(root, FakeCatalog.iface(&catalog_active));
     defer source.deinit();
     source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
@@ -28020,7 +28062,7 @@ test "provisioned native backup restore repeats through shared read and write ow
 
     var read_source = table_reads.ProvisionedTableReadSource.init(
         root,
-        FakeCatalog.iface(),
+        FakeCatalog.iface(&catalog_active),
         raft_mod.read_gate.noopReadableLeaseRequester(),
     );
     read_source.backend_runtime = backend_runtime.ptr();
@@ -28029,7 +28071,7 @@ test "provisioned native backup restore repeats through shared read and write ow
     var server = http_server.ApiHttpServer.init(
         alloc,
         .{},
-        FakeStatusSource.iface(),
+        FakeStatusSource.iface(&catalog_active),
         read_source.source(),
         source.source(),
     );
@@ -28107,7 +28149,9 @@ test "provisioned native backup restore repeats through shared read and write ow
             .sync_level = .full_text,
         });
 
+        catalog_active = false;
         _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
+        catalog_active = true;
         _ = try source.source().createTable(alloc, "docs", .{});
 
         _ = try source.source().restoreTable(alloc, "docs", .{
@@ -43034,6 +43078,92 @@ test "provisioned table drop persists cleanup intent before filesystem failure a
     try std.testing.expect((try iterator.next(io_impl.io())) == null);
 }
 
+test "provisioned table drop retains repair intent until catalog ownership clears" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provisioned-drop-table-ownership-fence",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+
+    const Catalog = struct {
+        active: bool = true,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = if (self.active)
+                    @constCast((&[_]metadata_table_manager.TableRecord{.{
+                        .table_id = 7,
+                        .name = "docs",
+                        .placement_role = "data",
+                    }})[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = if (self.active)
+                    @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                        .group_id = 7001,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = null,
+                    }})[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
+
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
+    defer source.deinit();
+    try std.testing.expectError(
+        error.DropCleanupOwnershipInconclusive,
+        source.source().dropTable(alloc, "docs", .{
+            .table_id = 7,
+            .expected_transition_generation = 1,
+            .group_ids = &.{7001},
+        }),
+    );
+    try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
+
+    catalog.active = false;
+    try source.recoverDroppedTableRepairIntents(alloc);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
+
+    const repair_dir_path = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir_path);
+    var repair_dir = try std.Io.Dir.cwd().openDir(io_impl.io(), repair_dir_path, .{ .iterate = true });
+    defer repair_dir.close(io_impl.io());
+    var iterator = repair_dir.iterate();
+    try std.testing.expect((try iterator.next(io_impl.io())) == null);
+}
+
 test "provisioned table write source drop table retires old publication authority" {
     const alloc = std.testing.allocator;
 
@@ -43095,24 +43225,6 @@ test "provisioned table write source drop table does not hold local db mutex dur
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
     defer alloc.free(path);
 
-    const NoCatalog = struct {
-        fn iface() table_catalog.CatalogSource {
-            return .{
-                .ptr = undefined,
-                .vtable = &.{
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return error.UnexpectedCatalogCall;
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
     const DropProbe = struct {
         entered: std.atomic.Value(bool) = .init(false),
         release: std.atomic.Value(bool) = .init(false),
@@ -43146,7 +43258,7 @@ test "provisioned table write source drop table does not hold local db mutex dur
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
 
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
     source.backend_runtime = runtime.ptr();
     var probe = DropProbe{};
     test_before_drop_table_delete_hook = .{
@@ -45299,6 +45411,7 @@ test "hosted status-only open drains stale pending close before retry" {
 
     var generation: u64 = 0;
     var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), Router.iface(), Executor.iface());
+    try std.testing.expect(source.source().vtable.drop_table != null);
     _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&generation));
 
     const hosted_cache = try hostedManagedDbCacheForRoot(replica_root_dir);

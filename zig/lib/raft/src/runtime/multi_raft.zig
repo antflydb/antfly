@@ -93,6 +93,8 @@ pub const ReadyGroupDiagnostics = struct {
     denied_by_backpressure: bool = false,
     denied_by_transport_capacity: bool = false,
     denied_by_apply_capacity: bool = false,
+    rejected_oversized_outbound_ready: bool = false,
+    rejected_oversized_apply_ready: bool = false,
     denied_by_snapshot_throttle: bool = false,
     has_more_ready: bool = false,
 };
@@ -158,6 +160,8 @@ pub const HostMetrics = struct {
     pending_apply_bytes: usize = 0,
     transport_queue_denials: usize = 0,
     apply_queue_denials: usize = 0,
+    oversized_outbound_ready_rejections: usize = 0,
+    oversized_apply_ready_rejections: usize = 0,
     snapshot_compaction_requests: usize = 0,
     snapshot_compaction_completions: usize = 0,
     snapshot_compaction_failures: usize = 0,
@@ -1062,6 +1066,18 @@ pub const MultiRaft = struct {
             outbox.items.items.len == 0 and
             ready_pressure.message_count <= self.cfg.max_pending_outbound_messages and
             ready_pressure.message_bytes <= self.cfg.max_single_outbound_ready_bytes;
+        if (ready_pressure.message_bytes > self.cfg.max_single_outbound_ready_bytes) {
+            if (diagnostics) |diag| {
+                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+                diag.rejected_oversized_outbound_ready = true;
+            }
+            self.metrics.oversized_outbound_ready_rejections += 1;
+            std.log.warn(
+                "raft Ready exceeds hard outbound ceiling group_id={d} message_bytes={d} max_bytes={d}",
+                .{ group_id, ready_pressure.message_bytes, self.cfg.max_single_outbound_ready_bytes },
+            );
+            return error.OutboundReadyTooLarge;
+        }
         if (!outbound_capacity_available and !outbound_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
@@ -1079,6 +1095,18 @@ pub const MultiRaft = struct {
         const apply_single_ready_progress = self.pending_apply.items.len == 0 and
             new_apply_tasks <= self.cfg.max_pending_apply_tasks and
             apply_ready_bytes <= self.cfg.max_single_apply_ready_bytes;
+        if (apply_ready_bytes > self.cfg.max_single_apply_ready_bytes) {
+            if (diagnostics) |diag| {
+                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
+                diag.rejected_oversized_apply_ready = true;
+            }
+            self.metrics.oversized_apply_ready_rejections += 1;
+            std.log.warn(
+                "raft Ready exceeds hard apply ceiling group_id={d} apply_bytes={d} max_bytes={d} snapshot_bytes={d}",
+                .{ group_id, apply_ready_bytes, self.cfg.max_single_apply_ready_bytes, ready_pressure.snapshot_bytes },
+            );
+            return error.ApplyReadyTooLarge;
+        }
         if (!apply_capacity_available and !apply_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);

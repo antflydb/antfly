@@ -254,6 +254,8 @@ pub const HealthSource = struct {
         try append(writer, "antfly_raft_runtime_pending_apply_bytes", "gauge", "Approximate pending raft apply bytes inside the runtime", @intCast(host_metrics.runtime_pending_apply_bytes));
         try append(writer, "antfly_raft_runtime_transport_queue_denials_total", "counter", "Total raft ready denials from outbound transport queue pressure", @intCast(host_metrics.runtime_transport_queue_denials));
         try append(writer, "antfly_raft_runtime_apply_queue_denials_total", "counter", "Total raft ready denials from apply queue pressure", @intCast(host_metrics.runtime_apply_queue_denials));
+        try append(writer, "antfly_raft_runtime_oversized_outbound_ready_rejections_total", "counter", "Raft Ready batches rejected because outbound bytes exceeded the hard safety ceiling", @intCast(host_metrics.runtime_oversized_outbound_ready_rejections));
+        try append(writer, "antfly_raft_runtime_oversized_apply_ready_rejections_total", "counter", "Raft Ready batches rejected because apply bytes exceeded the hard safety ceiling", @intCast(host_metrics.runtime_oversized_apply_ready_rejections));
         try append(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", @intCast(host_metrics.runtime_snapshot_compaction_completions));
         try append(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", @intCast(host_metrics.runtime_snapshot_compaction_failures));
         try append(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", @intCast(host_metrics.runtime_snapshot_compaction_candidates));

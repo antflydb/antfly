@@ -2219,7 +2219,7 @@ test "multi raft drainReady always makes progress on one oversized Ready" {
     try std.testing.expect(!host.group(257).?.hasReady());
 }
 
-test "multi raft drainReady never exceeds the single Ready hard ceiling" {
+test "multi raft drainReady surfaces an impossible outbound Ready hard ceiling" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
@@ -2245,13 +2245,14 @@ test "multi raft drainReady never exceeds the single Ready hard ceiling" {
     });
     try host.campaignGroup(258);
 
-    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectError(error.OutboundReadyTooLarge, host.drainReady(1));
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_bytes);
-    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_queue_denials);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().transport_queue_denials);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
     try std.testing.expect(host.group(258).?.hasReady());
 }
 
-test "multi raft drainReady never exceeds the single apply Ready hard ceiling" {
+test "multi raft drainReady surfaces an impossible apply Ready hard ceiling" {
     var store = core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
 
@@ -2271,9 +2272,10 @@ test "multi raft drainReady never exceeds the single apply Ready hard ceiling" {
     try addSingleNodeGroup(&host, 259, &store, false);
     try host.campaignGroup(259);
 
-    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectError(error.ApplyReadyTooLarge, host.drainReady(1));
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_bytes);
-    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().apply_queue_denials);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().apply_queue_denials);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_apply_ready_rejections);
     try std.testing.expect(host.group(259).?.hasReady());
 }
 

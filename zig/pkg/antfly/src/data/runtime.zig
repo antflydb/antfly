@@ -15667,6 +15667,7 @@ const RemoteMetadataSource = struct {
                 .replace_table_definition = remoteReplaceTableDefinition,
                 .restore_table = remoteRestoreTable,
                 .drop_table = remoteDropTable,
+                .drop_table_exact = remoteDropTableExact,
                 .update_schema = remoteUpdateSchema,
                 .create_index = remoteCreateIndex,
                 .drop_index = remoteDropIndex,
@@ -15999,6 +16000,48 @@ const RemoteMetadataSource = struct {
             }
         }.call, table_name);
         self.invalidateCache();
+    }
+
+    fn remoteDropTableExact(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !antfly.metadata.topology_protocol.DropResult {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const Context = struct {
+            table_name: []const u8,
+            result_alloc: std.mem.Allocator,
+        };
+        const result = try self.withMetadataApiClient(
+            antfly.metadata.topology_protocol.DropResult,
+            struct {
+                fn call(
+                    _: *RemoteMetadataSource,
+                    client: *antfly.metadata_http_client.MetadataHttpClient,
+                    base_uri: []const u8,
+                    ctx: Context,
+                ) !antfly.metadata.topology_protocol.DropResult {
+                    var remote = try client.forwardTableDropMutationExact(
+                        base_uri,
+                        ctx.table_name,
+                        .{
+                            .remaining_ms = 5_000,
+                            .forwards_remaining = 2,
+                            .campaign_allowed = true,
+                        },
+                    );
+                    defer remote.deinit(client.alloc);
+                    return .{
+                        .table_id = remote.table_id,
+                        .expected_transition_generation = remote.expected_transition_generation,
+                        .group_ids = try ctx.result_alloc.dupe(u64, remote.group_ids),
+                    };
+                }
+            }.call,
+            Context{ .table_name = table_name, .result_alloc = alloc },
+        );
+        self.invalidateCache();
+        return result;
     }
 
     fn remoteRestoreTable(
@@ -30577,6 +30620,19 @@ test "remote metadata source pins one cluster incarnation across cache invalidat
         error.InvalidMetadataIncarnation,
         source.acceptMetadataIdentity(9, antfly.metadata.incarnation.zero),
     );
+}
+
+test "remote metadata status source advertises exact table drop cleanup" {
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(std.testing.allocator, .{});
+    defer backend_runtime.deinit();
+    var source = try RemoteMetadataSource.init(
+        std.testing.allocator,
+        &.{"http://metadata.invalid"},
+        backend_runtime.ptr().apiIoImpl().?,
+    );
+    defer source.deinit();
+
+    try std.testing.expect(source.statusSource().vtable.drop_table_exact != null);
 }
 
 test "remote metadata source retains mutation authority across cache invalidation" {

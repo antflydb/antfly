@@ -2190,6 +2190,22 @@ pub const RaftApplyStore = struct {
         return try decodeTableRecord(alloc, encoded);
     }
 
+    pub fn getRange(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        range_group_id: u64,
+    ) !?metadata.RangeRecord {
+        var key_buf: [160]u8 = undefined;
+        const key = try rangeKeyForGroup(&key_buf, group_id, range_group_id);
+        const encoded = self.store.get(alloc, key) catch |err| switch (err) {
+            error.NotFound => return null,
+            else => return err,
+        };
+        defer alloc.free(encoded);
+        return try decodeRangeRecord(alloc, encoded);
+    }
+
     pub fn getTableTransitionFence(
         self: *RaftApplyStore,
         group_id: u64,
