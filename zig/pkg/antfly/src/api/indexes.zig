@@ -1756,6 +1756,10 @@ fn classifyIndexObservation(
         item.runtime_observation_serviceable
     else
         false;
+    const targeted_sibling_proves_authority = if (@hasField(Item, "runtime_observation_targeted_sibling"))
+        item.runtime_observation_targeted_sibling
+    else
+        false;
     const coverage_identity_ready = if (@hasField(Item, "coverage_identity_ready"))
         item.coverage_identity_ready
     else
@@ -1767,12 +1771,16 @@ fn classifyIndexObservation(
     const repair_proves_serviceability = publicIndexRepairState(item) != null and
         repairActiveGenerationServiceable(item);
     const transition_serviceable = if (metadata) |value|
-        value.freshness == .catching_up and
-            indexObservationIsDerived(item) and
-            incarnation_current and
-            coverage_identity_ready and
-            coverage_summary_ready and
-            (cache_proves_serviceability or repair_proves_serviceability)
+        incarnation_current and
+            ((targeted_sibling_proves_authority and
+                (value.freshness == .opening or value.freshness == .catching_up) and
+                (!indexObservationIsDerived(item) or
+                    (coverage_identity_ready and coverage_summary_ready))) or
+                (value.freshness == .catching_up and
+                    indexObservationIsDerived(item) and
+                    coverage_identity_ready and
+                    coverage_summary_ready and
+                    (cache_proves_serviceability or repair_proves_serviceability)))
     else
         false;
     // Aggregates have already reduced the per-shard freshness decision and do
@@ -2973,6 +2981,19 @@ test "opening embeddings observation cannot publish cached queryability" {
     try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
     try std.testing.expectEqual(@as(u64, 0), aggregate.doc_count);
     try std.testing.expectEqual(@as(u64, 0), aggregate.coverage_produced_count);
+
+    indexes[0].runtime_observation_targeted_sibling = true;
+    const targeted_sibling = aggregateIndexStatusIndexed(
+        &runtimes,
+        "semantic_idx",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), targeted_sibling.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 2), targeted_sibling.doc_count);
+    try std.testing.expectEqual(@as(u64, 2), targeted_sibling.coverage_produced_count);
 }
 
 test "stale embeddings observation cannot publish cached queryability" {
@@ -3064,6 +3085,44 @@ test "target-scoped stale full text observation cannot publish old readiness" {
         "{\"readiness\":{\"state\":\"pending\",\"queryable\":false,\"complete\":false,\"pending_reasons\":[\"runtime_unavailable\",\"shard_observation_incomplete\",\"backfill\",\"replay\"]}}",
         encoded.items,
     );
+}
+
+test "targeted full text sibling remains authoritative during table catch up" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "search_idx",
+        .kind = .full_text,
+        .runtime_observation_serviceable = true,
+        .runtime_observation_targeted_sibling = true,
+        .doc_count = 8,
+        .term_count = 24,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
+        .stats = .{ .source_doc_count = 8, .index_count = 1, .indexes = &indexes },
+    }};
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "search_idx",
+        &.{7},
+        0,
+        0,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 1), aggregate.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 8), aggregate.doc_count);
+
+    indexes[0].runtime_observation_stale = true;
+    const fenced = aggregateIndexStatusIndexed(
+        &runtimes,
+        "search_idx",
+        &.{7},
+        0,
+        0,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 0), fenced.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 0), fenced.doc_count);
 }
 
 test "repair-free embeddings aggregate retains live dense catch-up" {

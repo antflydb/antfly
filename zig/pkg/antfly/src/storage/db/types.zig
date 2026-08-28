@@ -2854,6 +2854,11 @@ pub const DBIndexStats = struct {
     // This proof never originates in persisted DB stats and is cleared by a
     // fresh observation, a root change, or an incarnation change.
     runtime_observation_serviceable: bool = false,
+    // The status cache proved that this index is an untouched sibling of one
+    // exact in-place catalog target. Unlike generic derived-incarnation
+    // continuity, this proof can retain authority across table-level opening
+    // metadata and applies to every index kind. It is never persisted.
+    runtime_observation_targeted_sibling: bool = false,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
