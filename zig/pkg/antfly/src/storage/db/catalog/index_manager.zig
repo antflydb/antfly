@@ -1284,6 +1284,10 @@ pub const IndexManager = struct {
     // and retry/backoff state for self-healing (retryFailedIndexLoads).
     // Keys are duped index names; err_name values are static @errorName memory.
     failed_index_loads: std.StringHashMapUnmanaged(FailedIndexLoad) = .empty,
+    /// Stable resident work ring for bounded repair discovery. Entries borrow
+    /// the owned map keys and are updated under catalog_mutex.
+    failed_index_load_order: std.ArrayListUnmanaged([]const u8) = .empty,
+    failed_index_load_cursor: usize = 0,
     // Durable repair intents gate service independently of load failures. A
     // replacement may load successfully after pointer activation while its
     // intent is still in activating/validating; queries must remain closed
@@ -1299,6 +1303,8 @@ pub const IndexManager = struct {
 
     pub const FailedIndexLoad = struct {
         err_name: []const u8,
+        config: types.IndexConfig,
+        queue_position: usize,
         retry_attempts: u32 = 0,
         // Monotonic deadline before which retryFailedIndexLoads skips this
         // index. 0 = due immediately (first retry happens on the next tick).
@@ -1311,7 +1317,7 @@ pub const IndexManager = struct {
     };
 
     /// Process-local projection of repair admission. Durable transitions use
-    /// `durable_revision`; `provisional_fences` closes admission before the
+    /// `control_revision`; `provisional_fences` closes admission before the
     /// checkpoint CAS so allocation or callback failure after commit cannot
     /// expose an unsafe generation. Legacy structural admission remains an
     /// independent bit because it is authorized by a primary-store marker,
@@ -1320,8 +1326,8 @@ pub const IndexManager = struct {
         repair_id: u128 = 0,
         config_hash: u64 = 0,
         root_generation: u64 = 0,
+        control_revision: u64 = 0,
         durable_revision: u64 = 0,
-        committed_epoch: u64 = 0,
         durable_blocked: bool = false,
         legacy_blocked: bool = false,
         runtime_serviceable: bool = false,
@@ -1344,6 +1350,10 @@ pub const IndexManager = struct {
 
     pub const RepairAdmissionVersion = struct {
         repair_id: u128,
+        /// Checkpoint-wide durable order. This is authoritative for committed
+        /// publication ordering; process-local fence epochs only reserve the
+        /// fail-closed interval before the commit exists.
+        control_revision: u64,
         revision: u64,
         config_hash: u64,
         root_generation: u64,
@@ -1352,6 +1362,16 @@ pub const IndexManager = struct {
             return self.repair_id == slot.repair_id and
                 self.config_hash == slot.config_hash and
                 self.root_generation == slot.root_generation;
+        }
+
+        fn supersedesSlot(self: @This(), slot: RepairAdmissionSlot) bool {
+            if (self.root_generation != slot.root_generation) {
+                return self.root_generation > slot.root_generation;
+            }
+            if (self.control_revision != slot.control_revision) {
+                return self.control_revision > slot.control_revision;
+            }
+            return self.matchesSlot(slot) and self.revision >= slot.durable_revision;
         }
     };
 
@@ -3044,6 +3064,7 @@ pub const IndexManager = struct {
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         self.failed_index_loads.deinit(self.alloc);
+        self.failed_index_load_order.deinit(self.alloc);
         self.clearRepairUnavailableIndexes();
         self.repair_unavailable_indexes.deinit(self.alloc);
         self.clearManagedAdmissionSnapshot();
@@ -3103,8 +3124,49 @@ pub const IndexManager = struct {
         return loadFailureRecoveryAction(err_name);
     }
 
-    pub fn hasLoadFailures(self: *const IndexManager) bool {
+    pub fn hasLoadFailures(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         return self.failed_index_loads.count() > 0;
+    }
+
+    pub const FailedIndexLoadRecoveryCandidate = struct {
+        config: types.IndexConfig,
+        action: IndexLoadRecoveryAction,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            self.config.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    /// Returns a rotating, bounded snapshot of quarantined load failures.
+    /// The resident ring makes both inspection and cloning O(limit), even for
+    /// catalogs with many healthy or indefinitely quarantined indexes.
+    pub fn failedIndexLoadRecoveryCandidates(
+        self: *IndexManager,
+        alloc: Allocator,
+        limit: usize,
+    ) ![]FailedIndexLoadRecoveryCandidate {
+        if (limit == 0) return try alloc.alloc(FailedIndexLoadRecoveryCandidate, 0);
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const candidate_count = @min(limit, self.failed_index_load_order.items.len);
+        var out = try alloc.alloc(FailedIndexLoadRecoveryCandidate, candidate_count);
+        errdefer alloc.free(out);
+        var initialized: usize = 0;
+        errdefer for (out[0..initialized]) |*candidate| candidate.deinit(alloc);
+        while (initialized < candidate_count) : (initialized += 1) {
+            const position = self.failed_index_load_cursor % self.failed_index_load_order.items.len;
+            const name = self.failed_index_load_order.items[position];
+            const failure = self.failed_index_loads.get(name) orelse unreachable;
+            out[initialized] = .{
+                .config = try types.IndexConfig.clone(alloc, failure.config),
+                .action = loadFailureRecoveryAction(failure.err_name),
+            };
+            self.failed_index_load_cursor = (position + 1) % self.failed_index_load_order.items.len;
+        }
+        return out;
     }
 
     /// Refresh schema-derived mapping state for text indexes that have not
@@ -3198,10 +3260,10 @@ pub const IndexManager = struct {
         slot.repair_id = version.repair_id;
         slot.config_hash = version.config_hash;
         slot.root_generation = version.root_generation;
+        slot.control_revision = version.control_revision;
         slot.durable_revision = version.revision;
-        // This is also an incarnation barrier: any old-root fence reserved
-        // before the checkpoint replacement can no longer publish afterward.
-        slot.committed_epoch = self.allocateRepairAdmissionEpochUnlocked();
+        // The durable root/control version is also an incarnation barrier:
+        // any old-root fence reserved before replacement is stale afterward.
         slot.durable_blocked = false;
         slot.runtime_serviceable = false;
         slot.legacy_blocked = true;
@@ -3249,14 +3311,12 @@ pub const IndexManager = struct {
         defer self.catalog_mutex.unlockExclusive();
         const slot = self.repair_unavailable_indexes.getPtr(name) orelse unreachable;
         std.debug.assert(slot.provisional_fences != 0);
-        if (fence.epoch >= slot.committed_epoch and
-            version.root_generation >= slot.root_generation)
-        {
+        if (version.supersedesSlot(slot.*)) {
             slot.repair_id = version.repair_id;
             slot.config_hash = version.config_hash;
             slot.root_generation = version.root_generation;
+            slot.control_revision = version.control_revision;
             slot.durable_revision = version.revision;
-            slot.committed_epoch = fence.epoch;
             slot.durable_blocked = blocked;
             slot.legacy_blocked = false;
             if (!preserve_serviceability) slot.runtime_serviceable = false;
@@ -3298,12 +3358,13 @@ pub const IndexManager = struct {
             return;
         };
         const bootstrap_preallocated_gate = slot.repair_id == 0 and slot.legacy_blocked;
-        if ((version.matchesSlot(slot.*) and version.revision >= slot.durable_revision) or
+        if (version.supersedesSlot(slot.*) or
             bootstrap_preallocated_gate)
         {
             slot.repair_id = version.repair_id;
             slot.config_hash = version.config_hash;
             slot.root_generation = version.root_generation;
+            slot.control_revision = version.control_revision;
             slot.durable_revision = version.revision;
             slot.durable_blocked = blocked;
             slot.legacy_blocked = false;
@@ -3323,7 +3384,9 @@ pub const IndexManager = struct {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
         const slot = self.repair_unavailable_indexes.getPtr(name) orelse return;
-        if (!version.matchesSlot(slot.*) or version.revision != slot.durable_revision) return;
+        if (!version.matchesSlot(slot.*) or
+            version.control_revision != slot.control_revision or
+            version.revision != slot.durable_revision) return;
         slot.runtime_serviceable = true;
     }
 
@@ -3410,13 +3473,32 @@ pub const IndexManager = struct {
     }
 
     fn clearFailedIndexLoads(self: *IndexManager) void {
-        var it = self.failed_index_loads.keyIterator();
-        while (it.next()) |key| self.alloc.free(key.*);
+        var it = self.failed_index_loads.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.config.deinit(self.alloc);
+            self.alloc.free(entry.key_ptr.*);
+        }
         self.failed_index_loads.clearRetainingCapacity();
+        self.failed_index_load_order.clearRetainingCapacity();
+        self.failed_index_load_cursor = 0;
     }
 
     fn dropFailedIndexLoad(self: *IndexManager, name: []const u8) void {
-        if (self.failed_index_loads.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+        const entry = self.failed_index_loads.fetchRemove(name) orelse return;
+        const position = entry.value.queue_position;
+        const moved_name = self.failed_index_load_order.items[self.failed_index_load_order.items.len - 1];
+        _ = self.failed_index_load_order.swapRemove(position);
+        if (position < self.failed_index_load_order.items.len) {
+            self.failed_index_loads.getPtr(moved_name).?.queue_position = position;
+        }
+        if (self.failed_index_load_order.items.len == 0) {
+            self.failed_index_load_cursor = 0;
+        } else {
+            self.failed_index_load_cursor %= self.failed_index_load_order.items.len;
+        }
+        var failure = entry.value;
+        failure.config.deinit(self.alloc);
+        self.alloc.free(entry.key);
     }
 
     fn clearIndexLoadStates(self: *IndexManager) void {
@@ -3486,13 +3568,27 @@ pub const IndexManager = struct {
 
     fn recordFailedIndexLoad(self: *IndexManager, cfg: types.IndexConfig, err: anyerror) !void {
         if (self.loadFailure(cfg.name) != null) return;
-        var cloned = try types.IndexConfig.clone(self.alloc, cfg);
-        errdefer cloned.deinit(self.alloc);
-        try self.appendStatusOnlyConfig(cloned);
-        // The clone is owned by status_only_index_configs from here on.
+        var status_config = try types.IndexConfig.clone(self.alloc, cfg);
+        var status_config_owned = true;
+        errdefer if (status_config_owned) status_config.deinit(self.alloc);
+        var failure_config = try types.IndexConfig.clone(self.alloc, cfg);
+        errdefer failure_config.deinit(self.alloc);
         const name_key = try self.alloc.dupe(u8, cfg.name);
         errdefer self.alloc.free(name_key);
-        try self.failed_index_loads.put(self.alloc, name_key, .{ .err_name = @errorName(err) });
+        try self.failed_index_loads.ensureUnusedCapacity(self.alloc, 1);
+        try self.failed_index_load_order.ensureUnusedCapacity(self.alloc, 1);
+        // All resident queue/map capacity is reserved before the status-only
+        // catalog publication. The remainder is infallible, so quarantine is
+        // committed atomically across all three projections.
+        try self.appendStatusOnlyConfig(status_config);
+        status_config_owned = false;
+        const position = self.failed_index_load_order.items.len;
+        self.failed_index_loads.putAssumeCapacity(name_key, .{
+            .err_name = @errorName(err),
+            .config = failure_config,
+            .queue_position = position,
+        });
+        self.failed_index_load_order.appendAssumeCapacity(name_key);
     }
 
     const quarantine_retry_base_backoff_ns: u64 = 30 * std.time.ns_per_s;
@@ -3557,9 +3653,6 @@ pub const IndexManager = struct {
             for (tasks.items) |*task| task.deinit(self.alloc);
             tasks.deinit(self.alloc);
         }
-        var stale_failed_names = std.ArrayListUnmanaged([]const u8).empty;
-        defer stale_failed_names.deinit(self.alloc);
-
         {
             self.catalog_mutex.lockExclusive();
             defer self.catalog_mutex.unlockExclusive();
@@ -3568,27 +3661,19 @@ pub const IndexManager = struct {
             var it = self.failed_index_loads.iterator();
             while (it.next()) |entry| {
                 if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
-                const cfg = blk: {
-                    for (self.status_only_index_configs) |*candidate| {
-                        if (std.mem.eql(u8, candidate.name, entry.key_ptr.*)) break :blk candidate.*;
-                    }
-                    try stale_failed_names.append(self.alloc, entry.key_ptr.*);
-                    continue;
-                };
                 var task = RetryTask{
                     .name = try self.alloc.dupe(u8, entry.key_ptr.*),
                     .cfg = undefined,
                 };
                 var task_name_owned = true;
                 errdefer if (task_name_owned) self.alloc.free(task.name);
-                task.cfg = try types.IndexConfig.clone(self.alloc, cfg);
+                task.cfg = try types.IndexConfig.clone(self.alloc, entry.value_ptr.config);
                 var task_cfg_owned = true;
                 errdefer if (task_cfg_owned) task.cfg.deinit(self.alloc);
                 try tasks.append(self.alloc, task);
                 task_name_owned = false;
                 task_cfg_owned = false;
             }
-            for (stale_failed_names.items) |name| self.dropFailedIndexLoad(name);
         }
 
         var recovered: usize = 0;
@@ -25412,6 +25497,49 @@ test "remove status-only malformed dense config drops catalog entry" {
     try std.testing.expect(manager.loadFailure("bad_dense") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.status_only_index_configs.len);
     try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "failed index repair discovery is bounded and rotates resident work" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-repair-ring");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    const configs = [_]types.IndexConfig{
+        .{ .name = "failed-a", .kind = .dense_vector, .config_json = "{}" },
+        .{ .name = "failed-b", .kind = .dense_vector, .config_json = "{}" },
+        .{ .name = "failed-c", .kind = .dense_vector, .config_json = "{}" },
+    };
+    try manager.recordFailedIndexLoad(configs[0], error.IncompleteBulkPublish);
+    try manager.recordFailedIndexLoad(configs[1], error.InvalidIndexConfig);
+    try manager.recordFailedIndexLoad(configs[2], error.TableReadChurn);
+
+    const expected_actions = [_]IndexManager.IndexLoadRecoveryAction{
+        .rebuild_from_artifacts,
+        .manual_intervention,
+        .retry_open,
+    };
+    for (configs, expected_actions) |cfg, action| {
+        const candidates = try manager.failedIndexLoadRecoveryCandidates(alloc, 1);
+        defer {
+            for (candidates) |*candidate| candidate.deinit(alloc);
+            alloc.free(candidates);
+        }
+        try std.testing.expectEqual(@as(usize, 1), candidates.len);
+        try std.testing.expectEqualStrings(cfg.name, candidates[0].config.name);
+        try std.testing.expectEqual(action, candidates[0].action);
+    }
+
+    manager.dropFailedIndexLoad("failed-b");
+    const remaining = try manager.failedIndexLoadRecoveryCandidates(alloc, 8);
+    defer {
+        for (remaining) |*candidate| candidate.deinit(alloc);
+        alloc.free(remaining);
+    }
+    try std.testing.expectEqual(@as(usize, 2), remaining.len);
+    for (remaining) |candidate| try std.testing.expect(!std.mem.eql(u8, candidate.config.name, "failed-b"));
 }
 
 test "remove drops runtime index load state" {

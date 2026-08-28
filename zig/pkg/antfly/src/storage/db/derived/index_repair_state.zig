@@ -22,7 +22,7 @@ const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";
 const magic = "AFIDXRP1";
-const format_version: u32 = 7;
+const format_version: u32 = 9;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
@@ -117,6 +117,10 @@ pub const IndexRepairIntent = struct {
     /// every mutation advances this value, including pause, retry, pin, and
     /// progress-only updates.
     revision: u64 = 0,
+    /// Checkpoint-wide repair-control revision which last mutated this intent.
+    /// This orders same-name admission publications without coupling a proof
+    /// to unrelated indexes' later checkpoint mutations.
+    control_revision: u64 = 0,
     db_identity: u128,
     group_id: u64,
     replica_id: u128,
@@ -242,6 +246,10 @@ pub const Entry = struct {
 
 pub const State = struct {
     identity: ReplicaIdentity,
+    /// Monotonic order of durable repair-control mutations in this physical
+    /// root. Unlike an intent revision, this survives intent removal and can
+    /// therefore order a delayed upsert against the clear which retired it.
+    control_revision: u64 = 0,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -435,7 +443,10 @@ pub fn resetForRootGenerationWithIntentsAt(
     var old = try loadUnlockedAt(alloc, location);
     defer old.deinit(alloc);
     if (!old.identity.eql(expected_identity)) return error.ReplicaIdentityMismatch;
-    var replacement = State{ .identity = try newReplicaIdentity(alloc, root_generation) };
+    var replacement = State{
+        .identity = try newReplicaIdentity(alloc, root_generation),
+        .control_revision = 1,
+    };
     errdefer replacement.deinit(alloc);
     if (intents.len > max_entries) return error.IndexRepairStateTooLarge;
     for (intents) |intent| {
@@ -446,6 +457,7 @@ pub fn resetForRootGenerationWithIntentsAt(
         owned.replica_id = replacement.identity.replica_id;
         owned.root_generation = replacement.identity.root_generation;
         owned.revision = 1;
+        owned.control_revision = replacement.control_revision;
         if (owned.phase != .detected or replacement.findIndex(owned.index_name) != null) {
             return error.InvalidIndexRepairTransition;
         }
@@ -464,7 +476,7 @@ pub fn putEntry(
     expected: ?ExpectedTransition,
     entry: Entry,
 ) !void {
-    return try putEntryAt(alloc, .native(path), expected_identity, expected, entry);
+    _ = try putEntryAt(alloc, .native(path), expected_identity, expected, entry);
 }
 
 pub fn putEntryAt(
@@ -473,7 +485,7 @@ pub fn putEntryAt(
     expected_identity: ReplicaIdentity,
     expected: ?ExpectedTransition,
     entry: Entry,
-) !void {
+) !u64 {
     try validateEntry(entry);
     if (!entry.intent.identity().eql(expected_identity)) return error.ReplicaIdentityMismatch;
 
@@ -508,10 +520,13 @@ pub fn putEntryAt(
     var owned = try entry.clone(alloc);
     var owned_transferred = false;
     errdefer if (!owned_transferred) owned.deinit(alloc);
+    state.control_revision = std.math.add(u64, state.control_revision, 1) catch
+        return error.InvalidIndexRepairState;
     owned.intent.revision = if (expected) |transition|
         std.math.add(u64, transition.revision, 1) catch return error.InvalidIndexRepairState
     else
         1;
+    owned.intent.control_revision = state.control_revision;
     if (existing_index) |i| {
         state.entries.items[i].deinit(alloc);
         state.entries.items[i] = owned;
@@ -522,6 +537,7 @@ pub fn putEntryAt(
         owned_transferred = true;
     }
     try writeUnlockedAt(alloc, location, &state);
+    return state.control_revision;
 }
 
 fn phaseTransitionAllowed(from: Phase, to: Phase) bool {
@@ -547,7 +563,7 @@ pub fn removeEntryAndPin(
     expected_identity: ReplicaIdentity,
     expected: ExpectedTransition,
 ) !void {
-    return try removeEntryAndPinAt(alloc, .native(path), expected_identity, expected);
+    _ = try removeEntryAndPinAt(alloc, .native(path), expected_identity, expected);
 }
 
 pub fn removeEntryAndPinAt(
@@ -555,7 +571,7 @@ pub fn removeEntryAndPinAt(
     location: Location,
     expected_identity: ReplicaIdentity,
     expected: ExpectedTransition,
-) !void {
+) !u64 {
     var guard = try acquire(location.lock_key);
     defer guard.release();
     var state = try loadUnlockedAt(alloc, location);
@@ -573,7 +589,10 @@ pub fn removeEntryAndPinAt(
     }
     var removed = state.entries.orderedRemove(i);
     defer removed.deinit(alloc);
+    state.control_revision = std.math.add(u64, state.control_revision, 1) catch
+        return error.InvalidIndexRepairState;
     try writeUnlockedAt(alloc, location, &state);
+    return state.control_revision;
 }
 
 fn findIndexByRepairId(state: *const State, repair_id: u128) ?usize {
@@ -690,13 +709,18 @@ fn encode(alloc: Allocator, state: *const State) ![]u8 {
     try appendInt(alloc, &out, u128, state.identity.db_identity);
     try appendInt(alloc, &out, u128, state.identity.replica_id);
     try appendInt(alloc, &out, u64, state.identity.root_generation);
+    try appendInt(alloc, &out, u64, state.control_revision);
     try appendInt(alloc, &out, u32, @intCast(state.entries.items.len));
     for (state.entries.items) |entry| {
         try validateEntry(entry);
         const intent = entry.intent;
+        if (intent.control_revision == 0 or intent.control_revision > state.control_revision) {
+            return error.InvalidIndexRepairState;
+        }
         try appendInt(alloc, &out, u8, intent.version);
         try appendInt(alloc, &out, u128, intent.repair_id);
         try appendInt(alloc, &out, u64, intent.revision);
+        try appendInt(alloc, &out, u64, intent.control_revision);
         try appendInt(alloc, &out, u128, intent.db_identity);
         try appendInt(alloc, &out, u64, intent.group_id);
         try appendInt(alloc, &out, u128, intent.replica_id);
@@ -758,7 +782,10 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
         .db_identity = try readInt(raw[0..payload_end], &pos, u128),
         .replica_id = try readInt(raw[0..payload_end], &pos, u128),
         .root_generation = try readInt(raw[0..payload_end], &pos, u64),
-    } };
+    }, .control_revision = if (decoded_format_version >= 8)
+        try readInt(raw[0..payload_end], &pos, u64)
+    else
+        0 };
     errdefer state.deinit(alloc);
     if (state.identity.db_identity == 0 or state.identity.replica_id == 0) return error.InvalidIndexRepairState;
     const count = try readInt(raw[0..payload_end], &pos, u32);
@@ -768,6 +795,7 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
             .version = try readInt(raw[0..payload_end], &pos, u8),
             .repair_id = try readInt(raw[0..payload_end], &pos, u128),
             .revision = if (decoded_format_version >= 4) try readInt(raw[0..payload_end], &pos, u64) else 0,
+            .control_revision = if (decoded_format_version >= 9) try readInt(raw[0..payload_end], &pos, u64) else 0,
             .db_identity = try readInt(raw[0..payload_end], &pos, u128),
             .group_id = try readInt(raw[0..payload_end], &pos, u64),
             .replica_id = try readInt(raw[0..payload_end], &pos, u128),
@@ -831,9 +859,12 @@ fn decode(alloc: Allocator, raw: []const u8) !State {
             };
         }
         errdefer if (pin) |*value| value.deinit(alloc);
+        if (decoded_format_version < 9) intent.control_revision = intent.revision;
+        if (decoded_format_version < 8) state.control_revision = @max(state.control_revision, intent.revision);
         const entry = Entry{ .intent = intent, .pin = pin };
         try validateEntry(entry);
         if (!intent.identity().eql(state.identity) or state.findIndex(intent.index_name) != null) return error.InvalidIndexRepairState;
+        if (intent.control_revision > state.control_revision) return error.InvalidIndexRepairState;
         try state.entries.append(alloc, entry);
     }
     if (pos != payload_end) return error.InvalidIndexRepairState;
@@ -932,10 +963,11 @@ test "index repair state persists through backend storage" {
 
     var detected = try testEntry(alloc, identity, .detected);
     defer detected.deinit(alloc);
-    try putEntryAt(alloc, location, identity, null, detected);
+    try std.testing.expectEqual(@as(u64, 1), try putEntryAt(alloc, location, identity, null, detected));
 
     var reopened = try loadAt(alloc, location);
     defer reopened.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 1), reopened.control_revision);
     try std.testing.expectEqual(@as(usize, 1), reopened.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), reopened.entries.items[0].intent.revision);
     try std.testing.expectEqualStrings("dense_idx", reopened.entries.items[0].intent.index_name);
@@ -1087,6 +1119,10 @@ test "index repair state transitions are fenced and remove intent with pin" {
     var empty = try load(alloc, path);
     defer empty.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), empty.entries.items.len);
+    // Removal retains durable ordering even though no intent remains to carry
+    // a per-entry revision. This is the tombstone witness used by resident
+    // projections to reject a delayed pre-clear upsert.
+    try std.testing.expectEqual(@as(u64, 4), empty.control_revision);
 }
 
 test "index repair state revision fences same-phase mutations" {
@@ -1129,6 +1165,23 @@ test "index repair state revision fences same-phase mutations" {
     defer current.deinit(alloc);
     try std.testing.expectEqual(Automation.paused, current.entries.items[0].intent.automation);
     try std.testing.expectEqual(@as(u64, 2), current.entries.items[0].intent.revision);
+    try std.testing.expectEqual(@as(u64, 2), current.entries.items[0].intent.control_revision);
+
+    var sibling = try testEntry(alloc, identity, .detected);
+    defer sibling.deinit(alloc);
+    sibling.intent.repair_id = 92;
+    sibling.intent.config_hash = 45;
+    alloc.free(sibling.intent.index_name);
+    sibling.intent.index_name = try alloc.dupe(u8, "dense_sibling");
+    try putEntry(alloc, path, identity, null, sibling);
+
+    var with_sibling = try load(alloc, path);
+    defer with_sibling.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), with_sibling.control_revision);
+    const original_i = with_sibling.findIndex("dense_idx").?;
+    const sibling_i = with_sibling.findIndex("dense_sibling").?;
+    try std.testing.expectEqual(@as(u64, 2), with_sibling.entries.items[original_i].intent.control_revision);
+    try std.testing.expectEqual(@as(u64, 3), with_sibling.entries.items[sibling_i].intent.control_revision);
 }
 
 test "index repair state root-generation reset atomically rebinds replacement debt" {
