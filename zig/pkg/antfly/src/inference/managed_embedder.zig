@@ -1003,13 +1003,18 @@ fn embeddingHttpClientConfig(entry: *const ManagedEmbeddingEntry) !httpx.ClientC
         @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms),
     );
     config.timeouts = httpx.Timeouts.uniform(timeout_ms);
-    // The whole-request watchdog needs Io.concurrent. Manual/embedded owners
-    // deliberately use the single-threaded fallback executor, so retain finite
-    // connect/read/write timeouts there without attempting an unsupported
-    // watchdog. Their provider interface does not advertise a hard foreground
-    // bound and synchronous enrichment therefore fails closed before invoking
-    // it; supervised background replay remains backwards compatible.
-    if (entry.bounded_http_request) config.timeouts.request_ms = timeout_ms;
+    // Both the whole-request and connect watchdogs need Io.concurrent.
+    // Manual/embedded owners deliberately use the single-threaded fallback
+    // executor, so retain finite socket read/write timeouts without attempting
+    // either unsupported watchdog. Their provider interface does not advertise
+    // a hard foreground bound and synchronous enrichment therefore fails
+    // closed before invoking it; supervised background replay remains
+    // backwards compatible.
+    if (entry.bounded_http_request) {
+        config.timeouts.request_ms = timeout_ms;
+    } else {
+        config.timeouts.connect_ms = 0;
+    }
     return config;
 }
 
@@ -1087,7 +1092,9 @@ pub fn testEmbeddingProviderDeadlines() !void {
     defer manual.deinit();
     const manual_config = try embeddingHttpClientConfig(&manual.entries[0]);
     try std.testing.expectEqual(@as(u64, 0), manual_config.timeouts.request_ms);
-    try std.testing.expect(manual_config.timeouts.connect_ms > 0);
+    try std.testing.expectEqual(@as(u64, 0), manual_config.timeouts.connect_ms);
+    try std.testing.expect(manual_config.timeouts.read_ms > 0);
+    try std.testing.expect(manual_config.timeouts.write_ms > 0);
     try std.testing.expect(!manual.denseInterface().foreground_bounded);
 
     const Local = struct {
