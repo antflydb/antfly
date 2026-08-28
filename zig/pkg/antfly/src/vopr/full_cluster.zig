@@ -16,7 +16,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 16;
+    pub const version: u32 = 17;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -26,6 +26,7 @@ pub const Scenario = struct {
     const graph_split_id = vopr.id.stable(name, "public-graph-survives-active-split");
     const graph_split_transport_id = vopr.id.stable(name, "public-graph-active-split-transport-fails-closed");
     const graph_split_owner_restart_id = vopr.id.stable(name, "public-graph-active-split-owner-restart-fails-closed");
+    const graph_split_partial_write_id = vopr.id.stable(name, "public-graph-active-split-partial-write-completes");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
     const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
@@ -48,6 +49,7 @@ pub const Scenario = struct {
         .{ .id = graph_split_id, .name = name ++ ".public-graph-survives-active-split", .kind = .always },
         .{ .id = graph_split_transport_id, .name = name ++ ".public-graph-active-split-transport-fails-closed", .kind = .always },
         .{ .id = graph_split_owner_restart_id, .name = name ++ ".public-graph-active-split-owner-restart-fails-closed", .kind = .always },
+        .{ .id = graph_split_partial_write_id, .name = name ++ ".public-graph-active-split-partial-write-completes", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
         .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
@@ -79,6 +81,7 @@ pub const Scenario = struct {
         production_data_plane_graph_split,
         production_data_plane_graph_split_transport_failure,
         production_data_plane_graph_split_owner_restart,
+        production_data_plane_graph_split_partial_write,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
@@ -86,12 +89,13 @@ pub const Scenario = struct {
                 self == .production_data_plane or
                 self == .production_data_plane_graph_split or
                 self == .production_data_plane_graph_split_transport_failure or
-                self == .production_data_plane_graph_split_owner_restart;
+                self == .production_data_plane_graph_split_owner_restart or
+                self == .production_data_plane_graph_split_partial_write;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -125,6 +129,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "production-data-plane-graph-split"),
         vopr.id.stable(name, "production-data-plane-graph-split-transport-failure"),
         vopr.id.stable(name, "production-data-plane-graph-split-owner-restart"),
+        vopr.id.stable(name, "production-data-plane-graph-split-partial-write"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -142,6 +147,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-graph-split",
         name ++ ".production-data-plane-graph-split-transport-failure",
         name ++ ".production-data-plane-graph-split-owner-restart",
+        name ++ ".production-data-plane-graph-split-partial-write",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -150,6 +156,7 @@ pub const Scenario = struct {
     const production_graph_split_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split);
     const production_graph_split_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_transport_failure);
     const production_graph_split_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_owner_restart);
+    const production_graph_split_partial_write_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_partial_write);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -244,6 +251,8 @@ pub const Scenario = struct {
         graph_owner_restart_failure_observed: bool = false,
         graph_owner_restart_recovered: bool = false,
         graph_owner_restart_error_code: u64 = 0,
+        graph_partial_write_injected: bool = false,
+        graph_partial_write_observed: bool = false,
         graph_partial_rejected_sound: bool = false,
     };
 
@@ -370,6 +379,8 @@ pub const Scenario = struct {
                     .graph_owner_restart_failure_observed = snapshot.graph_owner_restart_failure_observed,
                     .graph_owner_restart_recovered = snapshot.graph_owner_restart_recovered,
                     .graph_owner_restart_error_code = snapshot.graph_owner_restart_error_code,
+                    .graph_partial_write_injected = snapshot.graph_partial_write_injected,
+                    .graph_partial_write_observed = snapshot.graph_partial_write_observed,
                     .graph_partial_rejected_sound = snapshot.graph_partial_rejected_sound,
                     .cleanup_ok = snapshot.cleanup_ok,
                     .raft_wire_requests = snapshot.raft_wire_requests,
@@ -429,17 +440,20 @@ pub const Scenario = struct {
                     mode == .production_data_plane or
                         mode == .production_data_plane_graph_split or
                         mode == .production_data_plane_graph_split_transport_failure or
-                        mode == .production_data_plane_graph_split_owner_restart,
+                        mode == .production_data_plane_graph_split_owner_restart or
+                        mode == .production_data_plane_graph_split_partial_write,
                 );
                 self.production_cluster.?.setGraphEnabled(
                     mode == .production_data_plane_graph or
                         mode == .production_data_plane_graph_split or
                         mode == .production_data_plane_graph_split_transport_failure or
-                        mode == .production_data_plane_graph_split_owner_restart,
+                        mode == .production_data_plane_graph_split_owner_restart or
+                        mode == .production_data_plane_graph_split_partial_write,
                 );
                 self.production_cluster.?.setFaultMode(switch (mode) {
                     .production_data_plane_graph_split_transport_failure => .graph_transport_failure,
                     .production_data_plane_graph_split_owner_restart => .graph_owner_restart,
+                    .production_data_plane_graph_split_partial_write => .graph_partial_write,
                     else => .clean,
                 });
                 self.production_cluster.?.bootstrap() catch |err| {
@@ -624,6 +638,22 @@ pub const Scenario = struct {
                         process_domains[target_index],
                     );
                 },
+                .production_data_plane_graph_split_partial_write => {
+                    const production = self.production_cluster orelse
+                        return error.MissingProductionCluster;
+                    const target_index = production.currentGraphOwnerIndex() orelse
+                        return error.ProductionDataGraphLeaderMissing;
+                    const coordinator_index = try production.configureGraphPartialWriteTarget(target_index);
+                    const link_id = for (deployment_links) |link| {
+                        if (link.from_node == deployment_node_ids[coordinator_index] and
+                            link.to_node == deployment_node_ids[target_index]) break link.id;
+                    } else return error.ProductionGraphPartialWriteLinkMissing;
+                    try deployment.activateFault(
+                        vopr.id.stable(name, "fault.production-graph-split-partial-write"),
+                        .network,
+                        link_id,
+                    );
+                },
                 .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split => {},
             }
         }
@@ -783,6 +813,8 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".graph-owner-restart-failure-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_owner_restart_failure_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-owner-restart-recovered", @intFromBool(if (cluster) |snapshot| snapshot.graph_owner_restart_recovered else false));
         try builder.addNamed(allocator, name ++ ".graph-owner-restart-error", if (cluster) |snapshot| @intCast(snapshot.graph_owner_restart_error_code) else 0);
+        try builder.addNamed(allocator, name ++ ".graph-partial-write-injected", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_write_injected else false));
+        try builder.addNamed(allocator, name ++ ".graph-partial-write-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_write_observed else false));
         try builder.addNamed(allocator, name ++ ".graph-partial-result-rejected", @intFromBool(if (cluster) |snapshot| snapshot.graph_partial_rejected_sound else false));
         try builder.addNamed(allocator, name ++ ".request-errors", if (production) |value| @intFromBool(value.failure != null) else if (fixture) |public_cluster| @intCast(public_cluster.request_errors) else 0);
         try builder.addNamed(allocator, name ++ ".last-request-error", if (production) |value| if (value.failure) |err| @intFromError(err) else 0 else if (fixture) |public_cluster| @intCast(public_cluster.last_request_error_code) else 0);
@@ -846,6 +878,12 @@ pub const Scenario = struct {
                 cluster.?.graph_owner_restart_requested and cluster.?.graph_owner_restart_down and
                 cluster.?.graph_owner_restart_failure_observed and cluster.?.graph_owner_restart_recovered and
                 cluster.?.graph_owner_restart_error_code != 0 and cluster.?.graph_partial_rejected_sound and
+                cluster.?.post_split_graph_query_ok));
+        try sink.check(allocator, graph_split_partial_write_id, !state.complete or state.mode.? != .production_data_plane_graph_split_partial_write or
+            (cluster != null and cluster.?.graph_query_ok and
+                cluster.?.split_graph_inflight_started and cluster.?.split_graph_inflight_complete and
+                !cluster.?.split_graph_inflight_rejected and cluster.?.split_graph_inflight_ok and
+                cluster.?.graph_partial_write_injected and cluster.?.graph_partial_write_observed and
                 cluster.?.post_split_graph_query_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
@@ -920,15 +958,17 @@ fn runExactMode(
     const production_graph_split_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_ordinal];
     const production_graph_split_transport_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_transport_ordinal];
     const production_graph_split_owner_restart_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_owner_restart_ordinal];
+    const production_graph_split_partial_write_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_partial_write_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
-        production_graph_split_transport_mode or production_graph_split_owner_restart_mode;
+        production_graph_split_transport_mode or production_graph_split_owner_restart_mode or
+        production_graph_split_partial_write_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
     // truth, while comparable scheduling ensures the experiment changes the
     // production fault rather than accidentally selecting a starvation-heavy
     // unrelated schedule solely because a new enum ordinal was appended.
-    const schedule_ordinal = if (production_graph_split_owner_restart_mode)
+    const schedule_ordinal = if (production_graph_split_owner_restart_mode or production_graph_split_partial_write_mode)
         Scenario.production_graph_split_transport_ordinal
     else
         mode_ordinal;
@@ -944,7 +984,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_graph_split_owner_restart_mode)
+            (if (production_graph_split_partial_write_mode)
+                "full-cluster-vopr-v17-graph-split-partial-write"
+            else if (production_graph_split_owner_restart_mode)
                 "full-cluster-vopr-v16-graph-split-owner-restart"
             else if (production_graph_split_transport_mode)
                 "full-cluster-vopr-v15-graph-split-transport"
@@ -1094,6 +1136,19 @@ test "full cluster production data plane graph active split owner restart exact 
         Scenario.mode_ids[ordinal],
         ordinal,
         650_000,
+        .complete,
+    );
+}
+
+test "full cluster production data plane graph active split partial write exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_graph_split_partial_write_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        500_000,
         .complete,
     );
 }

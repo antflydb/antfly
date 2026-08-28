@@ -27,6 +27,12 @@ pub const Faults = struct {
     outbound_endpoint_down: ?ids.StableId = null,
     outbound_endpoint_payload_contains: ?[]u8 = null,
     outbound_endpoint_payload_failure: ?[]usize = null,
+    /// When set with a payload selector, the first matching client write is
+    /// accepted only up to this byte count instead of failing. The selector is
+    /// then disarmed, modeling a real short stream write rather than a link
+    /// outage. The monotonic count makes scenario evidence non-vacuous.
+    outbound_endpoint_payload_partial_write_limit: ?usize = null,
+    outbound_endpoint_payload_partial_write_count: u64 = 0,
     partition_source: ?std.Io.net.Socket.Handle = null,
     partition_destination: ?std.Io.net.Socket.Handle = null,
     drop_next: bool = false,
@@ -302,7 +308,11 @@ pub const Network = struct {
             return error.SocketUnconnected;
         if (self.faults.network_down) return error.NetworkDown;
         const destination = self.getSocket(source.peer.?) orelse return error.ConnectionResetByPeer;
-        if (self.writeBlocked(source, destination, header, buffers, splat)) return error.NetworkDown;
+        const scoped_partial_write_limit = switch (self.outboundWriteFault(source, destination, header, buffers, splat)) {
+            .none => null,
+            .blocked => return error.NetworkDown,
+            .partial => |limit| limit,
+        };
         if (destination.closed or !destination.read_open) return error.ConnectionResetByPeer;
 
         var requested = header.len;
@@ -317,6 +327,7 @@ pub const Network = struct {
             if (self.faults.network_down) return error.NetworkDown;
         }
         var allowed = @min(requested, self.config.stream_capacity - self.queued_bytes);
+        if (scoped_partial_write_limit) |limit| allowed = @min(allowed, limit);
         if (self.faults.partial_write_limit) |limit| {
             allowed = @min(allowed, limit);
             self.faults.partial_write_limit = null;
@@ -582,14 +593,11 @@ pub const Network = struct {
     }
 
     pub fn setOutboundEndpointOutage(self: *Network, address: ?std.Io.net.IpAddress) void {
-        if (self.faults.outbound_endpoint_payload_contains) |selector| self.allocator.free(selector);
-        if (self.faults.outbound_endpoint_payload_failure) |failure| self.allocator.free(failure);
+        self.clearOutboundEndpointPayloadFault();
         self.faults.outbound_endpoint_down = if (address) |value|
             ids.derive("sim-io.socket", ipEndpointIdentity("sim-io.ip-listener", value), 1)
         else
             null;
-        self.faults.outbound_endpoint_payload_contains = null;
-        self.faults.outbound_endpoint_payload_failure = null;
         for (self.socket_order.items) |socket_state| socket_state.outbound_fault_match_len = 0;
     }
 
@@ -613,6 +621,32 @@ pub const Network = struct {
         self.setOutboundEndpointOutage(address);
         self.faults.outbound_endpoint_payload_contains = owned_selector;
         self.faults.outbound_endpoint_payload_failure = failure;
+    }
+
+    /// Limit the first client write whose semantic byte stream contains the
+    /// selector. Endpoint, direction, and payload scoping keep unrelated
+    /// Raft/control traffic and server responses out of the experiment.
+    pub fn setOutboundEndpointPayloadPartialWrite(
+        self: *Network,
+        address: std.Io.net.IpAddress,
+        payload_contains: []const u8,
+        limit: usize,
+    ) !void {
+        if (limit == 0) return error.InvalidPartialWriteLimit;
+        try self.setOutboundEndpointPayloadOutage(address, payload_contains);
+        self.faults.outbound_endpoint_payload_partial_write_limit = limit;
+    }
+
+    pub fn outboundEndpointPayloadPartialWriteCount(self: *const Network) u64 {
+        return self.faults.outbound_endpoint_payload_partial_write_count;
+    }
+
+    fn clearOutboundEndpointPayloadFault(self: *Network) void {
+        if (self.faults.outbound_endpoint_payload_contains) |selector| self.allocator.free(selector);
+        if (self.faults.outbound_endpoint_payload_failure) |failure| self.allocator.free(failure);
+        self.faults.outbound_endpoint_payload_contains = null;
+        self.faults.outbound_endpoint_payload_failure = null;
+        self.faults.outbound_endpoint_payload_partial_write_limit = null;
     }
 
     fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress, owner_id: ids.StableId) !*SocketState {
@@ -784,29 +818,43 @@ pub const Network = struct {
         return false;
     }
 
-    fn writeBlocked(
-        self: *const Network,
+    const OutboundWriteFault = union(enum) {
+        none,
+        blocked,
+        partial: usize,
+    };
+
+    fn outboundWriteFault(
+        self: *Network,
         source: *SocketState,
         destination: *const SocketState,
         header: []const u8,
         buffers: []const []const u8,
         splat: usize,
-    ) bool {
-        if (self.linkBlocked(source.handle, destination.handle)) return true;
-        const endpoint_id = self.faults.outbound_endpoint_down orelse return false;
+    ) OutboundWriteFault {
+        if (self.linkBlocked(source.handle, destination.handle)) return .blocked;
+        const endpoint_id = self.faults.outbound_endpoint_down orelse return .none;
         if (!source.connection_client or
             source.connection_endpoint_id != endpoint_id or
             destination.connection_endpoint_id != endpoint_id)
         {
-            return false;
+            return .none;
         }
-        const selector = self.faults.outbound_endpoint_payload_contains orelse return true;
+        const selector = self.faults.outbound_endpoint_payload_contains orelse return .blocked;
         const failure = self.faults.outbound_endpoint_payload_failure.?;
-        if (feedFaultSelector(source, selector, failure, header)) return true;
+        var matched = feedFaultSelector(source, selector, failure, header);
         for (0..splat) |_| for (buffers) |buffer| {
-            if (feedFaultSelector(source, selector, failure, buffer)) return true;
+            if (!matched and feedFaultSelector(source, selector, failure, buffer)) matched = true;
         };
-        return false;
+        if (!matched) return .none;
+        if (self.faults.outbound_endpoint_payload_partial_write_limit) |limit| {
+            self.faults.outbound_endpoint_payload_partial_write_count +|= 1;
+            self.faults.outbound_endpoint_down = null;
+            self.clearOutboundEndpointPayloadFault();
+            for (self.socket_order.items) |socket_state| socket_state.outbound_fault_match_len = 0;
+            return .{ .partial = limit };
+        }
+        return .blocked;
     }
 
     fn linkBlocked(self: *const Network, source: std.Io.net.Socket.Handle, destination: std.Io.net.Socket.Handle) bool {
@@ -1139,6 +1187,17 @@ test "outbound endpoint outage is directional and endpoint scoped" {
     try std.testing.expectEqual(@as(usize, "POST /internal/graph-".len), try network.write(blocked_client.handle, "", &.{"POST /internal/graph-"}, 1));
     try std.testing.expectError(error.NetworkDown, network.write(blocked_client.handle, "", &.{"expand HTTP/1.1"}, 1));
     network.setOutboundEndpointOutage(null);
+
+    try network.setOutboundEndpointPayloadPartialWrite(blocked_address, "/graph-expand", 2);
+    try std.testing.expectEqual(@as(usize, "POST /internal/graph-".len), try network.write(blocked_client.handle, "", &.{"POST /internal/graph-"}, 1));
+    try std.testing.expectEqual(@as(usize, 2), try network.write(blocked_client.handle, "", &.{"expand HTTP/1.1"}, 1));
+    try std.testing.expectEqual(@as(u64, 1), network.outboundEndpointPayloadPartialWriteCount());
+    // The scoped fault is one-shot. The caller can resume the rejected suffix,
+    // while server responses and unrelated endpoints remain unaffected.
+    try std.testing.expectEqual(@as(usize, "pand HTTP/1.1".len), try network.write(blocked_client.handle, "", &.{"pand HTTP/1.1"}, 1));
+    try std.testing.expectEqual(@as(usize, "response".len), try network.write(blocked_server.handle, "", &.{"response"}, 1));
+    try std.testing.expectEqual(@as(usize, "healthy".len), try network.write(healthy_client.handle, "", &.{"healthy"}, 1));
+    try std.testing.expectEqual(@as(u64, 1), network.outboundEndpointPayloadPartialWriteCount());
 }
 
 test "first stream payload preserves logical owner independent of connect order" {

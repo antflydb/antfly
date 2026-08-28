@@ -563,6 +563,22 @@ pub const VoprIo = struct {
         try self.network.setOutboundEndpointPayloadOutage(address, payload_contains);
     }
 
+    /// Apply one endpoint-, direction-, and semantic-stream-scoped short
+    /// write. This is deliberately distinct from an outage: the caller must
+    /// resume the same stream from the returned byte count.
+    pub fn setOutboundEndpointPayloadPartialWrite(
+        self: *VoprIo,
+        address: std.Io.net.IpAddress,
+        payload_contains: []const u8,
+        limit: usize,
+    ) !void {
+        try self.network.setOutboundEndpointPayloadPartialWrite(address, payload_contains, limit);
+    }
+
+    pub fn outboundEndpointPayloadPartialWriteCount(self: *const VoprIo) u64 {
+        return self.network.outboundEndpointPayloadPartialWriteCount();
+    }
+
     pub fn setDirectionalPartition(self: *VoprIo, source: ?std.Io.net.Socket.Handle, destination: ?std.Io.net.Socket.Handle) void {
         self.network.faults.partition_source = source;
         self.network.faults.partition_destination = destination;

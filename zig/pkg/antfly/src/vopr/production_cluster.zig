@@ -82,6 +82,7 @@ pub const Fixture = struct {
         clean,
         graph_transport_failure,
         graph_owner_restart,
+        graph_partial_write,
     };
 
     pub const Phase = enum(u8) {
@@ -229,6 +230,11 @@ pub const Fixture = struct {
     graph_partial_rejected_sound: bool = false,
     graph_transport_fault_armed: bool = false,
     graph_transport_fault_endpoint: ?std.Io.net.IpAddress = null,
+    graph_partial_write_injected: bool = false,
+    graph_partial_write_observed: bool = false,
+    graph_partial_write_count_before: u64 = 0,
+    graph_partial_write_target_index: usize = 0,
+    graph_partial_write_target_configured: bool = false,
     graph_restart_requested: std.Io.Semaphore = .{},
     graph_restart_down: std.Io.Semaphore = .{},
     graph_restart_recover: std.Io.Semaphore = .{},
@@ -296,6 +302,23 @@ pub const Fixture = struct {
             return error.InvalidProductionGraphRestartTarget;
         self.graph_restart_target_index = index;
         self.graph_restart_target_configured = true;
+    }
+
+    /// Freeze the advertised link selected by the deployment manifest before
+    /// workload start. The active history later fails closed if leadership
+    /// changes would make that registered fault scope inaccurate.
+    pub fn configureGraphPartialWriteTarget(self: *Fixture, target_index: usize) !usize {
+        if (self.phase != .leaders_ready or target_index >= self.data_server_count or !self.data_server_live[target_index])
+            return error.InvalidProductionGraphPartialWriteTarget;
+        const start_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
+            return error.ProductionDataGraphLeaderMissing;
+        const coordinator_index = for (0..self.data_api_uri_count) |index| {
+            if (index != start_index and index != target_index) break index;
+        } else return error.ProductionDataGraphRemoteCoordinatorMissing;
+        self.graph_partial_write_target_index = target_index;
+        self.graph_partial_write_target_configured = true;
+        self.graph_probe_route_index = coordinator_index;
+        return coordinator_index;
     }
 
     pub fn bootstrap(self: *Fixture) !void {
@@ -596,6 +619,14 @@ pub const Fixture = struct {
                         self.graph_restart_requested.post(self.sim.io());
                         self.graph_restart_down.wait(self.sim.io()) catch return;
                     },
+                    .graph_partial_write => {
+                        if (self.graph_partial_write_injected) return;
+                        self.graph_transport_fault_armed = false;
+                        const endpoint = self.graph_transport_fault_endpoint orelse return;
+                        self.graph_partial_write_count_before = self.sim.outboundEndpointPayloadPartialWriteCount();
+                        self.sim.setOutboundEndpointPayloadPartialWrite(endpoint, "/graph-expand", 1) catch unreachable;
+                        self.graph_partial_write_injected = true;
+                    },
                 }
             },
             .attempt_failed => {
@@ -618,6 +649,7 @@ pub const Fixture = struct {
                         self.graph_restart_recover.post(self.sim.io());
                         self.graph_restart_recovered.wait(self.sim.io()) catch return;
                     },
+                    .graph_partial_write => {},
                 }
             },
             else => {},
@@ -1205,6 +1237,13 @@ pub const Fixture = struct {
                             self.graph_restart_target_index = target_index;
                             self.graph_restart_future = self.sim.io().async(driveGraphOwnerRestart, .{self});
                         },
+                        .graph_partial_write => self.graph_transport_fault_endpoint =
+                            blk: {
+                                if (self.graph_partial_write_target_configured and
+                                    self.graph_partial_write_target_index != target_index)
+                                    return error.ProductionGraphPartialWriteTargetLeadershipChanged;
+                                break :blk try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
+                            },
                     }
                     self.graph_transport_fault_armed = true;
                 }
@@ -1325,6 +1364,12 @@ pub const Fixture = struct {
                     2,
                     &.{ "doc:x", "doc:k" },
                 );
+                if (self.fault_mode == .graph_partial_write) {
+                    self.graph_partial_write_observed = self.graph_partial_write_injected and
+                        self.sim.outboundEndpointPayloadPartialWriteCount() ==
+                            self.graph_partial_write_count_before + 1;
+                    return self.split_graph_inflight_complete and self.graph_partial_write_observed;
+                }
                 if (self.fault_mode != .clean) return false;
                 return self.split_graph_inflight_complete;
             },
@@ -1357,6 +1402,7 @@ pub const Fixture = struct {
                         self.split_graph_inflight_rejected;
                     return self.graph_partial_rejected_sound;
                 }
+                if (self.fault_mode == .graph_partial_write) return false;
                 return self.split_graph_inflight_rejected;
             },
             else => return error.UnexpectedHttpStatus,
@@ -1920,6 +1966,8 @@ pub const Fixture = struct {
         graph_owner_restart_failure_observed: bool,
         graph_owner_restart_recovered: bool,
         graph_owner_restart_error_code: u16,
+        graph_partial_write_injected: bool,
+        graph_partial_write_observed: bool,
         graph_partial_rejected_sound: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
@@ -1948,6 +1996,8 @@ pub const Fixture = struct {
             .graph_owner_restart_failure_observed = self.graph_owner_restart_failure_observed,
             .graph_owner_restart_recovered = self.graph_owner_restart_recovered,
             .graph_owner_restart_error_code = self.graph_owner_restart_error_code,
+            .graph_partial_write_injected = self.graph_partial_write_injected,
+            .graph_partial_write_observed = self.graph_partial_write_observed,
             .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally
