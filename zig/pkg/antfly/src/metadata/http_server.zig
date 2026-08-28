@@ -2288,6 +2288,7 @@ const ParsedRuntimeIndexStatus = struct {
     replay_applied_sequence: ?u64 = null,
     replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
+    dense_vector_projection_pending: ?bool = null,
     repair_status: ?metadata_table_manager.IndexRepairStatus = null,
     repair_active_generation_serviceable: ?bool = null,
 };
@@ -2642,16 +2643,17 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_applied_sequence = parsed.replay_applied_sequence orelse 0,
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
+        .dense_vector_projection_pending = parsed.dense_vector_projection_pending orelse false,
         .repair_status = parsed.repair_status,
         .repair_active_generation_serviceable = parsed.repair_status != null and
             (parsed.repair_active_generation_serviceable orelse false),
     };
 }
 
-test "metadata status JSON preserves compact managed repair admission state" {
+test "metadata status JSON preserves compact managed index admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","repair_status":"waiting","repair_active_generation_serviceable":true,"dense_vector_projection_pending":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -2660,10 +2662,12 @@ test "metadata status JSON preserves compact managed repair admission state" {
     try std.testing.expectEqual(@as(usize, 3), indexes.len);
     try std.testing.expectEqual(metadata_table_manager.IndexRepairStatus.waiting, indexes[0].repair_status.?);
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
+    try std.testing.expect(indexes[0].dense_vector_projection_pending);
     // Proof without a repair lifecycle is not actionable and must not survive
     // normalization from a malformed or mixed-version producer.
     try std.testing.expect(indexes[1].repair_status == null);
     try std.testing.expect(!indexes[1].repair_active_generation_serviceable);
+    try std.testing.expect(!indexes[1].dense_vector_projection_pending);
     // A mixed-version producer can omit both fields. Preserve that absence as
     // an incomplete identity so it cannot authorize repair-state deletion.
     try std.testing.expectEqualStrings("", indexes[2].kind);

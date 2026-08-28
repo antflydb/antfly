@@ -201,5 +201,6 @@ comptime {
     _ = @import("sim_runtime.zig");
     _ = @import("transactions.zig");
     _ = @import("ttl.zig");
+    _ = @import("vector_block_store.zig");
     _ = @import("wal.zig");
 }

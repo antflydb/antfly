@@ -404,6 +404,112 @@ pub fn distanceToQuery(query: []const f32, query_measure: f32, candidate: []cons
     };
 }
 
+/// Compute distance directly from a scaled float16 projection without first
+/// materializing a float32 candidate. This is useful for immutable mmap vector
+/// blocks: conversion, candidate norm, and query dot product share one pass,
+/// avoiding a request-sized decode buffer and a second candidate traversal.
+pub fn distanceToQueryF16(
+    query: []const f32,
+    query_measure: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    metric: DistanceMetric,
+) f32 {
+    return switch (metric) {
+        .l2_squared => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .l2_squared),
+        .inner_product => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .inner_product),
+        .cosine => distanceToQueryF16Metric(query, query_measure, candidate, candidate_scale, .cosine),
+    };
+}
+
+fn distanceToQueryF16Metric(
+    query: []const f32,
+    query_measure: f32,
+    candidate: []const f16,
+    candidate_scale: f32,
+    comptime metric: DistanceMetric,
+) f32 {
+    std.debug.assert(query.len == candidate.len);
+    std.debug.assert(std.math.isFinite(candidate_scale) and candidate_scale > 0);
+    const SimdF16 = @Vector(8, f16);
+    const SimdF32 = @Vector(8, f32);
+    const scale_vec: SimdF32 = @splat(candidate_scale);
+    var sum0: SimdF32 = @splat(0);
+    var sum1: SimdF32 = @splat(0);
+    var sum2: SimdF32 = @splat(0);
+    var sum3: SimdF32 = @splat(0);
+    var norm0: SimdF32 = @splat(0);
+    var norm1: SimdF32 = @splat(0);
+    var norm2: SimdF32 = @splat(0);
+    var norm3: SimdF32 = @splat(0);
+    var i: usize = 0;
+
+    while (i + 32 <= query.len) : (i += 32) {
+        const q0: SimdF32 = query[i..][0..8].*;
+        const q1: SimdF32 = query[i + 8 ..][0..8].*;
+        const q2: SimdF32 = query[i + 16 ..][0..8].*;
+        const q3: SimdF32 = query[i + 24 ..][0..8].*;
+        const c0: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i..][0..8].*))) * scale_vec;
+        const c1: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 8 ..][0..8].*))) * scale_vec;
+        const c2: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 16 ..][0..8].*))) * scale_vec;
+        const c3: SimdF32 = @as(SimdF32, @floatCast(@as(SimdF16, candidate[i + 24 ..][0..8].*))) * scale_vec;
+        switch (metric) {
+            .l2_squared => {
+                const d0 = q0 - c0;
+                const d1 = q1 - c1;
+                const d2 = q2 - c2;
+                const d3 = q3 - c3;
+                sum0 += d0 * d0;
+                sum1 += d1 * d1;
+                sum2 += d2 * d2;
+                sum3 += d3 * d3;
+            },
+            .inner_product => {
+                sum0 += q0 * c0;
+                sum1 += q1 * c1;
+                sum2 += q2 * c2;
+                sum3 += q3 * c3;
+            },
+            .cosine => {
+                sum0 += q0 * c0;
+                sum1 += q1 * c1;
+                sum2 += q2 * c2;
+                sum3 += q3 * c3;
+                norm0 += c0 * c0;
+                norm1 += c1 * c1;
+                norm2 += c2 * c2;
+                norm3 += c3 * c3;
+            },
+        }
+    }
+
+    var sum: f32 = @reduce(.Add, sum0 + sum1 + sum2 + sum3);
+    var norm_squared: f32 = @reduce(.Add, norm0 + norm1 + norm2 + norm3);
+    while (i < query.len) : (i += 1) {
+        const value = @as(f32, @floatCast(candidate[i])) * candidate_scale;
+        switch (metric) {
+            .l2_squared => {
+                const diff = query[i] - value;
+                sum += diff * diff;
+            },
+            .inner_product => sum += query[i] * value,
+            .cosine => {
+                sum += query[i] * value;
+                norm_squared += value * value;
+            },
+        }
+    }
+
+    return switch (metric) {
+        .l2_squared => @max(0, sum),
+        .inner_product => -sum,
+        .cosine => if (query_measure == 0 or norm_squared == 0)
+            1
+        else
+            1 - sum / (query_measure * @sqrt(norm_squared)),
+    };
+}
+
 /// Compute cosine similarity between two vectors.
 pub fn cosineSimilarity(a: []const f32, b: []const f32) f32 {
     const na = norm(a);
@@ -512,10 +618,21 @@ pub fn batchL2SquaredDistance(query: []const f32, candidates: []const []const f3
 pub fn minMax(v: []const f32) struct { min: f32, max: f32 } {
     if (v.len == 0) return .{ .min = 0, .max = 0 };
 
-    var min_val: f32 = v[0];
-    var max_val: f32 = v[0];
+    const simd_width = 8;
+    const SimdF32 = @Vector(simd_width, f32);
+    var min_vec: SimdF32 = @splat(v[0]);
+    var max_vec: SimdF32 = @splat(v[0]);
+    var i: usize = 1;
+    while (i + simd_width <= v.len) : (i += simd_width) {
+        const values: SimdF32 = v[i..][0..simd_width].*;
+        min_vec = @min(min_vec, values);
+        max_vec = @max(max_vec, values);
+    }
 
-    for (v[1..]) |val| {
+    var min_val: f32 = @reduce(.Min, min_vec);
+    var max_val: f32 = @reduce(.Max, max_vec);
+    while (i < v.len) : (i += 1) {
+        const val = v[i];
         if (val < min_val) min_val = val;
         if (val > max_val) max_val = val;
     }
@@ -547,14 +664,46 @@ test "subTo" {
     try std.testing.expectApproxEqAbs(dst[2], -2.0, 1e-6);
 }
 
+test "minMax handles SIMD body and scalar tail" {
+    const values = [_]f32{ 4, -2, 7, 3, 1, 9, -8, 5, 6, 11, -3, 2, 8, 0, 10, -1, 12, -4 };
+    const result = minMax(&values);
+    try std.testing.expectEqual(@as(f32, -8), result.min);
+    try std.testing.expectEqual(@as(f32, 12), result.max);
+}
+
 test "distance conversion produces higher-is-better similarity scores" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), similarityFromDistance(0.0, .l2_squared), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), similarityFromDistance(3.0, .l2_squared), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), similarityFromDistance(0.2, .cosine), 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.5), similarityFromDistance(-2.5, .inner_product), 1e-6);
 
-    inline for (.{ DistanceMetric.l2_squared, .inner_product, .cosine }) |metric| {
+    inline for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
         try std.testing.expect(similarityFromDistance(0.25, metric) > similarityFromDistance(0.75, metric));
+    }
+}
+
+test "scaled float16 distance matches decoded float32 distance" {
+    var query: [35]f32 = undefined;
+    var encoded: [35]f16 = undefined;
+    var decoded: [35]f32 = undefined;
+    const candidate_scale: f32 = 2.5;
+    for (0..query.len) |i| {
+        query[i] = @as(f32, @floatFromInt(i % 11)) * 0.125 - 0.5;
+        encoded[i] = @floatCast(@as(f32, @floatFromInt(i % 7)) * 0.25 - 0.75);
+        decoded[i] = @as(f32, @floatCast(encoded[i])) * candidate_scale;
+    }
+
+    inline for ([_]DistanceMetric{ .l2_squared, .inner_product, .cosine }) |metric| {
+        const query_measure = switch (metric) {
+            .l2_squared => dot(&query, &query),
+            .inner_product => 0,
+            .cosine => norm(&query),
+        };
+        try std.testing.expectApproxEqAbs(
+            distanceToQuery(&query, query_measure, &decoded, metric),
+            distanceToQueryF16(&query, query_measure, &encoded, candidate_scale, metric),
+            1e-5,
+        );
     }
 }
 

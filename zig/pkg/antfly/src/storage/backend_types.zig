@@ -112,6 +112,11 @@ pub const BatchMode = enum {
 pub const BatchOptions = struct {
     mode: BatchMode = .default,
     defer_commit_flush: bool = false,
+    // Read-throughs performed by a write batch (for example, loading exact
+    // vectors while building a derived index) may be one-pass scans. Keep the
+    // default reusable, but let those callers avoid filling the shared block
+    // cache with source blocks that already have a bounded native workspace.
+    block_cache_admission: Namespace.BlockCacheAdmission = .retain,
 };
 
 pub const BulkIngestFinishOptions = struct {

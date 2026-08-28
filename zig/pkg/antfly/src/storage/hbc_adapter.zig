@@ -61,6 +61,8 @@ const vectorindex_hbc_runtime = @import("antfly_vectorindex").hbc_runtime;
 const vectorindex_hbc = @import("antfly_vectorindex").hbc;
 const vectorindex_hbc_index = @import("antfly_vectorindex").hbc_index;
 const vectorindex_posting = @import("antfly_vectorindex").posting;
+const vectorindex_centroid_directory = @import("antfly_vectorindex").centroid_directory;
+const vectorindex_quantized_directory = @import("antfly_vectorindex").quantized_directory;
 const vectorindex_posting_segment = @import("antfly_vectorindex").posting_segment;
 const vectorindex_posting_wal = @import("antfly_vectorindex").posting_wal;
 const vectorindex_hbc_vector_directory = @import("antfly_vectorindex").hbc_vector_directory;
@@ -2195,11 +2197,13 @@ const ExperimentalPostingResolvedValue = struct {
 const ExperimentalPostingReadState = struct {
     alloc: Allocator,
     covered_source_sequence: u64,
+    wal_generation: u64,
     /// One complete base followed by ordered immutable replacement deltas.
     /// Readers search deltas newest-first and then the mmap-friendly base.
     retained_segments: []posting_segment_store_mod.RetainedSegment,
     segments: []vectorindex_posting_segment.VerifiedReader,
     vector_directory: ?vectorindex_hbc_vector_directory.Reader = null,
+    quantized_directory: ?vectorindex_quantized_directory.VerifiedReader = null,
     // Full WAL records borrow directly from this one retained buffer. Only
     // decoded replacement patches allocate individual owned values, avoiding
     // a second full copy of the bounded WAL tail after restart.
@@ -2217,6 +2221,7 @@ const ExperimentalPostingReadState = struct {
         while (values.next()) |slot| if (slot.owned) if (slot.bytes) |owned| self.alloc.free(owned);
         self.materialized.deinit(self.alloc);
         for (&self.patch_cache) |*shard| shard.deinit(self.alloc);
+        if (self.quantized_directory) |*directory| directory.deinit();
         if (self.wal_bytes) |bytes| self.alloc.free(bytes);
         for (self.segments) |*segment| segment.deinit();
         self.alloc.free(self.segments);
@@ -2255,6 +2260,27 @@ const ExperimentalPostingReadState = struct {
             return try self.cachePatchedValue(key, owned);
         }
         return resolved.bytes;
+    }
+
+    /// Returns a borrowed base-directory view only when no immutable delta or
+    /// recovered WAL value shadows that posting. This keeps the native base a
+    /// read optimization; the existing value chain remains authoritative for
+    /// every mutation and crash-recovery path.
+    fn quantizedViewIfUnmodified(self: *ExperimentalPostingReadState, posting_id: u64) !?vectorindex_quantized_directory.View {
+        const directory = if (self.quantized_directory) |*stored_directory| stored_directory else return null;
+        const key = experimentalPostingValueKey(posting_id, .quantized_checkpoint);
+        if (self.materialized.contains(key)) return null;
+        var index = self.segments.len;
+        while (index > 1) {
+            index -= 1;
+            if ((try self.segments[index].getValue(posting_id, .quantized_checkpoint)) != null or
+                (try self.segments[index].getValue(posting_id, .quantized_checkpoint_tombstone)) != null or
+                (try self.segments[index].getValue(posting_id, .quantized_checkpoint_patch)) != null)
+            {
+                return null;
+            }
+        }
+        return try directory.get(posting_id);
     }
 
     fn patchCacheShard(key: u128) usize {
@@ -2309,7 +2335,20 @@ const ExperimentalPostingReadState = struct {
                     var base = (try self.resolveSegmentValueAlloc(alloc, index, posting_id, kind)) orelse
                         return error.PostingPatchBaseMismatch;
                     defer base.deinit(alloc);
-                    const decoded = try vectorindex_posting_wal.applyReplacementPatchAlloc(alloc, patch_bytes, base.bytes);
+                    const decoded = vectorindex_posting_wal.applyReplacementPatchAlloc(alloc, patch_bytes, base.bytes) catch |err| {
+                        if (err == error.PostingPatchBaseMismatch and patch_bytes.len >= 28) {
+                            std.log.warn("dense posting immutable patch base mismatch posting_id={} target={s} segment={} actual_len={} expected_len={} actual_crc={x} expected_crc={x}", .{
+                                posting_id,
+                                @tagName(kind),
+                                index,
+                                base.bytes.len,
+                                std.mem.readInt(u32, patch_bytes[8..12], .big),
+                                std.hash.Crc32.hash(base.bytes),
+                                std.mem.readInt(u32, patch_bytes[24..28], .big),
+                            });
+                        }
+                        return err;
+                    };
                     if (decoded.target != kind) {
                         alloc.free(decoded.replacement);
                         return error.InvalidPostingPatchTarget;
@@ -2318,8 +2357,29 @@ const ExperimentalPostingReadState = struct {
                 }
             }
         }
-        const value_bytes = (try self.segments[0].getValue(posting_id, entry_kind)) orelse return null;
-        return .{ .bytes = value_bytes };
+        if (try self.segments[0].getValue(posting_id, entry_kind)) |value_bytes| {
+            return .{ .bytes = value_bytes };
+        }
+        if (experimentalPostingSegmentTombstoneKind(kind)) |tombstone_kind| {
+            if (try self.segments[0].getValue(posting_id, tombstone_kind)) |_| return error.NotFound;
+        }
+
+        // Full native checkpoints keep non-root quantized payloads only in
+        // their compact mmap directory. Replacement patches remain encoded
+        // against the logical protobuf value, so reconstruct that value only
+        // when a mutation or later immutable patch actually needs it. Search
+        // continues to borrow QuantizedDirectory.View directly and does not
+        // pay this serialization cost.
+        if (kind == .quantized_checkpoint) {
+            if (self.quantized_directory) |*directory| {
+                if (try directory.get(posting_id)) |view| {
+                    var borrowed = view.asProto();
+                    const encoded = try borrowed.encode(alloc);
+                    return .{ .bytes = encoded, .owned = encoded };
+                }
+            }
+        }
+        return null;
     }
 
     fn replaceMaterialized(
@@ -2365,10 +2425,37 @@ const ExperimentalPostingReadState = struct {
                     else => return error.InvalidPostingPatchTarget,
                 };
                 const base = self.value(record.posting_id, target) catch |err| switch (err) {
-                    error.NotFound => return error.PostingPatchBaseMismatch,
+                    error.NotFound => {
+                        std.log.warn("dense posting WAL patch base missing posting_id={} target={s} source_sequence={}", .{
+                            record.posting_id,
+                            @tagName(target),
+                            record.source_sequence,
+                        });
+                        return error.PostingPatchBaseMismatch;
+                    },
                     else => return err,
-                } orelse return error.PostingPatchBaseMismatch;
-                const decoded = try vectorindex_posting_wal.applyReplacementPatchAlloc(self.alloc, record.payload, base);
+                } orelse {
+                    std.log.warn("dense posting WAL patch base absent posting_id={} target={s} source_sequence={}", .{
+                        record.posting_id,
+                        @tagName(target),
+                        record.source_sequence,
+                    });
+                    return error.PostingPatchBaseMismatch;
+                };
+                const decoded = vectorindex_posting_wal.applyReplacementPatchAlloc(self.alloc, record.payload, base) catch |err| {
+                    if (err == error.PostingPatchBaseMismatch and record.payload.len >= 28) {
+                        std.log.warn("dense posting WAL patch base mismatch posting_id={} target={s} source_sequence={} actual_len={} expected_len={} actual_crc={x} expected_crc={x}", .{
+                            record.posting_id,
+                            @tagName(target),
+                            record.source_sequence,
+                            base.len,
+                            std.mem.readInt(u32, record.payload[8..12], .big),
+                            std.hash.Crc32.hash(base),
+                            std.mem.readInt(u32, record.payload[24..28], .big),
+                        });
+                    }
+                    return err;
+                };
                 if (decoded.target != target) {
                     self.alloc.free(decoded.replacement);
                     return error.InvalidPostingPatchTarget;
@@ -2468,6 +2555,11 @@ const ExperimentalPostingReadGeneration = struct {
     /// generation. This comes from the posting checkpoint/WAL commit boundary,
     /// not from the projection metadata value stored inside the generation.
     covered_source_sequence: std.atomic.Value(u64),
+    /// Exact durable WAL boundary represented by this logical generation.
+    /// Source sequences alone are insufficient because multiple ordered
+    /// derived batches may commit at the same source sequence.
+    wal_generation: std.atomic.Value(u64),
+    wal_committed_bytes: std.atomic.Value(u64),
     root: ?*ExperimentalPostingReadState = null,
     parent: ?*ExperimentalPostingReadGeneration = null,
     values: std.AutoHashMapUnmanaged(u128, ?[]u8) = .empty,
@@ -2477,6 +2569,8 @@ const ExperimentalPostingReadGeneration = struct {
         generation.* = .{
             .alloc = alloc,
             .covered_source_sequence = .init(state.covered_source_sequence),
+            .wal_generation = .init(state.wal_generation),
+            .wal_committed_bytes = .init(state.wal_committed_bytes),
             .root = state,
         };
         return generation;
@@ -2486,12 +2580,16 @@ const ExperimentalPostingReadGeneration = struct {
         alloc: Allocator,
         parent: *ExperimentalPostingReadGeneration,
         covered_source_sequence: u64,
+        wal_generation: u64,
+        wal_committed_bytes: u64,
     ) !*ExperimentalPostingReadGeneration {
         if (covered_source_sequence < parent.covered_source_sequence.load(.acquire)) return error.PostingWalSequenceRegression;
         const generation = try alloc.create(ExperimentalPostingReadGeneration);
         generation.* = .{
             .alloc = alloc,
             .covered_source_sequence = .init(covered_source_sequence),
+            .wal_generation = .init(wal_generation),
+            .wal_committed_bytes = .init(wal_committed_bytes),
             .parent = parent,
         };
         parent.retain();
@@ -2528,16 +2626,25 @@ const ExperimentalPostingReadGeneration = struct {
         }
     }
 
-    fn advanceCoveredSourceSequence(self: *ExperimentalPostingReadGeneration, sequence: u64) void {
+    fn advanceDurableBoundary(
+        self: *ExperimentalPostingReadGeneration,
+        sequence: u64,
+        wal_generation: u64,
+        wal_committed_bytes: u64,
+    ) void {
         var current = self.covered_source_sequence.load(.acquire);
         while (sequence > current) {
-            current = self.covered_source_sequence.cmpxchgWeak(
+            if (self.covered_source_sequence.cmpxchgWeak(
                 current,
                 sequence,
                 .release,
                 .acquire,
-            ) orelse return;
+            )) |updated| {
+                current = updated;
+            } else break;
         }
+        self.wal_generation.store(wal_generation, .release);
+        self.wal_committed_bytes.store(wal_committed_bytes, .release);
     }
 
     fn set(self: *ExperimentalPostingReadGeneration, posting_id: u64, kind: vectorindex_posting_wal.RecordKind, value_bytes: ?[]const u8) !void {
@@ -2557,6 +2664,16 @@ const ExperimentalPostingReadGeneration = struct {
         }
         return error.Corrupted;
     }
+
+    fn quantizedViewIfUnmodified(self: *ExperimentalPostingReadGeneration, posting_id: u64) !?vectorindex_quantized_directory.View {
+        const key = experimentalPostingValueKey(posting_id, .quantized_checkpoint);
+        var generation: ?*ExperimentalPostingReadGeneration = self;
+        while (generation) |current| : (generation = current.parent) {
+            if (current.values.contains(key)) return null;
+            if (current.root) |state| return try state.quantizedViewIfUnmodified(posting_id);
+        }
+        return error.Corrupted;
+    }
 };
 
 fn experimentalPostingValueKey(posting_id: u64, kind: vectorindex_posting_wal.RecordKind) u128 {
@@ -2569,6 +2686,28 @@ fn experimentalPostingValueKeyId(key: u128) u64 {
 
 const ExperimentalPostingLatestValues = std.AutoHashMapUnmanaged(u128, ?[]const u8);
 const ExperimentalPostingCapturedValues = std.AutoHashMapUnmanaged(u128, ?[]u8);
+
+pub const ExperimentalExactVectorMutation = struct {
+    pub const Kind = enum { upsert, tombstone };
+
+    kind: Kind,
+    vector_id: u64,
+    metadata: []u8,
+    vector: []f32 = &.{},
+
+    pub fn deinit(self: *ExperimentalExactVectorMutation, alloc: Allocator) void {
+        alloc.free(self.metadata);
+        alloc.free(self.vector);
+        self.* = undefined;
+    }
+
+    fn lessThan(_: void, lhs: ExperimentalExactVectorMutation, rhs: ExperimentalExactVectorMutation) bool {
+        const order = std.mem.order(u8, lhs.metadata, rhs.metadata);
+        return if (order == .eq) lhs.vector_id < rhs.vector_id else order == .lt;
+    }
+};
+
+const ExperimentalExactVectorMutations = std.AutoHashMapUnmanaged(u64, ExperimentalExactVectorMutation);
 
 fn experimentalPostingRootState(generation: *ExperimentalPostingReadGeneration) ?*ExperimentalPostingReadState {
     var current: ?*ExperimentalPostingReadGeneration = generation;
@@ -2774,7 +2913,10 @@ const ExperimentalPostingCheckpointBuild = struct {
             .delta => HBCIndex.buildExperimentalPostingDeltaFromGeneration(
                 allocator(),
                 self.source_generation,
+                self.metadata,
                 self.covered_source_sequence,
+                self.resource_manager,
+                &self.force_progress,
             ),
         } catch |err| {
             self.build_error = err;
@@ -2834,11 +2976,26 @@ const managedPostingIdleCheckpointWalBytes: u64 = 64 * 1024 * 1024;
 const managedPostingDeltaCheckpointWalBytes: u64 = 128 * 1024 * 1024;
 const managedPostingFullCheckpointWalBytes: u64 = 192 * 1024 * 1024;
 const managedPostingCheckpointHardWalBytes: u64 = 256 * 1024 * 1024;
-// Patched deltas are much smaller than full generations, but every cold value
-// lookup must replay its patch chain before the decoded node/quantized caches
-// can take over. Two deltas retain most of the write-amplification win without
-// turning restart or the first query sweep into a six-generation point-read.
-const managedPostingMaxDeltaSegments: usize = 2;
+// Patched deltas are much smaller than full generations. Use the complete
+// bounded chain supported by the durable checkpoint format so sustained
+// ingestion does not repeatedly rewrite the growing base. Cold lookup cost is
+// still capped at eight immutable patches before decoded node/quantized caches
+// take over, and the 256 MiB WAL ceiling remains the synchronous recovery-debt
+// bound. Query/restart qualification covers the deliberately larger chain.
+const managedPostingMaxDeltaSegments: usize = vectorindex_posting_wal.Checkpoint.max_delta_segments;
+
+pub const TopologyRebuildAlgorithm = enum {
+    recursive,
+    global_kmeans,
+};
+
+pub const TopologyRebuildStats = struct {
+    vectors: u64,
+    retired_nodes: u64,
+    created_nodes: u64,
+    workspace_bytes: u64,
+    elapsed_ns: u64,
+};
 
 fn shouldStartExperimentalPostingCheckpoint(wal_bytes: u64, delta_segment_count: usize) bool {
     // A delta writes only changed tree state, while a max-chain checkpoint
@@ -2861,6 +3018,15 @@ fn shouldStartExperimentalPostingIdleCheckpoint(wal_bytes: u64, delta_segment_co
     // short WAL tail.
     return delta_segment_count > managedPostingMaxDeltaSegments or
         wal_bytes >= managedPostingIdleCheckpointWalBytes;
+}
+
+fn shouldStartExperimentalPostingReadinessCheckpoint(wal_bytes: u64, delta_segment_count: usize) bool {
+    // A lifecycle owner has already proved a stable source tip and will join
+    // the build before publication. Any remaining overlay is therefore both
+    // avoidable cold-read amplification and work that could otherwise race
+    // the first query wave; unlike opportunistic idle work, no size floor is
+    // appropriate here.
+    return wal_bytes != 0 or delta_segment_count != 0;
 }
 
 const ExperimentalPostingMaintenanceCapture = struct {
@@ -2891,6 +3057,8 @@ pub const HBCIndex = struct {
     experimental_posting_mutation_base_generation: ?*ExperimentalPostingReadGeneration = null,
     experimental_posting_capture_enabled: bool = false,
     experimental_posting_captured_values: ExperimentalPostingCapturedValues = .empty,
+    experimental_exact_vector_capture_enabled: bool = false,
+    experimental_exact_vector_mutations: ExperimentalExactVectorMutations = .empty,
     rng: go_rand.GoPcg,
     // Set when a write path observes a tree-link inconsistency (stale parent
     // pointer, dangling node reference); background maintenance runs a
@@ -2986,6 +3154,10 @@ pub const HBCIndex = struct {
         artifact_keys: [][]const u8,
         raw_values: []?[]const u8,
         vector_views: [][]const f32,
+        /// Source boundary pinned by the same immutable HBC generation lease
+        /// as this search transaction. External exact-vector projections must
+        /// not return a revision newer than this sequence.
+        source_sequence: ?u64 = null,
     };
     pub const ExternalVectorBatchDistanceLoader = *const fn (
         ctx: *anyopaque,
@@ -3992,7 +4164,17 @@ pub const HBCIndex = struct {
     }
 
     pub fn setBypassExternalVectorCache(self: *HBCIndex, enabled: bool) void {
+        if (self.bypass_external_vector_cache == enabled) return;
         self.bypass_external_vector_cache = enabled;
+        // A native external generation is itself immutable exact-vector
+        // residency. Fence fills already in flight before dropping the heap
+        // duplicate; otherwise a pre-publication request can repopulate the
+        // cache after the generation becomes visible.
+        if (enabled) self.clearVectorCache();
+    }
+
+    pub fn bypassExternalVectorCache(self: *const HBCIndex) bool {
+        return self.bypass_external_vector_cache;
     }
 
     pub fn acquireRoutingScratch(self: *HBCIndex) !RoutingScratchHandle {
@@ -4103,6 +4285,10 @@ pub const HBCIndex = struct {
 
     fn endStreamingSplitVectorWorkspace(self: *HBCIndex) void {
         self.bulk_split_vector_workspace.active = false;
+        // A replay window owns this delta cache. Exact vectors remain durable
+        // in the primary store, so retaining the ring after the window closes
+        // only pins derivative memory between catch-up passes.
+        self.deinitBulkSplitVectorWorkspace();
     }
 
     fn endBulkSplitVectorWorkspace(self: *HBCIndex) void {
@@ -4120,8 +4306,14 @@ pub const HBCIndex = struct {
     }
 
     fn bulkSplitVectorWorkspaceBudgetBytes(self: *const HBCIndex) u64 {
-        _ = self;
-        return default_bulk_split_vector_workspace_budget_bytes;
+        const manager = self.resource_manager orelse return default_bulk_split_vector_workspace_budget_bytes;
+        const hard_limit = manager.sliceStats(.dense_apply_working_set).hard_limit_bytes;
+        if (hard_limit == 0) return default_bulk_split_vector_workspace_budget_bytes;
+        // Leave half of the apply slice for the active mutation batch, staged
+        // node values, split matrices, and allocator growth. One vector is the
+        // useful minimum for very small explicitly configured envelopes.
+        const one_vector_bytes = @as(u64, @intCast(self.config.dims)) *| @sizeOf(f32);
+        return @min(default_bulk_split_vector_workspace_budget_bytes, @max(one_vector_bytes, hard_limit / 2));
     }
 
     fn bulkSplitVectorWorkspaceMaxEntries(self: *const HBCIndex) usize {
@@ -4615,6 +4807,8 @@ pub const HBCIndex = struct {
         }
         self.clearExperimentalPostingCapturedValues();
         self.experimental_posting_captured_values.deinit(self.alloc);
+        self.clearExperimentalExactVectorMutations();
+        self.experimental_exact_vector_mutations.deinit(self.alloc);
         if (self.resource_manager) |manager| {
             manager.unregisterReclaimer(self.local_reclaimer_identity);
             self.local_reclaimer_identity = 0;
@@ -4716,6 +4910,251 @@ pub const HBCIndex = struct {
         return generation;
     }
 
+    fn experimentalPostingSourceSequenceFromTxn(txn: anytype) ?u64 {
+        const Txn = comptime txnLikeChild(@TypeOf(txn));
+        if (comptime !@hasField(Txn, "read_lease")) return null;
+        const lease = txn.read_lease orelse return null;
+        if (lease.release != ExperimentalPostingReadGeneration.releaseOpaque) return null;
+        const generation: *ExperimentalPostingReadGeneration = @ptrCast(@alignCast(lease.ptr));
+        return generation.covered_source_sequence.load(.acquire);
+    }
+
+    fn experimentalPostingGenerationFromTxn(txn: anytype) ?*ExperimentalPostingReadGeneration {
+        const Txn = comptime txnLikeChild(@TypeOf(txn));
+        if (comptime !@hasField(Txn, "read_lease")) return null;
+        const lease = txn.read_lease orelse return null;
+        if (lease.release != ExperimentalPostingReadGeneration.releaseOpaque) return null;
+        return @ptrCast(@alignCast(lease.ptr));
+    }
+
+    /// Returns every packed-node id that can supersede the complete base
+    /// segment. Values are resolved separately from the leased generation so
+    /// this set stays proportional to tree mutations, not vector metadata.
+    fn experimentalPostingBaseOverrideIdsAlloc(
+        self: *HBCIndex,
+        generation: *ExperimentalPostingReadGeneration,
+    ) ![]u64 {
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(self.alloc);
+        var current: ?*ExperimentalPostingReadGeneration = generation;
+        while (current) |item| : (current = item.parent) {
+            var values = item.values.keyIterator();
+            while (values.next()) |key| {
+                if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                    try ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+                }
+            }
+            if (item.root) |root| {
+                var materialized = root.materialized.keyIterator();
+                while (materialized.next()) |key| {
+                    if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                        try ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+                    }
+                }
+                var segment_index = root.segments.len;
+                while (segment_index > 1) {
+                    segment_index -= 1;
+                    var entries = root.segments[segment_index].entries();
+                    while (try entries.next()) |entry| switch (entry.kind) {
+                        .base, .base_patch, .base_tombstone => try ids.put(self.alloc, entry.id, {}),
+                        else => {},
+                    };
+                }
+                break;
+            }
+        }
+        const owned = try self.alloc.alloc(u64, ids.count());
+        var index: usize = 0;
+        var it = ids.keyIterator();
+        while (it.next()) |id| : (index += 1) owned[index] = id.*;
+        std.mem.sort(u64, owned, {}, std.sort.asc(u64));
+        return owned;
+    }
+
+    const ExperimentalPersistedCentroid = struct {
+        covering_radius: f32,
+        measure: f32,
+        vector: []const f32,
+    };
+
+    /// Borrows the columnar centroid directory from the same immutable native
+    /// generation as `txn`. The retained generation becomes the directory's
+    /// backing lease, so checkpoint replacement cannot unmap an active query.
+    pub fn loadPersistedFlatCentroidDirectory(
+        self: *HBCIndex,
+        txn: anytype,
+        root_node: u64,
+        node_count: u64,
+        publish_generation: u64,
+    ) !?vectorindex_spfresh_index.FlatCentroidDirectory {
+        if (!vectorindex_spfresh_index.usesFlatCentroidDirectory(self) or
+            self.config.centroid_directory_mode == .flat_rabitq)
+        {
+            return null;
+        }
+        const generation = experimentalPostingGenerationFromTxn(txn) orelse return null;
+        const root = experimentalPostingRootState(generation) orelse return null;
+        const maybe_encoded = root.segments[0].getValue(0, .centroid_directory) catch return null;
+        const encoded = maybe_encoded orelse return null;
+        const reader = vectorindex_centroid_directory.Reader.init(encoded) catch return null;
+        if (reader.dims != self.config.dims or reader.metric != @intFromEnum(self.config.metric)) return null;
+
+        const shadowed_ids = try self.experimentalPostingBaseOverrideIdsAlloc(generation);
+        var shadowed_ids_owned = true;
+        errdefer if (shadowed_ids_owned) self.alloc.free(shadowed_ids);
+        if (shadowed_ids.len != 0) {
+            // Native deltas carry the current leaf centroids for every packed
+            // base they replace. Compose those columnar payloads newest-first
+            // and resolve packed nodes only for the live WAL tail or older
+            // segments written before centroid deltas existed.
+            var live_base_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer live_base_ids.deinit(self.alloc);
+            var current: ?*ExperimentalPostingReadGeneration = generation;
+            while (current) |item| : (current = item.parent) {
+                var values = item.values.keyIterator();
+                while (values.next()) |key| {
+                    if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                        try live_base_ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+                    }
+                }
+                if (item.root) |root_item| {
+                    var materialized = root_item.materialized.keyIterator();
+                    while (materialized.next()) |key| {
+                        if (@as(u8, @truncate(key.*)) == @intFromEnum(vectorindex_posting_wal.RecordKind.base)) {
+                            try live_base_ids.put(self.alloc, experimentalPostingValueKeyId(key.*), {});
+                        }
+                    }
+                    break;
+                }
+            }
+
+            var delta_centroids: std.AutoHashMapUnmanaged(u64, ExperimentalPersistedCentroid) = .empty;
+            defer delta_centroids.deinit(self.alloc);
+            var centroid_delta_covered_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer centroid_delta_covered_ids.deinit(self.alloc);
+            var newer_delta_ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer newer_delta_ids.deinit(self.alloc);
+            var segment_index = root.segments.len;
+            while (segment_index > 1) {
+                segment_index -= 1;
+                var valid_delta_directory = false;
+                if (try root.segments[segment_index].getValue(0, .centroid_directory)) |delta_encoded| {
+                    const delta_reader = vectorindex_centroid_directory.Reader.init(delta_encoded) catch null;
+                    if (delta_reader) |delta| {
+                        if (delta.dims == self.config.dims and delta.metric == @intFromEnum(self.config.metric)) {
+                            valid_delta_directory = true;
+                            var blocks = delta.blocks();
+                            while (try blocks.next()) |block| {
+                                for (block.posting_ids, block.covering_radii, block.measures, 0..) |posting_id, covering_radius, measure, index| {
+                                    if (newer_delta_ids.contains(posting_id)) continue;
+                                    try delta_centroids.put(self.alloc, posting_id, .{
+                                        .covering_radius = covering_radius,
+                                        .measure = measure,
+                                        .vector = block.vectors[index * delta.dims ..][0..delta.dims],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                var entries = root.segments[segment_index].entries();
+                while (try entries.next()) |entry| switch (entry.kind) {
+                    .base, .base_patch, .base_tombstone => {
+                        if (valid_delta_directory) try centroid_delta_covered_ids.put(self.alloc, entry.id, {});
+                        try newer_delta_ids.put(self.alloc, entry.id, {});
+                    },
+                    else => {},
+                };
+            }
+
+            var posting_ids = std.ArrayListUnmanaged(u64).empty;
+            defer posting_ids.deinit(self.alloc);
+            var covering_radii = std.ArrayListUnmanaged(f32).empty;
+            defer covering_radii.deinit(self.alloc);
+            var measures = std.ArrayListUnmanaged(f32).empty;
+            defer measures.deinit(self.alloc);
+            var vectors = std.ArrayListUnmanaged(f32).empty;
+            defer vectors.deinit(self.alloc);
+            const dims: usize = @intCast(self.config.dims);
+            const metric = self.config.metric;
+            const centroid_scratch = try self.alloc.alloc(f32, dims);
+            defer self.alloc.free(centroid_scratch);
+            for (shadowed_ids) |posting_id| {
+                if (!live_base_ids.contains(posting_id) and centroid_delta_covered_ids.contains(posting_id)) {
+                    const persisted = delta_centroids.get(posting_id) orelse continue;
+                    try posting_ids.append(self.alloc, posting_id);
+                    try covering_radii.append(self.alloc, persisted.covering_radius);
+                    try measures.append(self.alloc, persisted.measure);
+                    try vectors.appendSlice(self.alloc, persisted.vector);
+                    continue;
+                }
+                const packed_node = generation.value(posting_id, .base) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                } orelse continue;
+                const node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+                if (!node.header.is_leaf or node.ids_bytes.len == 0) continue;
+                if (node.centroid_bytes.len != dims * @sizeOf(f32)) return error.Corrupted;
+                @memcpy(std.mem.sliceAsBytes(centroid_scratch), node.centroid_bytes);
+                try posting_ids.append(self.alloc, posting_id);
+                try covering_radii.append(self.alloc, node.covering_radius);
+                try measures.append(self.alloc, switch (metric) {
+                    .l2_squared => vec.dot(centroid_scratch, centroid_scratch),
+                    .cosine => vec.norm(centroid_scratch),
+                    .inner_product => 0,
+                });
+                try vectors.appendSlice(self.alloc, centroid_scratch);
+            }
+            var owned_posting_ids = try posting_ids.toOwnedSlice(self.alloc);
+            errdefer self.alloc.free(owned_posting_ids);
+            var owned_covering_radii = try covering_radii.toOwnedSlice(self.alloc);
+            errdefer self.alloc.free(owned_covering_radii);
+            var owned_measures = try measures.toOwnedSlice(self.alloc);
+            errdefer self.alloc.free(owned_measures);
+            var owned_vectors = try vectors.toOwnedSlice(self.alloc);
+            errdefer self.alloc.free(owned_vectors);
+            const overlay = vectorindex_spfresh_index.OwnedExactCentroidOverlay{
+                .posting_ids = owned_posting_ids,
+                .covering_radii = owned_covering_radii,
+                .measures = owned_measures,
+                .vectors = owned_vectors,
+            };
+            owned_posting_ids = &.{};
+            owned_covering_radii = &.{};
+            owned_measures = &.{};
+            owned_vectors = &.{};
+            generation.retain();
+            shadowed_ids_owned = false;
+            return try vectorindex_spfresh_index.layeredExactFlatCentroidDirectoryFromReader(
+                self.alloc,
+                reader,
+                overlay,
+                shadowed_ids,
+                root_node,
+                node_count,
+                publish_generation,
+                .{
+                    .ptr = generation,
+                    .release_fn = ExperimentalPostingReadGeneration.releaseOpaque,
+                },
+            );
+        }
+        self.alloc.free(shadowed_ids);
+        shadowed_ids_owned = false;
+        generation.retain();
+        return try vectorindex_spfresh_index.exactFlatCentroidDirectoryFromReader(
+            self.alloc,
+            reader,
+            root_node,
+            node_count,
+            publish_generation,
+            .{
+                .ptr = generation,
+                .release_fn = ExperimentalPostingReadGeneration.releaseOpaque,
+            },
+        );
+    }
+
     fn experimentalPostingReadGenerationIsCurrent(
         self: *HBCIndex,
         generation: *ExperimentalPostingReadGeneration,
@@ -4766,6 +5205,8 @@ pub const HBCIndex = struct {
             self.alloc,
             root,
             source.covered_source_sequence.load(.acquire),
+            source.wal_generation.load(.acquire),
+            source.wal_committed_bytes.load(.acquire),
         );
         errdefer collapsed.release();
         try collapsed.values.ensureTotalCapacity(self.alloc, latest.count());
@@ -4842,6 +5283,9 @@ pub const HBCIndex = struct {
         touched_keys: []const u128,
         covered_source_sequence: u64,
     ) !void {
+        const posting_store = &self.experimental_posting_write_store.?;
+        const durable_wal_generation = posting_store.wal_generation;
+        const durable_wal_bytes = posting_store.wal_committed_bytes;
         const parent = self.retainCurrentExperimentalPostingReadGeneration() orelse return;
         defer parent.release();
         if (covered_source_sequence < parent.covered_source_sequence.load(.acquire)) {
@@ -4851,7 +5295,14 @@ pub const HBCIndex = struct {
             // Coverage does not change query contents, so advance it in place
             // instead of growing an empty generation chain for source windows
             // that do not touch this dense index.
-            parent.advanceCoveredSourceSequence(covered_source_sequence);
+            lockAtomic(&self.experimental_posting_read_generation_mu);
+            defer self.experimental_posting_read_generation_mu.unlock();
+            if (self.experimental_posting_read_generation != parent) return error.PostingWalConcurrentWriter;
+            parent.advanceDurableBoundary(
+                covered_source_sequence,
+                durable_wal_generation,
+                durable_wal_bytes,
+            );
             return;
         }
         for (touched_keys) |key| {
@@ -4883,7 +5334,11 @@ pub const HBCIndex = struct {
                         result.value_ptr.* = captured.*;
                         captured.* = null;
                     }
-                    current.advanceCoveredSourceSequence(covered_source_sequence);
+                    current.advanceDurableBoundary(
+                        covered_source_sequence,
+                        durable_wal_generation,
+                        durable_wal_bytes,
+                    );
                     return;
                 }
             }
@@ -4895,6 +5350,8 @@ pub const HBCIndex = struct {
             self.alloc,
             parent,
             covered_source_sequence,
+            durable_wal_generation,
+            durable_wal_bytes,
         );
         errdefer generation.release();
         try generation.values.ensureTotalCapacity(self.alloc, @intCast(touched_keys.len));
@@ -4915,7 +5372,8 @@ pub const HBCIndex = struct {
     }
 
     fn decodeExperimentalPostingMetadata(self: *const HBCIndex, encoded: []const u8) !IndexMetadata {
-        if (encoded.len != IndexMetadata.encoded_size) return error.CorruptedPostingMetadata;
+        if (encoded.len != IndexMetadata.encoded_size and encoded.len != IndexMetadata.legacy_encoded_size)
+            return error.CorruptedPostingMetadata;
         const metadata = IndexMetadata.decode(encoded);
         if (metadata.version != self.metadata.version or
             metadata.dims != self.metadata.dims or
@@ -4996,6 +5454,96 @@ pub const HBCIndex = struct {
         self.experimental_posting_captured_values.clearRetainingCapacity();
     }
 
+    fn clearExperimentalExactVectorMutations(self: *HBCIndex) void {
+        var values = self.experimental_exact_vector_mutations.valueIterator();
+        while (values.next()) |value| value.deinit(self.alloc);
+        self.experimental_exact_vector_mutations.clearRetainingCapacity();
+        self.experimental_exact_vector_capture_enabled = false;
+    }
+
+    fn capturedVectorMetadata(self: *HBCIndex, vector_id: u64) !?[]const u8 {
+        const key = experimentalPostingValueKey(vector_id, .vector_metadata);
+        if (self.experimental_posting_captured_values.get(key)) |captured| return captured;
+        const generation = self.experimental_posting_mutation_base_generation orelse return null;
+        return generation.value(vector_id, .vector_metadata) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
+    fn setCapturedExactVectorMutation(
+        self: *HBCIndex,
+        vector_id: u64,
+        kind: ExperimentalExactVectorMutation.Kind,
+        metadata: []const u8,
+        vector: []const f32,
+    ) !void {
+        const owned_metadata = try self.alloc.dupe(u8, metadata);
+        errdefer self.alloc.free(owned_metadata);
+        // Keep the owned representation mutable even for tombstones. Using an
+        // empty array literal here infers []const f32 and would make the
+        // mutation's ownership (and deinit contract) depend on its kind.
+        const owned_vector = try self.alloc.dupe(f32, vector);
+        errdefer self.alloc.free(owned_vector);
+        const result = try self.experimental_exact_vector_mutations.getOrPut(self.alloc, vector_id);
+        if (result.found_existing) result.value_ptr.deinit(self.alloc);
+        result.value_ptr.* = .{
+            .kind = kind,
+            .vector_id = vector_id,
+            .metadata = owned_metadata,
+            .vector = owned_vector,
+        };
+    }
+
+    fn captureExactVectorBatch(self: *HBCIndex, writes: []const BatchInsertItem, deletes: []const u64) !void {
+        if (!self.experimental_posting_capture_enabled or !self.experimental_exact_vector_capture_enabled) return;
+        for (deletes) |vector_id| {
+            if (self.experimental_exact_vector_mutations.get(vector_id)) |existing| {
+                try self.setCapturedExactVectorMutation(vector_id, .tombstone, existing.metadata, &.{});
+            } else if (try self.capturedVectorMetadata(vector_id)) |metadata| {
+                try self.setCapturedExactVectorMutation(vector_id, .tombstone, metadata, &.{});
+            }
+        }
+        // Replacement batches delete then reinsert the same vector id. The
+        // final upsert must win in the exact-vector WAL just as it does in HBC.
+        for (writes) |write| {
+            try self.setCapturedExactVectorMutation(write.vector_id, .upsert, write.metadata, write.vector);
+        }
+    }
+
+    fn captureExactVectorPreparedBulkBuild(self: *HBCIndex, inputs: []const PreparedBulkBuildInput) !void {
+        if (!self.experimental_posting_capture_enabled or !self.experimental_exact_vector_capture_enabled) return;
+        for (inputs) |input| {
+            try self.setCapturedExactVectorMutation(
+                input.vector_id,
+                .upsert,
+                input.metadata,
+                input.vector,
+            );
+        }
+    }
+
+    pub fn enableExperimentalExactVectorCapture(self: *HBCIndex, enabled: bool) void {
+        self.experimental_exact_vector_capture_enabled = enabled;
+        if (!enabled) self.clearExperimentalExactVectorMutations();
+    }
+
+    /// Transfers the source window's coalesced exact-vector changes to the
+    /// table-level WAL publisher before the posting capture is committed.
+    pub fn takeExperimentalExactVectorMutations(self: *HBCIndex) ![]ExperimentalExactVectorMutation {
+        const mutations = try self.alloc.alloc(ExperimentalExactVectorMutation, self.experimental_exact_vector_mutations.count());
+        var index: usize = 0;
+        var values = self.experimental_exact_vector_mutations.valueIterator();
+        while (values.next()) |value| : (index += 1) {
+            mutations[index] = value.*;
+            value.* = undefined;
+        }
+        self.experimental_exact_vector_mutations.clearRetainingCapacity();
+        self.experimental_exact_vector_capture_enabled = false;
+        std.mem.sort(ExperimentalExactVectorMutation, mutations, {}, ExperimentalExactVectorMutation.lessThan);
+        return mutations;
+    }
+
     fn clearExperimentalPostingMutationBase(self: *HBCIndex) void {
         if (self.experimental_posting_mutation_base_generation) |generation| {
             self.experimental_posting_mutation_base_generation = null;
@@ -5055,10 +5603,20 @@ pub const HBCIndex = struct {
     fn startExperimentalPostingCheckpointBuild(
         self: *HBCIndex,
         posting_store: *const posting_segment_store_mod.Store,
+        kind_override: ?ExperimentalPostingCheckpointKind,
     ) !bool {
         if (self.experimental_posting_checkpoint_build != null) return false;
         const checkpoint = posting_store.checkpoint orelse return false;
         const source_generation = self.retainCurrentExperimentalPostingReadGeneration() orelse return false;
+        const source_wal_generation = source_generation.wal_generation.load(.acquire);
+        const source_wal_bytes = source_generation.wal_committed_bytes.load(.acquire);
+        const source_sequence = source_generation.covered_source_sequence.load(.acquire);
+        if (source_wal_generation != posting_store.wal_generation or
+            source_wal_bytes > posting_store.wal_committed_bytes)
+        {
+            source_generation.release();
+            return error.PostingCheckpointSourceBoundaryMismatch;
+        }
         const build_alloc = ExperimentalPostingCheckpointBuild.allocator();
         const owned_root = build_alloc.dupe(u8, posting_store.root_dir) catch |err| {
             source_generation.release();
@@ -5082,11 +5640,11 @@ pub const HBCIndex = struct {
             .owner_alloc = self.alloc,
             .source_generation = source_generation,
             .metadata = self.metadata,
-            .kind = if (checkpoint.delta_segment_count < managedPostingMaxDeltaSegments) .delta else .full,
+            .kind = kind_override orelse if (checkpoint.delta_segment_count < managedPostingMaxDeltaSegments) .delta else .full,
             .segment_generation = segment_generation,
-            .covered_source_sequence = posting_store.covered_source_sequence,
-            .flattened_wal_bytes = posting_store.wal_committed_bytes,
-            .wal_generation = posting_store.wal_generation,
+            .covered_source_sequence = source_sequence,
+            .flattened_wal_bytes = source_wal_bytes,
+            .wal_generation = source_wal_generation,
             .staging_store = staging_store,
             .resource_manager = self.resource_manager,
         };
@@ -5166,7 +5724,25 @@ pub const HBCIndex = struct {
             result.encoded_patch_bytes,
         });
         self.discardExperimentalPostingDeltaBaseState();
-        self.refreshExperimentalPostingReadGenerationBestEffort(posting_store.covered_source_sequence);
+        if (self.experimental_posting_wal_authoritative.load(.acquire)) {
+            const published_sequence = posting_store.covered_source_sequence;
+            self.refreshExperimentalPostingReadGeneration(published_sequence) catch |err| {
+                // CURRENT is already durable. Continuing to encode mutations
+                // from the prior live root would make every later delta patch
+                // relative to the wrong immutable chain. Fence new reads and
+                // writes; source data remains authoritative and can rebuild
+                // this derived index without compounding the damage.
+                self.disableExperimentalPostingReads();
+                self.closeExperimentalPostingWalWriter();
+                std.log.err("dense posting authoritative checkpoint could not install its durable generation sequence={} err={s}", .{
+                    published_sequence,
+                    @errorName(err),
+                });
+                return err;
+            };
+        } else {
+            self.refreshExperimentalPostingReadGenerationBestEffort(posting_store.covered_source_sequence);
+        }
         self.experimental_posting_overlay_collapsed_wal_bytes = posting_store.wal_committed_bytes;
         return true;
     }
@@ -5212,7 +5788,7 @@ pub const HBCIndex = struct {
                 posting_store.deltaSegmentCount(),
             ))
         {
-            if (!try self.startExperimentalPostingCheckpointBuild(posting_store)) {
+            if (!try self.startExperimentalPostingCheckpointBuild(posting_store, null)) {
                 // A live immutable generation is normally available. Retain
                 // the synchronous LSM fallback for fail-closed recovery paths.
                 _ = try self.publishExperimentalPostingCheckpoint(posting_store.covered_source_sequence);
@@ -5253,11 +5829,122 @@ pub const HBCIndex = struct {
                 posting_store.deltaSegmentCount(),
             ))
         {
-            _ = try self.startExperimentalPostingCheckpointBuild(posting_store);
+            _ = try self.startExperimentalPostingCheckpointBuild(posting_store, null);
         }
         const generation_after = posting_store.latestSegmentGeneration() orelse 0;
         return generation_after != generation_before or
             (!build_before and self.experimental_posting_checkpoint_build != null);
+    }
+
+    /// At a caller-proven stable publication boundary, flatten every committed
+    /// WAL tail or delta into one full immutable generation. Even a small tail
+    /// can shadow centroids for thousands of exact routing scores, and its next
+    /// background checkpoint can collide with the first query wave. A final delta leaves
+    /// every shadowed leaf in the exact centroid overlay after restart; at 1M
+    /// scale that can add thousands of exact routing scores per query. The
+    /// readiness owner pairs this with
+    /// `finishExperimentalPostingCheckpointForReadiness` before advertising
+    /// the generation, so the compactor cannot become the first query's work.
+    pub fn requestExperimentalPostingFullCheckpointForReadiness(self: *HBCIndex) !bool {
+        if (!self.experimental_posting_sidecar_managed or
+            !self.experimental_posting_wal_authoritative.load(.acquire) or
+            self.write_session_depth != 0 or
+            self.experimental_posting_capture_enabled)
+        {
+            return false;
+        }
+        if (self.experimental_posting_write_store == null) {
+            self.experimental_posting_write_store = try self.openExperimentalPostingStore();
+        }
+        const posting_store = &self.experimental_posting_write_store.?;
+        _ = try self.publishCompletedExperimentalPostingCheckpointBuild(posting_store);
+        if (self.experimental_posting_checkpoint_build != null) return true;
+        if (!shouldStartExperimentalPostingReadinessCheckpoint(
+            posting_store.wal_committed_bytes,
+            posting_store.deltaSegmentCount(),
+        )) return false;
+        return try self.startExperimentalPostingCheckpointBuild(posting_store, .full);
+    }
+
+    /// Completes the stable-tip checkpoint requested above and atomically
+    /// installs it for new query leases. Forced progress is scoped to this
+    /// lifecycle fence; ordinary background checkpoints remain preemptible by
+    /// foreground queries.
+    pub fn finishExperimentalPostingCheckpointForReadiness(self: *HBCIndex) !bool {
+        const build = self.experimental_posting_checkpoint_build orelse return false;
+        build.force_progress.store(true, .release);
+        if (build.thread) |thread| {
+            thread.join();
+            build.thread = null;
+        }
+        if (self.experimental_posting_write_store == null) {
+            self.experimental_posting_write_store = try self.openExperimentalPostingStore();
+        }
+        return try self.publishCompletedExperimentalPostingCheckpointBuild(
+            &self.experimental_posting_write_store.?,
+        );
+    }
+
+    pub const ExperimentalPostingStableGenerationOptions = struct {
+        flatten: bool = true,
+        make_authoritative: bool = false,
+    };
+
+    /// Certifies a complete native posting generation at a caller-proven
+    /// stable source boundary. Rebuild/bootstrap paths may not have opened a
+    /// posting capture, so ordinary applied-sequence persistence is allowed to
+    /// leave no native checkpoint at all. Readiness must close that gap before
+    /// a replacement generation can be advertised.
+    ///
+    /// The authority marker is published only after a complete checkpoint is
+    /// recoverable. Once present, startup can select the mmap generation
+    /// without consulting the compatibility LSM; the in-process legacy handle
+    /// is then released best-effort because failure to reclaim it is a
+    /// performance concern, not a durability ambiguity.
+    pub fn finalizeExperimentalPostingGenerationAtAppliedSequence(
+        self: *HBCIndex,
+        applied_sequence: u64,
+        options: ExperimentalPostingStableGenerationOptions,
+    ) !void {
+        if (self.write_session_depth != 0) return error.ActiveWriteSession;
+        if (self.experimental_posting_capture_enabled) return error.ExperimentalPostingCaptureAlreadyActive;
+
+        if (self.experimentalPostingDurableAppliedSequence()) |covered| {
+            if (covered != applied_sequence) return error.PostingCheckpointSequenceMismatch;
+        } else {
+            // This is an explicit lifecycle boundary, unlike the optional
+            // sidecar rollout path. It is therefore safe to bootstrap directly
+            // from the complete compatibility projection even when no source
+            // capture was needed while constructing the candidate.
+            self.experimental_posting_sidecar_managed = true;
+            _ = try self.publishExperimentalPostingCheckpoint(applied_sequence);
+        }
+
+        if (options.flatten) {
+            _ = try self.requestExperimentalPostingFullCheckpointForReadiness();
+            _ = try self.finishExperimentalPostingCheckpointForReadiness();
+        }
+        if (self.experimentalPostingDurableAppliedSequence() != applied_sequence) {
+            return error.PostingCheckpointSequenceMismatch;
+        }
+        if (!self.experimentalPostingReadsEnabled()) return error.PostingWalMutationStoreUnavailable;
+
+        if (options.make_authoritative) {
+            if (!self.hasExternalVectorLoader()) return error.ExternalVectorLoaderRequired;
+            if (self.experimental_posting_write_store == null) {
+                self.experimental_posting_write_store = try self.openExperimentalPostingStore();
+            }
+            // CURRENT and its empty/current WAL are durable before this
+            // irreversible marker. A crash on either side therefore selects
+            // one complete authority, never a half-published native tree.
+            try self.experimental_posting_write_store.?.markAuthoritative();
+            self.experimental_posting_wal_authoritative_persisted = true;
+            self.experimental_posting_wal_authoritative.store(true, .release);
+            // Retry reclamation if an earlier best-effort detach was blocked.
+            // The authority marker and immutable generation make either owner
+            // safe until the compatibility handle can be released.
+            self.detachLegacyLsmAfterNativeActivationBestEffort();
+        }
     }
 
     pub fn closeExperimentalPostingWalWriter(self: *HBCIndex) void {
@@ -5321,6 +6008,7 @@ pub const HBCIndex = struct {
         self.experimental_posting_capture_enabled = false;
         self.clearExperimentalPostingMutationBase();
         self.clearExperimentalPostingCapturedValues();
+        self.clearExperimentalExactVectorMutations();
         self.disableExperimentalPostingReads();
         self.clearExperimentalPostingReadGeneration();
         self.discardExperimentalPostingDeltaBaseState();
@@ -5346,6 +6034,7 @@ pub const HBCIndex = struct {
             self.experimental_posting_capture_enabled = false;
             self.clearExperimentalPostingMutationBase();
             self.clearExperimentalPostingCapturedValues();
+            self.clearExperimentalExactVectorMutations();
             _ = try self.publishExperimentalPostingCheckpoint(applied_sequence);
             return;
         }
@@ -5403,6 +6092,9 @@ pub const HBCIndex = struct {
         // windows. The captured values are owned copies and publication still
         // waits until the outer write session is durably finished.
         self.clearExperimentalPostingCapturedValues();
+        const capture_exact_vectors = self.experimental_exact_vector_capture_enabled;
+        self.clearExperimentalExactVectorMutations();
+        self.experimental_exact_vector_capture_enabled = capture_exact_vectors;
         self.clearExperimentalPostingMutationBase();
         const wal_authoritative = self.experimental_posting_wal_authoritative.load(.acquire);
         if (self.experimental_posting_wal_mutations_enabled or wal_authoritative) {
@@ -5419,6 +6111,17 @@ pub const HBCIndex = struct {
         }
         self.experimental_posting_sidecar_managed = true;
         self.experimental_posting_capture_enabled = true;
+    }
+
+    /// Reports whether the active source transaction changed any HBC-owned
+    /// state. A completely empty capture is a source-only coverage advance:
+    /// table-level exact-vector projections may carry their immutable bytes
+    /// forward to that sequence. Any captured mutation is treated
+    /// conservatively as vector-relevant until the native vector WAL records
+    /// the corresponding artifact mutations itself.
+    pub fn experimentalPostingCaptureHasMutations(self: *const HBCIndex) bool {
+        return self.experimental_posting_capture_enabled and
+            self.experimental_posting_captured_values.count() != 0;
     }
 
     pub fn experimentalPostingMutationCaptureActive(self: *const HBCIndex) bool {
@@ -5455,6 +6158,7 @@ pub const HBCIndex = struct {
         }
         self.clearExperimentalPostingMutationBase();
         self.clearExperimentalPostingCapturedValues();
+        self.clearExperimentalExactVectorMutations();
         if (mutation_base_restored and
             self.experimental_posting_sidecar_managed and
             self.experimentalPostingReadGenerationLoaded())
@@ -5542,6 +6246,7 @@ pub const HBCIndex = struct {
         self.experimental_posting_capture_enabled = false;
         defer self.clearExperimentalPostingMutationBase();
         defer self.clearExperimentalPostingCapturedValues();
+        defer self.clearExperimentalExactVectorMutations();
         // The source/HBC transaction has already committed locally, but its
         // applied watermark has not. Optional dual-write mode may invalidate
         // and serve the complete LSM state. WAL-authoritative mode has no such
@@ -5777,6 +6482,28 @@ pub const HBCIndex = struct {
         var metadata_buf: [IndexMetadata.encoded_size]u8 = undefined;
         try writer.appendValueAt(0, .index_metadata, covered_source_sequence, metadata.encode(&metadata_buf));
 
+        const metric: vec.DistanceMetric = switch (metadata.metric) {
+            @intFromEnum(vec.DistanceMetric.l2_squared) => .l2_squared,
+            @intFromEnum(vec.DistanceMetric.inner_product) => .inner_product,
+            @intFromEnum(vec.DistanceMetric.cosine) => .cosine,
+            else => return error.DistanceMetricMismatch,
+        };
+        var centroid_directory = try vectorindex_centroid_directory.Writer.init(
+            alloc,
+            metadata.dims,
+            metadata.metric,
+            1024,
+        );
+        defer centroid_directory.deinit();
+        var quantized_directory = try vectorindex_quantized_directory.Writer.init(
+            alloc,
+            metadata.dims,
+            metadata.metric,
+        );
+        defer quantized_directory.deinit();
+        const centroid_scratch = try alloc.alloc(f32, metadata.dims);
+        defer alloc.free(centroid_scratch);
+
         var posting_count: u64 = 0;
         var node_id: u64 = 1;
         while (node_id <= metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
@@ -5786,6 +6513,17 @@ pub const HBCIndex = struct {
             const packed_node = (try experimentalPostingCheckpointValue(&latest, root, node_id, .base)) orelse continue;
             try writer.appendValueBorrowedAt(node_id, .base, covered_source_sequence, packed_node);
             posting_count += 1;
+            const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+            if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len > 0) {
+                if (decoded_node.centroid_bytes.len != centroid_scratch.len * @sizeOf(f32)) return error.Corrupted;
+                @memcpy(std.mem.sliceAsBytes(centroid_scratch), decoded_node.centroid_bytes);
+                const measure: f32 = switch (metric) {
+                    .l2_squared => vec.dot(centroid_scratch, centroid_scratch),
+                    .cosine => vec.norm(centroid_scratch),
+                    .inner_product => 0,
+                };
+                try centroid_directory.append(node_id, decoded_node.covering_radius, centroid_scratch, measure);
+            }
             if (try experimentalPostingCheckpointValue(&latest, root, node_id, .node_range)) |range| {
                 try writer.appendValueBorrowedAt(node_id, .node_range, covered_source_sequence, range);
             }
@@ -5793,9 +6531,28 @@ pub const HBCIndex = struct {
                 try writer.appendValueBorrowedAt(node_id, .posting_state, covered_source_sequence, posting_state);
             }
             if (try experimentalPostingCheckpointValue(&latest, root, node_id, .quantized_checkpoint)) |quantized| {
-                try writer.appendValueBorrowedAt(node_id, .quantized_checkpoint, covered_source_sequence, quantized);
+                if (node_id == metadata.root_node) {
+                    try writer.appendValueBorrowedAt(node_id, .quantized_checkpoint, covered_source_sequence, quantized);
+                } else {
+                    var decoded_quantized = proto.RaBitQuantizedVectorSet.decode(alloc, quantized) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.Corrupted,
+                    };
+                    defer decoded_quantized.deinit(alloc);
+                    try quantized_directory.append(node_id, &decoded_quantized);
+                }
+            } else if (node_id != metadata.root_node) {
+                if (try generation.quantizedViewIfUnmodified(node_id)) |view| {
+                    const borrowed_quantized = view.asProto();
+                    try quantized_directory.append(node_id, &borrowed_quantized);
+                }
             }
         }
+
+        const encoded_centroid_directory = try centroid_directory.build();
+        try writer.appendValueOwnedAt(0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
+        const encoded_quantized_directory = try quantized_directory.build();
+        try writer.appendValueOwnedAt(0, .quantized_directory, covered_source_sequence, encoded_quantized_directory);
 
         var vector_overrides = std.ArrayListUnmanaged(ExperimentalVectorOverride).empty;
         defer vector_overrides.deinit(alloc);
@@ -5892,7 +6649,10 @@ pub const HBCIndex = struct {
     fn buildExperimentalPostingDeltaFromGeneration(
         alloc: Allocator,
         generation: *ExperimentalPostingReadGeneration,
+        metadata: ?IndexMetadata,
         covered_source_sequence: u64,
+        foreground_manager: ?*resource_manager_mod.ResourceManager,
+        force_progress: ?*const std.atomic.Value(bool),
     ) !ExperimentalPostingCheckpointBuildResult {
         var latest: ExperimentalPostingLatestValues = .empty;
         defer latest.deinit(alloc);
@@ -5905,11 +6665,47 @@ pub const HBCIndex = struct {
         var patch_count: u64 = 0;
         var patched_value_bytes: u64 = 0;
         var encoded_patch_bytes: u64 = 0;
+        var centroid_directory = if (metadata) |value|
+            try vectorindex_centroid_directory.Writer.init(
+                alloc,
+                value.dims,
+                value.metric,
+                1024,
+            )
+        else
+            null;
+        defer if (centroid_directory) |*directory| directory.deinit();
+        const centroid_scratch = try alloc.alloc(f32, if (metadata) |value| value.dims else 0);
+        defer alloc.free(centroid_scratch);
+        const centroid_metric: ?vec.DistanceMetric = if (metadata) |value| switch (value.metric) {
+            @intFromEnum(vec.DistanceMetric.l2_squared) => .l2_squared,
+            @intFromEnum(vec.DistanceMetric.inner_product) => .inner_product,
+            @intFromEnum(vec.DistanceMetric.cosine) => .cosine,
+            else => return error.DistanceMetricMismatch,
+        } else null;
         var it = latest.iterator();
+        var visited: usize = 0;
         while (it.next()) |entry| {
+            visited += 1;
+            if (visited % 256 == 0) {
+                yieldExperimentalCheckpointForForeground(foreground_manager, force_progress);
+            }
             const id = experimentalPostingValueKeyId(entry.key_ptr.*);
             const record_kind = try experimentalPostingValueKeyKind(entry.key_ptr.*);
             if (entry.value_ptr.*) |value_bytes| {
+                if (record_kind == .base) if (centroid_directory) |*directory| {
+                    const node = try vectorindex_hbc.decodePackedNodeValue(value_bytes);
+                    if (node.header.is_leaf and node.ids_bytes.len > 0) {
+                        if (node.centroid_bytes.len != centroid_scratch.len * @sizeOf(f32)) return error.Corrupted;
+                        @memcpy(std.mem.sliceAsBytes(centroid_scratch), node.centroid_bytes);
+                        const measure: f32 = switch (centroid_metric.?) {
+                            .l2_squared => vec.dot(centroid_scratch, centroid_scratch),
+                            .cosine => vec.norm(centroid_scratch),
+                            .inner_product => 0,
+                        };
+                        try directory.append(id, node.covering_radius, centroid_scratch, measure);
+                    }
+                };
                 var emitted_patch = false;
                 if (experimentalPostingSegmentPatchKind(record_kind)) |patch_kind| {
                     var base_value = root.resolveSegmentValueAlloc(
@@ -5954,6 +6750,10 @@ pub const HBCIndex = struct {
                 try writer.appendValueBorrowedAt(id, tombstone_kind, covered_source_sequence, &.{});
             }
         }
+        if (centroid_directory) |*directory| {
+            const encoded = try directory.build();
+            try writer.appendValueOwnedAt(0, .centroid_directory, covered_source_sequence, encoded);
+        }
         return .{
             .segment_bytes = try writer.build(),
             .posting_count = posting_count,
@@ -5981,6 +6781,16 @@ pub const HBCIndex = struct {
         self.closeExperimentalPostingWalWriter();
         var posting_store = try self.openExperimentalPostingStore();
         defer posting_store.deinit();
+        if (source_generation) |read_generation| {
+            if (read_generation.covered_source_sequence.load(.acquire) != covered_source_sequence or
+                read_generation.wal_generation.load(.acquire) != posting_store.wal_generation or
+                read_generation.wal_committed_bytes.load(.acquire) != posting_store.wal_committed_bytes)
+            {
+                return error.PostingCheckpointSourceBoundaryMismatch;
+            }
+        } else if (posting_store.wal_committed_bytes != 0) {
+            return error.PostingCheckpointSourceBoundaryMismatch;
+        }
 
         const generation = if (posting_store.checkpoint) |checkpoint|
             std.math.add(u64, checkpoint.latestSegmentGeneration(), 1) catch return error.PostingSegmentGenerationOverflow
@@ -6022,6 +6832,15 @@ pub const HBCIndex = struct {
                 error.NotFound => {},
                 else => return err,
             }
+            var centroid_directory = try vectorindex_centroid_directory.Writer.init(
+                self.alloc,
+                self.metadata.dims,
+                self.metadata.metric,
+                1024,
+            );
+            defer centroid_directory.deinit();
+            const centroid_scratch = try self.alloc.alloc(f32, self.metadata.dims);
+            defer self.alloc.free(centroid_scratch);
             var node_id: u64 = 1;
             while (node_id <= self.metadata.node_count) : (node_id = std.math.add(u64, node_id, 1) catch break) {
                 var node_key_buf: [12]u8 = undefined;
@@ -6031,6 +6850,17 @@ pub const HBCIndex = struct {
                 };
                 try writer.appendBaseAt(node_id, covered_source_sequence, packed_node);
                 posting_count += 1;
+                const decoded_node = try vectorindex_hbc.decodePackedNodeValue(packed_node);
+                if (decoded_node.header.is_leaf and decoded_node.ids_bytes.len > 0) {
+                    if (decoded_node.centroid_bytes.len != centroid_scratch.len * @sizeOf(f32)) return error.Corrupted;
+                    @memcpy(std.mem.sliceAsBytes(centroid_scratch), decoded_node.centroid_bytes);
+                    const measure: f32 = switch (self.config.metric) {
+                        .l2_squared => vec.dot(centroid_scratch, centroid_scratch),
+                        .cosine => vec.norm(centroid_scratch),
+                        .inner_product => 0,
+                    };
+                    try centroid_directory.append(node_id, decoded_node.covering_radius, centroid_scratch, measure);
+                }
 
                 var range_key_buf: [12]u8 = undefined;
                 if (txn.get(.nodes, encodeNodeKey(&range_key_buf, node_id, .range))) |range| {
@@ -6056,6 +6886,9 @@ pub const HBCIndex = struct {
                     else => return err,
                 }
             }
+
+            const encoded_centroid_directory = try centroid_directory.build();
+            try writer.appendValueOwnedAt(0, .centroid_directory, covered_source_sequence, encoded_centroid_directory);
 
             // Vector-to-leaf assignments and external-vector metadata share
             // one compact ordered block. The first checkpoint (or a legacy
@@ -6088,7 +6921,11 @@ pub const HBCIndex = struct {
         });
         // Collapse the live overlay chain at the same point the durable WAL is
         // checkpointed. Failure leaves the equivalent old generation active.
-        self.refreshExperimentalPostingReadGenerationBestEffort(covered_source_sequence);
+        if (self.experimental_posting_wal_authoritative.load(.acquire)) {
+            try self.refreshExperimentalPostingReadGeneration(covered_source_sequence);
+        } else {
+            self.refreshExperimentalPostingReadGenerationBestEffort(covered_source_sequence);
+        }
         self.experimental_posting_overlay_collapsed_wal_bytes = posting_store.wal_committed_bytes;
         return .{
             .generation = generation,
@@ -6285,18 +7122,27 @@ pub const HBCIndex = struct {
             try vectorindex_hbc_vector_directory.Reader.init(bytes)
         else
             null;
+        var quantized_directory = if (try segments[0].getNestedContainer(0, .quantized_directory)) |bytes|
+            try vectorindex_quantized_directory.VerifiedReader.init(self.alloc, bytes)
+        else
+            null;
+        var quantized_directory_owned = quantized_directory != null;
+        errdefer if (quantized_directory_owned) if (quantized_directory) |*directory| directory.deinit();
         const state = try self.alloc.create(ExperimentalPostingReadState);
         errdefer self.alloc.destroy(state);
         state.* = .{
             .alloc = self.alloc,
             .covered_source_sequence = opened.store.covered_source_sequence,
+            .wal_generation = opened.store.wal_generation,
             .retained_segments = opened.segments,
             .segments = segments,
             .vector_directory = vector_directory,
+            .quantized_directory = quantized_directory,
             .wal_committed_bytes = @intCast(wal.replay.committed_bytes),
         };
         retained_segments_owned = false;
         segments_owned = false;
+        quantized_directory_owned = false;
         var state_initialized = true;
         errdefer if (state_initialized) state.deinit();
         try state.materializeWal(&wal);
@@ -6358,7 +7204,36 @@ pub const HBCIndex = struct {
         generation_owned = false;
         self.experimental_posting_sidecar_managed = true;
         self.experimental_posting_overlay_collapsed_wal_bytes = state.wal_committed_bytes;
+        self.cleanupLegacyLsmArtifactsAfterNativeReopenBestEffort();
         self.detachLegacyLsmAfterNativeActivationBestEffort();
+    }
+
+    /// Native authority is crash-sticky, but the process that publishes it can
+    /// still have pre-publication query leases on compatibility LSM runs. Do
+    /// not unlink those files in that process. On a later native-first reopen
+    /// no LSM handle was created, the posting generation has been fully
+    /// validated above, and the duplicate files can be reclaimed safely.
+    fn cleanupLegacyLsmArtifactsAfterNativeReopenBestEffort(self: *HBCIndex) void {
+        if (self.env_owner != .native) return;
+        const native = self.env_owner.native;
+        const directories = [_][]const u8{ "runs", "wal" };
+        for (directories) |name| {
+            const path = std.fs.path.join(self.alloc, &.{ native.root_dir, name }) catch return;
+            defer self.alloc.free(path);
+            native.storage.deleteTree(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => std.log.warn("HBC native legacy LSM directory cleanup deferred path={s} err={s}", .{ name, @errorName(err) }),
+            };
+        }
+        const files = [_][]const u8{ "manifest.bin", "writer.lock", "wal.lock" };
+        for (files) |name| {
+            const path = std.fs.path.join(self.alloc, &.{ native.root_dir, name }) catch return;
+            defer self.alloc.free(path);
+            native.storage.deleteFileAbsolute(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => std.log.warn("HBC native legacy LSM file cleanup deferred path={s} err={s}", .{ name, @errorName(err) }),
+            };
+        }
     }
 
     fn detachLegacyLsmAfterNativeActivationBestEffort(self: *HBCIndex) void {
@@ -7466,7 +8341,15 @@ pub const HBCIndex = struct {
         self.refreshHbcCacheUsage();
     }
 
-    fn clearVectorCache(self: *HBCIndex) void {
+    pub fn clearVectorCache(self: *HBCIndex) void {
+        // Fence fills which began before the clear. Without an epoch change a
+        // concurrent primary read can repopulate the just-retired generation.
+        _ = self.vector_cache_epoch.fetchAdd(1, .acq_rel);
+        // Scalar and residency-lease fills use the finer-grained stripe epoch
+        // rather than vector_cache_epoch. Advance every stripe by an even
+        // generation so existing fills fail their guarded publication check
+        // while newly-started fills still observe an admissible even epoch.
+        for (&self.vector_cache_fill_epochs) |*epoch| _ = epoch.fetchAdd(2, .acq_rel);
         if (self.shared_cache) |cache| {
             cache.clearVectorNamespace(self.cache_namespace);
             return;
@@ -8252,7 +9135,7 @@ pub const HBCIndex = struct {
 
     pub fn publishDeferredNodeKeysForBatchFinishTxn(self: *HBCIndex, txn: anytype, options: BatchInsertOptions) !void {
         if (!options.bulk_ingest) return;
-        if (self.crossBatchPublicationActive() and self.config.centroid_directory_mode == .flat_rabitq) return;
+        if (self.crossBatchPublicationActive() and vectorindex_spfresh_index.usesFlatCentroidDirectory(self)) return;
         if (self.shouldDeferLeafSplitToBulkFinish(options)) return;
         if (self.shouldDeferQuantizedRebuildToBulkFinish(options)) return;
         try self.publishDeferredNodeKeysForBulkFinishTxn(txn);
@@ -9238,6 +10121,7 @@ pub const HBCIndex = struct {
                 .artifact_keys = key_views_storage,
                 .raw_values = values_storage,
                 .vector_views = vector_view_storage,
+                .source_sequence = experimentalPostingSourceSequenceFromTxn(txn),
             },
             profile,
         ) catch |err| switch (err) {
@@ -9304,6 +10188,7 @@ pub const HBCIndex = struct {
                 .artifact_keys = key_views_storage,
                 .raw_values = values_storage,
                 .vector_views = vector_view_storage,
+                .source_sequence = experimentalPostingSourceSequenceFromTxn(txn),
             },
             null,
         ) catch |err| switch (err) {
@@ -9646,6 +10531,42 @@ pub const HBCIndex = struct {
         try vectorindex_hbc_index.putQuantizedCached(self, txn, node_id, qs, nowNs, elapsedSince);
     }
 
+    /// Borrows an aligned RaBitQ view from the immutable native base. The
+    /// surrounding read transaction pins the complete generation, and the
+    /// generation resolver declines this path whenever a WAL/delta value
+    /// shadows the posting. Mutation transactions therefore keep using the
+    /// independently owned protobuf path below.
+    pub fn loadNativeQuantizedView(
+        self: *HBCIndex,
+        txn: anytype,
+        node_id: u64,
+        is_root: bool,
+        expected_count: usize,
+    ) !?QuantizedSet {
+        if (is_root) return null;
+        const immutable_generation = experimentalPostingGenerationFromTxn(txn);
+        const generation = immutable_generation orelse self.experimental_posting_mutation_base_generation orelse return null;
+        // A native write transaction resolves staged values through the
+        // capture map first. Do not borrow the older directory row for a
+        // posting already replaced or deleted in this mutation window. Search
+        // leases intentionally retain their pre-commit generation instead.
+        if (immutable_generation == null and
+            self.experimental_posting_captured_values.contains(experimentalPostingValueKey(node_id, .quantized_checkpoint)))
+        {
+            return null;
+        }
+        const view = (try generation.quantizedViewIfUnmodified(node_id)) orelse return null;
+        const dims: usize = @intCast(self.config.dims);
+        if (view.metric != @intFromEnum(self.config.metric) or
+            view.centroid.len != dims or
+            view.count != expected_count or
+            view.width != rabitq.codeWidth(dims))
+        {
+            return error.Corrupted;
+        }
+        return .{ .rabit = view.asProto() };
+    }
+
     pub fn loadQuantized(self: *HBCIndex, txn: anytype, node_id: u64, is_root: bool, expected_count: usize) !QuantizedSet {
         return try vectorindex_hbc_index.loadQuantized(self, txn, node_id, is_root, expected_count, isNotFound);
     }
@@ -9784,15 +10705,20 @@ pub const HBCIndex = struct {
     }
 
     pub fn insertWithMetadata(self: *HBCIndex, vector_id: u64, vector_data: []const f32, metadata_value: []const u8) !void {
+        try self.captureExactVectorBatch(&.{.{
+            .vector_id = vector_id,
+            .vector = vector_data,
+            .metadata = metadata_value,
+        }}, &.{});
         try vectorindex_hbc_index.insertWithMetadata(self, vector_id, vector_data, metadata_value, nowNs, elapsedSince);
     }
 
     pub fn batchInsertWithMetadata(self: *HBCIndex, items: []const BatchInsertItem) !void {
-        try vectorindex_hbc_index.batchInsertWithMetadata(self, items, nowNs, elapsedSince);
+        try self.batchInsertWithMetadataOptions(items, .{});
     }
 
     pub fn batchApply(self: *HBCIndex, writes: []const BatchInsertItem, deletes: []const u64) !void {
-        try vectorindex_hbc_index.batchApply(self, writes, deletes, nowNs, elapsedSince);
+        try self.batchApplyOptions(writes, deletes, .{});
     }
 
     pub fn batchApplyOptions(
@@ -9801,6 +10727,7 @@ pub const HBCIndex = struct {
         deletes: []const u64,
         options: BatchInsertOptions,
     ) !void {
+        try self.captureExactVectorBatch(writes, deletes);
         self.admitBatchVectorsToBulkSplitWorkspace(writes, options.assume_absent_ids);
         if (writes.len == 0 or options.batch_vectors != null) {
             try vectorindex_hbc_index.batchApplyOptions(self, writes, deletes, options, nowNs, elapsedSince);
@@ -9812,6 +10739,7 @@ pub const HBCIndex = struct {
     }
 
     pub fn batchInsertWithMetadataOptions(self: *HBCIndex, items: []const BatchInsertItem, options: BatchInsertOptions) !void {
+        try self.captureExactVectorBatch(items, &.{});
         self.admitBatchVectorsToBulkSplitWorkspace(items, options.assume_absent_ids);
         if (items.len == 0 or options.batch_vectors != null) {
             try vectorindex_hbc_index.batchInsertWithMetadataOptions(self, items, options, nowNs, elapsedSince);
@@ -9827,18 +10755,22 @@ pub const HBCIndex = struct {
     }
 
     pub fn bulkBuildWithMetadata(self: *HBCIndex, items: []const BatchInsertItem) !void {
+        try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadata(self, items, nowNs, elapsedSince);
     }
 
     pub fn bulkBuildWithMetadataOptions(self: *HBCIndex, items: []const BatchInsertItem, options: BulkBuildOptions) !void {
+        try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadataOptions(self, items, options, nowNs, elapsedSince);
     }
 
     pub fn bulkBuildWithMetadataTxn(self: *HBCIndex, txn: anytype, items: []const BatchInsertItem) !void {
+        try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadataTxn(self, txn, items);
     }
 
     pub fn bulkBuildPreparedInputsTxn(self: *HBCIndex, txn: anytype, inputs: []const PreparedBulkBuildInput) !void {
+        try self.captureExactVectorPreparedBulkBuild(inputs);
         try vectorindex_hbc_index.bulkBuildPreparedInputsTxn(self, txn, inputs);
     }
 
@@ -9848,6 +10780,7 @@ pub const HBCIndex = struct {
         inputs: []const PreparedBulkBuildInput,
         options: BulkBuildOptions,
     ) !void {
+        try self.captureExactVectorPreparedBulkBuild(inputs);
         try vectorindex_hbc_index.bulkBuildPreparedInputsTxnOptions(self, txn, inputs, options, nowNs, elapsedSince);
     }
 
@@ -9857,6 +10790,7 @@ pub const HBCIndex = struct {
         items: []const BatchInsertItem,
         options: BulkBuildOptions,
     ) !void {
+        try self.captureExactVectorBatch(items, &.{});
         try vectorindex_hbc_index.bulkBuildWithMetadataTxnOptions(self, txn, items, options, nowNs, elapsedSince);
     }
 
@@ -10505,6 +11439,7 @@ pub const HBCIndex = struct {
 
     /// Delete a vector from the index by ID.
     pub fn delete(self: *HBCIndex, vector_id: u64) !void {
+        try self.captureExactVectorBatch(&.{}, &.{vector_id});
         try vectorindex_hbc_index.delete(self, vector_id);
     }
 
@@ -10581,6 +11516,197 @@ pub const HBCIndex = struct {
 
     pub fn debugDumpNodes(self: *HBCIndex, alloc: Allocator) ![]HBCDebugNode {
         return try vectorindex_hbc_debug.debugDumpNodes(self, alloc);
+    }
+
+    pub fn topologyRebuildWorkspaceBytes(self: *const HBCIndex, algorithm: TopologyRebuildAlgorithm) ?u64 {
+        const active_count: usize = std.math.cast(usize, self.metadata.active_count) orelse return null;
+        const dims: usize = @intCast(self.config.dims);
+        const matrix_floats = std.math.mul(usize, active_count, dims) catch return null;
+        const matrix_bytes = std.math.mul(usize, matrix_floats, @sizeOf(f32)) catch return null;
+        const per_vector_scalar_bytes = @sizeOf(u64) +
+            @sizeOf(?[]const u8) +
+            @sizeOf(PreparedBulkBuildInput) +
+            @sizeOf(usize) * 3 +
+            @sizeOf(f32) +
+            @sizeOf(u8);
+        const scalar_bytes = std.math.mul(usize, active_count, per_vector_scalar_bytes) catch return null;
+        var total = std.math.add(usize, matrix_bytes, scalar_bytes) catch return null;
+        if (algorithm == .global_kmeans) {
+            // K-means points reference the transformed matrix directly. Cover
+            // assignments, entries, output descriptors, and two centroid
+            // matrices without charging a second full vector matrix.
+            const kmeans_per_vector = @sizeOf(usize) * 3 + @sizeOf(f32) * 2 + 96;
+            total = std.math.add(
+                usize,
+                total,
+                std.math.mul(usize, active_count, kmeans_per_vector) catch return null,
+            ) catch return null;
+            const cluster_count = std.math.divCeil(usize, active_count, @max(@as(usize, 1), self.config.leaf_size)) catch return null;
+            const centroid_floats = std.math.mul(usize, cluster_count, dims * 2) catch return null;
+            total = std.math.add(
+                usize,
+                total,
+                std.math.mul(usize, centroid_floats, @sizeOf(f32)) catch return null,
+            ) catch return null;
+        }
+        return @intCast(total);
+    }
+
+    pub fn topologyRebuildMarkerMatches(
+        self: *const HBCIndex,
+        algorithm: TopologyRebuildAlgorithm,
+        vector_base_generation: u64,
+        vector_wal_mutation_sequence: u64,
+    ) !bool {
+        return self.metadata.topology_rebuild_algorithm == @intFromEnum(algorithm) and
+            self.metadata.topology_vector_base_generation == vector_base_generation and
+            self.metadata.topology_vector_wal_mutation_sequence == vector_wal_mutation_sequence;
+    }
+
+    /// Repack the complete visible corpus into one recursively clustered tree.
+    /// The source generation remains leased while a replacement is built in a
+    /// single WAL transaction, so searches see either the old root or the
+    /// complete new root. Exact vectors are loaded through the external vector
+    /// plane; callers bound the temporary transformed matrix explicitly.
+    pub fn rebuildTopologyFromCurrentVectors(
+        self: *HBCIndex,
+        max_workspace_bytes: u64,
+        algorithm: TopologyRebuildAlgorithm,
+        vector_base_generation: u64,
+        vector_wal_mutation_sequence: u64,
+    ) !?TopologyRebuildStats {
+        if (!self.hasExternalVectorLoader()) return null;
+        const active_count_u64 = self.metadata.active_count;
+        if (active_count_u64 == 0) return null;
+        const active_count: usize = std.math.cast(usize, active_count_u64) orelse return error.BufferTooSmall;
+        const dims: usize = @intCast(self.config.dims);
+        const matrix_floats = std.math.mul(usize, active_count, dims) catch return error.BufferTooSmall;
+        const workspace_bytes = self.topologyRebuildWorkspaceBytes(algorithm) orelse return error.BufferTooSmall;
+        if (workspace_bytes > max_workspace_bytes) return null;
+
+        const started = nowNs();
+        self.addApplyWorkspaceBytes(workspace_bytes);
+        defer self.releaseApplyWorkspaceBytes(workspace_bytes);
+
+        const old_nodes = try self.debugDumpNodes(self.alloc);
+        defer {
+            for (old_nodes) |*node| node.deinit(self.alloc);
+            self.alloc.free(old_nodes);
+        }
+
+        const vector_ids = try self.alloc.alloc(u64, active_count);
+        defer self.alloc.free(vector_ids);
+        var vector_count: usize = 0;
+        for (old_nodes) |node| {
+            if (!node.is_leaf) continue;
+            if (vector_count + node.members.len > vector_ids.len) return error.Corrupted;
+            @memcpy(vector_ids[vector_count .. vector_count + node.members.len], node.members);
+            vector_count += node.members.len;
+        }
+        if (vector_count != active_count) return error.Corrupted;
+        std.mem.sort(u64, vector_ids, {}, struct {
+            fn lessThan(_: void, a: u64, b: u64) bool {
+                return a < b;
+            }
+        }.lessThan);
+        for (vector_ids[1..], vector_ids[0 .. vector_ids.len - 1]) |current, previous| {
+            if (current == previous) return error.DuplicateVectorId;
+        }
+
+        var read_txn = try self.beginReadTxn();
+        defer read_txn.abort();
+        const metadata = try self.alloc.alloc(?[]const u8, active_count);
+        defer self.alloc.free(metadata);
+        try self.getMetadataManySortedInTxnUncached(&read_txn, vector_ids, metadata);
+        for (metadata) |maybe_value| if (maybe_value == null) return error.NotFound;
+
+        const transformed = try self.alloc.alloc(f32, matrix_floats);
+        defer self.alloc.free(transformed);
+        const load_batch_size: usize = 2048;
+        const positions = try self.alloc.alloc(usize, @min(load_batch_size, active_count));
+        defer self.alloc.free(positions);
+        const lookups = try self.alloc.alloc(FixedKeyLookup, positions.len);
+        defer self.alloc.free(lookups);
+        const key_views = try self.alloc.alloc([]const u8, positions.len);
+        defer self.alloc.free(key_views);
+        const values = try self.alloc.alloc(?[]const u8, positions.len);
+        defer self.alloc.free(values);
+        const vector_scratch = try self.alloc.alloc(f32, dims);
+        defer self.alloc.free(vector_scratch);
+
+        var start: usize = 0;
+        while (start < active_count) {
+            const end = @min(start + load_batch_size, active_count);
+            const count = end - start;
+            for (positions[0..count], 0..) |*position, i| position.* = start + i;
+            if (!try self.loadExternalVectorsTransformedIntoMatrix(
+                &read_txn,
+                vector_ids[start..end],
+                positions[0..count],
+                transformed,
+                lookups[0..count],
+                key_views[0..count],
+                values[0..count],
+                vector_scratch,
+            )) return error.Unsupported;
+            start = end;
+        }
+
+        const inputs = try self.alloc.alloc(PreparedBulkBuildInput, active_count);
+        defer self.alloc.free(inputs);
+        for (inputs, vector_ids, metadata, 0..) |*input, vector_id, maybe_metadata, i| {
+            const vector = transformed[i * dims ..][0..dims];
+            input.* = .{
+                .vector_id = vector_id,
+                // The recursive topology builder never persists raw vectors;
+                // exact values remain owned by the external vector plane.
+                .vector = vector,
+                .transformed = vector,
+                .metadata = maybe_metadata.?,
+            };
+        }
+
+        const posting_capture = try self.beginExperimentalPostingMaintenanceCapture();
+        errdefer if (posting_capture != null) self.cancelExperimentalPostingMaintenanceCapture();
+        const previous_metadata = self.metadata;
+        var committed = false;
+        errdefer if (!committed) {
+            self.metadata = previous_metadata;
+            self.clearNodeCache();
+            self.clearQuantizedCache();
+        };
+        var batch = try self.beginRuntimeBatchTxn();
+        var batch_active = true;
+        errdefer if (batch_active) batch.abort();
+        var built = switch (algorithm) {
+            .recursive => try vectorindex_hbc_index.buildBulkRecursiveFromInputs(self, &batch, inputs),
+            .global_kmeans => try vectorindex_hbc_index.buildBulkKmeansFromInputs(self, &batch, inputs),
+        };
+        defer built.deinit(self.alloc);
+        for (old_nodes) |node| try self.deleteNode(&batch, node.id);
+        self.metadata.root_node = built.node_id;
+        self.metadata.active_count = active_count_u64;
+        self.metadata.topology_rebuild_algorithm = @intFromEnum(algorithm);
+        self.metadata.topology_vector_base_generation = vector_base_generation;
+        self.metadata.topology_vector_wal_mutation_sequence = vector_wal_mutation_sequence;
+        try self.flushMetadataNow(&batch);
+
+        self.beginPublishedSearchStateRefresh();
+        errdefer self.abortPublishedSearchStateRefresh();
+        try batch.commit();
+        batch_active = false;
+        self.noteExperimentalPostingWalAuthorityCommit();
+        committed = true;
+        self.finishPublishedSearchStateRefresh();
+        if (posting_capture) |capture| try self.finishExperimentalPostingMaintenanceCapture(capture);
+
+        return .{
+            .vectors = active_count_u64,
+            .retired_nodes = @intCast(old_nodes.len),
+            .created_nodes = self.metadata.node_count -| previous_metadata.node_count,
+            .workspace_bytes = workspace_bytes,
+            .elapsed_ns = elapsedSince(started),
+        };
     }
 
     pub fn debugScoreLeaf(self: *HBCIndex, alloc: Allocator, leaf_id: u64, query: []const f32) ![]DebugLeafScore {
@@ -11183,6 +12309,31 @@ test "hbc vector fill captured before a committed mutation cannot repopulate sta
     var retained = idx.borrowCachedVector(7).?;
     defer retained.deinit();
     try std.testing.expectEqualSlices(f32, &new_vector, retained.view());
+}
+
+test "hbc vector cache clear fences scalar and residency fill generations" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var cache = Cache.init(alloc);
+    defer cache.deinit();
+    var idx = try HBCIndex.open(alloc, path, .{ .dims = 4 });
+    defer idx.close();
+    idx.attachSharedCache(&cache);
+
+    const stale_fill_epoch = idx.beginVectorCacheFill(7).?;
+    idx.clearVectorCache();
+    _ = try idx.cacheVectorIfFillCurrent(7, &.{ 1.0, 2.0, 3.0, 4.0 }, stale_fill_epoch);
+    try expectVectorNotCached(&idx, 7);
+
+    _ = try idx.cacheVector(7, &.{ 9.0, 8.0, 7.0, 6.0 });
+    try expectVectorCached(&idx, 7);
+    idx.setBypassExternalVectorCache(true);
+    try expectVectorNotCached(&idx, 7);
+    _ = try idx.cacheVector(8, &.{ 4.0, 3.0, 2.0, 1.0 });
+    try expectVectorNotCached(&idx, 8);
 }
 
 test "hbc shared detached leases remain physically accounted until release" {
@@ -12007,9 +13158,17 @@ test "hbc shared vector cache batch admission is concurrent and epoch guarded" {
     const epoch = idx.vectorCacheEpoch();
     idx.cacheVectorsAtPositionsIfEpoch(&vector_ids, &positions, &vectors, epoch);
 
-    try std.testing.expectEqualSlices(f32, vectors[0], idx.getCachedVector(11).?);
-    try std.testing.expectEqual(@as(?[]const f32, null), idx.getCachedVector(12));
-    try std.testing.expectEqualSlices(f32, vectors[1], idx.getCachedVector(13).?);
+    {
+        var borrowed = idx.borrowCachedVector(11) orelse return error.TestUnexpectedResult;
+        defer borrowed.deinit();
+        try std.testing.expectEqualSlices(f32, vectors[0], borrowed.view());
+    }
+    try expectVectorNotCached(&idx, 12);
+    {
+        var borrowed = idx.borrowCachedVector(13) orelse return error.TestUnexpectedResult;
+        defer borrowed.deinit();
+        try std.testing.expectEqualSlices(f32, vectors[1], borrowed.view());
+    }
 
     // Mutation invalidation advances the epoch before removing an entry. A
     // batch decoded from the preceding primary snapshot must not repopulate it.
@@ -12017,7 +13176,7 @@ test "hbc shared vector cache batch admission is concurrent and epoch guarded" {
     const stale_positions = [_]usize{1};
     const stale_vectors = [_][]const f32{&.{ 5.0, 6.0, 7.0, 8.0 }};
     idx.cacheVectorsAtPositionsIfEpoch(&vector_ids, &stale_positions, &stale_vectors, epoch);
-    try std.testing.expectEqual(@as(?[]const f32, null), idx.getCachedVector(12));
+    try expectVectorNotCached(&idx, 12);
     try std.testing.expect(resource_manager.sliceStats(.hbc_node_metadata_cache).used_bytes > 0);
 }
 
@@ -12536,6 +13695,7 @@ fn createTestExperimentalPostingReadState(
     state.* = .{
         .alloc = alloc,
         .covered_source_sequence = 1,
+        .wal_generation = 0,
         .retained_segments = retained,
         .segments = readers,
         .wal_committed_bytes = 0,
@@ -12597,10 +13757,10 @@ test "immutable posting replacement patches resolve bounded chains and compact l
     @memcpy(replacement_three[0..1024], replacement_two[0..1024]);
     @memset(replacement_three[1024..1040], 0x3c);
     @memcpy(replacement_three[1040..], replacement_two[1024..]);
-    const overlay = try ExperimentalPostingReadGeneration.createOverlay(alloc, root, 4);
+    const overlay = try ExperimentalPostingReadGeneration.createOverlay(alloc, root, 4, 0, 0);
     defer overlay.release();
     try overlay.set(id, .base, &replacement_three);
-    const built = try HBCIndex.buildExperimentalPostingDeltaFromGeneration(alloc, overlay, 4);
+    const built = try HBCIndex.buildExperimentalPostingDeltaFromGeneration(alloc, overlay, null, 4, null, null);
     defer alloc.free(built.segment_bytes);
     var delta_reader = try vectorindex_posting_segment.VerifiedReader.init(alloc, built.segment_bytes);
     defer delta_reader.deinit();
@@ -12616,6 +13776,70 @@ test "immutable posting replacement patches resolve bounded chains and compact l
         alloc.destroy(chained_state);
     }
     try std.testing.expectEqualSlices(u8, &replacement_three, (try chained_state.value(id, .base)).?);
+}
+
+test "quantized patches resolve their logical base from a native full checkpoint" {
+    const alloc = std.testing.allocator;
+    const id: u64 = 73;
+    var original = proto.RaBitQuantizedVectorSet{
+        .metric = .cosine,
+        .centroid = @constCast(&[_]f32{ 1.0, 0.0 }),
+        .codes = .{ .count = 2, .width = 1, .data = @constCast(&[_]u64{ 1, 2 }) },
+        .code_counts = @constCast(&[_]u32{ 1, 1 }),
+        .centroid_distances = @constCast(&[_]f32{ 0.1, 0.2 }),
+        .quantized_dot_products = @constCast(&[_]f32{ 0.3, 0.4 }),
+        .centroid_dot_products = @constCast(&[_]f32{ 0.5, 0.6 }),
+        .centroid_norm = 1.0,
+    };
+    var replacement = original;
+    replacement.centroid = @constCast(&[_]f32{ 0.75, 0.25 });
+    replacement.centroid_norm = 0.7905694;
+    const original_bytes = try original.encode(alloc);
+    defer alloc.free(original_bytes);
+    const replacement_bytes = try replacement.encode(alloc);
+    defer alloc.free(replacement_bytes);
+
+    var directory_writer = try vectorindex_quantized_directory.Writer.init(alloc, 2, @intFromEnum(vec.DistanceMetric.cosine));
+    defer directory_writer.deinit();
+    try directory_writer.append(id, &original);
+    const directory_bytes = try directory_writer.build();
+    defer alloc.free(directory_bytes);
+
+    var base_writer = vectorindex_posting_segment.Writer.init(alloc);
+    defer base_writer.deinit();
+    try base_writer.appendValueAt(0, .quantized_directory, 1, directory_bytes);
+    const base_segment = try base_writer.build();
+    defer alloc.free(base_segment);
+
+    const patch = try vectorindex_posting_wal.encodeReplacementPatchAlloc(
+        alloc,
+        .quantized_checkpoint,
+        original_bytes,
+        replacement_bytes,
+    );
+    defer alloc.free(patch);
+    const delta_segment = try buildTestExperimentalPostingSegment(
+        alloc,
+        id,
+        .quantized_checkpoint_patch,
+        2,
+        patch,
+    );
+    defer alloc.free(delta_segment);
+
+    const state = try createTestExperimentalPostingReadState(alloc, &.{ base_segment, delta_segment });
+    defer {
+        state.deinit();
+        alloc.destroy(state);
+    }
+    state.quantized_directory = try vectorindex_quantized_directory.VerifiedReader.init(
+        alloc,
+        (try state.segments[0].getValue(0, .quantized_directory)).?,
+    );
+
+    const resolved = (try state.value(id, .quantized_checkpoint)).?;
+    try std.testing.expectEqualSlices(u8, replacement_bytes, resolved);
+    try std.testing.expectEqual(resolved.ptr, (try state.value(id, .quantized_checkpoint)).?.ptr);
 }
 
 test "immutable posting replacement patches reject wrong bases and targets" {
@@ -12658,6 +13882,68 @@ test "immutable posting replacement patches reject wrong bases and targets" {
     try std.testing.expectError(error.InvalidPostingPatchTarget, target_state.value(id, .base));
 }
 
+test "immutable posting delta embeds exact centroid replacements" {
+    const alloc = std.testing.allocator;
+    const id: u64 = 7;
+    const header = NodeHeader{ .is_leaf = true, .level = 0, .parent = 1 };
+    const members = [_]u64{ 11, 13 };
+    const base_centroid = [_]f32{ 1.0, 0.0 };
+    const replacement_centroid = [_]f32{ 0.5, 0.5 };
+    const ids_bytes = std.mem.sliceAsBytes(&members);
+    const packed_len = vectorindex_hbc.packedNodeValueSize(
+        std.mem.sliceAsBytes(&base_centroid).len,
+        ids_bytes.len,
+    );
+    const base_storage = try alloc.alloc(u8, packed_len);
+    defer alloc.free(base_storage);
+    const base = try vectorindex_hbc.encodePackedNodeValue(
+        base_storage,
+        header,
+        0.25,
+        std.mem.sliceAsBytes(&base_centroid),
+        ids_bytes,
+    );
+    const replacement_storage = try alloc.alloc(u8, packed_len);
+    defer alloc.free(replacement_storage);
+    const replacement = try vectorindex_hbc.encodePackedNodeValue(
+        replacement_storage,
+        header,
+        0.75,
+        std.mem.sliceAsBytes(&replacement_centroid),
+        ids_bytes,
+    );
+
+    const base_segment = try buildTestExperimentalPostingSegment(alloc, id, .base, 1, base);
+    defer alloc.free(base_segment);
+    const state = try createTestExperimentalPostingReadState(alloc, &.{base_segment});
+    const root = try ExperimentalPostingReadGeneration.createRoot(alloc, state);
+    defer root.release();
+    const overlay = try ExperimentalPostingReadGeneration.createOverlay(alloc, root, 2, 0, 0);
+    defer overlay.release();
+    try overlay.set(id, .base, replacement);
+
+    const metadata = IndexMetadata{
+        .dims = 2,
+        .branching_factor = 2,
+        .leaf_size = 8,
+        .metric = @intFromEnum(vec.DistanceMetric.cosine),
+    };
+    const built = try HBCIndex.buildExperimentalPostingDeltaFromGeneration(alloc, overlay, metadata, 2, null, null);
+    defer alloc.free(built.segment_bytes);
+    var reader = try vectorindex_posting_segment.VerifiedReader.init(alloc, built.segment_bytes);
+    defer reader.deinit();
+    const encoded_directory = (try reader.getValue(0, .centroid_directory)).?;
+    const directory = try vectorindex_centroid_directory.Reader.init(encoded_directory);
+    try std.testing.expectEqual(@as(usize, 1), directory.posting_count);
+    var blocks = directory.blocks();
+    const block = (try blocks.next()).?;
+    try std.testing.expectEqualSlices(u64, &.{id}, block.posting_ids);
+    try std.testing.expectEqual(@as(f32, 0.75), block.covering_radii[0]);
+    try std.testing.expectEqualSlices(f32, &replacement_centroid, block.vectors);
+    try std.testing.expectApproxEqAbs(@as(f32, std.math.sqrt(0.5)), block.measures[0], 0.0001);
+    try std.testing.expect((try blocks.next()) == null);
+}
+
 test "experimental posting checkpoint reopens safely and publishes immutable generations" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -12671,6 +13957,7 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
             .branching_factor = 2,
             .search_width = 8,
             .use_quantization = true,
+            .centroid_directory_mode = .flat_exact,
             .storage_backend = .lsm,
         });
         defer idx.close();
@@ -12692,6 +13979,7 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
             .branching_factor = 2,
             .search_width = 8,
             .use_quantization = true,
+            .centroid_directory_mode = .flat_exact,
             .storage_backend = .lsm,
         });
         defer reopened.close();
@@ -12739,6 +14027,25 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         try std.testing.expectEqualStrings("doc:3", (try reopened.getMetadataInTxn(&new_txn, 3)).?);
         _ = try reopened.getVecLeaf(&new_txn, 3);
 
+        var dirty_directory_txn = try reopened.beginRuntimeSearchTxn();
+        defer dirty_directory_txn.abort();
+        const dirty_loaded_directory = (try reopened.loadPersistedFlatCentroidDirectory(
+            &dirty_directory_txn,
+            reopened.published_root_node.load(.acquire),
+            reopened.published_node_count.load(.acquire),
+            reopened.published_generation.load(.acquire),
+        )).?;
+        const retained_dirty_directory = try alloc.create(vectorindex_spfresh_index.FlatCentroidDirectory);
+        retained_dirty_directory.* = dirty_loaded_directory;
+        defer retained_dirty_directory.release(alloc);
+        try std.testing.expect(retained_dirty_directory.backing != null);
+        try std.testing.expect(retained_dirty_directory.owned_shadowed_posting_bits.len > 0);
+        try std.testing.expectEqual(@as(usize, 1), retained_dirty_directory.posting_count);
+
+        var dirty_results = try reopened.search(&[_]f32{ 0.5, 0.5 }, 3);
+        defer dirty_results.deinit();
+        try std.testing.expectEqual(@as(usize, 3), dirty_results.items.items.len);
+
         // A subsequent checkpoint flattens the complete leased generation,
         // including a vector id that was absent from the root directory.
         const flattened = try reopened.publishExperimentalPostingCheckpoint(4);
@@ -12748,6 +14055,20 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         defer flattened_txn.abort();
         try std.testing.expectEqualStrings("doc:3", (try reopened.getMetadataInTxn(&flattened_txn, 3)).?);
         _ = try reopened.getVecLeaf(&flattened_txn, 3);
+
+        var directory_txn = try reopened.beginRuntimeSearchTxn();
+        defer directory_txn.abort();
+        const loaded_directory = (try reopened.loadPersistedFlatCentroidDirectory(
+            &directory_txn,
+            reopened.published_root_node.load(.acquire),
+            reopened.published_node_count.load(.acquire),
+            reopened.published_generation.load(.acquire),
+        )).?;
+        const retained_directory = try alloc.create(vectorindex_spfresh_index.FlatCentroidDirectory);
+        retained_directory.* = loaded_directory;
+        defer retained_directory.release(alloc);
+        try std.testing.expect(retained_directory.backing != null);
+        try std.testing.expectEqual(@as(usize, 1), retained_directory.posting_count);
 
         var after_write = try reopened.search(&[_]f32{ 0.5, 0.5 }, 3);
         defer after_write.deinit();
@@ -12760,6 +14081,7 @@ test "experimental posting checkpoint reopens safely and publishes immutable gen
         .branching_factor = 2,
         .search_width = 8,
         .use_quantization = true,
+        .centroid_directory_mode = .flat_exact,
         .storage_backend = .lsm,
     });
     defer final.close();
@@ -12822,8 +14144,29 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
         try std.testing.expect(collapsed_generation.parent.?.root != null);
 
         var posting_store = &idx.experimental_posting_write_store.?;
-        try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(posting_store));
-        const flattened_wal_bytes = posting_store.wal_committed_bytes;
+        const source_wal_bytes = collapsed_generation.wal_committed_bytes.load(.acquire);
+        const coverage = [_]posting_segment_store_mod.BatchRecord{.{
+            .kind = .coverage,
+            .posting_id = 0,
+            .source_sequence = 4,
+            .payload = &.{},
+        }};
+        try idx.appendExperimentalPostingBatchDurably(
+            try posting_store.nextBatchId(),
+            &coverage,
+            4,
+            .{},
+        );
+        posting_store = &idx.experimental_posting_write_store.?;
+        try std.testing.expect(posting_store.wal_committed_bytes > source_wal_bytes);
+        try std.testing.expect(try idx.startExperimentalPostingCheckpointBuild(posting_store, null));
+        const flattened_wal_bytes = idx.experimental_posting_checkpoint_build.?.flattened_wal_bytes;
+        // The WAL append and logical-generation publication are deliberately
+        // separated above. A checkpoint must flatten only the exact boundary
+        // represented by its retained source generation and carry the newer
+        // durable bytes as tail.
+        try std.testing.expectEqual(source_wal_bytes, flattened_wal_bytes);
+        try std.testing.expect(flattened_wal_bytes < posting_store.wal_committed_bytes);
 
         // A delayed callback may commit another ordered batch at sequence 4
         // while the segment for the earlier sequence-4 prefix is building.
@@ -12876,6 +14219,50 @@ test "background posting checkpoint preserves concurrent same-sequence WAL tail"
     var compacted_results = try reopened.search(&[_]f32{ 0.5, 0.5 }, 5);
     defer compacted_results.deinit();
     try std.testing.expectEqual(@as(usize, 5), compacted_results.items.items.len);
+
+    // A readiness owner can explicitly choose a full generation and join its
+    // background build before exposing the stable tip. The resulting store
+    // remains flat even when the ordinary policy would have selected a delta.
+    try reopened.beginExperimentalPostingMutationCapture();
+    try reopened.insertWithMetadata(6, &[_]f32{ 0.4, 0.6 }, "doc:6");
+    try reopened.persistExperimentalPostingSidecarAtAppliedSequence(4, .{});
+    if (reopened.experimental_posting_write_store == null) {
+        reopened.experimental_posting_write_store = try reopened.openExperimentalPostingStore();
+    }
+    try std.testing.expect(try reopened.startExperimentalPostingCheckpointBuild(
+        &reopened.experimental_posting_write_store.?,
+        .full,
+    ));
+    // Commit a real packed-node/quantized mutation after the full builder has
+    // retained its source boundary. Publication must replay this patch tail
+    // over the newly compacted base, not flatten it accidentally or encode a
+    // later delta against the builder's retired root.
+    try reopened.beginExperimentalPostingMutationCapture();
+    try reopened.insertWithMetadata(7, &[_]f32{ 0.6, 0.4 }, "doc:7");
+    try reopened.persistExperimentalPostingSidecarAtAppliedSequence(4, .{});
+    // The mutation's ordinary maintenance may publish a builder that already
+    // completed; otherwise join it explicitly here.
+    _ = try reopened.finishExperimentalPostingCheckpointForReadiness();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        reopened.experimental_posting_write_store.?.deltaSegmentCount(),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 4),
+        reopened.experimental_posting_write_store.?.latestSegmentGeneration().?,
+    );
+    try std.testing.expect(reopened.experimental_posting_write_store.?.wal_committed_bytes > 0);
+    const installed = reopened.experimental_posting_read_generation.?;
+    try std.testing.expectEqual(
+        reopened.experimental_posting_write_store.?.wal_generation,
+        installed.wal_generation.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        reopened.experimental_posting_write_store.?.wal_committed_bytes,
+        installed.wal_committed_bytes.load(.acquire),
+    );
+    try std.testing.expectEqualStrings("doc:7", (try installed.value(7, .vector_metadata)).?);
+    try std.testing.expect((try installed.value(7, .vector_leaf)) != null);
 }
 
 test "idle posting checkpoint flattens a max-depth patch chain" {
@@ -12895,6 +14282,9 @@ test "idle posting checkpoint flattens a max-depth patch chain" {
         0,
         managedPostingMaxDeltaSegments + 1,
     ));
+    try std.testing.expect(!shouldStartExperimentalPostingReadinessCheckpoint(0, 0));
+    try std.testing.expect(shouldStartExperimentalPostingReadinessCheckpoint(1, 0));
+    try std.testing.expect(shouldStartExperimentalPostingReadinessCheckpoint(0, 1));
 }
 
 test "max-chain full checkpoint starts below the hard WAL budget" {
@@ -13186,6 +14576,78 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
     try std.testing.expectEqualStrings("doc:2", results.items.items[0].metadata.?);
 }
 
+test "stable generation finalization bootstraps capture-free rebuild into native authority" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const Loader = struct {
+        fn load(_: *anyopaque, loader_alloc: Allocator, vector_id: u64, _: []const u8) ![]f32 {
+            const vector: []const f32 = switch (vector_id) {
+                1 => &.{ 1.0, 0.0 },
+                2 => &.{ 0.0, 1.0 },
+                else => return error.NotFound,
+            };
+            return try loader_alloc.dupe(f32, vector);
+        }
+    };
+    var loader_context: u8 = 0;
+
+    {
+        var idx = try HBCIndex.open(alloc, path, .{
+            .dims = 2,
+            .leaf_size = 8,
+            .branching_factor = 2,
+            .search_width = 8,
+            .use_quantization = true,
+            .storage_backend = .lsm,
+        });
+        defer idx.close();
+        idx.setExternalVectorLoader(&loader_context, Loader.load);
+
+        // Shadow snapshot builders intentionally do not synthesize a source
+        // capture around their bulk construction pass.
+        try idx.batchInsertWithMetadataOptions(&.{
+            .{ .vector_id = 1, .vector = &.{ 1.0, 0.0 }, .metadata = "doc:1" },
+            .{ .vector_id = 2, .vector = &.{ 0.0, 1.0 }, .metadata = "doc:2" },
+        }, .{ .skip_vector_store = true });
+        try std.testing.expect(idx.experimentalPostingDurableAppliedSequence() == null);
+
+        try idx.finalizeExperimentalPostingGenerationAtAppliedSequence(7, .{
+            .make_authoritative = true,
+        });
+        try std.testing.expectEqual(@as(?u64, 7), idx.experimentalPostingDurableAppliedSequence());
+        try std.testing.expect(idx.experimentalPostingWalAuthoritative());
+        try std.testing.expect(idx.env_owner == .native);
+    }
+
+    var reopened = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer reopened.close();
+    try std.testing.expect(reopened.env_owner == .native);
+    reopened.setExternalVectorLoader(&loader_context, Loader.load);
+    try std.testing.expectEqual(@as(u64, 7), try reopened.activateExperimentalPostingReadsAtOrAfter(7));
+    for ([_][]const u8{ "runs", "wal", "manifest.bin", "writer.lock", "wal.lock" }) |name| {
+        const legacy_path = try std.fs.path.join(alloc, &.{ std.mem.span(path), name });
+        defer alloc.free(legacy_path);
+        try std.testing.expectError(
+            error.FileNotFound,
+            std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
+        );
+    }
+    var results = try reopened.search(&.{ 0.0, 1.0 }, 2);
+    defer results.deinit();
+    try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
+    try std.testing.expectEqualStrings("doc:2", results.items.items[0].metadata.?);
+}
+
 test "posting WAL capture can begin inside a streaming replay session" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -13370,6 +14832,91 @@ test "managed posting sidecar follows applied sequence and uncovered writes inva
     });
     defer final.close();
     try std.testing.expectError(error.MissingPostingCheckpoint, final.activateExperimentalPostingReads(3));
+}
+
+test "managed posting capture exports coalesced exact vector mutations" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .leaf_size = 8,
+        .branching_factor = 2,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    });
+    defer idx.close();
+
+    idx.enableExperimentalExactVectorCapture(true);
+    try idx.beginExperimentalPostingMutationCapture();
+    try idx.insertWithMetadata(1, &.{ 1.0, 0.0 }, "doc:1");
+    const inserted = try idx.takeExperimentalExactVectorMutations();
+    defer {
+        for (inserted) |*mutation| mutation.deinit(alloc);
+        alloc.free(inserted);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inserted.len);
+    try std.testing.expectEqual(ExperimentalExactVectorMutation.Kind.upsert, inserted[0].kind);
+    try std.testing.expectEqualStrings("doc:1", inserted[0].metadata);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 0.0 }, inserted[0].vector);
+    try idx.persistExperimentalPostingSidecarAtAppliedSequence(1, .{});
+    idx.enableExperimentalPostingWalMutations();
+
+    // A replacement is represented once and the final upsert wins over its
+    // internal delete. A pure delete recovers metadata from the pinned native
+    // mutation base so its artifact key can be tombstoned transactionally.
+    idx.enableExperimentalExactVectorCapture(true);
+    try idx.beginExperimentalPostingMutationCapture();
+    try std.testing.expect(idx.experimental_exact_vector_capture_enabled);
+    try std.testing.expect(idx.experimental_posting_capture_enabled);
+    try idx.batchApply(&.{.{ .vector_id = 1, .vector = &.{ 0.0, 1.0 }, .metadata = "doc:1" }}, &.{1});
+    try std.testing.expectEqual(@as(usize, 1), idx.experimental_exact_vector_mutations.count());
+    const replaced = try idx.takeExperimentalExactVectorMutations();
+    defer {
+        for (replaced) |*mutation| mutation.deinit(alloc);
+        alloc.free(replaced);
+    }
+    try std.testing.expectEqual(@as(usize, 1), replaced.len);
+    try std.testing.expectEqual(ExperimentalExactVectorMutation.Kind.upsert, replaced[0].kind);
+    try std.testing.expectEqualSlices(f32, &.{ 0.0, 1.0 }, replaced[0].vector);
+    try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
+
+    idx.enableExperimentalExactVectorCapture(true);
+    try idx.beginExperimentalPostingMutationCapture();
+    try idx.batchApply(&.{}, &.{1});
+    const deleted = try idx.takeExperimentalExactVectorMutations();
+    defer {
+        for (deleted) |*mutation| mutation.deinit(alloc);
+        alloc.free(deleted);
+    }
+    try std.testing.expectEqual(@as(usize, 1), deleted.len);
+    try std.testing.expectEqual(ExperimentalExactVectorMutation.Kind.tombstone, deleted[0].kind);
+    try std.testing.expectEqualStrings("doc:1", deleted[0].metadata);
+    try std.testing.expectEqual(@as(usize, 0), deleted[0].vector.len);
+    try idx.persistExperimentalPostingSidecarAtAppliedSequence(3, .{});
+
+    // Initial/empty-index construction uses the recursive bulk builder rather
+    // than batchApply. It belongs to the same source transaction and must
+    // seed the exact-vector WAL instead of forcing a later primary-LSM scan.
+    idx.enableExperimentalExactVectorCapture(true);
+    try idx.beginExperimentalPostingMutationCapture();
+    try idx.bulkBuildWithMetadata(&.{
+        .{ .vector_id = 2, .vector = &.{ 1.0, 1.0 }, .metadata = "doc:2" },
+        .{ .vector_id = 3, .vector = &.{ -1.0, 1.0 }, .metadata = "doc:3" },
+    });
+    const bulk_built = try idx.takeExperimentalExactVectorMutations();
+    defer {
+        for (bulk_built) |*mutation| mutation.deinit(alloc);
+        alloc.free(bulk_built);
+    }
+    try std.testing.expectEqual(@as(usize, 2), bulk_built.len);
+    try std.testing.expectEqual(@as(u64, 2), bulk_built[0].vector_id);
+    try std.testing.expectEqualStrings("doc:2", bulk_built[0].metadata);
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 1.0 }, bulk_built[0].vector);
+    try std.testing.expectEqual(@as(u64, 3), bulk_built[1].vector_id);
 }
 
 test "managed posting sidecar records maintenance without advancing source coverage" {
@@ -13574,6 +15121,7 @@ test "flat rabitq filtered traversal advances past its initial probe wave safely
     try std.testing.expect(profiled.profile.traversal_initial_wave_leaves == 2);
     try std.testing.expect(profiled.profile.traversal_waves > 1);
     try std.testing.expect(profiled.profile.leaves_explored > 2);
+    try std.testing.expect(profiled.profile.leaves_explored <= 32);
     try std.testing.expect(profiled.profile.traversal_bound_stops > 0);
 }
 
@@ -16097,6 +17645,77 @@ test "posting maintenance repairs dirty leaf centroid and state" {
     try std.testing.expectEqual(@as(u64, 1), profile.posting_maintenance_centroid_refreshed);
 }
 
+test "stable posting validation repairs missing clean quantized payload" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .use_quantization = true,
+    });
+    defer idx.close();
+
+    try idx.insert(1, &[_]f32{ 1.0, 0.0 });
+    try idx.insert(2, &[_]f32{ 0.0, 1.0 });
+    try std.testing.expectEqual(@as(u64, 0), (try idx.postingBacklogStats()).dirty_postings);
+
+    {
+        var txn = try idx.beginWriteTxn();
+        errdefer txn.abort();
+        var key_buf: [10]u8 = undefined;
+        try idx.deleteNamespaced(&txn, .quant, encodeQuantKey(&key_buf, idx.metadata.root_node));
+        try idx.finishWriteTxn(&txn);
+        idx.invalidateQuantizedCache(idx.metadata.root_node);
+    }
+
+    // The durable state bit alone cannot observe a missing paired payload.
+    try std.testing.expectEqual(@as(u64, 0), (try idx.postingBacklogStats()).dirty_postings);
+    const repaired = try idx.repairDirtyPostingsWithOptions(.{
+        .validate_payloads = true,
+        .rebalance_layout = false,
+    });
+    try std.testing.expectEqual(@as(u64, 1), repaired.repaired_postings);
+    try std.testing.expectEqual(@as(u64, 1), repaired.payload_refreshed);
+
+    var profiled = try idx.searchProfiledRequest(.{
+        .query = &[_]f32{ 1.0, 0.0 },
+        .k = 1,
+    });
+    defer profiled.results.deinit();
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.leaf_payload_missing);
+    try std.testing.expectEqual(@as(u64, 0), profiled.profile.leaf_payload_stale);
+}
+
+test "stable posting validation accepts canonical empty posting payload absence" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.open(alloc, path, .{
+        .dims = 2,
+        .use_quantization = true,
+    });
+    defer idx.close();
+
+    // An empty root posting intentionally has no quantized payload. Stable-tip
+    // validation must be idempotent: this is the state observed when a public
+    // API creates a dense index before the first document arrives.
+    for (0..2) |_| {
+        const result = try idx.repairDirtyPostingsWithOptions(.{
+            .validate_payloads = true,
+            .rebalance_layout = false,
+        });
+        try std.testing.expectEqual(@as(u64, 1), result.scanned_postings);
+        try std.testing.expectEqual(@as(u64, 0), result.dirty_postings);
+        try std.testing.expectEqual(@as(u64, 0), result.repaired_postings);
+        try std.testing.expectEqual(@as(u64, 0), result.payload_refreshed);
+    }
+    try std.testing.expectEqual(@as(u64, 0), (try idx.postingBacklogStats()).dirty_postings);
+}
+
 test "lazy posting maintenance defers foreground centroid refresh" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -17789,6 +19408,101 @@ test "bulk split workspace reuses transformed external vectors and reports apply
     try std.testing.expectEqual(baseline_apply_bytes, resource_manager.sliceStats(.dense_apply_working_set).used_bytes);
 }
 
+test "recursive topology rebuild atomically replaces a live external-vector tree" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    const LoaderCtx = struct {
+        vectors: *const [18][2]f32,
+
+        fn load(
+            ctx_ptr: *anyopaque,
+            vector_ids: []const u64,
+            metadata: []const ?[]const u8,
+            matrix_positions: []const usize,
+            matrix: []f32,
+            _: []f32,
+            dims: usize,
+            index: *HBCIndex,
+            transform: HBCIndex.ExternalVectorTransformFn,
+        ) !void {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            try std.testing.expectEqual(vector_ids.len, metadata.len);
+            for (vector_ids, matrix_positions) |vector_id, matrix_position| {
+                const offset = matrix_position * dims;
+                _ = transform(index, &ctx.vectors[@intCast(vector_id - 1)], matrix[offset .. offset + dims]);
+            }
+        }
+    };
+
+    var idx = try HBCIndex.openWithLsmOptions(alloc, path, .{
+        .dims = 2,
+        .metric = .l2_squared,
+        .leaf_size = 3,
+        .branching_factor = 2,
+        .search_width = 16,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    }, .{});
+    defer idx.close();
+
+    var vectors: [18][2]f32 = undefined;
+    var metadata_storage: [18][16]u8 = undefined;
+    var items: [18]BatchInsertItem = undefined;
+    for (&items, 0..) |*item, i| {
+        const cluster: f32 = @floatFromInt(i / 6);
+        vectors[i] = .{ cluster * 100.0 + @as(f32, @floatFromInt(i % 6)), cluster };
+        const metadata = try std.fmt.bufPrint(&metadata_storage[i], "doc:{d:0>4}", .{i});
+        item.* = .{
+            .vector_id = @intCast(i + 1),
+            .vector = &vectors[i],
+            .metadata = metadata,
+        };
+    }
+    try idx.batchInsertWithMetadata(&items);
+
+    var loader_ctx = LoaderCtx{ .vectors = &vectors };
+    idx.setExternalVectorBatchTransformedMatrixLoader(&loader_ctx, LoaderCtx.load);
+    const required = idx.topologyRebuildWorkspaceBytes(.recursive) orelse return error.TestUnexpectedResult;
+    const old_root = idx.stats().root_node;
+    try std.testing.expect((try idx.rebuildTopologyFromCurrentVectors(required - 1, .recursive, 7, 11)) == null);
+    try std.testing.expectEqual(old_root, idx.stats().root_node);
+
+    const rebuilt = (try idx.rebuildTopologyFromCurrentVectors(required, .recursive, 7, 11)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, @intCast(items.len)), rebuilt.vectors);
+    try std.testing.expect(rebuilt.retired_nodes > 0);
+    try std.testing.expect(rebuilt.created_nodes > 0);
+    try std.testing.expect(idx.stats().root_node != old_root);
+    try std.testing.expect(try idx.topologyRebuildMarkerMatches(.recursive, 7, 11));
+    try std.testing.expect(!try idx.topologyRebuildMarkerMatches(.recursive, 7, 12));
+    try std.testing.expect(!try idx.topologyRebuildMarkerMatches(.global_kmeans, 7, 11));
+    try std.testing.expect((try idx.verifyTreeLinks()).consistent());
+    for (1..items.len + 1) |vector_id| {
+        try std.testing.expectEqual(
+            try idx.debugScanLeafForVector(@intCast(vector_id)),
+            try idx.debugLeafForVector(@intCast(vector_id)),
+        );
+    }
+
+    var results = try idx.search(&[_]f32{ 102.0, 1.0 }, 3);
+    defer results.deinit();
+    const hits = results.getHits();
+    try std.testing.expectEqual(@as(usize, 3), hits.len);
+    var found_exact = false;
+    for (hits) |hit| {
+        // This test proves atomic topology replacement and mapping integrity,
+        // not a total-order guarantee for an approximate search. The three
+        // well-separated input clusters make cross-cluster routing a useful
+        // invariant while allowing quantized candidates to arrive in either
+        // order before the boundary rerank.
+        try std.testing.expect(hit.vector_id >= 7 and hit.vector_id <= 12);
+        found_exact = found_exact or hit.vector_id == 9;
+    }
+    try std.testing.expect(found_exact);
+}
+
 test "streaming split vector workspace survives retirement and ring churn" {
     const alloc = std.testing.allocator;
     var tp: TestPath = .{};
@@ -17826,15 +19540,39 @@ test "streaming split vector workspace survives retirement and ring churn" {
     }
     try idx.finishStreamingReplaySessionWithOptions(.{});
 
-    // Retained lookup entries must still point at the ring slot that owns the
-    // same id; tombstone churn must never manufacture aliases or underflow the
-    // hash table's capacity accounting.
-    var entries = idx.bulk_split_vector_workspace.map.iterator();
-    while (entries.next()) |entry| {
-        const slot = entry.value_ptr.* / idx.config.dims;
-        try std.testing.expect(slot < idx.bulk_split_vector_workspace.ids.items.len);
-        try std.testing.expectEqual(entry.key_ptr.*, idx.bulk_split_vector_workspace.ids.items[slot]);
-    }
+    // The window-local cache must not become permanent index residency after
+    // replay. Exact vectors remain authoritative in the primary store.
+    try std.testing.expectEqual(@as(u32, 0), idx.bulk_split_vector_workspace.map.count());
+    try std.testing.expectEqual(@as(usize, 0), idx.bulk_split_vector_workspace.ids.items.len);
+    try std.testing.expectEqual(@as(u64, 0), idx.bulk_split_vector_workspace.accounted_bytes);
+    try std.testing.expectEqual(@as(u64, 0), idx.apply_workspace_split_bytes);
+}
+
+test "streaming split vector workspace leaves dense apply budget headroom" {
+    const alloc = std.testing.allocator;
+    var tp: TestPath = .{};
+    const path = tp.init();
+    defer tp.cleanup();
+
+    var idx = try HBCIndex.openWithLsmOptions(alloc, path, .{
+        .dims = 16,
+        .leaf_size = 4,
+        .branching_factor = 8,
+        .search_width = 8,
+        .use_quantization = true,
+        .storage_backend = .lsm,
+    }, .{});
+    defer idx.close();
+
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = .{
+        .soft_limit_bytes = 768,
+        .hard_limit_bytes = 1024,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    idx.attachResourceManager(&resource_manager);
+
+    try std.testing.expectEqual(@as(u64, 512), idx.bulkSplitVectorWorkspaceBudgetBytes());
 }
 
 test "bulk ingest deferred leaf splits publish in bounded windows" {

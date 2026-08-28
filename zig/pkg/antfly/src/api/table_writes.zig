@@ -126,6 +126,26 @@ const auto_bulk_ingest_finish_options: backend_types.BulkIngestFinishOptions = .
     .max_deferred_l0_runs = 64,
     .max_deferred_hbc_leaf_splits_per_publish = auto_bulk_ingest_max_hbc_leaf_splits_per_publish,
 };
+// A max-operation roll is a batching boundary, not the end of the upload.
+// Writes are already durable in the primary WAL and visible through the
+// mutable/immutable read view, so forcing an L0 publication here ties file and
+// manifest cadence to the API's 25K-operation safety window. Keep adjacent
+// rolls in the bounded immutable flush window; byte/count/WAL pressure can
+// still publish it early, and explicit finalization force-drains it.
+const auto_bulk_ingest_roll_options: backend_types.BulkIngestFinishOptions = .{
+    .compact = false,
+    .flush = false,
+};
+// The API idle timer owns the lifetime of the batching lease, not the primary
+// store's physical publication cadence. A producer may legitimately pause for
+// a few seconds between chunks; force-draining each such pause manufactures a
+// small L0 generation. End the lease while leaving its WAL-backed state under
+// the LSM byte/count/idle/max-age policy. Explicit finish, transition, close,
+// and full-index paths continue to use the force-draining options above.
+const auto_bulk_ingest_idle_finish_options: backend_types.BulkIngestFinishOptions = .{
+    .compact = false,
+    .flush = false,
+};
 
 fn startupCatchUpMonotonicMs() u64 {
     return @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
@@ -2513,7 +2533,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (entry.auto_bulk_ingest_finishing) return false;
             if (!entry.auto_bulk_ingest_session_open or !entry.auto_bulk_ingest_finish_requested) return false;
             if (self.entryActiveLeasesLocked(entry) > 1) return false;
-            try entry.db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options);
+            try entry.db.rollPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_roll_options);
             entry.auto_bulk_ingest_session_open = true;
             entry.auto_bulk_ingest_ops = 0;
             entry.auto_bulk_ingest_started_ns = now_ns;
@@ -2566,7 +2586,7 @@ pub const ProvisionedTableWriteCache = struct {
             if (!idle_expired and entry.auto_bulk_ingest_finish_requested) {
                 continue;
             } else {
-                entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_finish_options) catch |err| {
+                entry.db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(auto_bulk_ingest_idle_finish_options) catch |err| {
                     if (first_err == null) first_err = err;
                     continue;
                 };
@@ -10068,6 +10088,44 @@ pub const ProvisionedTableWriteSource = struct {
         return total_steps;
     }
 
+    pub fn runVectorBlockMaintenanceRoundBestEffort(self: *ProvisionedTableWriteSource) !usize {
+        if (!self.local_db_mutex.tryLock()) return 0;
+        var leases = std.ArrayListUnmanaged(ProvisionedTableWriteCache.CachedDb).empty;
+        var lease_alloc: std.mem.Allocator = std.heap.page_allocator;
+        {
+            defer self.local_db_mutex.unlock();
+            const cache = self.write_cache orelse return 0;
+            lease_alloc = cache.alloc;
+            for (cache.entries.items) |entry| {
+                if (entry.bulk_ingest_session_open) continue;
+                if (entry.db.hasActiveDenseBulkWork()) continue;
+                try leases.append(lease_alloc, cache.leaseEntryLocked(entry));
+            }
+        }
+        defer {
+            for (leases.items) |*lease| lease.deinit(lease_alloc);
+            leases.deinit(lease_alloc);
+        }
+        // Projection readiness is fail-closed. Invalidate before publishing
+        // from the same leased writers so a best-effort refresh that loses a
+        // writer/publication race cannot leave an older `ready` snapshot in
+        // authority while the base is absent. Do this both before the long
+        // build and after every exit: failure remains pending, while success
+        // publishes the installed generation.
+        self.replaceRuntimeStatusLeaseSnapshotsFailClosed(lease_alloc, leases.items);
+        defer self.replaceRuntimeStatusLeaseSnapshotsFailClosed(lease_alloc, leases.items);
+        var total_steps: usize = 0;
+        for (leases.items) |lease| {
+            // "Best effort" means that this round may decline the cache lock
+            // or skip a busy DB. Once a projection build is admitted, however,
+            // its error is readiness state: swallowing it would let the data
+            // runtime retain a stale `ready` snapshot while queries fall back
+            // to an expensive primary-artifact scan.
+            total_steps += try lease.db.runVectorBlockMaintenanceForIdle();
+        }
+        return total_steps;
+    }
+
     pub fn finishExpiredAutoBulkIngestBestEffort(self: *ProvisionedTableWriteSource) bool {
         return self.tryFinishExpiredAutoBulkIngest() orelse false;
     }
@@ -10323,6 +10381,21 @@ pub const ProvisionedTableWriteSource = struct {
                 }),
             };
         }
+    }
+
+    fn replaceRuntimeStatusLeaseSnapshotsFailClosed(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        leases: []const ProvisionedTableWriteCache.CachedDb,
+    ) void {
+        // Invalidate every affected table before attempting any replacement.
+        // If one writer is fenced or busy, the cache has no stale success to
+        // serve and the next observation must inspect current durable state.
+        for (leases) |lease| {
+            const entry = lease.entry orelse continue;
+            self.invalidateRuntimeStatusCache(entry.table_name);
+        }
+        self.publishRuntimeStatusLeaseSnapshots(alloc, leases);
     }
 
     fn collectAllRuntimeStatusLeasesFromCacheLocked(
@@ -22788,6 +22861,7 @@ fn managedDbHasBroadCatchUpDebt(alloc: std.mem.Allocator, db: *db_mod.DB) !bool 
     const enrichment = pending_work.enrichment;
     if (enrichment.enabled and enrichment.applied_sequence < enrichment.target_sequence) return true;
     if (try db.restoreRuntimeRepairNeeded()) return true;
+    if (db.nativeVectorProjectionMaintenanceNeeded()) return true;
     return try db.denseArtifactRebuildMaintenanceNeeded(alloc);
 }
 
@@ -22858,6 +22932,7 @@ fn catchUpManagedDb(
         std.log.warn("managed startup catch-up dense rebuild probe failed table={s} err={}", .{ table_name, err });
         return err;
     };
+    const needs_native_vector_projection = db.nativeVectorProjectionMaintenanceNeeded();
     const initial_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
     // An unavailable checkpoint is not proof that repair debt is absent. Let
     // the scheduler retain this exact route and apply its normal error
@@ -22867,13 +22942,29 @@ fn catchUpManagedDb(
     const initial_repair_debt = had_debt or
         repair_metadata_rebuild_pending or
         restore_repair_needed or
+        needs_native_vector_projection or
         needs_dense_artifact_maintenance or
         initial_index_load_failure or
         initial_index_repair_intents;
+    if (initial_repair_debt) {
+        std.log.info(
+            "managed startup catch-up debt classified table={s} replay={} repair_metadata={} restore={} native_vector_projection={} dense_artifacts={} index_load_failure={} index_repair_intents={}",
+            .{
+                table_name,
+                had_debt,
+                repair_metadata_rebuild_pending,
+                restore_repair_needed,
+                needs_native_vector_projection,
+                needs_dense_artifact_maintenance,
+                initial_index_load_failure,
+                initial_index_repair_intents,
+            },
+        );
+    }
 
     if (mode == .index_repair_only) {
         if (!initial_index_repair_debt) return .{};
-        if (had_debt or restore_repair_needed or needs_dense_artifact_maintenance) {
+        if (had_debt or restore_repair_needed or needs_dense_artifact_maintenance or needs_native_vector_projection) {
             // Full startup/restore catch-up owns these mutations under its
             // exclusive lifecycle fence. Retain the exact index-repair queue
             // entry, but do not let a live, cooperatively admitted repair pass
@@ -22902,6 +22993,7 @@ fn catchUpManagedDb(
 
     var repaired_restore_runtime = false;
     var repaired_dense_artifacts = false;
+    var repaired_native_vector_projection = false;
     var repaired_artifact_metadata = false;
     var repaired_indexes: usize = 0;
     var degraded_indexes: usize = 0;
@@ -23001,6 +23093,14 @@ fn catchUpManagedDb(
         try db.core.index_manager.syncAll(true);
     }
 
+    if (runs_broad_debt and db.nativeVectorProjectionMaintenanceNeeded()) {
+        progress_ctx.phase = .artifact_rebuild;
+        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+        repaired_native_vector_projection = try db.publishVectorBlockBasesAtStableTip() != 0;
+        made_progress = made_progress or repaired_native_vector_projection;
+        try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .artifact_rebuild, db));
+    }
+
     if (mode == .all_debt and !initial_repair_debt) {
         try finishManagedMaintenanceStatusPublication(publishRuntimeStatusSnapshotWithStartupPhase(source, alloc, table_name, group_id, .idle, db));
         return .{};
@@ -23029,7 +23129,7 @@ fn catchUpManagedDb(
     }
 
     if (mode == .broad_debt_only) {
-        const initial_broad_debt = had_debt or repair_metadata_rebuild_pending or restore_repair_needed or needs_dense_artifact_maintenance;
+        const initial_broad_debt = had_debt or repair_metadata_rebuild_pending or restore_repair_needed or needs_dense_artifact_maintenance or needs_native_vector_projection;
         return .{
             .had_debt = initial_repair_debt,
             // The caller rechecks broad debt under the same exclusive guard
@@ -23111,6 +23211,13 @@ fn catchUpManagedDb(
                 .made_progress = made_progress,
             };
         }
+        if (db.nativeVectorProjectionMaintenanceNeeded()) {
+            return .{
+                .had_debt = initial_repair_debt,
+                .cleared_debt = false,
+                .made_progress = made_progress,
+            };
+        }
         if (db.pendingWorkStats().repair_metadata_rebuild_pending) {
             return .{
                 .had_debt = initial_repair_debt,
@@ -23159,7 +23266,7 @@ fn catchUpManagedDb(
         .cleared_debt = if (index_only_result)
             repaired_indexes > 0
         else
-            had_debt or repaired_artifact_metadata or repaired_restore_runtime or repaired_dense_artifacts or repaired_indexes > 0,
+            had_debt or repaired_artifact_metadata or repaired_restore_runtime or repaired_dense_artifacts or repaired_native_vector_projection or repaired_indexes > 0,
         .made_progress = made_progress,
         .index_repair_attempted = advance_index_repairs and repaired_indexes != 0,
         .index_repair_repaired = repaired_indexes != 0,
@@ -27049,8 +27156,12 @@ test "auto bulk max-window request waits for idle finish" {
     try std.testing.expect(write_cache.entries.items[0].*.auto_bulk_ingest_finish_requested);
     try std.testing.expect(write_cache.entries.items[0].*.auto_bulk_ingest_ops >= auto_bulk_ingest_max_window_ops);
 
+    const primary_before_idle = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
     const idle_finish_ns = write_cache.entries.items[0].*.auto_bulk_ingest_last_ns + auto_bulk_ingest_max_idle_ns;
     try std.testing.expect(try write_cache.finishExpiredAutoBulkIngestLocked(idle_finish_ns));
+    const primary_after_idle = write_cache.entries.items[0].*.db.snapshotPrimaryLsmWriteStatsForTest().?;
+    try std.testing.expectEqual(primary_before_idle.immutable_flushes, primary_after_idle.immutable_flushes);
+    try std.testing.expectEqual(primary_before_idle.manifest_writes, primary_after_idle.manifest_writes);
     try std.testing.expect(!write_cache.entries.items[0].*.auto_bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 0), write_cache.active_bulk_ingest_sessions.items.len);
 }
@@ -36545,6 +36656,69 @@ test "runtime status publication rejects retired writer and authoritatively clea
     published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
     try std.testing.expect(!published.items[0].stats.repair_degraded);
+}
+
+test "fail closed runtime status replacement cannot retain stale ready snapshot" {
+    const alloc = std.testing.allocator;
+    const NoCatalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedCatalogCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-fail-closed-replacement", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{ .lsm_root_generation = 1 });
+    defer db.close();
+
+    var snapshot_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer snapshot_cache.deinit();
+    var ready = runtime_status.LocalTableRuntimeStatus{
+        .group_id = 7001,
+        .stats = .{ .doc_count = 41 },
+    };
+    defer ready.deinit(alloc);
+    try publishRuntimeStatusGroupForTest(&snapshot_cache, "docs", ready);
+
+    var visible_generation: u64 = 2;
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
+    source.runtime_status_cache = &snapshot_cache;
+    _ = source.withGroupVisibleRootGeneration(testingVisibleRootGenerationSource(&visible_generation));
+
+    var entry = ProvisionedTableWriteCache.Entry{
+        .group_id = 7001,
+        .lsm_root_generation = 1,
+        .table_name = @constCast("docs"),
+        .managed_config_fingerprint = ProvisionedTableWriteCache.managedConfigFingerprint(null),
+        .db = undefined,
+    };
+    // `entry` only borrows this DB for the helper invocation; retain the
+    // original owner for the deferred close above.
+    const lease = ProvisionedTableWriteCache.CachedDb{
+        .entry = &entry,
+        .db = &db,
+        .schema_json = null,
+    };
+
+    source.replaceRuntimeStatusLeaseSnapshotsFailClosed(alloc, (&[_]ProvisionedTableWriteCache.CachedDb{lease})[0..]);
+    try std.testing.expect((try snapshot_cache.snapshot(alloc, "docs")) == null);
 }
 
 test "provisioned table write source publishes replay debt from owner db handle" {

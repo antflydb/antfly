@@ -106,6 +106,15 @@ pub const SearchProfile = struct {
     rerank_artifact_distance_ns: u64 = 0,
     rerank_lsm_cache_hits: u64 = 0,
     rerank_lsm_cache_misses: u64 = 0,
+    /// Exact candidates served directly from the table-level immutable vector
+    /// block generation.
+    rerank_vector_block_hits: u64 = 0,
+    /// Candidates for which the matching immutable generation was installed
+    /// but did not contain a usable exact vector.
+    rerank_vector_block_misses: u64 = 0,
+    /// Candidates routed to primary storage because no immutable generation
+    /// matched the search transaction's source boundary.
+    rerank_vector_block_fallbacks: u64 = 0,
     /// Candidates scored without reading an external artifact. This includes
     /// governed decoded residency and a request-local hit when a caller has a
     /// legitimate reuse opportunity.

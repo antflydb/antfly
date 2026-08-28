@@ -1528,6 +1528,16 @@ fn publicShardIndexRuntimeView(
     // this after aggregation can erase unrelated live catch-up on a sibling.
     if (publicIndexRepairState(item) != null and repairActiveGenerationServiceable(item)) return view;
 
+    if (item.kind == .dense_vector and async_indexing.dense_projection_finalizing) {
+        // Native exact-vector publication is table-writer runtime state. It
+        // can become pending after the cached per-index materialization
+        // snapshot was recorded, so project it here while shard ownership and
+        // its AsyncIndexingStats are still paired.
+        view.dense_vector_projection_pending = true;
+        view.backfill_active = true;
+        view.backfill_progress = @min(view.backfill_progress, 0.999);
+    }
+
     const dense_catch_up = async_indexing.dense_catch_up;
     if (!dense_catch_up.active) return view;
     view.catch_up_active = true;
@@ -1586,6 +1596,7 @@ const AggregatedIndexStatus = struct {
     repair_active_generation_serviceable: bool = false,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
+    dense_vector_projection_pending: bool = false,
     enrichment_failed: bool = false,
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,
@@ -1798,6 +1809,7 @@ fn aggregateIndexStatusIndexed(
             }
         }
         const public_item = publicShardIndexRuntimeView(item, runtime.stats.async_indexing);
+        if (public_item.dense_vector_projection_pending) aggregate.dense_vector_projection_pending = true;
         aggregate.doc_count += item.doc_count;
         aggregate.term_count += item.term_count;
         aggregate.edge_count += item.edge_count;
@@ -1926,6 +1938,7 @@ fn normalizeReadyEmbeddingsAggregate(aggregate: *AggregatedIndexStatus) void {
         aggregate.remote_unknown_group_count > 0 or
         aggregate.expected_group_count != aggregate.fresh_group_count) return;
     if (aggregate.load_error != null or aggregate.repair_degraded or aggregate.enrichment_failed) return;
+    if (aggregate.dense_vector_projection_pending) return;
     const enrichment_blocked = aggregate.enrichment.enabled and (aggregate.enrichment.retrying or aggregate.enrichment.worker_failed);
     if (enrichment_blocked) return;
     const complete_materialization = aggregate.coverage_identity_ready and
@@ -3043,6 +3056,8 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         materialization_complete;
     const all_sources_settled = !coverage_incomplete and replay_current and
         coverageAllSourcesTerminal(table_doc_count, produced_count, skipped_count, terminal_failed_count);
+    const vector_projection_pending = @hasField(@TypeOf(item), "dense_vector_projection_pending") and
+        item.dense_vector_projection_pending;
     if (if (observation_current) enrichment else null) |stats| {
         const index_applied_sequence = view.replay_applied_sequence;
         const index_target_sequence = view.replay_target_sequence;
@@ -3072,13 +3087,13 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         false;
     const merged_replay_current = view.replay_applied_sequence >= view.replay_target_sequence and
         !view.replay_catch_up_required;
-    if (readiness_complete and merged_replay_current and !enrichment_pending) {
+    if (readiness_complete and merged_replay_current and !enrichment_pending and !vector_projection_pending) {
         view.replay_catch_up_required = false;
         view.backfill_active = false;
         view.backfill_progress = 1.0;
         return view;
     }
-    if (all_sources_settled and merged_replay_current and !enrichment_pending) {
+    if (all_sources_settled and merged_replay_current and !enrichment_pending and !vector_projection_pending) {
         view.replay_catch_up_required = false;
         view.backfill_active = false;
         view.backfill_progress = 1.0;
@@ -3093,7 +3108,7 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
         view.backfill_progress = 0.0;
         return view;
     }
-    if (readiness_complete and !enrichment_pending) {
+    if (readiness_complete and !enrichment_pending and !vector_projection_pending) {
         view.backfill_active = false;
         view.backfill_progress = 1.0;
     } else if (!coverage_incomplete and replay_ready and source_coverage_visible and (!require_table_coverage or table_doc_count == 0) and !enrichment_pending) {
@@ -3108,7 +3123,74 @@ fn embeddingsRuntimeView(item: anytype, table_doc_count: u64, coverage_policy: E
                 @as(f64, @floatFromInt(table_doc_count)),
         );
     }
+    if (vector_projection_pending) {
+        view.backfill_active = true;
+        view.backfill_progress = @min(view.backfill_progress, 0.999);
+    }
     return view;
+}
+
+test "native dense vector projection remains public readiness debt after external coverage converges" {
+    const item: db_mod.types.DBIndexStats = .{
+        .name = "vec",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 7,
+        .coverage_config_hash = 41,
+        .coverage_identity_ready = true,
+        .backfill_active = true,
+        .backfill_progress = 0.999,
+        .dense_vector_projection_pending = true,
+        .replay_applied_sequence = 9,
+        .replay_target_sequence = 9,
+    };
+    const view = embeddingsRuntimeView(item, 1, .external, false, 7, 41, null, true);
+    try std.testing.expect(view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.999), view.backfill_progress);
+
+    var aggregate: AggregatedIndexStatus = .{
+        .kind = .dense_vector,
+        .backfill_active = true,
+        .backfill_progress = 0.999,
+        .dense_vector_projection_pending = true,
+        .reported_group_count = 1,
+        .expected_group_count = 1,
+        .fresh_group_count = 1,
+        .runtime_present = true,
+        .runtime_fresh = true,
+        .table_doc_count = 1,
+        .doc_count = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 7,
+        .coverage_config_hash = 41,
+        .coverage_identity_ready = true,
+        .replay_applied_sequence = 9,
+        .replay_target_sequence = 9,
+        .catch_up_applied_sequence = 9,
+        .catch_up_target_sequence = 9,
+    };
+    normalizeReadyEmbeddingsAggregate(&aggregate);
+    try std.testing.expect(aggregate.backfill_active);
+    try std.testing.expect(aggregate.dense_vector_projection_pending);
+}
+
+test "writer native vector finalization projects through cached shard status" {
+    const cached: db_mod.types.DBIndexStats = .{
+        .name = "vec",
+        .kind = .dense_vector,
+        .backfill_active = false,
+        .backfill_progress = 1.0,
+        .replay_applied_sequence = 501,
+        .replay_target_sequence = 501,
+    };
+    const view = publicShardIndexRuntimeView(cached, .{
+        .dense_projection_finalizing = true,
+    });
+    try std.testing.expect(view.dense_vector_projection_pending);
+    try std.testing.expect(view.backfill_active);
+    try std.testing.expectEqual(@as(f64, 0.999), view.backfill_progress);
 }
 
 fn aggregateRuntimeCoverageIncomplete(item: anytype, expected_generation: u64, expected_config_hash: u64) bool {
@@ -3631,6 +3713,8 @@ fn appendSingleIndexRuntimeStatus(
             replay_current,
         );
         const coverage_complete = coverage.complete;
+        const vector_projection_pending = @hasField(@TypeOf(item), "dense_vector_projection_pending") and
+            item.dense_vector_projection_pending;
         const artifact_publish_pending = !embeddings_materialization_current or
             (replay_target_sequence > 0 and
                 !embeddingsArtifactPublishComplete(item, embeddings_sparse, produced_count) and
@@ -3650,7 +3734,9 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"dense_replay_target_sequence\":");
         try appendIntValue(alloc, out, replay_target_sequence);
         try out.appendSlice(alloc, ",\"dense_publish_pending\":");
-        try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required or artifact_publish_pending) "true" else "false");
+        try out.appendSlice(alloc, if (catch_up_active or replay_catch_up_required or artifact_publish_pending or vector_projection_pending) "true" else "false");
+        try out.appendSlice(alloc, ",\"dense_vector_projection_pending\":");
+        try out.appendSlice(alloc, if (vector_projection_pending) "true" else "false");
         try out.appendSlice(alloc, ",\"coverage\":{");
         try appendJsonString(alloc, out, "policy");
         try out.append(alloc, ':');
@@ -4123,6 +4209,8 @@ fn appendAsyncIndexingStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnmana
     try appendStartupCatchUpStatus(alloc, out, stats.startup);
     try out.appendSlice(alloc, ",\"dense_catch_up\":");
     try appendDenseCatchUpStatus(alloc, out, stats.dense_catch_up);
+    try out.appendSlice(alloc, ",\"dense_projection_finalizing\":");
+    try out.appendSlice(alloc, if (stats.dense_projection_finalizing) "true" else "false");
     try out.append(alloc, '}');
 }
 

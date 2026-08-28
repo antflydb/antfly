@@ -1961,6 +1961,7 @@ fn writeLsmWriteMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Backend.W
     try health_metrics.appendPromMetric(writer, "antfly_lsm_wal_reset_ns_total", "counter", "Nanoseconds spent resetting cached write LSM WAL files", stats.wal_reset_ns);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_rotations_total", "counter", "Cached write LSM mutable-to-immutable rotations", stats.immutable_rotations);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flushes_total", "counter", "Cached write LSM immutable memtable flushes", stats.immutable_flushes);
+    try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_input_memtables_total", "counter", "Immutable memtable epochs consumed by cached write LSM flush windows", stats.immutable_flush_input_memtables);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_entries_total", "counter", "Entries flushed from cached write LSM immutable memtables", stats.immutable_flush_entries);
     try health_metrics.appendPromMetric(writer, "antfly_lsm_immutable_flush_ns_total", "counter", "Nanoseconds spent flushing cached write LSM immutable memtables", stats.immutable_flush_ns);
 }
@@ -2320,6 +2321,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.inference_scratch_working_set,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
+        resource_manager_mod.Slice.dense_vector_block_build_working_set,
     }) |slice| {
         const stats = snapshot.slices[@intFromEnum(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
@@ -2344,9 +2346,12 @@ fn resourceMetricValue(stats: resource_manager_mod.SliceStats, field: ResourceMe
 fn writeLsmCacheMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.CacheStats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_used_bytes", "gauge", "Shared LSM cache bytes currently resident", @intCast(stats.used_bytes));
     try health_metrics.appendPromMetric(writer, "antfly_lsm_cache_entries", "gauge", "Shared LSM cache entry count", @intCast(stats.entry_count));
+    try writeLsmCacheKindMetricFamily(writer, stats, .used_bytes, "antfly_lsm_cache_kind_used_bytes", "gauge", "Shared LSM cache resident bytes by entry kind");
     try writeLsmCacheKindMetricFamily(writer, stats, .hits, "antfly_lsm_cache_hits_total", "counter", "Shared LSM cache hits");
     try writeLsmCacheKindMetricFamily(writer, stats, .misses, "antfly_lsm_cache_misses_total", "counter", "Shared LSM cache misses");
     try writeLsmCacheKindMetricFamily(writer, stats, .inserts, "antfly_lsm_cache_inserts_total", "counter", "Shared LSM cache inserts");
+    try writeLsmCacheKindMetricFamily(writer, stats, .transient_serves, "antfly_lsm_cache_transient_serves_total", "counter", "LSM values served without cache retention by entry kind");
+    try writeLsmCacheKindMetricFamily(writer, stats, .policy_bypasses, "antfly_lsm_cache_policy_bypasses_total", "counter", "LSM cache admissions bypassed by caller policy by entry kind");
     try writeLsmCacheKindMetricFamily(writer, stats, .evictions, "antfly_lsm_cache_evictions_total", "counter", "Shared LSM cache evictions");
     try writeLsmCacheKindMetricFamily(writer, stats, .invalidations, "antfly_lsm_cache_invalidations_total", "counter", "Shared LSM cache invalidations");
     try writeLsmCacheKindMetricFamily(writer, stats, .waits, "antfly_lsm_cache_waits_total", "counter", "Shared LSM cache pending-load waits");
@@ -2394,9 +2399,12 @@ fn writeProcessMemoryMetrics(writer: *std.Io.Writer, stats: process_memory_mod.S
 }
 
 const LsmCacheMetricField = enum {
+    used_bytes,
     hits,
     misses,
     inserts,
+    transient_serves,
+    policy_bypasses,
     evictions,
     invalidations,
     waits,
@@ -2432,9 +2440,12 @@ fn appendLsmCacheKindSample(
 
 fn lsmCacheMetricValue(stats: lsm_backend_mod.CacheKindStats, field: LsmCacheMetricField) u64 {
     return switch (field) {
+        .used_bytes => @intCast(stats.used_bytes),
         .hits => stats.hits,
         .misses => stats.misses,
         .inserts => stats.inserts,
+        .transient_serves => stats.transient_serves,
+        .policy_bypasses => stats.policy_bypasses,
         .evictions => stats.evictions,
         .invalidations => stats.invalidations,
         .waits => stats.waits,
@@ -4604,6 +4615,7 @@ pub const DataServer = struct {
     lsm_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
     lsm_maintenance_obsolete_reclaim_due_ns: std.atomic.Value(u64) = .init(0),
     dense_posting_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
+    vector_block_maintenance_next_eligible_ns: std.atomic.Value(u64) = .init(0),
 
     const lsm_maintenance_worker_idle_sleep_ns = 250 * std.time.ns_per_ms;
     const lsm_maintenance_worker_retry_sleep_ns = 100 * std.time.ns_per_ms;
@@ -4622,6 +4634,7 @@ pub const DataServer = struct {
     // fixed cadence and retries quickly only while repairs are landing.
     const dense_posting_maintenance_idle_interval_ns = 30 * std.time.ns_per_s;
     const dense_posting_maintenance_retry_interval_ns = 1 * std.time.ns_per_s;
+    const vector_block_maintenance_interval_ns = 1 * std.time.ns_per_s;
     const ha_replication_default_max_records_per_apply = 256;
     const ha_replication_default_max_encoded_bytes_per_apply = 4 * 1024 * 1024;
     const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
@@ -6589,7 +6602,11 @@ pub const DataServer = struct {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
         const now_ns = platform_time.monotonicNs();
         if (now_ns < self.lsm_maintenance_next_eligible_ns.load(.monotonic)) return;
-        if (self.resourcePressureDefersBackgroundMaintenance()) {
+        // Exact-vector publication has its own bounded ResourceManager lane
+        // and is part of dense-index readiness. Soft LSM pressure must not
+        // prevent the worker from reaching it; generic maintenance still
+        // yields below.
+        if (self.resourcePressureDefersMaintenanceWake(now_ns)) {
             self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
             _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
             return;
@@ -6677,6 +6694,10 @@ pub const DataServer = struct {
         return now_ns >= self.dense_posting_maintenance_next_eligible_ns.load(.monotonic);
     }
 
+    fn vectorBlockMaintenanceDue(self: *DataServer, now_ns: u64) bool {
+        return now_ns >= self.vector_block_maintenance_next_eligible_ns.load(.monotonic);
+    }
+
     fn backgroundMaintenanceDue(self: *DataServer, now_ns: u64) bool {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return false;
         const live_write_source = self.liveRuntimeWriteSource();
@@ -6685,6 +6706,7 @@ pub const DataServer = struct {
             return true;
         }
         if (self.densePostingMaintenanceDue(now_ns)) return true;
+        if (self.vectorBlockMaintenanceDue(now_ns)) return true;
         const obsolete_due_ns = self.lsm_maintenance_obsolete_reclaim_due_ns.load(.monotonic);
         if (obsolete_due_ns != 0 and now_ns < obsolete_due_ns) return false;
         if (live_write_source.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| {
@@ -6711,6 +6733,11 @@ pub const DataServer = struct {
 
     fn resourcePressureDefersBackgroundMaintenance(self: *DataServer) bool {
         return self.provisioned_storage.resource_manager.shouldDeferBackgroundWork(.lsm_compaction_work);
+    }
+
+    fn resourcePressureDefersMaintenanceWake(self: *DataServer, now_ns: u64) bool {
+        return self.resourcePressureDefersBackgroundMaintenance() and
+            !self.vectorBlockMaintenanceDue(now_ns);
     }
 
     fn deferLsmMaintenance(self: *DataServer, now_ns: u64, delay_ns: u64) void {
@@ -6742,6 +6769,37 @@ pub const DataServer = struct {
                 sleepLsmMaintenanceWorker();
                 continue;
             }
+
+            const live_write_source = self.liveRuntimeWriteSource();
+            // Exact-vector publication is readiness-critical, uses its own
+            // allocation-accounted build lane, and commonly frees a larger
+            // decoded-vector cache when it publishes. Attempt it before the
+            // soft-pressure gate that protects optional LSM maintenance.
+            const vector_now_ns = platform_time.monotonicNs();
+            if (self.vectorBlockMaintenanceDue(vector_now_ns)) {
+                // Projection publication is part of dense-index readiness.
+                // Invalidate the cached status before entering a potentially
+                // long build and again on failure, even when no step commits.
+                // The worker remains best-effort and retries in the
+                // background, but clients must keep seeing `pending` instead
+                // of paying the fallback scan on their first query.
+                self.runtime_status_dirty.store(true, .release);
+                self.markStoreStatusDirtyImmediate();
+                const vector_steps = live_write_source.runVectorBlockMaintenanceRoundBestEffort() catch |err| blk: {
+                    std.log.warn("vector block maintenance round failed: {}", .{err});
+                    self.runtime_status_dirty.store(true, .release);
+                    self.markStoreStatusDirtyImmediate();
+                    break :blk 0;
+                };
+                self.vector_block_maintenance_next_eligible_ns.store(
+                    vector_now_ns +| vector_block_maintenance_interval_ns,
+                    .release,
+                );
+                if (vector_steps > 0) {
+                    self.runtime_status_dirty.store(true, .release);
+                    self.markStoreStatusDirtyImmediate();
+                }
+            }
             if (self.resourcePressureDefersBackgroundMaintenance()) {
                 self.deferLsmMaintenance(now_ns, lsm_maintenance_worker_pressure_defer_ns);
                 _ = self.lsm_maintenance_capacity_denied.fetchAdd(1, .monotonic);
@@ -6759,7 +6817,6 @@ pub const DataServer = struct {
 
             self.lsm_maintenance_active.store(true, .release);
             _ = self.lsm_maintenance_started.fetchAdd(1, .monotonic);
-            const live_write_source = self.liveRuntimeWriteSource();
             var completed = false;
             var maintenance_progressed = false;
             var maintenance_progressed_groups: [lsm_maintenance_worker_max_steps_per_wake]u64 = undefined;
@@ -13709,6 +13766,7 @@ pub const DataServer = struct {
         if (status.stats.async_indexing.dense_catch_up.active) return true;
         if (status.stats.async_indexing.bulk_coalescing.active_session) return true;
         for (status.stats.indexes) |index| {
+            if (index.dense_vector_projection_pending) return true;
             if (index.backfill_active) return true;
             if (index.catch_up_active) return true;
             if (index.replay_catch_up_required) return true;
@@ -16124,6 +16182,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .dense_vector_projection_pending = index.dense_vector_projection_pending,
         .repair_status = index.index_repair_status,
         .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
@@ -16136,17 +16195,19 @@ test "data runtime report preserves compact managed repair admission state" {
         .kind = .dense_vector,
         .index_repair_status = .waiting,
         .index_repair_active_generation_serviceable = false,
+        .dense_vector_projection_pending = true,
     });
     defer antfly.metadata.table_manager.freeRuntimeIndexStatusReport(alloc, report);
 
     try std.testing.expectEqual(antfly.metadata.table_manager.IndexRepairStatus.waiting, report.repair_status.?);
     try std.testing.expect(!report.repair_active_generation_serviceable);
+    try std.testing.expect(report.dense_vector_projection_pending);
 
     const encoded = try std.json.Stringify.valueAlloc(alloc, report, .{});
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false,\"dense_vector_projection_pending\":true}",
         encoded,
     );
 }
@@ -25084,7 +25145,9 @@ test "data runtime metrics use prometheus labels for resource and cache dimensio
     try writeLsmCacheMetrics(&writer, cache.snapshotStats());
     const cache_output = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "# HELP antfly_lsm_cache_hits_total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_kind_used_bytes{kind=\"run_table_physical_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_hits_total{kind=\"run_table_index\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_policy_bypasses_total{kind=\"run_table_block\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, cache_output, "antfly_lsm_cache_waits_total{kind=\"run_table_block\"}") != null);
 
     writer = .fixed(&writer_buf);
@@ -29024,6 +29087,13 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
     );
     defer server.provisioned_storage.resource_manager.observeUsage(.lsm_compaction_work, &observed_bytes, 0);
     try std.testing.expect(server.resourcePressureDefersBackgroundMaintenance());
+
+    // Soft LSM pressure still suppresses an LSM-only wake, but it cannot
+    // starve the separately-accounted exact-vector readiness lane.
+    server.vector_block_maintenance_next_eligible_ns.store(101, .release);
+    try std.testing.expect(server.resourcePressureDefersMaintenanceWake(100));
+    server.vector_block_maintenance_next_eligible_ns.store(100, .release);
+    try std.testing.expect(!server.resourcePressureDefersMaintenanceWake(100));
 }
 
 test "data runtime background maintenance is due for dense posting cadence without lsm debt" {

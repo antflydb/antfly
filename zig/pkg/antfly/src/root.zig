@@ -155,6 +155,7 @@ pub const lmdb = @import("storage/lmdb.zig");
 pub const lmdb_engine = @import("lmdb_engine");
 pub const hbc = @import("storage/hbc_adapter.zig");
 pub const posting_segment_store = @import("storage/posting_segment_store.zig");
+pub const vector_block_store = @import("storage/vector_block_store.zig");
 pub const ha = @import("storage/ha/mod.zig");
 pub const wal = @import("storage/wal.zig");
 pub const persistent = @import("storage/persistent.zig");

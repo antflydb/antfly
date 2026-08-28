@@ -881,6 +881,11 @@ fn workerMain(worker: *Worker) void {
         worker.catch_up_active = true;
         runtime.mutex.unlock(io);
 
+        // Do not pin the primary replay generation until the coalescing wait
+        // has collected its batch. Otherwise a stable cursor can only observe
+        // the pre-wait tail and every newly arrived record forces another
+        // publication cycle.
+        waitForReplayWindow(runtime, worker, from_sequence, io);
         ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
             runtime.mutex.lockUncancelable(io);
             worker.catch_up_active = false;
@@ -900,8 +905,6 @@ fn workerMain(worker: *Worker) void {
             runtime.recordError(io, worker.name, "begin_catch_up_session", err);
             return;
         };
-        waitForReplayWindow(runtime, worker, from_sequence, io);
-
         var stats = catchUpWorker(runtime, worker) catch |err| {
             runtime.mutex.lockUncancelable(io);
             worker.catch_up_active = false;
@@ -1305,6 +1308,11 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
         const sleep_ns = @min(delay_ns, max_wait_ns - waited_ns);
         io.sleep(Io.Duration.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
         waited_ns +|= sleep_ns;
+
+        runtime.mutex.lockUncancelable(io);
+        const target_advanced = worker.target_sequence > target;
+        runtime.mutex.unlock(io);
+        if (!target_advanced) return;
     }
 }
 

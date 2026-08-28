@@ -1136,6 +1136,46 @@ pub fn buildRunsFromStateBorrowedWithReservedIds(
     return runs;
 }
 
+/// Stream a newest-first window of immutable memtables into one persisted L0
+/// publication. The states remain borrowed and independently readable while
+/// the backend lock is released; duplicate keys are resolved in favor of the
+/// lowest (newest) source index without materializing a combined heap state.
+pub fn buildRunsFromStatesBorrowedWithReservedIds(
+    comptime BackendType: type,
+    backend: *BackendType,
+    states_newest_first: []const *const State,
+    reserved_run_id_start: u64,
+    reserved_run_id_end: u64,
+) !std.ArrayListUnmanaged(Run) {
+    if (states_newest_first.len == 0) return error.EmptyRun;
+    const BuildBackend = struct {
+        allocator: std.mem.Allocator,
+        storage: @TypeOf(backend.storage),
+        root_dir: @TypeOf(backend.root_dir),
+        options: @TypeOf(backend.options),
+        next_run_id: u64,
+    };
+    var build_backend = BuildBackend{
+        .allocator = backend.allocator,
+        .storage = backend.storage,
+        .root_dir = backend.root_dir,
+        .options = backend.options,
+        .next_run_id = reserved_run_id_start,
+    };
+    const runs = try makePersistedRunsFromStatesBorrowed(
+        BuildBackend,
+        &build_backend,
+        states_newest_first,
+        0,
+    );
+    errdefer {
+        var owned = runs;
+        discardOutputRuns(BuildBackend, &build_backend, &owned);
+    }
+    if (build_backend.next_run_id > reserved_run_id_end) return error.FlushRunIdReservationExhausted;
+    return runs;
+}
+
 fn relocatePlanIfInputsStillMatch(runs: []const Run, plan: CompactionPlan, selected_run_ids: []const u64) ?CompactionPlan {
     if (selected_run_ids.len != plan.source_len + plan.target_len or plan.source_len == 0) return null;
 
@@ -2511,6 +2551,90 @@ fn makePersistedRunsFromSelectedRunsWithForegroundPolicy(
     return runs;
 }
 
+fn makePersistedRunsFromStatesBorrowed(
+    comptime BackendType: type,
+    backend: *BackendType,
+    states_newest_first: []const *const State,
+    output_level: u32,
+) !std.ArrayListUnmanaged(Run) {
+    const allocator = backend.allocator;
+    var expected_entries: usize = 0;
+    for (states_newest_first) |state| {
+        if (state.entries.items.len == 0) return error.EmptyRun;
+        expected_entries = std.math.add(usize, expected_entries, state.entries.items.len) catch
+            return error.OutOfMemory;
+    }
+
+    var heap = try StateMergeHeap.init(allocator, states_newest_first);
+    defer heap.deinit();
+    var runs = std.ArrayListUnmanaged(Run).empty;
+    errdefer discardOutputRuns(BackendType, backend, &runs);
+    var output: PersistedOutputRunBuilder(BackendType) = undefined;
+    var output_active = false;
+    defer if (output_active) output.deinit();
+    const target_bytes = targetRunFileBytes(BackendType, backend);
+    const expected_entries_per_output = @max(
+        @as(usize, 1),
+        @min(expected_entries, target_bytes / minimum_table_entry_logical_bytes),
+    );
+    var consumed_entries: usize = 0;
+    var emitted_entries: usize = 0;
+
+    while (heap.peekSource()) |winner_source| {
+        const winner_owned = states_newest_first[winner_source].entries.items[heap.positions[winner_source]];
+        const winner = tableEntryFromOwnedEntry(winner_owned);
+        const entry_bytes = tableEntryLogicalBytes(winner);
+        if (output_active) {
+            const partition_changed = output.entry_count > 0 and !sameRunPartition(
+                output.smallest_namespace_name,
+                output.smallest_key,
+                winner.namespace_name,
+                winner.key,
+                backend.options.run_partition_prefix_bytes,
+            );
+            if (partition_changed or
+                (output.entry_count > 0 and target_bytes > 0 and output.logical_bytes + entry_bytes > target_bytes) or
+                (output.entry_count > 0 and !output.canAppendEntry(winner)))
+            {
+                try runs.ensureUnusedCapacity(allocator, 1);
+                runs.appendAssumeCapacity(try output.finish());
+                output.deinit();
+                output_active = false;
+            }
+        }
+        if (!output_active) {
+            const remaining_entries = expected_entries - consumed_entries;
+            try output.initInPlace(
+                backend,
+                output_level,
+                @max(@as(usize, 1), @min(remaining_entries, expected_entries_per_output)),
+            );
+            output_active = true;
+        }
+        if (!output.canAppendEntry(winner)) return error.TableFileTooLarge;
+        try output.appendEntry(winner, entry_bytes);
+        emitted_entries += 1;
+        consumed_entries += try heap.advanceTopSourcesAtKey(winner);
+
+        if (output.logical_bytes >= target_bytes) {
+            try runs.ensureUnusedCapacity(allocator, 1);
+            runs.appendAssumeCapacity(try output.finish());
+            output.deinit();
+            output_active = false;
+        }
+    }
+    if (output_active) {
+        try runs.ensureUnusedCapacity(allocator, 1);
+        runs.appendAssumeCapacity(try output.finish());
+        output.deinit();
+        output_active = false;
+    }
+    if (runs.items.len == 0) return error.EmptyRun;
+    if (consumed_entries != expected_entries) return error.InvalidTableFile;
+    if (countRunEntries(runs.items) != emitted_entries) return error.InvalidTableFile;
+    return runs;
+}
+
 fn PersistedOutputRunBuilder(comptime BackendType: type) type {
     return struct {
         backend: *BackendType,
@@ -2752,6 +2876,117 @@ const PersistedRunCursor = struct {
             window.checksum,
         );
         self.loaded_window = window;
+    }
+};
+
+const StateMergeHeap = struct {
+    allocator: std.mem.Allocator,
+    states: []const *const State,
+    positions: []usize,
+    sources: []usize,
+    advanced_sources: []usize,
+    len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, states: []const *const State) !StateMergeHeap {
+        const positions = try allocator.alloc(usize, states.len);
+        errdefer allocator.free(positions);
+        @memset(positions, 0);
+        const sources = try allocator.alloc(usize, states.len);
+        errdefer allocator.free(sources);
+        const advanced_sources = try allocator.alloc(usize, states.len);
+        errdefer allocator.free(advanced_sources);
+        var heap = StateMergeHeap{
+            .allocator = allocator,
+            .states = states,
+            .positions = positions,
+            .sources = sources,
+            .advanced_sources = advanced_sources,
+        };
+        errdefer heap.deinit();
+        for (states, 0..) |state, source| {
+            if (state.entries.items.len != 0) try heap.pushSource(source);
+        }
+        return heap;
+    }
+
+    fn deinit(self: *StateMergeHeap) void {
+        self.allocator.free(self.positions);
+        self.allocator.free(self.sources);
+        self.allocator.free(self.advanced_sources);
+        self.* = undefined;
+    }
+
+    fn peekSource(self: *const StateMergeHeap) ?usize {
+        return if (self.len == 0) null else self.sources[0];
+    }
+
+    fn currentEntry(self: *const StateMergeHeap, source: usize) lsm_table_file.Entry {
+        return tableEntryFromOwnedEntry(self.states[source].entries.items[self.positions[source]]);
+    }
+
+    fn advanceTopSourcesAtKey(self: *StateMergeHeap, key_entry: lsm_table_file.Entry) !usize {
+        var advanced_len: usize = 0;
+        while (self.peekSource()) |source| {
+            if (compareTableEntry(self.currentEntry(source), key_entry) != .eq) break;
+            _ = self.popSource();
+            self.positions[source] += 1;
+            self.advanced_sources[advanced_len] = source;
+            advanced_len += 1;
+        }
+        for (self.advanced_sources[0..advanced_len]) |source| {
+            if (self.positions[source] < self.states[source].entries.items.len) try self.pushSource(source);
+        }
+        return advanced_len;
+    }
+
+    fn pushSource(self: *StateMergeHeap, source: usize) !void {
+        std.debug.assert(self.len < self.sources.len);
+        self.sources[self.len] = source;
+        self.len += 1;
+        try self.siftUp(self.len - 1);
+    }
+
+    fn popSource(self: *StateMergeHeap) usize {
+        std.debug.assert(self.len != 0);
+        const source = self.sources[0];
+        self.len -= 1;
+        if (self.len > 0) {
+            self.sources[0] = self.sources[self.len];
+            self.siftDown(0) catch unreachable;
+        }
+        return source;
+    }
+
+    fn siftUp(self: *StateMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (index > 0) {
+            const parent = (index - 1) / 2;
+            if (!self.sourceLess(self.sources[index], self.sources[parent])) break;
+            std.mem.swap(usize, &self.sources[index], &self.sources[parent]);
+            index = parent;
+        }
+    }
+
+    fn siftDown(self: *StateMergeHeap, start_index: usize) !void {
+        var index = start_index;
+        while (true) {
+            const left = index * 2 + 1;
+            if (left >= self.len) break;
+            const right = left + 1;
+            var child = left;
+            if (right < self.len and self.sourceLess(self.sources[right], self.sources[left])) child = right;
+            if (!self.sourceLess(self.sources[child], self.sources[index])) break;
+            std.mem.swap(usize, &self.sources[child], &self.sources[index]);
+            index = child;
+        }
+    }
+
+    fn sourceLess(self: *const StateMergeHeap, lhs_source: usize, rhs_source: usize) bool {
+        const order = compareTableEntry(self.currentEntry(lhs_source), self.currentEntry(rhs_source));
+        if (order != .eq) return order == .lt;
+        // Callers pass newest to oldest, so the lower source index wins a
+        // duplicate key and is emitted before all older copies are advanced.
+        return lhs_source < rhs_source;
     }
 };
 

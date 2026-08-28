@@ -674,6 +674,29 @@ fn storesHaveRuntimeRepairStatus(stores: []const metadata_table_manager.StoreRec
     return false;
 }
 
+fn storeHasDenseVectorProjectionPending(record: anytype) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.dense_vector_projection_pending) return true;
+        }
+    }
+    return false;
+}
+
+fn reportsHaveDenseVectorProjectionPending(reports: []const metadata_table_manager.StoreStatusReport) bool {
+    for (reports) |report| {
+        if (storeHasDenseVectorProjectionPending(report)) return true;
+    }
+    return false;
+}
+
+fn storesHaveDenseVectorProjectionPending(stores: []const metadata_table_manager.StoreRecord) bool {
+    for (stores) |store| {
+        if (storeHasDenseVectorProjectionPending(store)) return true;
+    }
+    return false;
+}
+
 fn storesHaveRuntimeReporterFence(stores: []const metadata_table_manager.StoreRecord) bool {
     for (stores) |store| {
         if (store.reporter_incarnation != 0) return true;
@@ -713,9 +736,14 @@ fn runtimeStatusProtocolSafeCommand(
                 record.reporter_incarnation,
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
-            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+            const vector_projection_pending = storeHasDenseVectorProjectionPending(record);
+            const needs_current_protocol = vector_projection_pending or storeHasRuntimeRepairStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
+            // Projection debt is a readiness fence. Encoding it as v12/v13
+            // would turn pending work into ready state, so it has no safe
+            // rolling-upgrade downgrade.
+            if (vector_projection_pending) return error.RuntimeStatusProtocolUnavailable;
             // Unlike registration, an upsert carrying an incarnation may be a
             // clone of already-committed v13 state. Downgrading it would erase
             // causal authority. Retry after readiness can be proven instead.
@@ -731,9 +759,11 @@ fn runtimeStatusProtocolSafeCommand(
                 record.reporter_incarnation,
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
-            const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+            const vector_projection_pending = storeHasDenseVectorProjectionPending(record);
+            const needs_current_protocol = vector_projection_pending or storeHasRuntimeRepairStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
+            if (vector_projection_pending) return error.RuntimeStatusProtocolUnavailable;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
             stripRuntimeReporterFence(&legacy_record);
@@ -6568,6 +6598,50 @@ test "metadata service transition commands downgrade runtime repair status until
     try std.testing.expectEqual(@as(u64, 77), current_command.upsert_store.reporter_incarnation);
 }
 
+test "metadata service never downgrades vector projection readiness debt" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        ready: bool,
+
+        fn runtimeStatusRepairProtocolReady(self: *@This()) bool {
+            return self.ready;
+        }
+    };
+    var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .dense_vector_projection_pending = true,
+    }};
+    var runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .indexes = indexes[0..],
+    }};
+    const store = metadata_table_manager.StoreRecord{
+        .store_id = 1,
+        .node_id = 2,
+        .runtime_statuses = runtime_statuses[0..],
+    };
+    var service = FakeService{ .alloc = std.testing.allocator, .ready = false };
+    var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
+
+    try std.testing.expectError(
+        error.RuntimeStatusProtocolUnavailable,
+        runtimeStatusProtocolSafeCommand(
+            &service,
+            .{ .register_store = store },
+            &owned_legacy_store,
+        ),
+    );
+    try std.testing.expect(owned_legacy_store == null);
+
+    service.ready = true;
+    const command = try runtimeStatusProtocolSafeCommand(
+        &service,
+        .{ .register_store = store },
+        &owned_legacy_store,
+    );
+    try std.testing.expect(storeHasDenseVectorProjectionPending(command.register_store));
+}
+
 test "metadata service defers reporter fence transitions while activation is unknown" {
     const FakeService = struct {
         alloc: std.mem.Allocator,
@@ -6626,6 +6700,53 @@ test "metadata service defers reporter fence transitions while activation is unk
     try std.testing.expectEqual(@as(u64, 0), service.last_reporter_incarnation);
     try std.testing.expectEqual(@as(u64, 0x1234), projected[0].reporter_incarnation);
     try std.testing.expectEqual(@as(u64, 0), projected[1].reporter_incarnation);
+}
+
+test "metadata service defers vector projection readiness transitions while activation is unknown" {
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        upserts: usize = 0,
+
+        fn runtimeStatusRepairProtocolReady(_: *@This()) bool {
+            return false;
+        }
+
+        fn upsertStore(self: *@This(), _: metadata_table_manager.StoreRecord) !void {
+            self.upserts += 1;
+        }
+    };
+
+    var projected = [_]metadata_table_manager.StoreRecord{
+        try metadata_table_manager.cloneStore(std.testing.allocator, .{
+            .store_id = 7,
+            .node_id = 9,
+        }),
+    };
+    defer metadata_table_manager.freeStore(std.testing.allocator, projected[0]);
+    var indexes = [_]metadata_table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+        .dense_vector_projection_pending = true,
+    }};
+    var runtime_statuses = [_]metadata_table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .group_id = 2,
+        .store_id = 7,
+        .node_id = 9,
+        .indexes = indexes[0..],
+    }};
+    const reports = [_]metadata_table_manager.StoreStatusReport{.{
+        .store_id = 7,
+        .runtime_statuses = runtime_statuses[0..],
+    }};
+    var service = FakeService{ .alloc = std.testing.allocator };
+
+    try std.testing.expectError(
+        error.RuntimeStatusProtocolUnavailable,
+        reportStoreStatusesWithProjected(&service, &projected, &reports),
+    );
+    try std.testing.expectEqual(@as(usize, 0), service.upserts);
+    try std.testing.expect(!storeHasDenseVectorProjectionPending(projected[0]));
 }
 
 test "metadata service status reporting never proposes deletion of committed repair facts while activation is unknown" {
@@ -7374,18 +7495,28 @@ fn reportStoreStatusesWithProjected(
     projected: []metadata_table_manager.StoreRecord,
     reports: []const metadata_table_manager.StoreStatusReport,
 ) !usize {
-    // Reporter fences and both publishing and clearing repair facts are v13
-    // transitions. Avoid the activation lookup for the overwhelmingly common
-    // all-v12 case, but fail closed as soon as either side carries v13 state.
-    // Otherwise a status report could introduce an unreadable record or erase
-    // committed causal authority during startup or a transient marker failure.
+    // Reporter fences, repair facts, and native vector projection debt are
+    // versioned transitions. Avoid the activation lookup for the common
+    // all-v12 case, but fail closed as soon as either side carries newer state.
+    // Otherwise a report could introduce an unreadable record or erase a
+    // readiness/admission fence during startup or a rolling upgrade.
     const repair_status_transition_possible = reportsHaveRuntimeRepairStatus(reports) or
         storesHaveRuntimeRepairStatus(projected);
+    const vector_projection_transition_possible = reportsHaveDenseVectorProjectionPending(reports) or
+        storesHaveDenseVectorProjectionPending(projected);
     const current_protocol_transition_possible = repair_status_transition_possible or
+        vector_projection_transition_possible or
         reportsHaveRuntimeReporterFence(reports) or
         storesHaveRuntimeReporterFence(projected);
     const current_protocol_ready = !current_protocol_transition_possible or
         service.runtimeStatusRepairProtocolReady();
+    // Unlike repair state, projection debt cannot be conservatively stripped:
+    // false means public query readiness. Leave the committed projection
+    // untouched and make the reporter retry once every metadata member can
+    // decode V14.
+    if (vector_projection_transition_possible and !current_protocol_ready) {
+        return error.RuntimeStatusProtocolUnavailable;
+    }
     const include_repair_status = !repair_status_transition_possible or current_protocol_ready;
     var changed_indices = std.ArrayListUnmanaged(usize).empty;
     defer changed_indices.deinit(service.alloc);

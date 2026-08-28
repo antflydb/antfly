@@ -7,6 +7,7 @@
 
 const http_server = @import("api/http_server.zig");
 const httpx_handler = @import("api/httpx_handler.zig");
+const indexes = @import("api/indexes.zig");
 const kernel_abi = @import("api/kernel_abi.zig");
 const kernel_bridge = @import("api/kernel_bridge.zig");
 const kernel_exports = @import("api/kernel_exports.zig");
@@ -22,6 +23,7 @@ pub const lsm_backend = @import("storage/lsm_backend.zig");
 test {
     _ = http_server;
     _ = httpx_handler;
+    _ = indexes;
     _ = kernel_abi;
     _ = kernel_bridge;
     _ = kernel_exports;

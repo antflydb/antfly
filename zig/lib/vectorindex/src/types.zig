@@ -37,8 +37,10 @@ pub const HBCConfig = struct {
     };
 
     pub const CentroidDirectoryMode = enum {
+        auto,
         hbc,
         flat_rabitq,
+        flat_exact,
     };
 
     storage_backend: StorageBackend = .lmdb,
@@ -71,7 +73,8 @@ pub const HBCConfig = struct {
     defer_page_mutation: bool = false,
     lazy_posting_maintenance: bool = false,
     auto_posting_maintenance_max_postings: usize = 0,
-    centroid_directory_mode: CentroidDirectoryMode = .hbc,
+    centroid_directory_mode: CentroidDirectoryMode = .auto,
+    flat_exact_min_postings: usize = 1024,
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
 };

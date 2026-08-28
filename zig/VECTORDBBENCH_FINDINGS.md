@@ -1831,6 +1831,771 @@ compare the 50K diagnostic-only cold replay's 14.16 ms mean against the 3.67
 ms post-warm profile: diagnostic-only resume intentionally skips the two
 official serial warm-up stages.
 
+Metric-correct angular covering radii were also implemented and rejected for
+the Cohere cosine workload. A fresh 50K public-API qualification preserved the
+load and quality envelope at 22.37 seconds ready and 0.9838 detailed recall,
+and 208 of 214 frontier nodes resolved a durable exact-centroid bound. However,
+all 1,000 queries still explored all 208 leaves and no bound stop fired. In
+1,536 dimensions the exact leaf-enclosing angular spheres are nearly
+hemispherical, so subtracting their radii from the query-to-centroid angle
+collapses the triangle-inequality lower bound to zero. Do not pay write/format
+cost for cosine enclosing spheres on this design; useful cosine stopping needs
+a tighter proof object than a single centroid sphere. The experiment was
+reverted. The profiler retains the traversal counters, and progressive rerank
+now explicitly retires any candidates skipped by its existing proven stop so
+they cannot re-enter the final approximate ordering.
+
+The primary WAL checkpoint floor and immutable publication window must be
+treated as two separate bounds. Raising both to 256 MiB reduced flush topology
+but was rejected: the 1M lifecycle regressed to 735.01 seconds ready, cloned
+8.57 GB cumulatively, and spent 144.63 seconds publishing native HBC posting
+generations. Rotating the mutable epoch at 128 MiB while continuing to stream
+two epochs into one 256 MiB immutable publication recovered the load baseline.
+The fresh 1M public-API lifecycle completed in 623.16 seconds (613.58 insert +
+9.59 catch-up), preserved 0.9845--0.9849 recall, peaked at 2.91 GB RSS with
+1.40 GB attributable demand, and reduced manifests from the prior 598 to 167.
+All nine primary pressure events completed with zero overload or hard debt;
+cumulative snapshot copying was 3.24 GB. The corresponding 50K gate completed
+in 22.43 seconds with 0.9849--0.9862 recall, 1.22 GB peak RSS, and 322.13 MB of
+snapshot copies. Retain the nested 128/256 MiB bounds: a single large mutable
+epoch couples source-scan cloning to HBC publication cadence even when the
+eventual persisted flush topology looks cleaner.
+
+Making the existing anchor-preserving L0 delta seal eligible under soft
+maintenance was also tested and rejected. On a clone of the completed 1M
+generation it reduced the active primary topology from 40 runs / 33 L0 runs to
+20 / 13 without changing the seven-run lower base or recall. That did not make
+reranking faster. The original detailed public profile was 36.19/82.12 ms
+mean/p95 with 24.12 ms mean in exact-artifact reads; the immediate post-seal
+profile was 46.89/93.02 ms with 34.77 ms artifact reads, and a second clean
+reopen remained worse at 50.12/108.78 ms with 37.15 ms artifact reads. Fewer
+generic LSM runs destroyed favorable artifact block locality rather than
+improving it. The soft scheduling change was reverted; the hard-pressure seal
+remains available for admission safety.
+
+The half-window run therefore sharpens the next format boundary. Native HBC
+tree traversal itself averaged about 10.2 ms once exact-vector loading is
+subtracted, while primary artifact reads consumed roughly two thirds of warm
+query time. A per-index float32 plane would duplicate about 3.07 GB at 1M and
+is not an acceptable endpoint. The next high-upside design is one table-level,
+versioned vector-block store shared by every index using an embedding artifact,
+with source sequence and artifact revision in its WAL/delta publication and
+generation leases matching HBC topology to the exact vector revision.
+
+Before adding that format, a matched 1M read-path experiment showed that much
+of the cold artifact cost was avoidable serialization. On the same repaired
+native generation, raising sparse point-block overlap from four to sixteen cut
+server mean/p95 from 86.51/166.44 to 51.72/93.73 ms and artifact-read mean from
+72.33 to 39.65 ms, with identical 0.98477 recall, candidate counts, and cache
+residency. Fixed sixteen was not the production endpoint: at 30 public clients
+it peaked at 132.83 QPS with 630/1341 ms p95/p99 because every query could
+independently fan out to sixteen reads.
+
+The retained policy gives each batch up to sixteen reads but divides a
+64-read backend-wide target across simultaneously active sparse batches. It is
+non-blocking: later arrivals narrow themselves, and a share below two falls
+back to the scalar precedence-preserving path. Against fixed sixteen, the
+matched warmed 1/5/10/20/30-client curve changed QPS from
+30.12/80.89/136.51/138.99/132.83 to
+30.98/86.57/117.48/153.54/160.48. At 30 clients p95/p99 fell from
+630/1341 to 475/645 ms. The post-curve detailed profile preserved 0.98477
+recall and measured 35.02 ms mean, 71.16 ms p95, and 23.45 ms mean artifact
+reads; the prior published half-window profile was 36.19/82.12 ms with
+24.12 ms artifact reads. Peak sampled RSS was 1.865 GB and the process
+physical-footprint ledger was 1.60 GB under the explicit 2 GiB envelope.
+
+This is a general sparse LSM read improvement, not an HBC-only shortcut, and
+it does not change key precedence, tombstone handling, block-cache ownership,
+or recall policy. It improves the current primary-artifact miss path while the
+shared table-level vector-block store remains the architectural endpoint.
+
+The native posting/WAL and shared exact-vector block formats moved the next
+query bottleneck into topology routing. A clean vector-block 1M generation
+visited about 2,022 tree leaves, scored 235K approximate vectors, reranked 1,639
+exact vectors, and measured 27.83 ms public p50 / 25.98 ms HBC p50 at 0.98437
+detailed recall. Recursive binary and one-shot global k-means topology rebuilds
+did not improve the leaf-recall curve. At 50K they increased topology and/or
+workspace cost, retained roughly the same 208-leaf query budget, and produced
+no latency win. They remain useful negative experiments, not production
+defaults.
+
+A flat full-precision centroid directory did improve the routing curve. At the
+normal 0.5 effort, the same 1M generation reached 0.99095 recall with 15.34 ms
+public p50 and 14.10 ms HBC p50. At the lowest measured parity boundary (0.47),
+it reached 0.98495 recall with 13.40 ms public p50, visited 1,408 leaves, scored
+165K approximate vectors, and reranked 443 exact vectors. The official public
+API cold/warm runs at that boundary measured 12.2/12.2 ms p50 and 0.9829
+recall, versus 28.6/30.6 ms and 0.9842 for the tree. The matched
+1/5/10/20/30-client curve improved QPS from
+60.83/215.15/219.67/199.38/183.97 to
+81.04/322.14/332.81/320.96/291.32; concurrency-20 p95 fell from 146.71 to
+79.11 ms. Attributable restart demand stayed 423--468 MB. Cache-inclusive RSS
+rose when queries touched more mmap pages, so it must continue to be reported
+separately from reclaimable demand.
+
+The production policy is adaptive rather than a benchmark-wide override. Small
+indexes keep tree routing (exact flat routing was about 3% slower at 50K), and
+indexes estimated to have at least 1,024 postings use the exact directory at
+the caller's unchanged effort. Full checkpoints now encode that directory as a
+versioned, block-columnar entry in the same immutable native segment. Clean
+generations borrow its aligned vectors directly under the query generation
+lease; a post-checkpoint packed-node mutation refuses the stale entry and uses
+the topology fallback until a matching generation is published. This removes
+the restart topology scan and the roughly 54 MB exact-centroid heap copy at 1M
+without introducing another store or publication boundary.
+
+The complete persisted-centroid-delta lifecycle then passed a fresh 1M public
+API qualification under a 2 GiB process budget. It inserted in 592.39 seconds
+and reached full query visibility in 634.64 seconds, versus the earlier
+619.96-second vector-block insert baseline. Live serial p50 was 13.7 ms at
+0.9900 recall and the concurrency curve peaked at 274.54 QPS, improving the
+earlier roughly 220-QPS peak. The final shared vector base encoded one million
+768-dimensional vectors in 3.164 GB in 33.25 seconds; the native HBC generation
+was 278.54 MB. All eight primary hard-pressure events completed with no
+overload or remaining hard debt.
+
+The same run separated reclaimable mmap residency from attributable demand.
+Peak live demand was 1.812 GB and ResourceManager's managed peak was 1.040 GB
+with zero release-accounting errors, but sampled RSS reached 6.128 GB live and
+6.251 GB after restart. Disk was 6.5 GB total: 2.9 GB in shared vector blocks
+and 270 MB in the native HBC index. Reopened detailed queries measured 27.28 ms
+public p50 / 25.95 ms server p50 at 0.99055 recall, scoring 2,048 leaves and
+239.6K approximate vectors; exact-vector loading accounted for 3.37 ms. The
+literal first server search after a clean reopen was 199.57 ms, down from the
+earlier roughly 650-ms activation sample, while the Python client's 1.76-second
+wall time was dominated by loading its Parquet fixture.
+
+A same-generation public `search_effort` sweep confirmed that candidate work,
+not routing lookup or rerank storage, is the remaining steady-query lever.
+Effort 0.40 visited 588 leaves and reached 11.18 ms server p50 but only 0.95255
+recall. Effort 0.45 visited 1,097 leaves and reached 16.43 ms at 0.97895 recall.
+Effort 0.46 visited 1,243 leaves, scored 145.8K approximate vectors, and reached
+17.96 ms at 0.98195 recall, 0.86 percentage points below the default. This is a
+useful explicit latency/quality point, not enough cross-dataset evidence to
+change the public 0.5 default.
+
+The restart RSS diagnosis exposed a physical-layout issue in the first shared
+vector-block writer. Although vector payload checksums were already lazy, the
+file interleaved each compact key with its roughly 3 KiB vector. Correct startup
+validation of every key's checksum, shard, and total ordering consequently
+faulted nearly every mmap page. New blocks now place all keys before an aligned
+vector arena and retain the index/footer at the end. This preserves the same
+reader, revision, checksum, and lazy-payload contracts—including compatibility
+with existing interleaved blocks—but lets admission touch only compact key and
+index pages. A fresh columnar-block lifecycle is required to quantify the RSS
+and restart improvement; an old generation cannot gain it without rebuilding
+its base.
+
+The first fresh columnar-block 50K lifecycle passed the public API gate. It
+inserted in 31.23 seconds and became ready in 33.34 seconds with 0.9869 live
+recall, 7.7/11.5/14.5 ms serial p50/p95/p99, and a 699.65-QPS peak. The shared
+base encoded 307.2 MB of float vectors into a 311.65 MB generation in 6.44
+seconds. Most importantly, cache-inclusive restart RSS fell from the prior
+interleaved-block sample's 609 MB to 383 MB, and live RSS fell from roughly
+1.22 GB to 624 MB. Reopened recall remained 0.9851. Query latency in that
+restart interval was host-contended (21.6 ms warm p50 versus the prior roughly
+12 ms), and the system wired baseline moved enough to make the one-shot demand
+delta non-comparable; neither is used to claim a search-kernel change. The RSS
+direction is nevertheless the expected direct result of leaving untouched
+vector pages out of the process mapping residency.
+
+The interrupted first columnar 1M lifecycle exposed two readiness bugs rather
+than a search failure. Background vector maintenance enumerated only live
+write-cache databases, and the no-replay startup path returned before native
+projection maintenance. Even after a later build, the public embeddings view
+could erase the DB's pending state once external coverage converged. Native
+projection absence is now broad startup debt, is executed at the stable source
+tip, and is represented explicitly as `dense_vector_projection_pending` all
+the way through shard aggregation and the public response. The checked-in
+qualification runner refuses to query while that bit, backfill, or dense
+publication is pending. LSM soft pressure still defers generic LSM work but no
+longer starves this separately governed vector publication lane.
+
+The 1M migration then built a complete 128-shard columnar float32 base in
+41.98 seconds. Its actual ResourceManager builder/overlap peak was about
+120.8 MB and the dedicated slice stayed within its 128 MiB hard limit with no
+pressure event or rejection. A clean public restart measured 0.99061 recall,
+28.41 ms client p50, 27.13 ms server p50, and 16.74 ms p50 in exact-vector
+payload reads. It scored the same 2,048 leaves, 242.4K approximate vectors,
+and 446.7 exact vectors as the prior generation, with zero primary-LSM or
+vector-block fallback. Cache-inclusive RSS was 3.38 GB, but attributable
+demand was only 437 MB; most of the difference was reclaimable mmap residency.
+
+Ordering exact reads by `(shard, full_hash, key)` fixed a latent physical-sort
+bug: ordering by full hash alone alternated among all low-bit-selected shard
+files. A byte-bounded external rerank unit now coalesces sets that fit within
+2 MiB (up to 512 vectors) and retains 128-entry progress checkpoints for long
+tails. On the matched 1M corpus it preserved 0.99061 recall and improved server
+p95/p99 from 80.07/128.42 to 75.94/108.72 ms, but did not improve p50. This
+ruled out per-batch lease/sort overhead as the median bottleneck and isolated
+the float32 exact plane's random payload reads.
+
+A versioned float16 query projection produced the first large cross-scale
+read-path gain without discarding the authoritative float32 artifact. The
+source document/embedding store and mutation WAL remain float32; only the
+immutable mmap base is encoded as float16, and source-sequence/revision misses
+retain the primary fallback. On the matched 1M generation, recall changed only
+from 0.99061 to 0.99047. Server p50/p95/p99 fell from
+27.41/75.94/108.72 to 18.30/43.97/71.94 ms, client p50/p95/p99 fell from
+28.64/77.39/109.91 to 19.65/45.25/73.19 ms, and exact-payload read p50 fell
+from 17.12 to 7.79 ms. Cache-inclusive RSS fell from 3.38 to 2.28 GB while
+attributable demand stayed about 434 MB. The base shrank from 3.162 to
+1.626 GB, published in 40.02 seconds, used 57.4 MB at the governed builder
+slice peak, and had zero misses, fallbacks, pressure events, or rejections.
+
+The matched 50K comparison generalized the result. Float32 versus float16
+recall was 0.98514 versus 0.98482, a 0.032-percentage-point change. Server
+p50/p95/p99 improved from 15.69/29.81/53.68 to 9.37/12.61/13.97 ms and
+client p50/p95/p99 from 17.45/32.19/55.28 to 11.37/14.72/16.71 ms. Restart
+RSS fell from 457 to 380 MB and the base from roughly 312 to 158 MB. Its
+coverage-only-WAL, 64-to-128-shard migration published in 3.43 seconds with a
+48.2 MB builder-slice peak and no fallback or resource pressure.
+
+That 50K migration deliberately found two publication invariants that the
+already-128-shard 1M base did not exercise. First, a complete base replacement
+was incorrectly forbidden from changing shard count. Second, the validator
+treated a WAL containing only a coverage certificate as mutation debt. The
+fixed contract permits an all-shard replacement to re-shard only when replay
+contains no committed upsert or tombstone; coverage-only frames are subsumed by
+the pinned snapshot. Sparse deltas and any mutation-bearing WAL retain the old
+shard identity. Tests cover both the allowed coverage-only 4-to-8 replacement
+and rejection of the same change after a committed vector mutation.
+
+The current format version adds a per-vector float32 scale to float16 blocks.
+Ordinary embeddings retain scale one; larger finite vectors are divided into
+the safe float16 domain and rescaled during decode, while non-finite inputs
+fail before mutating writer state. Readers remain compatible with v1 float32
+and v2 unscaled float16 bases. Float16 is now the native projection default,
+with an explicit float32 qualification/rollout override; this does not change
+the precision of authoritative storage or recovery.
+
+The first fresh scaled-float16 (`AFVBLK` v3) public lifecycle established the
+current 50K end state. The official VectorDBBench load inserted in 22.16
+seconds and reached full index/vector-projection readiness in 22.20 seconds,
+with 0.9857 recall. The detailed 1,000-query public profile measured
+7.75/9.75/11.21 ms client p50/p95/p99 and 5.97/7.88/9.08 ms server latency;
+QPS at concurrency 1/10/30 was 95.5/966.5/1,083.8. Live/restart RSS was
+926/368 MB and restart demand was 120 MB. The v3 block encoded 50,000 source
+vectors into 158.3 MB in 3.06 seconds. The table had only the external vector
+index during load; no full-text consumer participated.
+
+The matching fresh 1M public lifecycle inserted in 751.66 seconds and became
+fully ready in 755.71 seconds (12.60 minutes), correcting the reported
+roughly-3,000-second batch-100 result while preserving 0.9901 official recall.
+The final vector generation encoded 1,000,000 768D source vectors into 1.630 GB
+in 30.82 seconds. Total disk was 5.54 GB: approximately 3.50 GB authoritative
+primary document/artifact LSM, 1.59 GB shared exact-vector projection, 448 MB
+native posting generations/WAL, and only 324 KiB in the compatibility HBC LSM.
+Live RSS peaked at 3.41 GB; a clean restart used 3.01 GB RSS and 663 MB
+attributable demand. Four concurrent public loaders were slower than the
+earlier roughly-592-second serial result, so this meets the expected 13-minute
+gate but does not close the remaining primary-store contention work.
+
+That run also exposed a benchmark lifecycle contamination. VectorDBBench wrote
+`key:__circus_write_probe__` before every skip-load search phase. On the first
+1M reopen those non-vector source revisions overlapped bounded posting repair,
+grew the posting WAL from source sequence 10001 to 10003, and made the supposed
+cold measurement describe a mutated system. The adapter now has an explicit
+read-only-reuse contract: query-only qualification verifies the existing table
+and vector index but cannot issue the sentinel, remove full text, or create an
+index. The repo runner also gates restart queries on zero posting backlog and
+uses this contract for cold, warm, and concurrent reuse phases.
+
+A controlled read-only rerun proved that boundary. The WAL mtime and size
+remained exactly unchanged at 64,571,893 bytes, source applied/target sequence
+remained 10003, and the reopened process reported zero dirty postings and zero
+maintenance mutations. Genuine cold 1M serial p50/p95/p99 was
+20.2/57.2/94.0 ms; the immediately warm official run was
+14.2/16.9/18.9 ms at 0.9901 recall. A separate 100-query public profile measured
+14.38/16.83/17.77 ms and 0.9895 recall. The stable 1,000-query auto-directory
+control remains 14.50/17.47/21.54 ms at 0.99005 recall. `flat_rabitq` was
+slightly faster but fell to 0.97423 recall, so the exact persisted directory
+remains the production default.
+
+Finally, `DB.runUntilIdle` had applied only one bounded 64-posting repair page.
+That was safe for ordinary background maintenance but wrong for an explicit
+lifecycle fence: large loads could return and reopen with later pages still
+pending. The idle path now repeats bounded, query-cooperative pages until the
+posting backlog is clean, without busy-waiting on asynchronous checkpoints or
+the vector-block debounce. A regression dirties more than 64 leaves and proves
+that one `runUntilIdle` call drains every page. Foreground/background write
+paths remain bounded and may defer to active queries.
+
+The fresh post-drain 50K gate showed that the honest fence does not regress the
+small-corpus load target. Insert took 22.0018 seconds and complete readiness
+22.0255 seconds, with 0.9860 official recall. Live serial p50/p95/p99 was
+5.1/6.8/8.8 ms and QPS at concurrency 1/10/30 was
+148.6/1,105.0/1,097.6. Read-only cold and warm restart p50 were both 6.2 ms.
+The 1,000-query public profile measured 6.67/8.59/9.68 ms client and
+4.97/6.85/7.70 ms server p50/p95/p99 at 0.98582 recall. Restart RSS was 374 MB
+and its attributable footprint ledger was 120 MB. This supersedes the earlier
+22.20-second v3 gate for current-code latency and lifecycle behavior.
+
+The matching post-drain 1M load inserted in 737.35 seconds and the legacy
+VectorDBBench optimize predicate returned at 745.53 seconds (12.43 minutes),
+with 0.9899 recall. Steady live serial p50/p95/p99 was
+14.2/17.0/18.2 ms and concurrency 10/20/30 reached
+226.2/232.8/204.6 QPS. Live RSS peaked at 2.82 GB and the post-load process
+footprint ledger at 1.90 GB. Disk was 5.61 GB: 3.53 GB primary LSM, 1.63 GB
+float16 vector blocks, and 446 MB native HBC state.
+
+That run also isolated a remaining readiness cliff without the old write
+sentinel: concurrency one issued a single request that took 40.96 seconds.
+The native vector generation was still encoding 1.63 GB from 3.10 GB of
+authoritative artifacts and published in 40.78 seconds; the first request
+arrived after the legacy adapter accepted `rebuilding=false` but before that
+projection and the final 73 centroid repairs had completed. The adapter now
+requires Antfly's authoritative readiness state, current replay watermarks,
+zero dense publication/projection debt, and zero dirty postings. `runUntilIdle`
+also preserves the ordinary bounded maintenance side effects, drains every
+posting page, publishes the vector generation, and rechecks posting debt before
+returning. This is a lifecycle fence, not a benchmark warm-up.
+
+Primary ingest remained slower than the earlier 592.39-second four-worker
+control even though both used batch 100 and the same client concurrency. The
+post-drain run rotated 3.08 GB of mutable state through 51 current-scan epochs,
+versus 1.26 GB through 22 epochs in that control. The 128 MiB WAL checkpoint
+floor had coupled mutable-generation size to the 256 MiB immutable merge
+window, recreating the large scan/snapshot surface that the window was meant
+to remove. The next controlled A/B restores the independent 32 MiB mutable
+floor while retaining WAL-backed epochs, the 256 MiB streaming linear merge,
+four-way L0 tiers, and ratio sealing.
+
+## 2026-08-26 end-state qualification
+
+The linear-merge/WAL follow-up found that a logical immutable merge window must
+not be forced out by every size rotation. Idle and WAL-pressure rotations still
+publish partial windows, while ordinary size rotations accumulate to the
+configured window. The WAL checkpoint floor also has a two-segment lower bound
+for windowed publication so a segment-straddling retained tail cannot recreate
+tiny flush cascades. Raising the resident mutable cap to 768 MiB was rejected:
+it increased 1M readiness to 858.29 seconds and peak RSS to 3.17 GB without a
+query benefit. The production cap remains 256 MiB.
+
+Native posting checkpoints had another independent write-amplification bug.
+The file format already supports eight immutable deltas, but managed policy
+flattened after two. Using the format limit reduced the 1M load from five full
+posting rewrites to two. On the final public batch-100/four-worker load, insert
+completed in 715.28 seconds. Primary storage performed six pressure
+compactions with zero overloads, flushed 3.576 GB in 116 flushes, accumulated
+3.565 GB of mutable snapshot copies plus 1.936 GB of read-snapshot rotations,
+and retained seven lower-level runs. Live RSS peaked at 3.187 GB. This is a
+real public API load with the default full-text index removed through the API;
+it is not a direct-store or batch-size shortcut.
+
+Exact-vector publication exposed two production issues. First,
+`BudgetedAllocator` did not retry incremental growth after aggregate cache
+reclamation, unlike ordinary ResourceManager admission. A 1M builder could
+scan and spool the full corpus, fail with `ResourceBudgetExceeded`, delete its
+work, and immediately repeat. Incremental growth now reclaims governed HBC and
+LSM cache before denying the allocation. Second, asynchronous status
+invalidation left a race in which clients could observe the preceding ready
+snapshot during a long base build. The maintenance owner now publishes pending
+from its leased writer before the build and publishes the terminal state on
+success or failure. Projection encoding and physical shard geometry are both
+part of readiness, so a policy migration atomically replaces `CURRENT` rather
+than silently retaining a suboptimal generation.
+
+The builder now uses 64 KiB partition buffers. A controlled same-corpus A/B
+rejected 256 vector shards even though they built in 34.40 seconds: cold
+p50/p95/p99 was 28.1/66.2/101.5 ms, warm was 22.0/28.9/31.1 ms, maximum QPS
+was 213.4, and restart RSS peaked at 2.605 GB. The final 128-shard generation
+built under the same 2 GiB resource envelope in 43.29 seconds, removed every
+spool after atomic publication, and reduced cold latency to
+19.0/41.5/59.5 ms. Warm p50/p95/p99 was 12.3/15.2/19.3 ms at 0.9903 recall;
+QPS at concurrency 1/10/20/30 was 78.1/267.2/225.9/214.6. The 1,000-query
+public profile measured 12.86/15.70/18.96 ms client and
+11.51/14.27/16.12 ms server p50/p95/p99 at 0.99027 recall. Restart RSS peaked
+at 2.527 GB and attributable demand at 625 MB. The final vector directory is
+1.630 GB across 128 float16 blocks; the complete data tree is 5.455 GB.
+
+The measured final insert plus same-corpus 128-shard build is 758.57 seconds
+(12.64 minutes), inside the 13-minute goal. A fresh single-lifecycle repeat is
+still required before treating that sum as publication-grade readiness rather
+than qualified component timing. The small-corpus end-to-end gate did complete
+in one lifecycle: 50K inserted in 20.02 seconds and was fully ready in
+20.05 seconds, with 0.9862 recall, live serial p50/p95/p99 4.8/6.8/9.1 ms,
+1,090 peak QPS, 1.017 GB peak live RSS, and 325 MB peak restart RSS.
+
+## Native shadow certification and restart end state
+
+A capture-free dense repair candidate exposed a cross-generation publication
+hole. The replacement could reach its source tip and publish its ready marker
+without ever creating a native posting generation. Vector blocks correctly
+refused to bind without a matching durable posting sequence, but activation
+could still select the candidate's compatibility HBC LSM. The resulting index
+was complete and queryable yet restarted with roughly 70 MB of obsolete HBC
+LSM state, 1.50 GB RSS, and 36--79 ms query latency instead of the native read
+path.
+
+Shadow readiness now certifies a complete native posting generation before its
+first ready marker, validates and flattens the converged candidate outside the
+short activation fence, and verifies only the final WAL tail while source apply
+is paused. Capture-free builders bootstrap one complete checkpoint directly
+from their private compatibility projection; only after that checkpoint is
+durable may they publish `AUTHORITY`, detach the live LSM, and bind a vector
+generation at the identical `covered_source_sequence`. A native-first reopen
+then removes only the obsolete `runs`, `wal`, manifest, and lock artifacts,
+while preserving posting segments, generation identity, and active query
+leases.
+
+The repaired 50K generation demonstrated the intended restart state. Its
+native-only HBC directory was 22 MB instead of 70 MB, the complete data tree
+fell from 545 MB to 496 MB after safe legacy cleanup, restart RSS was 309 MB,
+and a 1,000-query public profile measured 5.48/6.95/7.93 ms client and
+3.80/5.16/6.16 ms server p50/p95/p99 at 0.98457 recall. Warm concurrency
+1/10/20/30 reached 208/1,198/1,408/1,241 QPS. This was a migration of an
+existing generation, so a fresh lifecycle remained the correctness gate.
+
+The fresh public-API gate then inserted 50,000 1536D vectors in 21.11 seconds
+and reached authoritative readiness in 21.13 seconds. The vector base encoded
+in 2.60 seconds, live peak RSS was 1.147 GB, and restart peak RSS was 394 MB.
+Cold and warm VectorDBBench recall were both 0.9862 with 6.3 ms p95 and
+7.2--7.3 ms p99. The separate 1,000-query public profile measured
+5.52/7.13/7.93 ms client and 3.85/5.26/6.18 ms server p50/p95/p99 at 0.98617
+recall. Full text was removed through the public table API before load; the run
+used batch 100, four public writers, native HBC WAL/segments, float16 vector
+blocks, and read-only restart phases.
+
+That fresh run also caught an empty-index lifecycle bug before the final gate.
+An empty root intentionally has no quantized payload, but stable validation
+treated that canonical absence as corruption and repeatedly repaired it back
+to absence while holding structural admission. Missing payload is now valid
+only for an empty posting; non-empty absence remains corrupt. Stable validation
+also retries one fresh-lease no-progress observation, requires a clean
+verification pass, and fails after bounded repeated mutations. This prevents
+both premature native readiness and an infinite WAL rewrite if some future
+payload cannot converge.
+
+The next fresh gate found that a time-only quiescence test could still mistake
+an LSM backpressure pause for the end of a burst. At sequence 204, with only
+about 20,300 source rows, the primary still held 19 immutable memtables,
+266.8 MB of immutable state, and a maintenance score of 111,276; nevertheless
+the optional vector publisher built a 64 MB intermediate base. Opportunistic
+publication now requires a complete quiet interval after the primary has zero
+immutable state, WAL checkpoint/pressure debt, active compaction jobs, and
+maintenance score. Caller-owned stable lifecycle fences remain immediate.
+
+With that gate, the fresh public-API 50K run inserted in 20.87 seconds and was
+ready in 20.90 seconds. It published no non-empty vector base before the final
+source sequence 501. Recall was 0.9851 before and after restart; live p95/p99
+was 6.1/7.0 ms, cold and warm p95/p99 was 6.4/7.8 ms, and peak QPS was 1,316.
+The 1,000-query public profile measured 5.43/7.27/9.17 ms client and
+3.70/5.11/5.98 ms server p50/p95/p99. Restart RSS was 321 MB. The 490 MB data
+tree consisted primarily of the source document/artifact LSM, 151 MB of
+float16 exact-vector blocks, and a 22 MB full native posting segment.
+
+The first uninterrupted 1M lifecycle with the same online topology completed
+insert-to-ready in 1,078.48 seconds (17.97 minutes). This is a large correction
+from the reported 3,000 seconds, but it remains above the roughly 13-minute
+target. The only non-empty exact-vector base published at final sequence 10,001
+and encoded 3.072 GB of source vectors into 1.630 GB of float16 blocks in
+36.1 seconds. Final posting validation flattened to a 279 MB native segment.
+Thus, vector publication itself accounts for less than a minute; primary LSM
+pressure and compaction set the remaining load curve.
+
+The primary finished with 25 runs (18 L0), zero active maintenance job and zero
+maintenance score, after 13 compactions read 7.754 GB and wrote 7.677 GB. Six
+foreground pressure events all completed a pressure compaction, but ingestion
+followed a reactive sawtooth near the 128-run hard limit. Direct sorted ingest
+succeeded for 4.504M of 5.000M physical entries; 0.497M fell back while the
+backend was pending. Cumulative mutable snapshot copies were 3.707 GB and read
+snapshot rotations were 3.535 GB. The complete tree used 5.1 GiB: approximately
+3.52 GB of source document/artifact runs, 1.63 GB of vector blocks, and 279 MB
+of native HBC postings.
+
+Recall was 0.9900 live, cold, and warm. Live queries overlapped the tail of
+post-ingest storage work and were not publication-quality: serial p95/p99 was
+47.5/68.5 ms, peak QPS was 87.6, and one concurrency-30 wave stalled for about
+40.9 seconds. Reopened results isolate the native query path: cold p95/p99 was
+15.7/21.8 ms and warm was 15.4/16.9 ms. The separate 1,000-query public profile
+measured 12.97/15.42/16.48 ms client and 11.49/13.94/14.76 ms server
+p50/p95/p99. It traversed 2,048 leaves and scored about 238K approximate
+vectors/query before boundary rerank. Live/restart RSS peaked at 2.77/2.36 GB;
+attributable restart demand was 409 MB.
+
+A bounded recursive topology rebuild was then tested as an end-state
+experiment. At 50K it consumed a measured 312.65 MB workspace and 4.6 seconds,
+but reduced mean approximate candidates only from 24,189 to 23,927 and
+regressed server p95/p99 from 5.11/5.98 ms to 6.17/7.38 ms. It is therefore not
+a default-quality win. More importantly, that run exposed that the durable
+tree was paired with a process-local "already rebuilt" sequence. Reopen reset
+the marker, and coverage-only source advances from 501 to 503 rebuilt the same
+tree twice more, consuming 4.4 seconds and 312.65 MB each time and changing
+recall as randomized replacement trees published.
+
+Topology rebuild identity is now durable in the same captured HBC metadata
+transaction as the replacement root. Its epoch is the vector base generation,
+the latest actual vector-WAL mutation sequence, and the algorithm. Generic
+coverage commits do not change it. WAL replay reconstructs the same vector
+epoch, while a real vector mutation, new base, or algorithm change admits one
+new rebuild. This makes restart idempotent and prevents an optional optimizer
+from silently becoming startup work; recursive topology remains opt-in until
+it demonstrates recall/latency value. A fresh native-authority qualification
+confirmed exactly one rebuild in the initial lifecycle and none after reopen:
+root 441 and node count 1,315 were identical before and after coverage advanced
+from sequence 501 to 503, recall remained 0.9831 live/cold/warm, and restart RSS
+fell from the faulty run's 980 MB to 404 MB. Recursive still regressed ready
+time to 22.39 seconds and server p95/p99 to 6.32/7.57 ms, so the 20.90-second
+online topology run remains the qualified default.
+
+### Exact-vector publication is part of readiness, not restart work
+
+The first proactive-primary 1M run appeared to improve insert-to-ready from
+1,078.48 to 740.27 seconds, but it was not a valid result. The public index
+became ready while its exact-vector generation still covered the empty source
+sequence. Reopen then built all 1M float16 vectors in 65.15 seconds. Query
+visibility and recall happened to remain correct because the live process
+could fall back to the primary LSM, but that made readiness, live latency, and
+restart cost depend on an implementation fallback rather than the published
+index generation.
+
+Readiness now verifies source sequence, encoding, shard count, and exact vector
+cardinality under one immutable generation lease. A vector mutation marks the
+projection dirty and invalidates the old generation while holding the shared
+publication mutex; a later vector-neutral transaction cannot advance the old
+empty generation's coverage. The public status projects this writer-owned
+pending fact as active finalization, so a client cannot observe ready between
+derived catch-up and exact-vector publication. This ordering is crash-safe:
+`CURRENT` remains on the last complete generation until the replacement base
+is fully written and verified.
+
+Waiting for the primary LSM to become completely idle before this optional
+publication was correct but unnecessarily slow. A fresh 50K run inserted in
+23.57 seconds, then waited 29 seconds for a small immutable tail to reach its
+age-based flush threshold; the vector build itself took only 3.8 seconds.
+Opportunistic publication now admits a stable primary tail only when there is
+no WAL checkpoint or pressure block, hard L0 run/byte debt, or active
+compaction, and the tail is bounded to 32 immutable memtables and 256 MiB.
+The outer source-idle lease, two-second source debounce, and resource-manager
+builder reservation remain mandatory. This is a general bounded-overlap rule,
+not a VectorDBBench shortcut.
+
+The resulting public-API 50K qualification inserted in 20.70 seconds and was
+fully ready in 26.75 seconds. Generation 2 encoded all 50K vectors at source
+sequence 501 in 2.79 seconds before readiness, with no restart rebuild. Recall
+was 0.9849. Public client p50/p95/p99 was 5.45/6.99/8.06 ms and server
+p50/p95/p99 was 3.74/5.15/6.20 ms. Live concurrency 1/10/20/30 reached
+183/860/909/945 QPS. Live/restart peak RSS was 732/318 MB; attributable live
+demand was 342 MB. The primary still had one safe 7.5 MB immutable tail at
+publication, demonstrating that the removed wait—not weaker vector work—was
+the speedup.
+
+### Qualified proactive-tiering 1M end state
+
+The uninterrupted 1M public-API qualification inserted in 663.75 seconds and
+was fully ready in 717.10 seconds (11.95 minutes), beating the approximately
+13-minute target. The exact-vector generation encoded all 1M source vectors
+into 1.630 GB of float16 blocks at sequence 10,001 in 37.07 seconds before
+readiness. The native posting store then flattened its seven-delta chain into
+a 279 MB full generation. Reopen performed neither vector nor posting rebuild.
+
+VectorDBBench measured 0.9902 recall and 0.9918 NDCG, with serial p95/p99 of
+15.7/17.7 ms and peak throughput of 218.5 QPS on the contended development
+host. Cold/warm reopen retained 0.9902 recall and measured 15.9/24.8 ms and
+15.4/17.1 ms p95/p99 respectively. The separate 1,000-query public profile
+measured 12.95/18.17/28.47 ms client and 11.48/14.95/22.05 ms server
+p50/p95/p99. Live/restart peak RSS was 2.72/2.41 GB, while attributable demand
+was 1.70/0.40 GB under the 2 GB process budget; mapped and reclaimable file
+pages account for much of the RSS gap.
+
+Primary proactive tiering limited the run to one completed pressure event.
+Final primary state had 33 L0 runs, seven lower-level runs, no immutable tail,
+and zero maintenance score. Cumulative primary mutable snapshot copies were
+2.413 GB versus 3.707 GB in the 1,078-second baseline. The next load-side
+opportunity is reducing current-scan copying and compaction write
+amplification without returning to the reactive hard-limit sawtooth.
+
+The dominant 1M query cost is now the exact flat centroid/quantized scan:
+queries visit 2,048 leaves and score about 240K approximate vectors, consuming
+11.93 ms mean HBC time. Exact boundary rerank loads about 448 vectors and costs
+2.40 ms, of which artifact reads are 2.10 ms. Query work should therefore
+prioritize recall-preserving routing/scoring layout and SIMD before changing
+the rerank boundary. Packing immutable exact-vector shards into fewer indexed
+container files is still worthwhile for metadata, restart, and artifact-read
+tails, but it cannot by itself remove the larger approximate-scan cost.
+
+## Native first-load transaction and linear consolidation (r55)
+
+The first production bulk build must participate in the same exact-vector
+capture as incremental `batchApply`. The initial implementation gated capture
+on a nonzero HBC cardinality, and the recursive bulk-build wrappers bypassed
+capture entirely. That made the empty sequence-one vector base stale on the
+first replay window and forced a later primary-LSM reconstruction. Both gates
+are now removed: ordinary and prepared-input bulk builders publish their
+coalesced exact mutations into the HBC-native vector WAL transaction.
+
+At a stable source tip, maintenance now treats a sequence-aligned native
+WAL/delta generation as self-contained. It force-checkpoints the vector WAL to
+the target encoding, merges base plus deltas one hash shard at a time, omits
+latest tombstones from the complete replacement base, atomically publishes
+`CURRENT`, and then validates/flattens the posting generation under the same
+readiness fence. Only a missing generation or a base-only cardinality mismatch
+uses the guarded pinned primary scan. This prevents an upload lull from causing
+generic LSM snapshot cloning and prevents readiness from exposing a compact
+vector base beside a large query-time posting overlay.
+
+The public API batch-100 50K r55 qualification measured:
+
+- 19.9995 s insert + 6.0391 s optimize = 26.0385 s ready;
+- 0.9842 official recall and 0.9866 NDCG;
+- 1,366.16 peak QPS; live serial p95/p99 6.7/8.9 ms;
+- reopened detailed public p50/p95/p99 5.62/7.73/10.07 ms at 0.98421 recall;
+- 1.484 GB cache-inclusive live peak RSS, 392 MB restart peak RSS, and
+  115 MB attributable restart demand;
+- one 154,800-KiB float16 vector base, one 23-MiB posting segment, and an
+  empty current posting WAL.
+
+The necessary A/B was r54. Publishing only the vector base left a 58-MiB
+posting WAL instead of the 23-MiB immutable segment. Exact rerank candidates
+rose from roughly 272 to 1,178, mean leaf scoring rose from 1.37 ms to 8.42 ms,
+reopened public p95 rose to 15.75 ms, and live RSS peaked at 2.34 GB during the
+query phase. Joining posting flattening to the stable-tip publication restored
+latency and reduced the live peak by about 856 MB without changing the rerank
+policy boundary.
+
+## Native 1M qualification and bootstrap-linear checkpointing (r56)
+
+The same public API lifecycle at 1M completed without retry, index
+reactivation, capture-boundary failure, or primary-LSM vector reconstruction:
+
+- 599.7847 s insert + 20.4622 s optimize = 620.2469 s ready, versus the r44
+  843.5063 s insert + 81.7756 s optimize = 925.2819 s ready baseline;
+- 0.9899 recall and 0.9916 NDCG, preserving the existing rerank boundary;
+- 426.90 peak QPS, versus 235.58 in r44, with live serial p95/p99 of
+  14.2/15.5 ms;
+- restarted 1,000-query p50/p95/p99 of 12.10/15.07/22.66 ms at 0.98994
+  recall, versus 14.58/20.66/23.95 ms in r44;
+- 1.30 GB attributable live demand, versus 1.70 GB in r44;
+- 4.773 GB cache-inclusive live RSS and 2.894 GB restart RSS, versus
+  2.720/1.948 GB in r44;
+- one 1,629,901,750-byte float16 vector base, one 280,684,301-byte posting
+  segment, and empty mutation WALs. Total allocated data was 5,326,904 KiB,
+  essentially unchanged from r44's 5,317,360 KiB because primary embedding
+  ownership remains deliberately out of scope.
+
+The RSS high-water occurred about 449 seconds into the load, not during final
+publication. The vector manifest produced roughly 40 immutable generations.
+Its former flat eight-delta limit repeatedly coalesced all accumulated
+first-load vectors even though the bootstrap base was empty and the batches
+were predominantly disjoint. This kept demand bounded but touched an
+ever-growing set of clean mmaps and rewrote the same f16 projection repeatedly.
+
+The r59 A/B allowed an empty base to append up to 64 immutable delta
+generations, while an established base retained the eight-generation online
+lookup limit. It measured:
+
+- 503.9492 s insert + 24.4342 s optimize = 528.3834 s ready, 91.86 s (14.8%)
+  faster than r56;
+- 0.9903 recall, 536.55 peak QPS, and live serial p95/p99 of 13.5/13.9 ms;
+- restarted detailed p50/p95/p99 of 11.45/13.94/20.89 ms at 0.99033 recall;
+- 4.954 GB cache-inclusive live peak RSS and 1.70 GB sampled attributable
+  demand, versus 4.773/1.30 GB in r56.
+
+The 64-run policy therefore proves that repeated first-load rewrites cost
+about 92 seconds, but it is too permissive as the final residency policy. The
+production candidate checkpoints an empty bootstrap chain at 24 generations,
+which should cause one mid-load coalescence on this corpus. The durable format
+continues to admit 64 generations so tightening policy never makes a
+previously valid `CURRENT` unreadable during restart or rolling upgrade.
+Stable-tip maintenance still performs the complete shard-local merge,
+atomically publishes `CURRENT`, and flattens postings under the same readiness
+fence. This is a production first-load policy, not a batch-size exception:
+crash recovery and queries continue to see every committed WAL/delta
+generation, and ordinary online update fan-out is unchanged.
+
+The 24-run r60 public qualification performed exactly one bootstrap
+coalescence near 650K rows and measured 537.6565 s insert + 23.1201 s optimize
+= 560.7766 s ready. This retains 59.47 seconds of the r59 speedup while the
+4.814 GB cache-inclusive peak is effectively tied with r56. Recall was 0.9900;
+the restarted detailed p50/p95/p99 was 11.79/14.43/23.55 ms. The format/policy
+split therefore gives a better default balance than either eight or 64 runs.
+
+r62 then released clean mmap residency after each input shard was durably
+staged during delta and complete-base compaction. It preserved load throughput
+(539.2666 s insert + 25.4540 s optimize = 564.7206 s ready), 0.9902 recall,
+and live p95/p99 of 14.2/16.3 ms. It lowered RSS by approximately 135 MB at the
+mid-load merge and reclaimed roughly 1.8 GB promptly after final publication,
+but did not lower the historical high-water: validation had already touched
+every new block's sorted index and key boundaries.
+
+An r64 follow-up tested releasing those validation-touched pages immediately
+after admission while retaining the immutable mapping. Reject this policy. It
+made the 1M insert 601.0115 s (61.74 s slower than r62), raised live peak RSS
+from 4.851 GB to 5.164 GB, and raised restart RSS from 2.624 GB to 2.891 GB.
+Recall remained 0.9900 and detailed p50/p95/p99 was
+11.60/14.19/21.87 ms, so there was no compensating query benefit. RSS briefly
+fell to 1.10 GB after the mid-load merge, but continued mutation and final
+publication refaulted the same pages and produced a higher high-water. Keep
+post-shard maintenance reclaim from r62; do not evict a newly admitted
+generation before its normal workload establishes actual residency.
+
+The next query experiment kept the search effort and rerank boundary fixed and
+changed only the AArch64 RaBitQ weighted-popcount reduction. Zig's prior
+`@Vector(4, u64)` horizontal reduction lowered to repeated widening and scalar
+extract sequences on NEON. Reducing 128-bit byte popcounts instead lowers to
+`CNT` plus `UADDLV`; every other architecture retains the previous kernel. A
+240K-candidate, 768-dimensional warm microbenchmark improved by 8.1%, with
+identical integer results. Differential tests cover widths 0 through 32.
+
+The r66 50K public lifecycle confirmed that the kernel win survives traversal
+and heap admission: mean leaf scoring fell from 1.288 ms in r61 to 1.189 ms
+(7.7%), mean HBC search fell from 3.817 to 3.706 ms, and peak QPS reached
+1,649.6. Insert plus catch-up was 23.3697 + 6.0372 = 29.4069 s; recall was
+0.9811, and restarted cold/warm p95 was 6.0/5.9 ms. The bit kernel is exact, so
+the 0.21-percentage-point recall difference from r61 is concurrently-built tree
+variance rather than approximate-math drift.
+
+The r67 1M lifecycle then measured 556.4232 s insert + 35.1253 s catch-up =
+591.5485 s ready, 0.9900 recall, and live serial p95/p99 of 13.8/14.9 ms. Mean
+leaf scoring was 6.727 ms versus 7.223 ms in r62 (6.9% lower). Cache-inclusive
+live peak RSS was 4.457 GB versus 4.851 GB in r62; restart RSS remained
+effectively unchanged at 2.570 GB. The 2.20 GB physical-footprint sample is
+within the run-to-run/host noise of r62's 2.27 GB and must not be claimed as a
+demand reduction. The next query costs are the remaining 6.73 ms leaf scan and
+2.02 ms exact-vector artifact read, not tree expansion (0.83 ms) or exact
+distance arithmetic (0.05 ms).
+
+The native exact-vector follow-up scores aligned little-endian float16 block
+payloads directly instead of expanding them into request-sized float32 scratch
+and then reading that scratch again. Conversion, query dot product, candidate
+norm, and distance now share one SIMD pass. Payload CRC verification, immutable
+generation leases, exact source-sequence equality, primary fallback, and the
+rerank boundary are unchanged. Float32, WAL, unaligned, and big-endian values
+retain the decoded path. Metric-parity tests cover L2, inner product, and
+cosine including scalar tails.
+
+r68 at 50K lowered mean native artifact read from 1.977 to 1.864 ms (5.7%) and
+exact-vector load from 2.083 to 1.976 ms (5.1%) versus r66. Mean HBC search was
+3.647 ms, peak QPS was 1,928.4, recall was 0.9820, and the complete public
+lifecycle was 20.2534 s insert + 8.0855 s catch-up = 28.3389 s ready. r69 at
+1M lowered artifact read from 2.021 to 1.875 ms (7.2%) and vector load from
+2.331 to 2.185 ms (6.2%) versus r67. Mean HBC search was 10.788 ms, peak QPS
+was 472.6, and recall was 0.9897. The lifecycle measured 569.5528 s insert +
+2.0423 s catch-up = 571.5951 s ready. Its 4.852 GB live peak matched r62,
+restart RSS was 2.563 GB, and sampled demand was 1.90 GB; do not attribute the
+memory movement to this allocation-free query kernel. The concurrency-one
+sample contained one 15.7-second cold/host stall and is not a steady-state
+latency result.
+
+Reader admission already validates the complete immutable index, every entry
+range/flag/scale, the index checksum, every key checksum, and total hash/key/
+source ordering. A further native lookup fast path reuses the artifact hash and
+trusts those admitted index/key regions for the mmap lease lifetime instead of
+re-parsing invariants and recomputing key CRCs at every binary-search step.
+Per-vector payload CRC remains lazy and mandatory; checked admission and
+compaction iteration are unchanged.
+
+r70 at 50K lowered artifact read from 1.864 to 1.802 ms (3.3%), vector load
+from 1.976 to 1.905 ms (3.6%), and mean HBC search from 3.647 to 3.532 ms
+versus r68. Recall/restart was clean at 0.9840. A query-only reopen of r69's
+identical 1M durable generation proved upgrade/restart compatibility and
+preserved recall exactly at 0.98967. The first cold profile faulted mmap pages
+and is intentionally not a steady-state comparison. An immediate warm repeat
+lowered artifact read mean/p50 from 1.875/1.702 to 1.835/1.650 ms, vector load
+from 2.185 to 2.122 ms, and mean HBC search from 10.788 to 10.401 ms; server
+p95 fell from 13.02 to 12.21 ms on the same topology and source generation.
+
 ## Memory methodology
 
 Use Circus's native `footprint_sampler.py` against the Antfly server process
@@ -1869,12 +2634,11 @@ published.
    127.6 MB of the 150.7 MB live aggregate in the external-admission run;
    bound-read copies were 23.1 MB. Do not replace multi-operation snapshots
    with unsafe live probes merely to improve a cumulative counter.
-4. Repeat the whole-tree 1M lifecycle three times through the post-phase-sampled
-   harness on a controlled host and publish its mean plus range. Historical
-   1M timings between 1,386 and 1,915 seconds were collected with intrusive
-   `vmmap` polling and must be rerun; the 50K phase split and immediate query
-   tails are also scheduler-sensitive even when total load stays near
-   42--45 seconds.
+4. Repeat the final 128-shard/64-KiB-buffer float16 50K and 1M lifecycle three
+   times through the post-phase-sampled, read-only-restart harness on a
+   controlled host and publish mean plus range. In particular, measure insert
+   and base publication in one uninterrupted 1M lifecycle; the current
+   758.57-second readiness figure is a qualified sum from the same corpus.
 5. Add deterministic fault injection at every posting-WAL append, fsync,
    checkpoint staging, `CURRENT` replacement, overlay allocation, and applied
    watermark boundary. The production ordering and fail-closed recovery paths
@@ -1883,35 +2647,25 @@ published.
    explicit catalog capability once mixed-version upgrade/downgrade policy is
    defined. Keep the persisted authority marker sticky and require an explicit
    source-journal rebuild to move back to the general LSM.
-7. Make append-heavy primary document/artifact publication use a larger sorted
-   run window with one manifest per window, while preserving duplicate-key,
-   tombstone, WAL, and source-sequence ordering. The post-governor 1M run sent
-   only 7.2% of five million entries through direct sorted ingest and paid for
-   4,564 mutable flushes, 16,595 output runs, and 4,381 manifests. Then make
-   soft primary compaction yield promptly to foreground query admission and
-   remeasure the lower-level overlap closure.
-8. Bound native HBC mutation/publication CPU and delta disk amplification
-   without weakening its durable sequence. The current WAL/generation boundary
-   correctly owns `covered_source_sequence`, but the cost-aware 1M run still
-   spent 241.59 seconds in publication and retained 1.08 GB across its bounded
-   chain. Preserve source-journal retention, atomic generation leases, and
-   boundary rerank while testing indexed patch-native or chunked-copy-on-write
-   deltas and cheaper WAL-generation rotation.
-9. Store metric-correct cluster radii (or an equivalent conservative lower
-   bound) in native node records and stop when the next subtree cannot improve
-   the current candidate boundary. Keep the leaf-width policy as a hard safety
-   cap, disable bound pruning for inner product until it has a proven contract,
-   and requalify across 50K/1M plus at least one non-Cohere dataset.
-10. Replace retained per-index exact-vector heap copies with one table-level,
-    versioned mmap vector-block store shared by every index using an embedding
-    artifact. Its WAL/delta publication must carry source sequence and artifact
-    revision, and HBC query leases must request the matching revision so an old
-    topology generation cannot score a newly overwritten vector. Do not add a
-    second 3.07 GB per-index float32 plane as the final implementation.
-11. Audit managed-memory ownership against process footprint. Dense apply
-    reached 222.42 MB against an 89.48 MB slice hard limit, ResourceManager
-    recorded two aggregate accounting errors, and 1M demand/RSS exceeded the
-    managed-host peak by roughly 1.0/1.4 GB. Classify allocator arenas, mapped
-    run/index pages, detached cache leases, and runtime stacks before changing
-    budgets; fix missing or double ownership rather than lowering cache targets
-    until the gap is explained.
+7. Reduce the remaining primary document/artifact contention. The final 1M
+   load still accumulated 3.565 GB of mutable snapshot copies and 1.936 GB of
+   read-snapshot rotations. Attribute those copies by reader class and compare
+   four public workers against a current serial control before changing the
+   benchmark's concurrency.
+8. Reduce the native posting chain's 448 MB disk footprint and query-time mmap
+   residency without weakening `covered_source_sequence`, atomic CURRENT
+   publication, generation leases, or boundary rerank. Prefer indexed
+   patch-native/chunked-copy-on-write deltas and measure recovery time as well
+   as bytes.
+9. Optimize the exact flat centroid scan itself—SIMD/block layout, cache
+   residency, and bounded parallel scoring—while keeping the demonstrated
+   0.990 recall. RaBitQ routing's 1.55-percentage-point loss is outside the
+   parity budget and must not become the default merely for latency.
+10. Compare the qualified 128-shard curve (0.9903 recall, 267 peak QPS) against
+    current Circus competitors using identical corpus, payload, recall, and
+    concurrency semantics. Report cold and warm separately; never mix source
+    mutation or maintenance into the first concurrency sample.
+11. Audit the remaining gap between 625 MB attributable restart demand and
+    roughly 2.53 GB cache-inclusive RSS. Classify mmap residency, allocator
+    arenas, primary run/index pages, cache leases, and runtime stacks before
+    changing budgets; reclaimable file cache must not be mislabeled as demand.

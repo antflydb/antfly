@@ -3814,6 +3814,7 @@ pub fn build(b: *std.Build) void {
         "api http public sort capability gate fails closed for uncovered observed dynamic fields",
         "api http server create table with local writes waits for projected presence without lifecycle",
         "api http server create index installs exact visible config and defers lagging projection",
+        "writer native vector finalization projects through cached shard status",
         "status source reports an absent linearizable read capability without failing",
         "table read source distinguishes unavailable physical capability observation",
         "generated route policy inventory is unique and describes wire modes",
@@ -6141,6 +6142,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source runtime status serves cached snapshot during active same-table work",
             "provisioned table write source runtime status still serves unrelated table snapshot while source mutex is busy",
             "provisioned table write source best effort publish does not advertise lock contention as an empty table",
+            "fail closed runtime status replacement cannot retain stale ready snapshot",
             "hosted backup forwarding preserves external io authority",
             "backup storage resolution rejects a reused table name from another incarnation",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
@@ -6215,6 +6217,7 @@ pub fn build(b: *std.Build) void {
             "HA ownership transition serializes with active writer cache mutation",
             "startup cache clear retires dirty identity without a serving owner",
             "dirty auto bulk writer publishes runtime status without closing the cached writer",
+            "auto bulk max-window request waits for idle finish",
             "split transition auto bulk publication retries while a writer lease is active",
             "median key lookup reuses startup writer instead of reopening its root",
             "write cache retirement is allocation-free after entry installation",
@@ -6229,6 +6232,9 @@ pub fn build(b: *std.Build) void {
             "committed generation reconciliation preserves the validated candidate",
             "generation publication marker parsing preserves allocator exhaustion",
         },
+        // ReleaseFast table-writes regression codegen peaks around 11.3 GiB on
+        // macOS Zig 0.16. This is a compiler scheduler reservation only.
+        .max_rss = 12 * 1024 * 1024 * 1024,
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
     const run_api_table_writes_production_regression_unit_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
@@ -6546,7 +6552,7 @@ pub fn build(b: *std.Build) void {
         "shared LSM cache yields to foreground aggregate admission",
         "shared LSM resource reclaimer never waits for active accounting",
         "lsm backend resource manager throttles projected immutable state",
-        "lsm backend resource manager rejects before wal apply",
+        "lsm backend resource manager reclaims local durable state before rejecting",
         "derived backlog tracker accounts and releases payload bytes",
         "derived backlog tracker fails closed when sequence accounting allocation fails",
         "derived backlog tracker bounds sequence-only admission drain window",
@@ -7715,6 +7721,7 @@ pub fn build(b: *std.Build) void {
             "storage.sim_runtime.",
             "storage.transactions.",
             "storage.ttl.",
+            "storage.vector_block_store.",
             "storage.wal.",
         },
     };
@@ -7795,7 +7802,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast support artifact now peaks just over
+        // 10 GiB on macOS Zig 0.16. This is a compiler scheduler reservation,
+        // not a runtime memory allowance for Antfly.
+        .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_support_tests.step.dependOn(&unit_storage_shard_audit.step);
     const run_unit_storage_support_tests = b.addRunArtifact(unit_storage_support_tests);
@@ -7854,7 +7864,10 @@ pub fn build(b: *std.Build) void {
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
-        .max_rss = 8 * 1024 * 1024 * 1024,
+        // The consolidated ReleaseFast DB-core artifact now peaks just over
+        // 10 GiB on macOS Zig 0.16. This reserves compiler scheduling capacity;
+        // it does not raise Antfly's runtime memory budget.
+        .max_rss = 12 * 1024 * 1024 * 1024,
     });
     unit_storage_db_core_tests.step.dependOn(&unit_storage_shard_audit.step);
     const unit_storage_compile_step = b.step(
@@ -10284,7 +10297,7 @@ pub fn build(b: *std.Build) void {
     assignDefaultAggregateMaxRss(
         b,
         unit_test_step,
-        7 * 1024 * 1024 * 1024,
+        @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     );
 
@@ -10450,7 +10463,7 @@ pub fn build(b: *std.Build) void {
     assignDefaultAggregateMaxRss(
         b,
         test_step,
-        7 * 1024 * 1024 * 1024,
+        @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
         6 * 1024 * 1024 * 1024,
     );
 

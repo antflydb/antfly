@@ -970,6 +970,20 @@ pub const DocStore = struct {
         };
     }
 
+    /// Open one stable replay-lane generation. Runtime LSM implementations
+    /// narrow the mutable snapshot to this lane; callers may retain the
+    /// transaction and cursor while consuming several bounded replay chunks.
+    pub fn beginReplayLaneScanTxn(self: *DocStore, kind_ordinal: u8, from_sequence: u64) !Txn {
+        if (!(try self.hasReplayEntries())) return error.ReplayIndexUnavailable;
+        return switch (self.kind) {
+            .lmdb => try self.beginReadTxn(),
+            .runtime => .{
+                .alloc = self.alloc,
+                .current_scan = try self.runtime_store.beginReplayLaneScan(kind_ordinal, from_sequence),
+            },
+        };
+    }
+
     pub fn beginWriteTxn(self: *DocStore) !Txn {
         return switch (self.kind) {
             .lmdb => if (supports_lmdb) blk: {

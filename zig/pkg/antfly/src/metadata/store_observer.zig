@@ -465,6 +465,7 @@ fn runtimeStatusEqual(
             left.replay_applied_sequence != right.replay_applied_sequence or
             left.replay_target_sequence != right.replay_target_sequence or
             left.replay_catch_up_required != right.replay_catch_up_required or
+            left.dense_vector_projection_pending != right.dense_vector_projection_pending or
             (include_repair_status and (left.repair_status != right.repair_status or
                 left.repair_active_generation_serviceable != right.repair_active_generation_serviceable)))
         {
@@ -765,6 +766,35 @@ test "store observer can ignore unactivated repair fields without hiding other c
     try std.testing.expect(!observationChangesRecordWithRepairStatus(existing, observation, false));
     observed_indexes[0].doc_count += 1;
     try std.testing.expect(observationChangesRecordWithRepairStatus(existing, observation, false));
+}
+
+test "store observer publishes projection-only readiness transitions" {
+    var existing_indexes = [_]table_manager.RuntimeIndexStatusReport{.{
+        .name = "visual_idx",
+        .kind = "dense_vector",
+    }};
+    var observed_indexes = existing_indexes;
+    observed_indexes[0].dense_vector_projection_pending = true;
+    var existing_runtime = [_]table_manager.RuntimeGroupStatusReport{.{
+        .table_id = 1,
+        .group_id = 2,
+        .store_id = 3,
+        .node_id = 4,
+        .indexes = existing_indexes[0..],
+    }};
+    var observed_runtime = existing_runtime;
+    observed_runtime[0].indexes = observed_indexes[0..];
+    const existing = table_manager.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .runtime_statuses = existing_runtime[0..],
+    };
+    const observation = StoreObservation{
+        .store_id = 3,
+        .runtime_statuses = observed_runtime[0..],
+    };
+
+    try std.testing.expect(observationChangesRecord(existing, observation));
 }
 
 test "store observer fences repair transitions by registered reporter incarnation and generation" {

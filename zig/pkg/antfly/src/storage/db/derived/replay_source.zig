@@ -215,10 +215,35 @@ const PrimaryStoreMatchingCursor = struct {
     kind_ordinal: u8,
     hint: TargetHint,
     next_sequence: u64,
+    scan_lane_ordinal: u8,
+    scan_txn: ?docstore_mod.DocStore.Txn = null,
+    cursor: ?backend_erased.Cursor = null,
+    entry: ?backend_erased.Entry = null,
+    fallback_all: bool = false,
     hint_exhausted: bool = false,
 
     fn deinit(self: *@This()) void {
+        if (self.cursor) |*cursor| cursor.close();
+        if (self.scan_txn) |*txn| txn.abort();
         self.* = undefined;
+    }
+
+    fn openLane(self: *@This(), lane_ordinal: u8) !void {
+        std.debug.assert(self.scan_txn == null);
+        std.debug.assert(self.cursor == null);
+        var txn = try self.store.beginReplayLaneScanTxn(lane_ordinal, self.next_sequence + 1);
+        errdefer txn.abort();
+        var scan_cursor = try txn.openCursor();
+        errdefer scan_cursor.close();
+        const lower = internal_keys.replayRangeLower(lane_ordinal, self.next_sequence + 1);
+        const entry = try scan_cursor.seekAtOrAfter(lower[0..]);
+        self.scan_lane_ordinal = lane_ordinal;
+        self.scan_txn = txn;
+        self.cursor = scan_cursor;
+        self.entry = if (entry) |kv|
+            if (internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) != null) kv else null
+        else
+            null;
     }
 };
 
@@ -269,70 +294,42 @@ fn primaryStoreMatchingCursorForEachNext(
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
 ) !MatchingRecordStats {
     if (cursor.hint_exhausted) return .{};
+    var stats = MatchingRecordStats{ .scan_batches = 1 };
+    const max_scanned_entries = if (cursor.fallback_all)
+        primaryStoreFallbackScanBudget(max_matched_entries)
+    else
+        std.math.maxInt(usize);
 
-    const Context = struct {
-        consumer_ctx: *anyopaque,
-        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
-        stats: MatchingRecordStats = .{},
-
-        fn handle(self: *@This(), sequence: u64, payload: []const u8) !void {
-            self.stats.scanned_entries += 1;
-            try self.consume(self.consumer_ctx, sequence, payload);
-            self.stats.matched_entries += 1;
-            self.stats.last_sequence = sequence;
+    while (cursor.entry) |entry| {
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, cursor.scan_lane_ordinal) orelse {
+            cursor.entry = null;
+            break;
+        };
+        if (cursor.fallback_all and !try change_journal_mod.encodedRecordHasHint(entry.value, cursor.hint)) {
+            stats.scanned_entries += 1;
+            stats.hint_filter_skips += 1;
+            stats.last_sequence = sequence;
+            cursor.next_sequence = sequence;
+            cursor.entry = try cursor.cursor.?.next();
+            if (stats.scanned_entries >= max_scanned_entries) return stats;
+            continue;
         }
-    };
-    var callback_ctx = Context{
-        .consumer_ctx = ctx,
-        .consume = consume,
-    };
-    callback_ctx.stats.scan_batches = 1;
-    const replay_stats = cursor.store.forEachReplayLaneFrom(
-        cursor.kind_ordinal,
-        cursor.next_sequence + 1,
-        max_matched_entries,
-        &callback_ctx,
-        Context.handle,
-    ) catch |err| switch (err) {
-        error.ReplayIndexUnavailable => {
-            const stats = try primaryStoreForEachMatchingRecordFallbackAll(
-                cursor.store,
-                cursor.next_sequence,
-                cursor.hint,
-                max_matched_entries,
-                primaryStoreFallbackScanBudget(max_matched_entries),
-                ctx,
-                consume,
-            );
-            cursor.next_sequence = @max(cursor.next_sequence, stats.last_sequence);
-            if (stats.matched_entries == 0 and stats.scanned_entries == 0) cursor.hint_exhausted = true;
-            return stats;
-        },
-        StopReplayChunk.StopReplayChunk => {
-            cursor.next_sequence = @max(cursor.next_sequence, callback_ctx.stats.last_sequence);
-            return callback_ctx.stats;
-        },
-        else => return err,
-    };
-    cursor.next_sequence = @max(cursor.next_sequence, replay_stats.last_sequence);
-    if (replay_stats.matched_entries == 0) {
-        const fallback_stats = try primaryStoreForEachMatchingRecordFallbackAll(
-            cursor.store,
-            cursor.next_sequence,
-            cursor.hint,
-            max_matched_entries,
-            primaryStoreFallbackScanBudget(max_matched_entries),
-            ctx,
-            consume,
-        );
-        cursor.next_sequence = @max(cursor.next_sequence, fallback_stats.last_sequence);
-        if (fallback_stats.matched_entries == 0 and fallback_stats.scanned_entries == 0) cursor.hint_exhausted = true;
-        return fallback_stats;
+
+        consume(ctx, sequence, entry.value) catch |err| switch (err) {
+            // Keep this entry current: the builder rejected it before taking
+            // ownership, so the following replay window must retry it.
+            StopReplayChunk.StopReplayChunk => return stats,
+            else => return err,
+        };
+        stats.scanned_entries += 1;
+        stats.matched_entries += 1;
+        stats.last_sequence = sequence;
+        cursor.next_sequence = sequence;
+        cursor.entry = try cursor.cursor.?.next();
+        if (max_matched_entries != 0 and stats.matched_entries >= max_matched_entries) return stats;
     }
-    callback_ctx.stats.scanned_entries = @max(callback_ctx.stats.scanned_entries, replay_stats.scanned_entries);
-    callback_ctx.stats.hint_filter_skips += replay_stats.hint_filter_skips;
-    callback_ctx.stats.scan_batches = @max(callback_ctx.stats.scan_batches, replay_stats.scan_batches);
-    return callback_ctx.stats;
+    cursor.hint_exhausted = true;
+    return stats;
 }
 
 fn primaryStoreForEachMatchingRecordFallbackAll(
@@ -420,16 +417,38 @@ fn primaryStoreOpenMatchingCursor(
     const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
 
     const kind_ordinal: u8 = @intCast(@intFromEnum(hint));
-    return .{
+    var out = MatchingCursor{
         .state = .{
             .primary_store = .{
                 .store = store,
                 .kind_ordinal = kind_ordinal,
                 .hint = hint,
                 .next_sequence = from_sequence,
+                .scan_lane_ordinal = kind_ordinal,
             },
         },
     };
+    const cursor = &out.state.primary_store;
+    cursor.openLane(kind_ordinal) catch |err| switch (err) {
+        error.ReplayIndexUnavailable => {
+            cursor.hint_exhausted = true;
+            return out;
+        },
+        else => return err,
+    };
+    if (cursor.entry == null and kind_ordinal != internal_keys.replay_all_kind) {
+        if (cursor.cursor) |*scan_cursor| scan_cursor.close();
+        cursor.cursor = null;
+        if (cursor.scan_txn) |*txn| txn.abort();
+        cursor.scan_txn = null;
+        cursor.fallback_all = true;
+        cursor.openLane(internal_keys.replay_all_kind) catch |err| switch (err) {
+            error.ReplayIndexUnavailable => cursor.hint_exhausted = true,
+            else => return err,
+        };
+    }
+    if (cursor.entry == null) cursor.hint_exhausted = true;
+    return out;
 }
 
 fn journalForEachMatchingRecord(
@@ -594,39 +613,15 @@ fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator
 
 fn primaryStoreIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
     const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
-    const Context = struct {
-        expected: u64,
-        visible: bool = false,
-
-        fn consume(self: *@This(), found_sequence: u64, payload: []const u8) !void {
-            _ = payload;
-            self.visible = found_sequence == self.expected;
-        }
-    };
-    var ctx = Context{ .expected = sequence };
-    _ = store.forEachReplayLaneFrom(
-        internal_keys.replay_all_kind,
-        sequence,
-        1,
-        &ctx,
-        Context.consume,
-    ) catch |err| switch (err) {
-        error.ReplayIndexUnavailable => return try primaryStoreIsSequenceVisibleFallback(store, sequence),
+    if (!(try store.hasReplayEntries())) return false;
+    var txn = try store.beginProbeTxn();
+    defer txn.abort();
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
+    _ = txn.get(key[0..]) catch |err| switch (err) {
+        error.NotFound => return false,
         else => return err,
     };
-    return ctx.visible;
-}
-
-fn primaryStoreIsSequenceVisibleFallback(store: *docstore_mod.DocStore, sequence: u64) !bool {
-    var txn = try store.beginCurrentScanTxn();
-    defer txn.abort();
-
-    var cur = try txn.openCursor();
-    defer cur.close();
-
-    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence);
-    const entry = try cur.seekAtOrAfter(key[0..]) orelse return false;
-    return std.mem.eql(u8, entry.key, key[0..]);
+    return true;
 }
 
 fn collectEnrichmentDocumentGroupsFromEntries(alloc: Allocator, entries: anytype) ![]PendingDocumentGroup {

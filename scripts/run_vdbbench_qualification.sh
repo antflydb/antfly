@@ -7,6 +7,7 @@ usage() {
   echo "Options:" >&2
   echo "  --case NAME              VectorDBBench case" >&2
   echo "  --vdbbench-root PATH     VectorDBBench checkout" >&2
+  echo "  --vdbbench-python PATH   Python from a prepared VectorDBBench virtualenv" >&2
   echo "  --batch N                Public insert batch size" >&2
   echo "  --workers N              Requested load workers when supported" >&2
   echo "  --query-concurrency CSV  Query concurrencies" >&2
@@ -14,14 +15,24 @@ usage() {
   echo "  --memory-budget-mb N     Explicit Antfly process envelope" >&2
   echo "  --profile-count N        Detailed public-API query count" >&2
   echo "  --profile-dataset PATH   Dataset directory for detailed profiling" >&2
+  echo "  --search-effort FLOAT    Public ANN effort in the inclusive range 0..1" >&2
   echo "  --native-hbc             Enable the HBC native posting WAL/segment store" >&2
+  echo "  --vector-blocks          Build/use the shared mmap exact-vector projection" >&2
+  echo "  --vector-block-encoding MODE  Exact projection encoding (float32 or float16)" >&2
+  echo "  --recursive-topology-max-workspace-mb N" >&2
+  echo "                           Enable bounded quiescent recursive topology rebuild" >&2
+  echo "  --topology-rebuild-algorithm MODE  recursive or global_kmeans" >&2
+  echo "  --centroid-directory MODE  HBC centroid routing mode (auto, hbc, flat_rabitq, or flat_exact)" >&2
+  echo "  --flat-probe-count N     Initial flat centroid posting wave (0: search width)" >&2
   echo "  --resume                 Restart/query an existing run root" >&2
+  echo "  --resume-concurrent      Run the configured concurrent-search curve after warm resume" >&2
   echo "  --diagnostic-profile-only  Skip the official client lifecycle during a resume A/B" >&2
   echo "  --label-suffix SUFFIX    Unique suffix required by --resume" >&2
   echo "" >&2
   echo "Environment:" >&2
   echo "  ANTFLY_BIN       Antfly binary (default: zig/zig-out/bin/antfly)" >&2
   echo "  VDBBENCH_ROOT    VectorDBBench checkout (default: ../VectorDBBench)" >&2
+  echo "  VDBBENCH_PYTHON  Python from a prepared VectorDBBench virtualenv" >&2
   echo "  VDBBENCH_CASE    Case name (default: Performance1536D50K)" >&2
   echo "  VDBBENCH_BATCH   Insert batch size (default: 100)" >&2
   echo "  VDBBENCH_WORKERS Load workers when supported by the checkout (default: 4)" >&2
@@ -30,7 +41,11 @@ usage() {
   echo "  VDBBENCH_PROCESS_MEMORY_BUDGET_MB Explicit Antfly process envelope (default: auto)" >&2
   echo "  VDBBENCH_PROFILE_COUNT Detailed public-API queries after the warm run (default: 1000; 0 disables)" >&2
   echo "  VDBBENCH_PROFILE_DATASET Dataset directory for detailed profiling (default: inferred from case)" >&2
+  echo "  VDBBENCH_VECTOR_BLOCKS Build/use the shared mmap exact-vector projection (default: 0)" >&2
+  echo "  VDBBENCH_VECTOR_BLOCK_ENCODING Exact projection encoding (default: float16)" >&2
+  echo "  VDBBENCH_RECURSIVE_TOPOLOGY_MAX_WORKSPACE_MB Bounded recursive topology workspace (default: disabled)" >&2
   echo "  VDBBENCH_RESUME_AFTER_LIVE Restart/query an existing run root (default: 0)" >&2
+  echo "  VDBBENCH_RESUME_CONCURRENT Run concurrent search after a warm resume (default: 0)" >&2
   echo "  VDBBENCH_LABEL_SUFFIX Required unique suffix for a resume run (for example: -budget-1024)" >&2
   exit 2
 }
@@ -47,6 +62,7 @@ common_git_dir=$(git -C "$repo_root" rev-parse --path-format=absolute --git-comm
 main_checkout=$(cd "$(dirname "$common_git_dir")" && pwd)
 antfly_bin=${ANTFLY_BIN:-$repo_root/zig/zig-out/bin/antfly}
 vdbbench_root=${VDBBENCH_ROOT:-$main_checkout/../VectorDBBench}
+vdbbench_python=${VDBBENCH_PYTHON:-}
 vdbbench_case=${VDBBENCH_CASE:-Performance1536D50K}
 batch_size=${VDBBENCH_BATCH:-100}
 load_workers=${VDBBENCH_WORKERS:-4}
@@ -56,18 +72,27 @@ process_memory_budget_mb=${VDBBENCH_PROCESS_MEMORY_BUDGET_MB:-}
 profile_count=${VDBBENCH_PROFILE_COUNT:-1000}
 dataset_root=${DATASET_LOCAL_DIR:-/private/tmp/vdbbench-dataset}
 profile_dataset=${VDBBENCH_PROFILE_DATASET:-}
+search_effort=${VDBBENCH_SEARCH_EFFORT:-}
 sampler=${FOOTPRINT_SAMPLER:-$main_checkout/../antfly-circus/benchmarks/CRAG-harness/footprint_sampler.py}
 supports_load_concurrency=false
 supports_serial_cooldown=false
 resume_after_live=${VDBBENCH_RESUME_AFTER_LIVE:-0}
+resume_concurrent=${VDBBENCH_RESUME_CONCURRENT:-0}
 label_suffix=${VDBBENCH_LABEL_SUFFIX:-}
 native_hbc=0
+vector_blocks=${VDBBENCH_VECTOR_BLOCKS:-0}
+vector_block_encoding=${VDBBENCH_VECTOR_BLOCK_ENCODING:-float16}
+recursive_topology_max_workspace_mb=${VDBBENCH_RECURSIVE_TOPOLOGY_MAX_WORKSPACE_MB:-}
+topology_rebuild_algorithm=${VDBBENCH_TOPOLOGY_REBUILD_ALGORITHM:-global_kmeans}
 diagnostic_profile_only=0
+centroid_directory_mode=${VDBBENCH_HBC_CENTROID_DIRECTORY_MODE:-}
+flat_probe_count=${VDBBENCH_HBC_FLAT_PROBE_COUNT:-}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --case) [[ $# -ge 2 ]] || usage; vdbbench_case=$2; shift 2 ;;
     --vdbbench-root) [[ $# -ge 2 ]] || usage; vdbbench_root=$2; shift 2 ;;
+    --vdbbench-python) [[ $# -ge 2 ]] || usage; vdbbench_python=$2; shift 2 ;;
     --batch) [[ $# -ge 2 ]] || usage; batch_size=$2; shift 2 ;;
     --workers) [[ $# -ge 2 ]] || usage; load_workers=$2; shift 2 ;;
     --query-concurrency) [[ $# -ge 2 ]] || usage; query_concurrency=$2; shift 2 ;;
@@ -75,22 +100,69 @@ while [[ $# -gt 0 ]]; do
     --memory-budget-mb) [[ $# -ge 2 ]] || usage; process_memory_budget_mb=$2; shift 2 ;;
     --profile-count) [[ $# -ge 2 ]] || usage; profile_count=$2; shift 2 ;;
     --profile-dataset) [[ $# -ge 2 ]] || usage; profile_dataset=$2; shift 2 ;;
+    --search-effort) [[ $# -ge 2 ]] || usage; search_effort=$2; shift 2 ;;
     --native-hbc) native_hbc=1; shift ;;
+    --vector-blocks) vector_blocks=1; shift ;;
+    --vector-block-encoding) [[ $# -ge 2 ]] || usage; vector_block_encoding=$2; shift 2 ;;
+    --recursive-topology-max-workspace-mb) [[ $# -ge 2 ]] || usage; recursive_topology_max_workspace_mb=$2; shift 2 ;;
+    --topology-rebuild-algorithm) [[ $# -ge 2 ]] || usage; topology_rebuild_algorithm=$2; shift 2 ;;
+    --centroid-directory) [[ $# -ge 2 ]] || usage; centroid_directory_mode=$2; shift 2 ;;
+    --flat-probe-count) [[ $# -ge 2 ]] || usage; flat_probe_count=$2; shift 2 ;;
     --resume) resume_after_live=1; shift ;;
+    --resume-concurrent) resume_concurrent=1; shift ;;
     --diagnostic-profile-only) diagnostic_profile_only=1; shift ;;
     --label-suffix) [[ $# -ge 2 ]] || usage; label_suffix=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 
+if [[ -z "$vdbbench_python" ]]; then
+  vdbbench_python=$vdbbench_root/.venv/bin/python
+fi
+
 if [[ "$native_hbc" == "1" ]]; then
   export ANTFLY_HBC_POSTING_SIDECAR=1
   export ANTFLY_HBC_POSTING_WAL_STORE=1
+fi
+if [[ "$vector_blocks" == "1" ]]; then
+  export ANTFLY_HBC_VECTOR_BLOCK_STORE=1
+fi
+if [[ "$vector_block_encoding" != "float32" && "$vector_block_encoding" != "float16" && "$vector_block_encoding" != "f32" && "$vector_block_encoding" != "f16" ]]; then
+  echo "vector block encoding must be float32 or float16" >&2
+  exit 2
+fi
+export ANTFLY_HBC_VECTOR_BLOCK_ENCODING=$vector_block_encoding
+if [[ -n "$recursive_topology_max_workspace_mb" ]]; then
+  if [[ ! "$recursive_topology_max_workspace_mb" =~ ^[1-9][0-9]*$ ]]; then
+    echo "recursive topology workspace must be a positive integer in MiB" >&2
+    exit 2
+  fi
+  export ANTFLY_HBC_RECURSIVE_TOPOLOGY_REBUILD_MAX_BYTES=$((recursive_topology_max_workspace_mb * 1024 * 1024))
+fi
+if [[ "$topology_rebuild_algorithm" != "recursive" && "$topology_rebuild_algorithm" != "global_kmeans" ]]; then
+  echo "topology rebuild algorithm must be recursive or global_kmeans" >&2
+  exit 2
+fi
+export ANTFLY_HBC_TOPOLOGY_REBUILD_ALGORITHM=$topology_rebuild_algorithm
+if [[ -n "$centroid_directory_mode" ]]; then
+  if [[ "$centroid_directory_mode" != "auto" && "$centroid_directory_mode" != "hbc" && "$centroid_directory_mode" != "flat_rabitq" && "$centroid_directory_mode" != "flat_exact" ]]; then
+    echo "centroid directory mode must be auto, hbc, flat_rabitq, or flat_exact" >&2
+    exit 2
+  fi
+  export ANTFLY_HBC_CENTROID_DIRECTORY_MODE=$centroid_directory_mode
+fi
+if [[ -n "$flat_probe_count" ]]; then
+  if [[ ! "$flat_probe_count" =~ ^[0-9]+$ ]]; then
+    echo "flat probe count must be a non-negative integer" >&2
+    exit 2
+  fi
+  export ANTFLY_HBC_FLAT_CENTROID_PROBE_COUNT=$flat_probe_count
 fi
 
 live_label="antfly-qualification-online-live${label_suffix}"
 cold_label="antfly-qualification-reopened-cold${label_suffix}"
 warm_label="antfly-qualification-reopened-warm${label_suffix}"
+concurrent_label="antfly-qualification-reopened-concurrent${label_suffix}"
 case "$vdbbench_case" in
   *50K*)
     expected_docs=50000
@@ -105,6 +177,20 @@ esac
 
 if [[ ! "$profile_count" =~ ^[0-9]+$ ]]; then
   echo "VDBBENCH_PROFILE_COUNT must be a non-negative integer" >&2
+  exit 2
+fi
+if [[ -n "$search_effort" ]] && ! python3 - "$search_effort" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if math.isfinite(value) and 0 <= value <= 1 else 1)
+PY
+then
+  echo "search effort must be a finite number in the inclusive range 0..1" >&2
   exit 2
 fi
 if [[ -n "$process_memory_budget_mb" && ! "$process_memory_budget_mb" =~ ^[1-9][0-9]*$ ]]; then
@@ -128,7 +214,15 @@ if [[ "$diagnostic_profile_only" == "1" && "$resume_after_live" != "1" ]]; then
   echo "--diagnostic-profile-only requires --resume" >&2
   exit 2
 fi
-for required in "$antfly_bin" "$vdbbench_root/.venv/bin/python" "$sampler"; do
+if [[ "$resume_concurrent" == "1" && "$resume_after_live" != "1" ]]; then
+  echo "--resume-concurrent requires --resume" >&2
+  exit 2
+fi
+if [[ "$resume_concurrent" == "1" && "$diagnostic_profile_only" == "1" ]]; then
+  echo "--resume-concurrent is incompatible with --diagnostic-profile-only" >&2
+  exit 2
+fi
+for required in "$antfly_bin" "$vdbbench_python" "$sampler"; do
   if [[ ! -e "$required" ]]; then
     echo "missing required path: $required" >&2
     exit 2
@@ -141,7 +235,7 @@ done
 # current public CLI.
 vdbbench_help=$(
   cd "$vdbbench_root"
-  LOG_FILE=/dev/null .venv/bin/python -m vectordb_bench.cli.vectordbbench antflyaknn --help
+  LOG_FILE=/dev/null "$vdbbench_python" -m vectordb_bench.cli.vectordbbench antflyaknn --help
 )
 if [[ "$vdbbench_help" == *"--load-concurrency"* ]]; then
   supports_load_concurrency=true
@@ -154,7 +248,7 @@ fi
 
 mkdir -p "$run_root/results"
 if [[ "$resume_after_live" != "1" ]]; then
-  python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$native_hbc" <<'PY'
+  python3 - "$run_root/run-config.json" "$repo_root" "$vdbbench_root" "$vdbbench_case" "$batch_size" "$load_workers" "$query_concurrency" "$query_seconds" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$recursive_topology_max_workspace_mb" "$topology_rebuild_algorithm" "$centroid_directory_mode" "$flat_probe_count" <<'PY'
 import json
 import subprocess
 import sys
@@ -171,7 +265,14 @@ import sys
     memory_budget_mb,
     profile_count,
     profile_dataset,
+    search_effort,
     native_hbc,
+    vector_blocks,
+    vector_block_encoding,
+    recursive_topology_max_workspace_mb,
+    topology_rebuild_algorithm,
+    centroid_directory_mode,
+    flat_probe_count,
 ) = sys.argv[1:]
 antfly_git_head = subprocess.check_output(
     ["git", "-C", repo_root, "rev-parse", "HEAD"], text=True
@@ -193,7 +294,18 @@ with open(out_path, "w", encoding="utf-8") as handle:
             "process_memory_budget_mb": int(memory_budget_mb) if memory_budget_mb else None,
             "public_profile_count": int(profile_count),
             "public_profile_dataset": profile_dataset,
+            "search_effort": float(search_effort) if search_effort else None,
             "native_hbc_posting_store": native_hbc == "1",
+            "native_exact_vector_blocks": vector_blocks == "1",
+            "vector_block_encoding": vector_block_encoding,
+            "recursive_topology_max_workspace_mb": (
+                int(recursive_topology_max_workspace_mb)
+                if recursive_topology_max_workspace_mb
+                else None
+            ),
+            "topology_rebuild_algorithm": topology_rebuild_algorithm,
+            "centroid_directory_mode": centroid_directory_mode or None,
+            "flat_centroid_probe_count": int(flat_probe_count) if flat_probe_count else None,
             "load_lifecycle": "public_api_online_incremental",
             "builder": "server_selected; do not assume recursive from client batch size",
         },
@@ -205,7 +317,7 @@ with open(out_path, "w", encoding="utf-8") as handle:
 PY
   python3 "$sampler" --capture-wired-baseline "$run_root/wired-baseline.json"
 else
-  python3 - "$run_root/resume-config${label_suffix}.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$cold_label" "$warm_label" "$native_hbc" "$diagnostic_profile_only" <<'PY'
+  python3 - "$run_root/resume-config${label_suffix}.json" "$repo_root" "$antfly_bin" "$vdbbench_root" "$process_memory_budget_mb" "$profile_count" "$profile_dataset" "$search_effort" "$cold_label" "$warm_label" "$concurrent_label" "$native_hbc" "$vector_blocks" "$vector_block_encoding" "$diagnostic_profile_only" "$resume_concurrent" <<'PY'
 import json
 import subprocess
 import sys
@@ -218,10 +330,15 @@ import sys
     memory_budget_mb,
     profile_count,
     profile_dataset,
+    search_effort,
     cold_label,
     warm_label,
+    concurrent_label,
     native_hbc,
+    vector_blocks,
+    vector_block_encoding,
     diagnostic_profile_only,
+    resume_concurrent,
 ) = sys.argv[1:]
 with open(out_path, "w", encoding="utf-8") as handle:
     json.dump(
@@ -236,10 +353,15 @@ with open(out_path, "w", encoding="utf-8") as handle:
             ),
             "public_profile_count": int(profile_count),
             "public_profile_dataset": profile_dataset,
+            "search_effort": float(search_effort) if search_effort else None,
             "cold_label": cold_label,
             "warm_label": warm_label,
+            "concurrent_label": concurrent_label if resume_concurrent == "1" else None,
             "native_hbc_posting_store": native_hbc == "1",
+            "native_exact_vector_blocks": vector_blocks == "1",
+            "vector_block_encoding": vector_block_encoding,
             "diagnostic_profile_only": diagnostic_profile_only == "1",
+            "resume_concurrent": resume_concurrent == "1",
         },
         handle,
         indent=2,
@@ -253,6 +375,7 @@ fi
 server_pid=
 sampler_pid=
 rss_sampler_pid=
+metrics_sampler_pid=
 
 stop_server() {
   if [[ -n "$server_pid" ]]; then
@@ -273,6 +396,11 @@ cleanup() {
     wait "$rss_sampler_pid" 2>/dev/null || true
     rss_sampler_pid=
   fi
+  if [[ -n "$metrics_sampler_pid" ]]; then
+    kill "$metrics_sampler_pid" 2>/dev/null || true
+    wait "$metrics_sampler_pid" 2>/dev/null || true
+    metrics_sampler_pid=
+  fi
   stop_server
 }
 trap cleanup EXIT INT TERM
@@ -290,27 +418,66 @@ PY
 
 start_server() {
   local log_name=$1
-  local server_env=()
+  local memory_args=()
   if [[ -n "$process_memory_budget_mb" ]]; then
-    server_env+=("ANTFLY_PROCESS_MEMORY_BUDGET_MB=$process_memory_budget_mb")
+    # Use the standalone contract rather than leaking the canonical process
+    # budget environment variable into linked runtimes that also consume it.
+    memory_args+=("--process-memory-budget-mb" "$process_memory_budget_mb")
   fi
-  env "${server_env[@]}" "$antfly_bin" standalone \
+  "$antfly_bin" standalone \
     --host 127.0.0.1 \
     --port "$port" \
     --health-port "$health_port" \
     --auth false \
+    "${memory_args[@]}" \
     --data-dir "$run_root/data" \
     >"$run_root/$log_name" 2>&1 &
   server_pid=$!
   printf '%s\n' "$server_pid" >"$run_root/antfly.pid"
 
+  # Health alone proves only the operator listener. Require one harmless public
+  # metadata read so the qualification's readiness boundary is end to end.
   for _ in $(seq 1 300); do
-    if curl -fsS "http://127.0.0.1:$health_port/healthz" >/dev/null 2>&1; then
+    if curl -fsS "http://127.0.0.1:$health_port/healthz" >/dev/null 2>&1 &&
+      curl -fsS "http://127.0.0.1:$port/db/v1/tables" >/dev/null 2>&1; then
       return
     fi
     sleep 0.1
   done
   curl -fsS "http://127.0.0.1:$health_port/healthz" >/dev/null
+  curl -fsS "http://127.0.0.1:$port/db/v1/tables" >/dev/null
+}
+
+wait_public_index_ready() {
+  local suffix=$1
+  local status_path="$run_root/index-readiness${suffix}.json"
+  local attempts=0
+  while [[ "$attempts" -lt 1800 ]]; do
+    attempts=$((attempts + 1))
+    if curl -fsS "http://127.0.0.1:$port/db/v1/tables/vdbbench/indexes/vec" >"$status_path" 2>/dev/null &&
+      python3 - "$status_path" <<'PY'
+import json
+import pathlib
+import sys
+
+payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+status = payload.get("status", {})
+ready = (
+    status.get("readiness", {}).get("state") == "ready"
+    and not status.get("backfill_active", True)
+    and not status.get("dense_publish_pending", True)
+    and not status.get("dense_vector_projection_pending", False)
+    and status.get("hbc_posting", {}).get("dirty_postings", 0) == 0
+)
+raise SystemExit(0 if ready else 1)
+PY
+    then
+      return
+    fi
+    sleep 1
+  done
+  echo "public vector index did not become query-ready within 30 minutes; see $status_path" >&2
+  return 1
 }
 
 start_rss_sampler() {
@@ -327,6 +494,26 @@ start_rss_sampler() {
     done
   ) >"$samples_path" &
   rss_sampler_pid=$!
+}
+
+start_metrics_sampler() {
+  local samples_path=$1
+  (
+    while kill -0 "$server_pid" 2>/dev/null; do
+      printf '# snapshot_wall_time_s %s\n' "$(date +%s)"
+      curl -fsS "http://127.0.0.1:$health_port/metrics" 2>/dev/null || true
+      sleep 2
+    done
+  ) >"$samples_path" &
+  metrics_sampler_pid=$!
+}
+
+stop_metrics_sampler() {
+  if [[ -n "$metrics_sampler_pid" ]]; then
+    kill "$metrics_sampler_pid" 2>/dev/null || true
+    wait "$metrics_sampler_pid" 2>/dev/null || true
+    metrics_sampler_pid=
+  fi
 }
 
 stop_rss_sampler() {
@@ -380,12 +567,22 @@ run_public_profile() {
     exit 2
   fi
   mark_phase "public_profile${suffix}_start"
-  "$vdbbench_root/.venv/bin/python" "$script_dir/profile_vdbbench_public_query.py" \
-    --dataset "$profile_dataset" \
-    --port "$port" \
-    --count "$profile_count" \
-    --output "$run_root/public-query-profile${suffix}.json" \
-    >"$run_root/public-query-profile${suffix}.log" 2>&1
+  if [[ -n "$search_effort" ]]; then
+    "$vdbbench_python" "$script_dir/profile_vdbbench_public_query.py" \
+      --dataset "$profile_dataset" \
+      --port "$port" \
+      --count "$profile_count" \
+      --output "$run_root/public-query-profile${suffix}.json" \
+      --search-effort "$search_effort" \
+      >"$run_root/public-query-profile${suffix}.log" 2>&1
+  else
+    "$vdbbench_python" "$script_dir/profile_vdbbench_public_query.py" \
+      --dataset "$profile_dataset" \
+      --port "$port" \
+      --count "$profile_count" \
+      --output "$run_root/public-query-profile${suffix}.json" \
+      >"$run_root/public-query-profile${suffix}.log" 2>&1
+  fi
   mark_phase "public_profile${suffix}_end"
 }
 
@@ -457,9 +654,13 @@ run_vdbbench() {
   if [[ "$supports_serial_cooldown" == true ]]; then
     cli_args+=(--serial-cooldown 2)
   fi
+  if [[ -n "$search_effort" ]]; then
+    cli_args+=(--search-effort "$search_effort")
+  fi
   (
     cd "$vdbbench_root"
     ANTFLY_VDBBENCH_KEEP_DEFAULT_FULL_TEXT=0 \
+    ANTFLY_VDBBENCH_READ_ONLY_REUSE=${ANTFLY_VDBBENCH_READ_ONLY_REUSE:-0} \
     ANTFLY_BENCH_STATUS=1 \
     ANTFLY_BENCH_STATUS_INTERVAL=5 \
     DATASET_LOCAL_DIR=${DATASET_LOCAL_DIR:-/private/tmp/vdbbench-dataset} \
@@ -469,7 +670,7 @@ run_vdbbench() {
     IR_DATASETS_TMP=${IR_DATASETS_TMP:-/private/tmp/vdbbench-ir-tmp} \
     LOG_FILE="$run_root/vdbbench-framework.log" \
     PYTHONPATH=. \
-    .venv/bin/python -m vectordb_bench.cli.vectordbbench "${cli_args[@]}" "$@"
+    "$vdbbench_python" -m vectordb_bench.cli.vectordbbench "${cli_args[@]}" "$@"
   )
 }
 
@@ -522,16 +723,25 @@ if [[ "$resume_after_live" == "1" ]]; then
   mark_phase restart_begin
   start_server "antfly-reopened${label_suffix}.log"
   start_rss_sampler "$run_root/rss-restart${label_suffix}.tsv"
+  start_metrics_sampler "$run_root/metrics-live-restart${label_suffix}.prom"
   mark_phase restart_ready
+  wait_public_index_ready "$label_suffix"
+  mark_phase restart_index_ready
   if [[ "$diagnostic_profile_only" != "1" ]]; then
-    run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+    ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
       >"$run_root/vdbbench-reopened-cold${label_suffix}.log" 2>&1
     validate_vdbbench_result "$cold_label" 0 1
     mark_phase reopened_cold_query_end
-    run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+    ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
       >"$run_root/vdbbench-reopened-warm${label_suffix}.log" 2>&1
     validate_vdbbench_result "$warm_label" 0 1
     mark_phase reopened_warm_query_end
+    if [[ "$resume_concurrent" == "1" ]]; then
+      ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$concurrent_label" --skip-drop-old --skip-load --search-concurrent --skip-search-serial \
+        >"$run_root/vdbbench-reopened-concurrent${label_suffix}.log" 2>&1
+      validate_vdbbench_result "$concurrent_label" 0 0
+      mark_phase reopened_concurrent_query_end
+    fi
   fi
   run_public_profile "$label_suffix"
   curl -fsS "http://127.0.0.1:$health_port/metrics" >"$run_root/metrics-after-restart${label_suffix}.txt"
@@ -544,6 +754,7 @@ if [[ "$resume_after_live" == "1" ]]; then
   stop_rss_sampler \
     "$run_root/rss-restart${label_suffix}.tsv" \
     "$run_root/rss-restart${label_suffix}.json"
+  stop_metrics_sampler
   if [[ "$diagnostic_profile_only" != "1" ]]; then
     python3 "$script_dir/summarize_vdbbench_qualification.py" "$run_root"
   fi
@@ -553,6 +764,7 @@ fi
 mark_phase server_start
 start_server antfly-initial.log
 start_rss_sampler "$run_root/rss-live.tsv"
+start_metrics_sampler "$run_root/metrics-live.prom"
 mark_phase live_load_and_query_start
 run_vdbbench "$live_label" --drop-old --load --search-concurrent --search-serial \
   >"$run_root/vdbbench-live.log" 2>&1
@@ -567,6 +779,7 @@ capture_footprint_once \
   "$run_root/footprint.log" \
   "$run_root/wired-baseline.json"
 stop_rss_sampler "$run_root/rss-live.tsv" "$run_root/rss-live.json"
+stop_metrics_sampler
 
 mark_phase restart_begin
 stop_server
@@ -574,12 +787,14 @@ mark_phase shutdown_complete
 start_server antfly-reopened.log
 start_rss_sampler "$run_root/rss-restart.tsv"
 mark_phase restart_ready
+wait_public_index_ready ""
+mark_phase restart_index_ready
 
-run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$cold_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
   >"$run_root/vdbbench-reopened-cold.log" 2>&1
 validate_vdbbench_result "$cold_label" 0 1
 mark_phase reopened_cold_query_end
-run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
+ANTFLY_VDBBENCH_READ_ONLY_REUSE=1 run_vdbbench "$warm_label" --skip-drop-old --skip-load --skip-search-concurrent --search-serial \
   >"$run_root/vdbbench-reopened-warm.log" 2>&1
 validate_vdbbench_result "$warm_label" 0 1
 mark_phase reopened_warm_query_end

@@ -71,6 +71,8 @@ const MinSmartDenseRepairBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartDenseRepairBytes: u64 = 512 * 1024 * 1024;
 const MinSmartShardTransitionBytes: u64 = 64 * 1024 * 1024;
 const MaxSmartShardTransitionBytes: u64 = 512 * 1024 * 1024;
+const MinSmartVectorBlockBuildBytes: u64 = 64 * 1024 * 1024;
+const MaxSmartVectorBlockBuildBytes: u64 = 256 * 1024 * 1024;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
     platform_sync.lockYielding(mutex);
@@ -220,6 +222,7 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     const algebraic_tensor_hard = adaptiveSliceHardLimit(total, 64, MinSmartAlgebraicTensorBytes, MaxSmartAlgebraicTensorBytes);
     const dense_repair_hard = adaptiveSliceHardLimit(total, 24, MinSmartDenseRepairBytes, MaxSmartDenseRepairBytes);
     const shard_transition_hard = adaptiveSliceHardLimit(total, 24, MinSmartShardTransitionBytes, MaxSmartShardTransitionBytes);
+    const vector_block_build_hard = adaptiveSliceHardLimit(total, 16, MinSmartVectorBlockBuildBytes, MaxSmartVectorBlockBuildBytes);
 
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = elasticCacheBudget(lsm_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = resourceBudget(3, lsm_compaction_hard);
@@ -239,6 +242,7 @@ fn smartResourceBudgetsForTotal(total: u64) SmartResourceBudgets {
     options.budgets[@intFromEnum(resource_manager_mod.Slice.algebraic_tensor_accumulators)] = resourceBudget(3, algebraic_tensor_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = resourceBudget(3, dense_repair_hard);
     options.budgets[@intFromEnum(resource_manager_mod.Slice.shard_transition_working_set)] = resourceBudget(3, shard_transition_hard);
+    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = resourceBudget(3, vector_block_build_hard);
     // Inference slices are logical host-plus-accelerator metrics. Their host
     // component is enforced by the aggregate budget above; ModelManager and
     // BackendRuntime retain device-aware backend admission.
@@ -667,6 +671,7 @@ test "provisioned group storage derives all resource budgets" {
         resource_manager_mod.Slice.lite_native_link_cache,
         resource_manager_mod.Slice.dense_repair_working_set,
         resource_manager_mod.Slice.shard_transition_working_set,
+        resource_manager_mod.Slice.dense_vector_block_build_working_set,
     }) |slice| {
         const stats = storage.resource_manager.sliceStats(slice);
         try std.testing.expect(stats.hard_limit_bytes > 0);

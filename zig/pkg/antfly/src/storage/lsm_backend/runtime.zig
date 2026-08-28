@@ -217,6 +217,12 @@ fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTabl
     }
 }
 
+fn enforceSortedWriteAdmission(backend: anytype, incoming: *const State) !void {
+    if (@hasDecl(@TypeOf(backend.*), "enforceSortedWriteAdmission")) {
+        try backend.enforceSortedWriteAdmission(incoming);
+    }
+}
+
 fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     const BackendType = @TypeOf(backend.*);
     if (@hasDecl(BackendType, "noteWriteMutationLocked")) {
@@ -403,6 +409,22 @@ pub fn BoundStore(comptime BackendType: type) type {
             return try LocalCurrentScanTxn.open(self.backend, self.namespace);
         }
 
+        pub fn beginReplayLaneScan(self: *@This(), lane_ordinal: u8, from_sequence: u64) !LocalCurrentScanTxn {
+            var replay_namespace = self.namespace;
+            replay_namespace.block_cache_admission = .transient;
+            if (@hasDecl(BackendType, "cloneReplayLaneMutableRange")) {
+                const lower = internal_keys.replayRangeLower(lane_ordinal, from_sequence);
+                const upper = internal_keys.replayRangeUpper(lane_ordinal);
+                return try LocalCurrentScanTxn.openReplayLane(
+                    self.backend,
+                    replay_namespace,
+                    lower[0..],
+                    upper[0..],
+                );
+            }
+            return try LocalCurrentScanTxn.open(self.backend, replay_namespace);
+        }
+
         pub fn forEachReplayLaneFrom(
             self: *@This(),
             lane_ordinal: u8,
@@ -411,11 +433,18 @@ pub fn BoundStore(comptime BackendType: type) type {
             ctx: *anyopaque,
             callback: backend_erased.Store.ReplayCallback,
         ) !backend_types.ReplayLaneIterationStats {
+            // Replay lanes are monotonically consumed, bounded source scans.
+            // Their data blocks will not be revisited by the same cursor and
+            // downstream indexes own any useful derivative residency. Retain
+            // table indexes/bloom metadata, but do not let a catch-up scan
+            // displace foreground query data from the shared block cache.
+            var replay_namespace = self.namespace;
+            replay_namespace.block_cache_admission = .transient;
             if (@hasDecl(BackendType, "cloneReplayLaneMutableRange")) {
                 return try forEachReplayLaneFromRangeSnapshot(
                     BackendType,
                     self.backend,
-                    self.namespace,
+                    replay_namespace,
                     lane_ordinal,
                     from_sequence,
                     max_entries,
@@ -423,7 +452,7 @@ pub fn BoundStore(comptime BackendType: type) type {
                     callback,
                 );
             }
-            var scan = try LocalCurrentScanTxn.open(self.backend, self.namespace);
+            var scan = try LocalCurrentScanTxn.open(self.backend, replay_namespace);
             defer scan.abort();
 
             var cursor = try scan.openCursor();
@@ -457,7 +486,9 @@ pub fn BoundStore(comptime BackendType: type) type {
         }
 
         pub fn beginBatchWithOptions(self: *@This(), options: backend_types.BatchOptions) !LocalWriteTxn {
-            return try LocalWriteTxn.openWithOptions(self.backend, self.namespace, options);
+            var namespace = self.namespace;
+            namespace.block_cache_admission = options.block_cache_admission;
+            return try LocalWriteTxn.openWithOptions(self.backend, namespace, options);
         }
 
         pub fn sync(self: *@This(), force: bool) !void {
@@ -534,6 +565,7 @@ fn forEachReplayLaneFromRangeSnapshot(
         false,
     );
     defer cursor.close();
+    cursor.boundPersistedRunBlockResidency();
     cursor.setUpperBound(upper[0..]);
 
     var stats = backend_types.ReplayLaneIterationStats{ .scan_batches = 1 };
@@ -670,7 +702,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             tombstone: bool,
         };
         const cursor_storage_alignment = @max(
-            @max(@alignOf(?usize), @alignOf(?SourceEntry)),
+            @max(@max(@alignOf(?usize), @alignOf(?SourceEntry)), @alignOf(?[]u8)),
             @max(
                 @alignOf(SourceBlockLease),
                 @max(
@@ -692,6 +724,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         namespace: backend_types.Namespace,
         positions: []?usize,
         source_entries: []?SourceEntry,
+        source_key_copies: []?[]u8 = &.{},
         source_blocks: []SourceBlockLease,
         source_block_indices: []?usize,
         source_table_indices: []?*const lsm_table_file.TableIndex,
@@ -708,11 +741,14 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         upper_bound: ?[]const u8 = null,
         backend_locked: bool = false,
         record_scan_value_stats: bool = true,
+        bounded_run_block_residency: bool = false,
+        resident_run_source: ?usize = null,
 
         fn cursorStorageSize(source_count: usize) usize {
             var offset: usize = 0;
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?SourceEntry, &offset, source_count);
+            cursorStorageAdvance(?[]u8, &offset, source_count);
             cursorStorageAdvance(SourceBlockLease, &offset, source_count);
             cursorStorageAdvance(?usize, &offset, source_count);
             cursorStorageAdvance(?*const lsm_table_file.TableIndex, &offset, source_count);
@@ -767,6 +803,8 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             @memset(positions, null);
             const source_entries = cursorStorageSlice(?SourceEntry, storage, &offset, source_count);
             @memset(source_entries, null);
+            const source_key_copies = cursorStorageSlice(?[]u8, storage, &offset, source_count);
+            @memset(source_key_copies, null);
             const source_blocks = cursorStorageSlice(SourceBlockLease, storage, &offset, source_count);
             @memset(source_blocks, .none);
             const source_block_indices = cursorStorageSlice(?usize, storage, &offset, source_count);
@@ -791,6 +829,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 .namespace = namespace,
                 .positions = positions,
                 .source_entries = source_entries,
+                .source_key_copies = source_key_copies,
                 .source_blocks = source_blocks,
                 .source_block_indices = source_block_indices,
                 .source_table_indices = source_table_indices,
@@ -805,6 +844,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn close(self: *@This()) void {
             for (0..self.source_blocks.len) |source_index| self.clearSourceBlock(source_index);
+            for (0..self.source_key_copies.len) |source_index| self.clearSourceKeyCopy(source_index);
             for (self.source_table_index_handles) |*maybe_handle| {
                 if (maybe_handle.*) |*handle| handle.release();
                 maybe_handle.* = null;
@@ -817,6 +857,7 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                 self.allocator.free(self.source_block_indices);
                 self.allocator.free(self.source_blocks);
                 self.allocator.free(self.source_entries);
+                self.allocator.free(self.source_key_copies);
                 self.allocator.free(self.positions);
                 self.allocator.free(self.source_table_indices);
                 self.allocator.free(self.source_table_index_handles);
@@ -835,6 +876,16 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
 
         pub fn setUpperBound(self: *@This(), upper: ?[]const u8) void {
             self.upper_bound = upper;
+        }
+
+        /// Bounds decoded persisted-run data residency to the run currently
+        /// winning the merge. Inactive runs retain only their current key for
+        /// heap ordering. This is intended for synchronous streaming consumers
+        /// such as replay, which do not retain returned values across `next`.
+        pub fn boundPersistedRunBlockResidency(self: *@This()) void {
+            std.debug.assert(self.current_key == null);
+            std.debug.assert(self.source_heap_len == 0);
+            self.bounded_run_block_residency = true;
         }
 
         pub fn last(self: *@This()) !?backend_adapter.Entry {
@@ -899,19 +950,19 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     self.current_visible_source = null;
                     return null;
                 };
-                const candidate = self.source_entries[winner_source].?.key;
-                const entry = self.source_entries[winner_source].?;
-                if (!self.keyBeforeUpper(entry.key)) {
+                if (!self.keyBeforeUpper(self.source_entries[winner_source].?.key)) {
                     self.current_visible_source = null;
                     return null;
                 }
+                try self.makeRunSourceResident(winner_source);
+                const entry = self.source_entries[winner_source].?;
                 if (!entry.tombstone) {
                     self.current_visible_source = winner_source;
                     self.recordVisibleValueStat(winner_source);
                     return .{ .key = entry.key, .value = entry.value };
                 }
                 self.current_visible_source = null;
-                try self.advanceForwardSourcesAtKey(candidate);
+                try self.advanceForwardSourcesAtKey(entry.key);
             }
         }
 
@@ -1202,6 +1253,9 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
             }
 
             const run = try self.runForSource(source_index);
+            if (self.bounded_run_block_residency and run.state == null and run.path != null) {
+                self.resetRunSourceResidency(source_index);
+            }
             if (!runMayContainAtOrAfter(run.*, self.namespace, target)) {
                 self.clearSourceBlock(source_index);
                 self.positions[source_index] = null;
@@ -1223,7 +1277,11 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     try self.sourceEntryAt(source_index, idx)
                 else
                     null;
-                if (self.positions[source_index] == null) self.clearSourceBlock(source_index);
+                if (self.positions[source_index] == null) {
+                    self.clearSourceBlock(source_index);
+                } else if (self.bounded_run_block_residency) {
+                    try self.spillRunSource(source_index);
+                }
                 return;
             }
 
@@ -1272,7 +1330,13 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
                     try self.sourceEntryAt(source_index, idx)
                 else
                     null;
-                if (self.positions[source_index] == null) self.clearSourceBlock(source_index);
+                if (self.positions[source_index] == null) {
+                    self.clearSourceBlock(source_index);
+                    self.clearSourceKeyCopy(source_index);
+                    if (self.resident_run_source == source_index) self.resident_run_source = null;
+                } else if (self.bounded_run_block_residency and self.resident_run_source != source_index) {
+                    try self.spillRunSource(source_index);
+                }
                 return;
             }
 
@@ -1568,6 +1632,67 @@ pub fn MergeCursor(comptime BackendType: type, comptime MutableType: type) type 
         fn clearSourceBlock(self: *@This(), source_index: usize) void {
             self.source_blocks[source_index].release();
             self.source_block_indices[source_index] = null;
+        }
+
+        fn clearSourceKeyCopy(self: *@This(), source_index: usize) void {
+            if (self.source_key_copies[source_index]) |key| self.allocator.free(key);
+            self.source_key_copies[source_index] = null;
+        }
+
+        fn resetRunSourceResidency(self: *@This(), source_index: usize) void {
+            self.clearSourceBlock(source_index);
+            self.clearSourceKeyCopy(source_index);
+            if (self.resident_run_source == source_index) self.resident_run_source = null;
+        }
+
+        fn isPersistedRunSource(self: *const @This(), source_index: usize) bool {
+            const offset = self.runSourceOffset();
+            if (source_index < offset) return false;
+            const run_index = source_index - offset;
+            if (run_index >= self.runs.len) return false;
+            const run = self.runs[run_index];
+            return run.state == null and run.path != null;
+        }
+
+        fn spillRunSource(self: *@This(), source_index: usize) !void {
+            if (!self.bounded_run_block_residency or !self.isPersistedRunSource(source_index)) return;
+            const entry = self.source_entries[source_index] orelse {
+                self.resetRunSourceResidency(source_index);
+                return;
+            };
+            if (self.source_key_copies[source_index] != null) return;
+
+            const key = try self.allocator.dupe(u8, entry.key);
+            self.source_key_copies[source_index] = key;
+            self.source_entries[source_index] = .{
+                .namespace_name = self.namespace.name,
+                .key = key,
+                .value = &.{},
+                .tombstone = entry.tombstone,
+            };
+            self.clearSourceBlock(source_index);
+            if (self.resident_run_source == source_index) self.resident_run_source = null;
+        }
+
+        fn makeRunSourceResident(self: *@This(), source_index: usize) !void {
+            if (!self.bounded_run_block_residency) return;
+            if (self.resident_run_source == source_index) return;
+
+            if (self.resident_run_source) |resident_source| {
+                try self.spillRunSource(resident_source);
+            }
+            if (!self.isPersistedRunSource(source_index)) return;
+
+            const copied_key = self.source_key_copies[source_index] orelse {
+                self.resident_run_source = source_index;
+                return;
+            };
+            const position = self.positions[source_index] orelse return error.RunStateUnavailable;
+            const entry = try self.sourceEntryAt(source_index, position);
+            self.source_entries[source_index] = entry;
+            self.allocator.free(copied_key);
+            self.source_key_copies[source_index] = null;
+            self.resident_run_source = source_index;
         }
 
         fn sourceEntryAtFromLocalIndex(
@@ -3327,6 +3452,51 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             };
         }
 
+        /// Capture a replay lane once and keep its merge generation pinned
+        /// while the derived worker consumes multiple bounded windows. Only
+        /// the append-only mutable lane range is copied; documents and other
+        /// replay lanes remain outside this snapshot.
+        pub fn openReplayLane(
+            backend: *BackendType,
+            namespace: backend_types.Namespace,
+            lower: []const u8,
+            upper: []const u8,
+        ) !@This() {
+            const locked = lockBackend(BackendType, backend);
+            defer unlockBackend(BackendType, backend, locked);
+            const metadata_allocator = runtimeScratchAllocator(backend.allocator);
+            const runs = try borrowRunSnapshotList(BackendType, backend, metadata_allocator, backend.runs.items);
+            errdefer freeRunSnapshotList(BackendType, backend, metadata_allocator, runs);
+            const l0_groups = try buildL0RunGroupsWithStats(backend, metadata_allocator, runs);
+            errdefer deinitRunGroups(metadata_allocator, l0_groups);
+            const levels = try buildLowerLevels(metadata_allocator, runs);
+            errdefer metadata_allocator.free(levels);
+            try retainReadReader(BackendType, backend, .current_scan);
+            errdefer releaseReadReader(BackendType, backend, .current_scan);
+
+            const owned = try backend.allocator.create(State);
+            errdefer backend.allocator.destroy(owned);
+            owned.* = try backend.cloneReplayLaneMutableRange(namespace, lower, upper);
+            errdefer owned.deinit(backend.allocator);
+
+            const immutable_memtables = if (@hasDecl(BackendType, "snapshotImmutableMemtables"))
+                try backend.snapshotImmutableMemtables()
+            else
+                &.{};
+            errdefer releaseImmutableMemtableSnapshotList(BackendType, backend, immutable_memtables);
+            return .{
+                .allocator = backend.allocator,
+                .metadata_allocator = metadata_allocator,
+                .backend = backend,
+                .namespace = namespace,
+                .mutable_snapshot = .{ .owned = owned },
+                .immutable_memtables = immutable_memtables,
+                .runs = runs,
+                .l0_groups = l0_groups,
+                .levels = levels,
+            };
+        }
+
         pub fn abort(self: *@This()) void {
             const backend = self.backend;
             deinitRunGroups(self.metadata_allocator, self.l0_groups);
@@ -3613,7 +3783,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if ((self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) and
+            const can_queue_pending_immutable = @hasDecl(BackendType, "canQueueDirectBulkStateWithPendingImmutable") and
+                self.backend.canQueueDirectBulkStateWithPendingImmutable();
+            if ((self.backend.mutable.entries.items.len != 0 or
+                (self.backend.activeImmutableMemtableCount() != 0 and !can_queue_pending_immutable)) and
                 @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
             {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
@@ -3623,7 +3796,9 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
             }
-            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+            if (self.backend.mutable.entries.items.len != 0 or
+                (self.backend.activeImmutableMemtableCount() != 0 and !can_queue_pending_immutable))
+            {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
                 try self.drainBulkAppendsToMutable();
@@ -3652,10 +3827,15 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 return false;
             }
 
+            try enforceSortedWriteAdmission(self.backend, &self.bulk_appends);
             if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&self.bulk_appends);
-            if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+            const queued = if (@hasDecl(BackendType, "enqueueOwnedSortedStateForFlush"))
+                try self.backend.enqueueOwnedSortedStateForFlush(&self.bulk_appends)
+            else
+                false;
+            if (!queued and @hasDecl(BackendType, "ingestOwnedSortedState")) {
                 try self.backend.ingestOwnedSortedState(&self.bulk_appends);
-            } else {
+            } else if (!queued) {
                 try self.backend.ingestSortedState(&self.bulk_appends);
             }
             if (@hasDecl(BackendType, "recordBulkAppendSuccess")) self.backend.recordBulkAppendSuccess(entries, sort_ns);
@@ -3688,6 +3868,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                 self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
                 @hasDecl(BackendType, "directIngestCombinedMutable"))
             {
+                try enforceMutableWriteAdmission(self.backend, &self.mutable);
                 if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
                 const sort_start_ns = platform_time.monotonicNs();
                 if (!try self.backend.directIngestCombinedMutable(&self.mutable)) {
@@ -3707,14 +3888,19 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBelowThreshold")) self.backend.recordDirectBulkIngestFallbackBelowThreshold();
                     return false;
                 }
+                try enforceMutableWriteAdmission(self.backend, &self.mutable);
                 if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
                 const sort_start_ns = platform_time.monotonicNs();
                 var sorted = try self.mutable.toStateMove(self.allocator);
                 errdefer sorted.deinit(self.allocator);
                 const sort_ns = elapsedNs(sort_start_ns);
-                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                const queued = if (@hasDecl(BackendType, "enqueueOwnedSortedStateForFlush"))
+                    try self.backend.enqueueOwnedSortedStateForFlush(&sorted)
+                else
+                    false;
+                if (!queued and @hasDecl(BackendType, "ingestOwnedSortedState")) {
                     try self.backend.ingestOwnedSortedState(&sorted);
-                } else {
+                } else if (!queued) {
                     try self.backend.ingestSortedState(&sorted);
                 }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
@@ -3729,10 +3915,15 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     sorted.deinit(self.allocator);
                     return false;
                 }
+                try enforceSortedWriteAdmission(self.backend, &sorted);
                 if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&sorted);
-                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                const queued = if (@hasDecl(BackendType, "enqueueOwnedSortedStateForFlush"))
+                    try self.backend.enqueueOwnedSortedStateForFlush(&sorted)
+                else
+                    false;
+                if (!queued and @hasDecl(BackendType, "ingestOwnedSortedState")) {
                     try self.backend.ingestOwnedSortedState(&sorted);
-                } else {
+                } else if (!queued) {
                     try self.backend.ingestSortedState(&sorted);
                 }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
@@ -4498,6 +4689,31 @@ const PointRunCandidate = struct {
 const max_stack_point_run_candidates = 16;
 const max_point_async_stack_reads = 16;
 
+const PointAsyncBatchLease = struct {
+    limit: usize,
+    managed: bool = false,
+};
+
+fn acquirePointAsyncBatchLease(backend: anytype) PointAsyncBatchLease {
+    if (@hasDecl(@TypeOf(backend.*), "acquirePointAsyncBatchLimit")) {
+        const per_batch = @min(backend.options.max_concurrent_point_block_reads, max_point_async_stack_reads);
+        return .{
+            .limit = backend.acquirePointAsyncBatchLimit(max_point_async_stack_reads),
+            .managed = per_batch >= 2,
+        };
+    }
+    return .{
+        .limit = @min(backend.options.max_concurrent_point_block_reads, max_point_async_stack_reads),
+    };
+}
+
+fn releasePointAsyncBatchLease(backend: anytype, lease: PointAsyncBatchLease) void {
+    if (!lease.managed) return;
+    if (@hasDecl(@TypeOf(backend.*), "releasePointAsyncBatchLimit")) {
+        backend.releasePointAsyncBatchLimit();
+    }
+}
+
 fn runIndicesUsePathBackedPointPrecheck(backend: anytype, runs: []Run, run_indices: []const usize) bool {
     for (run_indices) |run_index| {
         const run = &runs[run_index];
@@ -4950,7 +5166,10 @@ fn tryReadPointRunCandidatesAsync(
 ) !?AsyncPointLookupResult {
     if (backend.storage == null) return null;
     var stack_reads: [max_point_async_stack_reads]AsyncPointBlockRead = undefined;
-    const configured_limit = @min(backend.options.max_concurrent_point_block_reads, max_point_async_stack_reads);
+    const async_lease = acquirePointAsyncBatchLease(backend);
+    defer releasePointAsyncBatchLease(backend, async_lease);
+    const configured_limit = async_lease.limit;
+    if (configured_limit < 2) return null;
     const batch_limit = @max(@as(usize, 1), configured_limit);
     var offset: usize = 0;
     while (offset < candidates.len) {
@@ -5049,7 +5268,9 @@ fn readManySortedPointFromSnapshotAsync(
     backend_locked: bool,
 ) !?BatchCursorReadResult {
     if (backend_locked or keys.len < 2 or backend.storage == null or backend.options.cache == null) return null;
-    const configured_limit = @min(backend.options.max_concurrent_point_block_reads, max_point_async_stack_reads);
+    const async_lease = acquirePointAsyncBatchLease(backend);
+    defer releasePointAsyncBatchLease(backend, async_lease);
+    const configured_limit = async_lease.limit;
     if (configured_limit < 2) return null;
     // Decide eligibility before touching output slots or read telemetry. A
     // legacy in-memory run uses a different borrowing lifetime and falls back
@@ -6662,7 +6883,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 try self.drainBulkAppendsToMutable();
                 return false;
             }
-            if ((self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) and
+            const can_queue_pending_immutable = @hasDecl(BackendType, "canQueueDirectBulkStateWithPendingImmutable") and
+                self.backend.canQueueDirectBulkStateWithPendingImmutable();
+            if ((self.backend.mutable.entries.items.len != 0 or
+                (self.backend.activeImmutableMemtableCount() != 0 and !can_queue_pending_immutable)) and
                 @hasDecl(BackendType, "drainMutableBeforeBulkAppendDirectIngest"))
             {
                 if (!try self.backend.drainMutableBeforeBulkAppendDirectIngest()) {
@@ -6672,7 +6896,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     return false;
                 }
             }
-            if (self.backend.mutable.entries.items.len != 0 or self.backend.activeImmutableMemtableCount() != 0) {
+            if (self.backend.mutable.entries.items.len != 0 or
+                (self.backend.activeImmutableMemtableCount() != 0 and !can_queue_pending_immutable))
+            {
                 if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackBackendPending")) self.backend.recordBulkAppendFallbackBackendPending(entries);
                 try self.drainBulkAppendsToMutable();
@@ -6701,10 +6927,15 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 return false;
             }
 
+            try enforceSortedWriteAdmission(self.backend, &self.bulk_appends);
             if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&self.bulk_appends);
-            if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+            const queued = if (@hasDecl(BackendType, "enqueueOwnedSortedStateForFlush"))
+                try self.backend.enqueueOwnedSortedStateForFlush(&self.bulk_appends)
+            else
+                false;
+            if (!queued and @hasDecl(BackendType, "ingestOwnedSortedState")) {
                 try self.backend.ingestOwnedSortedState(&self.bulk_appends);
-            } else {
+            } else if (!queued) {
                 try self.backend.ingestSortedState(&self.bulk_appends);
             }
             if (@hasDecl(BackendType, "recordBulkAppendSuccess")) self.backend.recordBulkAppendSuccess(entries, sort_ns);
@@ -6737,6 +6968,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                 self.backend.shouldDrainMutableBeforeDirectBulkIngest(&self.mutable) and
                 @hasDecl(BackendType, "directIngestCombinedMutable"))
             {
+                try enforceMutableWriteAdmission(self.backend, &self.mutable);
                 if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
                 const sort_start_ns = platform_time.monotonicNs();
                 if (!try self.backend.directIngestCombinedMutable(&self.mutable)) {
@@ -6756,14 +6988,19 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     if (@hasDecl(BackendType, "recordDirectBulkIngestFallbackBelowThreshold")) self.backend.recordDirectBulkIngestFallbackBelowThreshold();
                     return false;
                 }
+                try enforceMutableWriteAdmission(self.backend, &self.mutable);
                 if (@hasDecl(BackendType, "appendWalForMutable")) try self.backend.appendWalForMutable(&self.mutable);
                 const sort_start_ns = platform_time.monotonicNs();
                 var sorted = try self.mutable.toStateMove(self.allocator);
                 errdefer sorted.deinit(self.allocator);
                 const sort_ns = elapsedNs(sort_start_ns);
-                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                const queued = if (@hasDecl(BackendType, "enqueueOwnedSortedStateForFlush"))
+                    try self.backend.enqueueOwnedSortedStateForFlush(&sorted)
+                else
+                    false;
+                if (!queued and @hasDecl(BackendType, "ingestOwnedSortedState")) {
                     try self.backend.ingestOwnedSortedState(&sorted);
-                } else {
+                } else if (!queued) {
                     try self.backend.ingestSortedState(&sorted);
                 }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
@@ -6778,10 +7015,15 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     sorted.deinit(self.allocator);
                     return false;
                 }
+                try enforceSortedWriteAdmission(self.backend, &sorted);
                 if (@hasDecl(BackendType, "appendWalForState")) try self.backend.appendWalForState(&sorted);
-                if (@hasDecl(BackendType, "ingestOwnedSortedState")) {
+                const queued = if (@hasDecl(BackendType, "enqueueOwnedSortedStateForFlush"))
+                    try self.backend.enqueueOwnedSortedStateForFlush(&sorted)
+                else
+                    false;
+                if (!queued and @hasDecl(BackendType, "ingestOwnedSortedState")) {
                     try self.backend.ingestOwnedSortedState(&sorted);
-                } else {
+                } else if (!queued) {
                     try self.backend.ingestSortedState(&sorted);
                 }
                 if (@hasDecl(BackendType, "recordDirectBulkIngestSuccess")) self.backend.recordDirectBulkIngestSuccess(entries, sort_ns);
@@ -7185,6 +7427,70 @@ test "lsm merge cursor frees loaded blocks with backend allocator" {
     cursor.clearSourceBlock(0);
     try std.testing.expectEqual(SourceBlockLease.none, cursor.source_blocks[0]);
     try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[0]);
+}
+
+test "lsm bounded merge cursor spills inactive persisted block" {
+    const TestBackend = struct {
+        allocator: Allocator,
+    };
+    const Cursor = MergeCursor(TestBackend, State);
+
+    var backend = TestBackend{ .allocator = std.testing.allocator };
+    var mutable: State = .{};
+    defer mutable.deinit(std.testing.allocator);
+    var path = [_]u8{'r'};
+    var empty = [_]u8{};
+    var runs = [_]Run{.{
+        .id = 1,
+        .level = 0,
+        .size_bytes = 4096,
+        .path = path[0..],
+        .smallest_namespace_name = null,
+        .smallest_key = empty[0..],
+        .largest_namespace_name = null,
+        .largest_key = empty[0..],
+        .entry_count = 1,
+        .bloom_filter = null,
+        .owns_metadata = false,
+        .owns_path = false,
+        .owns_bloom_filter = false,
+        .state = null,
+    }};
+    var cursor = try Cursor.init(
+        std.testing.allocator,
+        &backend,
+        &mutable,
+        &.{},
+        runs[0..],
+        &.{},
+        &.{},
+        .{ .name = "docs" },
+        false,
+    );
+    defer cursor.close();
+    cursor.boundPersistedRunBlockResidency();
+
+    const run_source = cursor.runSourceOffset();
+    cursor.positions[run_source] = 0;
+    cursor.source_entries[run_source] = .{
+        .namespace_name = "docs",
+        .key = "replay:1",
+        .value = "payload",
+        .tombstone = false,
+    };
+    cursor.source_blocks[run_source] = .{ .owned = .{
+        .allocator = std.testing.allocator,
+        .bytes = try std.testing.allocator.alloc(u8, 4096),
+    } };
+    cursor.source_block_indices[run_source] = 0;
+    cursor.resident_run_source = run_source;
+
+    try cursor.spillRunSource(run_source);
+    try std.testing.expectEqual(@as(?usize, null), cursor.resident_run_source);
+    try std.testing.expectEqual(SourceBlockLease.none, cursor.source_blocks[run_source]);
+    try std.testing.expectEqual(@as(?usize, null), cursor.source_block_indices[run_source]);
+    try std.testing.expectEqualStrings("replay:1", cursor.source_key_copies[run_source].?);
+    try std.testing.expectEqual(@as(usize, 0), cursor.source_entries[run_source].?.value.len);
 }
 
 test "lsm async point read cleanup preserves independently retained index pin" {

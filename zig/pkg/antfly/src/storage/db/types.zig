@@ -2829,6 +2829,11 @@ pub const DBIndexStats = struct {
     coverage_identity_ready: bool = false,
     backfill_active: bool = false,
     backfill_progress: f64 = 0.0,
+    /// The HBC/posting generation is visible, but its native exact-vector
+    /// projection has not reached the same source sequence. This is separate
+    /// from generic backfill because public coverage normalization may clear
+    /// stale replay activity once external artifacts are complete.
+    dense_vector_projection_pending: bool = false,
     enrichment_failed: bool = false,
     repair_degraded: bool = false,
     repair_issue_count: u64 = 0,
@@ -3289,6 +3294,7 @@ pub const AsyncIndexingStats = struct {
     applied_sequence: AppliedSequenceStats = .{},
     startup: StartupCatchUpStats = .{},
     dense_catch_up: DenseCatchUpStats = .{},
+    dense_projection_finalizing: bool = false,
     bulk_coalescing: BulkCoalescingStats = .{},
     derived_workers: DerivedWorkerStats = .{},
 };
@@ -3436,6 +3442,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     accumulateAppliedSequenceStats(&dst.applied_sequence, src.applied_sequence);
     accumulateStartupCatchUpStats(&dst.startup, src.startup);
     accumulateDenseCatchUpStats(&dst.dense_catch_up, src.dense_catch_up);
+    dst.dense_projection_finalizing = dst.dense_projection_finalizing or src.dense_projection_finalizing;
     dst.bulk_coalescing.active_session = dst.bulk_coalescing.active_session or src.bulk_coalescing.active_session;
     dst.bulk_coalescing.staged_keys = @max(dst.bulk_coalescing.staged_keys, src.bulk_coalescing.staged_keys);
     dst.bulk_coalescing.stage_batches += src.bulk_coalescing.stage_batches;

@@ -21,3 +21,4 @@ pub const resource_manager = @import("resource_manager.zig");
 pub const rowsource = @import("rowsource/mod.zig");
 pub const runtime_backend = @import("runtime_backend.zig");
 pub const sim_runtime = @import("sim_runtime.zig");
+pub const vector_block_store = @import("vector_block_store.zig");

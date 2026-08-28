@@ -4361,9 +4361,19 @@ fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
     return false;
 }
 
+fn storeHasVectorProjectionStatus(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.dense_vector_projection_pending) return true;
+        }
+    }
+    return false;
+}
+
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
     if (record.reporter_incarnation != 0 or record.status_generation != 0)
         return runtime_status_protocol.current_record_version;
+    if (storeHasVectorProjectionStatus(record)) return runtime_status_protocol.vector_projection_record_version;
     if (storeHasRuntimeRepairStatus(record)) return runtime_status_protocol.repair_status_record_version;
     return null;
 }
@@ -5357,6 +5367,8 @@ fn appendRuntimeGroupStatusRecord(
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
     for (record.indexes) |index| {
+        if (index.dense_vector_projection_pending)
+            return runtime_status_protocol.vector_projection_record_version;
         if (index.repair_status != null) return runtime_status_protocol.repair_status_record_version;
     }
     return runtime_status_protocol.legacy_record_version;
@@ -5788,6 +5800,9 @@ fn appendRuntimeIndexStatusRecord(
             if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
         );
     }
+    if (version >= runtime_status_protocol.vector_projection_record_version) {
+        try out.append(alloc, if (record.dense_vector_projection_pending) 1 else 0);
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -5853,6 +5868,13 @@ fn readRuntimeIndexStatusRecord(
         if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
+    const dense_vector_projection_pending = if (version >= runtime_status_protocol.vector_projection_record_version) blk: {
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const value = encoded[pos.*];
+        pos.* += 1;
+        if (value > 1) return error.InvalidMetadataTransitionEncoding;
+        break :blk value == 1;
+    } else false;
     return .{
         .name = name,
         .kind = kind,
@@ -5874,6 +5896,7 @@ fn readRuntimeIndexStatusRecord(
         .replay_applied_sequence = replay_applied_sequence,
         .replay_target_sequence = replay_target_sequence,
         .replay_catch_up_required = replay_catch_up_required,
+        .dense_vector_projection_pending = dense_vector_projection_pending,
         .repair_status = repair_status,
         .repair_active_generation_serviceable = repair_active_generation_serviceable,
     };
@@ -11148,6 +11171,7 @@ test "metadata raft apply store runtime status codec preserves document identity
             .coverage_summary_ready = true,
             .repair_status = .rebuilding,
             .repair_active_generation_serviceable = true,
+            .dense_vector_projection_pending = true,
         }})[0..]),
     }};
 
@@ -11197,6 +11221,7 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expect(status.indexes[0].coverage_summary_ready);
     try std.testing.expectEqual(metadata.IndexRepairStatus.rebuilding, status.indexes[0].repair_status.?);
     try std.testing.expect(status.indexes[0].repair_active_generation_serviceable);
+    try std.testing.expect(status.indexes[0].dense_vector_projection_pending);
 }
 
 test "metadata runtime index status decoder accepts version ten records" {
@@ -11214,9 +11239,10 @@ test "metadata runtime index status decoder accepts version ten records" {
     }, runtime_status_protocol.current_record_version);
 
     // Version 10 ended immediately after replay_catch_up_required. Remove the
-    // version-11 optional load-error tag and the two version-13 repair bytes.
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, encoded.items[encoded.items.len - 3 ..]);
-    encoded.items.len -= 3;
+    // version-11 optional load-error tag, the two version-13 repair bytes,
+    // and the version-14 vector projection byte.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, encoded.items[encoded.items.len - 4 ..]);
+    encoded.items.len -= 4;
 
     var pos: usize = 0;
     const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, 10);
@@ -11231,6 +11257,7 @@ test "metadata runtime index status decoder accepts version ten records" {
     try std.testing.expectEqual(@as(?[]const u8, null), decoded.load_error);
     try std.testing.expect(decoded.repair_status == null);
     try std.testing.expect(!decoded.repair_active_generation_serviceable);
+    try std.testing.expect(!decoded.dense_vector_projection_pending);
 }
 
 test "metadata runtime status writer preserves the version twelve rolling-upgrade contract" {
@@ -11288,6 +11315,24 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
             runtime_status_protocol.legacy_record_version,
         ),
     );
+
+    encoded.clearRetainingCapacity();
+    indexes[0].dense_vector_projection_pending = true;
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
+    version_pos = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.vector_projection_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    var current_pos: usize = 0;
+    const current = try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded.items,
+        &current_pos,
+        runtime_status_protocol.current_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, current);
+    try std.testing.expect(current.indexes[0].dense_vector_projection_pending);
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {

@@ -97,8 +97,9 @@ pub const SplitResult = struct {
 };
 
 const BulkRecursiveScratch = struct {
-    vec_data: []f32,
-    positions: []u64,
+    assignments: []u8,
+    distances: []f32,
+    offsets: []usize,
     partitioned_indexes: []usize,
 };
 
@@ -194,11 +195,16 @@ pub fn CachedQuantizedReadHandle(comptime T: type) type {
     const Borrowed = if (comptime @hasDecl(Index, "BorrowedQuantized")) Index.BorrowedQuantized else void;
     return union(enum) {
         borrowed: Borrowed,
+        /// The value object is request-owned while all of its slices borrow
+        /// from the immutable generation pinned by the surrounding read txn.
+        /// It must therefore never run the protobuf-owned deinitializer.
+        native_borrowed: hbc_runtime.QuantizedSet,
         owned: hbc_runtime.QuantizedSet,
 
         pub fn ptr(self: *const @This()) *const hbc_runtime.QuantizedSet {
             return switch (self.*) {
                 .borrowed => |*lease| if (Borrowed == void) unreachable else lease.ptr(),
+                .native_borrowed => |*qs| qs,
                 .owned => |*qs| qs,
             };
         }
@@ -208,6 +214,7 @@ pub fn CachedQuantizedReadHandle(comptime T: type) type {
                 .borrowed => |*lease| {
                     if (Borrowed != void) lease.deinit();
                 },
+                .native_borrowed => {},
                 .owned => |*qs| qs.deinit(alloc),
             }
             self.* = undefined;
@@ -429,6 +436,26 @@ fn loadMutationNodeReadHandle(
     return .{ .owned = loaded };
 }
 
+fn loadNativeQuantizedReadView(
+    self: anytype,
+    txn: anytype,
+    node_id: u64,
+    is_root: bool,
+    expected_count: usize,
+) !?hbc_runtime.QuantizedSet {
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime !@hasDecl(Index, "loadNativeQuantizedView")) return null;
+    return self.loadNativeQuantizedView(txn, node_id, is_root, expected_count) catch |err| switch (err) {
+        // Deferred batch maintenance may intentionally leave a quantized
+        // payload behind its posting membership. Read handles have always
+        // treated that as an unavailable acceleration and fallen back to
+        // exact vectors; the native borrowed fast path must preserve the same
+        // contract as decoded and cached payloads.
+        error.Corrupted => null,
+        else => return err,
+    };
+}
+
 pub fn loadQuantizedReadHandleProfiled(
     self: anytype,
     txn: anytype,
@@ -442,6 +469,10 @@ pub fn loadQuantizedReadHandleProfiled(
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
     const Index = comptime childType(@TypeOf(self));
     const lookup_start = now_fn();
+    if (try loadNativeQuantizedReadView(self, txn, node_id, is_root, expected_count)) |native| {
+        profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
+        return .{ .native_borrowed = native };
+    }
     if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
         if (self.borrowCachedQuantized(node_id)) |borrowed| {
             profile.quantized_cache_lookup_ns += elapsed_fn(lookup_start);
@@ -491,6 +522,9 @@ pub fn loadQuantizedReadHandle(
     is_not_found: fn (anyerror) bool,
 ) !?CachedQuantizedReadHandle(@TypeOf(self)) {
     const Index = comptime childType(@TypeOf(self));
+    if (try loadNativeQuantizedReadView(self, txn, node_id, is_root, expected_count)) |native| {
+        return .{ .native_borrowed = native };
+    }
     if (comptime @hasDecl(Index, "borrowCachedQuantized")) {
         if (self.borrowCachedQuantized(node_id)) |borrowed| {
             var handle = borrowed;
@@ -1184,10 +1218,12 @@ fn saveLeafNodeBodyWithKnownVectors(
         self.write_profile.save_node_calls += 1;
     }
 
-    node.covering_radius = if (self.config.metric == .l2_squared)
-        l2CoveringRadiusForMatrix(node.centroid, vectors, node.members.len)
-    else
-        std.math.nan(f32);
+    node.covering_radius = coveringRadiusForMatrix(
+        self.config.metric,
+        node.centroid,
+        vectors,
+        node.members.len,
+    );
     try savePackedNodeValue(self, txn, node);
     try refreshQuantizedWithKnownVectors(self, txn, node, vectors, nowNsU64Fixed, elapsedSinceU64Fixed);
     // Only an exact nonquantized payload can replace the rolling split
@@ -2197,7 +2233,7 @@ pub fn searchProfiledRequest(
     errdefer approx_results.deinit();
     profile.setup_ns += elapsed_fn_u64(setup_start);
 
-    if (self.config.centroid_directory_mode == .flat_rabitq and self.config.use_quantization) {
+    if (spfresh_index.usesFlatCentroidDirectory(self)) {
         const configured_probe_count = if (self.config.flat_centroid_probe_count != 0)
             self.config.flat_centroid_probe_count
         else
@@ -2207,15 +2243,19 @@ pub fn searchProfiledRequest(
         // centroid per posting). Keep the full ordered frontier so selective
         // filters can advance without rebuilding it and stopping can be based
         // on a real lower bound instead of the old fixed probe cutoff.
-        const probes = try spfresh_index.selectFlatRabitqPostingsAlloc(
+        const search_width_usize: usize = @intCast(search_width);
+        const missing_posting_slack = @max(@as(usize, 16), search_width_usize / 100);
+        const selection = try spfresh_index.selectFlatPostingsAlloc(
             self,
             &txn,
             transformed_query,
+            search_width_usize +| missing_posting_slack,
             scratch,
             &profile,
             now_fn_u64,
             elapsed_fn_u64,
         );
+        const probes = selection.probes;
         defer self.alloc.free(probes);
         const probe_count = probes.len;
 
@@ -2224,6 +2264,15 @@ pub fn searchProfiledRequest(
         var next_wave_end: usize = @min(initial_probe_limit, probe_count);
         profile.traversal_initial_wave_leaves = @intCast(@min(next_wave_end, std.math.maxInt(u32)));
         for (probes[0..probe_count], 0..) |probe, i| {
+            // Flat routing replaces the tree directory, not the caller's ANN
+            // effort contract. Proof bounds may stop before search_width, but
+            // weak spheres must not silently turn an approximate query into a
+            // full posting scan. Filters retain the same bounded-effort
+            // semantics as tree traversal.
+            if (flat_leaves_scored >= @as(usize, @intCast(search_width))) {
+                profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
+                break;
+            }
             if (i == next_wave_end and next_wave_end < probe_count) {
                 profile.traversal_waves += 1;
                 profile.traversal_max_wave_leaves = @max(
@@ -2231,14 +2280,14 @@ pub fn searchProfiledRequest(
                     @as(u64, @intCast(next_wave_end - previous_wave_end)),
                 );
                 if (approx_results.isFull() and
-                    probe.bound_resolved and
-                    flatProbeFrontierHasOnlyResolvedBounds(probes[i..probe_count]))
+                    probe.suffix_bounds_resolved and
+                    std.math.isFinite(probe.suffix_member_lower_bound))
                 {
                     const result_upper = retainedResultUpperBound(&approx_results);
-                    if (probe.member_lower_bound > result_upper) {
+                    if (probe.suffix_member_lower_bound > result_upper) {
                         profile.traversal_bound_stops += 1;
-                        profile.traversal_frontier_remaining = @intCast(probe_count - i);
-                        profile.traversal_stop_lower_bound = probe.member_lower_bound;
+                        profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
+                        profile.traversal_stop_lower_bound = probe.suffix_member_lower_bound;
                         profile.traversal_stop_result_upper_bound = result_upper;
                         break;
                     }
@@ -2425,8 +2474,21 @@ pub fn searchProfiledRequest(
             // foreground appends update a posting without rewriting its whole
             // ancestor chain. Resolve/expand those internal nodes first, then
             // order the resulting leaf frontier by durable posting radii.
+            // L2 leaf spheres are useful enough to justify resolving them
+            // after the leaf load. High-dimensional cosine spheres were
+            // admissible but nearly hemispherical in qualification, so they
+            // never stopped traversal and only caused each leaf to be queued
+            // and loaded a second time. Keep their persisted proof data for a
+            // future directory that can expose the radius before loading the
+            // leaf, but preserve the ordinary one-load cosine path here.
             if (node.is_leaf and self.config.metric == .l2_squared) {
-                if (l2SubtreeLowerBound(candidate, node.covering_radius)) |lower_bound| {
+                if (subtreeLowerBound(
+                    self.config.metric,
+                    transformed_query_measure,
+                    candidate,
+                    node.centroid,
+                    node.covering_radius,
+                )) |lower_bound| {
                     candidate.lower_bound = lower_bound;
                     candidate.bound_resolved = true;
                     candidate.is_leaf = node.is_leaf;
@@ -2930,7 +2992,12 @@ pub fn rerankResults(
         var external_scored = false;
         const Index = comptime childType(@TypeOf(self));
         if (indexHasExternalVectorLoader(self) and comptime @hasDecl(Index, "scoreExternalRerankVectorsSortedWithScratch")) {
-            const max_external_rerank_batch: usize = 128;
+            // Most exact rerank sets fit in a small, already-reserved scratch
+            // window. Score those as one physical-read unit so the external
+            // store can order the complete set by file/offset and pay one
+            // lease, arena, and sort. Large sets retain 128-entry checkpoints
+            // so the boundary proof can still stop before loading a long tail.
+            const max_external_rerank_batch = externalRerankBatchSize(self.config.dims, rerank_positions.len);
             var offset: usize = 0;
             while (offset < rerank_positions.len) {
                 const batch_end = @min(offset + max_external_rerank_batch, rerank_positions.len);
@@ -2993,6 +3060,7 @@ pub fn rerankResults(
                     scratch.distances,
                 )) {
                     profile.rerank_candidates_skipped_by_bound += rerank_positions.len - offset;
+                    discardPendingRerankCandidates(ranked_items, rerank_selection.flags);
                     break;
                 }
             }
@@ -3080,6 +3148,32 @@ pub fn rerankResults(
         profile.rerank_metadata_ns += elapsed_fn_u64(metadata_start);
     }
     return exact_results;
+}
+
+const external_rerank_locality_target_bytes: usize = 2 * 1024 * 1024;
+const external_rerank_large_set_batch: usize = 128;
+
+fn externalRerankBatchSize(dims: usize, candidate_count: usize) usize {
+    if (candidate_count == 0) return 0;
+    const vector_bytes = std.math.mul(usize, @max(dims, 1), @sizeOf(f32)) catch return external_rerank_large_set_batch;
+    const byte_bounded = external_rerank_locality_target_bytes / vector_bytes;
+    const locality_count = @max(byte_bounded, external_rerank_large_set_batch);
+    return if (candidate_count <= locality_count) candidate_count else external_rerank_large_set_batch;
+}
+
+test "external rerank locality batch coalesces bounded sets and checkpoints long tails" {
+    // 447 768D float vectors occupy about 1.31 MiB and should be physically
+    // ordered as one read unit. A 900-vector tail stays progressive.
+    try std.testing.expectEqual(@as(usize, 447), externalRerankBatchSize(768, 447));
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(768, 900));
+    // Higher dimensions reduce the locality window by bytes, not by a
+    // benchmark-specific vector count.
+    try std.testing.expectEqual(@as(usize, 341), externalRerankBatchSize(1536, 341));
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(1536, 342));
+    // The bound is expressed in bytes. Low-dimensional sets should not be
+    // fragmented merely because they contain more than 512 vectors.
+    try std.testing.expectEqual(@as(usize, 1025), externalRerankBatchSize(2, 1025));
+    try std.testing.expectEqual(@as(usize, 0), externalRerankBatchSize(768, 0));
 }
 
 fn selectRerankCandidates(
@@ -3351,6 +3445,32 @@ fn selectedRerankCandidatePositionsInto(
         }
     }.lessThan);
     return used;
+}
+
+fn discardPendingRerankCandidates(
+    ranked_items: []search_results.ApproxSearchResult,
+    pending_flags: []bool,
+) void {
+    for (ranked_items, pending_flags) |*item, *pending| {
+        if (!pending.*) continue;
+        item.distance = std.math.inf(f32);
+        item.error_bound = 0;
+        pending.* = false;
+    }
+}
+
+test "bound-skipped rerank candidates cannot re-enter final approximate sort" {
+    var items = [_]search_results.ApproxSearchResult{
+        .{ .vector_id = 1, .distance = 1.0, .error_bound = 0 },
+        .{ .vector_id = 2, .distance = 1.1, .error_bound = 0.2 },
+        .{ .vector_id = 3, .distance = 1.2, .error_bound = 0.2 },
+    };
+    var pending = [_]bool{ false, true, true };
+    discardPendingRerankCandidates(&items, &pending);
+    try std.testing.expect(std.math.isInf(items[1].distance));
+    try std.testing.expect(std.math.isInf(items[2].distance));
+    try std.testing.expectEqual(@as(f32, 0), items[1].error_bound);
+    try std.testing.expectEqualSlices(bool, &.{ false, false, false }, &pending);
 }
 
 fn loadRerankVectorsSorted(
@@ -4020,6 +4140,22 @@ test "estimate quantized distances rejects stale quantized count" {
     );
 }
 
+test "native quantized read view declines stale payloads" {
+    const TestIndex = struct {
+        fn loadNativeQuantizedView(
+            _: *@This(),
+            _: void,
+            _: u64,
+            _: bool,
+            _: usize,
+        ) !?hbc_runtime.QuantizedSet {
+            return error.Corrupted;
+        }
+    };
+    var index: TestIndex = .{};
+    try std.testing.expect((try loadNativeQuantizedReadView(&index, {}, 840, false, 169)) == null);
+}
+
 test "only root nodes use nonquantized payloads" {
     var root_leaf = types.Node{
         .id = 1,
@@ -4291,7 +4427,13 @@ fn normalizeCentroidForMetric(self: anytype, centroid: []f32) void {
     }
 }
 
-fn l2CoveringRadiusForMatrix(centroid: []const f32, vectors: []const f32, count: usize) f32 {
+fn coveringRadiusForMatrix(
+    metric: vec.DistanceMetric,
+    centroid: []const f32,
+    vectors: []const f32,
+    count: usize,
+) f32 {
+    if (metric == .inner_product) return std.math.nan(f32);
     if (count == 0) return 0;
     if (centroid.len == 0 or vectors.len < count * centroid.len) return std.math.nan(f32);
     var max_squared: f32 = 0;
@@ -4304,7 +4446,117 @@ fn l2CoveringRadiusForMatrix(centroid: []const f32, vectors: []const f32, count:
         }
         max_squared = @max(max_squared, squared);
     }
-    return @sqrt(max_squared);
+    const radius = @sqrt(max_squared);
+    return if (metric == .cosine) conservativeCosineRadius(radius) else radius;
+}
+
+fn conservativeCosineRadius(radius: f32) f32 {
+    if (!std.math.isFinite(radius) or radius < 0) return std.math.nan(f32);
+    // Radius values become proof objects. Expand them slightly so f32 dot,
+    // norm, and sqrt rounding can only make pruning more conservative.
+    return std.math.nextAfter(f32, radius * 1.000001 + 0.000001, std.math.inf(f32));
+}
+
+fn updateWeightedCentroidAndMeasureCosineShift(
+    self: anytype,
+    centroid: []f32,
+    old_weight: f32,
+    new_weight: f32,
+    added_sum: []const f32,
+) f32 {
+    var old_norm_squared: f32 = 0;
+    var new_norm_squared: f32 = 0;
+    var old_new_dot: f32 = 0;
+    for (centroid, added_sum) |*center, added| {
+        const old_center = center.*;
+        const new_center = (old_center * old_weight + added) / new_weight;
+        old_norm_squared += old_center * old_center;
+        new_norm_squared += new_center * new_center;
+        old_new_dot += old_center * new_center;
+        center.* = new_center;
+    }
+    normalizeCentroidForMetric(self, centroid);
+    if (self.config.metric != .cosine) return 0;
+    if (!(new_norm_squared > 0) or !std.math.isFinite(new_norm_squared)) return std.math.nan(f32);
+    const shift_squared = @max(
+        @as(f32, 0),
+        old_norm_squared + 1.0 - 2.0 * old_new_dot / @sqrt(new_norm_squared),
+    );
+    return conservativeCosineRadius(@sqrt(shift_squared));
+}
+
+fn expandCosineRadiusAfterBatchAppend(
+    node: *types.Node,
+    appended: []const f32,
+    added_count: usize,
+    centroid_shift: f32,
+) void {
+    if (added_count == 0) return;
+    if (node.members.len == added_count) {
+        node.covering_radius = coveringRadiusForMatrix(.cosine, node.centroid, appended, added_count);
+        return;
+    }
+    if (!std.math.isFinite(node.covering_radius) or
+        node.covering_radius < 0 or
+        !std.math.isFinite(centroid_shift) or
+        centroid_shift < 0 or
+        appended.len < added_count * node.centroid.len)
+    {
+        node.covering_radius = std.math.nan(f32);
+        return;
+    }
+
+    var radius = node.covering_radius + centroid_shift;
+    for (0..added_count) |row| {
+        const candidate = appended[row * node.centroid.len ..][0..node.centroid.len];
+        var squared: f32 = 0;
+        for (node.centroid, candidate) |center, value| {
+            const delta = value - center;
+            squared += delta * delta;
+        }
+        radius = @max(radius, @sqrt(squared));
+    }
+    node.covering_radius = conservativeCosineRadius(radius);
+}
+
+test "cosine append preserves a conservative moving-centroid radius" {
+    const TestIndex = struct {
+        config: struct { metric: vec.DistanceMetric },
+    };
+    const index: TestIndex = .{ .config = .{ .metric = .cosine } };
+    const old_members = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const appended = [_]f32{ -1.0, 0.0 };
+    var centroid = [_]f32{ 1.0, 1.0 };
+    _ = vec.normalize(&centroid);
+    var member_ids = [_]u64{ 1, 2, 3 };
+    var node: types.Node = .{
+        .id = 1,
+        .is_leaf = true,
+        .level = 0,
+        .parent = 0,
+        .centroid = &centroid,
+        .covering_radius = coveringRadiusForMatrix(.cosine, &centroid, &old_members, 2),
+        .children = &.{},
+        .members = &member_ids,
+    };
+
+    const shift = updateWeightedCentroidAndMeasureCosineShift(
+        index,
+        &centroid,
+        2.0,
+        3.0,
+        &appended,
+    );
+    expandCosineRadiusAfterBatchAppend(&node, &appended, 1, shift);
+
+    for (0..2) |row| {
+        const member = old_members[row * 2 ..][0..2];
+        try std.testing.expect(@sqrt(vec.l2SquaredDistanceToQuery(&centroid, member)) <= node.covering_radius);
+    }
+    try std.testing.expect(@sqrt(vec.l2SquaredDistanceToQuery(&centroid, &appended)) <= node.covering_radius);
 }
 
 fn expandL2RadiusAfterAppend(node: *types.Node, appended: []const f32) void {
@@ -4331,7 +4583,7 @@ fn expandL2RadiusAfterAppend(node: *types.Node, appended: []const f32) void {
 fn expandL2RadiusAfterBatchAppend(node: *types.Node, appended: []const f32, added_count: usize) void {
     if (added_count == 0) return;
     if (node.members.len == added_count) {
-        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, appended, added_count);
+        node.covering_radius = coveringRadiusForMatrix(.l2_squared, node.centroid, appended, added_count);
         return;
     }
     if (!std.math.isFinite(node.covering_radius) or node.covering_radius < 0 or appended.len < added_count * node.centroid.len) {
@@ -4362,12 +4614,72 @@ fn expandL2RadiusAfterBatchAppend(node: *types.Node, appended: []const f32, adde
     node.covering_radius = radius;
 }
 
-fn l2SubtreeLowerBound(candidate: types.PriorityItem, covering_radius: f32) ?f32 {
+fn subtreeLowerBound(
+    metric: vec.DistanceMetric,
+    query_measure: f32,
+    candidate: types.PriorityItem,
+    centroid: []const f32,
+    covering_radius: f32,
+) ?f32 {
     if (!std.math.isFinite(covering_radius) or covering_radius < 0) return null;
-    const centroid_squared_lower = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
-    if (!std.math.isFinite(centroid_squared_lower)) return null;
-    const vector_distance_lower = @max(@as(f32, 0), @sqrt(centroid_squared_lower) - covering_radius);
-    return vector_distance_lower * vector_distance_lower;
+    const centroid_metric_lower = @max(@as(f32, 0), candidate.distance - candidate.error_bound);
+    if (!std.math.isFinite(centroid_metric_lower)) return null;
+    const centroid_chord_lower = switch (metric) {
+        .l2_squared => @sqrt(centroid_metric_lower),
+        .cosine => blk: {
+            // The cosine transform and centroid maintenance normalize both
+            // query and centroid. On the unit sphere cosine distance equals
+            // half squared Euclidean chord distance, so the ordinary metric
+            // ball triangle inequality gives a sound member lower bound.
+            // Degenerate/non-unit centroids retain the width fallback.
+            if (!(query_measure > 0) or centroid.len == 0) return null;
+            const centroid_norm = vec.norm(centroid);
+            if (!std.math.isFinite(centroid_norm) or @abs(centroid_norm - 1.0) > 0.001) return null;
+            break :blk @sqrt(2.0 * @min(centroid_metric_lower, 2.0));
+        },
+        .inner_product => return null,
+    };
+    const member_chord_lower = @max(@as(f32, 0), centroid_chord_lower - covering_radius);
+    return switch (metric) {
+        .l2_squared => member_chord_lower * member_chord_lower,
+        .cosine => 0.5 * member_chord_lower * member_chord_lower,
+        .inner_product => unreachable,
+    };
+}
+
+test "cosine subtree chord bound is admissible" {
+    const query = [_]f32{ 1.0, 0.0, 0.0 };
+    const centroid = [_]f32{ 0.8, 0.6, 0.0 };
+    const members = [_]f32{
+        0.6,  0.8,  0.0,
+        0.96, 0.28, 0.0,
+        0.8,  0.48, 0.36,
+    };
+    const radius = coveringRadiusForMatrix(.cosine, &centroid, &members, 3);
+    const centroid_distance = vec.distanceToQuery(&query, 1.0, &centroid, .cosine);
+    const candidate: types.PriorityItem = .{
+        .id = 1,
+        .distance = centroid_distance,
+        .error_bound = 0.001,
+    };
+    const lower = subtreeLowerBound(.cosine, 1.0, candidate, &centroid, radius) orelse
+        return error.TestUnexpectedResult;
+    for (0..3) |row| {
+        const member = members[row * 3 ..][0..3];
+        const exact = vec.distanceToQuery(&query, 1.0, member, .cosine);
+        try std.testing.expect(lower <= exact + 0.000001);
+    }
+}
+
+test "cosine subtree chord bound rejects degenerate centroid" {
+    const candidate: types.PriorityItem = .{ .id = 1, .distance = 1.0 };
+    try std.testing.expect(subtreeLowerBound(
+        .cosine,
+        1.0,
+        candidate,
+        &[_]f32{ 0.0, 0.0 },
+        1.0,
+    ) == null);
 }
 
 fn retainedResultUpperBound(results: *const search_results.ApproxSearchResults) f32 {
@@ -4383,23 +4695,26 @@ fn candidateFrontierHasOnlyResolvedBounds(candidates: anytype) bool {
     return true;
 }
 
-fn flatProbeFrontierHasOnlyResolvedBounds(probes: []const spfresh_index.FlatCentroidProbe) bool {
-    for (probes) |probe| {
-        if (!probe.bound_resolved or !std.math.isFinite(probe.member_lower_bound)) return false;
-    }
-    return true;
-}
-
 fn computeInternalCoveringRadius(self: anytype, txn: anytype, node: *const types.Node) !f32 {
-    if (self.config.metric != .l2_squared) return std.math.nan(f32);
+    if (self.config.metric == .inner_product) return std.math.nan(f32);
     if (node.children.len == 0) return 0;
     var radius: f32 = 0;
     for (node.children) |child_id| {
         var child = try loadNode(self, txn, child_id);
         defer child.deinit(self.alloc);
         if (!std.math.isFinite(child.covering_radius) or child.covering_radius < 0) return std.math.nan(f32);
-        const center_squared = vec.distanceToQuery(node.centroid, vec.dot(node.centroid, node.centroid), child.centroid, .l2_squared);
-        radius = @max(radius, @sqrt(@max(center_squared, 0)) + child.covering_radius);
+        const center_distance = vec.distanceToQuery(
+            node.centroid,
+            queryMeasureForMetric(self.config.metric, node.centroid),
+            child.centroid,
+            self.config.metric,
+        );
+        const center_chord = switch (self.config.metric) {
+            .l2_squared => @sqrt(@max(center_distance, 0)),
+            .cosine => @sqrt(2.0 * @min(@max(center_distance, 0), 2.0)),
+            .inner_product => unreachable,
+        };
+        radius = @max(radius, center_chord + child.covering_radius);
     }
     return radius;
 }
@@ -5372,6 +5687,7 @@ pub fn insertWithMetadataTxnOptions(
     _ = try posting.PostingStore.appendMember(self.alloc, &leaf, vector_id);
 
     const n = leaf.members.len;
+    var cosine_centroid_shift: f32 = 0;
     if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
         self.write_profile.posting_lazy_centroid_deferrals += 1;
     } else if (leaf.centroid.len == 0) {
@@ -5380,16 +5696,19 @@ pub fn insertWithMetadataTxnOptions(
         posting.PostingStore.noteCentroidRefreshed(&leaf);
     } else {
         const nf: f32 = @floatFromInt(n);
-        for (leaf.centroid, 0..) |*c, i| {
-            c.* = c.* * (nf - 1.0) / nf + effective_transformed[i] / nf;
-        }
-        normalizeCentroidForMetric(self, leaf.centroid);
+        cosine_centroid_shift = updateWeightedCentroidAndMeasureCosineShift(
+            self,
+            leaf.centroid,
+            nf - 1.0,
+            nf,
+            effective_transformed,
+        );
         posting.PostingStore.noteCentroidRefreshed(&leaf);
     }
-    if (self.config.metric == .l2_squared) {
-        expandL2RadiusAfterAppend(&leaf, effective_transformed);
-    } else {
-        leaf.covering_radius = std.math.nan(f32);
+    switch (self.config.metric) {
+        .l2_squared => expandL2RadiusAfterAppend(&leaf, effective_transformed),
+        .cosine => expandCosineRadiusAfterBatchAppend(&leaf, effective_transformed, 1, cosine_centroid_shift),
+        .inner_product => leaf.covering_radius = std.math.nan(f32),
     }
     const leaf_overflows = leaf.members.len > self.config.leaf_size;
     const defer_leaf_split = shouldDeferOversizedLeafSplit(self, &leaf, batch_insert_options);
@@ -5906,20 +6225,19 @@ fn rebuildOversizedLeafAsSubtree(
     const indexes = try self.alloc.alloc(usize, count);
     defer self.alloc.free(indexes);
     for (indexes, 0..) |*index, i| index.* = i;
-    const positions = try self.alloc.alloc(u64, count);
-    defer self.alloc.free(positions);
+    const assignments = try self.alloc.alloc(u8, count);
+    defer self.alloc.free(assignments);
+    const distances = try self.alloc.alloc(f32, count);
+    defer self.alloc.free(distances);
+    const offsets = try self.alloc.alloc(usize, count);
+    defer self.alloc.free(offsets);
     const partitioned_indexes = try self.alloc.alloc(usize, count);
     defer self.alloc.free(partitioned_indexes);
-    addApplyWorkspaceBytes(self, @intCast(matrix_bytes));
-    const recursive_vec_data = try self.alloc.alloc(f32, matrix_floats);
-    defer {
-        self.alloc.free(recursive_vec_data);
-        releaseApplyWorkspaceBytes(self, @intCast(matrix_bytes));
-    }
 
     var scratch = BulkRecursiveScratch{
-        .vec_data = recursive_vec_data,
-        .positions = positions,
+        .assignments = assignments,
+        .distances = distances,
+        .offsets = offsets,
         .partitioned_indexes = partitioned_indexes,
     };
 
@@ -6092,13 +6410,13 @@ pub fn splitLeafWithOptions(
     defer if (left_vectors.len > 0) self.alloc.free(left_vectors);
     var right_vectors: []f32 = &.{};
     defer if (right_vectors.len > 0) self.alloc.free(right_vectors);
-    if (publish_known_quantized_now or self.config.metric == .l2_squared) {
+    if (publish_known_quantized_now or self.config.metric != .inner_product) {
         left_vectors = try copyNodeMemberVectorsFromSource(self, &left_node, leaf.members, vec_data);
         right_vectors = try copyNodeMemberVectorsFromSource(self, &right_node, leaf.members, vec_data);
     }
-    if (self.config.metric == .l2_squared) {
-        left_node.covering_radius = l2CoveringRadiusForMatrix(left_node.centroid, left_vectors, left_node.members.len);
-        right_node.covering_radius = l2CoveringRadiusForMatrix(right_node.centroid, right_vectors, right_node.members.len);
+    if (self.config.metric != .inner_product) {
+        left_node.covering_radius = coveringRadiusForMatrix(self.config.metric, left_node.centroid, left_vectors, left_node.members.len);
+        right_node.covering_radius = coveringRadiusForMatrix(self.config.metric, right_node.centroid, right_vectors, right_node.members.len);
     }
 
     if (splitting_root) {
@@ -6345,10 +6663,12 @@ pub fn rebuildOversizedLeafKmeansWithOptions(
                 .members = members,
             };
             defer node.deinit(self.alloc);
-            node.covering_radius = if (self.config.metric == .l2_squared)
-                l2CoveringRadiusForMatrix(node.centroid, group_vectors, node.members.len)
-            else
-                std.math.nan(f32);
+            node.covering_radius = coveringRadiusForMatrix(
+                self.config.metric,
+                node.centroid,
+                group_vectors,
+                node.members.len,
+            );
             if (publish_known_quantized_now) {
                 try saveLeafNodeWithKnownVectors(self, txn, &node, group_vectors, now_fn, elapsed_fn);
             } else {
@@ -7059,6 +7379,7 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         }
 
         const new_len = leaf.members.len;
+        var cosine_centroid_shift: f32 = 0;
         if (shouldDeferPostingCentroidRefresh(self, &leaf)) {
             self.write_profile.posting_lazy_centroid_deferrals += 1;
         } else if (leaf.centroid.len == 0) {
@@ -7070,14 +7391,19 @@ fn batchInsertAssumeAbsentGroupedTxnOptions(
         } else {
             const old_f: f32 = @floatFromInt(old_len);
             const new_f: f32 = @floatFromInt(new_len);
-            for (leaf.centroid, 0..) |*c, dim| c.* = (c.* * old_f + centroid_sum[dim]) / new_f;
-            normalizeCentroidForMetric(self, leaf.centroid);
+            cosine_centroid_shift = updateWeightedCentroidAndMeasureCosineShift(
+                self,
+                leaf.centroid,
+                old_f,
+                new_f,
+                centroid_sum,
+            );
             posting.PostingStore.noteCentroidRefreshed(&leaf);
         }
-        if (self.config.metric == .l2_squared) {
-            expandL2RadiusAfterBatchAppend(&leaf, added_vectors, group_len);
-        } else {
-            leaf.covering_radius = std.math.nan(f32);
+        switch (self.config.metric) {
+            .l2_squared => expandL2RadiusAfterBatchAppend(&leaf, added_vectors, group_len),
+            .cosine => expandCosineRadiusAfterBatchAppend(&leaf, added_vectors, group_len, cosine_centroid_shift),
+            .inner_product => leaf.covering_radius = std.math.nan(f32),
         }
 
         const leaf_overflows = leaf.members.len > self.config.leaf_size;
@@ -7386,17 +7712,19 @@ pub fn buildBulkRecursiveFromInputs(
     const indexes = try self.alloc.alloc(usize, inputs.len);
     defer self.alloc.free(indexes);
     for (indexes, 0..) |*index, i| index.* = i;
-    const dims: usize = @intCast(self.config.dims);
-    const vec_data = try self.alloc.alloc(f32, inputs.len * dims);
-    defer self.alloc.free(vec_data);
-    const positions = try self.alloc.alloc(u64, inputs.len);
-    defer self.alloc.free(positions);
+    const assignments = try self.alloc.alloc(u8, inputs.len);
+    defer self.alloc.free(assignments);
+    const distances = try self.alloc.alloc(f32, inputs.len);
+    defer self.alloc.free(distances);
+    const offsets = try self.alloc.alloc(usize, inputs.len);
+    defer self.alloc.free(offsets);
     const partitioned_indexes = try self.alloc.alloc(usize, inputs.len);
     defer self.alloc.free(partitioned_indexes);
 
     var scratch = BulkRecursiveScratch{
-        .vec_data = vec_data,
-        .positions = positions,
+        .assignments = assignments,
+        .distances = distances,
+        .offsets = offsets,
         .partitioned_indexes = partitioned_indexes,
     };
     return try buildBulkSubtreeRecursive(self, txn, inputs, indexes, &scratch, 0, 0);
@@ -7607,19 +7935,27 @@ pub fn buildBulkKmeansFromInputs(
     const cluster_count = std.math.divCeil(usize, inputs.len, leaf_size) catch unreachable;
     const dims: usize = @intCast(self.config.dims);
 
-    const dense_vectors = try self.alloc.alloc(f32, inputs.len * dims);
-    defer self.alloc.free(dense_vectors);
     const points = try self.alloc.alloc(kmeans.Point, inputs.len);
     defer self.alloc.free(points);
-    for (points, inputs, 0..) |*point, input, i| {
-        const vector = dense_vectors[i * dims ..][0..dims];
-        @memcpy(vector, input.transformed);
+    for (points, inputs) |*point, input| {
         point.* = .{
             .stable_id = input.vector_id,
-            .vector = vector,
+            .vector = input.transformed,
             .weight = 1,
         };
     }
+
+    // Prepared bulk callers normally own one contiguous transformed matrix.
+    // Preserve the Metal assignment fast path without cloning that entire
+    // matrix; non-contiguous callers remain correct through the CPU backend.
+    const dense_vectors: ?[]const f32 = blk: {
+        if (inputs.len == 0 or inputs[0].transformed.len != dims) break :blk null;
+        const base = inputs[0].transformed.ptr;
+        for (inputs, 0..) |input, i| {
+            if (input.transformed.len != dims or input.transformed.ptr != base + i * dims) break :blk null;
+        }
+        break :blk base[0 .. inputs.len * dims];
+    };
 
     const assignments = try self.alloc.alloc(usize, inputs.len);
     defer self.alloc.free(assignments);
@@ -7763,6 +8099,12 @@ pub fn putQuantizedCached(self: anytype, txn: anytype, node_id: u64, qs: *const 
 
 pub fn loadQuantized(self: anytype, txn: anytype, node_id: u64, is_root: bool, expected_count: usize, is_not_found: fn (anyerror) bool) !hbc_runtime.QuantizedSet {
     _ = is_not_found;
+    const Index = comptime childType(@TypeOf(self));
+    if (comptime @hasDecl(Index, "loadNativeQuantizedView")) {
+        if (try self.loadNativeQuantizedView(txn, node_id, is_root, expected_count)) |native| {
+            return try native.clone(self.alloc);
+        }
+    }
     var key_buf: [10]u8 = undefined;
     const data = try self.getNamespaced(txn, .quant, hbc.encodeQuantKey(&key_buf, node_id));
     var decoded = if (is_root)
@@ -8646,13 +8988,13 @@ fn buildBulkLeaf(
         .children = &.{},
         .members = members,
     };
-    if (self.config.metric == .l2_squared) {
+    if (self.config.metric != .inner_product) {
         const radius_matrix = try self.alloc.alloc(f32, inputs.len * self.config.dims);
         defer self.alloc.free(radius_matrix);
         for (inputs, 0..) |input, row| {
             @memcpy(radius_matrix[row * self.config.dims ..][0..self.config.dims], input.transformed);
         }
-        node.covering_radius = l2CoveringRadiusForMatrix(node.centroid, radius_matrix, inputs.len);
+        node.covering_radius = coveringRadiusForMatrix(self.config.metric, node.centroid, radius_matrix, inputs.len);
     }
     try self.saveNodeBody(txn, &node);
     try self.putNodeSplitRange(txn, node_id, &range);
@@ -8686,38 +9028,278 @@ fn partitionBulkInputIndexesInPlace(
     indexes: []usize,
     scratch: *BulkRecursiveScratch,
 ) !usize {
+    if (indexes.len < 2) return error.TooFewVectors;
+    if (self.config.metric == .cosine) {
+        for (indexes) |input_idx| {
+            if (@abs(vec.norm(inputs[input_idx].transformed) - 1.0) > 1e-3) return error.NonUnitVector;
+        }
+    }
+    return switch (self.config.split_algo) {
+        .kmeans => partitionBulkInputIndexesKmeans(self, inputs, indexes, scratch),
+        .hilbert => partitionBulkInputIndexesHilbert(self, inputs, indexes, scratch),
+    };
+}
+
+/// Partition views over the caller-owned vector plane. The previous recursive
+/// builder copied every vector in the current subtree into one contiguous
+/// matrix before each split. At the root that duplicated the complete corpus
+/// (3.07 GB for 1M x 768), and every lower level recopied it again. Keeping
+/// only indexes and O(N) scalar scratch makes the builder usable with mmap'd
+/// exact-vector generations while preserving the same two-means algorithm.
+fn partitionBulkInputIndexesKmeans(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []usize,
+    scratch: *BulkRecursiveScratch,
+) !usize {
+    const count = indexes.len;
     const dims: usize = @intCast(self.config.dims);
-    const vec_data = scratch.vec_data[0 .. indexes.len * dims];
-    const positions = scratch.positions[0..indexes.len];
-    const partitioned_indexes = scratch.partitioned_indexes[0..indexes.len];
+    const assignments = scratch.assignments[0..count];
+    const distances = scratch.distances[0..count];
+    const offsets = scratch.offsets[0..count];
+    const partitioned_indexes = scratch.partitioned_indexes[0..count];
+
+    const left_centroid = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(left_centroid);
+    const right_centroid = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(right_centroid);
+    const new_left = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(new_left);
+    const new_right = try self.alloc.alloc(f32, dims);
+    defer self.alloc.free(new_right);
+
+    const left_idx = self.rng.intN(count);
+    @memcpy(left_centroid, inputs[indexes[left_idx]].transformed);
+
+    var dist_sum: f32 = 0;
+    var min_dist: f32 = std.math.inf(f32);
+    for (indexes, 0..) |input_idx, i| {
+        const input_vector = inputs[input_idx].transformed;
+        var distance = vec.distance(input_vector, left_centroid, self.config.metric);
+        if (self.config.metric == .inner_product) {
+            const norm = vec.norm(input_vector);
+            if (norm != 0) distance /= norm;
+        }
+        distances[i] = distance;
+        dist_sum += distance;
+        min_dist = @min(min_dist, distance);
+    }
+    dist_sum += @as(f32, @floatFromInt(count)) * -min_dist;
+    if (min_dist != 0) {
+        for (distances) |*distance| distance.* -= min_dist;
+    }
+    if (dist_sum > 0) vec.scale(1.0 / dist_sum, distances);
+
+    var cumulative: f32 = 0;
+    const random = self.rng.float32();
+    var right_idx: usize = count - 1;
+    for (distances, 0..) |probability, i| {
+        cumulative += probability;
+        if (random < cumulative) {
+            right_idx = i;
+            break;
+        }
+    }
+    @memcpy(right_centroid, inputs[indexes[right_idx]].transformed);
+
+    const tolerance = calcIndexedTolerance(self, inputs, indexes);
+    for (0..self.config.kmeans_max_iter) |_| {
+        assignIndexedPartitions(self, inputs, indexes, left_centroid, right_centroid, assignments, distances, offsets);
+        calcIndexedPartitionCentroids(inputs, indexes, assignments, new_left, new_right);
+        const left_shift = vec.l2SquaredDistance(left_centroid, new_left);
+        const right_shift = vec.l2SquaredDistance(right_centroid, new_right);
+        @memcpy(left_centroid, new_left);
+        @memcpy(right_centroid, new_right);
+        if (left_shift + right_shift <= tolerance) break;
+    }
+    assignIndexedPartitions(self, inputs, indexes, left_centroid, right_centroid, assignments, distances, offsets);
+
+    var left_count: usize = 0;
+    for (assignments) |assignment| {
+        if (assignment == 0) left_count += 1;
+    }
+    if (left_count == 0 or left_count == count) return error.UnbalancedBulkSplit;
+
+    var left_position: usize = 0;
+    var right_position: usize = left_count;
+    for (indexes, assignments) |input_idx, assignment| {
+        if (assignment == 0) {
+            partitioned_indexes[left_position] = input_idx;
+            left_position += 1;
+        } else {
+            partitioned_indexes[right_position] = input_idx;
+            right_position += 1;
+        }
+    }
+    @memcpy(indexes, partitioned_indexes);
+    return left_count;
+}
+
+fn partitionBulkInputIndexesHilbert(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []usize,
+    scratch: *BulkRecursiveScratch,
+) !usize {
+    const Entry = struct {
+        position: usize,
+        embedding: []const u8,
+    };
+    const count = indexes.len;
+    const entries = try self.alloc.alloc(Entry, count);
+    defer self.alloc.free(entries);
+    const hilbert = try self.getHilbert();
+    const embedding_len = hilbert.byteLen();
+    const embeddings = try self.alloc.alloc(u8, count * embedding_len);
+    defer self.alloc.free(embeddings);
+    const coords = try self.alloc.alloc(u32, hilbert.dimension);
+    defer self.alloc.free(coords);
+    const assignments = scratch.assignments[0..count];
+    const partitioned_indexes = scratch.partitioned_indexes[0..count];
+
+    for (indexes, 0..) |input_idx, position| {
+        const embedding = embeddings[position * embedding_len ..][0..embedding_len];
+        try hilbert.encodeVecBytesInto(inputs[input_idx].transformed, coords, embedding);
+        entries[position] = .{ .position = position, .embedding = embedding };
+    }
+    std.mem.sort(Entry, entries, {}, struct {
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            const order = std.mem.order(u8, a.embedding, b.embedding);
+            return order == .lt or (order == .eq and a.position < b.position);
+        }
+    }.lessThan);
+
+    const left_count = count / 2;
+    @memset(assignments, 1);
+    for (entries[0..left_count]) |entry| assignments[entry.position] = 0;
+    var left_position: usize = 0;
+    var right_position: usize = left_count;
+    for (indexes, assignments) |input_idx, assignment| {
+        if (assignment == 0) {
+            partitioned_indexes[left_position] = input_idx;
+            left_position += 1;
+        } else {
+            partitioned_indexes[right_position] = input_idx;
+            right_position += 1;
+        }
+    }
+    @memcpy(indexes, partitioned_indexes);
+    return left_count;
+}
+
+fn assignIndexedPartitions(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []const usize,
+    left_centroid: []const f32,
+    right_centroid: []const f32,
+    assignments: []u8,
+    distances: []f32,
+    offsets: []usize,
+) void {
+    const spherical = self.config.metric == .cosine;
+    var inv_left_norm: f32 = 1;
+    var inv_right_norm: f32 = 1;
+    if (spherical) {
+        const left_norm = vec.norm(left_centroid);
+        if (left_norm != 0) inv_left_norm = 1.0 / left_norm;
+        const right_norm = vec.norm(right_centroid);
+        if (right_norm != 0) inv_right_norm = 1.0 / right_norm;
+    }
+
+    var left_count: usize = 0;
+    for (indexes, 0..) |input_idx, i| {
+        const input_vector = inputs[input_idx].transformed;
+        const left_distance = if (spherical)
+            -vec.dot(input_vector, left_centroid) * inv_left_norm
+        else if (self.config.metric == .inner_product)
+            -vec.dot(input_vector, left_centroid)
+        else
+            vec.l2SquaredDistance(input_vector, left_centroid);
+        const right_distance = if (spherical)
+            -vec.dot(input_vector, right_centroid) * inv_right_norm
+        else if (self.config.metric == .inner_product)
+            -vec.dot(input_vector, right_centroid)
+        else
+            vec.l2SquaredDistance(input_vector, right_centroid);
+        distances[i] = left_distance - right_distance;
+        if (distances[i] < 0) left_count += 1;
+    }
+
+    const count = indexes.len;
+    const min_count = (count * self.config.kmeans_min_balance_pct + 99) / 100;
+    if (left_count >= min_count and count - left_count >= min_count) {
+        for (distances, 0..) |distance, i| assignments[i] = if (distance < 0) 0 else 1;
+        return;
+    }
+
+    for (offsets, 0..) |*offset, i| offset.* = i;
+    std.mem.sort(usize, offsets, distances, struct {
+        fn lessThan(ctx: []f32, a: usize, b: usize) bool {
+            return ctx[a] < ctx[b] or (ctx[a] == ctx[b] and a < b);
+        }
+    }.lessThan);
+    const adjusted_left = if (left_count < min_count)
+        min_count
+    else if (count - left_count < min_count)
+        count - min_count
+    else
+        left_count;
+    for (offsets, 0..) |offset, i| assignments[offset] = if (i < adjusted_left) 0 else 1;
+}
+
+fn calcIndexedPartitionCentroids(
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []const usize,
+    assignments: []const u8,
+    left_centroid: []f32,
+    right_centroid: []f32,
+) void {
+    @memset(left_centroid, 0);
+    @memset(right_centroid, 0);
+    var left_count: usize = 0;
+    var right_count: usize = 0;
+    for (indexes, assignments) |input_idx, assignment| {
+        if (assignment == 0) {
+            vec.add(left_centroid, inputs[input_idx].transformed);
+            left_count += 1;
+        } else {
+            vec.add(right_centroid, inputs[input_idx].transformed);
+            right_count += 1;
+        }
+    }
+    if (left_count > 0) vec.scale(1.0 / @as(f32, @floatFromInt(left_count)), left_centroid);
+    if (right_count > 0) vec.scale(1.0 / @as(f32, @floatFromInt(right_count)), right_centroid);
+}
+
+fn calcIndexedTolerance(
+    self: anytype,
+    inputs: []const bulk_build.PreparedBulkBuildInput,
+    indexes: []const usize,
+) f32 {
+    if (indexes.len < 2) return 0;
+    const dims: usize = @intCast(self.config.dims);
+    const means = self.alloc.alloc(f32, dims) catch return 0;
+    defer self.alloc.free(means);
+    const m2 = self.alloc.alloc(f32, dims) catch return 0;
+    defer self.alloc.free(m2);
+    @memset(means, 0);
+    @memset(m2, 0);
 
     for (indexes, 0..) |input_idx, i| {
-        const input = inputs[input_idx];
-        positions[i] = @intCast(i);
-        @memcpy(vec_data[i * dims ..][0..dims], input.transformed);
+        const input_vector = inputs[input_idx].transformed;
+        const sample_index: f32 = @floatFromInt(i + 1);
+        for (0..dims) |dimension| {
+            const delta = input_vector[dimension] - means[dimension];
+            means[dimension] += delta / sample_index;
+            const delta2 = input_vector[dimension] - means[dimension];
+            m2[dimension] += delta * delta2;
+        }
     }
-    var vector_set = vec.Set{
-        .dims = self.config.dims,
-        .count = indexes.len,
-        .data = vec_data,
-    };
-    const split = try self.splitVectorSet(&vector_set, positions);
-    defer {
-        if (split.c1.len > 0) self.alloc.free(split.c1);
-        if (split.g1.len > 0) self.alloc.free(split.g1);
-        if (split.c2.len > 0) self.alloc.free(split.c2);
-        if (split.g2.len > 0) self.alloc.free(split.g2);
-    }
-
-    for (split.g1, 0..) |position, i| {
-        partitioned_indexes[i] = indexes[@intCast(position)];
-    }
-    for (split.g2, 0..) |position, i| {
-        partitioned_indexes[split.g1.len + i] = indexes[@intCast(position)];
-    }
-    if (split.g1.len == 0 or split.g2.len == 0) return error.UnbalancedBulkSplit;
-    @memcpy(indexes, partitioned_indexes);
-    return split.g1.len;
+    var variance_sum: f32 = 0;
+    const inverse_count_minus_one = 1.0 / @as(f32, @floatFromInt(indexes.len - 1));
+    for (m2) |value| variance_sum += value * inverse_count_minus_one;
+    return (variance_sum / @as(f32, @floatFromInt(dims))) * 1e-4;
 }
 
 fn splitVectorSetKmeans(

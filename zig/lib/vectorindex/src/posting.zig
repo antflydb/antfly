@@ -43,6 +43,11 @@ pub const PostingState = types.PostingState;
 pub const PostingMaintenanceOptions = struct {
     max_postings: usize = std.math.maxInt(usize),
     refresh_payloads: bool = true,
+    /// Decode-check stored quantized payloads against the current posting
+    /// membership even when the durable dirty bit is clear. This is reserved
+    /// for explicit publication/recovery boundaries; ordinary background
+    /// passes retain the cheaper state-only scan.
+    validate_payloads: bool = false,
     refresh_ancestors: bool = true,
     rebalance_layout: bool = false,
     max_layout_changes: usize = std.math.maxInt(usize),
@@ -311,7 +316,7 @@ pub const PostingStore = struct {
         }
         vec.scale(1.0 / @as(f32, @floatFromInt(node.members.len)), node.centroid);
         normalizeCentroidForMetric(index, node.centroid);
-        if (index.config.metric == .l2_squared) {
+        if (index.config.metric != .inner_product) {
             const vectors = if (comptime @hasDecl(Index, "loadPostingVectorsTransformed"))
                 transformed_vectors.?
             else blk: {
@@ -336,7 +341,11 @@ pub const PostingStore = struct {
                 }
                 max_squared = @max(max_squared, squared);
             }
-            node.covering_radius = @sqrt(max_squared);
+            const radius = @sqrt(max_squared);
+            node.covering_radius = if (index.config.metric == .cosine)
+                std.math.nextAfter(f32, radius * 1.000001 + 0.000001, std.math.inf(f32))
+            else
+                radius;
         } else {
             node.covering_radius = std.math.nan(f32);
         }

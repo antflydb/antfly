@@ -29,7 +29,12 @@ const dense_replay_finish_hard_ns: u64 = 8 * std.time.ns_per_s;
 const dense_replay_write_pressure_hard_ns: u64 = std.time.ns_per_s;
 const dense_replay_soft_compaction_quiet_ns: u64 = 500 * std.time.ns_per_ms;
 const foreground_query_maintenance_quiet_ns: u64 = 25 * std.time.ns_per_ms;
-const foreground_query_compaction_yield_max_ns: u64 = 2 * std.time.ns_per_ms;
+// A two-millisecond cap is shorter than one cold vector query and lets a
+// multi-GiB compactor repeatedly reclaim the storage device before the query
+// can fault its native posting/vector pages. Fifty milliseconds still gives a
+// sustained query stream bounded compaction progress at every merge quantum,
+// while allowing ordinary foreground reads to finish in one yield window.
+const foreground_query_compaction_yield_max_ns: u64 = 50 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
     builtin.link_libc and
@@ -108,6 +113,12 @@ pub const Slice = enum(u8) {
     inference_scratch_working_set,
     dense_repair_working_set,
     shard_transition_working_set,
+    /// Transient heap used to project primary embedding artifacts into an
+    /// immutable mmap exact-vector generation. This is separate from dense
+    /// apply so readiness publication cannot consume foreground mutation
+    /// admission, and every builder allocation remains inside the aggregate
+    /// host-memory envelope.
+    dense_vector_block_build_working_set,
 
     pub fn name(self: Slice) []const u8 {
         return switch (self) {
@@ -141,6 +152,7 @@ pub const Slice = enum(u8) {
             .inference_scratch_working_set => "inference.scratch_working_set",
             .dense_repair_working_set => "dense_repair.working_set",
             .shard_transition_working_set => "shard_transition.working_set",
+            .dense_vector_block_build_working_set => "dense.vector_block_build_working_set",
         };
     }
 };
@@ -366,6 +378,7 @@ pub const Options = struct {
             .{},
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
             .{ .soft_limit_bytes = 128 * 1024 * 1024, .hard_limit_bytes = 256 * 1024 * 1024 },
+            .{ .soft_limit_bytes = 96 * 1024 * 1024, .hard_limit_bytes = 128 * 1024 * 1024 },
         };
     }
 
@@ -401,6 +414,7 @@ pub const Options = struct {
             .{ .soft_action = .report, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
             .{ .soft_action = .defer_background_work, .hard_action = .reject_work },
+            .{ .soft_action = .report, .hard_action = .reject_work },
         };
     }
 };
@@ -2455,9 +2469,25 @@ pub const BudgetedAllocator = struct {
                 minimum,
                 @max(minimum, self.credit_quantum),
                 self.max_hard_limit_multiple,
-            ) catch {
-                self.budget_denied = true;
-                return false;
+            ) catch blk: {
+                // Incremental allocators must have the same cache-reclaim
+                // semantics as ResourceManager.reserve(). Without this retry,
+                // a bounded builder can repeatedly scan/spool its entire
+                // source and then fail even though reclaimable HBC/LSM cache
+                // bytes are the only thing occupying the aggregate envelope.
+                if (self.reservation.manager.reclaimForAllocation(self.reservation.slice, minimum) == 0) {
+                    self.budget_denied = true;
+                    return false;
+                }
+                break :blk self.reservation.manager.growReservationAmortized(
+                    &self.reservation,
+                    minimum,
+                    @max(minimum, self.credit_quantum),
+                    self.max_hard_limit_multiple,
+                ) catch {
+                    self.budget_denied = true;
+                    return false;
+                };
             };
         }
         self.live_bytes = next_live;
@@ -3589,6 +3619,51 @@ test "budgeted allocator admits before allocation and releases exact live bytes"
     alloc.free(oversized);
     alloc.free(first);
     try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.shard_transition_working_set).used_bytes);
+}
+
+test "budgeted allocator reclaims aggregate cache before denying growth" {
+    const ReclaimContext = struct {
+        manager: *ResourceManager,
+        accounted: u64,
+
+        fn reclaim(raw: *anyopaque, target: u64) u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const released = @min(target, self.accounted);
+            self.manager.observeUsage(.hbc_node_metadata_cache, &self.accounted, self.accounted - released);
+            return released;
+        }
+    };
+
+    var budgets = Options.defaultBudgets();
+    budgets[sliceIndex(.hbc_node_metadata_cache)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
+    budgets[sliceIndex(.dense_vector_block_build_working_set)] = .{ .soft_limit_bytes = 80, .hard_limit_bytes = 100 };
+    var manager = ResourceManager.init(.{
+        .memory_budget = .{ .soft_limit_bytes = 90, .hard_limit_bytes = 100 },
+        .budgets = budgets,
+    });
+    defer manager.deinit(std.testing.allocator);
+
+    var context = ReclaimContext{ .manager = &manager, .accounted = 0 };
+    manager.observeUsage(.hbc_node_metadata_cache, &context.accounted, 80);
+    const identity = try manager.registerReclaimer(.hbc_node_metadata_cache, &context, ReclaimContext.reclaim);
+    defer manager.unregisterReclaimer(identity);
+
+    var budgeted = BudgetedAllocator.init(
+        &manager,
+        .dense_vector_block_build_working_set,
+        std.testing.allocator,
+        1,
+    );
+    defer budgeted.deinit();
+    const bytes = try budgeted.allocator().alloc(u8, 30);
+    defer budgeted.allocator().free(bytes);
+
+    try std.testing.expectEqual(@as(u64, 70), context.accounted);
+    try std.testing.expectEqual(@as(u64, 30), budgeted.live_bytes);
+    const stats = manager.snapshot();
+    try std.testing.expectEqual(@as(u64, 100), stats.memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.reclaim_requests);
+    try std.testing.expectEqual(@as(u64, 10), stats.reclaimed_bytes);
 }
 
 test "budgeted allocator allows concurrent operations within the shared hard limit" {

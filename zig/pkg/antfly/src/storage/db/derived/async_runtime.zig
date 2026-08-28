@@ -484,6 +484,10 @@ fn workerMain(worker: *Worker) void {
             continue;
         }
 
+        // Coalesce before opening the replay cursor. Primary-store cursors pin
+        // a read generation, so opening first would exclude every record that
+        // arrives during this wait and defeat the coalescing policy.
+        waitForReplayWindow(runtime, worker, from_sequence);
         ensureWorkerCatchUpState(runtime, worker, from_sequence) catch |err| {
             if (isRecoverableCatchUpError(worker, err)) {
                 closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
@@ -498,8 +502,6 @@ fn workerMain(worker: *Worker) void {
             runtime.recordError(err);
             return;
         };
-        waitForReplayWindow(runtime, worker, from_sequence);
-
         var stats = catchUpWorker(runtime, worker) catch |err| {
             if (isRecoverableCatchUpError(worker, err)) {
                 closeWorkerCatchUpState(runtime, worker, false) catch |close_err| {
@@ -816,6 +818,15 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
         const sleep_ns = @min(delay_ns, max_wait_ns - waited_ns);
         sleepNs(sleep_ns);
         waited_ns +|= sleep_ns;
+
+        // One quiet period is enough for an isolated write. Keep waiting only
+        // while producers advance the target, bounded by max_wait_ns above.
+        // This makes online visibility predictable without fragmenting a
+        // sustained ingest burst into tiny publish/checkpoint transactions.
+        lock(runtime);
+        const target_advanced = worker.target_sequence > target;
+        runtime.mutex.unlock();
+        if (!target_advanced) return;
     }
 }
 
@@ -842,6 +853,7 @@ fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.Catc
             .max_items_per_window = policy.max_items_per_window,
             .max_chunk_bytes = policy.max_chunk_bytes,
             .estimated_dense_vector_bytes = policy.estimated_dense_vector_bytes,
+            .target_sequence = worker.target_sequence,
         },
     );
 }
@@ -953,7 +965,7 @@ fn testInMemoryJournalOpenOptions() change_journal_mod.OpenOptions {
     };
 }
 
-test "async dense replay wait policy scales with pending tail" {
+test "async dense replay wait policy bounds a busy tail" {
     const policy = catch_up_policy.Policy{
         .coalesce_min_records = 256,
         .coalesce_delay_ns = 50 * std.time.ns_per_ms,
@@ -961,9 +973,9 @@ test "async dense replay wait policy scales with pending tail" {
     };
 
     try std.testing.expectEqual(@as(u64, 0), catch_up_policy.replayWindowMaxWaitNs(policy, 0));
-    try std.testing.expectEqual(@as(u64, 7_812_500), catch_up_policy.replayWindowMaxWaitNs(policy, 1));
-    try std.testing.expectEqual(@as(u64, 54_687_500), catch_up_policy.replayWindowMaxWaitNs(policy, 7));
-    try std.testing.expectEqual(@as(u64, 1_000 * std.time.ns_per_ms), catch_up_policy.replayWindowMaxWaitNs(policy, 128));
+    try std.testing.expectEqual(@as(u64, 2_000 * std.time.ns_per_ms), catch_up_policy.replayWindowMaxWaitNs(policy, 1));
+    try std.testing.expectEqual(@as(u64, 2_000 * std.time.ns_per_ms), catch_up_policy.replayWindowMaxWaitNs(policy, 7));
+    try std.testing.expectEqual(@as(u64, 2_000 * std.time.ns_per_ms), catch_up_policy.replayWindowMaxWaitNs(policy, 128));
     try std.testing.expectEqual(@as(u64, 0), catch_up_policy.replayWindowMaxWaitNs(policy, 256));
 }
 

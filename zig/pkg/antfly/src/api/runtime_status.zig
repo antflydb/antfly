@@ -840,6 +840,7 @@ fn preserveIndexProjectionLifecycle(dst: *db_mod.types.DBIndexStats, cached: db_
     dst.projection_checkpoint_generation = cached.projection_checkpoint_generation;
     dst.projection_checkpoint_config_hash = cached.projection_checkpoint_config_hash;
     dst.checkpoint_replay_tail_sequence_count = cached.checkpoint_replay_tail_sequence_count;
+    dst.dense_vector_projection_pending = cached.dense_vector_projection_pending;
 }
 
 fn runtimeStatusWorthPreserving(status: LocalTableRuntimeStatus) bool {
@@ -858,6 +859,7 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
         if (index.repair_degraded or index.repair_issue_count != 0) return true;
+        if (index.dense_vector_projection_pending) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
         // A target-only replay/catch-up marker can be synthesized from topology
         // and accepted sequence. It is not enough to prove that a live runtime

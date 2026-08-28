@@ -638,6 +638,9 @@ pub const Store = struct {
         // original transaction layout and fall back to ordinary admission.
         begin_read_with_block_cache_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn = null,
         begin_probe_with_block_cache_admission: ?*const fn (Allocator, *anyopaque, backend_types.Namespace.BlockCacheAdmission) anyerror!ProbeTxn = null,
+        /// Open one stable, range-scoped replay-lane view. The returned
+        /// transaction may outlive multiple bounded derived-index windows.
+        begin_replay_lane_scan: ?*const fn (Allocator, *anyopaque, u8, u64) anyerror!CurrentScanTxn = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -680,6 +683,18 @@ pub const Store = struct {
             return try BoundaryAbi.call("begin_current_scan", self.boundary_dispatch, begin_current_scan, .{ self.allocator, self.ptr });
         }
         return try currentScanTxnFrom(self.allocator, try self.beginRead());
+    }
+
+    pub fn beginReplayLaneScan(self: *Store, lane_ordinal: u8, from_sequence: u64) !CurrentScanTxn {
+        if (self.vtable.begin_replay_lane_scan) |begin_replay_lane_scan| {
+            return try BoundaryAbi.call("begin_replay_lane_scan", self.boundary_dispatch, begin_replay_lane_scan, .{
+                self.allocator,
+                self.ptr,
+                lane_ordinal,
+                from_sequence,
+            });
+        }
+        return try self.beginCurrentScan();
     }
 
     pub fn beginWrite(self: *Store) !WriteTxn {
@@ -1535,6 +1550,16 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try currentScanTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
+        fn beginReplayLaneScan(alloc: Allocator, ptr: *anyopaque, lane_ordinal: u8, from_sequence: u64) anyerror!CurrentScanTxn {
+            if (Handle == Store) {
+                return try unbox(ptr).handle.beginReplayLaneScan(lane_ordinal, from_sequence);
+            }
+            if (@hasDecl(Handle, "beginReplayLaneScan")) {
+                return try currentScanTxnFrom(alloc, try unbox(ptr).handle.beginReplayLaneScan(lane_ordinal, from_sequence));
+            }
+            return try beginCurrentScan(alloc, ptr);
+        }
+
         fn beginWrite(alloc: Allocator, ptr: *anyopaque) anyerror!WriteTxn {
             return try writeTxnFrom(alloc, try unbox(ptr).handle.beginWrite());
         }
@@ -1748,6 +1773,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,
             .begin_probe_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginProbeWithBlockCacheAdmission")) vt.beginProbeWithBlockCacheAdmission else null,
             .begin_current_scan = if (Handle == Store or @hasDecl(Handle, "beginCurrentScan")) vt.beginCurrentScan else null,
+            .begin_replay_lane_scan = if (Handle == Store or @hasDecl(Handle, "beginReplayLaneScan")) vt.beginReplayLaneScan else null,
             .begin_write = vt.beginWrite,
             .begin_batch = vt.beginBatch,
             .begin_batch_with_options = vt.beginBatchWithOptions,

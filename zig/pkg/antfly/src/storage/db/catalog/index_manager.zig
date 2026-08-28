@@ -43,6 +43,7 @@ const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const vector_block_store_mod = @import("../../vector_block_store.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
@@ -1093,6 +1094,29 @@ pub const DenseSplitHandoff = struct {
     }
 };
 
+const SharedVectorBlockGeneration = struct {
+    alloc: Allocator,
+    opened: vector_block_store_mod.Opened,
+    refs: std.atomic.Value(u64) = .init(1),
+
+    fn create(alloc: Allocator, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
+        const generation = try alloc.create(SharedVectorBlockGeneration);
+        generation.* = .{ .alloc = alloc, .opened = opened };
+        return generation;
+    }
+
+    fn retain(self: *SharedVectorBlockGeneration) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *SharedVectorBlockGeneration) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+        const alloc = self.alloc;
+        self.opened.deinit();
+        alloc.destroy(self);
+    }
+};
+
 const SplitSide = enum {
     left,
     right,
@@ -1109,6 +1133,8 @@ pub const IndexManager = struct {
     text_wal_lsm_options: lsm_backend_mod.Options,
     dense_storage_backend: hbc_mod.StorageBackend,
     dense_lsm_storage: ?lsm_backend_mod.Storage,
+    vector_block_storage: ?lsm_backend_mod.Storage,
+    owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage,
     dense_lsm_options: lsm_backend_mod.Options,
     sparse_backend: sparse_mod.SparseBackend,
     sparse_lsm_storage: ?lsm_backend_mod.Storage,
@@ -1130,7 +1156,27 @@ pub const IndexManager = struct {
     hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
     hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
+    // The primary DocStore intentionally erases its concrete backend. Keep a
+    // non-owning pointer to the DB-owned LSM solely for opportunistic derived
+    // publication admission; explicit stable lifecycle fences do not consult
+    // it. The backend outlives IndexManager in DBCore.
+    primary_lsm_backend: ?*lsm_backend_mod.Backend = null,
     applied_sequence_checkpoint_path: ?[]const u8,
+    vector_block_generation_mu: std.atomic.Mutex = .unlocked,
+    vector_block_build_mu: std.atomic.Mutex = .unlocked,
+    // Public readiness remains closed from stable-tip vector publication
+    // through posting-generation flattening. Queries may still lease the new
+    // mmap generation, but readiness cannot hand the compactor to query one.
+    vector_block_stable_tip_finalizing: std.atomic.Value(bool) = .init(false),
+    vector_block_generation: ?*SharedVectorBlockGeneration = null,
+    // Once a source transaction changes dense artifacts, an older immutable
+    // base must never receive later coverage-only watermarks. Keeping CURRENT
+    // at its last genuinely covered sequence is also the crash-safe dirty
+    // marker: restart can prove that a replacement base is required without
+    // relying on this process-local bit.
+    vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
+    vector_block_candidate_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    vector_block_candidate_since_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
@@ -2135,6 +2181,22 @@ pub const IndexManager = struct {
         };
         const bind_cache_resource_manager = opts.bind_cache_resource_manager and owned_resource_manager == null;
 
+        var owned_vector_block_storage: ?*lsm_backend_mod.NativeStorage = null;
+        errdefer if (owned_vector_block_storage) |storage| {
+            storage.deinit();
+            alloc.destroy(storage);
+        };
+        var vector_block_storage = opts.vector_block_storage;
+        if (vector_block_storage == null and denseVectorBlockStoreEnabled()) {
+            const native_storage = try alloc.create(lsm_backend_mod.NativeStorage);
+            native_storage.* = lsm_backend_mod.NativeStorage.init(alloc, .threaded) catch |err| {
+                alloc.destroy(native_storage);
+                return err;
+            };
+            owned_vector_block_storage = native_storage;
+            vector_block_storage = native_storage.storage();
+        }
+
         const text_main_lsm_options = db_config.mergedIndexLsmOptions(
             opts.text_lsm_storage,
             opts.lsm_cache,
@@ -2187,6 +2249,8 @@ pub const IndexManager = struct {
             .text_wal_lsm_options = text_wal_lsm_options,
             .dense_storage_backend = opts.dense_storage_backend,
             .dense_lsm_storage = opts.dense_lsm_storage,
+            .vector_block_storage = vector_block_storage,
+            .owned_vector_block_storage = owned_vector_block_storage,
             .dense_lsm_options = dense_lsm_options,
             .sparse_backend = opts.sparse_backend,
             .sparse_lsm_storage = opts.sparse_lsm_storage,
@@ -2204,6 +2268,7 @@ pub const IndexManager = struct {
             .retained_vector_cache_enabled = opts.retained_vector_cache_enabled,
             .primary_store = null,
             .applied_sequence_checkpoint_path = null,
+            .vector_block_generation = null,
             .load_parallelism = null,
             .full_text_pending_bytes_accounted = 0,
             .text_indexes = .empty,
@@ -2332,6 +2397,15 @@ pub const IndexManager = struct {
         self.dense_lsm_storage = storage;
     }
 
+    pub fn setVectorBlockStorage(self: *IndexManager, storage: ?lsm_backend_mod.Storage) void {
+        if (self.owned_vector_block_storage) |owned| {
+            owned.deinit();
+            self.alloc.destroy(owned);
+            self.owned_vector_block_storage = null;
+        }
+        self.vector_block_storage = storage;
+    }
+
     pub fn setDenseLsmOptions(self: *IndexManager, options: lsm_backend_mod.Options) void {
         self.dense_lsm_options = options;
     }
@@ -2356,6 +2430,10 @@ pub const IndexManager = struct {
         self.load_parallelism = if (parallelism) |value| @max(value, 1) else null;
     }
 
+    pub fn setPrimaryLsmBackend(self: *IndexManager, backend: ?*lsm_backend_mod.Backend) void {
+        self.primary_lsm_backend = backend;
+    }
+
     // Provide the background lane that algebraic indexes use for HLL cardinality
     // maintenance. Call before loading indexes so newly opened algebraic indexes
     // pick up the lane; already-open indexes are (re)attached here too.
@@ -2377,7 +2455,793 @@ pub const IndexManager = struct {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
+            self.loadVectorBlockGenerationIfPresent() catch |err| {
+                std.log.warn("shared vector-block generation open failed; primary artifact fallback remains active err={s}", .{@errorName(err)});
+            };
         }
+    }
+
+    fn vectorBlockRootAlloc(self: *const IndexManager) ![]u8 {
+        return try std.fs.path.join(self.alloc, &.{ self.base_path, "vector-blocks" });
+    }
+
+    fn acquireVectorBlockGeneration(self: *IndexManager) ?*SharedVectorBlockGeneration {
+        lockAtomicWithBackoff(&self.vector_block_generation_mu);
+        defer self.vector_block_generation_mu.unlock();
+        const generation = self.vector_block_generation orelse return null;
+        generation.retain();
+        return generation;
+    }
+
+    fn attachVectorBlockResidencyPolicy(self: *IndexManager, index: *hbc_mod.HBCIndex) void {
+        const generation = self.acquireVectorBlockGeneration() orelse return;
+        generation.release();
+        // Startup can load CURRENT before dense index objects are constructed.
+        // Apply the same no-duplicate-residency policy to each later index as
+        // an online generation install applies to already-open indexes.
+        index.setBypassExternalVectorCache(true);
+    }
+
+    fn vectorBlockReadyAtSequence(self: *IndexManager, source_sequence: u64) bool {
+        // Environment flags are process bootstrap inputs, not mutable runtime
+        // truth. Once storage is attached, every mutation/readiness decision
+        // must remain on the native projection path for this manager's full
+        // lifetime (including status snapshots collected by another lane).
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
+        const generation = self.acquireVectorBlockGeneration() orelse return false;
+        defer generation.release();
+        return vectorBlockGenerationReadyAtSequence(generation, source_sequence);
+    }
+
+    fn vectorBlockGenerationReadyAtSequence(
+        generation: *const SharedVectorBlockGeneration,
+        source_sequence: u64,
+    ) bool {
+        return generation.opened.store.covered_source_sequence == source_sequence and
+            generation.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding()) and
+            generation.opened.store.manifest.?.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
+    }
+
+    fn vectorBlockReadyAtSequenceAndCount(
+        self: *IndexManager,
+        source_sequence: u64,
+        expected_count: u64,
+    ) bool {
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
+        const generation = self.acquireVectorBlockGeneration() orelse return false;
+        defer generation.release();
+        if (!vectorBlockGenerationReadyAtSequence(generation, source_sequence)) return false;
+        // Base-only generations have a cheap exact cardinality certificate.
+        // Enforce it so a coverage-only frame cannot make an empty/stale base
+        // current after vector writes. Mutation-WAL and sparse-delta layouts
+        // are already transactionally authoritative and intentionally have no
+        // additive physical-count shortcut.
+        if (generation.opened.baseOnlyVectorCount()) |actual_count| {
+            return actual_count == expected_count;
+        }
+        // An empty structural base followed only by WAL/delta records is
+        // transactionally queryable, but it has not completed initial
+        // publication. Keep creation readiness pending until bounded native
+        // compaction turns that overlay into a cardinality-certified base.
+        // Established non-empty bases remain available through ordinary
+        // online deltas without making every write flap public readiness.
+        if (expected_count != 0 and generation.opened.baseVectorCount() == 0) return false;
+        return true;
+    }
+
+    pub fn vectorBlockReadyForDenseIndex(self: *IndexManager, name: []const u8) bool {
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
+        if (self.vector_block_stable_tip_finalizing.load(.acquire)) return false;
+        const entry = self.denseIndex(name) orelse return false;
+        // Public replay/status watermarks can include unrelated table metadata
+        // writes. Exact-vector consistency is tied to the immutable HBC
+        // generation lease, whose durable posting boundary is the sequence
+        // passed to the query scorer.
+        const source_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse return false;
+        return self.vectorBlockReadyAtSequenceAndCount(source_sequence, entry.index.stats().active_count);
+    }
+
+    /// Status/readiness already owns an explicit replay boundary. Check the
+    /// shared exact-vector generation against that boundary rather than the
+    /// posting generation visible through a separately opened status reader:
+    /// the latter can legitimately lag the resident WAL-authoritative writer
+    /// by one published read generation. Using it made an empty sequence-one
+    /// vector base certify a sequence-501/10001 public index as ready.
+    pub fn vectorBlockReadyForDenseIndexAtSequence(
+        self: *IndexManager,
+        name: []const u8,
+        source_sequence: u64,
+        expected_count: u64,
+    ) bool {
+        if (self.vector_block_storage == null) return !denseVectorBlockStoreEnabled();
+        if (self.vector_block_stable_tip_finalizing.load(.acquire)) return false;
+        _ = self.denseIndex(name) orelse return false;
+        return self.vectorBlockReadyAtSequenceAndCount(source_sequence, expected_count);
+    }
+
+    pub fn vectorBlockBaseMaintenanceNeeded(self: *IndexManager) bool {
+        if (self.vector_block_storage == null) return false;
+        for (self.dense_indexes.items) |*entry| {
+            if (self.vectorBlockReadyForDenseIndex(entry.config.name)) continue;
+            const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence();
+            const generation = self.acquireVectorBlockGeneration() orelse {
+                std.log.info("shared vector-block maintenance needed index={s} reason=generation_missing posting_sequence={?}", .{
+                    entry.config.name,
+                    posting_sequence,
+                });
+                return true;
+            };
+            defer generation.release();
+            const manifest = generation.opened.store.manifest.?;
+            std.log.info(
+                "shared vector-block maintenance needed index={s} reason=boundary_mismatch posting_sequence={?} covered_sequence={} preferred_encoding={} shard_count={} expected_shards={}",
+                .{
+                    entry.config.name,
+                    posting_sequence,
+                    generation.opened.store.covered_source_sequence,
+                    generation.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding()),
+                    manifest.shard_count,
+                    (vector_block_store_mod.BaseBuildOptions{}).shard_count,
+                },
+            );
+            return true;
+        }
+        return false;
+    }
+
+    /// Cheap writer-owned readiness fact for runtime status publication.
+    /// Unlike a materialized DB status snapshot, this observes the currently
+    /// leased HBC generation and exact-vector generation in the same manager.
+    pub fn vectorBlockProjectionPending(self: *IndexManager) bool {
+        if (self.vector_block_storage == null) return false;
+        for (self.dense_indexes.items) |*entry| {
+            if (!self.vectorBlockReadyForDenseIndex(entry.config.name)) return true;
+        }
+        return false;
+    }
+
+    fn installVectorBlockGeneration(self: *IndexManager, generation: *SharedVectorBlockGeneration) void {
+        lockAtomicWithBackoff(&self.vector_block_generation_mu);
+        const previous = self.vector_block_generation;
+        self.vector_block_generation = generation;
+        self.vector_block_generation_mu.unlock();
+        // The mmap generation is itself exact-vector residency. Keeping the
+        // insertion-time HBC vector cache would duplicate the corpus in heap
+        // and erase the memory benefit of the native format. Enabling bypass
+        // also fences every cache fill that began before publication.
+        for (self.dense_indexes.items) |*entry| entry.index.setBypassExternalVectorCache(true);
+        if (previous) |old| old.release();
+    }
+
+    fn clearVectorBlockGeneration(self: *IndexManager) void {
+        lockAtomicWithBackoff(&self.vector_block_generation_mu);
+        const previous = self.vector_block_generation;
+        self.vector_block_generation = null;
+        self.vector_block_generation_mu.unlock();
+        // A replacement build can temporarily leave primary artifacts as the
+        // only exact-vector authority. Restore governed decoded residency for
+        // that interval; the next install clears it atomically.
+        for (self.dense_indexes.items) |*entry| entry.index.setBypassExternalVectorCache(false);
+        if (previous) |old| old.release();
+    }
+
+    /// Durably certifies that a source-only commit did not alter the exact
+    /// vector projection. The immutable blocks keep their original record
+    /// sequences; a coverage frame extends the safe query boundary without
+    /// rewriting the corpus. Readers opened after the WAL fsync see the old
+    /// base plus the newer certified watermark as one leased generation.
+    fn advanceVectorBlockCoverage(self: *IndexManager, covered_source_sequence: u64) !bool {
+        if (self.vector_block_storage == null) return false;
+        if (self.vector_block_projection_dirty.load(.acquire)) return false;
+        const storage = self.vector_block_storage orelse return false;
+        const current = self.acquireVectorBlockGeneration() orelse return false;
+        defer current.release();
+        const current_coverage = current.opened.store.covered_source_sequence;
+        if (covered_source_sequence <= current_coverage) return false;
+
+        const root = try self.vectorBlockRootAlloc();
+        defer self.alloc.free(root);
+        {
+            var writer = try vector_block_store_mod.Store.open(self.alloc, storage, root);
+            defer writer.deinit();
+            if (writer.covered_source_sequence < covered_source_sequence) {
+                const batch_id = try writer.nextBatchId();
+                try writer.appendCoverage(batch_id, covered_source_sequence, .{});
+            }
+        }
+
+        var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
+        errdefer opened.deinit();
+        if (opened.store.covered_source_sequence < covered_source_sequence)
+            return error.VectorBlockCoverageCommitMissing;
+        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        self.installVectorBlockGeneration(generation);
+        return true;
+    }
+
+    fn publishVectorBlockMutationWal(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        mutations: []const hbc_mod.ExperimentalExactVectorMutation,
+        covered_source_sequence: u64,
+    ) !bool {
+        if (mutations.len == 0) return false;
+        const storage = self.vector_block_storage orelse return false;
+        const current = self.acquireVectorBlockGeneration() orelse return false;
+        defer current.release();
+        const current_coverage = current.opened.store.covered_source_sequence;
+        if (current_coverage > covered_source_sequence) return error.VectorBlockPublicationBoundaryRegressed;
+
+        const root = try self.vectorBlockRootAlloc();
+        defer self.alloc.free(root);
+        var store = try vector_block_store_mod.Store.open(self.alloc, storage, root);
+        defer store.deinit();
+        if (store.manifest == null or store.covered_source_sequence != current_coverage) return false;
+        const batch_id = try store.nextBatchId();
+        const primary = self.primary_store orelse return error.MissingPrimaryStore;
+        var primary_txn = try primary.beginReadTxn();
+        defer primary_txn.abort();
+
+        const records = try self.alloc.alloc(vector_block_store_mod.BatchRecord, mutations.len);
+        defer self.alloc.free(records);
+        const keys = try self.alloc.alloc([]u8, mutations.len);
+        var key_count: usize = 0;
+        defer {
+            for (keys[0..key_count]) |key| self.alloc.free(key);
+            self.alloc.free(keys);
+        }
+        const artifact_name = entry.embedding_name orelse entry.config.name;
+        for (mutations, 0..) |mutation, index| {
+            const key = if (internal_keys.isInternalUserKey(mutation.metadata))
+                try internal_keys.derivedEmbeddingArtifactKeyAlloc(self.alloc, mutation.metadata, artifact_name)
+            else
+                try internal_keys.embeddingArtifactKeyForDocumentAlloc(self.alloc, mutation.metadata, artifact_name);
+            keys[index] = key;
+            key_count += 1;
+            const revision = switch (mutation.kind) {
+                // Match the full-base builder's revision certificate exactly,
+                // including a managed artifact's source-hash header. Reading
+                // the just-committed primary value also detects any accidental
+                // mismatch between HBC capture and authoritative storage.
+                .upsert => std.hash.XxHash64.hash(0, try primary_txn.get(key)),
+                .tombstone => batch_id,
+            };
+            records[index] = .{
+                .kind = switch (mutation.kind) {
+                    .upsert => .upsert,
+                    .tombstone => .tombstone,
+                },
+                .key = key,
+                .source_sequence = covered_source_sequence,
+                .revision = revision,
+                .vector = mutation.vector,
+            };
+        }
+        try store.appendBatch(batch_id, records, covered_source_sequence, .{});
+
+        var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
+        errdefer opened.deinit();
+        if (try opened.checkpointWalToDelta(false)) {
+            // Publication rotated WAL and CURRENT. Reopen so the installed
+            // query lease owns exactly the new sparse generation rather than
+            // the pre-checkpoint mmap/WAL view retained by the builder.
+            const checkpointed = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &opened);
+            opened.deinit();
+            opened = checkpointed;
+        }
+        if (opened.store.covered_source_sequence != covered_source_sequence or !opened.store.wal_has_mutations) {
+            // A successful sparse checkpoint intentionally empties the WAL;
+            // the segment watermark is then the durable mutation certificate.
+            if (opened.store.covered_source_sequence != covered_source_sequence or
+                opened.store.checkpointedThrough() != covered_source_sequence)
+            {
+                return error.VectorBlockMutationCommitMissing;
+            }
+        }
+        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        self.installVectorBlockGeneration(generation);
+        self.vector_block_projection_dirty.store(false, .release);
+        return true;
+    }
+
+    /// Consolidates a current native WAL/delta generation without consulting
+    /// the primary LSM. A forced WAL checkpoint first converts float32 commit
+    /// records to the base encoding; the shard-local merge then publishes one
+    /// complete mmap base and atomically retires every sparse generation.
+    fn compactVectorBlockGenerationAtStableTip(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        covered_source_sequence: u64,
+    ) !bool {
+        const storage = self.vector_block_storage orelse return false;
+        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        defer self.vector_block_build_mu.unlock();
+
+        const current = self.acquireVectorBlockGeneration() orelse return false;
+        defer current.release();
+        if (!vectorBlockGenerationReadyAtSequence(current, covered_source_sequence)) return false;
+        if (current.opened.baseOnlyVectorCount() != null) return false;
+
+        const root = try self.vectorBlockRootAlloc();
+        defer self.alloc.free(root);
+        var opened = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &current.opened);
+        defer opened.deinit();
+        if (opened.store.wal_has_mutations) {
+            _ = try opened.checkpointWalToDelta(true);
+            const checkpointed = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &opened);
+            opened.deinit();
+            opened = checkpointed;
+        }
+        if (!try opened.compactDeltasToBase()) return false;
+
+        var compacted = try vector_block_store_mod.Store.openWithBlocksReusing(self.alloc, storage, root, &opened);
+        errdefer compacted.deinit();
+        if (compacted.store.covered_source_sequence != covered_source_sequence or
+            compacted.baseOnlyVectorCount() != entry.index.stats().active_count)
+        {
+            return error.VectorBlockPublishedGenerationNotReady;
+        }
+        const generation = try SharedVectorBlockGeneration.create(self.alloc, compacted);
+        self.installVectorBlockGeneration(generation);
+        self.vector_block_projection_dirty.store(false, .release);
+        std.log.info(
+            "shared vector-block native generations compacted sequence={} vectors={}",
+            .{ covered_source_sequence, entry.index.stats().active_count },
+        );
+        return true;
+    }
+
+    fn loadVectorBlockGenerationIfPresent(self: *IndexManager) !void {
+        if (self.vector_block_storage == null) return;
+        if (self.acquireVectorBlockGeneration()) |current| {
+            current.release();
+            return;
+        }
+        const root = try self.vectorBlockRootAlloc();
+        defer self.alloc.free(root);
+        const current_path = try std.fs.path.join(self.alloc, &.{ root, "CURRENT" });
+        defer self.alloc.free(current_path);
+        _ = self.vector_block_storage.?.fileSize(current_path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        var opened = try vector_block_store_mod.Store.openWithBlocks(self.alloc, self.vector_block_storage.?, root);
+        errdefer opened.deinit();
+        if (opened.store.manifest == null) {
+            opened.deinit();
+            return;
+        }
+        const generation = try SharedVectorBlockGeneration.create(self.alloc, opened);
+        self.installVectorBlockGeneration(generation);
+    }
+
+    pub fn ensureVectorBlockBaseAtAppliedSequence(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
+        if (self.vector_block_storage == null) return;
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
+            if (posting_sequence != applied_sequence) return error.PostingCheckpointSequenceMismatch;
+        }
+        const storage = self.vector_block_storage orelse {
+            std.log.warn("shared vector-block build deferred: native file storage unavailable sequence={}", .{applied_sequence});
+            return;
+        };
+        const primary = self.primary_store orelse {
+            std.log.warn("shared vector-block build deferred: primary store unavailable sequence={}", .{applied_sequence});
+            return;
+        };
+        const primary_tip = primary.lastReplaySequence(0);
+        if (applied_sequence < primary_tip) {
+            if (primary_tip - applied_sequence <= 2) {
+                std.log.info("shared vector-block build deferred behind source applied_sequence={} source_sequence={}", .{ applied_sequence, primary_tip });
+            }
+            return;
+        }
+        lockAtomicWithBackoff(&self.vector_block_build_mu);
+        defer self.vector_block_build_mu.unlock();
+
+        var requires_projection_rewrite = false;
+        if (self.acquireVectorBlockGeneration()) |current| {
+            const current_coverage = current.opened.store.covered_source_sequence;
+            const preferred_encoding = current.opened.usesBaseEncoding(denseVectorBlockPreferredEncoding());
+            const preferred_layout = current.opened.store.manifest.?.shard_count == (vector_block_store_mod.BaseBuildOptions{}).shard_count;
+            const certified_count = current.opened.baseOnlyVectorCount();
+            current.release();
+            if (current_coverage == applied_sequence and preferred_encoding and preferred_layout and
+                (certified_count == null or certified_count.? == entry.index.stats().active_count))
+            {
+                self.vector_block_projection_dirty.store(false, .release);
+                return;
+            }
+            requires_projection_rewrite = current_coverage == applied_sequence;
+            // Never let a stale shared projection answer a newer HBC lease.
+            // Existing query leases retain the old mmap generation while new
+            // queries use primary artifacts until publication completes.
+            self.clearVectorBlockGeneration();
+        }
+
+        // The decoded HBC vector cache is a derivative of the same primary
+        // artifacts this build scans. Drop that duplicate before asking the
+        // ResourceManager to admit builder memory; otherwise a node near its
+        // aggregate hard limit can deadlock readiness on memory that the
+        // successful generation would immediately discard anyway.
+        const previous_cache_bypass = try self.alloc.alloc(bool, self.dense_indexes.items.len);
+        defer self.alloc.free(previous_cache_bypass);
+        for (self.dense_indexes.items, 0..) |*dense_entry, i| {
+            previous_cache_bypass[i] = dense_entry.index.bypassExternalVectorCache();
+            dense_entry.index.setBypassExternalVectorCache(true);
+        }
+        var keep_native_cache_bypass = false;
+        defer if (!keep_native_cache_bypass) {
+            for (self.dense_indexes.items, 0..) |*dense_entry, i| {
+                dense_entry.index.setBypassExternalVectorCache(previous_cache_bypass[i]);
+            }
+        };
+
+        // Pin one source snapshot and derive its watermark from that snapshot.
+        // A current-tip check before a separately-opened scan is insufficient:
+        // a concurrent source commit can otherwise be mislabeled as the older
+        // HBC generation.
+        // This is a one-pass projection scan. Retaining primary LSM blocks
+        // would immediately duplicate the exact vectors in both the shared
+        // cache and the mmap generation (hundreds of MiB at only 50K rows),
+        // even though native reranking will not read those artifact blocks.
+        var source_txn = try primary.beginReadTxnWithBlockCacheAdmission(.transient);
+        defer source_txn.abort();
+        const snapshot_sequence = try primary.lastReplaySequenceFromTxn(&source_txn, 0);
+        if (snapshot_sequence != applied_sequence) {
+            std.log.info("shared vector-block build deferred at snapshot boundary applied_sequence={} snapshot_sequence={}", .{ applied_sequence, snapshot_sequence });
+            return;
+        }
+
+        const root = try self.vectorBlockRootAlloc();
+        defer self.alloc.free(root);
+        // Charge actual allocator growth instead of guessing from corpus
+        // cardinality. One build may borrow up to twice its normal slice hard
+        // limit when it is the sole builder, but never exceeds the aggregate
+        // process envelope. The per-shard format bounds ordinary 1M-scale
+        // construction well below that exception.
+        var budgeted_alloc: ?resource_manager_mod.BudgetedAllocator = if (self.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(
+                manager,
+                .dense_vector_block_build_working_set,
+                self.alloc,
+                2,
+            )
+        else
+            null;
+        defer if (budgeted_alloc) |*budget| budget.deinit();
+        const build_alloc = if (budgeted_alloc) |*budget| budget.allocator() else self.alloc;
+        var store = vector_block_store_mod.Store.open(build_alloc, storage, root) catch |err| {
+            if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
+                return error.ResourceBudgetExceeded;
+            return err;
+        };
+        defer store.deinit();
+        if (store.manifest != null and store.covered_source_sequence == applied_sequence and !requires_projection_rewrite) {
+            try self.loadVectorBlockGenerationIfPresent();
+            if (self.vectorBlockReadyAtSequenceAndCount(applied_sequence, entry.index.stats().active_count)) {
+                self.vector_block_projection_dirty.store(false, .release);
+                keep_native_cache_bypass = true;
+                return;
+            }
+            // CURRENT may be a readable legacy float32 base. It is safe for
+            // fallback queries, but it is not the preferred bounded-residency
+            // projection. Replace it through the same atomic generation path.
+            self.clearVectorBlockGeneration();
+        }
+        const generation = if (store.manifest) |manifest|
+            std.math.add(u64, manifest.latest_generation, 1) catch return error.VectorBlockGenerationOverflow
+        else
+            1;
+        const started = platform_time.monotonicNs();
+        const stats = store.buildBaseFromArtifactsTxn(primary, &source_txn, generation, applied_sequence, .{
+            .encoding = denseVectorBlockPreferredEncoding(),
+        }) catch |err| {
+            if (err == error.OutOfMemory and budgeted_alloc != null and budgeted_alloc.?.denied())
+                return error.ResourceBudgetExceeded;
+            return err;
+        };
+        std.log.info(
+            "shared vector-block base published generation={} sequence={} vectors={} vector_bytes={} artifact_bytes={} block_bytes={} elapsed_ms={}",
+            .{
+                generation,
+                applied_sequence,
+                stats.vectors,
+                stats.vector_bytes,
+                stats.artifact_bytes_scanned,
+                stats.block_bytes,
+                (platform_time.monotonicNs() - started) / std.time.ns_per_ms,
+            },
+        );
+        try self.loadVectorBlockGenerationIfPresent();
+        if (!self.vectorBlockReadyAtSequenceAndCount(applied_sequence, entry.index.stats().active_count))
+            return error.VectorBlockPublishedGenerationNotReady;
+        self.vector_block_projection_dirty.store(false, .release);
+        keep_native_cache_bypass = true;
+    }
+
+    /// Publishes every native query artifact required at a stable source tip
+    /// under one readiness fence. The exact-vector base remains independently
+    /// leasable, dirty posting payloads are repaired against that base, and a
+    /// meaningful posting WAL tail is flattened into a full generation. This
+    /// keeps neither posting repair, background checkpointing, nor a large
+    /// exact centroid overlay from becoming the first query's work.
+    pub fn finalizeVectorBlockBaseAtStableTip(
+        self: *IndexManager,
+        name: []const u8,
+        applied_sequence: u64,
+    ) !void {
+        if (self.vector_block_storage == null) return;
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        lockAtomicWithBackoff(entry.apply_mutex);
+        defer entry.apply_mutex.unlock();
+        try self.finalizeVectorBlockBaseAtStableTipLocked(entry, applied_sequence);
+    }
+
+    /// Caller owns entry.apply_mutex. Keep vector publication, native posting
+    /// repair, and the final flattened generation in one mutation epoch: a
+    /// query may otherwise arrive after vector publication, observe an active
+    /// repair capture, and fall back to the compatibility LSM for the entire
+    /// maintenance transaction.
+    fn finalizeVectorBlockBaseAtStableTipLocked(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        applied_sequence: u64,
+    ) !void {
+        self.vector_block_stable_tip_finalizing.store(true, .release);
+        defer self.vector_block_stable_tip_finalizing.store(false, .release);
+
+        _ = try self.compactVectorBlockGenerationAtStableTip(entry, applied_sequence);
+        try self.ensureVectorBlockBaseAtAppliedSequence(entry.config.name, applied_sequence);
+        _ = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, applied_sequence, .{
+            .validate_payloads = true,
+            .flatten = true,
+        });
+    }
+
+    pub const NativePostingStableTipOptions = struct {
+        validate_payloads: bool = false,
+        flatten: bool = true,
+    };
+
+    /// Certifies posting/tree state independently from the table-global exact
+    /// vector projection. Shadow replacements own a private HBC namespace but
+    /// intentionally share the primary vector source, so their generation
+    /// manifest must call this before pointer publication without building a
+    /// duplicate vector-block base inside the shadow.
+    pub fn finalizeNativePostingGenerationAtStableTip(
+        self: *IndexManager,
+        name: []const u8,
+        applied_sequence: u64,
+        options: NativePostingStableTipOptions,
+    ) !bool {
+        const entry = self.denseIndex(name) orelse return error.IndexNotFound;
+        lockAtomicWithBackoff(entry.apply_mutex);
+        defer entry.apply_mutex.unlock();
+        return try self.finalizeNativePostingGenerationAtStableTipLocked(entry, applied_sequence, options);
+    }
+
+    fn finalizeNativePostingGenerationAtStableTipLocked(
+        self: *IndexManager,
+        entry: *DenseIndex,
+        applied_sequence: u64,
+        options: NativePostingStableTipOptions,
+    ) !bool {
+        _ = self;
+        if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return false;
+        if (options.validate_payloads) {
+            const posting_steps = try drainDensePostingMaintenanceEntry(entry, .{
+                .max_postings_per_index = std.math.maxInt(usize),
+                .validate_payloads = true,
+                // Stable publication validates the state already chosen by
+                // the ordinary maintenance policy. It must not turn readiness
+                // or an index-repair fence into an unbounded topology optimizer.
+                .rebalance_layout = false,
+                .cooperative = false,
+            });
+            const remaining = try entry.index.postingBacklogStats();
+            if (remaining.needsRepair()) {
+                std.log.warn(
+                    "dense posting stable-tip validation incomplete dirty={} centroid_dirty={} payload_dirty={} skipped_missing={}",
+                    .{
+                        remaining.dirty_postings,
+                        remaining.centroid_dirty_postings,
+                        remaining.payload_dirty_postings,
+                        remaining.skipped_missing,
+                    },
+                );
+                return error.PostingMaintenanceIncomplete;
+            }
+            if (posting_steps != 0) {
+                std.log.info("dense posting stable-tip validation repaired steps={d}", .{posting_steps});
+            }
+        }
+        try entry.index.finalizeExperimentalPostingGenerationAtAppliedSequence(applied_sequence, .{
+            .flatten = options.flatten,
+            .make_authoritative = densePostingWalMutationStoreEnabled() or
+                entry.index.experimentalPostingWalAuthoritative(),
+        });
+        return true;
+    }
+
+    // Time remains a secondary debounce for a completely settled write plane.
+    // It is not sufficient evidence by itself: explicit lifecycle barriers
+    // publish immediately, while background publication additionally requires
+    // no mutable rows, immutable memtables, or active bulk batch below.
+    const vector_block_quiescence_ns: u64 = 2 * std.time.ns_per_s;
+
+    fn primaryWritePlaneSafeForProjection(stats: lsm_backend_mod.Backend.MaintenanceStats, maintenance_score: u64) bool {
+        // An upload lull is not a stable publication boundary. Even a small
+        // mutable/immutable tail proves that the write plane has not drained;
+        // rebuilding a corpus-sized base there can repeat once traffic resumes.
+        // Caller-proven lifecycle barriers bypass this opportunistic policy and
+        // safely build from a pinned snapshot, so strictness here adds no finite
+        // load readiness delay.
+        if (stats.mutable_entries != 0 or
+            stats.immutable_memtables != 0 or
+            stats.active_bulk_ingest_batches != 0 or
+            stats.wal_checkpoint_pending or
+            stats.wal_pressure_blocked or
+            stats.write_stall_l0_run_debt != 0 or
+            stats.write_stall_l0_byte_debt != 0 or
+            stats.compaction_scheduler_active_jobs != 0)
+            return false;
+
+        // A score of one is non-mutating manifest/obsolete-path housekeeping.
+        // Higher scores represent remaining write-plane or compaction debt.
+        return stats.active_immutable_logical_bytes == 0 and maintenance_score <= 1;
+    }
+
+    /// Observe an idle, fully-covered source tip twice before starting the
+    /// snapshot bootstrap. This runs on the normal dense maintenance lane, so
+    /// it is neither a benchmark-specific optimize hook nor a first-query
+    /// latency penalty. A source advance between observations resets the
+    /// candidate; a source advance before the pinned snapshot aborts inside
+    /// ensureVectorBlockBaseAtAppliedSequence without scanning.
+    fn maintainVectorBlockBaseIfQuiescent(self: *IndexManager, entry: *DenseIndex) !bool {
+        if (self.vector_block_storage == null) return false;
+        const primary = self.primary_store orelse return false;
+        const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse return false;
+        const source_sequence = primary.lastReplaySequence(0);
+        const now = platform_time.monotonicNs();
+        if (self.vector_block_candidate_sequence.load(.acquire) != source_sequence) {
+            self.vector_block_candidate_sequence.store(source_sequence, .release);
+            self.vector_block_candidate_since_ns.store(now, .release);
+        }
+        // The source-tip debounce is deliberately retained while derived
+        // catch-up trails it. Once postings reach the same stable source tip,
+        // publication may proceed without paying another quiet interval.
+        if (posting_sequence != source_sequence) return false;
+        // A native generation with a mutation overlay is self-contained even
+        // though initial-publication readiness deliberately waits for a
+        // cardinality-certified base. A base-only generation must already
+        // match HBC cardinality or it needs the guarded primary-scan path.
+        const native_generation_self_contained = blk: {
+            const generation = self.acquireVectorBlockGeneration() orelse break :blk false;
+            defer generation.release();
+            if (!vectorBlockGenerationReadyAtSequence(generation, source_sequence)) break :blk false;
+            const base_only_count = generation.opened.baseOnlyVectorCount();
+            break :blk base_only_count == null or base_only_count.? == entry.index.stats().active_count;
+        };
+
+        const since = self.vector_block_candidate_since_ns.load(.acquire);
+        if (since == 0 or now -| since < vector_block_quiescence_ns) return true;
+
+        // A sequence-aligned native generation can be finalized entirely from
+        // its immutable blocks and WAL. Keep vector consolidation and posting
+        // validation/flattening under the same readiness fence: publishing the
+        // vector base alone would leave a large posting overlay as query-time
+        // merge and rerank debt. This path is safe under primary LSM pressure
+        // and never turns an upload lull into another source scan.
+        if (native_generation_self_contained) {
+            try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+            const topology_rebuilt = self.maybeRebuildRecursiveTopologyFromVectorBlocks(entry) catch |err| blk: {
+                std.log.warn("recursive HBC topology rebuild deferred index={s} sequence={} err={s}", .{
+                    entry.config.name,
+                    source_sequence,
+                    @errorName(err),
+                });
+                break :blk false;
+            };
+            if (!topology_rebuilt and hbcRecursiveTopologyRebuildMaxWorkspaceBytes() != 0) return true;
+            self.vector_block_candidate_sequence.store(0, .release);
+            self.vector_block_candidate_since_ns.store(0, .release);
+            return true;
+        }
+
+        // Missing or fenced native state needs a pinned primary snapshot. A
+        // quiet source sequence can be an LSM backpressure pause rather than
+        // an idle workload, so opportunistic source scans require a completely
+        // settled write plane. Explicit lifecycle barriers bypass this gate.
+        if (self.primary_lsm_backend) |backend| {
+            const primary_stats = backend.snapshotMaintenanceStats();
+            if (!primaryWritePlaneSafeForProjection(primary_stats, backend.maintenanceScore())) {
+                self.vector_block_candidate_since_ns.store(now, .release);
+                return true;
+            }
+        }
+
+        try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+        const topology_rebuilt = self.maybeRebuildRecursiveTopologyFromVectorBlocks(entry) catch |err| blk: {
+            // This is optional topology maintenance. The freshly published
+            // exact-vector base and existing HBC tree remain authoritative if
+            // admission or reconstruction fails.
+            std.log.warn("recursive HBC topology rebuild deferred index={s} sequence={} err={s}", .{
+                entry.config.name,
+                source_sequence,
+                @errorName(err),
+            });
+            break :blk false;
+        };
+        if (!topology_rebuilt and hbcRecursiveTopologyRebuildMaxWorkspaceBytes() != 0) {
+            // Vector publication succeeded, but topology admission is a
+            // separate optional operation. Retain the candidate so a later
+            // idle pass retries against this already-current vector base.
+            return true;
+        }
+        self.vector_block_candidate_sequence.store(0, .release);
+        self.vector_block_candidate_since_ns.store(0, .release);
+        return true;
+    }
+
+    fn maybeRebuildRecursiveTopologyFromVectorBlocks(self: *IndexManager, entry: *DenseIndex) !bool {
+        const max_workspace_bytes = hbcRecursiveTopologyRebuildMaxWorkspaceBytes();
+        if (max_workspace_bytes == 0) return false;
+        const algorithm = hbcTopologyRebuildAlgorithm();
+        const generation = self.acquireVectorBlockGeneration() orelse return false;
+        defer generation.release();
+        const epoch = generation.opened.store.topologyEpoch() orelse return false;
+        if (try entry.index.topologyRebuildMarkerMatches(
+            algorithm,
+            epoch.base_generation,
+            epoch.wal_mutation_sequence,
+        )) return false;
+        const workspace_bytes = entry.index.topologyRebuildWorkspaceBytes(algorithm) orelse return false;
+        if (workspace_bytes > max_workspace_bytes) {
+            std.log.info("recursive HBC topology rebuild skipped by workspace bound index={s} required_bytes={} max_bytes={}", .{
+                entry.config.name,
+                workspace_bytes,
+                max_workspace_bytes,
+            });
+            return false;
+        }
+
+        var reservation: ?resource_manager_mod.Reservation = if (self.resource_manager) |manager|
+            // A complete topology generation is one indivisible progress unit.
+            // It runs under the per-index apply mutex in quiescent maintenance,
+            // so admit one bounded oversized unit while still enforcing both
+            // slice serialization and the process-wide physical envelope.
+            manager.reserveBoundedOversizedSingle(.dense_repair_working_set, workspace_bytes, 4) catch |err| {
+                std.log.info("recursive HBC topology rebuild awaiting resource admission index={s} workspace_bytes={} err={s}", .{
+                    entry.config.name,
+                    workspace_bytes,
+                    @errorName(err),
+                });
+                return false;
+            }
+        else
+            null;
+        defer if (reservation) |*held| held.release();
+
+        const stats = (try entry.index.rebuildTopologyFromCurrentVectors(
+            max_workspace_bytes,
+            algorithm,
+            epoch.base_generation,
+            epoch.wal_mutation_sequence,
+        )) orelse return false;
+        std.log.info(
+            "HBC topology rebuilt index={s} algorithm={s} vectors={} retired_nodes={} created_nodes={} workspace_bytes={} elapsed_ms={}",
+            .{
+                entry.config.name,
+                @tagName(algorithm),
+                stats.vectors,
+                stats.retired_nodes,
+                stats.created_nodes,
+                stats.workspace_bytes,
+                stats.elapsed_ns / std.time.ns_per_ms,
+            },
+        );
+        return true;
     }
 
     fn freeTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
@@ -2555,6 +3419,7 @@ pub const IndexManager = struct {
             .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
             .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
             .centroid_directory_mode = dense_cfg.centroid_directory_mode,
+            .flat_exact_min_postings = dense_cfg.flat_exact_min_postings,
             .flat_centroid_block_size = dense_cfg.flat_centroid_block_size,
             .flat_centroid_probe_count = dense_cfg.flat_centroid_probe_count,
             .no_sync = self.relaxed_split_durability,
@@ -2588,6 +3453,7 @@ pub const IndexManager = struct {
         index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
         index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
         index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
+        self.attachVectorBlockResidencyPolicy(&index);
 
         entry.index = index;
         entry.vector_loader_context = vector_loader_context;
@@ -2798,6 +3664,7 @@ pub const IndexManager = struct {
     }
 
     fn deinitWithBackendDisposition(self: *IndexManager, abandon_after_crash: bool) void {
+        self.clearVectorBlockGeneration();
         self.releaseFullTextPendingBytes();
         self.text_merge_scheduler.deinit(self.alloc);
         for (self.text_indexes.items) |*entry| {
@@ -2833,6 +3700,10 @@ pub const IndexManager = struct {
         self.algebraic_indexes.deinit(self.alloc);
         self.enrichments.deinit(self.alloc);
         self.resolvers.deinit(self.alloc);
+        if (self.owned_vector_block_storage) |storage| {
+            storage.deinit();
+            self.alloc.destroy(storage);
+        }
         self.alloc.free(self.base_path);
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
@@ -4087,6 +4958,9 @@ pub const IndexManager = struct {
 
     pub const DensePostingMaintenanceOptions = struct {
         max_postings_per_index: usize = 64,
+        validate_payloads: bool = false,
+        rebalance_layout: bool = true,
+        cooperative: bool = true,
         max_layout_changes_per_index: usize = 8,
         max_boundary_reassignments_per_index: usize = 64,
         boundary_reassignment_min_improvement: f32 = 0.0,
@@ -4120,18 +4994,147 @@ pub const IndexManager = struct {
             if (try entry.index.requestExperimentalPostingCheckpointForIdle()) {
                 total_steps += 1;
             }
+            if (try self.maintainVectorBlockBaseIfQuiescent(entry)) {
+                total_steps += 1;
+            }
             if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
             const backlog = try entry.index.postingBacklogStats();
             if (!backlog.needsRepair()) continue;
 
             const result = try entry.index.repairDirtyPostingsOptionalWithOptions(.{
                 .max_postings = options.max_postings_per_index,
-                .rebalance_layout = true,
+                .rebalance_layout = options.rebalance_layout,
                 .max_layout_changes = options.max_layout_changes_per_index,
                 .max_boundary_reassignments = options.max_boundary_reassignments_per_index,
                 .boundary_reassignment_min_improvement = options.boundary_reassignment_min_improvement,
             });
             total_steps += @intCast(result.repaired_postings + result.split_postings + result.merged_postings + result.boundary_reassigned_vectors);
+        }
+        return total_steps;
+    }
+
+    /// Drains query-visible posting repair debt at an explicit idle boundary.
+    /// Each repair call remains bounded and cooperatively yields to foreground
+    /// queries, but a lifecycle fence must not return after only the first
+    /// bounded page: large bulk loads can otherwise reopen with hundreds of
+    /// stale centroids/payloads and make the first query wave finish the work.
+    /// Native checkpoint and vector-block maintenance stay outside this loop;
+    /// they have their own publication policies and must not turn a posting
+    /// repair drain into a busy wait for an asynchronous build or debounce.
+    pub fn drainDensePostingMaintenance(self: *IndexManager, options: DensePostingMaintenanceOptions) !usize {
+        var total_steps: usize = 0;
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
+            lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+            total_steps += try drainDensePostingMaintenanceEntry(entry, options);
+        }
+        return total_steps;
+    }
+
+    fn drainDensePostingMaintenanceEntry(entry: *DenseIndex, options: DensePostingMaintenanceOptions) !usize {
+        var total_steps: usize = 0;
+        var validation_mutating_passes: usize = 0;
+        var validation_stalled_passes: usize = 0;
+        while (!options.cooperative or !entry.index.shouldDeferOptionalPostingMaintenance()) {
+            if (!options.validate_payloads) {
+                const backlog = try entry.index.postingBacklogStats();
+                if (!backlog.needsRepair()) break;
+            }
+
+            const maintenance_options: hbc_mod.PostingMaintenanceOptions = .{
+                .max_postings = options.max_postings_per_index,
+                .validate_payloads = options.validate_payloads,
+                .rebalance_layout = options.rebalance_layout,
+                .max_layout_changes = options.max_layout_changes_per_index,
+                .max_boundary_reassignments = options.max_boundary_reassignments_per_index,
+                .boundary_reassignment_min_improvement = options.boundary_reassignment_min_improvement,
+            };
+            const result = if (options.cooperative)
+                try entry.index.repairDirtyPostingsOptionalWithOptions(maintenance_options)
+            else
+                try entry.index.repairDirtyPostingsWithOptions(maintenance_options);
+            const progressed = result.repaired_postings +
+                result.split_postings +
+                result.merged_postings +
+                result.boundary_reassigned_vectors;
+            total_steps += @intCast(progressed);
+            if (progressed == 0) {
+                if (!options.validate_payloads) break;
+
+                // Native publication must verify the generation through a
+                // fresh read lease. A just-published posting overlay can make
+                // the validating write transaction report no work while that
+                // fresh lease still observes durable dirty state. Retry that
+                // visibility edge once under the same apply fence; a second
+                // stalled pass is a genuine non-converging invariant, not a
+                // reason to spin readiness forever.
+                const remaining = try entry.index.postingBacklogStats();
+                if (!remaining.needsRepair()) break;
+                validation_stalled_passes += 1;
+                if (validation_stalled_passes > 1) return error.PostingMaintenanceIncomplete;
+                continue;
+            }
+
+            validation_stalled_passes = 0;
+            if (options.validate_payloads) {
+                // Stable validation uses an unbounded posting page with layout
+                // changes disabled, so one pass repairs the observed corpus
+                // and a second can settle a newly published overlay. Require
+                // the following pass to be read-only. Persistently malformed
+                // or unavailable payloads therefore fail closed after bounded
+                // work instead of repeatedly rewriting the same WAL records.
+                if (validation_mutating_passes >= 2) return error.PostingMaintenanceIncomplete;
+                validation_mutating_passes += 1;
+            }
+        }
+        return total_steps;
+    }
+
+    /// Advance the mmap exact-vector projection independently of posting
+    /// repair and generic LSM compaction. The readiness-critical publication
+    /// check is O(indexes) until its one bounded snapshot build is admitted.
+    pub fn runVectorBlockMaintenance(self: *IndexManager) !usize {
+        var total_steps: usize = 0;
+        for (self.dense_indexes.items) |*entry| {
+            if (entry.index.shouldDeferOptionalPostingMaintenance()) continue;
+            lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+            if (try self.maintainVectorBlockBaseIfQuiescent(entry)) total_steps += 1;
+        }
+        return total_steps;
+    }
+
+    /// Publish the exact-vector projection at a caller-proven idle boundary.
+    /// Startup catch-up and DB.runUntilIdle own a stable writer generation, so
+    /// making them wait for a second observation would retire the only writer
+    /// capable of doing the build. Ordinary background calls retain the
+    /// debounce in runVectorBlockMaintenance.
+    pub fn publishVectorBlockBasesAtStableTip(self: *IndexManager) !usize {
+        if (self.vector_block_storage == null) return 0;
+        const primary = self.primary_store orelse return 0;
+        var total_steps: usize = 0;
+        for (self.dense_indexes.items) |*entry| {
+            lockAtomicWithBackoff(entry.apply_mutex);
+            defer entry.apply_mutex.unlock();
+            const source_sequence = primary.lastReplaySequence(0);
+            var changed = false;
+            if (entry.index.experimentalPostingDurableAppliedSequence() == null) {
+                changed = try self.finalizeNativePostingGenerationAtStableTipLocked(entry, source_sequence, .{
+                    .validate_payloads = true,
+                    .flatten = true,
+                });
+            }
+            const posting_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse continue;
+            if (posting_sequence != source_sequence) continue;
+            if (!self.vectorBlockReadyAtSequenceAndCount(source_sequence, entry.index.stats().active_count)) {
+                try self.finalizeVectorBlockBaseAtStableTipLocked(entry, source_sequence);
+                changed = self.vectorBlockReadyAtSequenceAndCount(
+                    source_sequence,
+                    entry.index.stats().active_count,
+                ) or changed;
+            }
+            if (changed) total_steps += 1;
         }
         return total_steps;
     }
@@ -7578,6 +8581,19 @@ pub const IndexManager = struct {
             enabledEnvironmentFlag("ANTFLY_HBC_POSTING_SIDECAR");
     }
 
+    fn denseVectorBlockStoreEnabled() bool {
+        return enabledEnvironmentFlag("ANTFLY_HBC_VECTOR_BLOCK_STORE");
+    }
+
+    fn denseVectorBlockPreferredEncoding() vector_block_store_mod.Encoding {
+        const raw_z = getenv("ANTFLY_HBC_VECTOR_BLOCK_ENCODING") orelse return .float16;
+        const raw = std.mem.span(raw_z);
+        return if (std.ascii.eqlIgnoreCase(raw, "float16") or std.ascii.eqlIgnoreCase(raw, "f16"))
+            .float16
+        else
+            .float32;
+    }
+
     pub fn beginDensePostingSidecarCaptureByName(self: *IndexManager, name: []const u8) !bool {
         const entry = self.denseIndex(name) orelse return error.IndexNotFound;
         // The durable authority marker is sticky. Once an index has moved its
@@ -7596,6 +8612,17 @@ pub const IndexManager = struct {
             if (entry.index.lsmSessionBatchingActive()) return false;
             return error.PostingWalCaptureOwnershipConflict;
         }
+        var capture_exact_vectors = false;
+        if (self.vector_block_storage != null) {
+            if (entry.index.experimentalPostingDurableAppliedSequence()) |posting_sequence| {
+                if (self.acquireVectorBlockGeneration()) |generation| {
+                    capture_exact_vectors = vectorBlockGenerationReadyAtSequence(generation, posting_sequence);
+                    generation.release();
+                }
+            }
+        }
+        entry.index.enableExperimentalExactVectorCapture(capture_exact_vectors);
+        errdefer entry.index.enableExperimentalExactVectorCapture(false);
         try entry.index.beginExperimentalPostingMutationCapture();
         return true;
     }
@@ -7608,6 +8635,34 @@ pub const IndexManager = struct {
     pub fn persistDensePostingSidecarByName(self: *IndexManager, name: []const u8, applied_sequence: u64) !void {
         const entry = self.denseIndex(name) orelse return;
         if (!densePostingSidecarEnabled() and !entry.index.experimentalPostingWalAuthoritative()) return;
+        const posting_capture_has_mutations = entry.index.experimentalPostingCaptureHasMutations();
+        const exact_vector_mutations = try entry.index.takeExperimentalExactVectorMutations();
+        defer {
+            for (exact_vector_mutations) |*mutation| mutation.deinit(self.alloc);
+            self.alloc.free(exact_vector_mutations);
+        }
+        var vector_mutations_published = false;
+        if (self.vector_block_storage != null and exact_vector_mutations.len != 0) {
+            lockAtomicWithBackoff(&self.vector_block_build_mu);
+            vector_mutations_published = self.publishVectorBlockMutationWal(
+                entry,
+                exact_vector_mutations,
+                applied_sequence,
+            ) catch |err| blk: {
+                // The primary artifact transaction has already committed and
+                // remains exact. Fence the stale projection below and let
+                // quiescent maintenance rebuild it; an optional acceleration
+                // failure must not reject or expose a partial source write.
+                std.log.warn("shared vector-block mutation WAL deferred index={s} sequence={} mutations={} err={s}", .{
+                    name,
+                    applied_sequence,
+                    exact_vector_mutations.len,
+                    @errorName(err),
+                });
+                break :blk false;
+            };
+            self.vector_block_build_mu.unlock();
+        }
         entry.index.persistExperimentalPostingSidecarAtAppliedSequence(applied_sequence, .{}) catch |err| {
             if (entry.index.experimentalPostingWalAuthoritative()) {
                 std.log.err("dense posting WAL publication failed before applied watermark index={s} sequence={} err={s}", .{
@@ -7626,6 +8681,61 @@ pub const IndexManager = struct {
                 std.log.warn("dense posting sidecar invalidation failed index={s} err={s}", .{ name, @errorName(invalidate_err) });
             };
         };
+        if (self.vector_block_storage != null) {
+            // The exact-vector base is shared across dense indexes. Serialize
+            // mutation invalidation, coverage-only commits, and base builds so
+            // another index cannot advance CURRENT after this transaction has
+            // dirtied it but before the replacement generation is published.
+            {
+                lockAtomicWithBackoff(&self.vector_block_build_mu);
+                defer self.vector_block_build_mu.unlock();
+                if (posting_capture_has_mutations and !vector_mutations_published) {
+                    // Never let an older exact-vector generation answer across a
+                    // source transaction that changed HBC state. Primary
+                    // artifacts remain the safe authority until quiescent
+                    // maintenance publishes the replacement snapshot.
+                    self.vector_block_projection_dirty.store(true, .release);
+                    self.clearVectorBlockGeneration();
+                } else if (!vector_mutations_published) {
+                    _ = self.advanceVectorBlockCoverage(applied_sequence) catch |err| blk: {
+                        // The posting transaction is already durable. Coverage
+                        // acceleration is optional because primary artifacts are
+                        // still exact; leave the older generation fenced and let
+                        // maintenance/restart retry rather than failing the write.
+                        std.log.warn("shared vector-block coverage advance deferred sequence={} err={s}", .{
+                            applied_sequence,
+                            @errorName(err),
+                        });
+                        break :blk false;
+                    };
+                }
+            }
+            // Measure quiescence from the primary source tip, not from each
+            // derived posting commit. A busy source continually moves this
+            // candidate, while posting catch-up to an already-stable tip can
+            // publish immediately once the exact sequence boundary matches.
+            // Do not hold vector_block_build_mu here: the builder acquires it
+            // after pinning the entry mutation epoch. Re-entering that mutex
+            // would deadlock every finite bulk load at its first quiet tip.
+            if (self.primary_store) |primary| {
+                const source_sequence = primary.lastReplaySequence(0);
+                if (self.vector_block_candidate_sequence.load(.acquire) != source_sequence) {
+                    self.vector_block_candidate_sequence.store(source_sequence, .release);
+                    self.vector_block_candidate_since_ns.store(platform_time.monotonicNs(), .release);
+                }
+                _ = self.maintainVectorBlockBaseIfQuiescent(entry) catch |err| blk: {
+                    // Native exact-vector publication is an optimization;
+                    // the primary artifact store remains the correctness
+                    // fallback when a snapshot cannot be built yet.
+                    std.log.warn("shared vector-block maintenance deferred index={s} sequence={} err={s}", .{
+                        name,
+                        source_sequence,
+                        @errorName(err),
+                    });
+                    break :blk false;
+                };
+            }
+        }
     }
 
     pub fn beginDenseStreamingReplaySessionByName(self: *IndexManager, name: []const u8) !void {
@@ -7787,11 +8897,12 @@ pub const IndexManager = struct {
         options: backend_types.BulkIngestFinishOptions,
     ) !void {
         const previous_load_session = active_dense_vector_load_session;
+        const previous_vector_cache_bypass = entry.index.bypassExternalVectorCache();
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
             if (vector_load_session != null) {
                 active_dense_vector_load_session = previous_load_session;
-                entry.index.setBypassExternalVectorCache(false);
+                entry.index.setBypassExternalVectorCache(previous_vector_cache_bypass);
             }
             if (vector_load_session) |*session| session.deinit();
         }
@@ -7805,6 +8916,9 @@ pub const IndexManager = struct {
         if (!reuse_existing_session and self.primary_store != null and entry.vector_loader_context != null) {
             vector_load_session = .{
                 .context = entry.vector_loader_context.?,
+                // Bulk finish walks source vectors once while normalizing the
+                // deferred tree. Its bounded split workspace owns reuse.
+                .block_cache_admission = .transient,
             };
             active_dense_vector_load_session = &vector_load_session.?;
             entry.index.setBypassExternalVectorCache(true);
@@ -10923,6 +12037,7 @@ pub const IndexManager = struct {
                     .lazy_posting_maintenance = dense_cfg.lazy_posting_maintenance,
                     .auto_posting_maintenance_max_postings = dense_cfg.auto_posting_maintenance_max_postings,
                     .centroid_directory_mode = dense_cfg.centroid_directory_mode,
+                    .flat_exact_min_postings = dense_cfg.flat_exact_min_postings,
                     .flat_centroid_block_size = dense_cfg.flat_centroid_block_size,
                     .flat_centroid_probe_count = dense_cfg.flat_centroid_probe_count,
                     .no_sync = self.relaxed_split_durability,
@@ -10959,6 +12074,7 @@ pub const IndexManager = struct {
                 index.setExternalVectorBatchScratchLoader(vector_loader_context, loadDenseVectorsForHbcBatch);
                 index.setExternalVectorBatchTransformedMatrixLoader(vector_loader_context, loadDenseVectorsForHbcBatchIntoTransformedMatrix);
                 index.setExternalVectorBatchDistanceLoader(vector_loader_context, scoreDenseVectorsForHbcBatch);
+                self.attachVectorBlockResidencyPolicy(&index);
                 if (densePostingSidecarEnabled() or index.experimentalPostingWalAuthoritative()) {
                     const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpoint(
                         self.alloc,
@@ -14502,14 +15618,24 @@ pub const IndexManager = struct {
 
         var dense_apply_working_bytes: u64 = 0;
         defer self.observeDenseApplyWorkingBytes(&dense_apply_working_bytes, 0);
-        var store_batch = try store.beginWriteBatchWithOptions(batch_options);
+        var store_batch_options = batch_options;
+        if (batch_options.mode == .bulk_ingest or entry.index.lsmSessionBatchingActive()) {
+            // Streaming/bulk HBC replay already retains the recent exact
+            // vectors it can reuse in a bounded native split workspace. The
+            // primary LSM reads feeding that workspace are one-pass source
+            // scans; retaining their data blocks duplicates hundreds of MiB
+            // without improving subsequent public queries.
+            store_batch_options.block_cache_admission = .transient;
+        }
+        var store_batch = try store.beginWriteBatchWithOptions(store_batch_options);
         errdefer store_batch.abort();
         const store_txn = store_batch.asTxn();
         const previous_load_session = active_dense_vector_load_session;
+        const previous_vector_cache_bypass = entry.index.bypassExternalVectorCache();
         var vector_load_session: ?DenseVectorLoadSession = null;
         defer {
             active_dense_vector_load_session = previous_load_session;
-            if (vector_load_session != null) entry.index.setBypassExternalVectorCache(false);
+            if (vector_load_session != null) entry.index.setBypassExternalVectorCache(previous_vector_cache_bypass);
             if (vector_load_session) |*session| session.deinit();
         }
         if (self.primary_store != null and entry.vector_loader_context != null) {
@@ -14519,6 +15645,7 @@ pub const IndexManager = struct {
                 vector_load_session = .{
                     .context = entry.vector_loader_context.?,
                     .txn_override = store_txn,
+                    .block_cache_admission = store_batch_options.block_cache_admission,
                 };
                 active_dense_vector_load_session = &vector_load_session.?;
                 entry.index.setBypassExternalVectorCache(true);
@@ -14675,8 +15802,9 @@ pub const IndexManager = struct {
             const before_lsm_stats = entry.index.snapshotLsmWriteStats();
             const started = platform_time.monotonicNs();
             const skip_vector_store = entry.index.hasExternalVectorLoader();
+            const previous_empty_insert_cache_bypass = entry.index.bypassExternalVectorCache();
             if (skip_vector_store) entry.index.setBypassExternalVectorCache(true);
-            defer if (skip_vector_store) entry.index.setBypassExternalVectorCache(false);
+            defer if (skip_vector_store) entry.index.setBypassExternalVectorCache(previous_empty_insert_cache_bypass);
             try entry.index.batchInsertWithMetadataOptions(
                 items.items.items,
                 denseHbcBatchOptions(batch_options, all_vector_ids_new, skip_vector_store),
@@ -15179,6 +16307,7 @@ pub const IndexManager = struct {
         const before_lsm_stats = entry.index.snapshotLsmWriteStats();
         const started = platform_time.monotonicNs();
         const previous_load_session = active_dense_vector_load_session;
+        const previous_vector_cache_bypass = entry.index.bypassExternalVectorCache();
         var vector_load_session: ?DenseVectorLoadSession = null;
         const reuse_existing_session = blk: {
             if (active_dense_vector_load_session == null) break :blk false;
@@ -15188,7 +16317,7 @@ pub const IndexManager = struct {
         defer {
             if (vector_load_session != null) {
                 active_dense_vector_load_session = previous_load_session;
-                entry.index.setBypassExternalVectorCache(false);
+                entry.index.setBypassExternalVectorCache(previous_vector_cache_bypass);
             }
             if (vector_load_session) |*session| session.deinit();
         }
@@ -15259,6 +16388,17 @@ pub const IndexManager = struct {
         const value = stressEnvUsize("ANTFLY_HBC_BULK_INGEST_BULK_BUILD_MIN_ITEMS", 1024);
         hbc_bulk_ingest_bulk_build_min_items_cache.store(value +% 1, .monotonic);
         return value;
+    }
+
+    fn hbcRecursiveTopologyRebuildMaxWorkspaceBytes() u64 {
+        return @intCast(stressEnvUsize("ANTFLY_HBC_RECURSIVE_TOPOLOGY_REBUILD_MAX_BYTES", 0));
+    }
+
+    fn hbcTopologyRebuildAlgorithm() hbc_mod.TopologyRebuildAlgorithm {
+        const raw_z = getenv("ANTFLY_HBC_TOPOLOGY_REBUILD_ALGORITHM") orelse return .global_kmeans;
+        const raw = std.mem.span(raw_z);
+        if (std.mem.eql(u8, raw, "recursive")) return .recursive;
+        return .global_kmeans;
     }
 
     fn hbcBulkRebuildLeafMinMembers() usize {
@@ -16018,8 +17158,32 @@ pub const IndexManager = struct {
     const DenseArtifactReadKey = struct {
         key: []const u8,
         position: usize,
+        block_hash: u64,
+
+        fn init(key: []const u8, position: usize) @This() {
+            return .{
+                .key = key,
+                .position = position,
+                .block_hash = std.hash.XxHash64.hash(0, key),
+            };
+        }
 
         fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            return std.mem.order(u8, lhs.key, rhs.key) == .lt;
+        }
+
+        /// Each vector-block shard is physically ordered by full hash then
+        /// key, while the shard itself is selected by the low hash bits.
+        /// Group by shard first: sorting only by full hash oscillates between
+        /// every mmap file and defeats the ascending stream inside each one.
+        /// Primary-LSM fallbacks are re-sorted lexicographically.
+        fn blockLessThan(shard_count: u32, lhs: @This(), rhs: @This()) bool {
+            std.debug.assert(shard_count != 0 and std.math.isPowerOfTwo(shard_count));
+            const shard_mask = @as(u64, shard_count) - 1;
+            const lhs_shard = lhs.block_hash & shard_mask;
+            const rhs_shard = rhs.block_hash & shard_mask;
+            if (lhs_shard != rhs_shard) return lhs_shard < rhs_shard;
+            if (lhs.block_hash != rhs.block_hash) return lhs.block_hash < rhs.block_hash;
             return std.mem.order(u8, lhs.key, rhs.key) == .lt;
         }
     };
@@ -16081,10 +17245,11 @@ pub const IndexManager = struct {
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
             else
                 try internal_keys.embeddingArtifactKeyForDocumentAlloc(manager.alloc, doc_key, artifact_name);
-            artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
+            artifact_reads[key_count] = DenseArtifactReadKey.init(artifact_key, i);
             key_count += 1;
         }
         if (key_count == 0) return;
+
         std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
 
         const artifact_keys = try manager.alloc.alloc([]const u8, key_count);
@@ -16199,10 +17364,63 @@ pub const IndexManager = struct {
                 try internal_keys.derivedEmbeddingArtifactKeyAlloc(manager.alloc, doc_key, artifact_name)
             else
                 try internal_keys.embeddingArtifactKeyForDocumentAlloc(manager.alloc, doc_key, artifact_name);
-            artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
+            artifact_reads[key_count] = DenseArtifactReadKey.init(artifact_key, i);
             key_count += 1;
         }
         if (key_count == 0) return;
+
+        // A published exact-vector generation is already the immutable source
+        // plane needed by topology construction and posting splits. Re-reading
+        // the same artifacts through the primary LSM would duplicate cache
+        // residency and turn an mmap-to-mmap rebuild into a full LSM scan.
+        // Only use it at the exact HBC durability boundary; otherwise retain
+        // the primary store as the correctness fallback.
+        const vector_block_generation = blk: {
+            const source_sequence = entry.index.experimentalPostingDurableAppliedSequence() orelse break :blk null;
+            const generation = manager.acquireVectorBlockGeneration() orelse break :blk null;
+            if (generation.opened.store.covered_source_sequence != source_sequence) {
+                generation.release();
+                break :blk null;
+            }
+            break :blk generation;
+        };
+        defer if (vector_block_generation) |generation| generation.release();
+        if (vector_block_generation) |generation| {
+            const shard_count = generation.opened.store.manifest.?.shard_count;
+            std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], shard_count, DenseArtifactReadKey.blockLessThan);
+            var remaining_count: usize = 0;
+            for (artifact_reads[0..key_count]) |artifact_read| {
+                const source_sequence = generation.opened.store.covered_source_sequence;
+                const found = generation.opened.getHashed(artifact_read.key, artifact_read.block_hash, source_sequence, null) catch {
+                    artifact_reads[remaining_count] = artifact_read;
+                    remaining_count += 1;
+                    continue;
+                };
+                const value = switch (found) {
+                    .vector => |vector| vector,
+                    .missing, .tombstone => {
+                        artifact_reads[remaining_count] = artifact_read;
+                        remaining_count += 1;
+                        continue;
+                    },
+                };
+                if (value.dims != dims) {
+                    artifact_reads[remaining_count] = artifact_read;
+                    remaining_count += 1;
+                    continue;
+                }
+                const slot = artifact_read.position;
+                const matrix_pos = matrix_positions[slot];
+                const matrix_start = std.math.mul(usize, matrix_pos, dims) catch return error.BufferTooSmall;
+                const matrix_end = std.math.add(usize, matrix_start, dims) catch return error.BufferTooSmall;
+                if (matrix_end > matrix.len) return error.BufferTooSmall;
+                const vector = value.vectorView() orelse try value.decodeInto(scratch);
+                _ = transform(index, vector, matrix[matrix_start..matrix_end]);
+            }
+            key_count = remaining_count;
+            if (key_count == 0) return;
+        }
+
         std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
 
         const artifact_keys = try manager.alloc.alloc([]const u8, key_count);
@@ -16325,7 +17543,7 @@ pub const IndexManager = struct {
                     try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
                 else
                     try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
-                artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
+                artifact_reads[key_count] = DenseArtifactReadKey.init(artifact_key, i);
                 key_count += 1;
             }
         } else {
@@ -16367,14 +17585,84 @@ pub const IndexManager = struct {
                     try internal_keys.derivedEmbeddingArtifactKeyAlloc(key_alloc, doc_key, artifact_name)
                 else
                     try internal_keys.embeddingArtifactKeyForDocumentAlloc(key_alloc, doc_key, artifact_name);
-                artifact_reads[key_count] = .{ .key = artifact_key, .position = i };
+                artifact_reads[key_count] = DenseArtifactReadKey.init(artifact_key, i);
                 key_count += 1;
             }
         }
         if (key_count == 0) return;
         if (profile) |p| p.rerank_artifact_vectors_loaded +|= @intCast(key_count);
-        std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
         if (profile) |p| p.rerank_artifact_key_ns += platform_time.monotonicNs() - key_start;
+
+        // The table-level block projection is useful only when it is pinned to
+        // exactly the same source boundary as this HBC search generation. A
+        // newer replacement base may have discarded an overwritten revision;
+        // an older base may be missing a committed mutation. Either mismatch
+        // falls through to the authoritative primary artifact store.
+        const vector_block_generation = if (scratch.source_sequence) |source_sequence| blk: {
+            const generation = manager.acquireVectorBlockGeneration() orelse break :blk null;
+            if (generation.opened.store.covered_source_sequence != source_sequence) {
+                generation.release();
+                break :blk null;
+            }
+            break :blk generation;
+        } else null;
+        defer if (vector_block_generation) |generation| generation.release();
+        if (vector_block_generation == null) {
+            if (profile) |p| p.rerank_vector_block_fallbacks +|= @intCast(key_count);
+        }
+        if (vector_block_generation) |generation| {
+            const shard_count = generation.opened.store.manifest.?.shard_count;
+            std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], shard_count, DenseArtifactReadKey.blockLessThan);
+            const block_read_start = platform_time.monotonicNs();
+            var remaining_count: usize = 0;
+            for (artifact_reads[0..key_count]) |artifact_read| {
+                const source_sequence = scratch.source_sequence.?;
+                const found = generation.opened.getHashed(artifact_read.key, artifact_read.block_hash, source_sequence, null) catch {
+                    if (profile) |p| p.rerank_vector_block_misses += 1;
+                    artifact_reads[remaining_count] = artifact_read;
+                    remaining_count += 1;
+                    continue;
+                };
+                const value = switch (found) {
+                    .vector => |vector| vector,
+                    .missing, .tombstone => {
+                        if (profile) |p| p.rerank_vector_block_misses += 1;
+                        artifact_reads[remaining_count] = artifact_read;
+                        remaining_count += 1;
+                        continue;
+                    },
+                };
+                if (value.dims != dims) {
+                    if (profile) |p| p.rerank_vector_block_misses += 1;
+                    artifact_reads[remaining_count] = artifact_read;
+                    remaining_count += 1;
+                    continue;
+                }
+                const slot = artifact_read.position;
+                const vector_start = std.math.mul(usize, slot, dims) catch return error.BufferTooSmall;
+                const vector_scratch = batch_scratch[vector_start .. vector_start + dims];
+                const distance_start = platform_time.monotonicNs();
+                distances[slot] = try exactVectorBlockDistance(value, query, query_measure, metric, vector_scratch);
+                if (profile) |p| {
+                    const elapsed = platform_time.monotonicNs() - distance_start;
+                    p.rerank_vector_block_hits += 1;
+                    p.rerank_artifact_cache_hits += 1;
+                    p.rerank_artifact_distance_ns += elapsed;
+                    p.rerank_distance_ns += elapsed;
+                }
+            }
+            // Do not copy mmap vectors into the HBC heap cache. The native
+            // generation is already immutable residency and remains leased for
+            // the duration of this scoring call.
+            key_count = remaining_count;
+            if (profile) |p| p.rerank_artifact_read_ns += platform_time.monotonicNs() - block_read_start;
+            if (key_count == 0) return;
+        }
+
+        // The primary LSM multi-get contract requires lexical ordering. This
+        // is also the only sort paid when no matching native generation is
+        // installed.
+        std.mem.sort(DenseArtifactReadKey, artifact_reads[0..key_count], {}, DenseArtifactReadKey.lessThan);
 
         const artifact_keys = scratch.artifact_keys[0..key_count];
         for (artifact_reads[0..key_count], 0..) |artifact_read, i| artifact_keys[i] = artifact_read.key;
@@ -16573,10 +17861,10 @@ pub const IndexManager = struct {
         for (metadata, distances, 0..) |maybe_doc_key, distance, slot| {
             if (std.math.isFinite(distance)) continue;
             const doc_key = maybe_doc_key orelse continue;
-            reads[read_count] = .{
-                .key = try internal_keys.documentKeyAlloc(key_alloc, doc_key),
-                .position = slot,
-            };
+            reads[read_count] = DenseArtifactReadKey.init(
+                try internal_keys.documentKeyAlloc(key_alloc, doc_key),
+                slot,
+            );
             read_count += 1;
         }
         if (read_count == 0) return;
@@ -16665,6 +17953,30 @@ pub const IndexManager = struct {
         metric: vector_mod.DistanceMetric,
     ) f32 {
         return vector_mod.distanceToQuery(query, query_measure, candidate, metric);
+    }
+
+    fn exactVectorBlockDistance(
+        value: anytype,
+        query: []const f32,
+        query_measure: f32,
+        metric: vector_mod.DistanceMetric,
+        decode_scratch: []f32,
+    ) !f32 {
+        if (value.vectorView()) |vector| {
+            return exactStoredVectorDistance(query, query_measure, vector, metric);
+        }
+        if (value.encoding == .float16 and
+            builtin.target.cpu.arch.endian() == .little and
+            @intFromPtr(value.bytes.ptr) % @alignOf(f16) == 0)
+        {
+            const aligned: []align(@alignOf(f16)) const u8 = @alignCast(value.bytes);
+            const encoded = std.mem.bytesAsSlice(f16, aligned);
+            if (encoded.len != query.len) return error.InvalidVectorDimensions;
+            return vector_mod.distanceToQueryF16(query, query_measure, encoded, value.scale, metric);
+        }
+        const decoded = try value.decodeInto(decode_scratch);
+        if (decoded.len != query.len) return error.InvalidVectorDimensions;
+        return exactStoredVectorDistance(query, query_measure, decoded, metric);
     }
 
     fn loadDenseVectorArtifactForHbc(
@@ -18031,7 +19343,8 @@ const DenseConfig = struct {
     use_random_ortho_trans: bool = false,
     lazy_posting_maintenance: bool = false,
     auto_posting_maintenance_max_postings: usize = 0,
-    centroid_directory_mode: hbc_mod.HBCConfig.CentroidDirectoryMode = .hbc,
+    centroid_directory_mode: hbc_mod.HBCConfig.CentroidDirectoryMode = .auto,
+    flat_exact_min_postings: usize = 1024,
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
 
@@ -18042,10 +19355,17 @@ const DenseConfig = struct {
 };
 
 fn defaultDenseCentroidDirectoryMode() hbc_mod.HBCConfig.CentroidDirectoryMode {
-    const raw_z = getenv("ANTFLY_HBC_CENTROID_DIRECTORY_MODE") orelse return .hbc;
+    const raw_z = getenv("ANTFLY_HBC_CENTROID_DIRECTORY_MODE") orelse return .auto;
     const raw = std.mem.span(raw_z);
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
     if (std.mem.eql(u8, raw, "flat_rabitq")) return .flat_rabitq;
+    if (std.mem.eql(u8, raw, "flat_exact")) return .flat_exact;
     return .hbc;
+}
+
+fn defaultFlatCentroidProbeCount() usize {
+    const raw_z = getenv("ANTFLY_HBC_FLAT_CENTROID_PROBE_COUNT") orelse return 0;
+    return std.fmt.parseUnsigned(usize, std.mem.span(raw_z), 10) catch 0;
 }
 
 /// Returns whether rebuilding this dense projection depends on durable
@@ -18446,6 +19766,10 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
             try parseCentroidDirectoryMode(value.string)
         else
             defaultDenseCentroidDirectoryMode(),
+        .flat_exact_min_postings = if (root.object.get("flat_exact_min_postings")) |value|
+            std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
+        else
+            1024,
         .flat_centroid_block_size = if (root.object.get("flat_centroid_block_size")) |value|
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
@@ -18453,7 +19777,7 @@ fn parseDenseConfig(alloc: Allocator, raw: []const u8) !DenseConfig {
         .flat_centroid_probe_count = if (root.object.get("flat_centroid_probe_count")) |value|
             std.math.cast(usize, value.integer) orelse return error.InvalidIndexConfig
         else
-            0,
+            defaultFlatCentroidProbeCount(),
     };
 }
 
@@ -19552,8 +20876,10 @@ fn parseDenseRerankPolicy(raw: []const u8) !hbc_mod.HBCConfig.RerankPolicy {
 }
 
 fn parseCentroidDirectoryMode(raw: []const u8) !hbc_mod.HBCConfig.CentroidDirectoryMode {
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
     if (std.mem.eql(u8, raw, "hbc")) return .hbc;
     if (std.mem.eql(u8, raw, "flat_rabitq")) return .flat_rabitq;
+    if (std.mem.eql(u8, raw, "flat_exact")) return .flat_exact;
     return error.InvalidIndexConfig;
 }
 
@@ -21524,6 +22850,7 @@ test "parseDenseConfig accepts HBC algorithm tuning" {
         \\  "lazy_posting_maintenance": true,
         \\  "auto_posting_maintenance_max_postings": 17,
         \\  "centroid_directory_mode": "flat_rabitq",
+        \\  "flat_exact_min_postings": 512,
         \\  "flat_centroid_block_size": 1024,
         \\  "flat_centroid_probe_count": 33
         \\}
@@ -21550,6 +22877,7 @@ test "parseDenseConfig accepts HBC algorithm tuning" {
     try std.testing.expectEqual(true, cfg.lazy_posting_maintenance);
     try std.testing.expectEqual(@as(usize, 17), cfg.auto_posting_maintenance_max_postings);
     try std.testing.expectEqual(hbc_mod.HBCConfig.CentroidDirectoryMode.flat_rabitq, cfg.centroid_directory_mode);
+    try std.testing.expectEqual(@as(usize, 512), cfg.flat_exact_min_postings);
     try std.testing.expectEqual(@as(usize, 1024), cfg.flat_centroid_block_size);
     try std.testing.expectEqual(@as(usize, 33), cfg.flat_centroid_probe_count);
 }
@@ -25793,6 +27121,7 @@ test "production external scorers use bounded cache-first artifact batches" {
         var rerank_distances: [2]f32 = undefined;
         var rerank_vector_ids: [2]u64 = undefined;
         var rerank_metadata: [2]?[]const u8 = undefined;
+        var rerank_vector_views: [2][]const f32 = undefined;
         var rerank_lookups: [2]hbc_mod.FixedKeyLookup = undefined;
         var rerank_key_views: [2][]const u8 = undefined;
         var rerank_values: [2]?[]const u8 = undefined;
@@ -25808,6 +27137,7 @@ test "production external scorers use bounded cache-first artifact batches" {
             &rerank_distances,
             &rerank_vector_ids,
             &rerank_metadata,
+            &rerank_vector_views,
             &rerank_lookups,
             &rerank_key_views,
             &rerank_values,
@@ -25865,10 +27195,11 @@ test "production external scorers use bounded cache-first artifact batches" {
     try std.testing.expectEqual(@as(usize, 10), outcome.results.getHits().len);
     try std.testing.expectEqual(candidate_ids[candidate_count - 1], outcome.results.getHits()[0].vector_id);
 
-    // Drive the complete production HBC search path through more than one
-    // 128-entry external rerank batch. This catches regressions in batching,
-    // output-slot restoration, profile composition, and loader wiring that a
-    // direct two-candidate adapter call cannot observe.
+    // Drive the complete production HBC search path through a rerank set large
+    // enough to exercise output-slot restoration, profile composition, and
+    // loader wiring that a direct two-candidate adapter call cannot observe.
+    // The bounded locality policy deliberately handles this sub-2 MiB set as
+    // one physical-read unit.
     for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
     entry.index.abortVectorCacheMutations();
     var first_sorted_idx: usize = 0;
@@ -25896,8 +27227,8 @@ test "production external scorers use bounded cache-first artifact batches" {
 
     try std.testing.expect(full_profiled.profile.approx_candidate_count > 128);
     try std.testing.expect(full_profiled.profile.rerank_candidate_count > 128);
-    try std.testing.expect(full_profiled.profile.rerank_batches >= 2);
-    try std.testing.expectEqual(@as(u64, 128), full_profiled.profile.rerank_max_batch_size);
+    try std.testing.expectEqual(@as(u64, 1), full_profiled.profile.rerank_batches);
+    try std.testing.expectEqual(full_profiled.profile.rerank_candidate_count, full_profiled.profile.rerank_max_batch_size);
     try std.testing.expect(full_profiled.profile.rerank_artifact_cache_hits > 0);
     try std.testing.expect(full_profiled.profile.rerank_artifact_vectors_loaded > 128);
     try std.testing.expectEqual(
@@ -28000,6 +29331,39 @@ test "authoritative posting capture starts inside an existing replay session" {
     session_open = false;
 }
 
+test "stable native finalization certifies an empty dense index" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    }});
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    _ = try entry.index.publishExperimentalPostingCheckpoint(0);
+    entry.index.experimental_posting_wal_authoritative.store(true, .release);
+    try std.testing.expect(try manager.finalizeNativePostingGenerationAtStableTip(
+        "dv_v1",
+        0,
+        .{ .validate_payloads = true },
+    ));
+    try std.testing.expectEqual(@as(?u64, 0), entry.index.experimentalPostingDurableAppliedSequence());
+    try std.testing.expectEqual(@as(u64, 0), (try entry.index.postingBacklogStats()).dirty_postings);
+}
+
 test "dense replay keep mask keeps only the last write per doc and index" {
     var v0 = [_]f32{1.0};
     var v1 = [_]f32{2.0};
@@ -28050,5 +29414,87 @@ test "dense replay keep mask does not collide on embedded nul bytes" {
     var keep_write: [writes.len]bool = undefined;
     try IndexManager.computeDenseReplayKeepMask(std.testing.allocator, &writes, &keep_write);
     try std.testing.expectEqualSlices(bool, &.{ true, true }, &keep_write);
+}
+
+test "opportunistic vector publication requires a fully settled primary write plane" {
+    var stats = lsm_backend_mod.Backend.MaintenanceStats{};
+    try std.testing.expect(IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+
+    // Score one is non-blocking manifest/obsolete-path housekeeping. Higher
+    // debt blocks a fully flushed source, where waiting has no max-age cost.
+    try std.testing.expect(IndexManager.primaryWritePlaneSafeForProjection(stats, 1));
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 2));
+
+    stats.mutable_entries = 1;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.mutable_entries = 0;
+
+    stats.immutable_memtables = 1;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.immutable_memtables = 0;
+
+    stats.active_immutable_logical_bytes = 1;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.active_immutable_logical_bytes = 0;
+
+    stats.active_bulk_ingest_batches = 1;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.active_bulk_ingest_batches = 0;
+
+    stats.wal_checkpoint_pending = true;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.wal_checkpoint_pending = false;
+
+    stats.wal_pressure_blocked = true;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.wal_pressure_blocked = false;
+
+    stats.write_stall_l0_run_debt = 1;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.write_stall_l0_run_debt = 0;
+
+    stats.write_stall_l0_byte_debt = 1;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.write_stall_l0_byte_debt = 0;
+
+    stats.compaction_scheduler_active_jobs = 1;
+    try std.testing.expect(!IndexManager.primaryWritePlaneSafeForProjection(stats, 0));
+    stats.compaction_scheduler_active_jobs = 0;
+    try std.testing.expect(IndexManager.primaryWritePlaneSafeForProjection(stats, 1));
+}
+
+test "dense vector block physical order drains one low-bit shard at a time" {
+    const ReadKey = IndexManager.DenseArtifactReadKey;
+    var reads = [_]ReadKey{
+        .{ .key = "shard-3-low", .position = 0, .block_hash = 3 },
+        .{ .key = "shard-0-high", .position = 1, .block_hash = 8 },
+        .{ .key = "shard-1", .position = 2, .block_hash = 5 },
+        .{ .key = "shard-0-low", .position = 3, .block_hash = 4 },
+        .{ .key = "shard-3-high", .position = 4, .block_hash = 11 },
+    };
+    std.mem.sort(ReadKey, &reads, @as(u32, 4), ReadKey.blockLessThan);
+    try std.testing.expectEqualSlices(usize, &.{ 3, 1, 2, 0, 4 }, &.{
+        reads[0].position,
+        reads[1].position,
+        reads[2].position,
+        reads[3].position,
+        reads[4].position,
+    });
+}
+
+test "attached vector block storage is sticky runtime readiness authority" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var manager = try IndexManager.init(alloc, "__test/vector-block-readiness-authority");
+    defer manager.deinit();
+    manager.setVectorBlockStorage(memory.storage());
+
+    // No CURRENT generation exists. Once storage is attached, readiness must
+    // fail closed regardless of the bootstrap environment's current value.
+    try std.testing.expect(!manager.vectorBlockReadyAtSequence(7));
+    manager.setVectorBlockStorage(null);
+    try std.testing.expect(manager.vectorBlockReadyAtSequence(7));
 }
 const StoreBatchOptions = backend_types.BatchOptions;

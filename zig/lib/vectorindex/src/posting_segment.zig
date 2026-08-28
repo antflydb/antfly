@@ -56,6 +56,9 @@ pub const EntryKind = enum(u8) {
     /// the same logical value in the preceding immutable segment generation.
     base_patch = 19,
     quantized_checkpoint_patch = 20,
+    /// Complete mmap-friendly RaBitQ leaf directory. Per-posting WAL/delta
+    /// records remain authoritative overlays above this immutable base.
+    quantized_directory = 21,
 };
 
 pub const DeltaValue = struct {
@@ -72,6 +75,15 @@ const PendingEntry = struct {
     value: []const u8,
     owned: bool,
 };
+
+const nested_container_alignment: usize = 64;
+
+fn isNativeNestedContainer(kind: EntryKind) bool {
+    return switch (kind) {
+        .centroid_directory, .vector_directory, .quantized_directory => true,
+        else => false,
+    };
+}
 
 const EntryKey = struct {
     posting_id: PostingId,
@@ -262,11 +274,15 @@ pub const Writer = struct {
         var index_entries = try std.ArrayListUnmanaged(IndexEntry).initCapacity(self.alloc, self.entries.items.len);
         defer index_entries.deinit(self.alloc);
 
-        var output_len = footer_size;
-        output_len = std.math.add(usize, output_len, std.math.mul(usize, self.entries.items.len, index_entry_size) catch return error.PostingSegmentTooLarge) catch return error.PostingSegmentTooLarge;
+        var payload_len: usize = 0;
         for (self.entries.items) |entry| {
-            output_len = std.math.add(usize, output_len, entry.value.len) catch return error.PostingSegmentTooLarge;
+            if (isNativeNestedContainer(entry.kind)) {
+                payload_len = std.mem.alignForward(usize, payload_len, nested_container_alignment);
+            }
+            payload_len = std.math.add(usize, payload_len, entry.value.len) catch return error.PostingSegmentTooLarge;
         }
+        var output_len = std.math.add(usize, payload_len, footer_size) catch return error.PostingSegmentTooLarge;
+        output_len = std.math.add(usize, output_len, std.math.mul(usize, self.entries.items.len, index_entry_size) catch return error.PostingSegmentTooLarge) catch return error.PostingSegmentTooLarge;
         try out.ensureTotalCapacity(self.alloc, output_len);
         self.finished = true;
 
@@ -275,6 +291,10 @@ pub const Writer = struct {
         // roughly one payload copy instead of holding complete input and output
         // payloads concurrently.
         for (self.entries.items) |*entry| {
+            if (isNativeNestedContainer(entry.kind)) {
+                const aligned = std.mem.alignForward(usize, out.items.len, nested_container_alignment);
+                try out.appendNTimes(self.alloc, 0, aligned - out.items.len);
+            }
             const offset = out.items.len;
             try out.appendSlice(self.alloc, entry.value);
             const value_len = entry.value.len;
@@ -450,6 +470,7 @@ pub const Reader = struct {
             @intFromEnum(EntryKind.index_metadata_tombstone) => .index_metadata_tombstone,
             @intFromEnum(EntryKind.base_patch) => .base_patch,
             @intFromEnum(EntryKind.quantized_checkpoint_patch) => .quantized_checkpoint_patch,
+            @intFromEnum(EntryKind.quantized_directory) => .quantized_directory,
             else => return error.CorruptedPostingSegment,
         };
         const offset = std.math.cast(usize, readU64(raw[17..25])) orelse return error.CorruptedPostingSegment;
@@ -542,8 +563,10 @@ pub const VerifiedReader = struct {
     /// each value. Restrict this API so ordinary posting values cannot bypass
     /// their payload checksum by accident.
     pub fn getNestedContainer(self: *VerifiedReader, id: PostingId, kind: EntryKind) !?[]const u8 {
-        if (kind != .vector_directory) return error.NotNestedPostingContainer;
-        return try self.reader.getValue(id, kind);
+        if (kind != .vector_directory and kind != .quantized_directory) return error.NotNestedPostingContainer;
+        const index = (try self.reader.latestIndex(id, kind)) orelse return null;
+        const entry = try self.reader.indexEntry(index);
+        return try entry.rawValue(self.reader.data);
     }
 
     fn getLatest(self: *VerifiedReader, posting_id: PostingId, kind: EntryKind) !?SequencedValue {
@@ -854,10 +877,16 @@ test "posting segment nested container avoids eager payload verification" {
     var writer = Writer.init(alloc);
     defer writer.deinit();
     try writer.appendValueAt(0, .vector_directory, 1, "nested payload");
+    try writer.appendValueAt(0, .quantized_directory, 1, "quantized payload");
     const bytes = try writer.build();
     defer alloc.free(bytes);
     var reader = try VerifiedReader.init(alloc, bytes);
     defer reader.deinit();
     try std.testing.expectEqualStrings("nested payload", (try reader.getNestedContainer(0, .vector_directory)).?);
+    const quantized = (try reader.getNestedContainer(0, .quantized_directory)).?;
+    const quantized_index = (try reader.reader.latestIndex(0, .quantized_directory)).?;
+    const quantized_entry = try reader.reader.indexEntry(quantized_index);
+    try std.testing.expectEqual(@as(usize, 0), quantized_entry.offset % nested_container_alignment);
+    try std.testing.expectEqualStrings("quantized payload", quantized);
     try std.testing.expectError(error.NotNestedPostingContainer, reader.getNestedContainer(0, .base));
 }

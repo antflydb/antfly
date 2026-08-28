@@ -3584,6 +3584,7 @@ pub const ApiHttpServer = struct {
                 .replay_applied_sequence = index.replay_applied_sequence,
                 .replay_target_sequence = index.replay_target_sequence,
                 .replay_catch_up_required = index.replay_catch_up_required,
+                .dense_vector_projection_pending = index.dense_vector_projection_pending,
                 .index_repair_status = index.repair_status,
                 .index_repair_active_generation_serviceable = index.repair_active_generation_serviceable,
                 .catch_up_active = dense_catch_up_active,
@@ -32329,6 +32330,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
             .replay_catch_up_required = true,
             .repair_status = .waiting,
             .repair_active_generation_serviceable = false,
+            .dense_vector_projection_pending = true,
         }})[0..]),
     };
 
@@ -32342,6 +32344,7 @@ test "remote runtime status reports replay debt separately from active catch-up"
     try std.testing.expectEqual(true, index.replay_catch_up_required);
     try std.testing.expectEqual(db_mod.types.IndexRepairStatus.waiting, index.index_repair_status.?);
     try std.testing.expect(!index.index_repair_active_generation_serviceable);
+    try std.testing.expect(index.dense_vector_projection_pending);
     try std.testing.expectEqual(false, index.catch_up_active);
     try std.testing.expectEqual(@as(u64, 225), index.catch_up_applied_sequence);
     try std.testing.expectEqual(@as(u64, 300), index.catch_up_target_sequence);
