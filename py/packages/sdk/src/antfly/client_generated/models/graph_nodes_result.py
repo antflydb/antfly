@@ -18,14 +18,16 @@ T = TypeVar("T", bound="GraphNodesResult")
 
 @_attrs_define
 class GraphNodesResult:
-    """Composable result nodes and any materialized paths from a canonical traversal or path query.
+    """Composable results from a canonical traversal or path query. Traversals return nodes and keep the top-level paths
+    array empty. Pathfinding returns one lightweight terminal node per authoritative top-level path.
 
-    Attributes:
-        kind (GraphNodesResultKind): Stable discriminator for the graph result shape.
-        nodes (list[GraphResultNode]): Traversal result nodes. Path operations emit one terminal result node per
-            returned path; inspect paths[].nodes for complete path membership.
-        paths (list[GraphPath]): Materialized result paths; empty when paths were not requested or produced.
-        stats (GraphQueryStats):
+        Attributes:
+            kind (GraphNodesResultKind): Stable discriminator for the graph result shape.
+            nodes (list[GraphResultNode]): Traversal result nodes. Path operations emit one terminal result node per
+                returned path; inspect paths[].nodes for complete path membership.
+            paths (list[GraphPath]): Authoritative paths for shortest_path and k_shortest_paths, ordered in lockstep with
+                nodes. Always empty for traversal results; requested traversal paths are stored on each result node.
+            stats (GraphQueryStats):
     """
 
     kind: GraphNodesResultKind

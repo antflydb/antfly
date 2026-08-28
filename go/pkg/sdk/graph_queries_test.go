@@ -704,7 +704,7 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 			responses: QueryResponses{Responses: []QueryResult{{
 				GraphResults: map[string]GraphResult{"count": decode(`{"kind":"aggregates","aggregates":{"rows":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}`)},
 			}}},
-			contains: "exact aggregate graph results cannot be truncated",
+			contains: "exact graph results cannot be truncated",
 		},
 		{
 			name:     "canonical payload requires all structural fields",
@@ -813,6 +813,96 @@ func TestDecodeGraphResultForQueryValidatesRequestedProjection(t *testing.T) {
 	wrongAggregates := decodeResult(`{"kind":"aggregates","aggregates":{"other":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":false}}`)
 	if _, err := DecodeGraphResultForQuery(aggregatesQuery, wrongAggregates); err == nil || !strings.Contains(err.Error(), "do not match requested names") {
 		t.Fatalf("expected aggregate name mismatch, got %v", err)
+	}
+}
+
+func TestDecodeGraphResultForQueryEnforcesOperationCardinalityAndPathOwnership(t *testing.T) {
+	decodeQuery := func(encoded string) GraphQuery {
+		t.Helper()
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(encoded), &query); err != nil {
+			t.Fatal(err)
+		}
+		return query
+	}
+	decodeResult := func(encoded string) GraphResult {
+		t.Helper()
+		var result GraphResult
+		if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	const zeroHopPath = `{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}`
+	tests := []struct {
+		name     string
+		query    string
+		result   string
+		contains string
+	}{
+		{
+			name:     "bindings honor requested limit",
+			query:    `{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"bindings":["a"],"limit":1}}`,
+			result:   `{"kind":"bindings","rows":[{"a":{"key":"1"}},{"a":{"key":"2"}}],"stats":{"returned_items":2,"truncated":true}}`,
+			contains: "requested limit of 1 rows",
+		},
+		{
+			name:     "shortest path returns at most one path",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0},{"key":"a","depth":0}],"paths":[` + zeroHopPath + `,` + zeroHopPath + `],"stats":{"returned_items":2,"truncated":false}}`,
+			contains: "requested limit of 1 items",
+		},
+		{
+			name:     "exact paths cannot be truncated",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
+			result:   `{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":true}}`,
+			contains: "exact graph results cannot be truncated",
+		},
+		{
+			name:     "path terminal does not duplicate path",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0,"path":[{"key":"a"}]}],"paths":[` + zeroHopPath + `],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "duplicates its authoritative top-level path",
+		},
+		{
+			name:     "path terminal depth matches path",
+			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":1}],"paths":[` + zeroHopPath + `],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "depth does not match",
+		},
+		{
+			name:     "traversal paths stay on nodes",
+			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]}}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0}],"paths":[` + zeroHopPath + `],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "top-level paths array",
+		},
+		{
+			name:     "traversal omits unrequested node paths",
+			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]}}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0,"path":[{"key":"a"}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "path that was not requested",
+		},
+		{
+			name:     "traversal returns requested node paths",
+			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]},"include_paths":true}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "missing its requested path",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			query := decodeQuery(test.query)
+			result := decodeResult(test.result)
+			if _, err := DecodeGraphResultForQuery(query, result); err == nil || !strings.Contains(err.Error(), test.contains) {
+				t.Fatalf("expected error containing %q, got %v", test.contains, err)
+			}
+
+			requests := []QueryRequest{{GraphQueries: map[string]GraphQuery{"result": query}}}
+			responses := QueryResponses{Responses: []QueryResult{{GraphResults: map[string]GraphResult{"result": result}}}}
+			if err := validateQueryGraphResponses(requests, &responses); err == nil || !strings.Contains(err.Error(), test.contains) {
+				t.Fatalf("automatic validation: expected error containing %q, got %v", test.contains, err)
+			}
+		})
 	}
 }
 

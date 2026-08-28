@@ -3886,6 +3886,7 @@ pub fn build(b: *std.Build) void {
         "graph aggregate response fails closed on missing or inexact results",
         "graph response encoding requires exactly one result per traversal operation",
         "canonical path responses require one terminal node per path",
+        "canonical traversal responses keep paths on bounded result nodes",
         "canonical graph paths preserve table-qualified node identities",
         "canonical graph path objective exposes max weight product",
         "canonical graph path metadata safely reads legacy non-object records",

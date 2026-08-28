@@ -23986,7 +23986,9 @@ components:
       x-go-type-skip-optional-pointer: true
       type: object
       additionalProperties: false
-      description: A node in graph query results
+      description: A traversal result node or the terminal node paired with a pathfinding result. Traversal
+        paths, when requested, are carried by path and path_edges. Shortest-path operations keep the complete
+        path only in the enclosing GraphNodesResult.paths entry to avoid duplicate wire data.
       required:
         - key
         - depth
@@ -24020,15 +24022,17 @@ components:
           maxItems: 65
           items:
             $ref: '#/components/schemas/GraphPathEndpoint'
-          description: Exact ordered node identities from the start node, terminating at this node's fully
-            qualified identity
+          description: Exact ordered traversal identities from the start node, terminating at this node's
+            fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding
+            uses GraphNodesResult.paths.
         path_edges:
           x-go-type-skip-optional-pointer: true
           type: array
           maxItems: 64
           items:
             $ref: '#/components/schemas/GraphPathEdge'
-          description: Ordered typed edges in path from start to this node; omitted when path is omitted
+          description: Ordered typed traversal edges from the start node. Present only with path for traversal
+            queries; pathfinding uses GraphNodesResult.paths.
         provenance:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -24093,8 +24097,9 @@ components:
         - nodes
         - paths
         - stats
-      description: Composable result nodes and any materialized paths from a canonical traversal or path
-        query.
+      description: Composable results from a canonical traversal or path query. Traversals return nodes
+        and keep the top-level paths array empty. Pathfinding returns one lightweight terminal node per
+        authoritative top-level path.
       properties:
         kind:
           type: string
@@ -24114,7 +24119,9 @@ components:
           maxItems: 10000
           items:
             $ref: '#/components/schemas/GraphPath'
-          description: Materialized result paths; empty when paths were not requested or produced.
+          description: Authoritative paths for shortest_path and k_shortest_paths, ordered in lockstep
+            with nodes. Always empty for traversal results; requested traversal paths are stored on each
+            result node.
         stats:
           $ref: '#/components/schemas/GraphQueryStats'
     GraphQueryResult:

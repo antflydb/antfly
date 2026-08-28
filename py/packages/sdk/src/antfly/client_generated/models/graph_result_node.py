@@ -19,20 +19,23 @@ T = TypeVar("T", bound="GraphResultNode")
 
 @_attrs_define
 class GraphResultNode:
-    """A node in graph query results
+    """A traversal result node or the terminal node paired with a pathfinding result. Traversal paths, when requested, are
+    carried by path and path_edges. Shortest-path operations keep the complete path only in the enclosing
+    GraphNodesResult.paths entry to avoid duplicate wire data.
 
-    Attributes:
-        key (str): Document key
-        depth (int): Hop count from the start node; when path is present this equals path length minus one
-        table (str | Unset): Owning table for a cross-table node; omitted for nodes in the queried table
-        document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
-        path (list[GraphPathEndpoint] | Unset): Exact ordered node identities from the start node, terminating at this
-            node's fully qualified identity
-        path_edges (list[GraphPathEdge] | Unset): Ordered typed edges in path from start to this node; omitted when path
-            is omitted
-        provenance (list[str] | Unset): Algebraic provenance labels folded into this result, when requested by an
-            algebraic graph executor
-        evidence (GraphResultNodeEvidence | Unset): Parsed evidence envelope for provenance labels and edge metadata
+        Attributes:
+            key (str): Document key
+            depth (int): Hop count from the start node; when path is present this equals path length minus one
+            table (str | Unset): Owning table for a cross-table node; omitted for nodes in the queried table
+            document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
+            path (list[GraphPathEndpoint] | Unset): Exact ordered traversal identities from the start node, terminating at
+                this node's fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding
+                uses GraphNodesResult.paths.
+            path_edges (list[GraphPathEdge] | Unset): Ordered typed traversal edges from the start node. Present only with
+                path for traversal queries; pathfinding uses GraphNodesResult.paths.
+            provenance (list[str] | Unset): Algebraic provenance labels folded into this result, when requested by an
+                algebraic graph executor
+            evidence (GraphResultNodeEvidence | Unset): Parsed evidence envelope for provenance labels and edge metadata
     """
 
     key: str

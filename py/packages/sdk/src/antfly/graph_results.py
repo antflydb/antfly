@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from math import isfinite
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NamedTuple, NoReturn
 
 from .client_generated.models.query_responses import QueryResponses
 from .exceptions import AntflyException
@@ -21,6 +21,15 @@ _MAX_GRAPH_ITEMS = 10_000
 _MISSING = object()
 GraphResultDialect = Literal["auto", "canonical", "legacy", "none"]
 GraphResultKind = Literal["bindings", "aggregates", "nodes"]
+GraphNodeResultMode = Literal["traversal", "shortest_path", "k_shortest_paths"]
+
+
+class _CanonicalResultContract(NamedTuple):
+    kind: GraphResultKind
+    names: frozenset[str] | None = None
+    max_items: int | None = None
+    node_mode: GraphNodeResultMode | None = None
+    include_paths: bool = False
 
 
 def _invalid(path: str, message: str) -> NoReturn:
@@ -305,7 +314,7 @@ def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
     _validate_stats(value["stats"], f"{path}.stats", len(paths) if paths else len(nodes), allow_truncated=True)
 
 
-def _canonical_result_contract(value: object, path: str) -> tuple[GraphResultKind, frozenset[str] | None]:
+def _canonical_result_contract(value: object, path: str) -> _CanonicalResultContract:
     operation = _object(value, path)
     if "match" in operation:
         returned = _object(operation.get("return", _MISSING), f"{path}.return")
@@ -316,13 +325,28 @@ def _canonical_result_contract(value: object, path: str) -> tuple[GraphResultKin
                 if not isinstance(name, str):
                     _invalid(f"{path}.return.bindings[{index}]", "must be a string")
                 names.append(name)
-            return "bindings", frozenset(names)
+            raw_limit = returned.get("limit", 100)
+            limit = _bounded_integer(raw_limit, f"{path}.return.limit", 1, _MAX_GRAPH_ITEMS)
+            return _CanonicalResultContract("bindings", frozenset(names), limit)
         if "aggregates" in returned:
             aggregates = _object(returned["aggregates"], f"{path}.return.aggregates")
-            return "aggregates", frozenset(aggregates)
+            return _CanonicalResultContract("aggregates", frozenset(aggregates))
         _invalid(f"{path}.return", "must select bindings or aggregates")
-    if any(name in operation for name in ("traverse", "shortest_path", "k_shortest_paths")):
-        return "nodes", None
+    if "traverse" in operation:
+        traversal = _object(operation["traverse"], f"{path}.traverse")
+        limit = _bounded_integer(traversal.get("limit", 100), f"{path}.traverse.limit", 1, _MAX_GRAPH_ITEMS)
+        return _CanonicalResultContract(
+            "nodes",
+            max_items=limit,
+            node_mode="traversal",
+            include_paths=traversal.get("include_paths") is True,
+        )
+    if "shortest_path" in operation:
+        return _CanonicalResultContract("nodes", max_items=1, node_mode="shortest_path")
+    if "k_shortest_paths" in operation:
+        k_shortest_paths = _object(operation["k_shortest_paths"], f"{path}.k_shortest_paths")
+        k = _bounded_integer(k_shortest_paths.get("k", _MISSING), f"{path}.k_shortest_paths.k", 1, 100)
+        return _CanonicalResultContract("nodes", max_items=k, node_mode="k_shortest_paths")
     _invalid(path, "does not contain a supported graph operation")
 
 
@@ -330,7 +354,7 @@ def _validate_graph_result(
     value: object,
     path: str,
     dialect: GraphResultDialect,
-    contract: tuple[GraphResultKind, frozenset[str] | None] | None = None,
+    contract: _CanonicalResultContract | None = None,
 ) -> None:
     result = _object(value, path)
     kind = result.get("kind", _MISSING)
@@ -344,24 +368,62 @@ def _validate_graph_result(
         _invalid(f"{path}.kind", "legacy graph results must use the legacy result shape")
     if not isinstance(kind, str):
         _invalid(f"{path}.kind", "must be a string")
-    if contract is not None and kind != contract[0]:
-        _invalid(f"{path}.kind", f"must be {contract[0]!r} for the requested operation")
+    if contract is not None and kind != contract.kind:
+        _invalid(f"{path}.kind", f"must be {contract.kind!r} for the requested operation")
     if kind == "bindings":
         _validate_bindings_result(result, path)
-        if contract is not None and contract[1] is not None:
-            expected = contract[1]
+        if contract is not None and contract.max_items is not None:
+            rows = _array(result["rows"], f"{path}.rows")
+            if len(rows) > contract.max_items:
+                _invalid(f"{path}.rows", "exceeds the requested limit")
+        if contract is not None and contract.names is not None:
+            expected = contract.names
             for row_index, raw_row in enumerate(_array(result["rows"], f"{path}.rows")):
                 row = _object(raw_row, f"{path}.rows[{row_index}]")
                 if frozenset(row) != expected:
                     _invalid(f"{path}.rows[{row_index}]", "binding aliases do not match the requested projection")
     elif kind == "aggregates":
         _validate_aggregates_result(result, path)
-        if contract is not None and contract[1] is not None:
+        if contract is not None and contract.names is not None:
             aggregates = _object(result["aggregates"], f"{path}.aggregates")
-            if frozenset(aggregates) != contract[1]:
+            if frozenset(aggregates) != contract.names:
                 _invalid(f"{path}.aggregates", "names do not match the requested aggregates")
     elif kind == "nodes":
         _validate_nodes_result(result, path)
+        if contract is not None:
+            raw_nodes = _array(result["nodes"], f"{path}.nodes")
+            raw_paths = _array(result["paths"], f"{path}.paths")
+            if contract.max_items is None or contract.node_mode is None:
+                _invalid(path, "has no node operation contract")
+            if len(raw_nodes) > contract.max_items or len(raw_paths) > contract.max_items:
+                _invalid(path, "exceeds the requested result limit")
+            if contract.node_mode == "traversal":
+                if raw_paths:
+                    _invalid(f"{path}.paths", "traversal paths belong on result nodes")
+                for index, raw_node in enumerate(raw_nodes):
+                    node = _object(raw_node, f"{path}.nodes[{index}]")
+                    if contract.include_paths:
+                        if "path" not in node:
+                            _invalid(f"{path}.nodes[{index}]", "is missing its requested path")
+                    else:
+                        if "path" in node or "path_edges" in node:
+                            _invalid(f"{path}.nodes[{index}]", "contains a path that was not requested")
+            else:
+                if len(raw_nodes) != len(raw_paths):
+                    _invalid(path, "path results require one terminal node per path")
+                stats = _object(result["stats"], f"{path}.stats")
+                if stats["truncated"]:
+                    _invalid(f"{path}.stats.truncated", "must be false for an exact path result")
+                for index, (raw_node, raw_path) in enumerate(zip(raw_nodes, raw_paths, strict=True)):
+                    node = _object(raw_node, f"{path}.nodes[{index}]")
+                    graph_path = _object(raw_path, f"{path}.paths[{index}]")
+                    if "path" in node or "path_edges" in node:
+                        _invalid(
+                            f"{path}.nodes[{index}]",
+                            "duplicates its authoritative top-level path",
+                        )
+                    if node["depth"] != graph_path["length"]:
+                        _invalid(f"{path}.nodes[{index}].depth", "does not match its path length")
     else:
         _invalid(f"{path}.kind", f"has unknown canonical discriminator {kind!r}")
 

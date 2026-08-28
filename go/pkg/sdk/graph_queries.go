@@ -257,9 +257,21 @@ func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses
 }
 
 type canonicalGraphResultContract struct {
-	kind  string
-	names []string
+	kind         string
+	names        []string
+	maxItems     int
+	nodeMode     canonicalGraphNodeMode
+	includePaths bool
 }
+
+type canonicalGraphNodeMode uint8
+
+const (
+	canonicalGraphNodeModeNone canonicalGraphNodeMode = iota
+	canonicalGraphNodeModeTraversal
+	canonicalGraphNodeModeShortestPath
+	canonicalGraphNodeModeKShortestPaths
+)
 
 func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResultContract, error) {
 	encoded, err := json.Marshal(query)
@@ -289,7 +301,15 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 			if err := match.Return.DecodeStrictInto(&value); err != nil {
 				return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph bindings return: %w", err)
 			}
-			return canonicalGraphResultContract{kind: string(GraphBindingsResultKindBindings), names: append([]string(nil), value.Bindings...)}, nil
+			limit := value.Limit
+			if limit == 0 {
+				limit = defaultGraphBindingsLimit
+			}
+			return canonicalGraphResultContract{
+				kind:     string(GraphBindingsResultKindBindings),
+				names:    append([]string(nil), value.Bindings...),
+				maxItems: limit,
+			}, nil
 		}
 		if _, ok := returnMembers["aggregates"]; ok {
 			var value GraphAggregatesReturn
@@ -306,10 +326,43 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 		return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph match return must select bindings or aggregates")
 	}
 
-	for _, operation := range []string{"traverse", "shortest_path", "k_shortest_paths"} {
-		if raw, ok := members[operation]; ok && !isNullGraphJSON(raw) {
-			return canonicalGraphResultContract{kind: string(GraphNodesResultKindNodes)}, nil
+	if raw, ok := members["traverse"]; ok && !isNullGraphJSON(raw) {
+		var value GraphTraverseQuery
+		if err := query.DecodeStrictInto(&value); err != nil {
+			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph traversal query: %w", err)
 		}
+		limit := value.Traverse.Limit
+		if limit == 0 {
+			limit = defaultGraphBindingsLimit
+		}
+		return canonicalGraphResultContract{
+			kind:         string(GraphNodesResultKindNodes),
+			maxItems:     limit,
+			nodeMode:     canonicalGraphNodeModeTraversal,
+			includePaths: value.Traverse.IncludePaths,
+		}, nil
+	}
+	if raw, ok := members["shortest_path"]; ok && !isNullGraphJSON(raw) {
+		var value GraphShortestPathQuery
+		if err := query.DecodeStrictInto(&value); err != nil {
+			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph shortest path query: %w", err)
+		}
+		return canonicalGraphResultContract{
+			kind:     string(GraphNodesResultKindNodes),
+			maxItems: 1,
+			nodeMode: canonicalGraphNodeModeShortestPath,
+		}, nil
+	}
+	if raw, ok := members["k_shortest_paths"]; ok && !isNullGraphJSON(raw) {
+		var value GraphKShortestPathsQuery
+		if err := query.DecodeStrictInto(&value); err != nil {
+			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph k-shortest-paths query: %w", err)
+		}
+		return canonicalGraphResultContract{
+			kind:     string(GraphNodesResultKindNodes),
+			maxItems: value.KShortestPaths.K,
+			nodeMode: canonicalGraphNodeModeKShortestPaths,
+		}, nil
 	}
 	return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph query has no supported operation")
 }
@@ -455,7 +508,7 @@ func validateCanonicalGraphResultPayload(
 	case string(GraphAggregatesResultKindAggregates):
 		return validateAggregatesResultPayload(contract, result, envelope)
 	case string(GraphNodesResultKindNodes):
-		return validateNodesResultPayload(result, envelope)
+		return validateNodesResultPayload(contract, result, envelope)
 	default:
 		return fmt.Errorf("antfly: unknown canonical graph result discriminator %q", contract.kind)
 	}
@@ -469,8 +522,8 @@ func validateBindingsResultPayload(contract canonicalGraphResultContract, result
 	if value.Kind != GraphBindingsResultKindBindings || value.Rows == nil {
 		return fmt.Errorf("antfly: bindings graph result requires kind and rows")
 	}
-	if len(value.Rows) > maxGraphHydratedBindings {
-		return fmt.Errorf("antfly: bindings graph result exceeds %d rows", maxGraphHydratedBindings)
+	if len(value.Rows) > contract.maxItems {
+		return fmt.Errorf("antfly: bindings graph result exceeds the requested limit of %d rows", contract.maxItems)
 	}
 	expected := make(map[string]struct{}, len(contract.names))
 	for _, name := range contract.names {
@@ -525,7 +578,7 @@ func validateAggregatesResultPayload(contract canonicalGraphResultContract, resu
 	return validateDecodedGraphStats(envelope, len(value.Aggregates), false)
 }
 
-func validateNodesResultPayload(result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
+func validateNodesResultPayload(contract canonicalGraphResultContract, result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
 	var value graphNodesResultValidation
 	if err := result.DecodeStrictInto(&value); err != nil {
 		return fmt.Errorf("antfly: invalid nodes graph result: %w", err)
@@ -533,8 +586,8 @@ func validateNodesResultPayload(result strictGraphResultDecoder, envelope graphQ
 	if value.Kind != GraphNodesResultKindNodes || value.Nodes == nil || value.Paths == nil {
 		return fmt.Errorf("antfly: nodes graph result requires kind, nodes, and paths")
 	}
-	if len(value.Nodes) > maxGraphHydratedBindings || len(value.Paths) > maxGraphHydratedBindings {
-		return fmt.Errorf("antfly: nodes graph result exceeds %d items", maxGraphHydratedBindings)
+	if len(value.Nodes) > contract.maxItems || len(value.Paths) > contract.maxItems {
+		return fmt.Errorf("antfly: nodes graph result exceeds the requested limit of %d items", contract.maxItems)
 	}
 	for i := range value.Nodes {
 		if err := validateGraphResultNodePayload(&value.Nodes[i]); err != nil {
@@ -546,23 +599,47 @@ func validateNodesResultPayload(result strictGraphResultDecoder, envelope graphQ
 			return fmt.Errorf("antfly: nodes graph result path %d: %w", i, err)
 		}
 	}
-	if len(value.Paths) > 0 {
+	allowTruncated := true
+	primaryItems := len(value.Nodes)
+	switch contract.nodeMode {
+	case canonicalGraphNodeModeTraversal:
+		if len(value.Paths) != 0 {
+			return fmt.Errorf("antfly: traversal graph result must expose paths on nodes, not in the top-level paths array")
+		}
+		for i := range value.Nodes {
+			if contract.includePaths {
+				if value.Nodes[i].Path == nil {
+					return fmt.Errorf("antfly: traversal graph result node %d is missing its requested path", i)
+				}
+			} else {
+				if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
+					return fmt.Errorf("antfly: traversal graph result node %d contains a path that was not requested", i)
+				}
+			}
+		}
+	case canonicalGraphNodeModeShortestPath, canonicalGraphNodeModeKShortestPaths:
+		allowTruncated = false
+		primaryItems = len(value.Paths)
 		if len(value.Nodes) != len(value.Paths) {
 			return fmt.Errorf("antfly: path graph result requires one terminal node per path")
 		}
 		for i := range value.Paths {
+			if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
+				return fmt.Errorf("antfly: path graph result node %d duplicates its authoritative top-level path", i)
+			}
+			if value.Nodes[i].Depth != value.Paths[i].Length {
+				return fmt.Errorf("antfly: path graph result node %d depth does not match its path length", i)
+			}
 			terminal := value.Paths[i].Nodes[len(value.Paths[i].Nodes)-1]
 			node := &value.Nodes[i]
 			if !sameDecodedGraphEndpoint(terminal, GraphPathEndpoint{Key: node.Key, Table: node.Table.pointer()}) {
 				return fmt.Errorf("antfly: path graph result node %d does not match its path terminal", i)
 			}
 		}
+	default:
+		return fmt.Errorf("antfly: nodes graph result has no operation contract")
 	}
-	primaryItems := len(value.Nodes)
-	if len(value.Paths) > 0 {
-		primaryItems = len(value.Paths)
-	}
-	return validateDecodedGraphStats(envelope, primaryItems, true)
+	return validateDecodedGraphStats(envelope, primaryItems, allowTruncated)
 }
 
 func validateGraphResultNodePayload(node *graphResultNodeValidation) error {
@@ -713,6 +790,9 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 		if contract.kind != string(GraphBindingsResultKindBindings) {
 			return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, GraphBindingsResultKindBindings)
 		}
+		if len(value.Rows) > contract.maxItems {
+			return fmt.Errorf("antfly: bindings graph result exceeds the requested limit of %d rows", contract.maxItems)
+		}
 		expected := make(map[string]struct{}, len(contract.names))
 		for _, name := range contract.names {
 			expected[name] = struct{}{}
@@ -745,7 +825,45 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 		if contract.kind != string(GraphNodesResultKindNodes) {
 			return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, GraphNodesResultKindNodes)
 		}
-		return nil
+		if len(value.Nodes) > contract.maxItems || len(value.Paths) > contract.maxItems {
+			return fmt.Errorf("antfly: nodes graph result exceeds the requested limit of %d items", contract.maxItems)
+		}
+		switch contract.nodeMode {
+		case canonicalGraphNodeModeTraversal:
+			if len(value.Paths) != 0 {
+				return fmt.Errorf("antfly: traversal graph result must expose paths on nodes, not in the top-level paths array")
+			}
+			for i := range value.Nodes {
+				if contract.includePaths {
+					if value.Nodes[i].Path == nil {
+						return fmt.Errorf("antfly: traversal graph result node %d is missing its requested path", i)
+					}
+				} else {
+					if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
+						return fmt.Errorf("antfly: traversal graph result node %d contains a path that was not requested", i)
+					}
+				}
+			}
+			return nil
+		case canonicalGraphNodeModeShortestPath, canonicalGraphNodeModeKShortestPaths:
+			if value.Stats.Truncated {
+				return fmt.Errorf("antfly: exact graph results cannot be truncated")
+			}
+			if len(value.Nodes) != len(value.Paths) {
+				return fmt.Errorf("antfly: path graph result requires one terminal node per path")
+			}
+			for i := range value.Paths {
+				if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
+					return fmt.Errorf("antfly: path graph result node %d duplicates its authoritative top-level path", i)
+				}
+				if value.Nodes[i].Depth != value.Paths[i].Length {
+					return fmt.Errorf("antfly: path graph result node %d depth does not match its path length", i)
+				}
+			}
+			return nil
+		default:
+			return fmt.Errorf("antfly: nodes graph result has no operation contract")
+		}
 	default:
 		return fmt.Errorf("antfly: unsupported decoded graph result type %T", decoded)
 	}
@@ -877,7 +995,7 @@ func validateDecodedGraphStats(envelope graphQueryResultEnvelope, itemCount int,
 		return fmt.Errorf("antfly: graph result stats returned_items does not match the payload")
 	}
 	if !allowTruncated && *envelope.Stats.Truncated {
-		return fmt.Errorf("antfly: exact aggregate graph results cannot be truncated")
+		return fmt.Errorf("antfly: exact graph results cannot be truncated")
 	}
 	return nil
 }

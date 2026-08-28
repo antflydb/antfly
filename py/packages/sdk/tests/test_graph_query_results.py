@@ -166,6 +166,93 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
         )
 
 
+def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> None:
+    zero_hop_path = {
+        "nodes": [{"key": "a"}],
+        "edges": [],
+        "length": 0,
+        "weight_mode": "min_hops",
+        "weight_sum": 0,
+        "objective_value": 0,
+    }
+    path_query = {
+        "path": {
+            "index": "graph",
+            "shortest_path": {"from": {"key": "a"}, "to": {"key": "a"}},
+        }
+    }
+    malformed_path_results = [
+        (
+            {
+                "kind": "nodes",
+                "nodes": [{"key": "a", "depth": 0}, {"key": "a", "depth": 0}],
+                "paths": [zero_hop_path, zero_hop_path],
+                "stats": {"returned_items": 2, "truncated": False},
+            },
+            "exceeds the requested result limit",
+        ),
+        (
+            {
+                "kind": "nodes",
+                "nodes": [],
+                "paths": [],
+                "stats": {"returned_items": 0, "truncated": True},
+            },
+            "must be false for an exact path result",
+        ),
+        (
+            {
+                "kind": "nodes",
+                "nodes": [{"key": "a", "depth": 0, "path": [{"key": "a"}]}],
+                "paths": [zero_hop_path],
+                "stats": {"returned_items": 1, "truncated": False},
+            },
+            "duplicates its authoritative top-level path",
+        ),
+    ]
+    for result, message in malformed_path_results:
+        with pytest.raises(AntflyException, match=message):
+            decode_query_responses(
+                _query_response(result, operation="path"),
+                expected_graph_queries=path_query,
+            )
+
+    traversal_query = {
+        "walk": {
+            "index": "graph",
+            "traverse": {"start": {"keys": ["a"]}, "limit": 1},
+        }
+    }
+    with pytest.raises(AntflyException, match="contains a path that was not requested"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "nodes",
+                    "nodes": [{"key": "a", "depth": 0, "path": [{"key": "a"}]}],
+                    "paths": [],
+                    "stats": {"returned_items": 1, "truncated": False},
+                },
+                operation="walk",
+            ),
+            expected_graph_queries=traversal_query,
+        )
+
+    traversal_query["walk"]["traverse"]["include_paths"] = True
+    with pytest.raises(AntflyException, match="is missing its requested path"):
+        decode_query_responses(
+            _query_response(
+                {
+                    "kind": "nodes",
+                    "nodes": [{"key": "a", "depth": 0}],
+                    "paths": [],
+                    "stats": {"returned_items": 1, "truncated": False},
+                },
+                operation="walk",
+            ),
+            expected_graph_queries=traversal_query,
+        )
+
+
 def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> None:
     canonical = decode_query_responses(
         _query_response(

@@ -12,6 +12,9 @@ type GraphDialect = "canonical" | "legacy" | "none";
 type CanonicalResultContract = {
   kind: "bindings" | "aggregates" | "nodes";
   names?: Set<string>;
+  maxItems?: number;
+  nodeMode?: "traversal" | "shortest_path" | "k_shortest_paths";
+  includePaths?: boolean;
 };
 type RequestGraphContract = {
   dialect: GraphDialect;
@@ -229,7 +232,7 @@ function stats(value: unknown, path: string, expectedItems: number, allowTruncat
   }
   if (typeof result.truncated !== "boolean") invalid(`${path}.truncated`, "must be a boolean");
   if (!allowTruncated && result.truncated)
-    invalid(`${path}.truncated`, "must be false for exact aggregates");
+    invalid(`${path}.truncated`, "must be false for an exact result");
 }
 
 function sameNameSet(actual: readonly string[], expected: Set<string>): boolean {
@@ -244,7 +247,8 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
   if (result.kind === "bindings") {
     exactKeys(result, path, ["kind", "rows", "stats"]);
     const rows = array(result.rows, `${path}.rows`);
-    if (rows.length > MAX_ITEMS) invalid(`${path}.rows`, "contains too many rows");
+    if (rows.length > (contract.maxItems ?? MAX_ITEMS))
+      invalid(`${path}.rows`, "exceeds the requested limit");
     rows.forEach((rawRow, rowIndex) => {
       const rowPath = `${path}.rows[${rowIndex}]`;
       const row = object(rawRow, rowPath);
@@ -298,26 +302,47 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
     exactKeys(result, path, ["kind", "nodes", "paths", "stats"]);
     const rawNodes = array(result.nodes, `${path}.nodes`);
     const rawPaths = array(result.paths, `${path}.paths`);
-    if (rawNodes.length > MAX_ITEMS || rawPaths.length > MAX_ITEMS)
-      invalid(path, "contains too many items");
+    const maxItems = contract.maxItems ?? MAX_ITEMS;
+    if (rawNodes.length > maxItems || rawPaths.length > maxItems)
+      invalid(path, "exceeds the requested result limit");
     const nodes = rawNodes.map((node, index) => resultNode(node, `${path}.nodes[${index}]`));
     const paths = rawPaths.map((item, index) => graphPath(item, `${path}.paths[${index}]`));
-    if (paths.length > 0) {
+    if (contract.nodeMode === "traversal") {
+      if (paths.length !== 0) invalid(`${path}.paths`, "traversal paths belong on result nodes");
+      nodes.forEach((node, index) => {
+        if (contract.includePaths) {
+          if (node.path === undefined)
+            invalid(`${path}.nodes[${index}]`, "is missing its requested path");
+        } else {
+          if (node.path !== undefined || node.path_edges !== undefined)
+            invalid(`${path}.nodes[${index}]`, "contains a path that was not requested");
+        }
+      });
+      stats(result.stats, `${path}.stats`, nodes.length, true);
+      return;
+    }
+    if (contract.nodeMode === "shortest_path" || contract.nodeMode === "k_shortest_paths") {
       if (nodes.length !== paths.length) invalid(path, "requires one terminal node per path");
       paths.forEach((graphPathValue, index) => {
+        const node = item(nodes, index, `${path}.nodes[${index}]`);
+        if (node.path !== undefined || node.path_edges !== undefined)
+          invalid(`${path}.nodes[${index}]`, "duplicates its authoritative top-level path");
+        if (node.depth !== graphPathValue.length)
+          invalid(`${path}.nodes[${index}].depth`, "does not match its path length");
         const endpoints = graphPathValue.nodes as unknown[];
         if (
           !sameEndpoint(
             object(endpoints[endpoints.length - 1], `${path}.paths[${index}].nodes`),
-            item(nodes, index, `${path}.nodes[${index}]`)
+            node
           )
         ) {
           invalid(`${path}.nodes[${index}]`, "does not match its path terminal");
         }
       });
+      stats(result.stats, `${path}.stats`, paths.length, false);
+      return;
     }
-    stats(result.stats, `${path}.stats`, paths.length > 0 ? paths.length : nodes.length, true);
-    return;
+    invalid(path, "has no node operation contract");
   }
   invalid(`${path}.kind`, "canonical graph results require bindings, aggregates, or nodes");
 }
@@ -334,7 +359,12 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
           invalid(`${path}.return.bindings[${index}]`, "must be a string");
         names.add(name);
       });
-      return { kind: "bindings", names };
+      const rawLimit = returned.limit;
+      const maxItems =
+        rawLimit === undefined
+          ? 100
+          : boundedInteger(rawLimit, `${path}.return.limit`, 1, MAX_ITEMS);
+      return { kind: "bindings", names, maxItems };
     }
     if (returned.aggregates !== undefined) {
       return {
@@ -344,14 +374,135 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
     }
     return invalid(`${path}.return`, "must select bindings or aggregates");
   }
-  if (
-    operation.traverse !== undefined ||
-    operation.shortest_path !== undefined ||
-    operation.k_shortest_paths !== undefined
-  ) {
-    return { kind: "nodes" };
+  if (operation.traverse !== undefined) {
+    const traversal = object(operation.traverse, `${path}.traverse`);
+    const rawLimit = traversal.limit;
+    const maxItems =
+      rawLimit === undefined
+        ? 100
+        : boundedInteger(rawLimit, `${path}.traverse.limit`, 1, MAX_ITEMS);
+    return {
+      kind: "nodes",
+      maxItems,
+      nodeMode: "traversal",
+      includePaths: traversal.include_paths === true,
+    };
+  }
+  if (operation.shortest_path !== undefined) {
+    return { kind: "nodes", maxItems: 1, nodeMode: "shortest_path" };
+  }
+  if (operation.k_shortest_paths !== undefined) {
+    const kShortestPaths = object(operation.k_shortest_paths, `${path}.k_shortest_paths`);
+    return {
+      kind: "nodes",
+      maxItems: boundedInteger(kShortestPaths.k, `${path}.k_shortest_paths.k`, 1, 100),
+      nodeMode: "k_shortest_paths",
+    };
   }
   return invalid(path, "does not contain a supported graph operation");
+}
+
+function legacySafeInteger(value: unknown, path: string): number {
+  if (!Number.isSafeInteger(value)) invalid(path, "must be a safely representable integer");
+  return value as number;
+}
+
+function legacyPathEdge(value: unknown, path: string): void {
+  const edge = object(value, path);
+  for (const name of ["source", "target", "type"] as const) {
+    if (edge[name] !== undefined && typeof edge[name] !== "string")
+      invalid(`${path}.${name}`, "must be a string");
+  }
+  if (
+    edge.weight !== undefined &&
+    (typeof edge.weight !== "number" || !Number.isFinite(edge.weight))
+  )
+    invalid(`${path}.weight`, "must be a finite number");
+  if (edge.metadata !== undefined) object(edge.metadata, `${path}.metadata`);
+}
+
+function legacyPath(value: unknown, path: string): void {
+  const graphPath = object(value, path);
+  if (graphPath.nodes !== undefined) {
+    array(graphPath.nodes, `${path}.nodes`).forEach((node, index) => {
+      if (typeof node !== "string") invalid(`${path}.nodes[${index}]`, "must be a string");
+    });
+  }
+  if (graphPath.edges !== undefined)
+    array(graphPath.edges, `${path}.edges`).forEach((edge, index) => {
+      legacyPathEdge(edge, `${path}.edges[${index}]`);
+    });
+  if (graphPath.total_weight !== undefined)
+    finiteNonnegative(graphPath.total_weight, `${path}.total_weight`);
+  if (graphPath.length !== undefined) legacySafeInteger(graphPath.length, `${path}.length`);
+}
+
+function legacyNode(value: unknown, path: string): void {
+  const node = object(value, path);
+  if (typeof node.key !== "string") invalid(`${path}.key`, "must be a string");
+  if (node.table !== undefined && typeof node.table !== "string")
+    invalid(`${path}.table`, "must be a string");
+  if (node.depth !== undefined) legacySafeInteger(node.depth, `${path}.depth`);
+  if (
+    node.distance !== undefined &&
+    (typeof node.distance !== "number" || !Number.isFinite(node.distance))
+  )
+    invalid(`${path}.distance`, "must be a finite number");
+  if (node.document !== undefined) object(node.document, `${path}.document`);
+  if (node.evidence !== undefined) object(node.evidence, `${path}.evidence`);
+  for (const name of ["path", "provenance"] as const) {
+    if (node[name] !== undefined)
+      array(node[name], `${path}.${name}`).forEach((item, index) => {
+        if (typeof item !== "string") invalid(`${path}.${name}[${index}]`, "must be a string");
+      });
+  }
+  if (node.path_edges !== undefined)
+    array(node.path_edges, `${path}.path_edges`).forEach((edge, index) => {
+      legacyPathEdge(edge, `${path}.path_edges[${index}]`);
+    });
+  if (node.edges !== undefined) array(node.edges, `${path}.edges`);
+}
+
+function legacyResult(value: unknown, path: string): void {
+  const result = object(value, path);
+  exactKeys(result, path, ["type", "total"], ["kind", "nodes", "paths", "matches", "took"]);
+  if (result.kind !== undefined && result.kind !== "legacy")
+    invalid(`${path}.kind`, "must be legacy when present");
+  if (
+    result.type !== "neighbors" &&
+    result.type !== "traverse" &&
+    result.type !== "shortest_path" &&
+    result.type !== "k_shortest_paths" &&
+    result.type !== "pattern"
+  ) {
+    invalid(`${path}.type`, "has an unknown legacy graph query type");
+  }
+  legacySafeInteger(result.total, `${path}.total`);
+  if (result.took !== undefined) legacySafeInteger(result.took, `${path}.took`);
+  if (result.nodes !== undefined)
+    array(result.nodes, `${path}.nodes`).forEach((node, index) => {
+      legacyNode(node, `${path}.nodes[${index}]`);
+    });
+  if (result.paths !== undefined)
+    array(result.paths, `${path}.paths`).forEach((graphPath, index) => {
+      legacyPath(graphPath, `${path}.paths[${index}]`);
+    });
+  if (result.matches !== undefined) {
+    array(result.matches, `${path}.matches`).forEach((rawMatch, index) => {
+      const matchPath = `${path}.matches[${index}]`;
+      const match = object(rawMatch, matchPath);
+      if (match.bindings !== undefined) {
+        for (const [name, binding] of Object.entries(
+          object(match.bindings, `${matchPath}.bindings`)
+        ))
+          legacyNode(binding, `${matchPath}.bindings.${name}`);
+      }
+      if (match.path !== undefined)
+        array(match.path, `${matchPath}.path`).forEach((edge, edgeIndex) => {
+          legacyPathEdge(edge, `${matchPath}.path[${edgeIndex}]`);
+        });
+    });
+  }
 }
 
 function requestDialect(request: QueryRequest): RequestGraphContract {
@@ -427,9 +578,7 @@ export function validateGraphQueryResponses(
         const contract = operations.get(name);
         if (!contract) invalid(path, "has no canonical request contract");
         canonicalResult(result, path, contract);
-      } else if (result.kind !== undefined && result.kind !== "legacy") {
-        invalid(`${path}.kind`, "legacy graph results must use the legacy result shape");
-      }
+      } else legacyResult(result, path);
     }
   });
 }

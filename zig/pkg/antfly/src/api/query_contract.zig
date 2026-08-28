@@ -5504,6 +5504,9 @@ fn toOpenApiGraphResultWithFormat(
         return .{ .legacy_graph_query_result = response };
     }
     if (query.match_pattern != null and query.aggregates.len == 0) {
+        const return_limit: usize = @intCast(if (query.return_limit == 0) 100 else query.return_limit);
+        if (graph_result.matches.len > return_limit)
+            return error.InvalidRemoteResponse;
         const rows = try toOpenApiGraphRows(
             alloc,
             graph_result,
@@ -5541,15 +5544,36 @@ fn toOpenApiGraphResultWithFormat(
         return .{ .graph_aggregates_result = response };
     }
 
-    const nodes = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup);
+    const path_operation = switch (query.query_type) {
+        .shortest_path, .k_shortest_paths => true,
+        .traverse => false,
+        .neighbors, .pattern => return error.InvalidRemoteResponse,
+    };
+    const result_limit: usize = if (path_operation)
+        @intCast(if (query.query_type == .shortest_path) 1 else query.k)
+    else
+        @intCast(query.params.max_results);
+    if (graph_result.nodes.len > result_limit or graph_result.paths.len > result_limit)
+        return error.InvalidRemoteResponse;
+    if (!path_operation and graph_result.paths.len != 0)
+        return error.InvalidRemoteResponse;
+    if (path_operation and graph_result.truncated)
+        return error.QueryCandidateBudgetExceeded;
+
+    // Traversals optionally materialize their path on each node. Pathfinding
+    // instead has one authoritative top-level path and a lightweight terminal
+    // node, avoiding a second allocation and a duplicated wire representation.
+    const nodes = try toOpenApiGraphNodes(
+        alloc,
+        graph_result,
+        &document_lookup,
+        !path_operation and query.params.include_paths,
+    );
     const paths = try toOpenApiGraphPaths(alloc, graph_result.paths, query.params.weight_mode);
-    // A path operation exposes one terminal node per returned path. Enforce
-    // both cardinality and ordered table-qualified identity at the producer
-    // boundary so result references and the public path payload cannot
-    // disagree about which nodes were returned.
-    if (paths.len > 0) {
+    if (path_operation) {
         if (nodes.len != paths.len) return error.InvalidRemoteResponse;
         for (nodes, paths) |node, path| {
+            if (node.depth != path.length) return error.InvalidRemoteResponse;
             const terminal = path.nodes[path.nodes.len - 1];
             if (!GraphNodeIdentityContext.eql(.{}, .{ .key = node.key, .table = node.table }, .{ .key = terminal.key, .table = terminal.table }))
                 return error.InvalidRemoteResponse;
@@ -5984,6 +6008,61 @@ test "canonical path responses require one terminal node per path" {
         },
     ));
 
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"a"} },
+            .target_nodes = .{ .keys = &.{"a"} },
+        },
+        .{},
+        .{
+            .name = @constCast("path"),
+            .nodes = nodes[0..1],
+            .paths = &.{},
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    ));
+    try std.testing.expectError(error.QueryCandidateBudgetExceeded, toOpenApiGraphQueryResult(
+        alloc,
+        .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"a"} },
+            .target_nodes = .{ .keys = &.{"a"} },
+        },
+        .{},
+        .{
+            .name = @constCast("path"),
+            .nodes = nodes[0..1],
+            .paths = &paths,
+            .hits = &.{},
+            .total_hits = 1,
+            .truncated = true,
+        },
+    ));
+
+    nodes[0].depth = 1;
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        .{
+            .query_type = .shortest_path,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"a"} },
+            .target_nodes = .{ .keys = &.{"a"} },
+        },
+        .{},
+        .{
+            .name = @constCast("path"),
+            .nodes = nodes[0..1],
+            .paths = &paths,
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    ));
+
     nodes = .{
         .{ .key = "a", .table = "entities", .depth = 0, .distance = 0 },
         .{ .key = "unused", .depth = 0, .distance = 0 },
@@ -6001,6 +6080,95 @@ test "canonical path responses require one terminal node per path" {
             .name = @constCast("path"),
             .nodes = nodes[0..1],
             .paths = &paths,
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    ));
+}
+
+test "canonical traversal responses keep paths on bounded result nodes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var node_path = [_][]const u8{"a"};
+    var nodes = [_]graph_query_mod.GraphResultNode{
+        .{ .key = "a", .depth = 0, .distance = 0, .path = &node_path },
+        .{ .key = "extra", .depth = 0, .distance = 0 },
+    };
+    const query = graph_query_mod.GraphQuery{
+        .query_type = .traverse,
+        .index_name = "graph_idx",
+        .start_nodes = .{ .keys = &.{"a"} },
+        .params = .{ .max_results = 1, .include_paths = false },
+    };
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        query,
+        .{},
+        .{
+            .name = @constCast("walk"),
+            .nodes = &nodes,
+            .hits = &.{},
+            .total_hits = 2,
+        },
+    ));
+
+    const response = try toOpenApiGraphQueryResult(
+        alloc,
+        query,
+        .{},
+        .{
+            .name = @constCast("walk"),
+            .nodes = nodes[0..1],
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    );
+    try std.testing.expect(response.graph_nodes_result.nodes[0].path == null);
+    try std.testing.expectEqual(@as(usize, 0), response.graph_nodes_result.paths.len);
+
+    var query_with_paths = query;
+    query_with_paths.params.include_paths = true;
+    const response_with_paths = try toOpenApiGraphQueryResult(
+        alloc,
+        query_with_paths,
+        .{},
+        .{
+            .name = @constCast("walk"),
+            .nodes = nodes[0..1],
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    );
+    try std.testing.expect(response_with_paths.graph_nodes_result.nodes[0].path != null);
+    nodes[0].path = null;
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        query_with_paths,
+        .{},
+        .{
+            .name = @constCast("walk"),
+            .nodes = nodes[0..1],
+            .hits = &.{},
+            .total_hits = 1,
+        },
+    ));
+    nodes[0].path = &node_path;
+
+    var graph_paths = [_]graph_paths_mod.Path{.{
+        .nodes = &node_path,
+        .edges = &.{},
+        .total_weight = 0,
+        .length = 0,
+    }};
+    try std.testing.expectError(error.InvalidRemoteResponse, toOpenApiGraphQueryResult(
+        alloc,
+        query,
+        .{},
+        .{
+            .name = @constCast("walk"),
+            .nodes = nodes[0..1],
+            .paths = &graph_paths,
             .hits = &.{},
             .total_hits = 1,
         },
@@ -6113,11 +6281,20 @@ test "canonical graph paths preserve table-qualified node identities" {
         .total_weight = 1,
         .length = 1,
     }};
+    var result_node_path_edges = [_]graph_query_mod.PathEdgeInfo{.{
+        .source = "doc:a",
+        .target = "shared",
+        .edge_type = "mentions",
+        .weight = 1,
+    }};
     var result_nodes = [_]graph_query_mod.GraphResultNode{.{
         .key = "shared",
         .table = "entities",
         .depth = 1,
         .distance = 1,
+        .path = &path_nodes,
+        .path_tables = &node_tables,
+        .path_edges = &result_node_path_edges,
     }};
     const query = graph_query_mod.GraphQuery{
         .query_type = .shortest_path,
@@ -6135,6 +6312,8 @@ test "canonical graph paths preserve table-qualified node identities" {
 
     const canonical = try toOpenApiGraphQueryResult(alloc, query, .{}, graph_result);
     try std.testing.expect(canonical == .graph_nodes_result);
+    try std.testing.expect(canonical.graph_nodes_result.nodes[0].path == null);
+    try std.testing.expect(canonical.graph_nodes_result.nodes[0].path_edges == null);
     try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].nodes[1].key);
     try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].nodes[1].table.?);
     try std.testing.expectEqualStrings("doc:a", canonical.graph_nodes_result.paths[0].edges[0].from.key);
@@ -6213,19 +6392,21 @@ fn toOpenApiGraphNodes(
     alloc: std.mem.Allocator,
     graph_result: db_mod.types.GraphSearchResult,
     document_lookup: *GraphDocumentLookup,
+    include_paths: bool,
 ) ![]const indexes_openapi.GraphResultNode {
     if (graph_result.nodes.len > public_limits.max_graph_result_items)
         return error.InvalidRemoteResponse;
     const nodes = try alloc.alloc(indexes_openapi.GraphResultNode, graph_result.nodes.len);
     for (graph_result.nodes, 0..) |node, i| {
         try validateCanonicalGraphResultNode(node);
+        if (include_paths and node.path == null) return error.InvalidRemoteResponse;
         nodes[i] = .{
             .key = node.key,
             .table = node.table,
             .depth = @intCast(node.depth),
             .document = try document_lookup.document(node.key, node.table),
-            .path = try toOpenApiGraphNodePath(alloc, node),
-            .path_edges = try toOpenApiOptionalGraphPathEdges(alloc, node),
+            .path = if (include_paths) try toOpenApiGraphNodePath(alloc, node) else null,
+            .path_edges = if (include_paths) try toOpenApiOptionalGraphPathEdges(alloc, node) else null,
             .provenance = node.provenance,
             .evidence = try graphNodeEvidenceJsonValue(alloc, node),
         };
@@ -6750,7 +6931,7 @@ test "api query contract preserves algebraic graph path provenance" {
 
     var document_lookup = try GraphDocumentLookup.init(alloc, graph_result.hits, false);
     defer document_lookup.deinit(alloc);
-    const encoded = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup);
+    const encoded = try toOpenApiGraphNodes(alloc, graph_result, &document_lookup, true);
     defer {
         if (encoded[0].path) |items| alloc.free(items);
         if (encoded[0].path_edges) |items| alloc.free(items);

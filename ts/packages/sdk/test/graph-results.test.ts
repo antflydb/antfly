@@ -173,5 +173,104 @@ describe("graph result admission", () => {
         request,
       ])
     ).not.toThrow();
+
+    for (const malformed of [
+      { type: "neighbors" },
+      { total: 1 },
+      { type: "unknown", total: 1 },
+      { type: "neighbors", total: null },
+      { type: "neighbors", total: 1, unexpected: true },
+      { type: "neighbors", total: 1, nodes: [{ key: 42 }] },
+    ]) {
+      expect(() =>
+        validateGraphQueryResponses(responses(malformed, "legacy operation"), [request])
+      ).toThrow();
+    }
+  });
+
+  it("enforces request-derived cardinality and path ownership", () => {
+    const zeroHopPath = {
+      nodes: [{ key: "a" }],
+      edges: [],
+      length: 0,
+      weight_mode: "min_hops",
+      weight_sum: 0,
+      objective_value: 0,
+    };
+    const pathResult = (nodes: unknown[], paths: unknown[], truncated = false) => ({
+      kind: "nodes",
+      nodes,
+      paths,
+      stats: { returned_items: paths.length, truncated },
+    });
+
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          pathResult(
+            [
+              { key: "a", depth: 0 },
+              { key: "a", depth: 0 },
+            ],
+            [zeroHopPath, zeroHopPath]
+          )
+        ),
+        [canonicalRequest]
+      )
+    ).toThrow("exceeds the requested result limit");
+
+    expect(() =>
+      validateGraphQueryResponses(responses(pathResult([], [], true)), [canonicalRequest])
+    ).toThrow("must be false for an exact result");
+
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(pathResult([{ key: "a", depth: 0, path: [{ key: "a" }] }], [zeroHopPath])),
+        [canonicalRequest]
+      )
+    ).toThrow("duplicates its authoritative top-level path");
+
+    const traversalRequest = {
+      graph_queries: {
+        walk: { index: "graph_idx", traverse: { start: { keys: ["a"] }, limit: 1 } },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          {
+            kind: "nodes",
+            nodes: [{ key: "a", depth: 0, path: [{ key: "a" }] }],
+            paths: [],
+            stats: { returned_items: 1, truncated: false },
+          },
+          "walk"
+        ),
+        [traversalRequest]
+      )
+    ).toThrow("contains a path that was not requested");
+
+    const traversalWithPaths = {
+      graph_queries: {
+        walk: {
+          index: "graph_idx",
+          traverse: { start: { keys: ["a"] }, include_paths: true },
+        },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          {
+            kind: "nodes",
+            nodes: [{ key: "a", depth: 0 }],
+            paths: [],
+            stats: { returned_items: 1, truncated: false },
+          },
+          "walk"
+        ),
+        [traversalWithPaths]
+      )
+    ).toThrow("is missing its requested path");
   });
 });

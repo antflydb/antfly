@@ -12508,7 +12508,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description A node in graph query results */
+        /** @description A traversal result node or the terminal node paired with a pathfinding result. Traversal paths, when requested, are carried by path and path_edges. Shortest-path operations keep the complete path only in the enclosing GraphNodesResult.paths entry to avoid duplicate wire data. */
         GraphResultNode: {
             /** @description Document key */
             key: string;
@@ -12520,9 +12520,9 @@ export interface components {
             document?: {
                 [key: string]: unknown;
             };
-            /** @description Exact ordered node identities from the start node, terminating at this node's fully qualified identity */
+            /** @description Exact ordered traversal identities from the start node, terminating at this node's fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding uses GraphNodesResult.paths. */
             path?: components["schemas"]["GraphPathEndpoint"][];
-            /** @description Ordered typed edges in path from start to this node; omitted when path is omitted */
+            /** @description Ordered typed traversal edges from the start node. Present only with path for traversal queries; pathfinding uses GraphNodesResult.paths. */
             path_edges?: components["schemas"]["GraphPathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
@@ -12550,7 +12550,7 @@ export interface components {
             objective_value: number;
             length: number;
         };
-        /** @description Composable result nodes and any materialized paths from a canonical traversal or path query. */
+        /** @description Composable results from a canonical traversal or path query. Traversals return nodes and keep the top-level paths array empty. Pathfinding returns one lightweight terminal node per authoritative top-level path. */
         GraphNodesResult: {
             /**
              * @description Stable discriminator for the graph result shape.
@@ -12559,7 +12559,7 @@ export interface components {
             kind: "nodes";
             /** @description Traversal result nodes. Path operations emit one terminal result node per returned path; inspect paths[].nodes for complete path membership. */
             nodes: components["schemas"]["GraphResultNode"][];
-            /** @description Materialized result paths; empty when paths were not requested or produced. */
+            /** @description Authoritative paths for shortest_path and k_shortest_paths, ordered in lockstep with nodes. Always empty for traversal results; requested traversal paths are stored on each result node. */
             paths: components["schemas"]["GraphPath"][];
             stats: components["schemas"]["GraphQueryStats"];
         };

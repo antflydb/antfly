@@ -6240,13 +6240,13 @@ pub const GraphNodeSelector = union(enum) {
     }
 };
 
-/// Composable result nodes and any materialized paths from a canonical traversal or path query.
+/// Composable results from a canonical traversal or path query. Traversals return nodes and keep the top-level paths array empty. Pathfinding returns one lightweight terminal node per authoritative top-level path.
 pub const GraphNodesResult = struct {
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
     /// Traversal result nodes. Path operations emit one terminal result node per returned path; inspect paths[].nodes for complete path membership.
     nodes: []const GraphResultNode,
-    /// Materialized result paths; empty when paths were not requested or produced.
+    /// Authoritative paths for shortest_path and k_shortest_paths, ordered in lockstep with nodes. Always empty for traversal results; requested traversal paths are stored on each result node.
     paths: []const GraphPath,
     stats: GraphQueryStats,
 };
@@ -6699,7 +6699,7 @@ pub const GraphResult = union(enum) {
 
 pub const GraphResultBinding = ?GraphBindingNode;
 
-/// A node in graph query results
+/// A traversal result node or the terminal node paired with a pathfinding result. Traversal paths, when requested, are carried by path and path_edges. Shortest-path operations keep the complete path only in the enclosing GraphNodesResult.paths entry to avoid duplicate wire data.
 pub const GraphResultNode = struct {
     /// Document key
     key: []const u8,
@@ -6709,9 +6709,9 @@ pub const GraphResultNode = struct {
     depth: i64,
     /// Full document (if include_documents=true)
     document: ?std.json.Value = null,
-    /// Exact ordered node identities from the start node, terminating at this node's fully qualified identity
+    /// Exact ordered traversal identities from the start node, terminating at this node's fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding uses GraphNodesResult.paths.
     path: ?[]const GraphPathEndpoint = null,
-    /// Ordered typed edges in path from start to this node; omitted when path is omitted
+    /// Ordered typed traversal edges from the start node. Present only with path for traversal queries; pathfinding uses GraphNodesResult.paths.
     path_edges: ?[]const GraphPathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
