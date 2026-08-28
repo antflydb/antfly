@@ -208,6 +208,8 @@ pub fn convertNodeWithScope(
         .CumSum => convertCumSum(builder, node, inputs),
         .DequantizeLinear => convertDequantizeLinear(builder, node, inputs),
         .QuantizeLinear => convertQuantizeLinear(builder, node, inputs),
+        .DynamicQuantizeLinear => convertDynamicQuantizeLinear(builder, inputs, extra_outputs),
+        .MatMulInteger => convertMatMulInteger(builder, node, inputs),
         .AveragePool => convertAveragePool(builder, node, inputs),
         .MaxPool => convertMaxPool(builder, node, inputs),
         .GlobalAveragePool => convertGlobalAveragePool(builder, inputs),
@@ -332,6 +334,8 @@ const OpType = enum {
     CumSum,
     DequantizeLinear,
     QuantizeLinear,
+    DynamicQuantizeLinear,
+    MatMulInteger,
     AveragePool,
     MaxPool,
     GlobalAveragePool,
@@ -440,6 +444,8 @@ const OpType = enum {
             .{ "CumSum", .CumSum },
             .{ "DequantizeLinear", .DequantizeLinear },
             .{ "QuantizeLinear", .QuantizeLinear },
+            .{ "DynamicQuantizeLinear", .DynamicQuantizeLinear },
+            .{ "MatMulInteger", .MatMulInteger },
             .{ "AveragePool", .AveragePool },
             .{ "MaxPool", .MaxPool },
             .{ "GlobalAveragePool", .GlobalAveragePool },
@@ -880,6 +886,7 @@ fn materializeConstantValues(builder: *Builder, node_id: NodeId, buf: []f32) ?[]
             return buf[0..total];
         },
         .gather => |g_attrs| {
+            if (g_attrs.elements) return null;
             // Gather(data, indices) along axis — materialize both, extract elements
             const gather_inputs = n.getInputs();
             if (gather_inputs.len < 2) return null;
@@ -931,6 +938,39 @@ fn nodeDependsOnRuntimeValue(builder: *Builder, node_id: NodeId, depth: usize) b
             break :blk false;
         },
     };
+}
+
+fn nodeHasRuntimeDependentShape(builder: *Builder, node_id: NodeId, depth: usize) bool {
+    if (node_id == null_node) return false;
+    // Conservatively preserve Shape as a runtime operation when a dynamic
+    // shape transform may be hidden behind otherwise-concrete import-time
+    // inference. This prevents Shape(Reshape(x, runtime_target)) from
+    // capturing the representative import dimensions.
+    if (depth >= 64) return true;
+
+    const n = builder.graph.node(node_id);
+    for (0..n.output_shape.rank()) |axis| {
+        if (n.output_shape.dim(@intCast(axis)) < 0) return true;
+    }
+
+    switch (n.op) {
+        .constant, .parameter, .fused_from_float32 => return false,
+        .reshape => |attrs| {
+            if (attrs.runtime_shape) return true;
+        },
+        .broadcast_in_dim => {
+            if (n.num_inputs > 1 and nodeDependsOnRuntimeValue(builder, n.inputs[1], 0)) return true;
+        },
+        .slice => |attrs| {
+            if (attrs.runtime_starts or attrs.runtime_limits) return true;
+        },
+        else => {},
+    }
+
+    for (n.getInputs()) |input| {
+        if (nodeHasRuntimeDependentShape(builder, input, depth + 1)) return true;
+    }
+    return false;
 }
 
 fn foldSymbolicShapeArithmetic(op: OpCode, a: f32, b: f32) ?f32 {
@@ -1092,6 +1132,11 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
         if (inserted_axis) |axis| {
             for (0..rank) |target_i| {
                 if (target_i == axis or dims[target_i] >= 0) continue;
+                // Splitting the final input dimension produces two final
+                // target dimensions. Do not copy the unsplit input width into
+                // the inferred trailing target; the division below resolves
+                // it from the explicit split factor instead.
+                if (axis == input_rank - 1 and target_i == rank - 1) continue;
                 const input_i = if (target_i < axis) target_i else target_i - 1;
                 dims[target_i] = input_shape.dim(@intCast(input_i));
             }
@@ -1278,7 +1323,19 @@ fn convertReshape(allocator: std.mem.Allocator, builder: *Builder, node: *const 
         .rank_ = rank,
     };
 
-    return builder.reshape(inputs[0], new_shape);
+    const result = try builder.reshape(inputs[0], new_shape);
+    const target_node = builder.graph.node(inputs[1]);
+    const runtime_shape = std.meta.activeTag(target_node.op) != .constant;
+    if (runtime_shape or allow_zero) {
+        const reshape_node = builder.graph.nodeMut(result);
+        reshape_node.op.reshape.runtime_shape = runtime_shape;
+        reshape_node.op.reshape.allow_zero = allow_zero;
+        if (runtime_shape) {
+            reshape_node.inputs[1] = inputs[1];
+            reshape_node.num_inputs = 2;
+        }
+    }
+    return result;
 }
 
 fn convertTranspose(builder: *Builder, node: *const NodeProto, input: NodeId) ConvertError!NodeId {
@@ -2095,8 +2152,11 @@ fn convertExpand(builder: *Builder, inputs: []const NodeId) ConvertError!NodeId 
             .num_axes = @min(in_rank, out_rank),
         } },
         .output_shape = out_shape,
-        .inputs = .{ src, null_node, null_node, null_node },
-        .num_inputs = 1,
+        // Keep the ONNX shape input live. Static dimensions remain embedded
+        // in target_shape, while the interpreter can use the tensor's values
+        // when shape arithmetic resolves symbolic dimensions at runtime.
+        .inputs = .{ src, inputs[1], null_node, null_node },
+        .num_inputs = 2,
     });
 }
 
@@ -2285,7 +2345,7 @@ fn convertShape(builder: *Builder, node: *const NodeProto, input: NodeId) Conver
         if (dim < 0) has_dynamic = true;
         dims_f32[i] = @floatFromInt(dim);
     }
-    if (has_dynamic) {
+    if (has_dynamic or nodeHasRuntimeDependentShape(builder, input, 0)) {
         return builder.graph.addNode(.{
             .op = .{ .shape_of = .{
                 .start = @intCast(start),
@@ -3273,7 +3333,7 @@ fn convertGatherElements(builder: *Builder, node: *const NodeProto, inputs: []co
 
     // GatherElements output shape = indices shape
     return builder.graph.addNode(.{
-        .op = .{ .gather = .{ .axis = axis } },
+        .op = .{ .gather = .{ .axis = axis, .elements = true } },
         .output_shape = Shape{ .dtype = data_shape.dtype, .dims = indices_shape.dims, .rank_ = indices_shape.rank_ },
         .inputs = .{ inputs[0], inputs[1], null_node, null_node },
         .num_inputs = 2,
@@ -3419,11 +3479,6 @@ fn convertQuantizeLinear(builder: *Builder, node: *const NodeProto, inputs: []co
     // y = x / scale
     var result = try builder.div(x, scale);
 
-    // Round to nearest (half to even is ONNX default, we approximate with floor(x + 0.5))
-    const half = try builder.scalarConst(x_shape.dtype, 0.5);
-    result = try builder.add(result, half);
-    result = try convertFloor(builder, result);
-
     // Add zero_point if provided
     if (inputs.len >= 3 and inputs[2] != null_node) {
         var zp = inputs[2];
@@ -3436,25 +3491,147 @@ fn convertQuantizeLinear(builder: *Builder, node: *const NodeProto, inputs: []co
         result = try builder.add(result, zp);
     }
 
-    // Clamp to output type range
+    // Clamp to the output type range before rounding. Values outside the
+    // range saturate to the same endpoint whether clipping happens before or
+    // after rounding, and clipping first keeps parity detection numerically
+    // well-behaved for large out-of-range values.
     const qmin: f32 = switch (out_dtype) {
         .u8 => 0.0,
+        .i8 => -128.0,
+        .i16 => -32768.0,
         .i32 => -2147483648.0,
         else => 0.0,
     };
     const qmax: f32 = switch (out_dtype) {
         .u8 => 255.0,
+        .i8 => 127.0,
+        .i16 => 32767.0,
         .i32 => 2147483647.0,
         else => 255.0,
     };
-    const min_node = try builder.scalarConst(x_shape.dtype, qmin);
-    const max_node = try builder.scalarConst(x_shape.dtype, qmax);
-    // clamp: max(min, min(x, max))
-    const clamped_hi = try selectOp(builder, try cmpLessThan(builder, result, max_node), result, max_node);
-    const clamped = try selectOp(builder, try cmpLessThan(builder, min_node, clamped_hi), clamped_hi, min_node);
+    result = try roundToNearestEvenClamped(builder, result, qmin, qmax);
 
     // Cast to output dtype
-    return castDType(builder, clamped, out_dtype);
+    return castDType(builder, result, out_dtype);
+}
+
+/// ONNX Round uses round-to-nearest, ties-to-even. The graph IR does not have
+/// a native round primitive, so decompose it from Floor, comparisons, and
+/// selection. `value` is clipped first because all current users are
+/// quantizers with a finite integer output range.
+fn roundToNearestEvenClamped(builder: *Builder, value: NodeId, min_value: f32, max_value: f32) ConvertError!NodeId {
+    const dtype = builder.graph.node(value).output_shape.dtype;
+    const min_node = try builder.scalarConst(dtype, min_value);
+    const max_node = try builder.scalarConst(dtype, max_value);
+    const below_min = try broadcastBinaryOp(builder, .less_than, value, min_node);
+    const clipped_min = try selectOp(builder, below_min, min_node, value);
+    const above_max = try broadcastBinaryOp(builder, .less_than, max_node, clipped_min);
+    const clipped = try selectOp(builder, above_max, max_node, clipped_min);
+
+    const floored = try convertFloor(builder, clipped);
+    const fraction = try builder.sub(clipped, floored);
+    const half = try builder.scalarConst(dtype, 0.5);
+    const one = try builder.scalarConst(dtype, 1.0);
+    const zero = try builder.scalarConst(dtype, 0.0);
+
+    const below_half = try broadcastBinaryOp(builder, .less_than, fraction, half);
+    const above_half = try broadcastBinaryOp(builder, .less_than, half, fraction);
+
+    // For an exact tie, round up only when floor(value) is odd. Values have
+    // already been clipped to the quantized range, so floor(value) is a small
+    // integer and this parity calculation is exact in f32.
+    const two = try builder.scalarConst(dtype, 2.0);
+    const half_floor = try convertFloor(builder, try builder.div(floored, two));
+    const even_floor = try builder.mul(half_floor, two);
+    const floor_is_odd = try broadcastBinaryOp(builder, .less_than, even_floor, floored);
+    const tie_increment = try selectOp(builder, floor_is_odd, one, zero);
+    const at_or_above_half_increment = try selectOp(builder, above_half, one, tie_increment);
+    const increment = try selectOp(builder, below_half, zero, at_or_above_half_increment);
+    return builder.add(floored, increment);
+}
+
+/// DynamicQuantizeLinear computes one uint8 scale and zero point across the
+/// full activation tensor, then quantizes the activation with ONNX's
+/// round-to-nearest-even rule. Its three outputs are `(y, scale, zero_point)`.
+fn convertDynamicQuantizeLinear(builder: *Builder, inputs: []const NodeId, extra_outputs: ?[]NodeId) ConvertError!NodeId {
+    if (inputs.len < 1 or inputs[0] == null_node) return error.MissingInput;
+    const x = inputs[0];
+    const x_shape = builder.graph.node(x).output_shape;
+    if (x_shape.dtype != .f32) return error.UnsupportedDType;
+
+    var axes: [8]u8 = undefined;
+    for (0..x_shape.rank()) |axis| axes[axis] = @intCast(axis);
+
+    const x_max_kept = try builder.reduceMax(x, axes[0..x_shape.rank()]);
+    const x_min_kept = try builder.neg(try builder.reduceMax(try builder.neg(x), axes[0..x_shape.rank()]));
+    const scalar_shape = Shape.scalar(.f32);
+    const x_max = try builder.reshape(x_max_kept, scalar_shape);
+    const x_min = try builder.reshape(x_min_kept, scalar_shape);
+
+    const zero = try builder.scalarConst(.f32, 0.0);
+    const one = try builder.scalarConst(.f32, 1.0);
+    const qmax = try builder.scalarConst(.f32, 255.0);
+    const min_adjusted = try selectOp(builder, try cmpLessThan(builder, x_min, zero), x_min, zero);
+    const max_adjusted = try selectOp(builder, try cmpLessThan(builder, zero, x_max), x_max, zero);
+    const value_range = try builder.sub(max_adjusted, min_adjusted);
+    const computed_scale = try builder.div(value_range, qmax);
+    // ORT defines the all-zero tensor case as scale=1, zero_point=0.
+    const has_range = try cmpLessThan(builder, zero, value_range);
+    const scale = try selectOp(builder, has_range, computed_scale, one);
+
+    const initial_zero_point = try builder.neg(try builder.div(min_adjusted, scale));
+    const rounded_zero_point = try roundToNearestEvenClamped(builder, initial_zero_point, 0.0, 255.0);
+    const zero_point = try castDType(builder, rounded_zero_point, .u8);
+
+    var quantized = try broadcastBinaryOp(builder, .div, x, scale);
+    quantized = try broadcastBinaryOp(builder, .add, quantized, try castDType(builder, zero_point, .f32));
+    quantized = try roundToNearestEvenClamped(builder, quantized, 0.0, 255.0);
+    quantized = try castDType(builder, quantized, .u8);
+
+    if (extra_outputs) |outputs| {
+        if (outputs.len >= 1) outputs[0] = scale;
+        if (outputs.len >= 2) outputs[1] = zero_point;
+    }
+    return quantized;
+}
+
+/// MatMulInteger computes `(A - a_zero_point) @ (B - b_zero_point)` and
+/// produces i32 values. The native interpreter stores numeric buffers as f32,
+/// but its dot primitive accumulates in f64 before materializing f32; this
+/// matches this reranker's immediate MatMulInteger -> Cast(float) path.
+///
+/// For a 2-D RHS with a per-column zero point, expand the algebra instead of
+/// broadcasting and materializing a centered copy of the full weight matrix:
+///
+///   A' @ (B - b_zp) = A' @ B - reduce_sum(A', K) * b_zp
+fn convertMatMulInteger(builder: *Builder, node: *const NodeProto, inputs: []const NodeId) ConvertError!NodeId {
+    if (inputs.len < 2 or inputs[0] == null_node or inputs[1] == null_node) return error.MissingInput;
+
+    var a = try castDType(builder, inputs[0], .f32);
+    const b = try castDType(builder, inputs[1], .f32);
+    if (inputs.len >= 3 and inputs[2] != null_node) {
+        const a_zero_point = try castDType(builder, inputs[2], .f32);
+        a = try broadcastBinaryOp(builder, .sub, a, a_zero_point);
+    }
+
+    var result = try convertMatMul(builder, node, a, b);
+    if (inputs.len >= 4 and inputs[3] != null_node) {
+        const b_zero_point = try castDType(builder, inputs[3], .f32);
+        const b_shape = builder.graph.node(b).output_shape;
+        const b_zp_shape = builder.graph.node(b_zero_point).output_shape;
+        if (b_shape.rank() == 2 and b_zp_shape.rank() <= 1) {
+            const a_shape = builder.graph.node(a).output_shape;
+            if (a_shape.rank() == 0) return error.ShapeMismatch;
+            const row_sums = try builder.reduceSum(a, &.{a_shape.rank() - 1});
+            const correction = try broadcastBinaryOp(builder, .mul, row_sums, b_zero_point);
+            result = try broadcastBinaryOp(builder, .sub, result, correction);
+        } else {
+            const centered_b = try broadcastBinaryOp(builder, .sub, b, b_zero_point);
+            result = try convertMatMul(builder, node, a, centered_b);
+        }
+    }
+
+    return castDType(builder, result, .i32);
 }
 
 /// Reshape a 1D per-axis tensor to broadcast along a specific axis of the target shape.
@@ -5383,6 +5560,29 @@ test "convertNode Shape materializes dims" {
     try std.testing.expectEqual(@as(i64, 3), out_shape.dim(0));
 }
 
+test "convertNode Shape stays runtime after runtime-targeted Reshape" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("input", Shape.init(.f32, &.{ 1, 512, 768 }));
+    const dim0 = try b.scalarConst(.f32, 12.0);
+    const dim1 = try b.scalarConst(.f32, 512.0);
+    const dim2 = try b.scalarConst(.f32, 64.0);
+    const concat_node = NodeProto{ .op_type = "Concat" };
+    const target = try convertNode(allocator, &b, &concat_node, &.{ dim0, dim1, dim2 }, null);
+
+    const reshape_node = NodeProto{ .op_type = "Reshape" };
+    const reshaped = try convertNode(allocator, &b, &reshape_node, &.{ x, target }, null);
+    try std.testing.expect(g.node(reshaped).op.reshape.runtime_shape);
+    try std.testing.expectEqual(@as(i64, 12), g.node(reshaped).output_shape.dim(0));
+
+    const shape_node = NodeProto{ .op_type = "Shape" };
+    const result = try convertNode(allocator, &b, &shape_node, &.{reshaped}, null);
+    try std.testing.expectEqual(.shape_of, std.meta.activeTag(g.node(result).op));
+}
+
 test "convertNode LayerNormalization emits fused" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -5478,6 +5678,9 @@ test "OpType.fromString Phase 3 ops" {
     try std.testing.expect(OpType.fromString("GatherElements") != null);
     try std.testing.expect(OpType.fromString("CumSum") != null);
     try std.testing.expect(OpType.fromString("DequantizeLinear") != null);
+    try std.testing.expect(OpType.fromString("QuantizeLinear") != null);
+    try std.testing.expect(OpType.fromString("DynamicQuantizeLinear") != null);
+    try std.testing.expect(OpType.fromString("MatMulInteger") != null);
     try std.testing.expect(OpType.fromString("AveragePool") != null);
     try std.testing.expect(OpType.fromString("MaxPool") != null);
     try std.testing.expect(OpType.fromString("GlobalAveragePool") != null);
@@ -5839,6 +6042,47 @@ test "convertNode QuantizeLinear with zero_point" {
     try std.testing.expectEqual(DType.u8, g.node(result).output_shape.dtype);
 }
 
+test "convertNode DynamicQuantizeLinear exposes quantized scale and zero point outputs" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    var outputs = [_]NodeId{ null_node, null_node };
+    var output_names = [_][]const u8{ "y", "y_scale", "y_zero_point" };
+    const node = NodeProto{ .op_type = "DynamicQuantizeLinear", .outputs = &output_names };
+    const quantized = try convertNode(allocator, &b, &node, &.{x}, &outputs);
+
+    try std.testing.expectEqual(DType.u8, g.node(quantized).output_shape.dtype);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, g.node(quantized).output_shape.dims[0..2]);
+    try std.testing.expect(outputs[0] != null_node);
+    try std.testing.expectEqual(DType.f32, g.node(outputs[0]).output_shape.dtype);
+    try std.testing.expectEqual(@as(u8, 0), g.node(outputs[0]).output_shape.rank());
+    try std.testing.expect(outputs[1] != null_node);
+    try std.testing.expectEqual(DType.u8, g.node(outputs[1]).output_shape.dtype);
+    try std.testing.expectEqual(@as(u8, 0), g.node(outputs[1]).output_shape.rank());
+}
+
+test "convertNode MatMulInteger lowers per-column weight zero point without centering weight" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const a = try b.parameter("a", Shape.init(.u8, &.{ 2, 3 }));
+    const weight = try b.parameter("weight", Shape.init(.i8, &.{ 3, 4 }));
+    const a_zero_point = try b.parameter("a_zero_point", Shape.scalar(.u8));
+    const weight_zero_point = try b.parameter("weight_zero_point", Shape.init(.i8, &.{4}));
+    const node = NodeProto{ .op_type = "MatMulInteger" };
+    const result = try convertNode(allocator, &b, &node, &.{ a, weight, a_zero_point, weight_zero_point }, null);
+
+    try std.testing.expectEqual(DType.i32, g.node(result).output_shape.dtype);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4 }, g.node(result).output_shape.dims[0..2]);
+    try std.testing.expectEqual(@as(usize, 1), countOpTag(&g, .dot_general));
+    try std.testing.expectEqual(@as(usize, 1), countOpTag(&g, .reduce_sum));
+}
+
 test "convertNode DequantizeLinear block quantization" {
     const allocator = std.testing.allocator;
     var g = Graph.init(allocator);
@@ -6192,6 +6436,9 @@ test "convertNode Reshape preserves symbolic copied dim in ambiguous target" {
     try std.testing.expectEqual(@as(u8, 2), out_shape.rank());
     try std.testing.expectEqual(@as(i64, 1), out_shape.dim(0));
     try std.testing.expectEqual(@as(i64, -1), out_shape.dim(1));
+    try std.testing.expect(g.node(result).op.reshape.runtime_shape);
+    try std.testing.expectEqual(@as(u8, 2), g.node(result).num_inputs);
+    try std.testing.expectEqual(target, g.node(result).inputs[1]);
 }
 
 test "convertNode Reshape keeps fully symbolic ambiguous target dynamic" {
@@ -6321,6 +6568,29 @@ test "convertNode Expand" {
     const out_shape = g.node(result).output_shape;
     try std.testing.expectEqual(@as(i64, 3), out_shape.dim(0));
     try std.testing.expectEqual(@as(i64, 4), out_shape.dim(1));
+    try std.testing.expectEqual(@as(u8, 2), g.node(result).num_inputs);
+    try std.testing.expectEqual(target, g.node(result).inputs[1]);
+}
+
+test "convertNode GatherElements preserves elementwise semantics" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const data = try b.parameter("data", Shape.init(.f32, &.{ 2, 3, 4 }));
+    const indices = try b.parameter("indices", Shape.init(.i64, &.{ 2, 3, 2 }));
+    var attrs = [_]AttributeProto{
+        .{ .name = "axis", .i = 2 },
+    };
+    const node = NodeProto{ .op_type = "GatherElements", .attributes = &attrs };
+    const result = try convertNode(allocator, &b, &node, &.{ data, indices }, null);
+
+    const gather = g.node(result);
+    try std.testing.expect(gather.op.gather.elements);
+    try std.testing.expectEqual(@as(u8, 2), gather.op.gather.axis);
+    try std.testing.expectEqual(@as(u8, 3), gather.output_shape.rank());
+    try std.testing.expectEqual(@as(i64, 2), gather.output_shape.dim(2));
 }
 
 // ── Coverage Tests: Reductions ──────────────────────────────────────
@@ -6559,6 +6829,20 @@ test "convertNode Reshape still infers inserted split axis for attention heads" 
     try std.testing.expectEqual(@as(i64, 77), out_shape.dim(1));
     try std.testing.expectEqual(@as(i64, 8), out_shape.dim(2));
     try std.testing.expectEqual(@as(i64, 64), out_shape.dim(3));
+}
+
+test "convertNode Reshape infers trailing head dimension from explicit head count" {
+    const allocator = std.testing.allocator;
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var b = Builder.init(&g);
+
+    const x = try b.parameter("attn_hidden", Shape.init(.f32, &.{ 1, 512, 768 }));
+    const target = try b.tensorConst(&.{ 1.0, 512.0, 12.0, -1.0 }, Shape.init(.i64, &.{4}));
+    const node = NodeProto{ .op_type = "Reshape", .name = "split_heads_trailing" };
+    const result = try convertNode(allocator, &b, &node, &.{ x, target }, null);
+    const out_shape = g.node(result).output_shape;
+    try std.testing.expectEqualSlices(i64, &.{ 1, 512, 12, 64 }, out_shape.dims[0..out_shape.rank()]);
 }
 
 test "convertNode Reshape infers split axis when target has two symbolic dims" {
