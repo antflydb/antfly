@@ -1,5 +1,6 @@
 ---
 title: Hybrid Search
+order: 2
 description: Combine keyword and semantic search for better results
 ---
 
@@ -11,23 +12,7 @@ description: Combine keyword and semantic search for better results
 - When should I use hybrid search vs full-text or semantic search alone?
 </Questions>
 
-## Overview
-
-Hybrid search combines two complementary retrieval methods:
-
-- **Full-text search (BM25)** excels at exact keyword matching. It finds documents containing specific terms, phrases, and field-scoped queries. But it misses synonyms and paraphrases entirely -- searching for "automobile" won't find documents about "cars."
-
-- **Semantic search (vector similarity)** understands meaning. It finds conceptually related documents even when they use different words. But it can miss exact matches that a keyword search would catch instantly.
-
-AntflyDB runs both searches in parallel and fuses the results into a single ranked list. You get the precision of keyword matching and the recall of semantic understanding in one query.
-
-## Getting Started
-
-This guide assumes you have AntflyDB running with the Wikipedia dataset from the [quickstart guide](/docs/guides/quickstart). If you haven't set that up yet, start there first.
-
-### Your First Hybrid Query
-
-A hybrid query uses both `--full-text-search` and `--semantic-search` together:
+This guide assumes Antfly is running with the Wikipedia table from the [Quickstart](/docs/guides/quickstart). One query, both retrieval methods:
 
 ```bash
 antfly query --table wikipedia \
@@ -37,6 +22,19 @@ antfly query --table wikipedia \
   --fields "title,url" \
   --limit 10
 ```
+
+`--full-text-search` finds documents that contain the words; `--semantic-search` finds documents that mean the same thing. Antfly runs both and fuses the ranked lists.
+
+## How fusion works
+
+Hybrid search combines two complementary retrieval methods:
+
+- **Full-text search (BM25)** excels at exact keyword matching. It finds documents containing specific terms, phrases, and field-scoped queries. But it misses synonyms and paraphrases entirely -- searching for "automobile" won't find documents about "cars."
+
+- **Semantic search (vector similarity)** understands meaning. It finds conceptually related documents even when they use different words. But it can miss exact matches that a keyword search would catch instantly.
+
+AntflyDB runs both searches in parallel and fuses the results into a single ranked list. You get the precision of keyword matching and the recall of semantic understanding in one query.
+
 
 The same query via the REST API:
 
@@ -121,7 +119,7 @@ curl -X POST http://localhost:8080/v1/query \
   }'
 ```
 
-This is useful in production when your embedding service (Antfly inference, Ollama, or an external provider) might be temporarily unavailable. Your queries will always return results.
+This is useful in production when your embedding service (Antfly Inference, Ollama, or an external provider) might be temporarily unavailable. Your queries will always return results.
 
 <Callout type="tip">
 The `merge_strategy` field is available in the REST API. The CLI uses RRF by default and does not currently expose a flag to change it. Use `curl` or the SDKs if you need RSF or failover.

@@ -13,6 +13,25 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 QUICKSTART = REPO / "docs" / "guides" / "quickstart.mdx"
+# Pages on the launch path (home -> install -> docs). Their fenced blocks and
+# cURL payloads get the same static checks as the quickstart.
+LAUNCH_PAGES = (
+    REPO / "docs" / "index.mdx",
+    REPO / "docs" / "downloads.mdx",
+    REPO / "docs" / "guides" / "inference.mdx",
+    REPO / "docs" / "guides" / "hybrid-search.mdx",
+)
+DOCS_DIR = REPO / "docs"
+# Terminology is fixed, not decorative. Prose must not use these forms.
+BANNED_PHRASES = {
+    "swarm": "say `antfly standalone` or `cluster`; the word swarm does not appear in prose",
+    "pre-alpha": "no release hedges next to a download",
+    "coming soon": "no scarcity phrasing; say invite-only or say nothing",
+    "cutting-edge": "no marketing adjectives in docs",
+    "Search AF": "SearchAF is one word",
+    "Antfly inference": "the ML engine is `Antfly Inference` (capital I)",
+    "Termite": "the ML engine is Antfly Inference, not a separate product",
+}
 GO_EXAMPLE = REPO / "go" / "pkg" / "sdk" / "examples" / "quickstart" / "main.go"
 
 
@@ -36,7 +55,7 @@ def check_component_balance(source: str) -> None:
             fail(f"unbalanced <{component}> components: {opened} open, {closed} close")
 
 
-def check_shell(block: str, index: int) -> None:
+def check_shell(block: str, index: object) -> None:
     result = subprocess.run(
         ["bash", "-n"],
         input=block,
@@ -59,7 +78,40 @@ def check_json_payloads(source: str) -> None:
             fail(f"cURL JSON payload {index} is invalid: {error}")
 
 
+def check_page_blocks(path: Path) -> None:
+    source = path.read_text(encoding="utf-8")
+    check_component_balance(source)
+    for index, (language, block) in enumerate(fenced_blocks(source), start=1):
+        if language in {"bash", "sh", "shell"}:
+            check_shell(block, f"{path.name}#{index}")
+        elif language == "python":
+            try:
+                ast.parse(block)
+            except SyntaxError as error:
+                fail(f"{path.name} Python block {index} does not parse: {error}")
+    for index, payload in enumerate(re.findall(r"\s-d '(\{.*?\})'", source, re.DOTALL), start=1):
+        try:
+            json.loads(payload)
+        except json.JSONDecodeError as error:
+            fail(f"{path.name} cURL JSON payload {index} is invalid: {error}")
+
+
+def check_terminology() -> None:
+    # `antfly inference <cmd>` (the CLI) is fine; the banned form is the prose name.
+    cli_form = re.compile(r"`[^`]*antfly inference[^`]*`|^\s*antfly inference\b", re.MULTILINE)
+    for path in sorted(DOCS_DIR.rglob("*.md*")):
+        source = cli_form.sub("", path.read_text(encoding="utf-8"))
+        for phrase, reason in BANNED_PHRASES.items():
+            for line_number, line in enumerate(source.splitlines(), start=1):
+                if phrase in line:
+                    fail(f"{path.relative_to(REPO)}:{line_number}: {phrase!r} — {reason}")
+
+
 def main() -> int:
+    for page in LAUNCH_PAGES:
+        check_page_blocks(page)
+    check_terminology()
+
     source = QUICKSTART.read_text(encoding="utf-8")
     go_example = GO_EXAMPLE.read_text(encoding="utf-8")
 

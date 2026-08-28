@@ -1,6 +1,7 @@
 ---
-title: Antfly inference
-description: Use Antfly inference for local ML inference — embeddings, chunking, and reranking
+title: Antfly Inference
+order: 4
+description: Use Antfly Inference for local ML inference — embeddings, chunking, and reranking
 prerequisites:
   - Antfly installed and running
 difficulty: beginner
@@ -9,20 +10,28 @@ tags: [inference, embeddings, reranking, models]
 ---
 
 <Questions>
-- What is Antfly inference?
-- How do I download models for Antfly inference?
+- What is Antfly Inference?
+- How do I download models for Antfly Inference?
 - What models are available?
-- How do I use Antfly inference for embeddings, chunking, and reranking?
+- How do I use Antfly Inference for embeddings, chunking, and reranking?
 </Questions>
 
-Antfly inference is Antfly's local ML inference service for embeddings, chunking, and reranking. It runs ONNX-optimized models for fast CPU inference without external API dependencies.
+Pull a model, then embed a sentence through the running engine. Nothing leaves the machine:
 
-## Features
+```bash
+antfly inference pull antflydb/clipclap:gguf:Q4_K
 
-- **Embedding Generation** - Text and multimodal (CLIP) embedding models
-- **Text Chunking** - Semantic chunking with ONNX models or fixed-size fallback
-- **Reranking** - Relevance re-scoring for search results
-- **Privacy** - Data never leaves your infrastructure
+curl -X POST http://localhost:8080/ai/v1/embed \
+  -H "Content-Type: application/json" \
+  -d '{"model":"antflydb/clipclap","input":["a photograph of a lighthouse"]}'
+```
+
+The response is a 512-dimension vector in the OpenAI embeddings shape (`{"object":"list","data":[{"embedding":[...]}]}`).
+
+Antfly Inference is the ML engine inside Antfly. It runs quantized embedding,
+chunking, reranking, extraction, and generation models in the same process as
+the database, so enrichers and query processors call it without a network hop.
+External providers plug in through the same interface.
 
 ## Model Management
 
@@ -87,14 +96,14 @@ Models are stored in `~/.antfly/inference/models/` by default, organized by type
 - `~/.antfly/inference/models/rerankers/` - Reranking models
 - `~/.antfly/inference/models/generators/` - Generation models
 
-Antfly inference auto-discovers and loads models from these directories when Antfly starts in standalone mode. Use `--models-dir` to override the default location.
+Antfly Inference auto-discovers and loads models from these directories when Antfly starts in standalone mode. Use `--models-dir` to override the default location.
 
 For text generation, only a specific set of model architectures is supported. See
 [Supported models](/docs/guides/supported-models) before pulling a generator.
 
 ## Configuration
 
-Antfly inference models can be used in index and query configurations:
+Antfly Inference models can be used in index and query configurations:
 
 ### Embedder Configuration
 

@@ -1,5 +1,6 @@
 ---
 title: Quickstart
+order: 1
 description: Install Antfly, load data, and run your first queries
 prerequisites:
   - "curl and jq (for sample data)"
@@ -12,36 +13,15 @@ This guide walks you through installing Antfly, loading data, and running your f
 
 ## Install Antfly
 
-<Tabs defaultValue="macos">
-  <TabsList>
-    <TabsTrigger value="macos">macOS</TabsTrigger>
-    <TabsTrigger value="linux">Linux</TabsTrigger>
-    <TabsTrigger value="docker">Docker</TabsTrigger>
-  </TabsList>
-
-  <TabsContent value="macos">
-```bash
-brew install antflydb/taps/antfly
-
-# Verify
-antfly --version
-```
-  </TabsContent>
-
-  <TabsContent value="linux">
 ```bash
 curl -fsSL https://releases.antfly.io/antfly/latest/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
-
-# Verify
 antfly --version
 ```
-  </TabsContent>
 
-  <TabsContent value="docker">
-See the [Downloads page](/docs/downloads) for a complete Docker Compose setup with Antfly and Ollama.
-  </TabsContent>
-</Tabs>
+On macOS, `brew install antflydb/taps/antfly` works too. On Windows, run the
+script inside WSL2. Docker and every archive are on the
+[Downloads page](/docs/downloads).
 
 ## Start Antfly
 
@@ -58,7 +38,7 @@ brew services start antfly
 ```
 
 <Callout type="info">
-Standalone mode starts metadata, data nodes, and Antfly inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
+Standalone mode starts metadata, data nodes, and Antfly Inference in a single process — ideal for local development. You can also access the [web dashboard](/docs/guides/dashboard) at `http://localhost:8080` to manage tables, run queries, and monitor your cluster.
 </Callout>
 
 ### Verify the basic data path
@@ -1010,7 +990,7 @@ antfly inference pull ggml-org/gemma-4-E4B-it-GGUF:gguf:Q4_K_M
 ```
 
 <Callout type="info">
-`ggml-org/gemma-4-E4B-it-GGUF` runs locally via Antfly inference and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. The generator config caps output at 128 tokens for predictable local latency. For alternative providers, see the [next step](#rag-with-alternative-providers).
+`ggml-org/gemma-4-E4B-it-GGUF` runs locally via Antfly Inference and supports the full quickstart RAG flow — classification, generation, reasoning, and follow-up questions. The generator config caps output at 128 tokens for predictable local latency. For alternative providers, see the [next step](#rag-with-alternative-providers).
 </Callout>
 
 ### Classify and generate
@@ -1217,7 +1197,7 @@ This command searches for semantically similar articles, reranks and prunes resu
 
 ### RAG with alternative providers
 
-The previous step uses Antfly inference for local inference. You can also use cloud APIs or Ollama:
+The previous step uses Antfly Inference for local inference. You can also use cloud APIs or Ollama:
 
 <Tabs defaultValue="gemini">
   <TabsList>
@@ -1281,7 +1261,7 @@ antfly agents retrieval --table wikipedia \
 
 <Callout type="info">
 **Choosing a generator model:**
-- **`ggml-org/gemma-4-E4B-it-GGUF`** — local GGUF inference via Antfly inference, no API key needed
+- **`ggml-org/gemma-4-E4B-it-GGUF`** — local GGUF inference via Antfly Inference, no API key needed
 - **Ollama `gemma3:4b-it-qat`** — local inference via Ollama, quantized for fast CPU/GPU performance
 - **Gemini `gemini-2.5-flash`** — cloud API, fast and high quality, requires API key
 - **OpenAI `gpt-4.1-mini`** — cloud API, fast and high quality, requires API key
@@ -1416,5 +1396,5 @@ brew services stop antfly
 - How do I create my first table and index?
 - How do I load data into Antfly?
 - How do I run a search query?
-- How do I use RAG with Antfly inference for AI-powered answers?
+- How do I use RAG with Antfly Inference for AI-powered answers?
 </Questions>

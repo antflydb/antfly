@@ -1,5 +1,6 @@
 ---
 title: Antfly Lite Migration
+unlisted: true
 description: Move data between Antfly Lite .aflite databases and normal Antfly deployments
 prerequisites:
   - "Antfly CLI built or installed"
@@ -151,7 +152,7 @@ Common cases:
 
 - Caller-supplied artifacts migrate as stored data and remain queryable.
 - Deferred enrichment work remains pending until a remote provider, local
-  embedded runtime, hosted maintenance worker, or normal Antfly inference
+  embedded runtime, hosted maintenance worker, or normal Antfly Inference
   service is available.
 - A Lite database opened without inference should report
   `no_inference_configured_ok: true`; this is expected for embedded apps that
