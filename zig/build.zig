@@ -7847,6 +7847,7 @@ pub fn build(b: *std.Build) void {
             "storage.docstore.",
             "storage.enrichment.",
             "storage.filesystem_capacity.",
+            "storage.generation_publication.",
             "storage.hbc_adapter.",
             "storage.hierarchy_navigation.",
             "storage.internal_keys.",

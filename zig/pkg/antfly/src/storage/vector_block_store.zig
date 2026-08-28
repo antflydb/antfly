@@ -17,6 +17,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("lsm_backend/mod.zig");
+const generation_publication = @import("generation_publication.zig");
 const vectorindex = @import("antfly_vectorindex");
 const vector_block = vectorindex.vector_block;
 const vector_wal = vectorindex.vector_block_wal;
@@ -477,7 +478,10 @@ pub const Store = struct {
         try atomicReplace(self.alloc, self.storage, next_wal_path, &.{});
         const current_path = try self.currentPathAlloc();
         defer self.alloc.free(current_path);
-        try atomicReplace(self.alloc, self.storage, current_path, encoded);
+        generation_publication.publishControlFile(self.alloc, self.storage, current_path, encoded) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
 
         // CURRENT is now the crash-recovery authority. Replacement bases do
         // not reference any prior block, so unlink those generations before
@@ -597,6 +601,17 @@ pub const Store = struct {
             stats: *BaseBuildStats,
             coverages: []vector_manifest.Coverage,
 
+            fn coverageIndex(ctx: *const @This(), scope_hash: u64) ?usize {
+                var lo: usize = 0;
+                var hi = ctx.coverages.len;
+                while (lo < hi) {
+                    const mid = lo + (hi - lo) / 2;
+                    if (ctx.coverages[mid].scope_hash < scope_hash) lo = mid + 1 else hi = mid;
+                }
+                if (lo >= ctx.coverages.len or ctx.coverages[lo].scope_hash != scope_hash) return null;
+                return lo;
+            }
+
             fn flush(ctx: *@This(), shard: usize) !void {
                 const buffer = &ctx.buffers[shard];
                 if (buffer.items.len == 0) return;
@@ -609,6 +624,7 @@ pub const Store = struct {
                 key: []const u8,
                 artifact: []const u8,
                 vector: []const f32,
+                coverage_index: usize,
             ) !void {
                 const dims = std.math.cast(u32, vector.len) orelse return error.VectorBlockTooLarge;
                 const source_vector_bytes = std.math.mul(usize, vector.len, @sizeOf(f32)) catch return error.VectorBlockTooLarge;
@@ -633,33 +649,33 @@ pub const Store = struct {
                 // query projection use a narrower encoding.
                 ctx.stats.vector_bytes += source_vector_bytes;
                 ctx.stats.artifact_bytes_scanned += artifact.len;
-                if (internal_keys.embeddingArtifactScopeHash(key)) |scope_hash| {
-                    for (ctx.coverages) |*coverage| {
-                        if (coverage.scope_hash < scope_hash) continue;
-                        if (coverage.scope_hash > scope_hash) break;
-                        coverage.vector_count +|= 1;
-                        coverage.key_hash_xor ^= hash;
-                        coverage.key_hash_sum +%= hash;
-                        break;
-                    }
-                }
+                const coverage = &ctx.coverages[coverage_index];
+                coverage.vector_count +|= 1;
+                coverage.key_hash_xor ^= hash;
+                coverage.key_hash_sum +%= hash;
                 if (ctx.buffers[shard].items.len >= ctx.flush_bytes) try ctx.flush(shard);
             }
 
             fn scan(raw_ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!@import("docstore.zig").DocStore.ScanAction {
                 const ctx: *@This() = @ptrCast(@alignCast(raw_ctx orelse return error.InvalidArgument));
                 if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) return .@"continue";
+                // The vector projection is shared by active dense indexes, not
+                // an archive of every historical embedding artifact. Reject
+                // inactive scopes before decoding or spooling their payloads;
+                // multiple indexes sharing one scope still store it once.
+                const scope_hash = internal_keys.embeddingArtifactScopeHash(key) orelse return .@"continue";
+                const coverage_index = ctx.coverageIndex(scope_hash) orelse return .@"continue";
                 const header = try artifact_codec.decodeHeader(value);
                 if (header.kind != .dense_embedding) return .@"continue";
                 const dims = try artifact_codec.decodeDenseEmbeddingDims(value);
                 if (dims == 0) return error.InvalidVectorDimensions;
                 if (try artifact_codec.denseEmbeddingVectorView(value)) |vector| {
-                    try ctx.appendVectorRecord(key, value, vector);
+                    try ctx.appendVectorRecord(key, value, vector, coverage_index);
                 } else {
                     const scratch = try ctx.alloc.alloc(f32, dims);
                     defer ctx.alloc.free(scratch);
                     const vector = try artifact_codec.decodeDenseEmbeddingInto(value, scratch);
-                    try ctx.appendVectorRecord(key, value, vector);
+                    try ctx.appendVectorRecord(key, value, vector, coverage_index);
                 }
                 return .@"continue";
             }
@@ -1494,12 +1510,7 @@ fn boundedReadLimit(max_bytes: usize) usize {
 }
 
 fn atomicReplace(alloc: Allocator, storage: lsm_backend.Storage, path: []const u8, contents: []const u8) !void {
-    var sink = try storage.beginAtomicWrite(alloc, path);
-    var active = true;
-    defer if (active) sink.abort();
-    try sink.appendSlice(contents);
-    active = false;
-    try sink.finish();
+    try generation_publication.replaceImmutable(alloc, storage, path, contents);
 }
 
 test "vector block store publishes base and replays committed WAL" {
@@ -1580,6 +1591,33 @@ test "vector block store publishes base and replays committed WAL" {
         try std.testing.expect(reused.blocks[0].shared == opened.blocks[0].shared);
         try std.testing.expectEqualSlices(f32, &.{ 3.0, 4.0 }, (try reused.get("artifact-a", 3, 2)).vector.vectorView().?);
     }
+}
+
+test "vector block store poisons ambiguous CURRENT publication" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/vector-block-ambiguous-current");
+
+    var writer = try vector_block.Writer.init(alloc, 1, 0, 1, 0);
+    defer writer.deinit();
+    try writer.appendVector("artifact-a", 0, 1, &.{ 1.0, 2.0 });
+    const base = try writer.build();
+    defer alloc.free(base);
+
+    generation_publication.injectPostPublishFailuresForTest(2);
+    try std.testing.expectError(
+        error.GenerationPublicationDurabilityUncertain,
+        store.publishGeneration(1, 0, &.{.{ .shard_id = 0, .bytes = base }}, true),
+    );
+    try std.testing.expect(store.poisoned);
+    try std.testing.expectError(error.VectorBlockStoreRequiresReopen, store.appendCoverage(1, 1, .{}));
+    store.deinit();
+
+    store = try Store.open(alloc, memory.storage(), "/vector-block-ambiguous-current");
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u64, 1), store.manifest.?.base_generation);
+    try std.testing.expectEqual(@as(u64, 0), store.covered_source_sequence);
 }
 
 test "vector block store checkpoints and consolidates sparse delta generations" {
@@ -1801,8 +1839,8 @@ test "vector block store bulk builder stages bounded shared shards" {
         .encoding = .float16,
         .artifact_scope_hashes = &.{embedding_v1_scope},
     });
-    try std.testing.expectEqual(@as(u64, 3), stats.vectors);
-    try std.testing.expectEqual(@as(u64, 36), stats.vector_bytes);
+    try std.testing.expectEqual(@as(u64, 2), stats.vectors);
+    try std.testing.expectEqual(@as(u64, 24), stats.vector_bytes);
 
     // An authoritative snapshot may advance an older base directly when its
     // WAL is empty. This is the safe bootstrap/migration replacement path.
@@ -1831,9 +1869,10 @@ test "vector block store bulk builder stages bounded shared shards" {
     var opened = try Store.openWithBlocks(alloc, memory.storage(), "/vector-block-builder");
     defer opened.deinit();
     try std.testing.expectEqual(Encoding.float16, opened.baseEncoding().?);
-    try std.testing.expectEqual(@as(?u64, 3), opened.baseOnlyVectorCount());
+    try std.testing.expectEqual(@as(?u64, 2), opened.baseOnlyVectorCount());
     try std.testing.expectEqual(@as(u64, 2), opened.baseOnlyCoverage(embedding_v1_scope).?.vector_count);
     try std.testing.expect(opened.baseOnlyCoverage(internal_keys.embeddingArtifactScopeHashForName("embedding-v2")) == null);
+    try std.testing.expect((try opened.get(key_c, 10, null)) == .missing);
     const revision_a = std.hash.XxHash64.hash(0, payload_a2);
     const projected = (try opened.get(key_a, 10, revision_a)).vector;
     var decoded: [3]f32 = undefined;

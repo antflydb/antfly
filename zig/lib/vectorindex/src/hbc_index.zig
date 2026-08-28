@@ -2603,10 +2603,6 @@ fn searchProfiledRequestAttempt(
     try coverage_tracker.prepare(self, scratch);
     if (exhaustive_coverage) try scratch.resetCoverageVisited(self.alloc, published_snapshot.node_count);
 
-    var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
-    defer candidates.deinit(self.alloc);
-    try candidates.ensureTotalCapacity(self.alloc, candidate_capacity);
-
     var approx_results = try search_results.ApproxSearchResults.initCapacity(self.alloc, req.k, candidate_limit, candidate_limit);
     errdefer approx_results.deinit();
     profile.setup_ns += elapsed_fn_u64(setup_start);
@@ -2618,9 +2614,10 @@ fn searchProfiledRequestAttempt(
             @as(usize, @intCast(search_width));
         const initial_probe_limit = @max(configured_probe_count, @as(usize, 1));
         // The flat directory is compact (one id/radius plus a quantized
-        // centroid per posting). Keep the full ordered frontier so selective
-        // filters can advance without rebuilding it and stopping can be based
-        // on a real lower bound instead of the old fixed probe cutoff.
+        // centroid per posting). Keep a bounded ordered frontier with slack so
+        // selective filters can advance without rebuilding it; complete
+        // snapshot requests retain the entire directory for their coverage
+        // contract.
         const search_width_usize: usize = @intCast(search_width);
         const missing_posting_slack = @max(@as(usize, 16), search_width_usize / 100);
         const selection = try spfresh_index.selectFlatPostingsAlloc(
@@ -2628,7 +2625,7 @@ fn searchProfiledRequestAttempt(
             &txn,
             transformed_query,
             search_width_usize +| missing_posting_slack,
-            scratch,
+            &scratch_handle,
             &profile,
             coverage_policy,
             if (exhaustive_coverage) .{
@@ -2641,12 +2638,15 @@ fn searchProfiledRequestAttempt(
             elapsed_fn_u64,
         );
         const probes = selection.probes;
-        defer self.alloc.free(probes);
         const probe_count = probes.len;
+        const effective_initial_probe_limit = if (exhaustive_coverage)
+            probe_count
+        else
+            @min(initial_probe_limit, probe_count);
 
         var flat_leaves_scored: usize = 0;
         var previous_wave_end: usize = 0;
-        var next_wave_end: usize = @min(initial_probe_limit, probe_count);
+        var next_wave_end: usize = effective_initial_probe_limit;
         profile.traversal_initial_wave_leaves = @intCast(@min(next_wave_end, std.math.maxInt(u32)));
         for (probes[0..probe_count], 0..) |probe, i| {
             // Flat routing replaces the tree directory, not the caller's ANN
@@ -2654,7 +2654,7 @@ fn searchProfiledRequestAttempt(
             // weak spheres must not silently turn an approximate query into a
             // full posting scan. Filters retain the same bounded-effort
             // semantics as tree traversal.
-            if (flat_leaves_scored >= @as(usize, @intCast(search_width))) {
+            if (!exhaustive_coverage and flat_leaves_scored >= @as(usize, @intCast(search_width))) {
                 profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
                 break;
             }
@@ -2670,7 +2670,7 @@ fn searchProfiledRequestAttempt(
                 // floor, then expand only when filters or sparse postings have
                 // not filled the requested rerank pool.
                 if (!exhaustive_coverage and approx_results.items.items.len >= candidate_limit) {
-                    profile.traversal_frontier_remaining = @intCast(probe_count - i);
+                    profile.traversal_frontier_remaining = @intCast(selection.total_postings -| i);
                     break;
                 }
 
@@ -2715,6 +2715,13 @@ fn searchProfiledRequestAttempt(
             flat_leaves_scored += 1;
         }
 
+        if (!exhaustive_coverage and
+            profile.traversal_frontier_remaining == 0 and
+            probe_count < selection.total_postings)
+        {
+            profile.traversal_frontier_remaining = @intCast(selection.total_postings - probe_count);
+        }
+
         if (flat_leaves_scored > previous_wave_end) {
             profile.traversal_waves += 1;
             profile.traversal_max_wave_leaves = @max(
@@ -2740,6 +2747,14 @@ fn searchProfiledRequestAttempt(
             return .{ .results = results, .profile = profile };
         }
     }
+
+    // Flat-directory searches return above whenever they have a usable
+    // frontier. Allocate the tree heap only for the tree route (or a genuinely
+    // empty flat directory), avoiding redundant ungoverned work on the common
+    // native flat path.
+    var candidates = std.PriorityQueue(types.PriorityItem, void, search_types.candidateLessThan).initContext({});
+    defer candidates.deinit(self.alloc);
+    try candidates.ensureTotalCapacity(self.alloc, candidate_capacity);
 
     const root_start = now_fn_u64();
     var root_handle = loadNodeReadHandleProfiledWithCachePolicy(self, &txn, root_node_id, &profile, use_search_cache, now_fn_u64, elapsed_fn_u64) catch |err| switch (err) {
@@ -3174,7 +3189,7 @@ const CompleteCoverageTracker = struct {
 
         for (member_ids) |member_id| {
             if (self.assignment_count == assignment_batch_size) {
-                try self.flushAssignments(txn, scratch);
+                try self.flushAssignments(index, txn, scratch);
             }
             scratch.coverage_members[self.assignment_count] = .{
                 .vector_id = member_id,
@@ -3184,7 +3199,7 @@ const CompleteCoverageTracker = struct {
         }
     }
 
-    fn flushAssignments(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
+    fn flushAssignments(self: *CompleteCoverageTracker, index: anytype, txn: anytype, scratch: anytype) !void {
         if (self.assignment_count == 0) return;
         const assignments = scratch.coverage_members[0..self.assignment_count];
         std.mem.sort(search_runtime.CoverageMember, assignments, {}, struct {
@@ -3204,7 +3219,7 @@ const CompleteCoverageTracker = struct {
             _ = hbc.encodeVecLeafKey(&lookups[i].key, assignment.vector_id);
             key_views[i] = lookups[i].key[0..];
         }
-        try txn.getManySorted(.vecs, key_views, values);
+        try getNamespacedManySorted(index, txn, .vecs, key_views, values);
         for (assignments, values) |assignment, maybe_value| {
             const value = maybe_value orelse return error.IncompletePublishedSnapshot;
             if (value.len < @sizeOf(u64) or std.mem.readInt(u64, value[0..8], .little) != assignment.leaf_id) {
@@ -3214,10 +3229,10 @@ const CompleteCoverageTracker = struct {
         self.assignment_count = 0;
     }
 
-    fn validate(self: *CompleteCoverageTracker, txn: anytype, scratch: anytype) !void {
+    fn validate(self: *CompleteCoverageTracker, index: anytype, txn: anytype, scratch: anytype) !void {
         if (!self.enabled) return;
         if (self.observed_count != self.expected_count) return error.IncompletePublishedSnapshot;
-        return self.flushAssignments(txn, scratch);
+        return self.flushAssignments(index, txn, scratch);
     }
 };
 
@@ -3228,7 +3243,7 @@ fn validateCompleteCoverage(
     tracker: *CompleteCoverageTracker,
     generation: u64,
 ) !void {
-    try tracker.validate(txn, scratch);
+    try tracker.validate(self, txn, scratch);
     if (!tracker.enabled) return;
     finishCompleteCoverageValidationIfSupported(self, generation, true);
     tracker.claim_held = false;
@@ -3863,23 +3878,23 @@ const external_rerank_large_set_batch: usize = 128;
 fn externalRerankBatchSize(dims: usize, candidate_count: usize) usize {
     if (candidate_count == 0) return 0;
     const vector_bytes = std.math.mul(usize, @max(dims, 1), @sizeOf(f32)) catch return external_rerank_large_set_batch;
-    const byte_bounded = external_rerank_locality_target_bytes / vector_bytes;
-    const locality_count = @max(byte_bounded, external_rerank_large_set_batch);
-    return if (candidate_count <= locality_count) candidate_count else external_rerank_large_set_batch;
+    // Keep exact reranking interruptible and bound every external fetch by
+    // both candidate count and decoded-vector bytes. In particular, small
+    // dimensions must not turn an ambiguous full shell into one arbitrarily
+    // large request merely because its payload happens to fit in 2 MiB.
+    const byte_bounded = @max(external_rerank_locality_target_bytes / vector_bytes, 1);
+    return @min(candidate_count, @min(external_rerank_large_set_batch, byte_bounded));
 }
 
-test "external rerank locality batch coalesces bounded sets and checkpoints long tails" {
-    // 447 768D float vectors occupy about 1.31 MiB and should be physically
-    // ordered as one read unit. A 900-vector tail stays progressive.
-    try std.testing.expectEqual(@as(usize, 447), externalRerankBatchSize(768, 447));
+test "external rerank batches are bounded by candidates and decoded bytes" {
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(768, 447));
     try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(768, 900));
-    // Higher dimensions reduce the locality window by bytes, not by a
-    // benchmark-specific vector count.
-    try std.testing.expectEqual(@as(usize, 341), externalRerankBatchSize(1536, 341));
-    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(1536, 342));
-    // The bound is expressed in bytes. Low-dimensional sets should not be
-    // fragmented merely because they contain more than 512 vectors.
-    try std.testing.expectEqual(@as(usize, 1025), externalRerankBatchSize(2, 1025));
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(1536, 341));
+    // Very wide vectors remain byte bounded below the ordinary count limit.
+    try std.testing.expectEqual(@as(usize, 32), externalRerankBatchSize(16_384, 128));
+    // Low-dimensional sets retain the latency/cancellation checkpoint.
+    try std.testing.expectEqual(@as(usize, 128), externalRerankBatchSize(2, 1025));
+    try std.testing.expectEqual(@as(usize, 31), externalRerankBatchSize(2, 31));
     try std.testing.expectEqual(@as(usize, 0), externalRerankBatchSize(768, 0));
 }
 
@@ -5198,7 +5213,12 @@ fn populateMetadataBatchedWithScratch(
     for (lookups, 0..) |*lookup, i| key_views[i] = lookup.key[0..];
 
     const fill = if (use_cache) searchCacheFillForTxn(self, txn) else SearchCacheFill{ .guarded = false, .epoch = null };
-    try txn.getManySorted(.vecs, key_views, values);
+    // The index wrapper may layer an immutable native generation over the
+    // compatibility transaction (or use a transaction shell after fully
+    // detaching it). Point metadata reads already honor that ownership map;
+    // keep the batched fast path on the same snapshot rather than bypassing
+    // it through the raw backend transaction.
+    try getNamespacedManySorted(self, txn, .vecs, key_views, values);
     for (values, 0..) |maybe_value, i| {
         const value = maybe_value orelse continue;
         if (use_cache) _ = try cacheMetadataAfterLoad(self, lookups[i].vector_id, value, fill);

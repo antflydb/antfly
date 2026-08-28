@@ -577,6 +577,38 @@ pub const CreatedProviderConfig = struct {
     timeout: ?i64 = null,
 };
 
+/// Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence.
+pub const DenseNativeStoragePhase = enum {
+    legacy,
+    native_building,
+    native_validating,
+    native_authoritative,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .legacy => "legacy",
+            .native_building => "native_building",
+            .native_validating => "native_validating",
+            .native_authoritative => "native_authoritative",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "legacy", .legacy },
+            .{ "native_building", .native_building },
+            .{ "native_validating", .native_validating },
+            .{ "native_authoritative", .native_authoritative },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 /// A structured reason why the coverage projection cannot be treated as globally complete.
 pub const DerivedCoverageObservationIncompleteReason = enum {
     runtime_unavailable,
@@ -914,6 +946,9 @@ pub const EmbeddingsIndexStats = struct {
     dense_replay_target_sequence: ?i64 = null,
     /// Whether dense/vector artifacts still need publication before queries see the latest data.
     dense_publish_pending: ?bool = null,
+    /// Whether the shared native exact-vector projection is still being built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true.
+    dense_vector_projection_pending: ?bool = null,
+    dense_native_storage_phase: ?DenseNativeStoragePhase = null,
     replay_applied_sequence: ?i64 = null,
     replay_target_sequence: ?i64 = null,
     replay_catch_up_required: ?bool = null,

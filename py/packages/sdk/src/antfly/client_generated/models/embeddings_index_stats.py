@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.dense_native_storage_phase import DenseNativeStoragePhase
 from ..models.embeddings_index_stats_index_type import EmbeddingsIndexStatsIndexType
 from ..types import UNSET, Unset
 
@@ -60,6 +61,11 @@ class EmbeddingsIndexStats:
         dense_replay_target_sequence (int | Unset):
         dense_publish_pending (bool | Unset): Whether dense/vector artifacts still need publication before queries see
             the latest data.
+        dense_vector_projection_pending (bool | Unset): Whether the shared native exact-vector projection is still being
+            built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true.
+        dense_native_storage_phase (DenseNativeStoragePhase | Unset): Conservative distributed rollout phase for native
+            WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied
+            current authority evidence.
         replay_applied_sequence (int | Unset):
         replay_target_sequence (int | Unset):
         replay_catch_up_required (bool | Unset):
@@ -128,6 +134,8 @@ class EmbeddingsIndexStats:
     dense_replay_applied_sequence: int | Unset = UNSET
     dense_replay_target_sequence: int | Unset = UNSET
     dense_publish_pending: bool | Unset = UNSET
+    dense_vector_projection_pending: bool | Unset = UNSET
+    dense_native_storage_phase: DenseNativeStoragePhase | Unset = UNSET
     replay_applied_sequence: int | Unset = UNSET
     replay_target_sequence: int | Unset = UNSET
     replay_catch_up_required: bool | Unset = UNSET
@@ -220,6 +228,12 @@ class EmbeddingsIndexStats:
         dense_replay_target_sequence = self.dense_replay_target_sequence
 
         dense_publish_pending = self.dense_publish_pending
+
+        dense_vector_projection_pending = self.dense_vector_projection_pending
+
+        dense_native_storage_phase: str | Unset = UNSET
+        if not isinstance(self.dense_native_storage_phase, Unset):
+            dense_native_storage_phase = self.dense_native_storage_phase.value
 
         replay_applied_sequence = self.replay_applied_sequence
 
@@ -358,6 +372,10 @@ class EmbeddingsIndexStats:
             field_dict["dense_replay_target_sequence"] = dense_replay_target_sequence
         if dense_publish_pending is not UNSET:
             field_dict["dense_publish_pending"] = dense_publish_pending
+        if dense_vector_projection_pending is not UNSET:
+            field_dict["dense_vector_projection_pending"] = dense_vector_projection_pending
+        if dense_native_storage_phase is not UNSET:
+            field_dict["dense_native_storage_phase"] = dense_native_storage_phase
         if replay_applied_sequence is not UNSET:
             field_dict["replay_applied_sequence"] = replay_applied_sequence
         if replay_target_sequence is not UNSET:
@@ -509,6 +527,15 @@ class EmbeddingsIndexStats:
 
         dense_publish_pending = d.pop("dense_publish_pending", UNSET)
 
+        dense_vector_projection_pending = d.pop("dense_vector_projection_pending", UNSET)
+
+        _dense_native_storage_phase = d.pop("dense_native_storage_phase", UNSET)
+        dense_native_storage_phase: DenseNativeStoragePhase | Unset
+        if isinstance(_dense_native_storage_phase, Unset):
+            dense_native_storage_phase = UNSET
+        else:
+            dense_native_storage_phase = DenseNativeStoragePhase(_dense_native_storage_phase)
+
         replay_applied_sequence = d.pop("replay_applied_sequence", UNSET)
 
         replay_target_sequence = d.pop("replay_target_sequence", UNSET)
@@ -636,6 +663,8 @@ class EmbeddingsIndexStats:
             dense_replay_applied_sequence=dense_replay_applied_sequence,
             dense_replay_target_sequence=dense_replay_target_sequence,
             dense_publish_pending=dense_publish_pending,
+            dense_vector_projection_pending=dense_vector_projection_pending,
+            dense_native_storage_phase=dense_native_storage_phase,
             replay_applied_sequence=replay_applied_sequence,
             replay_target_sequence=replay_target_sequence,
             replay_catch_up_required=replay_catch_up_required,

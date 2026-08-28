@@ -15,6 +15,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("lsm_backend/mod.zig");
+const generation_publication = @import("generation_publication.zig");
 const vectorindex = @import("antfly_vectorindex");
 const posting_segment = vectorindex.posting_segment;
 const posting_wal = vectorindex.posting_wal;
@@ -226,9 +227,13 @@ pub const Store = struct {
     }
 
     pub fn markAuthoritative(self: *Store) !void {
+        if (self.poisoned) return error.PostingStoreRequiresReopen;
         const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, authority_name });
         defer self.alloc.free(path);
-        try atomicReplace(self.alloc, self.storage, path, authority_value);
+        generation_publication.publishControlFile(self.alloc, self.storage, path, authority_value) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
     }
 
     pub fn appendBatch(self: *Store, batch_id: u64, records: []const BatchRecord, covered_source_sequence: u64) !void {
@@ -559,7 +564,10 @@ pub const Store = struct {
         const encoded = next_checkpoint.encode();
         const current_path = try self.currentPathAlloc();
         defer self.alloc.free(current_path);
-        try atomicReplace(self.alloc, self.storage, current_path, &encoded);
+        generation_publication.publishControlFile(self.alloc, self.storage, current_path, &encoded) catch |err| {
+            self.poisoned = true;
+            return err;
+        };
 
         const previous = self.checkpoint;
         const previous_wal_generation = self.wal_generation;
@@ -721,12 +729,7 @@ fn boundedReadLimit(max_bytes: usize) usize {
 }
 
 fn atomicReplace(alloc: Allocator, storage: lsm_backend.Storage, path: []const u8, contents: []const u8) !void {
-    var sink = try storage.beginAtomicWrite(alloc, path);
-    var active = true;
-    defer if (active) sink.abort();
-    try sink.appendSlice(contents);
-    active = false;
-    try sink.finish();
+    try generation_publication.replaceImmutable(alloc, storage, path, contents);
 }
 
 fn deleteFileBestEffort(storage: lsm_backend.Storage, path: []const u8) void {
@@ -772,6 +775,34 @@ test "storage.posting segment store publishes checkpoint and committed WAL gener
     var replay = try store.recoverWal();
     defer replay.deinit();
     try std.testing.expectEqualStrings("quant-v2", replay.replay.latest(7, .quantized_checkpoint).?.payload);
+}
+
+test "storage.posting segment store poisons ambiguous CURRENT publication" {
+    const alloc = std.testing.allocator;
+    var memory = lsm_backend.MemoryStorage.init(alloc);
+    defer memory.deinit();
+
+    var store = try Store.open(alloc, memory.storage(), "/posting-ambiguous-current");
+    var writer = posting_segment.Writer.init(alloc);
+    defer writer.deinit();
+    try writer.appendBaseAt(1, 7, "base");
+    const segment = try writer.build();
+    defer alloc.free(segment);
+
+    generation_publication.injectPostPublishFailuresForTest(2);
+    try std.testing.expectError(
+        error.GenerationPublicationDurabilityUncertain,
+        store.publishCheckpoint(1, 7, segment),
+    );
+    try std.testing.expect(store.poisoned);
+    try std.testing.expectError(error.PostingStoreRequiresReopen, store.appendCoverage(1, 8, .{}));
+    try std.testing.expectError(error.PostingStoreRequiresReopen, store.markAuthoritative());
+    store.deinit();
+
+    store = try Store.open(alloc, memory.storage(), "/posting-ambiguous-current");
+    defer store.deinit();
+    try std.testing.expectEqual(@as(u64, 1), store.checkpoint.?.segment_generation);
+    try std.testing.expectEqual(@as(u64, 7), store.covered_source_sequence);
 }
 
 test "storage.posting segment store truncates incomplete WAL tail before append" {

@@ -9947,6 +9947,11 @@ export interface components {
             /** @description Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips. */
             degraded: boolean;
         };
+        /**
+         * @description Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence.
+         * @enum {string}
+         */
+        DenseNativeStoragePhase: "legacy" | "native_building" | "native_validating" | "native_authoritative";
         /** @description Runtime state for the durable embeddings enrichment worker. */
         EnrichmentRuntimeStatus: {
             enabled: boolean;
@@ -10109,6 +10114,9 @@ export interface components {
             dense_replay_target_sequence?: number;
             /** @description Whether dense/vector artifacts still need publication before queries see the latest data. */
             dense_publish_pending?: boolean;
+            /** @description Whether the shared native exact-vector projection is still being built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true. */
+            dense_vector_projection_pending?: boolean;
+            dense_native_storage_phase?: components["schemas"]["DenseNativeStoragePhase"];
             /** Format: uint64 */
             replay_applied_sequence?: number;
             /** Format: uint64 */

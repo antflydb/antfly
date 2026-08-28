@@ -1197,6 +1197,14 @@ components:
         total_embed_ns:
           type: integer
           format: uint64
+    DenseNativeStoragePhase:
+      type: string
+      enum:
+        - legacy
+        - native_building
+        - native_validating
+        - native_authoritative
+      description: "Conservative distributed rollout phase for native WAL-backed dense-index storage. native_authoritative is reported only when every expected shard has supplied current authority evidence."
     EmbeddingsIndexStats:
       type: object
       description: "Statistics for an embeddings index (dense or sparse)"
@@ -1305,6 +1313,13 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           description: "Whether dense/vector artifacts still need publication before queries see the latest data."
+        dense_vector_projection_pending:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: "Whether the shared native exact-vector projection is still being built or reconciled. Queries remain correct by falling back to primary embedding artifacts while this is true."
+        dense_native_storage_phase:
+          x-go-type-skip-optional-pointer: true
+          $ref: '#/components/schemas/DenseNativeStoragePhase'
         replay_applied_sequence:
           x-go-type-skip-optional-pointer: true
           type: integer

@@ -295,6 +295,9 @@ pub fn layeredExactFlatCentroidDirectoryFromReader(
 }
 
 pub const FlatCentroidSelection = struct {
+    /// Borrowed from the request scratch and valid until that handle is
+    /// released. Keeping ownership with the governed scratch avoids an
+    /// unaccounted allocation and retains capacity across requests.
     probes: []FlatCentroidProbe,
     total_postings: usize,
 };
@@ -420,32 +423,58 @@ fn flatProbeScore(probe: FlatCentroidProbe) f32 {
 }
 
 fn flatProbeWorseThan(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) std.math.Order {
-    const lhs_score = flatProbeScore(lhs);
-    const rhs_score = flatProbeScore(rhs);
-    if (lhs_score > rhs_score) return .lt;
-    if (lhs_score < rhs_score) return .gt;
-    // For equal distances the larger stable id is the less desirable row.
-    return std.math.order(rhs.posting_id, lhs.posting_id);
+    if (flatProbeLess({}, rhs, lhs)) return .lt;
+    if (flatProbeLess({}, lhs, rhs)) return .gt;
+    return .eq;
 }
 
+fn siftFlatProbeUp(probes: []FlatCentroidProbe, start_index: usize) void {
+    const child = probes[start_index];
+    var child_index = start_index;
+    while (child_index > 0) {
+        const parent_index = (child_index - 1) >> 1;
+        const parent = probes[parent_index];
+        if (flatProbeWorseThan({}, child, parent) != .lt) break;
+        probes[child_index] = parent;
+        child_index = parent_index;
+    }
+    probes[child_index] = child;
+}
+
+fn siftFlatProbeDown(probes: []FlatCentroidProbe, start_index: usize) void {
+    const parent = probes[start_index];
+    var parent_index = start_index;
+    while (true) {
+        const left_index = parent_index * 2 + 1;
+        if (left_index >= probes.len) break;
+        const right_index = left_index + 1;
+        const worse_child_index = if (right_index < probes.len and
+            flatProbeWorseThan({}, probes[right_index], probes[left_index]) == .lt)
+            right_index
+        else
+            left_index;
+        const worse_child = probes[worse_child_index];
+        if (flatProbeWorseThan({}, worse_child, parent) != .lt) break;
+        probes[parent_index] = worse_child;
+        parent_index = worse_child_index;
+    }
+    probes[parent_index] = parent;
+}
+
+/// Maintain a fixed-capacity max heap whose root is the least desirable
+/// retained probe. Insertion remains O(log k) without allocating a separate
+/// PriorityQueue backing buffer outside the resource governor.
 fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCentroidProbe) void {
     if (probes.len == 0) return;
     if (count.* < probes.len) {
         probes[count.*] = candidate;
+        siftFlatProbeUp(probes[0 .. count.* + 1], count.*);
         count.* += 1;
-    } else {
-        var worst_index: usize = 0;
-        var worst_score = flatAnnScore(probes[0]);
-        for (probes[1..], 1..) |probe, i| {
-            const score = flatAnnScore(probe);
-            if (score > worst_score) {
-                worst_score = score;
-                worst_index = i;
-            }
-        }
-        if (flatAnnScore(candidate) >= worst_score) return;
-        probes[worst_index] = candidate;
+        return;
     }
+    if (!flatProbeLess({}, candidate, probes[0])) return;
+    probes[0] = candidate;
+    siftFlatProbeDown(probes, 0);
 }
 
 fn flatAnnScore(probe: FlatCentroidProbe) f32 {
@@ -501,6 +530,26 @@ test "flat probes do not promote uncertain farther centroids" {
     std.mem.sort(FlatCentroidProbe, &probes, {}, flatProbeLess);
     try std.testing.expectEqual(@as(u64, 2), probes[0].posting_id);
     try std.testing.expectEqual(@as(u64, 1), probes[1].posting_id);
+}
+
+test "bounded flat probe heap retains the best stable frontier" {
+    var retained: [3]FlatCentroidProbe = undefined;
+    var retained_count: usize = 0;
+    const candidates = [_]FlatCentroidProbe{
+        .{ .posting_id = 5, .distance = 0.5, .error_bound = 0 },
+        .{ .posting_id = 2, .distance = 0.2, .error_bound = 0 },
+        .{ .posting_id = 4, .distance = 0.4, .error_bound = 0 },
+        .{ .posting_id = 1, .distance = 0.1, .error_bound = 0 },
+        .{ .posting_id = 3, .distance = 0.3, .error_bound = 0 },
+        // A non-finite routing score is always worse than a finite candidate.
+        .{ .posting_id = 0, .distance = std.math.nan(f32), .error_bound = 0 },
+    };
+    for (candidates) |candidate| insertFlatProbe(&retained, &retained_count, candidate);
+    try std.testing.expectEqual(retained.len, retained_count);
+    std.mem.sort(FlatCentroidProbe, &retained, {}, flatProbeLess);
+    try std.testing.expectEqual(@as(u64, 1), retained[0].posting_id);
+    try std.testing.expectEqual(@as(u64, 2), retained[1].posting_id);
+    try std.testing.expectEqual(@as(u64, 3), retained[2].posting_id);
 }
 
 fn flatMemberLowerBound(
@@ -1198,7 +1247,7 @@ pub fn selectFlatPostingsAlloc(
     txn: anytype,
     query: []const f32,
     max_postings: usize,
-    scratch: anytype,
+    scratch_handle: anytype,
     profile: *search_types.SearchProfile,
     coverage_policy: search_types.CoveragePolicy,
     expected_snapshot: ?PublishedSnapshot,
@@ -1206,13 +1255,16 @@ pub fn selectFlatPostingsAlloc(
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !FlatCentroidSelection {
+    const scratch = &scratch_handle.scratch;
     const start = now_fn_u64();
     const directory = try acquireFlatCentroidDirectory(self, txn, expected_snapshot, cancellation);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
 
     var posting_count: usize = 0;
+    var max_block_count: usize = 0;
     for (directory.blocks) |*block| {
+        max_block_count = @max(max_block_count, block.posting_ids.len);
         for (block.posting_ids) |posting_id| {
             if (postingBitIsSet(block.shadowed_posting_bits, posting_id)) continue;
             posting_count = std.math.add(usize, posting_count, 1) catch return error.OutOfMemory;
@@ -1226,9 +1278,23 @@ pub fn selectFlatPostingsAlloc(
         posting_count
     else
         @min(max_postings, posting_count);
-    var selected = std.PriorityQueue(FlatCentroidProbe, void, flatProbeWorseThan).initContext({});
-    defer selected.deinit(self.alloc);
-    try selected.ensureTotalCapacity(self.alloc, selection_limit);
+    const needs_merge = cancellation != null and selection_limit > cancellable_flat_sort_chunk_size;
+    const previous_accounted_bytes = scratch_handle.accounted_bytes;
+    const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "reserveSearchScratchBytes")) {
+        const target_bytes = try scratch.projectedBytesWithFlatProbeCapacity(
+            selection_limit,
+            needs_merge,
+            max_block_count,
+        );
+        try self.reserveSearchScratchBytes(scratch_handle, target_bytes);
+    }
+    errdefer if (comptime @hasDecl(Index, "rollbackSearchScratchBytes")) {
+        self.rollbackSearchScratchBytes(scratch_handle, previous_accounted_bytes);
+    };
+    try scratch.ensureFlatProbeCapacity(self.alloc, selection_limit, needs_merge);
+    const selected = scratch.flat_probes[0..selection_limit];
+    var selected_count: usize = 0;
     const query_measure: f32 = switch (self.config.metric) {
         .l2_squared => vec.dot(query, query),
         .cosine => vec.norm(query),
@@ -1276,18 +1342,12 @@ pub fn selectFlatPostingsAlloc(
                 .member_lower_bound = member_lower_bound orelse -std.math.inf(f32),
                 .bound_resolved = member_lower_bound != null,
             };
-            if (selected.items.len < selection_limit) {
-                try selected.push(self.alloc, candidate);
-            } else if (selection_limit > 0 and flatProbeLess({}, candidate, selected.peek().?)) {
-                _ = selected.pop();
-                try selected.push(self.alloc, candidate);
-            }
+            insertFlatProbe(selected, &selected_count, candidate);
         }
     }
 
-    const probes = try self.alloc.dupe(FlatCentroidProbe, selected.items);
-    errdefer self.alloc.free(probes);
-    std.mem.sort(FlatCentroidProbe, probes, {}, flatProbeLess);
+    const probes = selected[0..selected_count];
+    try sortFlatProbesCancellable(probes, scratch.flat_probe_merge, cancellation);
     // A suffix bound proves stopping only when the selection contains the
     // complete directory. A bounded top frontier deliberately leaves omitted
     // postings unresolved, preserving approximate-search correctness.

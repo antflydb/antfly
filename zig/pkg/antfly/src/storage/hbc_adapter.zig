@@ -3776,6 +3776,12 @@ pub const HBCIndex = struct {
                 try options.checkAdmission();
                 publish_window += 1;
                 const window_start_ns = nowNs();
+                // Each bounded finish window is one query-generation
+                // publication. The runtime batch owns storage staging, while
+                // this fence prevents staged caches/topology from escaping
+                // before the durable commit advances the published snapshot.
+                try self.beginPublishedSearchStateRefreshIo();
+                errdefer self.abortPublishedSearchStateRefresh();
                 var batch = try self.beginRuntimeBatchTxn();
                 errdefer batch.abort();
                 const split_calls_before = self.write_profile.split_leaf_calls;
@@ -8474,6 +8480,22 @@ pub const HBCIndex = struct {
         return (try base.value(identity.posting_id, identity.kind)) orelse return error.NotFound;
     }
 
+    /// One ownership gateway for every put-shaped mutation, including backend
+    /// append hints. Returning true means the value is already captured by an
+    /// external vector owner, deferred publication map, or native posting WAL
+    /// and must not reach the compatibility backend.
+    fn captureOrStageNamespacedPut(
+        self: *HBCIndex,
+        comptime namespace: Namespace,
+        key: []const u8,
+        value: []const u8,
+    ) !bool {
+        if (namespace == .vecs and isRawVectorKey(key) and self.hasExternalVectorLoader()) return true;
+        const wal_owned = try self.noteExperimentalPostingMutation(namespace, key, value);
+        if (namespace == .nodes and try self.stageNodeKeyPut(key, value)) return true;
+        return wal_owned;
+    }
+
     /// Batch lookups must honor the same immutable transaction lease as point
     /// reads; otherwise rerank metadata and split planning silently fall back
     /// to a newer LSM snapshot than the posting generation.
@@ -8598,10 +8620,7 @@ pub const HBCIndex = struct {
             PublishedWriteTxn,
             PublishedBatchTxn,
             => {
-                if (namespace == .vecs and isRawVectorKey(key) and self.hasExternalVectorLoader()) return;
-                const wal_owned = try self.noteExperimentalPostingMutation(namespace, key, value);
-                if (namespace == .nodes and try self.stageNodeKeyPut(key, value)) return;
-                if (wal_owned) return;
+                if (try self.captureOrStageNamespacedPut(namespace, key, value)) return;
                 try txn.put(namespace, key, value);
                 self.noteNamespacePut(namespace, key.len, value.len, false);
             },
@@ -8613,18 +8632,16 @@ pub const HBCIndex = struct {
     pub fn appendNamespaced(self: *HBCIndex, txn: anytype, comptime namespace: Namespace, key: []const u8, value: []const u8) !void {
         const Child = comptime txnLikeChild(@TypeOf(txn));
         switch (Child) {
-            vectorindex_store.NamespaceWriteTxn, PublishedWriteTxn => {
-                txn.appendPut(namespace, key, value) catch |err| switch (err) {
-                    error.Unsupported => {
-                        try txn.put(namespace, key, value);
-                        self.noteNamespacePut(namespace, key.len, value.len, false);
-                        return;
-                    },
-                    else => return err,
-                };
-                self.noteNamespacePut(namespace, key.len, value.len, true);
-            },
-            vectorindex_store.NamespaceBatch, PublishedBatchTxn => {
+            vectorindex_store.NamespaceWriteTxn,
+            vectorindex_store.NamespaceBatch,
+            PublishedWriteTxn,
+            PublishedBatchTxn,
+            => {
+                // Append is only a compatibility-backend optimization hint;
+                // it is not a separate ownership or durability path. Route it
+                // through the same native capture boundary as put so grouped
+                // ingest cannot escape the posting WAL after activation.
+                if (try self.captureOrStageNamespacedPut(namespace, key, value)) return;
                 txn.appendPut(namespace, key, value) catch |err| switch (err) {
                     error.Unsupported => {
                         try txn.put(namespace, key, value);
@@ -14326,7 +14343,7 @@ test "stale flat directory build preserves the current generation cache" {
         &older_txn,
         &.{ 1, 1, 1, 1 },
         std.math.maxInt(usize),
-        &scratch_handle.scratch,
+        &scratch_handle,
         &profile,
         .complete_snapshot,
         older_snapshot,
@@ -14335,7 +14352,6 @@ test "stale flat directory build preserves the current generation cache" {
         elapsedSince,
     );
     const probes = selection.probes;
-    defer alloc.free(probes);
     try std.testing.expect(probes.len > 0);
 
     lockAtomic(&idx.flat_centroid_mu);
@@ -17803,9 +17819,14 @@ test "posting WAL mutations provide read your writes without derived LSM persist
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(2, .{});
         try std.testing.expectEqual(@as(?[]const u8, null), try idx.getMetadataInTxn(&pinned_before_mutation, 2));
         pinned_before_mutation.abort();
+        try std.testing.expectEqualStrings(
+            "doc:2",
+            (try idx.experimental_posting_read_generation.?.value(2, .vector_metadata)).?,
+        );
         var after_publish = try idx.search(&[_]f32{ 0.0, 1.0 }, 2);
         defer after_publish.deinit();
         try std.testing.expectEqual(@as(usize, 2), after_publish.items.items.len);
+        try std.testing.expectEqual(@as(u64, 2), after_publish.items.items[0].vector_id);
         try std.testing.expectEqualStrings("doc:2", after_publish.items.items[0].metadata.?);
     }
 
@@ -17956,6 +17977,7 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
                 1 => &.{ 1.0, 0.0 },
                 2 => &.{ 0.0, 1.0 },
                 3 => &.{ 0.5, 0.5 },
+                4 => &.{ -0.5, 0.5 },
                 else => return error.NotFound,
             };
             return try loader_alloc.dupe(f32, vector);
@@ -18005,12 +18027,30 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
         }
 
         try idx.beginExperimentalPostingMutationCapture();
-        try idx.batchInsertWithMetadataOptions(&.{.{
-            .vector_id = 3,
-            .vector = &.{ 0.5, 0.5 },
-            .metadata = "doc:3",
-        }}, .{ .skip_vector_store = true });
+        // Exercise the grouped append-only fast path after the irreversible
+        // native authority transition. Metadata and raw-vector skip routing
+        // must share the ordinary put mutation gateway rather than reaching
+        // the fail-closed native transaction shell.
+        try idx.batchInsertWithMetadataOptions(&.{
+            .{ .vector_id = 3, .vector = &.{ 0.5, 0.5 }, .metadata = "doc:3" },
+            .{ .vector_id = 4, .vector = &.{ -0.5, 0.5 }, .metadata = "doc:4" },
+        }, .{
+            .assume_absent_ids = true,
+            .coalesce_leaf_writes = true,
+            .skip_vector_store = true,
+        });
         try idx.persistExperimentalPostingSidecarAtAppliedSequence(3, .{});
+        var native_read = try idx.beginRuntimeReadTxn();
+        defer native_read.abort();
+        try std.testing.expectEqualStrings("doc:3", (try idx.getMetadataInTxn(&native_read, 3)).?);
+        try std.testing.expectEqualStrings("doc:4", (try idx.getMetadataInTxn(&native_read, 4)).?);
+        var complete_results = try idx.searchWithRequest(.{
+            .query = &.{ 0.0, 1.0 },
+            .k = 2,
+            .search_effort = 1,
+        });
+        defer complete_results.deinit();
+        try std.testing.expectEqual(@as(usize, 2), complete_results.items.items.len);
     }
 
     var reopened = try HBCIndex.open(alloc, path, .{
@@ -18025,6 +18065,7 @@ test "authoritative external-vector HBC detaches legacy LSM and reopens native f
     try std.testing.expect(reopened.env_owner == .native);
     reopened.setExternalVectorLoader(&loader_context, Loader.load);
     try std.testing.expectEqual(@as(u64, 3), try reopened.activateExperimentalPostingReadsAtOrAfter(3));
+    try std.testing.expectEqual(@as(u64, 4), reopened.stats().active_count);
     var results = try reopened.search(&.{ 0.0, 1.0 }, 2);
     defer results.deinit();
     try std.testing.expectEqual(@as(usize, 2), results.items.items.len);
