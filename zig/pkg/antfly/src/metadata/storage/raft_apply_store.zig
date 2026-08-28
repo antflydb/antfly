@@ -741,6 +741,33 @@ test "table topology mutation atomically creates and drops catalog ranges" {
     try std.testing.expect(create_projection.fence.membership(table.table_id).eql(
         create_fence.membership(table.table_id),
     ));
+    // A current version marker must not suppress repair after an indexed read
+    // proves that an individual derived row is missing.
+    {
+        var txn = try store.store.beginWriteTxn();
+        var name_key_buf: [640]u8 = undefined;
+        try txn.delete(try tableNameIndexKey(&name_key_buf, metadata_group_id, table.name));
+        try txn.commit();
+    }
+    try std.testing.expectError(
+        error.InvalidDerivedCatalogIndex,
+        store.captureTableDropProjection(std.testing.allocator, metadata_group_id, table.name),
+    );
+    // Marker-based ensure is intentionally cheap and cannot diagnose row
+    // corruption; the explicit rebuild path must restore it.
+    try store.ensureDerivedCatalogIndexes(metadata_group_id);
+    try std.testing.expectError(
+        error.InvalidDerivedCatalogIndex,
+        store.captureTableDropProjection(std.testing.allocator, metadata_group_id, table.name),
+    );
+    try store.rebuildDerivedCatalogIndexes(metadata_group_id);
+    var repaired_projection = (try store.captureTableDropProjection(
+        std.testing.allocator,
+        metadata_group_id,
+        table.name,
+    )).?;
+    repaired_projection.deinit(std.testing.allocator);
+
     // A range admitted after the caller's snapshot advances the table fence.
     // The stale drop must therefore no-op without scanning unrelated ranges.
     const concurrent_range = metadata.RangeRecord{
@@ -2337,6 +2364,26 @@ pub const RaftApplyStore = struct {
         finished = true;
     }
 
+    /// Rebuilds every local derived catalog index from authoritative rows even
+    /// when the version marker is current. Callers use this only after an
+    /// indexed read proves that the marker and its rows disagree.
+    pub fn rebuildDerivedCatalogIndexes(self: *RaftApplyStore, group_id: u64) !void {
+        const io = self.io_impl.io();
+        self.apply_mutex.lockUncancelable(io);
+        defer self.apply_mutex.unlock(io);
+        var txn = try self.store.beginWriteTxn();
+        var finished = false;
+        defer if (!finished) txn.abort();
+        var version_key_buf: [160]u8 = undefined;
+        try txn.delete(try derivedCatalogIndexVersionKey(&version_key_buf, group_id));
+        // Keep the rebuild outside an assertion: ReleaseFast elides assert
+        // evaluation, while this mutation is the production repair itself.
+        if (!try self.ensureDerivedCatalogIndexesTxn(&txn, group_id))
+            return error.InvalidDerivedCatalogIndex;
+        try txn.commit();
+        finished = true;
+    }
+
     pub fn captureTableDropProjection(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
@@ -2360,7 +2407,26 @@ pub const RaftApplyStore = struct {
         var name_key_buf: [640]u8 = undefined;
         const name_key = try tableNameIndexKey(&name_key_buf, group_id, table_name);
         const encoded_table_id = txn.get(name_key) catch |err| switch (err) {
-            error.NotFound => return null,
+            error.NotFound => {
+                // A current marker promises that every primary table has a
+                // name row. Confirm absence against authoritative rows only
+                // on this exceptional miss so corruption cannot become a
+                // false 404 while ordinary indexed reads remain O(1).
+                var table_prefix_buf: [128]u8 = undefined;
+                const rows = try docstore.DocStore.scanPrefixTxn(
+                    alloc,
+                    &txn,
+                    try tablePrefixForGroup(&table_prefix_buf, group_id),
+                );
+                defer freeMetadataSnapshotRows(alloc, rows);
+                for (rows) |row| {
+                    const candidate = try decodeTableRecord(alloc, row.value);
+                    defer metadata_table_manager.freeTable(alloc, candidate);
+                    if (std.mem.eql(u8, candidate.name, table_name))
+                        return error.InvalidDerivedCatalogIndex;
+                }
+                return null;
+            },
             else => return err,
         };
         if (encoded_table_id.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
@@ -2384,8 +2450,8 @@ pub const RaftApplyStore = struct {
             else => return err,
         };
 
-        const indexed_range_group_ids = try self.indexedTableRangeIdsTxn(&txn, group_id, table_id);
-        defer self.alloc.free(indexed_range_group_ids);
+        const indexed_range_group_ids = try self.indexedTableRangeIdsTxn(alloc, &txn, group_id, table_id);
+        errdefer alloc.free(indexed_range_group_ids);
         if (!try self.indexedRangeMembershipMatchesTxn(
             &txn,
             group_id,
@@ -2393,9 +2459,6 @@ pub const RaftApplyStore = struct {
             indexed_range_group_ids,
             fence.membership(table_id),
         )) return error.InvalidDerivedCatalogIndex;
-        const range_group_ids = try alloc.dupe(u64, indexed_range_group_ids);
-        errdefer alloc.free(range_group_ids);
-
         var owner_prefix_buf: [640]u8 = undefined;
         const owner_prefix = try extensionTableOwnerIndexPrefixForTable(
             &owner_prefix_buf,
@@ -2413,7 +2476,7 @@ pub const RaftApplyStore = struct {
             .table = table,
             .fence = fence,
             .extension_owned = extension_owned,
-            .range_group_ids = range_group_ids,
+            .range_group_ids = indexed_range_group_ids,
         };
     }
 
@@ -3872,23 +3935,25 @@ pub const RaftApplyStore = struct {
 
     fn indexedTableRangeIdsTxn(
         self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
         txn: *docstore.DocStore.Txn,
         group_id: u64,
         table_id: u64,
     ) ![]u64 {
+        _ = self;
         var prefix_buf: [192]u8 = undefined;
         const prefix = try tableRangeIndexPrefixForTable(&prefix_buf, group_id, table_id);
         var ids = std.ArrayListUnmanaged(u64).empty;
-        errdefer ids.deinit(self.alloc);
+        errdefer ids.deinit(alloc);
         var cursor = try txn.openCursor();
         defer cursor.close();
         var entry = try cursor.seekAtOrAfter(prefix);
         while (entry) |row| : (entry = try cursor.next()) {
             if (!std.mem.startsWith(u8, row.key, prefix)) break;
             if (row.value.len != @sizeOf(u64)) return error.InvalidDerivedCatalogIndex;
-            try ids.append(self.alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
+            try ids.append(alloc, std.mem.readInt(u64, row.value[0..@sizeOf(u64)], .little));
         }
-        return try ids.toOwnedSlice(self.alloc);
+        return try ids.toOwnedSlice(alloc);
     }
 
     fn indexedRangeMembershipMatchesTxn(
@@ -3956,7 +4021,7 @@ pub const RaftApplyStore = struct {
         table_id: u64,
         expected: topology_protocol.RangeMembership,
     ) !?[]u64 {
-        var ids = self.indexedTableRangeIdsTxn(txn, group_id, table_id) catch |err| switch (err) {
+        var ids = self.indexedTableRangeIdsTxn(self.alloc, txn, group_id, table_id) catch |err| switch (err) {
             error.InvalidDerivedCatalogIndex => try self.rebuildTableRangeIndexTxn(txn, group_id, table_id),
             else => return err,
         };

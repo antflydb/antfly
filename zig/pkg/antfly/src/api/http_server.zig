@@ -12304,6 +12304,17 @@ pub const ApiHttpServer = struct {
         if (self.table_writes) |writes| {
             _ = writes.dropTable(self.alloc, table_name, drop_result.group_ids) catch |err| switch (err) {
                 error.TableNotFound => null,
+                error.DropCleanupIntentNotDurable => {
+                    std.log.err("MCP drop table committed but cleanup intent was not durable table={s}", .{table_name});
+                    const body = try std.json.Stringify.valueAlloc(
+                        self.alloc,
+                        .{ .status = "committed_repair_unavailable" },
+                        .{},
+                    );
+                    // The metadata mutation committed; surface operator debt
+                    // without reporting a replay-safe request failure.
+                    return contextual_operations.jsonWithStatus(202, body, false);
+                },
                 else => {
                     repair_required = true;
                     std.log.warn("MCP drop table committed with local cleanup repair required table={s} err={s}", .{ table_name, @errorName(err) });

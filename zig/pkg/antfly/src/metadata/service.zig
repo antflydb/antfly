@@ -6119,7 +6119,9 @@ pub const MetadataHttpService = struct {
 
     /// Capture every apply-time drop precondition from one storage read
     /// transaction. Derived indexes are repaired before the read, outside the
-    /// Raft runtime critical section, so admission is O(1) in cluster size.
+    /// Raft runtime critical section. Work is proportional to this table's
+    /// ranges, never to unrelated cluster ranges, and ownership is transferred
+    /// without another range-id copy.
     pub fn captureTableDropAdmission(
         self: *MetadataHttpService,
         alloc: std.mem.Allocator,
@@ -6128,25 +6130,36 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var attempt: u8 = 0;
         while (attempt < 2) : (attempt += 1) {
-            try store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            if (attempt == 0) {
+                try store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            } else {
+                try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            }
             var projection = (store.captureTableDropProjection(
                 alloc,
                 self.metadata_group_id,
                 table_name,
             ) catch |err| switch (err) {
-                // Snapshot install atomically removes local indexes. Retry
-                // once after rebuilding instead of exposing a false 404.
+                // Snapshot install atomically removes local indexes, while a
+                // damaged row can disagree with a still-current marker. Force
+                // one authoritative rebuild instead of repeating ensure.
                 error.InvalidDerivedCatalogIndex => continue,
                 else => return err,
             }) orelse return error.TableNotFound;
             defer projection.deinit(alloc);
-            return try tableDropAdmissionFromProjection(
-                alloc,
-                &projection.table,
-                projection.fence,
-                projection.extension_owned,
-                projection.range_group_ids,
-            );
+            if (projection.fence.active()) return error.TableTransitionActive;
+            if (projection.extension_owned) return error.ExtensionOwnedObject;
+            const expected_name = try alloc.dupe(u8, projection.table.name);
+            errdefer alloc.free(expected_name);
+            const range_group_ids = projection.range_group_ids;
+            projection.range_group_ids = &.{};
+            return .{
+                .table_id = projection.table.table_id,
+                .expected_name = expected_name,
+                .expected_transition_generation = projection.fence.generation,
+                .range_membership = projection.fence.membership(projection.table.table_id),
+                .range_group_ids = range_group_ids,
+            };
         }
         return error.InvalidDerivedCatalogIndex;
     }

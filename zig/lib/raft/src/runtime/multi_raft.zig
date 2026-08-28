@@ -35,10 +35,6 @@ pub const RuntimeConfig = struct {
     max_transport_bytes_per_round: usize = std.math.maxInt(usize),
     max_pending_apply_tasks: usize = std.math.maxInt(usize),
     max_pending_apply_bytes: usize = std.math.maxInt(usize),
-    /// Hard ceiling for the cloned payload of any one Ready. Pending queue
-    /// byte limits remain soft for liveness, but a single item may never turn
-    /// that exception into an unbounded allocation.
-    max_single_ready_bytes: usize = std.math.maxInt(usize),
     max_apply_tasks_per_round: usize = std.math.maxInt(usize),
     applied_log_retained_entries: u64 = 4096,
     applied_log_compaction_min_interval_entries: u64 = 4096,
@@ -1046,24 +1042,6 @@ pub const MultiRaft = struct {
         const apply_ready_bytes = ready_pressure.snapshot_bytes +|
             ready_pressure.committed_entry_bytes +|
             approxReadStatesSize(ready.read_states);
-        const single_ready_bytes = ready_pressure.message_bytes +| apply_ready_bytes;
-        if (single_ready_bytes > self.cfg.max_single_ready_bytes) {
-            if (diagnostics) |diag| {
-                diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
-                if (ready_pressure.message_bytes > 0) {
-                    diag.denied_by_transport_capacity = true;
-                } else {
-                    diag.denied_by_apply_capacity = true;
-                }
-            }
-            if (ready_pressure.message_bytes > 0) {
-                self.metrics.transport_queue_denials += 1;
-            } else {
-                self.metrics.apply_queue_denials += 1;
-            }
-            self.scheduler.deferReady(group_id);
-            return false;
-        }
         const outbound_capacity_available = self.hasOutboundCapacity(
             outbox.items.items.len +| ready_pressure.message_count,
             outbox.approxBytes() +| ready_pressure.message_bytes,

@@ -51,9 +51,6 @@ fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
         .max_transport_bytes_per_round = 512 * 1024,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
-        // Metadata snapshots and apply batches are expected to stay compact;
-        // retain one-item progress without permitting an unbounded clone.
-        .max_single_ready_bytes = 64 * 1024 * 1024,
         .max_apply_tasks_per_round = 16,
         .applied_log_retained_entries = metadata_raft_retained_entries,
         .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,

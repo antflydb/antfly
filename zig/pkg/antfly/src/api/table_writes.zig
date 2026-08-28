@@ -465,6 +465,10 @@ fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
 }
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
+const dropped_table_repair_dir_name = ".antfly-drop-repair";
+const dropped_table_repair_magic = "AFDROP1\x00";
+const max_dropped_table_repair_bytes: usize = 256 * 1024 * 1024;
+const max_dropped_table_repair_name_bytes: usize = 16 * 1024;
 
 fn accumulateTextMemoryAttributionStats(dst: *db_mod.TextMemoryAttributionStats, src: db_mod.TextMemoryAttributionStats) void {
     dst.text_indexes +|= src.text_indexes;
@@ -916,22 +920,33 @@ fn parseDocumentArtifactTableReprocessResultAlloc(alloc: std.mem.Allocator, body
 const DroppedTableDeleteWork = struct {
     path: []u8,
 
-    fn deletePath(path: []const u8, log_failure: bool) !void {
+    fn deletePath(path: []const u8) !void {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
-        runTestBeforeDropTableDeleteHook();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch |err| {
-            if (!log_failure) return err;
-            std.log.warn("background dropped-table delete failed path={s} err={s}", .{
-                path,
-                @errorName(err),
-            });
-        };
+        var attempt: u8 = 0;
+        while (attempt < 6) : (attempt += 1) {
+            runTestBeforeDropTableDeleteHook();
+            std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch |err| {
+                if (err == error.FileNotFound) return;
+                if (attempt == 5) return err;
+                const delay_ms: u64 = @as(u64, 25) << @intCast(attempt);
+                io_impl.io().sleep(.fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
+                continue;
+            };
+            return;
+        }
     }
 
     fn run(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try deletePath(self.path, true);
+        deletePath(self.path) catch |err| {
+            // The path remains under the durable trash root. A later recovery
+            // sweep or process restart retries it without blocking DDL.
+            std.log.warn("background dropped-table delete deferred path={s} err={s}", .{
+                self.path,
+                @errorName(err),
+            });
+        };
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -943,6 +958,136 @@ const DroppedTableDeleteWork = struct {
 
 fn droppedTableTrashDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, dropped_table_trash_dir_name });
+}
+
+fn droppedTableRepairDirPath(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ replica_root_dir, dropped_table_repair_dir_name });
+}
+
+fn droppedTableRepairIntentPath(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    table_name: []const u8,
+    group_ids: []const u64,
+) ![]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    var encoded_len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_len, table_name.len, .little);
+    hasher.update(&encoded_len);
+    hasher.update(table_name);
+    std.mem.writeInt(u64, &encoded_len, group_ids.len, .little);
+    hasher.update(&encoded_len);
+    for (group_ids) |group_id| {
+        std.mem.writeInt(u64, &encoded_len, group_id, .little);
+        hasher.update(&encoded_len);
+    }
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    const digest_hex = std.fmt.bytesToHex(digest, .lower);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}/drop-{s}.bin", .{
+        replica_root_dir,
+        dropped_table_repair_dir_name,
+        &digest_hex,
+    });
+}
+
+const DroppedTableRepairIntent = struct {
+    table_name: []u8,
+    group_ids: []u64,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.group_ids);
+        self.* = undefined;
+    }
+};
+
+fn persistDroppedTableRepairIntent(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    table_name: []const u8,
+    group_ids: []const u64,
+) ![]u8 {
+    if (table_name.len > max_dropped_table_repair_name_bytes) return error.NameTooLong;
+    const payload_bytes = std.math.add(usize, table_name.len, std.math.mul(usize, group_ids.len, @sizeOf(u64)) catch return error.DropRepairIntentTooLarge) catch return error.DropRepairIntentTooLarge;
+    const checksum_len = std.crypto.hash.sha2.Sha256.digest_length;
+    if (payload_bytes > max_dropped_table_repair_bytes - 20 - checksum_len) return error.DropRepairIntentTooLarge;
+
+    const repair_dir = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir);
+    const path = try droppedTableRepairIntentPath(alloc, replica_root_dir, table_name, group_ids);
+    errdefer alloc.free(path);
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, repair_dir);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buf: [16 * 1024]u8 = undefined;
+        var writer = file.writer(io, &buf);
+        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+        try writer.interface.writeAll(dropped_table_repair_magic);
+        checksum.update(dropped_table_repair_magic);
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u32, encoded[0..4], @intCast(table_name.len), .little);
+        try writer.interface.writeAll(encoded[0..4]);
+        checksum.update(encoded[0..4]);
+        std.mem.writeInt(u64, &encoded, @intCast(group_ids.len), .little);
+        try writer.interface.writeAll(&encoded);
+        checksum.update(&encoded);
+        try writer.interface.writeAll(table_name);
+        checksum.update(table_name);
+        for (group_ids) |group_id| {
+            std.mem.writeInt(u64, &encoded, group_id, .little);
+            try writer.interface.writeAll(&encoded);
+            checksum.update(&encoded);
+        }
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        checksum.final(&digest);
+        try writer.interface.writeAll(&digest);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try fs_paths.syncDirPortable(io, repair_dir);
+    return path;
+}
+
+fn loadDroppedTableRepairIntent(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) !DroppedTableRepairIntent {
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_dropped_table_repair_bytes));
+    defer alloc.free(encoded);
+    const checksum_len = std.crypto.hash.sha2.Sha256.digest_length;
+    if (encoded.len < 20 + checksum_len or !std.mem.eql(u8, encoded[0..8], dropped_table_repair_magic)) return error.InvalidDropRepairIntent;
+    const name_len: usize = std.mem.readInt(u32, encoded[8..12], .little);
+    const group_count_u64 = std.mem.readInt(u64, encoded[12..20], .little);
+    const group_count = std.math.cast(usize, group_count_u64) orelse return error.InvalidDropRepairIntent;
+    if (name_len > max_dropped_table_repair_name_bytes) return error.InvalidDropRepairIntent;
+    const group_bytes = std.math.mul(usize, group_count, @sizeOf(u64)) catch return error.InvalidDropRepairIntent;
+    const payload_end = std.math.add(usize, 20 + name_len, group_bytes) catch return error.InvalidDropRepairIntent;
+    const expected_len = std.math.add(usize, payload_end, checksum_len) catch return error.InvalidDropRepairIntent;
+    if (expected_len != encoded.len) return error.InvalidDropRepairIntent;
+    var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(encoded[0..payload_end], &actual_digest, .{});
+    if (!std.mem.eql(u8, &actual_digest, encoded[payload_end..])) return error.InvalidDropRepairIntent;
+    const table_name = try alloc.dupe(u8, encoded[20 .. 20 + name_len]);
+    errdefer alloc.free(table_name);
+    const group_ids = try alloc.alloc(u64, group_count);
+    errdefer alloc.free(group_ids);
+    var offset = 20 + name_len;
+    for (group_ids) |*group_id| {
+        group_id.* = std.mem.readInt(u64, encoded[offset..][0..8], .little);
+        offset += 8;
+    }
+    return .{ .table_name = table_name, .group_ids = group_ids };
 }
 
 fn droppedTableTrashPath(
@@ -984,6 +1129,9 @@ fn moveDroppedGroupPathToTrash(
         },
         else => return err,
     };
+    // Persist removal from the live group immediately. The caller batches the
+    // shared trash-directory sync once after every group rename.
+    try fs_paths.syncDirPortable(io_impl.io(), std.fs.path.dirname(path) orelse replica_root_dir);
     return trash_path;
 }
 
@@ -5891,6 +6039,8 @@ pub const ProvisionedTableWriteSource = struct {
     startup_write_cache: ?*ProvisionedTableWriteCache = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     dropped_table_delete_owner_id: u64 = 0,
+    dropped_table_recovery_started: std.atomic.Value(bool) = .init(false),
+    dropped_table_recovery_scheduled: std.atomic.Value(bool) = .init(false),
     restore_repair_work_group: Io.Group = .init,
     restore_repair_shutdown: std.atomic.Value(bool) = .init(false),
     restore_repair_completion_mutex: Io.Mutex = .init,
@@ -6759,6 +6909,127 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    fn removeDroppedTableRepairIntent(path: []const u8) !void {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        std.Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
+    }
+
+    fn recoverDroppedTableTrash(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !void {
+        const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
+        defer alloc.free(trash_dir_path);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, trash_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ trash_dir_path, entry.name });
+            if (self.scheduleDroppedGroupDelete(path) catch false) {
+                alloc.free(path);
+            } else {
+                defer alloc.free(path);
+                DroppedTableDeleteWork.deletePath(path) catch |delete_err| {
+                    std.log.warn("dropped-table trash recovery deferred path={s} err={s}", .{ path, @errorName(delete_err) });
+                };
+            }
+        }
+    }
+
+    fn recoverDroppedTableRepairIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !void {
+        const repair_dir_path = try droppedTableRepairDirPath(alloc, self.replica_root_dir);
+        defer alloc.free(repair_dir_path);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        var dir = std.Io.Dir.cwd().openDir(io, repair_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bin")) continue;
+            const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ repair_dir_path, entry.name });
+            defer alloc.free(path);
+            var intent = loadDroppedTableRepairIntent(alloc, io, path) catch |err| {
+                std.log.err("invalid dropped-table repair intent retained path={s} err={s}", .{ path, @errorName(err) });
+                continue;
+            };
+            defer intent.deinit(alloc);
+            self.executeDroppedTableCleanup(alloc, intent.table_name, intent.group_ids, false) catch |err| {
+                std.log.warn("dropped-table repair deferred table={s} path={s} err={s}", .{ intent.table_name, path, @errorName(err) });
+                continue;
+            };
+            removeDroppedTableRepairIntent(path) catch |err| {
+                std.log.warn("completed dropped-table repair intent retained path={s} err={s}", .{ path, @errorName(err) });
+            };
+        }
+    }
+
+    fn runDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+        const alloc = std.heap.page_allocator;
+        self.recoverDroppedTableRepairIntents(alloc) catch |err| {
+            std.log.warn("dropped-table intent recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+        };
+        self.recoverDroppedTableTrash(alloc) catch |err| {
+            std.log.warn("dropped-table trash recovery scan deferred root={s} err={s}", .{ self.replica_root_dir, @errorName(err) });
+        };
+    }
+
+    fn scheduleDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+        if (self.quiesced) return;
+        if (self.dropped_table_recovery_scheduled.swap(true, .acq_rel)) return;
+        const runtime = self.backend_runtime orelse {
+            self.runDroppedTableRecovery();
+            self.dropped_table_recovery_scheduled.store(false, .release);
+            return;
+        };
+        const Work = struct {
+            source: *ProvisionedTableWriteSource,
+
+            fn run(ptr: *anyopaque) !void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                work.source.runDroppedTableRecovery();
+            }
+
+            fn deinit(ptr: *anyopaque) void {
+                const work: *@This() = @ptrCast(@alignCast(ptr));
+                work.source.dropped_table_recovery_scheduled.store(false, .release);
+                std.heap.page_allocator.destroy(work);
+            }
+        };
+        const work = std.heap.page_allocator.create(Work) catch {
+            self.dropped_table_recovery_scheduled.store(false, .release);
+            return;
+        };
+        work.* = .{ .source = self };
+        runtime.durable_jobs.submit(.{
+            .owner_id = self.droppedTableDeleteOwnerId(runtime) catch {
+                std.heap.page_allocator.destroy(work);
+                self.dropped_table_recovery_scheduled.store(false, .release);
+                return;
+            },
+            .class = .cleanup,
+            .ptr = work,
+            .run = Work.run,
+            .deinit = Work.deinit,
+        }) catch {
+            std.heap.page_allocator.destroy(work);
+            self.dropped_table_recovery_scheduled.store(false, .release);
+        };
+    }
+
     fn scheduleDroppedGroupDelete(self: *ProvisionedTableWriteSource, path: []const u8) !bool {
         const runtime = self.backend_runtime orelse return false;
         const work = try std.heap.page_allocator.create(DroppedTableDeleteWork);
@@ -6779,7 +7050,7 @@ pub const ProvisionedTableWriteSource = struct {
     fn deleteDroppedGroupPath(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, path: []u8) !void {
         defer alloc.free(path);
         if (self.scheduleDroppedGroupDelete(path) catch false) return;
-        try DroppedTableDeleteWork.deletePath(path, false);
+        try DroppedTableDeleteWork.deletePath(path);
     }
 
     fn findTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8, group_id: ?u64) ?usize {
@@ -14184,6 +14455,12 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     pub fn source(self: *ProvisionedTableWriteSource) TableWriteSource {
+        // The intent directory is the durable owner of post-commit table-drop
+        // repair. Scheduling on source publication covers startup and keeps
+        // retry work off latency-sensitive request paths when a runtime exists.
+        if (!self.dropped_table_recovery_started.swap(true, .acq_rel)) {
+            self.scheduleDroppedTableRecovery();
+        }
         return .{
             .ptr = self,
             .vtable = &.{
@@ -14674,17 +14951,13 @@ pub const ProvisionedTableWriteSource = struct {
         self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
     }
 
-    fn dropTable(
-        ptr: *anyopaque,
+    fn executeDroppedTableCleanup(
+        self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
         group_ids: []const u64,
-    ) !?void {
-        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, group_ids);
-        try enforceHAWriteGateOptional(self.ha_write_gate);
-        if (group_ids.len == 0) return null;
-
+        retire_publication_authority: bool,
+    ) !void {
         // A durable index repair owns group admission while it advances one
         // bounded build slice. Publish cancellation before waiting for the
         // table-wide structural barrier so dropping a table cannot sit behind
@@ -14706,6 +14979,13 @@ pub const ProvisionedTableWriteSource = struct {
                 self.abortLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
             }
         };
+        // Publication handoffs are process-local and belong to the table
+        // incarnation that just committed its drop. Retire them before the
+        // first fallible cleanup step. A later durable replay skips this step
+        // so a newly created table with the same name remains authoritative.
+        if (retire_publication_authority) {
+            self.retireDroppedTablePublicationAuthority(table_name);
+        }
         var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
         defer {
             if (read_cache_exclusive) |*exclusive| exclusive.deinit();
@@ -14714,22 +14994,67 @@ pub const ProvisionedTableWriteSource = struct {
         local_db_mutex_held = false;
         self.drainWriteCachePendingClosesForGroups(table_name, group_ids);
 
+        var moved_any_group = false;
         for (group_ids) |group_id| {
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
             self.invalidateSharedPathCaches(path);
             const trash_path = try moveDroppedGroupPathToTrash(alloc, self.replica_root_dir, table_name, group_id);
             if (trash_path) |dropped_path| {
+                moved_any_group = true;
                 try self.deleteDroppedGroupPath(alloc, dropped_path);
             }
         }
-        self.retireDroppedTablePublicationAuthority(table_name);
+        if (moved_any_group) {
+            const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
+            defer alloc.free(trash_dir_path);
+            var io_impl = std.Io.Threaded.init(alloc, .{});
+            defer io_impl.deinit();
+            // The repair intent is removed only after both sides of every
+            // rename are durable. One shared-directory sync avoids an fsync
+            // per range while preserving crash recovery.
+            try fs_paths.syncDirPortable(io_impl.io(), trash_dir_path);
+        }
         self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
         structural_mutation_active = false;
         for (group_ids) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
         }
         self.notifyLocalChange(table_name, .structural);
+    }
+
+    fn dropTable(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        group_ids: []const u64,
+    ) !?void {
+        const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, group_ids);
+        if (group_ids.len == 0) return null;
+
+        // Metadata has already committed. Persist the exact cleanup contract
+        // before any fallible cache/filesystem operation so every later
+        // failure has a restart-safe, idempotent recovery owner.
+        const intent_path = persistDroppedTableRepairIntent(
+            alloc,
+            self.replica_root_dir,
+            table_name,
+            group_ids,
+        ) catch return error.DropCleanupIntentNotDurable;
+        defer alloc.free(intent_path);
+
+        // This is convergence for a metadata mutation that has already
+        // committed, not admission of a new user write. It must run on a
+        // standby as well as the active writer owner.
+        self.executeDroppedTableCleanup(alloc, table_name, group_ids, true) catch |err| {
+            if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
+            return err;
+        };
+        removeDroppedTableRepairIntent(intent_path) catch |err| {
+            if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
+            return err;
+        };
     }
 
     fn canCoalesceProvisionedGroupBatch(self: *ProvisionedTableWriteSource, group: GroupBatch, req: db_mod.types.BatchRequest) bool {
@@ -42560,6 +42885,64 @@ test "provisioned table write source drop table cancels index repair before stru
     try std.testing.expect(probe.remove_seen.isSet());
     try std.testing.expect(probe.clear_seen.isSet());
     try std.testing.expect(!probe.invalid_sequence.isSet());
+}
+
+test "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/provisioned-drop-table-durable-repair",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(group_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), group_path);
+    const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
+    defer alloc.free(trash_dir_path);
+    {
+        var obstruction = try fs_paths.createFilePortable(io_impl.io(), trash_dir_path, .{ .truncate = true });
+        obstruction.close(io_impl.io());
+    }
+
+    {
+        var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+        defer source.deinit();
+        var cleanup_failed = false;
+        _ = source.source().dropTable(alloc, "docs", &.{7001}) catch blk: {
+            cleanup_failed = true;
+            break :blk null;
+        };
+        try std.testing.expect(cleanup_failed);
+        try std.Io.Dir.cwd().access(io_impl.io(), group_path, .{});
+
+        const repair_dir_path = try droppedTableRepairDirPath(alloc, replica_root_dir);
+        defer alloc.free(repair_dir_path);
+        var repair_dir = try std.Io.Dir.cwd().openDir(io_impl.io(), repair_dir_path, .{ .iterate = true });
+        defer repair_dir.close(io_impl.io());
+        var iterator = repair_dir.iterate();
+        const entry = (try iterator.next(io_impl.io())) orelse return error.MissingDropRepairIntent;
+        try std.testing.expect(std.mem.endsWith(u8, entry.name, ".bin"));
+    }
+    try std.Io.Dir.cwd().deleteFile(io_impl.io(), trash_dir_path);
+
+    {
+        var recovered = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+        defer recovered.deinit();
+        recovered.runDroppedTableRecovery();
+    }
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), group_path, .{}));
+
+    const repair_dir_path = try droppedTableRepairDirPath(alloc, replica_root_dir);
+    defer alloc.free(repair_dir_path);
+    var repair_dir = try std.Io.Dir.cwd().openDir(io_impl.io(), repair_dir_path, .{ .iterate = true });
+    defer repair_dir.close(io_impl.io());
+    var iterator = repair_dir.iterate();
+    try std.testing.expect((try iterator.next(io_impl.io())) == null);
 }
 
 test "provisioned table write source drop table retires old publication authority" {

@@ -4336,11 +4336,18 @@ pub const AntflyApiHandler = struct {
         if (self.api_server.table_writes) |write_source| {
             _ = write_source.dropTable(alloc, decoded_table_name, drop_result.group_ids) catch |err| switch (err) {
                 error.TableNotFound => null,
+                error.DropCleanupIntentNotDurable => {
+                    std.log.err("public drop table committed but cleanup intent was not durable table={s}", .{decoded_table_name});
+                    // The metadata drop committed, so never invite an
+                    // automatic DDL replay with a generic failure status.
+                    _ = ctx.status(202);
+                    return ctx.json(.{ .status = "committed_repair_unavailable" });
+                },
                 else => {
-                    // Metadata is already committed. The storage owner first
-                    // atomically renames each group into durable trash and its
-                    // cleanup worker is idempotent, so surface repair debt
-                    // without inviting the client to replay the DDL.
+                    // Metadata is already committed and dropTable persisted
+                    // the exact cleanup contract before local mutation. The
+                    // recovery worker owns idempotent completion, so surface
+                    // repair debt without inviting a replay of the DDL.
                     repair_required = true;
                     std.log.warn("public drop table committed with local cleanup repair required table={s} err={s}", .{ decoded_table_name, @errorName(err) });
                 },

@@ -6281,6 +6281,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table write source read request permits replicated apply activity",
             "provisioned table group operation waiter queues ahead of later readers",
             "provisioned table write source drop table cancels index repair before structural admission",
+            "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
             "provisioned table write source drop table retires old publication authority",
             "provisioned table write request queues structural reconcile ahead of later writes",
             "structural reconcile reservation defers metadata group refresh without blocking admitted work",
