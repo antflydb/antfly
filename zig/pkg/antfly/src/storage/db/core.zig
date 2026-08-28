@@ -1277,6 +1277,30 @@ pub const DBCore = struct {
         return txn_id;
     }
 
+    pub fn beginTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        timestamp_ns: u64,
+        created_at_ns: u64,
+        participants: []const []const u8,
+        coordinator: bool,
+        retain_terminal: bool,
+        extra_batch: transactions_mod.MutationExtraBatch,
+    ) !transactions_mod.TxnId {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.initTransactionWithParticipantsCreatedAtRoleAndRetentionExtraBatch(
+            txn_id,
+            timestamp_ns,
+            created_at_ns,
+            participants,
+            coordinator,
+            retain_terminal,
+            extra_batch,
+        );
+        return txn_id;
+    }
+
     pub fn writeIntents(
         self: *DBCore,
         txn_id: transactions_mod.TxnId,
@@ -1286,6 +1310,18 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         try manager.writeIntents(txn_id, intents, predicates);
+    }
+
+    pub fn writeIntentsExtraBatch(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        intents: []const transactions_mod.WriteIntent,
+        predicates: []const transactions_mod.VersionPredicate,
+        extra_batch: transactions_mod.MutationExtraBatch,
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.writeIntentsExtraBatch(txn_id, intents, predicates, extra_batch);
     }
 
     pub fn checkVersionPredicates(
@@ -1411,10 +1447,27 @@ pub const DBCore = struct {
         return try manager.defersCoordinatorAcknowledgement(txn_id);
     }
 
+    pub fn transactionRetainsCoordinatorAcknowledgement(self: *DBCore, txn_id: transactions_mod.TxnId) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.retainsCoordinatorAcknowledgement(txn_id);
+    }
+
     pub fn markTransactionParticipantResolved(self: *DBCore, txn_id: transactions_mod.TxnId, participant: []const u8) !void {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         try manager.markParticipantResolved(txn_id, participant);
+    }
+
+    pub fn markTransactionParticipantResolvedExtraBatch(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        participant: []const u8,
+        extra_batch: transactions_mod.MutationExtraBatch,
+    ) !void {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        try manager.markParticipantResolvedExtraBatch(txn_id, participant, extra_batch);
     }
 
     pub fn cleanupTransactionMetadataIfEligible(
@@ -1426,6 +1479,23 @@ pub const DBCore = struct {
         var manager = try self.initTxnManager();
         defer manager.deinit();
         return try manager.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
+    }
+
+    pub fn cleanupTransactionMetadataIfEligibleExtraBatch(
+        self: *DBCore,
+        txn_id: transactions_mod.TxnId,
+        cutoff_timestamp: u64,
+        retained_cutoff_timestamp: u64,
+        extra_batch: transactions_mod.MutationExtraBatch,
+    ) !bool {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.cleanupTransactionMetadataIfEligibleExtraBatch(
+            txn_id,
+            cutoff_timestamp,
+            retained_cutoff_timestamp,
+            extra_batch,
+        );
     }
 
     pub fn getTransactionParticipants(self: *DBCore, alloc: Allocator, txn_id: transactions_mod.TxnId) ![][]u8 {

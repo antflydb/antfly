@@ -1900,6 +1900,7 @@ pub const ProvisionedTableWriteCache = struct {
                 runtime: ?*db_mod.background_runtime.BackendRuntime,
                 antfly_provider: ?managed_embedder.AntflyProvider,
                 secret_store: ?*common_secrets.FileStore,
+                schema_json: ?[]const u8,
                 identity_namespace: ?doc_identity.Namespace,
                 ha_write_gate: ?db_mod.HAWriteGate,
                 ha_async_mirror: ?db_mod.HAAsyncEffectMirror,
@@ -1923,6 +1924,7 @@ pub const ProvisionedTableWriteCache = struct {
                         identity_namespace,
                         .{
                             .drain_resolver_backfill = false,
+                            .schema_json_before_index_load = schema_json,
                             .inference_api_url = inference_api_url,
                             .ha_write_gate = ha_write_gate,
                             .ha_async_effect_mirror = effective_ha_mirror,
@@ -1994,6 +1996,7 @@ pub const ProvisionedTableWriteCache = struct {
                 self.backend_runtime,
                 self.antfly_provider,
                 self.secret_store,
+                metadata.schema_json,
                 identity_namespace,
                 self.ha_write_gate,
                 self.ha_async_mirror,
@@ -2048,6 +2051,7 @@ pub const ProvisionedTableWriteCache = struct {
             self.backend_runtime,
             self.antfly_provider,
             self.secret_store,
+            metadata.schema_json,
             identity_namespace,
             self.ha_write_gate,
             self.ha_async_mirror,
@@ -4606,6 +4610,14 @@ pub const RaftBatcher = struct {
             req: db_mod.types.BatchRequest,
             cancellation: db_mod.types.CancellationToken,
         ) anyerror!void = null,
+        batch_group_local_with_pre_decision_context: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            group_id: u64,
+            table_name: []const u8,
+            req: db_mod.types.BatchRequest,
+            context: distributed_txn.PreDecisionContext,
+        ) anyerror!void = null,
     };
 
     pub fn batchGroup(
@@ -4653,7 +4665,46 @@ pub const RaftBatcher = struct {
             return try self.batchGroupLocal(alloc, group_id, table_name, req);
         return try fn_ptr(self.ptr, alloc, group_id, table_name, req, cancellation);
     }
+
+    pub fn batchGroupLocalWithPreDecisionContext(
+        self: RaftBatcher,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        context: distributed_txn.PreDecisionContext,
+    ) !void {
+        const fn_ptr = self.vtable.batch_group_local_with_pre_decision_context orelse
+            return try self.batchGroupLocalWithCancellation(alloc, group_id, table_name, req, context.cancellation);
+        return try fn_ptr(self.ptr, alloc, group_id, table_name, req, context);
+    }
 };
+
+fn ensurePreDecisionContextActive(context: distributed_txn.PreDecisionContext) !void {
+    try context.cancellation.check();
+    if (context.deadline_ns) |deadline_ns| {
+        // This check is deliberately adjacent to mutation admission. Keep its
+        // error distinct from generic storage and transport deadlines so only
+        // this proven pre-proposal outcome may authorize replica failover.
+        if (platform_time.monotonicNs() >= deadline_ns) return error.PreDecisionDeadlineExceeded;
+    }
+}
+
+test "pre-decision context deadline has typed admission provenance" {
+    try std.testing.expectError(
+        error.PreDecisionDeadlineExceeded,
+        ensurePreDecisionContextActive(.{ .deadline_ns = 1 }),
+    );
+
+    var canceled = std.atomic.Value(bool).init(true);
+    try std.testing.expectError(
+        error.Canceled,
+        ensurePreDecisionContextActive(.{
+            .deadline_ns = std.math.maxInt(u64),
+            .cancellation = db_mod.types.CancellationToken.fromAtomic(&canceled),
+        }),
+    );
+}
 
 const DocumentChildRangeDispatchContext = struct {
     source: TableWriteSource,
@@ -4720,7 +4771,9 @@ pub const BoundTableWriteSource = struct {
                 .abort_bulk_ingest = abortBulkIngest,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
+                .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
+                .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
@@ -5462,6 +5515,20 @@ pub const BoundTableWriteSource = struct {
 
     fn txnBeginGroupLocal(
         ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        topology_epoch: u64,
+        retain_terminal: bool,
+        participants: []const []const u8,
+    ) !?void {
+        return try txnBeginGroupLocalWithPreDecisionContext(ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, .{});
+    }
+
+    fn txnBeginGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
         _: std.mem.Allocator,
         _: u64,
         table_name: []const u8,
@@ -5470,9 +5537,11 @@ pub const BoundTableWriteSource = struct {
         _: u64,
         retain_terminal: bool,
         participants: []const []const u8,
+        context: distributed_txn.PreDecisionContext,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try ensurePreDecisionContextActive(context);
         _ = try (try self.activeDb()).beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
             txn_id,
             begin_timestamp,
@@ -5486,16 +5555,31 @@ pub const BoundTableWriteSource = struct {
     fn txnPrepareGroupLocal(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        topology_epoch: u64,
+        req: db_mod.types.TransactionIntentRequest,
+    ) !?void {
+        return try txnPrepareGroupLocalWithPreDecisionContext(ptr, alloc, group_id, table_name, txn_id, topology_epoch, req, .{});
+    }
+
+    fn txnPrepareGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
         _: u64,
         table_name: []const u8,
         txn_id: db_mod.types.TxnId,
         _: u64,
         req: db_mod.types.TransactionIntentRequest,
+        context: distributed_txn.PreDecisionContext,
     ) !?void {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try ensurePreDecisionContextActive(context);
         const db = try self.activeDb();
         try validateTransactionAgainstLocalSchema(alloc, db, req.writes, req.deletes, req.transforms);
+        try ensurePreDecisionContextActive(context);
         try db.writeTransaction(txn_id, req);
     }
 
@@ -8536,6 +8620,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.local_db_mutex.unlock();
             return self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, lsm_root_generation, table_name, .default_async, null, null, null, managed_open_options) catch |err| {
                 if (!isTransientWriterOpenConflict(err)) return err;
+                if (!managed_open_options.retry_transient_writer_open) return err;
                 const now_ns = platform_time.monotonicNs();
                 if (now_ns >= deadline_ns) {
                     std.log.err("local mutation writer wait timed out table={s} group_id={} wait_ms={} err={s}", .{
@@ -8815,6 +8900,7 @@ pub const ProvisionedTableWriteSource = struct {
             effective_open_options.drain_resolver_backfill = false;
             effective_open_options.source_table = table_name;
             effective_open_options.destination_authorizer = self.destination_authorizer;
+            effective_open_options.schema_json_before_index_load = prepared_open.?.schema_json;
             effective_open_options.inference_api_url = self.inference_api_url;
             effective_open_options.ha_write_gate = self.ha_write_gate;
             effective_open_options.ha_async_effect_mirror = effective_ha_mirror;
@@ -9799,6 +9885,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .inference_api_url = self.inference_api_url,
+                    .schema_json_before_index_load = metadata.schema_json,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -9855,7 +9942,10 @@ pub const ProvisionedTableWriteSource = struct {
                 .identity_namespace = identity_namespace,
                 .metadata_source = .local_persisted,
             },
-            .{ .reconcile_for_replicated_apply = true },
+            .{
+                .reconcile_for_replicated_apply = true,
+                .retry_transient_writer_open = false,
+            },
         );
     }
 
@@ -10179,6 +10269,7 @@ pub const ProvisionedTableWriteSource = struct {
                     identity_namespace,
                     .{
                         .drain_resolver_backfill = false,
+                        .schema_json_before_index_load = metadata.schema_json,
                         .inference_api_url = self.inference_api_url,
                         .ha_write_gate = self.ha_write_gate,
                         .ha_async_effect_mirror = effective_ha_mirror,
@@ -12612,8 +12703,14 @@ pub const ProvisionedTableWriteSource = struct {
         const open_start_ns = platform_time.monotonicNs();
         var open_attempts: usize = 0;
         var logged_open_wait = false;
+        var raft_apply_marker_reset = staged_generation == null;
         while (true) {
-            if (!try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(alloc, self.table_activity_threaded.io(), path)) return;
+            const runtime_repair_needed = try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
+                alloc,
+                self.table_activity_threaded.io(),
+                path,
+            );
+            if (!runtime_repair_needed and raft_apply_marker_reset) return;
 
             const owned_indexes_json = if (indexes_json_override == null)
                 (try loadTableIndexesJson(alloc, self.catalog, table_name)) orelse return error.TableVisibilityTimeout
@@ -12649,10 +12746,20 @@ pub const ProvisionedTableWriteSource = struct {
             };
             defer db.close();
 
+            if (!raft_apply_marker_reset) {
+                // A restored generation contains document state, not the
+                // destination replica's Raft history. Reset the group-local
+                // replay fence before this isolated generation is sealed.
+                try db.clearRaftAppliedEntry();
+                raft_apply_marker_reset = true;
+            }
+
             if (schema_json_override) |schema_json| {
                 try applyLocalTableSchemaJson(alloc, &db, schema_json);
             }
-            try self.repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
+            if (runtime_repair_needed) {
+                try self.repairRestoredDbRuntimeStateBlocking(alloc, &db, group_id, open_attempts);
+            }
             return;
         }
     }
@@ -13631,6 +13738,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .schema_json_before_index_load = metadata.schema_json,
                     .inference_api_url = self.inference_api_url,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = self.ha_async_mirror,
@@ -14103,7 +14211,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .abort_bulk_ingest = abortBulkIngest,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
+                .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
+                .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
@@ -14349,6 +14459,7 @@ pub const ProvisionedTableWriteSource = struct {
                 .{
                     .inference_api_url = self.inference_api_url,
                     .drain_resolver_backfill = false,
+                    .schema_json_before_index_load = schema_json,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -15803,6 +15914,7 @@ pub const ProvisionedTableWriteSource = struct {
             table_name,
             req,
             .catalog,
+            null,
         );
     }
 
@@ -15822,10 +15934,42 @@ pub const ProvisionedTableWriteSource = struct {
             table_name,
             req,
             .local_persisted,
+            null,
+        );
+    }
+
+    /// Applies an exact data-Raft entry. The DB commits the entry identity with
+    /// ordinary document mutations so restart replay can skip non-idempotent
+    /// transforms that were already durable before the Raft watermark advanced.
+    pub fn applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
+        self: *ProvisionedTableWriteSource,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        entry: db_mod.RaftAppliedEntryIdentity,
+    ) !?void {
+        return try self.applyReplicatedBatchGroupLocalWithMetadata(
+            alloc,
+            group_id,
+            table_name,
+            req,
+            .local_persisted,
+            entry,
         );
     }
 
     const ReplicatedApplyMetadataSource = enum { catalog, local_persisted };
+
+    fn mapReplicatedApplyWriterAcquireError(
+        metadata_source: ReplicatedApplyMetadataSource,
+        err: anyerror,
+    ) anyerror {
+        if (metadata_source == .local_persisted and isTransientWriterOpenConflict(err)) {
+            return error.RaftApplyWriterUnavailable;
+        }
+        return err;
+    }
 
     fn applyReplicatedBatchGroupLocalWithMetadata(
         self: *ProvisionedTableWriteSource,
@@ -15834,6 +15978,7 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
         metadata_source: ReplicatedApplyMetadataSource,
+        raft_entry: ?db_mod.RaftAppliedEntryIdentity,
     ) !?void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -15874,14 +16019,15 @@ pub const ProvisionedTableWriteSource = struct {
             const target_generation = self.visibleRootGeneration(group_id);
             var cached = if (split_identity_namespace) |namespace|
                 (if (metadata_source == .local_persisted)
-                    try self.leasePreparedTransitionGroupWriter(alloc, group_id, table_name, namespace)
+                    self.leasePreparedTransitionGroupWriter(alloc, group_id, table_name, namespace) catch |err|
+                        return mapReplicatedApplyWriterAcquireError(metadata_source, err)
                 else
-                    try self.leaseCachedTransitionGroupWriterWithOptions(alloc, group_id, table_name, namespace, .{
+                    self.leaseCachedTransitionGroupWriterWithOptions(alloc, group_id, table_name, namespace, .{
                         .reconcile_for_replicated_apply = true,
-                    })) orelse
+                    }) catch |err| return mapReplicatedApplyWriterAcquireError(metadata_source, err)) orelse
                     return error.TransitionDestinationNotProvisioned
             else
-                try self.getOrOpenCachedDbForLocalMutationWithOptions(
+                self.getOrOpenCachedDbForLocalMutationWithOptions(
                     alloc,
                     cache,
                     path,
@@ -15889,16 +16035,31 @@ pub const ProvisionedTableWriteSource = struct {
                     target_generation,
                     table_name,
                     true,
-                    .{ .reconcile_for_replicated_apply = true },
-                );
+                    .{
+                        .reconcile_for_replicated_apply = true,
+                        .retry_transient_writer_open = metadata_source != .local_persisted,
+                    },
+                ) catch |err| return mapReplicatedApplyWriterAcquireError(metadata_source, err);
             defer cached.deinit(alloc);
-            try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
-            runTestBeforeBatchExecutionHook();
-            try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
-            if (apply_req.transaction != null) {
-                try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
-            } else try cached.db.batchReplicatedApply(apply_req);
+            const already_applied = if (raft_entry) |entry|
+                try cached.db.raftEntryAlreadyApplied(entry)
+            else
+                false;
+            if (!already_applied) {
+                try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                runTestBeforeBatchExecutionHook();
+                try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
+                if (apply_req.transaction != null) {
+                    try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    if (raft_entry) |entry|
+                        try applyReplicatedTransactionMutationAtRaftEntry(alloc, cached.db, table_name, group_id, apply_req, entry)
+                    else
+                        try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, apply_req);
+                } else if (raft_entry) |entry|
+                    try cached.db.batchRaftReplicatedApply(apply_req, entry)
+                else
+                    try cached.db.batchReplicatedApply(apply_req);
+            }
             cache.publishCachedLeaseGeneration(&cached, target_generation);
             {
                 lockAtomic(&self.local_db_mutex);
@@ -15924,13 +16085,25 @@ pub const ProvisionedTableWriteSource = struct {
             );
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
-            try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
-            runTestBeforeBatchExecutionHook();
-            try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
-            if (apply_req.transaction != null) {
-                try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-                try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
-            } else try db.batchReplicatedApply(apply_req);
+            const already_applied = if (raft_entry) |entry|
+                try db.raftEntryAlreadyApplied(entry)
+            else
+                false;
+            if (!already_applied) {
+                try validateTableBatchAgainstCatalogSchema(alloc, self.catalog, &db, table_name, apply_req.writes, apply_req.deletes, apply_req.transforms);
+                runTestBeforeBatchExecutionHook();
+                try validateSplitCheckpointGroup(apply_req.split_checkpoint, group_id);
+                if (apply_req.transaction != null) {
+                    try db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
+                    if (raft_entry) |entry|
+                        try applyReplicatedTransactionMutationAtRaftEntry(alloc, &db, table_name, group_id, apply_req, entry)
+                    else
+                        try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, apply_req);
+                } else if (raft_entry) |entry|
+                    try db.batchRaftReplicatedApply(apply_req, entry)
+                else
+                    try db.batchReplicatedApply(apply_req);
+            }
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -16222,7 +16395,23 @@ pub const ProvisionedTableWriteSource = struct {
         retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
+        return try txnBeginGroupLocalWithPreDecisionContext(ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, .{});
+    }
+
+    fn txnBeginGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        topology_epoch: u64,
+        retain_terminal: bool,
+        participants: []const []const u8,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try ensurePreDecisionContextActive(context);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         // Keep the epoch check and durable begin in the same transition
         // admission window. Otherwise a split can publish after validation
@@ -16230,9 +16419,11 @@ pub const ProvisionedTableWriteSource = struct {
         // transition fence.
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
+        try ensurePreDecisionContextActive(context);
         try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try ensurePreDecisionContextActive(context);
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+            try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
                 .transaction = .{ .begin = .{
                     .txn_id = txn_id,
                     .begin_timestamp = begin_timestamp,
@@ -16241,7 +16432,7 @@ pub const ProvisionedTableWriteSource = struct {
                     .retain_terminal = retain_terminal,
                     .participants = participants,
                 } },
-            });
+            }, context);
             return {};
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -16249,6 +16440,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.write_cache) |cache| {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
+            try ensurePreDecisionContextActive(context);
             try applyReplicatedTransactionMutation(alloc, cached.db, table_name, group_id, .{ .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
@@ -16264,6 +16456,7 @@ pub const ProvisionedTableWriteSource = struct {
             var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
+            try ensurePreDecisionContextActive(context);
             try applyReplicatedTransactionMutation(alloc, &db, table_name, group_id, .{ .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
@@ -16285,19 +16478,35 @@ pub const ProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
+        return try txnPrepareGroupLocalWithPreDecisionContext(ptr, alloc, group_id, table_name, txn_id, topology_epoch, req, .{});
+    }
+
+    fn txnPrepareGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        topology_epoch: u64,
+        req: db_mod.types.TransactionIntentRequest,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try ensurePreDecisionContextActive(context);
         try enforceHAWriteGateOptional(self.ha_write_gate);
         self.beginGroupOperation(table_name, group_id);
         defer self.endGroupOperation(table_name, group_id);
+        try ensurePreDecisionContextActive(context);
         try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
+        try ensurePreDecisionContextActive(context);
         if (self.raft_batcher) |batcher| {
-            try batcher.batchGroupLocal(alloc, group_id, table_name, .{
+            try batcher.batchGroupLocalWithPreDecisionContext(alloc, group_id, table_name, .{
                 .writes = transactionWritesAsBatchWrites(req.writes),
                 .deletes = req.deletes,
                 .transforms = req.transforms,
                 .predicates = req.predicates,
                 .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
-            });
+            }, context);
             return {};
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -16306,6 +16515,7 @@ pub const ProvisionedTableWriteSource = struct {
             var cached = try self.getOrOpenCachedDbMode(alloc, cache, path, group_id, table_name, .default_async, null, null);
             defer cached.deinit(alloc);
             try validateTransactionAgainstCatalogSchema(alloc, self.catalog, cached.db, table_name, req.writes, req.deletes, req.transforms);
+            try ensurePreDecisionContextActive(context);
             try cached.db.writeTransaction(txn_id, req);
             lockAtomic(&self.local_db_mutex);
             self.markWriteCacheDirty(table_name);
@@ -16315,6 +16525,7 @@ pub const ProvisionedTableWriteSource = struct {
             defer db.close();
             try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, &db);
             try validateTransactionAgainstCatalogSchema(alloc, self.catalog, &db, table_name, req.writes, req.deletes, req.transforms);
+            try ensurePreDecisionContextActive(context);
             try db.writeTransaction(txn_id, req);
             self.finishTransientManagedDbWriteBeforeClose(table_name, group_id, &db);
         }
@@ -17884,6 +18095,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .drain_resolver_backfill = false,
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
+                    .schema_json_before_index_load = prepared_open.?.schema_json,
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .ha_write_gate = cache.write_cache.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
@@ -18043,7 +18255,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .batch = batch,
                 .batch_group_local = batchGroupLocal,
                 .txn_begin_group_local = txnBeginGroupLocal,
+                .txn_begin_group_local_with_pre_decision_context = txnBeginGroupLocalWithPreDecisionContext,
                 .txn_prepare_group_local = txnPrepareGroupLocal,
+                .txn_prepare_group_local_with_pre_decision_context = txnPrepareGroupLocalWithPreDecisionContext,
                 .txn_resolve_group_local = txnResolveGroupLocal,
                 .txn_resolve_group_local_with_cancellation = txnResolveGroupLocalWithCancellation,
                 .txn_status_group_local = txnStatusGroupLocal,
@@ -18456,21 +18670,37 @@ pub const HostedProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         cancellation: db_mod.types.CancellationToken,
     ) !?void {
+        return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, req, topology_epoch, .{ .cancellation = cancellation });
+    }
+
+    fn batchGroupLocalFencedWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        topology_epoch: u64,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try ensurePreDecisionContextActive(context);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
         var cached = try self.getOrOpenCachedDbMode(hosted_cache, path, group_id, table_name, .default_async);
         defer cached.deinit(hosted_cache.write_cache.alloc);
+        try ensurePreDecisionContextActive(context);
         // Keep the catalog fence and transaction mutation inside one root
         // writer lease. Split/merge cannot snapshot this root between the
         // epoch check and making the transaction durable.
         if (topology_epoch != 0)
             try table_catalog.validateTransactionTopologyEpoch(alloc, self.catalog, table_name, topology_epoch);
         try validateTableBatchAgainstSchemaJson(alloc, cached.db, cached.schema_json, req.writes, req.deletes, req.transforms);
+        try ensurePreDecisionContextActive(context);
         if (req.transaction != null) {
             try cached.db.ensureTransactionRecoveryRuntime(self.transactionRecoveryConfig());
-            try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, req, cancellation);
+            try ensurePreDecisionContextActive(context);
+            try applyReplicatedTransactionMutationWithCancellation(alloc, cached.db, table_name, group_id, req, context.cancellation);
         } else try cached.db.batchReplicatedApply(req);
         if (self.shouldDrainAfterBatch(req.sync_level)) try drainManagedDbBeforeClose(cached.db);
     }
@@ -18486,7 +18716,22 @@ pub const HostedProvisionedTableWriteSource = struct {
         retain_terminal: bool,
         participants: []const []const u8,
     ) !?void {
-        return try batchGroupLocalFenced(ptr, alloc, group_id, table_name, .{
+        return try txnBeginGroupLocalWithPreDecisionContext(ptr, alloc, group_id, table_name, txn_id, begin_timestamp, topology_epoch, retain_terminal, participants, .{});
+    }
+
+    fn txnBeginGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        begin_timestamp: u64,
+        topology_epoch: u64,
+        retain_terminal: bool,
+        participants: []const []const u8,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
+        return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
             .transaction = .{ .begin = .{
                 .txn_id = txn_id,
                 .begin_timestamp = begin_timestamp,
@@ -18495,7 +18740,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .retain_terminal = retain_terminal,
                 .participants = participants,
             } },
-        }, topology_epoch);
+        }, topology_epoch, context);
     }
 
     fn txnPrepareGroupLocal(
@@ -18507,13 +18752,26 @@ pub const HostedProvisionedTableWriteSource = struct {
         topology_epoch: u64,
         req: db_mod.types.TransactionIntentRequest,
     ) !?void {
-        return try batchGroupLocalFenced(ptr, alloc, group_id, table_name, .{
+        return try txnPrepareGroupLocalWithPreDecisionContext(ptr, alloc, group_id, table_name, txn_id, topology_epoch, req, .{});
+    }
+
+    fn txnPrepareGroupLocalWithPreDecisionContext(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        txn_id: db_mod.types.TxnId,
+        topology_epoch: u64,
+        req: db_mod.types.TransactionIntentRequest,
+        context: distributed_txn.PreDecisionContext,
+    ) !?void {
+        return try batchGroupLocalFencedWithPreDecisionContext(ptr, alloc, group_id, table_name, .{
             .writes = transactionWritesAsBatchWrites(req.writes),
             .deletes = req.deletes,
             .transforms = req.transforms,
             .predicates = req.predicates,
             .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = topology_epoch } },
-        }, topology_epoch);
+        }, topology_epoch, context);
     }
 
     fn txnResolveGroupLocal(
@@ -19167,6 +19425,15 @@ pub const HostedProvisionedTableWriteSource = struct {
     }
 };
 
+test "prepared raft apply reclassifies every transient pre-mutation writer conflict" {
+    const map = ProvisionedTableWriteSource.mapReplicatedApplyWriterAcquireError;
+    try std.testing.expect(map(.local_persisted, error.LsmRootWriterAlreadyOpen) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.local_persisted, error.WriterLocked) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.local_persisted, error.PersistentDescriptorAdmissionExhausted) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.catalog, error.LsmRootWriterAlreadyOpen) == error.LsmRootWriterAlreadyOpen);
+    try std.testing.expect(map(.local_persisted, error.OutOfMemory) == error.OutOfMemory);
+}
+
 const GroupBatch = struct {
     group_id: u64,
     writes: std.ArrayListUnmanaged(db_mod.types.BatchWrite) = .empty,
@@ -19285,7 +19552,7 @@ fn applyReplicatedTransactionMutation(
     group_id: u64,
     req: db_mod.types.BatchRequest,
 ) !void {
-    try applyReplicatedTransactionMutationWithCancellation(alloc, db, table_name, group_id, req, .none);
+    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, null);
 }
 
 fn applyReplicatedTransactionMutationWithCancellation(
@@ -19295,6 +19562,29 @@ fn applyReplicatedTransactionMutationWithCancellation(
     group_id: u64,
     req: db_mod.types.BatchRequest,
     visibility_cancellation: db_mod.types.CancellationToken,
+) !void {
+    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, visibility_cancellation, null);
+}
+
+fn applyReplicatedTransactionMutationAtRaftEntry(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    raft_entry: db_mod.RaftAppliedEntryIdentity,
+) !void {
+    try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, raft_entry);
+}
+
+fn applyReplicatedTransactionMutationInternal(
+    alloc: std.mem.Allocator,
+    db: *db_mod.DB,
+    table_name: []const u8,
+    group_id: u64,
+    req: db_mod.types.BatchRequest,
+    visibility_cancellation: db_mod.types.CancellationToken,
+    raft_entry: ?db_mod.RaftAppliedEntryIdentity,
 ) !void {
     const mutation = req.transaction orelse return error.InvalidBatchRequest;
     switch (mutation) {
@@ -19318,57 +19608,104 @@ fn applyReplicatedTransactionMutationWithCancellation(
             // follower tracks itself, making successful cleanup O(N) rather
             // than every participant retrying every other participant.
             const durable_participants: []const []const u8 = if (coordinator) begin.participants else &local_only;
-            _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
-                begin.txn_id,
-                begin.begin_timestamp,
-                begin.created_at_ns,
-                durable_participants,
-                coordinator,
-                begin.retain_terminal,
-            );
+            if (raft_entry) |entry|
+                _ = try db.beginReplicatedTransactionAtRaftEntry(
+                    begin.txn_id,
+                    begin.begin_timestamp,
+                    begin.created_at_ns,
+                    durable_participants,
+                    coordinator,
+                    begin.retain_terminal,
+                    entry,
+                )
+            else
+                _ = try db.beginTransactionWithIdAndParticipantsCreatedAtRoleAndRetention(
+                    begin.txn_id,
+                    begin.begin_timestamp,
+                    begin.created_at_ns,
+                    durable_participants,
+                    coordinator,
+                    begin.retain_terminal,
+                );
         },
-        .prepare => |prepare| try db.writeTransaction(prepare.txn_id, .{
-            .writes = batchWritesAsTransactionWrites(req.writes),
-            .deletes = req.deletes,
-            .transforms = req.transforms,
-            .predicates = req.predicates,
-        }),
+        .prepare => |prepare| {
+            const intents: db_mod.types.TransactionIntentRequest = .{
+                .writes = batchWritesAsTransactionWrites(req.writes),
+                .deletes = req.deletes,
+                .transforms = req.transforms,
+                .predicates = req.predicates,
+            };
+            if (raft_entry) |entry|
+                try db.writeReplicatedTransactionAtRaftEntry(prepare.txn_id, intents, entry)
+            else
+                try db.writeTransaction(prepare.txn_id, intents);
+        },
         .resolve => |resolve| {
-            try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
-                resolve.txn_id,
-                resolve.status,
-                resolve.commit_version,
-                req.sync_level,
-                visibility_cancellation,
-            );
             const local_participant = try distributed_txn.participantIdForGroup(alloc, table_name, group_id);
             defer alloc.free(local_participant);
-            // Retained coordinators keep their own acknowledgement pending
-            // until the API session registry has durably recorded the terminal
-            // response. That acknowledgement is the topology-safe handoff.
-            const defer_coordinator_ack = db.transactionDefersCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
-                transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
-                else => return err,
-            };
-            if (!defer_coordinator_ack) {
-                db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
-                    transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
+            if (raft_entry) |entry| {
+                // Retained coordinators keep their own acknowledgement pending
+                // until the API session registry durably records the response.
+                // Everyone else records resolution, acknowledgement, and the
+                // Raft receipt in one backend batch.
+                const defer_coordinator_ack = db.transactionRetainsCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
+                    transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
                     else => return err,
                 };
+                try db.resolveReplicatedTransactionAtRaftEntry(
+                    resolve.txn_id,
+                    resolve.status,
+                    resolve.commit_version,
+                    req.sync_level,
+                    visibility_cancellation,
+                    entry,
+                    if (defer_coordinator_ack) null else local_participant,
+                );
+            } else {
+                try db.resolveTransactionIntentsWithSyncLevelAndCancellation(
+                    resolve.txn_id,
+                    resolve.status,
+                    resolve.commit_version,
+                    req.sync_level,
+                    visibility_cancellation,
+                );
+                const defer_coordinator_ack = db.transactionDefersCoordinatorAcknowledgement(resolve.txn_id) catch |err| switch (err) {
+                    transactions_mod.TxnError.TxnNotFound => if (resolve.status == .aborted) false else return err,
+                    else => return err,
+                };
+                if (!defer_coordinator_ack) {
+                    db.markTransactionParticipantResolved(resolve.txn_id, local_participant) catch |err| switch (err) {
+                        transactions_mod.TxnError.TxnNotFound => if (resolve.status != .aborted) return err,
+                        else => return err,
+                    };
+                }
             }
         },
-        .acknowledge => |ack| db.markTransactionParticipantResolved(ack.txn_id, ack.participant) catch |err| switch (err) {
+        .acknowledge => |ack| (if (raft_entry) |entry|
+            db.markReplicatedTransactionParticipantResolvedAtRaftEntry(ack.txn_id, ack.participant, entry)
+        else
+            db.markTransactionParticipantResolved(ack.txn_id, ack.participant)) catch |err| switch (err) {
             // Cleanup and acknowledgements are independently retryable Raft
             // commands. Once cleanup wins, a late acknowledgement is a safe
             // no-op and must not recreate coordinator sidecar metadata.
             transactions_mod.TxnError.TxnNotFound => {},
             else => return err,
         },
-        .cleanup => |cleanup| _ = try db.cleanupTransactionMetadataIfEligible(
-            cleanup.txn_id,
-            cleanup.cutoff_timestamp,
-            cleanup.retained_cutoff_timestamp,
-        ),
+        .cleanup => |cleanup| {
+            if (raft_entry) |entry|
+                _ = try db.cleanupReplicatedTransactionAtRaftEntry(
+                    cleanup.txn_id,
+                    cleanup.cutoff_timestamp,
+                    cleanup.retained_cutoff_timestamp,
+                    entry,
+                )
+            else
+                _ = try db.cleanupTransactionMetadataIfEligible(
+                    cleanup.txn_id,
+                    cleanup.cutoff_timestamp,
+                    cleanup.retained_cutoff_timestamp,
+                );
+        },
     }
 }
 
@@ -21709,6 +22046,11 @@ const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
     source_table: []const u8 = "",
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
+    schema_json_before_index_load: ?[]const u8 = null,
+    /// Request-owned Raft progress must never sleep inside writer acquisition:
+    /// the single cadence lane retries on its next tick and remains available
+    /// to drive elections, heartbeats, and unrelated groups.
+    retry_transient_writer_open: bool = true,
     /// HA replay must reconcile catalog-driven indexes while the node remains a
     /// read-only standby. Perform that structural reconciliation in an isolated
     /// workerless open, then reopen with the live HA gate before publishing the
@@ -21930,6 +22272,14 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
             namespace: ?doc_identity.Namespace,
             open_options: ManagedDbOpenOptions,
         ) !db_mod.DB {
+            const schema_before_index_load: ?storage_schema.TableSchema = if (open_mode == .query_readonly or open_mode == .status_only) null else if (open_options.schema_json_before_index_load) |schema_json| blk: {
+                if (schema_json.len == 0) break :blk null;
+                var parsed_schema = try tables_api.parseValidatedTableSchema(allocator, schema_json);
+                defer parsed_schema.deinit(allocator);
+                break :blk try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema);
+            } else null;
+            defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema);
+
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,
                 .hbc_cache = vector_cache,
@@ -21946,6 +22296,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                 .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                 .transaction_recovery = open_options.transaction_recovery,
+                .schema_before_index_load = schema_before_index_load,
             };
             return switch (open_mode) {
                 .default => if (enrichment_cfg != null)
@@ -21966,6 +22317,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
+                        .schema_before_index_load = schema_before_index_load,
                     }),
                 .default_async, .writer_no_replay => if (enrichment_cfg != null)
                     try db_mod.DB.open(allocator, db_path, .{
@@ -21984,6 +22336,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         // The managed write cache opens DBs synchronously while
                         // table/index metadata can still be settling. Keep
@@ -22007,6 +22360,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .ha_async_batch_mirror = open_options.ha_async_batch_mirror,
                         .ha_async_metadata_mirror = open_options.ha_async_metadata_mirror,
                         .transaction_recovery = open_options.transaction_recovery,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         .index_open_parallelism = 1,
                     }),
@@ -22021,6 +22375,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                     .identity_namespace = namespace,
                     .prefer_existing_identity_namespace = namespace != null,
                     .ha_write_gate = open_options.ha_write_gate,
+                    .schema_before_index_load = schema_before_index_load,
                     .open_mode = .writer_no_replay,
                     .start_index_workers = false,
                     .enrichment = if (enrichment_cfg) |configured| blk: {
@@ -22062,6 +22417,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .prefer_existing_identity_namespace = namespace != null,
                         .enrichment = enrichment_cfg,
                         .ha_write_gate = open_options.ha_write_gate,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .start_optional_runtime_workers = false,
@@ -22082,6 +22438,7 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                         .identity_namespace = namespace,
                         .prefer_existing_identity_namespace = namespace != null,
                         .ha_write_gate = open_options.ha_write_gate,
+                        .schema_before_index_load = schema_before_index_load,
                         .open_mode = .writer_no_replay,
                         .start_index_workers = false,
                         .start_optional_runtimes = false,
@@ -24940,8 +25297,13 @@ fn openManagedDbForReplicatedApply(
         value
     else
         try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
-    const indexes_json = try loadTableIndexesJson(alloc, catalog, table_name);
-    defer if (indexes_json) |value| alloc.free(value);
+    const metadata = try loadTableManagedMetadata(alloc, catalog, table_name);
+    defer if (metadata) |owned| {
+        if (owned.indexes_json) |value| alloc.free(value);
+        if (owned.schema_json) |value| alloc.free(value);
+    };
+    const indexes_json = if (metadata) |owned| owned.indexes_json else null;
+    const schema_json = if (metadata) |owned| owned.schema_json else null;
     const effective_ha_mirror = haMirrorForManagedDbOpenMode(.default_async, ha_async_mirror);
     var db = if (indexes_json) |value|
         try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
@@ -24960,6 +25322,7 @@ fn openManagedDbForReplicatedApply(
             namespace,
             .{
                 .drain_resolver_backfill = false,
+                .schema_json_before_index_load = schema_json,
                 .reconcile_for_replicated_apply = true,
                 .ha_write_gate = ha_write_gate,
                 .ha_async_effect_mirror = effective_ha_mirror,
@@ -37508,6 +37871,140 @@ test "standby HA replay reconciles managed indexes without opening the public wr
     try std.testing.expectError(error.HAReadOnlyStandby, source.source().batchGroupLocal(alloc, 7001, "docs", .{
         .writes = &.{.{ .key = "doc:forbidden", .value = "{\"body\":\"must not commit\"}" }},
     }));
+}
+
+test "cold replicated apply preserves declared full text projection across retained reopen" {
+    const alloc = std.testing.allocator;
+    const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
+    const cases = .{
+        .{
+            .name = "single-text-field",
+            .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}",
+            .key = "doc:a",
+            .value = "{\"title\":\"alpha beta\"}",
+            .field = "title",
+            .query = "alpha",
+        },
+        .{
+            .name = "mixed-keyword-and-text",
+            .schema_json = "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"slug\":{\"type\":\"keyword\"},\"body\":{\"type\":\"text\"}}}}}}",
+            .key = "doc:b",
+            .value = "{\"slug\":\"ignored\",\"body\":\"gamma delta\"}",
+            .field = "body",
+            .query = "gamma",
+        },
+        .{
+            .name = "alternate-document-type",
+            .schema_json = "{\"default_type\":\"article\",\"enforce_types\":true,\"document_schemas\":{\"article\":{\"schema\":{\"type\":\"object\",\"properties\":{\"summary\":{\"type\":\"text\"}}}}}}",
+            .key = "article:c",
+            .value = "{\"summary\":\"epsilon zeta\"}",
+            .field = "summary",
+            .query = "epsilon",
+        },
+    };
+
+    inline for (cases) |case| {
+        const Catalog = struct {
+            const schema = case.schema_json;
+
+            fn iface() table_catalog.CatalogSource {
+                return .{
+                    .ptr = undefined,
+                    .vtable = &.{
+                        .admin_snapshot = adminSnapshot,
+                        .free_admin_snapshot = freeAdminSnapshot,
+                    },
+                };
+            }
+
+            fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+                return .{
+                    .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                    .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                        .table_id = 7,
+                        .name = "docs",
+                        .placement_role = "data",
+                        .indexes_json = tables_api.default_indexes_json,
+                        .schema_json = schema,
+                    }})[0..]),
+                    .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                        .group_id = 7001,
+                        .table_id = 7,
+                        .start_key = "",
+                        .end_key = null,
+                    }})[0..]),
+                    .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                    .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                    .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                    .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                };
+            }
+
+            fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+        };
+
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const replica_root_dir = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{s}/cold-replicated-apply-{s}",
+            .{ tmp.sub_path, case.name },
+        );
+        defer alloc.free(replica_root_dir);
+        const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+        defer alloc.free(db_path);
+
+        const tables = [_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .placement_role = "data",
+            .indexes_json = tables_api.default_indexes_json,
+            .schema_json = case.schema_json,
+        }};
+        const ranges = [_]metadata_table_manager.RangeRecord{.{
+            .group_id = 7001,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }};
+
+        {
+            var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+            defer source.deinit();
+            var write_cache = ProvisionedTableWriteCache.init(alloc);
+            defer write_cache.deinit();
+            source.write_cache = &write_cache;
+
+            _ = try source.applyReplicatedBatchGroupLocal(alloc, 7001, "docs", .{
+                .writes = &.{.{ .key = case.key, .value = case.value }},
+                .sync_level = .full_index,
+            });
+
+            _ = try source.reconcileReplicaRootTablesWithWriteCache(
+                alloc,
+                1,
+                &.{7001},
+                &tables,
+                &ranges,
+                null,
+            );
+        }
+
+        var reopened = try db_mod.DB.open(alloc, db_path, .{
+            .identity_namespace = identity_namespace,
+            .prefer_existing_identity_namespace = true,
+            .start_index_workers = false,
+        });
+        defer reopened.close();
+        try std.testing.expect(reopened.core.index_manager.loadFailure("full_text_index_v0") == null);
+
+        var result = try reopened.search(alloc, .{
+            .index_name = "full_text_index_v0",
+            .full_text = .{ .match = .{ .field = case.field, .text = case.query } },
+        });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    }
 }
 
 test "provisioned replicated sync marks local runtime status dirty" {
