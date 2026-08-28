@@ -11557,12 +11557,11 @@ pub const ProvisionedTableWriteSource = struct {
         _: *ProvisionedTableWriteSource,
         status: *runtime_status.LocalTableRuntimeStatus,
     ) void {
-        status.metadata = .{
+        status.replaceMetadata(.{
             .updated_at_ns = platform_time.monotonicNs(),
             .source = .live_writer_publish,
             .freshness = .fresh,
-        };
-        runtime_status.clearRuntimeObservationServiceability(status);
+        });
     }
 
     fn lsmStorageStatsFromDb(db: *db_mod.DB) runtime_status.LsmStorageStats {
@@ -11815,18 +11814,17 @@ pub const ProvisionedTableWriteSource = struct {
     fn markRecoveredRuntimeStatuses(statuses: *runtime_status.LocalTableRuntimeStatuses) void {
         const now_ns = platform_time.monotonicNs();
         for (statuses.items) |*item| {
-            item.metadata = item.metadata.withDefaults(.cached_snapshot, now_ns);
-            item.metadata.source = .cached_snapshot;
-            item.metadata.freshness = .fresh;
-            runtime_status.clearRuntimeObservationServiceability(item);
+            var metadata = item.metadata.withDefaults(.cached_snapshot, now_ns);
+            metadata.source = .cached_snapshot;
+            metadata.freshness = .fresh;
+            item.replaceMetadata(metadata);
         }
     }
 
     fn markRuntimeStatusesStale(statuses: *runtime_status.LocalTableRuntimeStatuses) void {
         for (statuses.items) |*item| {
             if (item.metadata.freshness == .fresh) {
-                item.metadata.freshness = .stale;
-                runtime_status.clearRuntimeObservationServiceability(item);
+                item.replaceFreshness(.stale);
             }
         }
     }
@@ -11934,8 +11932,7 @@ pub const ProvisionedTableWriteSource = struct {
         if (needs_cold_refresh) {
             if (self.local_change_hook != null) {
                 for (cached.items) |*status| {
-                    status.metadata.freshness = .stale;
-                    runtime_status.clearRuntimeObservationServiceability(status);
+                    status.replaceFreshness(.stale);
                 }
                 self.notifyLocalChange(table_name, .runtime_status);
                 return cached;
@@ -23653,7 +23650,7 @@ fn markRuntimeStatusFromDb(
     status: *runtime_status.LocalTableRuntimeStatus,
     phase: db_mod.types.StartupCatchUpPhase,
 ) void {
-    status.metadata = .{
+    status.replaceMetadata(.{
         .updated_at_ns = platform_time.monotonicNs(),
         .source = if (phase != .idle)
             .startup_catch_up
@@ -23663,7 +23660,33 @@ fn markRuntimeStatusFromDb(
             .fresh
         else
             startupRuntimeStatusFreshness(phase),
-    };
+    });
+}
+
+test "db runtime relabel cannot reuse cached index serviceability" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .runtime_observation_serviceable = true,
+    }};
+
+    for ([_]db_mod.types.StartupCatchUpPhase{ .idle, .artifact_rebuild }) |phase| {
+        indexes[0].runtime_observation_serviceable = true;
+        var status = runtime_status.LocalTableRuntimeStatus{
+            .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
+            .stats = .{ .index_count = 1, .indexes = indexes[0..] },
+        };
+
+        markRuntimeStatusFromDb(&status, phase);
+        try std.testing.expectEqual(
+            if (phase == .idle)
+                runtime_status.RuntimeStatusFreshness.fresh
+            else
+                runtime_status.RuntimeStatusFreshness.catching_up,
+            status.metadata.freshness,
+        );
+        try std.testing.expect(!status.stats.indexes[0].runtime_observation_serviceable);
+    }
 }
 
 fn statusHasRuntimeFactsIgnoringMetadataSource(status: runtime_status.LocalTableRuntimeStatus) bool {
@@ -24121,10 +24144,7 @@ fn setRuntimeStatusMetadata(
     source: runtime_status.RuntimeStatusSource,
     freshness: runtime_status.RuntimeStatusFreshness,
 ) void {
-    status.metadata.source = source;
-    status.metadata.freshness = freshness;
-    status.metadata.updated_at_ns = platform_time.monotonicNs();
-    runtime_status.clearRuntimeObservationServiceability(status);
+    status.relabel(source, freshness, platform_time.monotonicNs());
 }
 
 fn markStartupRuntimeStatus(

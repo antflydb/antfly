@@ -97,7 +97,34 @@ pub const LocalTableRuntimeStatus = struct {
     }
 
     pub fn withMetadataDefaults(self: *@This(), source: RuntimeStatusSource, now_ns: u64) void {
-        self.metadata = self.metadata.withDefaults(source, now_ns);
+        self.replaceMetadata(self.metadata.withDefaults(source, now_ns));
+    }
+
+    // Metadata transitions never establish index serviceability. Replacing or
+    // relabeling an observation therefore clears every cache-local proof; only
+    // the exact cache merge may mint one after validating its full identity.
+    pub fn replaceMetadata(self: *@This(), metadata: RuntimeStatusMetadata) void {
+        self.metadata = metadata;
+        for (self.stats.indexes) |*item| item.runtime_observation_serviceable = false;
+    }
+
+    pub fn relabel(
+        self: *@This(),
+        source: RuntimeStatusSource,
+        freshness: RuntimeStatusFreshness,
+        updated_at_ns: u64,
+    ) void {
+        var metadata = self.metadata;
+        metadata.source = source;
+        metadata.freshness = freshness;
+        metadata.updated_at_ns = updated_at_ns;
+        self.replaceMetadata(metadata);
+    }
+
+    pub fn replaceFreshness(self: *@This(), freshness: RuntimeStatusFreshness) void {
+        var metadata = self.metadata;
+        metadata.freshness = freshness;
+        self.replaceMetadata(metadata);
     }
 };
 
@@ -984,8 +1011,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
 ) !LocalTableRuntimeStatus {
     if (placeholder.stats.indexes.len == 0) {
         var cloned = try previous.clone(alloc);
-        cloned.metadata = cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns);
-        clearRuntimeObservationServiceability(&cloned);
+        cloned.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
         return cloned;
     }
 
@@ -1010,17 +1036,8 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
         dst.* = cached;
         dst.name = owned_name;
     }
-    merged.metadata = cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns);
-    clearRuntimeObservationServiceability(&merged);
+    merged.replaceMetadata(cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns));
     return merged;
-}
-
-// Relabeling never proves serviceability, including when the destination is a
-// catch-up state. Clear copied proofs unconditionally; the cache merge is the
-// sole authority that may mint one after checking root, incarnation, and
-// published-generation continuity.
-pub fn clearRuntimeObservationServiceability(status: *LocalTableRuntimeStatus) void {
-    for (status.stats.indexes) |*item| item.runtime_observation_serviceable = false;
 }
 
 fn cachedSnapshotMetadata(

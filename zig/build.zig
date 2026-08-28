@@ -6370,6 +6370,7 @@ pub fn build(b: *std.Build) void {
             "write cache retirement is allocation-free after entry installation",
             "writer cache metric pin batch release compacts retired entries once",
             "writer cache bulk transition fences only its table",
+            "db runtime relabel cannot reuse cached index serviceability",
             "provisioned read cache retirement is allocation-free after entry installation",
             "provisioned group storage prunes stale visible root generations",
             "provisioned Raft snapshot install publishes a fenced group generation",

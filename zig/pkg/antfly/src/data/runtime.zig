@@ -14181,7 +14181,7 @@ pub const DataServer = struct {
             }
             if (try self.snapshotManagedWriterGroupStatusBestEffort(self.alloc, table.name, group_id)) |live_status| {
                 var status = live_status;
-                status.metadata = status.metadata.withDefaults(.live_writer_publish, platform_time.monotonicNs());
+                status.withMetadataDefaults(.live_writer_publish, platform_time.monotonicNs());
                 self.applyRuntimeStatusStorageFactsBestEffort(&status, group_id, null);
                 try items.append(self.alloc, status);
                 continue;
@@ -14240,7 +14240,11 @@ pub const DataServer = struct {
                         status,
                         self.provisioned_storage.visibleRootGenerationForGroup(group_id),
                     )) {
-                        status.metadata.source = .cached_snapshot;
+                        status.relabel(
+                            .cached_snapshot,
+                            status.metadata.freshness,
+                            status.metadata.updated_at_ns,
+                        );
                     } else {
                         setRuntimeStatusMetadata(&status, .cached_snapshot, .stale);
                     }
@@ -14338,10 +14342,7 @@ pub const DataServer = struct {
         source: runtime_status.RuntimeStatusSource,
         freshness: runtime_status.RuntimeStatusFreshness,
     ) void {
-        status.metadata.source = source;
-        status.metadata.freshness = freshness;
-        status.metadata.updated_at_ns = platform_time.monotonicNs();
-        runtime_status.clearRuntimeObservationServiceability(status);
+        status.relabel(source, freshness, platform_time.monotonicNs());
     }
 
     fn syntheticConfiguredRuntimeStatus(
