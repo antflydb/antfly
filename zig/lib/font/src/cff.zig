@@ -57,6 +57,11 @@ fn roundedIsizeFromFloat(value: f64) Error!isize {
     return @intFromFloat(rounded);
 }
 
+fn charsetRangeValue(first: u16, delta: usize) Error!u16 {
+    if (delta > std.math.maxInt(u16) - @as(usize, first)) return error.InvalidCff;
+    return @intCast(@as(usize, first) + delta);
+}
+
 pub const GlyphPoint = @import("sfnt.zig").GlyphPoint;
 pub const GlyphContour = @import("sfnt.zig").GlyphContour;
 pub const GlyphOutline = @import("sfnt.zig").GlyphOutline;
@@ -1022,7 +1027,7 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
                 cursor += 3;
                 var j: usize = 0;
                 while (j <= left and i < glyph_count) : (j += 1) {
-                    out[i] = @intCast(first + j);
+                    out[i] = try charsetRangeValue(first, j);
                     i += 1;
                 }
             }
@@ -1037,7 +1042,7 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
                 cursor += 4;
                 var j: usize = 0;
                 while (j <= left and i < glyph_count) : (j += 1) {
-                    out[i] = @intCast(first + j);
+                    out[i] = try charsetRangeValue(first, j);
                     i += 1;
                 }
             }
@@ -1540,6 +1545,15 @@ test "cff parses charset format 2" {
     const charset = try parseCharsetAlloc(alloc, &bytes, 3, 5);
     defer alloc.free(charset);
     try std.testing.expectEqualSlices(u16, &.{ 0, 30, 31, 32, 40 }, charset);
+}
+
+test "cff rejects overflowing charset ranges" {
+    const alloc = std.testing.allocator;
+    const format_1 = [_]u8{ 0, 0, 0, 1, 0xff, 0xff, 1 };
+    try std.testing.expectError(error.InvalidCff, parseCharsetAlloc(alloc, &format_1, 3, 3));
+
+    const format_2 = [_]u8{ 0, 0, 0, 2, 0xff, 0xff, 0, 1 };
+    try std.testing.expectError(error.InvalidCff, parseCharsetAlloc(alloc, &format_2, 3, 3));
 }
 
 test "cff resolves standard SID names and predefined encodings" {

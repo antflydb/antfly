@@ -2260,13 +2260,18 @@ pub const Reader = struct {
         var page = try self.readPageObject(page_num);
         defer page.deinit(self.alloc);
         const page_box = try self.extractPageBoxFromObject(&page);
+        const decoded_content = if (page.get("Contents")) |contents|
+            try self.readCombinedContentStreamsAlloc(contents)
+        else
+            try self.alloc.alloc(u8, 0);
+        defer self.alloc.free(decoded_content);
 
         const fonts = try self.collectPageFontsAlloc(&page);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
-        const images = try self.collectPageImagesAlloc(&page);
+        const images = try self.collectPageImagesForContentAlloc(&page, decoded_content);
         defer {
             for (images) |*image| image.deinit(self.alloc);
             self.alloc.free(images);
@@ -2276,7 +2281,7 @@ pub const Reader = struct {
             for (shadings) |*shading| shading.deinit(self.alloc);
             self.alloc.free(shadings);
         }
-        const patterns = try self.collectPagePatternsAlloc(&page);
+        const patterns = try self.collectPagePatternsForContentAlloc(&page, decoded_content);
         defer {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
@@ -2286,7 +2291,7 @@ pub const Reader = struct {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
-        const forms = try self.collectPageFormsAlloc(&page);
+        const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
@@ -2319,14 +2324,11 @@ pub const Reader = struct {
         var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, .{}, &.{}, .nonzero);
         defer text_parser.deinit();
 
-        if (page.get("Contents")) |contents| {
-            // A /Contents array is one logical content stream. Graphics state,
-            // operands, and paint order continue across its physical stream
-            // boundaries, as if the decoded bytes were separated by whitespace.
-            const decoded = try self.readCombinedContentStreamsAlloc(contents);
-            defer self.alloc.free(decoded);
-            try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded, fonts, images, shadings, patterns, gstates, forms);
+        if (decoded_content.len > 0) {
+            try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms);
         }
+        try appendVectorTextShapeRunsAlloc(self.alloc, &shape_out, fonts, text_out.items);
+        try appendVectorTextPatternRunsAlloc(self.alloc, &pattern_out, fonts, patterns, text_out.items);
 
         result.text_runs = try text_out.toOwnedSlice(self.alloc);
         text_transferred = true;
@@ -2424,34 +2426,43 @@ pub const Reader = struct {
         var out = std.ArrayList(ShapeRun).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*run| run.deinit(self.alloc);
+        try appendVectorTextShapeRunsAlloc(self.alloc, &out, fonts, text_runs);
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn appendVectorTextShapeRunsAlloc(
+        alloc: Allocator,
+        out: *std.ArrayList(ShapeRun),
+        fonts: []const PageFont,
+        text_runs: []const TextRun,
+    ) !void {
         for (text_runs) |run| {
             if (run.fill_pattern_name != null or run.stroke_pattern_name != null) continue;
             const font_index = run.font_index orelse continue;
             if (font_index >= fonts.len) continue;
             if (fonts[font_index].type3) |type3| {
                 const raw = run.raw_text orelse continue;
-                try appendType3RunShapesAlloc(self.alloc, &out, run, type3, raw);
+                try appendType3RunShapesAlloc(alloc, out, run, type3, raw);
                 continue;
             }
             if (fonts[font_index].type1) |type1| {
                 const raw = run.raw_text orelse continue;
-                try appendType1RunShapesAlloc(self.alloc, &out, run, type1, raw);
+                try appendType1RunShapesAlloc(alloc, out, run, type1, raw);
                 continue;
             }
             if (fonts[font_index].truetype) |truetype| {
-                try appendTrueTypeRunShapesAlloc(self.alloc, &out, run, truetype, run.raw_text);
+                try appendTrueTypeRunShapesAlloc(alloc, out, run, truetype, run.raw_text);
                 continue;
             }
             if (fonts[font_index].cff_otf) |cff_otf| {
-                try appendCffRunShapesAlloc(self.alloc, &out, run, cff_otf);
+                try appendCffRunShapesAlloc(alloc, out, run, cff_otf);
                 continue;
             }
             if (fonts[font_index].cff) |cff| {
                 const raw = run.raw_text orelse continue;
-                try appendEmbeddedCffRunShapesAlloc(self.alloc, &out, run, cff, raw);
+                try appendEmbeddedCffRunShapesAlloc(alloc, out, run, cff, raw);
             }
         }
-        return try out.toOwnedSlice(self.alloc);
     }
 
     pub fn extractPageVectorTextPatternRunsAlloc(self: *Reader, page_num: usize) ![]PatternRun {
@@ -3478,6 +3489,13 @@ pub const Reader = struct {
         return try self.collectImagesFromResourcesAlloc(&resources.?, content);
     }
 
+    fn collectPageImagesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageImage {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageImage, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
+        return try self.collectImagesFromResourcesAlloc(&resources.?, content);
+    }
+
     fn collectPageShadingsAlloc(self: *const Reader, page: *const syntax.Object) ![]PageShading {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageShading, 0);
@@ -3494,6 +3512,13 @@ pub const Reader = struct {
         return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
     }
 
+    fn collectPagePatternsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PagePattern {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PagePattern, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
+        return try self.collectPatternsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+    }
+
     fn collectPageExtGStatesAlloc(self: *const Reader, page: *const syntax.Object) ![]PageExtGState {
         var resources = try self.findInheritedPageValue(page, "Resources");
         if (resources == null) return try self.alloc.alloc(PageExtGState, 0);
@@ -3507,6 +3532,13 @@ pub const Reader = struct {
         defer if (resources) |*obj| obj.deinit(self.alloc);
         const content = try self.collectPageContentAlloc(page);
         defer self.alloc.free(content);
+        return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
+    }
+
+    fn collectPageFormsForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageForm {
+        var resources = try self.findInheritedPageValue(page, "Resources");
+        if (resources == null) return try self.alloc.alloc(PageForm, 0);
+        defer if (resources) |*obj| obj.deinit(self.alloc);
         return try self.collectFormsFromResourcesAlloc(&resources.?, &resources.?, 0, content);
     }
 
@@ -19100,12 +19132,9 @@ test "reader vectorizes Type1C standard SID glyphs with StandardEncoding" {
 
     var reader = try Reader.init(alloc, sample);
     defer reader.deinit();
-    const shapes = try reader.extractPageVectorTextShapeRunsAlloc(1);
-    defer {
-        for (shapes) |*shape| shape.deinit(alloc);
-        alloc.free(shapes);
-    }
-    try std.testing.expect(shapes.len > 0);
+    var runs = try reader.extractPageRenderRunsAlloc(1);
+    defer runs.deinit(alloc);
+    try std.testing.expect(runs.shape_runs.len > 0);
 }
 
 test "type1 font parsing is allocation-failure safe" {

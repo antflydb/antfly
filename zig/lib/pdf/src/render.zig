@@ -626,11 +626,10 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
     const y0 = floorToCanvas(margin_f + max_y - bounds.max_y, canvas_h);
     const y1 = ceilToCanvas(margin_f + max_y - bounds.min_y, canvas_h);
     const has_clip = run.clip_box != null or run.clip_points != null;
-    const projected_width = @sqrt(run.a * run.a + run.b * run.b);
-    const projected_height = @sqrt(run.c * run.c + run.d * run.d);
-    const filtered = run.interpolate or
-        @as(f64, @floatFromInt(run.width)) > projected_width + 0.01 or
-        @as(f64, @floatFromInt(run.height)) > projected_height + 0.01;
+    // PDF interpolation is opt-in. In particular, preserve hard sample
+    // boundaries for bilevel scans and line art when /Interpolate is absent
+    // or false, even when the image is minified.
+    const filtered = run.interpolate;
 
     var py = y0;
     while (py < y1) : (py += 1) {
@@ -2579,6 +2578,40 @@ test "draw image run respects polygon clip" {
     const outside = ((10 * 16) + 8) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas[inside]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas[outside]);
+}
+
+test "image minification honors explicit interpolation policy" {
+    var rgba = [_]u8{
+        0xff, 0x00, 0x00, 0xff,
+        0x00, 0x00, 0xff, 0xff,
+    };
+    const base: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 2,
+        .height = 1,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    };
+
+    var nearest = [_]u8{0xff} ** 4;
+    drawImageRun(&nearest, 1, 1, 0, 0, 1, base);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x00, 0xff, 0xff }, &nearest);
+
+    var filtered = [_]u8{0xff} ** 4;
+    var interpolated = base;
+    interpolated.interpolate = true;
+    drawImageRun(&filtered, 1, 1, 0, 0, 1, interpolated);
+    try std.testing.expect(filtered[0] > 0 and filtered[2] > 0);
+    try std.testing.expectEqual(@as(u8, 0), filtered[1]);
+    try std.testing.expectEqual(@as(u8, 0xff), filtered[3]);
 }
 
 test "draw shape run round cap paints endpoint beyond segment" {

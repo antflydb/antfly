@@ -151,83 +151,29 @@ fn renderParsedPagePngNativeAlloc(
     const shading_runs = render_runs.shading_runs;
     const pattern_runs = render_runs.pattern_runs;
     const shape_runs = render_runs.shape_runs;
-    var text_pattern_runs: []reader.PatternRun = &.{};
-    var text_shape_runs: []reader.ShapeRun = &.{};
-    defer {
-        for (text_pattern_runs) |*run| run.deinit(reader_alloc);
-        if (text_pattern_runs.len > 0) reader_alloc.free(text_pattern_runs);
-        for (text_shape_runs) |*run| run.deinit(reader_alloc);
-        if (text_shape_runs.len > 0) reader_alloc.free(text_shape_runs);
-    }
     var plain_runs = std.ArrayList(reader.TextRun).empty;
     defer plain_runs.deinit(alloc);
-    var needs_vector_text_patterns = false;
-    var needs_vector_text_shapes = false;
     for (runs) |run| {
         const has_pattern = run.fill_pattern_name != null or run.stroke_pattern_name != null;
-        if (has_pattern) {
-            needs_vector_text_patterns = true;
-        }
-        if (run.vectorizable) {
-            needs_vector_text_shapes = true;
-        }
         if (has_pattern or run.vectorizable) continue;
         try plain_runs.append(alloc, run);
-    }
-    if (needs_vector_text_patterns) {
-        text_pattern_runs = try parsed.extractPageVectorTextPatternRunsAlloc(page_number);
-        scalePatternRuns(text_pattern_runs, scale);
-    }
-    if (needs_vector_text_shapes) {
-        text_shape_runs = try parsed.extractPageVectorTextShapeRunsAlloc(page_number);
-        scaleShapeRuns(text_shape_runs, scale);
-    }
-    var all_shape_runs = std.ArrayList(reader.ShapeRun).empty;
-    defer {
-        for (all_shape_runs.items) |*run| run.deinit(alloc);
-        all_shape_runs.deinit(alloc);
-    }
-    for (shape_runs) |run| {
-        var cloned = try dupShapeRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_shape_runs.append(alloc, cloned);
-    }
-    for (text_shape_runs) |run| {
-        var cloned = try dupShapeRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_shape_runs.append(alloc, cloned);
-    }
-    var all_pattern_runs = std.ArrayList(reader.PatternRun).empty;
-    defer {
-        for (all_pattern_runs.items) |*run| run.deinit(alloc);
-        all_pattern_runs.deinit(alloc);
-    }
-    for (pattern_runs) |run| {
-        var cloned = try dupPatternRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_pattern_runs.append(alloc, cloned);
-    }
-    for (text_pattern_runs) |run| {
-        var cloned = try dupPatternRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_pattern_runs.append(alloc, cloned);
     }
     std.mem.sort(reader.TextRun, plain_runs.items, {}, struct {
         fn lessThan(_: void, a: reader.TextRun, b: reader.TextRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    std.mem.sort(reader.ShapeRun, all_shape_runs.items, {}, struct {
+    std.mem.sort(reader.ShapeRun, shape_runs, {}, struct {
         fn lessThan(_: void, a: reader.ShapeRun, b: reader.ShapeRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    std.mem.sort(reader.PatternRun, all_pattern_runs.items, {}, struct {
+    std.mem.sort(reader.PatternRun, pattern_runs, {}, struct {
         fn lessThan(_: void, a: reader.PatternRun, b: reader.PatternRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items, rotation);
+    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation);
 }
 
 fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {

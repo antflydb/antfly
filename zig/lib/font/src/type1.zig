@@ -255,14 +255,21 @@ fn executeCharStringAlloc(
                             // Flex termination returns the final current point
                             // to the customary `pop pop setcurrentpoint` tail.
                             0 => try othersubr_results.appendSlice(alloc, &.{ y.*, x.* }),
+                            // Flex initialization and point collection do not
+                            // return values. The charstring's move operators
+                            // remain authoritative for outline geometry.
+                            1, 2 => {},
                             // Hint replacement returns its sole argument.
                             3 => if (argument_count > 0) try othersubr_results.append(alloc, stack.items[stack.items.len - 1]),
-                            else => {},
+                            // Custom OtherSubrs execute arbitrary PostScript.
+                            // Silently consuming them fabricates coordinates;
+                            // fail closed so the caller can use its fallback.
+                            else => return error.UnsupportedType1,
                         }
                         stack.shrinkRetainingCapacity(first);
                     },
                     17 => {
-                        const value = othersubr_results.pop() orelse 0;
+                        const value = othersubr_results.pop() orelse return error.InvalidType1;
                         try stack.append(alloc, value);
                     },
                     33 => {
@@ -539,6 +546,19 @@ test "type1 rejects non-integral and out-of-range othersubr operands" {
     // Fractional argument counts are invalid rather than implicitly truncated.
     const fractional_count = [_]u8{ 141, 143, 12, 12, 139, 12, 16, 14 };
     try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &fractional_count, null));
+}
+
+test "type1 fails closed for custom OtherSubrs and empty pop" {
+    const alloc = std.testing.allocator;
+    const custom_othersubr = [_]u8{
+        139, 139, 21, // 0 0 rmoveto
+        139, 143, 12, 16, // 0 4 callothersubr
+        14,
+    };
+    try std.testing.expectError(error.UnsupportedType1, glyphOutlineAlloc(alloc, &custom_othersubr, null));
+
+    const empty_pop = [_]u8{ 12, 17, 14 };
+    try std.testing.expectError(error.InvalidType1, glyphOutlineAlloc(alloc, &empty_pop, null));
 }
 
 test "type1 rejects unsafe subroutine and seac integer operands" {
