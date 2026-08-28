@@ -219,7 +219,7 @@ func TestDedicatedLeaseRenewalAdvancesUnchangedHolderFromFreshRuntimeProof(t *te
 	}
 }
 
-func TestDedicatedLeaseRenewalPreservesPendingBootstrapCompareBoundary(t *testing.T) {
+func TestDedicatedLeaseRenewalClosesExactPrimaryRestartBootstrap(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
 	cluster.Status.HAStatus = caughtUpHAStatus()
@@ -239,11 +239,69 @@ func TestDedicatedLeaseRenewalPreservesPendingBootstrapCompareBoundary(t *testin
 		t.Fatalf("dedicated renewal with pending bootstrap receipt: %v", err)
 	}
 	observed := getOwnershipTestLease(t, reconciler)
-	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(leaseRenewedAt) {
-		t.Fatalf("dedicated renewal moved the full reconciler's compare boundary: %#v", observed.Spec.RenewTime)
+	if observed.Spec.RenewTime == nil || !observed.Spec.RenewTime.Time.Equal(now) {
+		t.Fatalf("dedicated renewal did not close the exact restart bootstrap: %#v", observed.Spec.RenewTime)
 	}
-	if observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != receipt {
-		t.Fatalf("dedicated renewal consumed another controller's bootstrap receipt: %#v", observed.Annotations)
+	if observed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != "" ||
+		observed.Annotations[haFencingLeaseAnnotationActivationReceipt] != "" {
+		t.Fatalf("dedicated renewal retained completed bootstrap receipts: %#v", observed.Annotations)
+	}
+}
+
+func TestDedicatedLeaseRenewalActivatesBoundProcessExactlyOnce(t *testing.T) {
+	boundAt := time.Now().UTC().Truncate(time.Microsecond)
+	cluster := haClusterWithAutomaticKubernetesLeaseFailover()
+	cluster.Status.HAStatus = caughtUpHAStatus()
+	proof := candidateLeaseProof(boundAt.Add(time.Second), "primary-a", "primary-a", 1)
+	cluster.Status.HAStatus.PrimaryWatchdogProof = proof
+	lease := haFenceLease(cluster, boundAt, 10, 1, "primary-a")
+	lease.Annotations[haFencingLeaseAnnotationProcessBootID] = proof.ProcessBootID
+	receipt := haFencingLeaseBootstrapReceipt("primary-a", 1, proof.ProcessBootID)
+	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = receipt
+	reconciler := testHAReconciler(t, cluster, lease, candidateLeasePod(boundAt, "primary-a-pod-uid"))
+	now := boundAt.Add(2 * time.Second)
+	reconciler.Now = func() time.Time { return now }
+
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("activate exact bound process: %v", err)
+	}
+	activated := getOwnershipTestLease(t, reconciler)
+	if activated.Spec.RenewTime == nil || !activated.Spec.RenewTime.Time.Equal(now) ||
+		activated.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != receipt ||
+		activated.Annotations[haFencingLeaseAnnotationActivationReceipt] != receipt {
+		t.Fatalf("bound process did not receive one durable activation renewal: %#v", activated)
+	}
+	if activated.Spec.HolderIdentity == nil || *activated.Spec.HolderIdentity != "primary-a" ||
+		activated.Spec.LeaseTransitions == nil || *activated.Spec.LeaseTransitions != 1 {
+		t.Fatalf("activation renewal changed Lease authority: %#v", activated.Spec)
+	}
+
+	// A process that remains pending cannot turn the activation exception into
+	// an ordinary renewal loop.
+	now = now.Add(time.Second)
+	proof.ObservedAt = metav1.NewTime(now)
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("repeat pending activation: %v", err)
+	}
+	repeated := getOwnershipTestLease(t, reconciler)
+	if !repeated.Spec.RenewTime.Equal(activated.Spec.RenewTime) {
+		t.Fatalf("pending process renewed more than once: first=%s repeat=%s", activated.Spec.RenewTime, repeated.Spec.RenewTime)
+	}
+
+	// Only a fresh full-authority proof after the activation boundary consumes
+	// both receipts and resumes normal renewal.
+	now = now.Add(time.Second)
+	proof.AuthorityGranted = true
+	proof.AuthorityRemainingMS = 8_000
+	proof.ObservedAt = metav1.NewTime(now)
+	if err := reconciler.renewCurrentHAFencingLease(context.Background(), cluster); err != nil {
+		t.Fatalf("close activated process bootstrap: %v", err)
+	}
+	authorized := getOwnershipTestLease(t, reconciler)
+	if authorized.Spec.RenewTime == nil || !authorized.Spec.RenewTime.Time.Equal(now) ||
+		authorized.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != "" ||
+		authorized.Annotations[haFencingLeaseAnnotationActivationReceipt] != "" {
+		t.Fatalf("authorized process did not close activation receipts: %#v", authorized)
 	}
 }
 
@@ -325,10 +383,9 @@ func TestDedicatedLeaseRenewalRejectsInexactSuccessorHandoff(t *testing.T) {
 			},
 		},
 		{
-			name: "non-authoritative proof",
+			name: "inactive proof",
 			mutate: func(cluster *antflyv1.AntflyCluster, _ *coordinationv1.Lease) {
-				cluster.Status.HAStatus.PrimaryWatchdogProof.AuthorityGranted = false
-				cluster.Status.HAStatus.PrimaryWatchdogProof.AuthorityRemainingMS = 0
+				cluster.Status.HAStatus.PrimaryWatchdogProof.Active = false
 			},
 		},
 	} {
@@ -377,6 +434,7 @@ func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
 	for _, tt := range []struct {
 		name        string
 		receipt     string
+		activated   bool
 		wantRenewed bool
 	}{
 		{name: "before successor process binding", wantRenewed: true},
@@ -394,6 +452,14 @@ func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
 			),
 			wantRenewed: false,
 		},
+		{
+			name: "successor spent one-shot activation",
+			receipt: haFencingLeaseBootstrapReceipt(
+				"standby-a", 2, strings.Repeat("b", 64),
+			),
+			activated:   true,
+			wantRenewed: false,
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			now := time.Now().UTC().Truncate(time.Microsecond)
@@ -408,6 +474,9 @@ func TestDedicatedLeaseRenewalAdvancesOnlyExactCommittedHandoff(t *testing.T) {
 			lease.Annotations[haFencingLeaseAnnotationProcessBootID] = strings.Repeat("b", 64)
 			if tt.receipt != "" {
 				lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] = tt.receipt
+			}
+			if tt.activated {
+				lease.Annotations[haFencingLeaseAnnotationActivationReceipt] = tt.receipt
 			}
 			reconciler := testHAReconciler(t, cluster, lease)
 			reconciler.Now = func() time.Time { return now }

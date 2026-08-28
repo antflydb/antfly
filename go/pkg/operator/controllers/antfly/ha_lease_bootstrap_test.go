@@ -304,6 +304,8 @@ func TestPendingBootstrapReceiptWaitsOldProcessFenceBoundaryThenRebindsOnce(t *t
 	lease.Annotations[haFencingLeaseAnnotationPrimaryLSN] = "0"
 	lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt] =
 		haFencingLeaseBootstrapReceipt("primary-a", 1, strings.Repeat("a", 64))
+	lease.Annotations[haFencingLeaseAnnotationActivationReceipt] =
+		lease.Annotations[haFencingLeaseAnnotationBootstrapReceipt]
 	replacementObserved := leaseTime.Add(time.Second)
 	cluster.Status.HAStatus = &antflyv1.HAStatus{
 		PrimaryAdminLastError: "HA Lease watchdog authority is pending for node primary-a",
@@ -338,7 +340,8 @@ func TestPendingBootstrapReceiptWaitsOldProcessFenceBoundaryThenRebindsOnce(t *t
 	wantReplacementReceipt := haFencingLeaseBootstrapReceipt("primary-a", 1, strings.Repeat("b", 64))
 	if renewed.Spec.RenewTime == nil || !renewed.Spec.RenewTime.Time.Equal(now) ||
 		renewed.Annotations[haFencingLeaseAnnotationBootstrapReceipt] != wantReplacementReceipt ||
-		renewed.Annotations[haFencingLeaseAnnotationProcessBootID] != strings.Repeat("b", 64) {
+		renewed.Annotations[haFencingLeaseAnnotationProcessBootID] != strings.Repeat("b", 64) ||
+		renewed.Annotations[haFencingLeaseAnnotationActivationReceipt] != "" {
 		t.Fatalf("replacement process was not rebound after the old process fence boundary: %#v", renewed)
 	}
 	if cluster.Status.HAStatus.Fencing.Ready {
