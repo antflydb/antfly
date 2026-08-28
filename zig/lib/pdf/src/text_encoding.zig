@@ -147,6 +147,44 @@ pub const mac_roman_glyph_names: [256][]const u8 = .{
     "macron",         "breve",          "dotaccent",      "ring",          "cedilla",       "hungarumlaut",   "ogonek",      "caron",
 };
 
+/// MacExpertEncoding from PDF 1.7, Appendix D.3. This is a PDF encoding,
+/// distinct from the CFF predefined ExpertEncoding and from an expert font's
+/// built-in encoding.
+pub const mac_expert_glyph_names: [256][]const u8 = .{
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    "space",             "exclamsmall",        "Hungarumlautsmall", "centoldstyle",      "dollaroldstyle",   "dollarsuperior",      "ampersandsmall",   "Acutesmall",
+    "parenleftsuperior", "parenrightsuperior", "twodotenleader",    "onedotenleader",    "comma",            "hyphen",              "period",           "fraction",
+    "zerooldstyle",      "oneoldstyle",        "twooldstyle",       "threeoldstyle",     "fouroldstyle",     "fiveoldstyle",        "sixoldstyle",      "sevenoldstyle",
+    "eightoldstyle",     "nineoldstyle",       "colon",             "semicolon",         ".notdef",          "threequartersemdash", ".notdef",          "questionsmall",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           "Ethsmall",         ".notdef",             ".notdef",          "onequarter",
+    "onehalf",           "threequarters",      "oneeighth",         "threeeighths",      "fiveeighths",      "seveneighths",        "onethird",         "twothirds",
+    ".notdef",           ".notdef",            ".notdef",           ".notdef",           ".notdef",          ".notdef",             "ff",               "fi",
+    "fl",                "ffi",                "ffl",               "parenleftinferior", ".notdef",          "parenrightinferior",  "Circumflexsmall",  "hypheninferior",
+    "Gravesmall",        "Asmall",             "Bsmall",            "Csmall",            "Dsmall",           "Esmall",              "Fsmall",           "Gsmall",
+    "Hsmall",            "Ismall",             "Jsmall",            "Ksmall",            "Lsmall",           "Msmall",              "Nsmall",           "Osmall",
+    "Psmall",            "Qsmall",             "Rsmall",            "Ssmall",            "Tsmall",           "Usmall",              "Vsmall",           "Wsmall",
+    "Xsmall",            "Ysmall",             "Zsmall",            "colonmonetary",     "onefitted",        "rupiah",              "Tildesmall",       ".notdef",
+    ".notdef",           "asuperior",          "centsuperior",      ".notdef",           ".notdef",          ".notdef",             ".notdef",          "Aacutesmall",
+    "Agravesmall",       "Acircumflexsmall",   "Adieresissmall",    "Atildesmall",       "Aringsmall",       "Ccedillasmall",       "Eacutesmall",      "Egravesmall",
+    "Ecircumflexsmall",  "Edieresissmall",     "Iacutesmall",       "Igravesmall",       "Icircumflexsmall", "Idieresissmall",      "Ntildesmall",      "Oacutesmall",
+    "Ogravesmall",       "Ocircumflexsmall",   "Odieresissmall",    "Otildesmall",       "Uacutesmall",      "Ugravesmall",         "Ucircumflexsmall", "Udieresissmall",
+    ".notdef",           "eightsuperior",      "fourinferior",      "threeinferior",     "sixinferior",      "eightinferior",       "seveninferior",    "Scaronsmall",
+    ".notdef",           "centinferior",       "twoinferior",       ".notdef",           "Dieresissmall",    ".notdef",             "Caronsmall",       "osuperior",
+    "fiveinferior",      ".notdef",            "commainferior",     "periodinferior",    "Yacutesmall",      ".notdef",             "dollarinferior",   ".notdef",
+    ".notdef",           "Thornsmall",         ".notdef",           "nineinferior",      "zeroinferior",     "Zcaronsmall",         "AEsmall",          "Oslashsmall",
+    "questiondownsmall", "oneinferior",        "Lslashsmall",       ".notdef",           ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           "Cedillasmall",       ".notdef",           ".notdef",           ".notdef",          ".notdef",             ".notdef",          "OEsmall",
+    "figuredash",        "hyphensuperior",     ".notdef",           ".notdef",           ".notdef",          ".notdef",             "exclamdownsmall",  ".notdef",
+    "Ydieresissmall",    ".notdef",            "onesuperior",       "twosuperior",       "threesuperior",    "foursuperior",        "fivesuperior",     "sixsuperior",
+    "sevensuperior",     "ninesuperior",       "zerosuperior",      ".notdef",           "esuperior",        "rsuperior",           "tsuperior",        ".notdef",
+    ".notdef",           "isuperior",          "ssuperior",         "dsuperior",         ".notdef",          ".notdef",             ".notdef",          ".notdef",
+    ".notdef",           "lsuperior",          "Ogoneksmall",       "Brevesmall",        "Macronsmall",      "bsuperior",           "nsuperior",        "msuperior",
+    "commasuperior",     "periodsuperior",     "Dotaccentsmall",    "Ringsmall",         ".notdef",          ".notdef",             ".notdef",          ".notdef",
+};
+
 pub fn decodeNamedAlloc(alloc: Allocator, enc: NamedEncoding, bytes: []const u8) ![]u8 {
     if (isUtf16Be(bytes)) return try utf16BeDecodeAlloc(alloc, bytes);
     const table: *const [256]u21 = switch (enc) {
@@ -357,4 +395,13 @@ test "win ansi decode handles euro" {
     const decoded = try decodeNamedAlloc(alloc, .win_ansi, &.{0x80});
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("\u{20ac}", decoded);
+}
+
+test "MacExpertEncoding matches PDF specification assignments" {
+    try std.testing.expectEqualStrings("space", mac_expert_glyph_names[32]);
+    try std.testing.expectEqualStrings("exclamsmall", mac_expert_glyph_names[33]);
+    try std.testing.expectEqualStrings("onequarter", mac_expert_glyph_names[71]);
+    try std.testing.expectEqualStrings(".notdef", mac_expert_glyph_names[65]);
+    try std.testing.expectEqualStrings("Asmall", mac_expert_glyph_names[97]);
+    try std.testing.expectEqualStrings("AEsmall", mac_expert_glyph_names[190]);
 }

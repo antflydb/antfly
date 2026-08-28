@@ -535,6 +535,13 @@ const EmbeddedCffGlyph = struct {
     advance: f64,
 };
 
+fn embeddedCffTextSpacing(code_bytes: usize, code: u32, char_spacing: f64, word_spacing: f64) f64 {
+    // PDF word spacing applies only when code 32 is a complete one-byte
+    // character. In particular, Identity-H's 0x0020 is a two-byte code
+    // and must not receive Tw.
+    return char_spacing + if (code_bytes == 1 and code == ' ') word_spacing else 0.0;
+}
+
 const EmbeddedCffFont = struct {
     bytes: []u8,
     font: font_lib.cff.Font,
@@ -564,13 +571,17 @@ const EmbeddedCffFont = struct {
         }
         return null;
     }
+
+    fn textSpacing(self: EmbeddedCffFont, code: u32, char_spacing: f64, word_spacing: f64) f64 {
+        return embeddedCffTextSpacing(self.code_bytes, code, char_spacing, word_spacing);
+    }
 };
 
-const SimpleCffBaseEncoding = enum { embedded, standard, expert, win_ansi, mac_roman };
+const SimpleCffBaseEncoding = enum { embedded, standard, mac_expert, win_ansi, mac_roman };
 
 fn simpleCffBaseEncodingFromName(name: []const u8) SimpleCffBaseEncoding {
     if (std.mem.eql(u8, name, "StandardEncoding")) return .standard;
-    if (std.mem.eql(u8, name, "MacExpertEncoding")) return .expert;
+    if (std.mem.eql(u8, name, "MacExpertEncoding")) return .mac_expert;
     if (std.mem.eql(u8, name, "WinAnsiEncoding")) return .win_ansi;
     if (std.mem.eql(u8, name, "MacRomanEncoding")) return .mac_roman;
     return .embedded;
@@ -580,7 +591,7 @@ fn cffGlyphIndexForBaseEncoding(cff: font_lib.cff.Font, encoding: SimpleCffBaseE
     return switch (encoding) {
         .embedded => cff.glyphIndexForEmbeddedCode(code),
         .standard => cff.glyphIndexForPredefinedCode(code, false),
-        .expert => cff.glyphIndexForPredefinedCode(code, true),
+        .mac_expert => cff.glyphIndexForName(text_encoding.mac_expert_glyph_names[code]),
         .win_ansi => cff.glyphIndexForName(text_encoding.win_ansi_glyph_names[code]),
         .mac_roman => cff.glyphIndexForName(text_encoding.mac_roman_glyph_names[code]),
     };
@@ -3446,7 +3457,7 @@ pub const Reader = struct {
                         try appendFontOutlineShapeRunAlloc(alloc, out, run, path.points, path.subpath_starts, .stroke);
                 }
             }
-            const spacing = run.char_spacing + if (code == ' ') run.word_spacing else 0.0;
+            const spacing = cff.textSpacing(code, run.char_spacing, run.word_spacing);
             cursor_x += (glyph.advance * scale + spacing) * run.horizontal_scale;
         }
     }
@@ -10561,7 +10572,7 @@ fn measureFontAdvanceAlloc(
             const code = parseRawCode(raw[offset .. offset + code_len]);
             offset += code_len;
             const glyph_advance = if (cff.glyphForCode(code)) |glyph| glyph.advance * scale else state.font_size * 0.6;
-            advance += (glyph_advance + state.char_spacing + if (code == ' ') state.word_spacing else 0.0) * state.horizontal_scale;
+            advance += (glyph_advance + cff.textSpacing(code, state.char_spacing, state.word_spacing)) * state.horizontal_scale;
         }
         return advance;
     }
@@ -18961,6 +18972,29 @@ test "CID widths use sparse arrays ranges and defaults" {
     try std.testing.expectEqual(@as(f64, 520), widths.width(12));
     try std.testing.expectEqual(@as(f64, 700), widths.width(25));
     try std.testing.expectEqual(@as(f64, 1000), widths.width(19));
+}
+
+test "embedded CFF word spacing applies only to single-byte space codes" {
+    try std.testing.expectEqual(@as(f64, 7), embeddedCffTextSpacing(1, ' ', 2, 5));
+    try std.testing.expectEqual(@as(f64, 2), embeddedCffTextSpacing(1, 'A', 2, 5));
+    try std.testing.expectEqual(@as(f64, 2), embeddedCffTextSpacing(2, 0x0020, 2, 5));
+}
+
+test "simple CFF resolves PDF MacExpertEncoding independently of CFF ExpertEncoding" {
+    const cff_bytes = [_]u8{
+        1,   0,   4,   1, 0,   1,   1,   1,   5,   'T', 'e', 's',
+        't', 0,   1,   1, 1,   5,   190, 15,  165, 17,  0,   0,
+        0,   0,   0,   2, 1,   1,   2,   20,  14,  139, 139, 21,
+        247, 124, 139, 5, 251, 124, 250, 124, 5,   251, 124, 251,
+        124, 5,   14,  0, 0,   158,
+    };
+    var cff = try font_lib.cff.Font.init(std.testing.allocator, &cff_bytes);
+    defer cff.deinit(std.testing.allocator);
+
+    const encoding = simpleCffBaseEncodingFromName("MacExpertEncoding");
+    try std.testing.expectEqual(SimpleCffBaseEncoding.mac_expert, encoding);
+    try std.testing.expectEqual(@as(?u16, 1), cffGlyphIndexForBaseEncoding(cff, encoding, 71));
+    try std.testing.expectEqual(@as(?u16, null), cff.glyphIndexForPredefinedCode(71, true));
 }
 
 test "CID widths resolve indirect defaults ranges and array members" {
