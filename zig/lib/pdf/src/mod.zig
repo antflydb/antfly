@@ -2452,7 +2452,7 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     const font_bytes = try buildSimpleOpenTypeCffFontAlloc(alloc);
     defer alloc.free(font_bytes);
 
-    const content = "BT\n/F1 20 Tf\n10 10 Td\n<0041> Tj\nET\n";
+    const content = "BT\n/F1 20 Tf\n10 10 Td\n<0001> Tj\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
@@ -2461,7 +2461,9 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
         "<0000> <FFFF>\n" ++
         "endcodespacerange\n" ++
         "1 beginbfchar\n" ++
-        "<0041> <0041>\n" ++
+        // Extraction deliberately disagrees with both the raw CID and the
+        // font's only cmap entry. Painting must still select CFF CID 1.
+        "<0001> <0042>\n" ++
         "endbfchar\n" ++
         "endcmap\n" ++
         "end\n" ++
@@ -2473,7 +2475,7 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     const obj4 = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
     defer alloc.free(obj4);
     const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>\nendobj\n";
-    const obj6 = "6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /TestCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R >>\nendobj\n";
+    const obj6 = "6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /TestCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 700 /W [1 [250]] /FontDescriptor 7 0 R >>\nendobj\n";
     const obj7 = "7 0 obj\n<< /Type /FontDescriptor /FontName /TestCID /FontFile3 9 0 R >>\nendobj\n";
     const obj8 = try std.fmt.allocPrint(alloc, "8 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap });
     defer alloc.free(obj8);
@@ -2518,6 +2520,20 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     try out.appendSlice(alloc, startxref);
     try out.appendSlice(alloc, "%%EOF\n");
 
+    var parsed = try reader.Reader.init(alloc, out.items);
+    defer parsed.deinit();
+    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings("B\n", analysis.text);
+    try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 5), analysis.runs[0].advance_width, 0.001);
+    const native_shapes = try parsed.extractPageVectorTextShapeRunsAlloc(1);
+    defer {
+        for (native_shapes) |*shape| shape.deinit(alloc);
+        if (native_shapes.len > 0) alloc.free(native_shapes);
+    }
+    try std.testing.expect(native_shapes.len > 0);
+
     const backend = Backend.native();
     const png = try backend.renderFirstPagePng(alloc, out.items);
     defer alloc.free(png);
@@ -2529,7 +2545,7 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF fdselect g
     const font_bytes = try buildFdSelectOpenTypeCffFontAlloc(alloc);
     defer alloc.free(font_bytes);
 
-    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00410042> Tj\nET\n";
+    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00010002> Tj\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
@@ -2538,8 +2554,8 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF fdselect g
         "<0000> <FFFF>\n" ++
         "endcodespacerange\n" ++
         "2 beginbfchar\n" ++
-        "<0041> <0041>\n" ++
-        "<0042> <0042>\n" ++
+        "<0001> <0041>\n" ++
+        "<0002> <0042>\n" ++
         "endbfchar\n" ++
         "endcmap\n" ++
         "end\n" ++

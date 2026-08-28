@@ -358,6 +358,18 @@ const FontDecoder = struct {
 
         return @min(self.code_bytes, remaining.len);
     }
+
+    fn countCodes(self: *const FontDecoder, raw: []const u8) u64 {
+        var count: u64 = 0;
+        var offset: usize = 0;
+        while (offset < raw.len) {
+            const width = self.detectCodeWidth(raw[offset..]);
+            if (width == 0) break;
+            offset += @min(width, raw.len - offset);
+            count = saturatedAddU64(count, 1);
+        }
+        return count;
+    }
 };
 
 const PageFont = struct {
@@ -518,12 +530,23 @@ const CffOpenTypeFont = struct {
     sfnt: font_lib.sfnt.Font,
     cff: font_lib.cff.Font,
     units_per_em: u16,
+    glyphs: []EmbeddedCffGlyph,
+    code_bytes: usize,
 
     fn deinit(self: *CffOpenTypeFont, alloc: Allocator) void {
         self.cff.deinit(alloc);
         self.sfnt.deinit(alloc);
+        if (self.glyphs.len > 0) alloc.free(self.glyphs);
         alloc.free(self.bytes);
         self.* = undefined;
+    }
+
+    fn glyphForCode(self: *const CffOpenTypeFont, code: u32) ?EmbeddedCffGlyph {
+        return findEmbeddedCffGlyph(self.glyphs, code);
+    }
+
+    fn textSpacing(self: CffOpenTypeFont, code: u32, char_spacing: f64, word_spacing: f64) f64 {
+        return embeddedCffTextSpacing(self.code_bytes, code, char_spacing, word_spacing);
     }
 };
 
@@ -531,6 +554,11 @@ const EmbeddedCffGlyph = struct {
     code: u32,
     glyph_index: u16,
     advance: f64,
+};
+
+const CffPdfGlyphMap = struct {
+    glyphs: []EmbeddedCffGlyph,
+    code_bytes: usize,
 };
 
 fn embeddedCffTextSpacing(code_bytes: usize, code: u32, char_spacing: f64, word_spacing: f64) f64 {
@@ -554,26 +582,30 @@ const EmbeddedCffFont = struct {
     }
 
     fn glyphForCode(self: *const EmbeddedCffFont, code: u32) ?EmbeddedCffGlyph {
-        var low: usize = 0;
-        var high = self.glyphs.len;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            const glyph = self.glyphs[mid];
-            if (glyph.code < code) {
-                low = mid + 1;
-            } else if (glyph.code > code) {
-                high = mid;
-            } else {
-                return glyph;
-            }
-        }
-        return null;
+        return findEmbeddedCffGlyph(self.glyphs, code);
     }
 
     fn textSpacing(self: EmbeddedCffFont, code: u32, char_spacing: f64, word_spacing: f64) f64 {
         return embeddedCffTextSpacing(self.code_bytes, code, char_spacing, word_spacing);
     }
 };
+
+fn findEmbeddedCffGlyph(glyphs: []const EmbeddedCffGlyph, code: u32) ?EmbeddedCffGlyph {
+    var low: usize = 0;
+    var high = glyphs.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const glyph = glyphs[mid];
+        if (glyph.code < code) {
+            low = mid + 1;
+        } else if (glyph.code > code) {
+            high = mid;
+        } else {
+            return glyph;
+        }
+    }
+    return null;
+}
 
 const SimpleCffBaseEncoding = enum { embedded, standard, mac_expert, win_ansi, mac_roman };
 
@@ -1049,7 +1081,7 @@ const VectorTextWorkBudget = struct {
     fn reserveTextMaterialization(self: *VectorTextWorkBudget, run: TextRun, font: PageFont) ?MaterializationReservation {
         if (self.exhausted) return null;
         const glyph_count: u64 = if (run.raw_text) |raw|
-            raw.len
+            font.decoder.countCodes(raw)
         else
             (std.unicode.utf8CountCodepoints(run.text) catch run.text.len);
         const paint_copies: u64 = switch (@mod(run.render_mode, 8)) {
@@ -2749,8 +2781,10 @@ pub const Reader = struct {
         }
         if (fonts[font_index].truetype) |truetype|
             return try appendTrueTypeRunShapesAlloc(alloc, out, run, truetype, run.raw_text);
-        if (fonts[font_index].cff_otf) |cff_otf|
-            return try appendCffRunShapesAlloc(alloc, out, run, cff_otf);
+        if (fonts[font_index].cff_otf) |cff_otf| {
+            const raw = run.raw_text orelse return false;
+            return try appendCffRunShapesAlloc(alloc, out, run, cff_otf, raw);
+        }
         if (fonts[font_index].cff) |cff| {
             const raw = run.raw_text orelse return false;
             return try appendEmbeddedCffRunShapesAlloc(alloc, out, run, cff, raw);
@@ -4137,22 +4171,21 @@ pub const Reader = struct {
         out: *std.ArrayList(ShapeRun),
         run: TextRun,
         cff_otf: CffOpenTypeFont,
+        raw: []const u8,
     ) !bool {
-        if (run.text.len == 0) return true;
+        if (raw.len == 0) return true;
         const mode = @mod(run.render_mode, 8);
         if (mode == 3 or mode == 7) return true;
 
         const scale = if (cff_otf.units_per_em == 0) 1.0 else run.font_size / @as(f64, @floatFromInt(cff_otf.units_per_em));
         var cursor_x: f64 = 0;
-        var view = std.unicode.Utf8View.init(run.text) catch return false;
-        var iter = view.iterator();
-        while (iter.nextCodepoint()) |cp| {
-            const glyph_index = (cff_otf.sfnt.cmapGlyphIndex(cp) catch return false) orelse {
-                cursor_x += estimateRenderedRunCodepointAdvance(run, cp);
-                return false;
-            };
-            const advance_width = cff_otf.sfnt.advanceWidth(glyph_index) catch return false;
-            if (try cff_otf.cff.glyphOutlineAllocLimited(alloc, glyph_index, .{ .max_operations = max_glyph_charstring_operations })) |outline_value| {
+        var offset: usize = 0;
+        while (offset < raw.len) {
+            const code_len = @min(cff_otf.code_bytes, raw.len - offset);
+            const code = parseRawCode(raw[offset .. offset + code_len]);
+            offset += code_len;
+            const glyph = cff_otf.glyphForCode(code) orelse return false;
+            if (try cff_otf.cff.glyphOutlineAllocLimited(alloc, glyph.glyph_index, .{ .max_operations = max_glyph_charstring_operations })) |outline_value| {
                 var outline = outline_value;
                 defer outline.deinit(alloc);
                 var path = try flattenGlyphOutlineAlloc(alloc, outline, run, cursor_x, scale, 0);
@@ -4166,8 +4199,8 @@ pub const Reader = struct {
                     }
                 }
             }
-            const spacing = run.char_spacing + if (cp == ' ') run.word_spacing else 0.0;
-            cursor_x += (@as(f64, @floatFromInt(advance_width)) * scale + spacing) * run.horizontal_scale;
+            const spacing = cff_otf.textSpacing(code, run.char_spacing, run.word_spacing);
+            cursor_x += (glyph.advance * run.font_size / 1000.0 + spacing) * run.horizontal_scale;
         }
         return true;
     }
@@ -6435,7 +6468,7 @@ pub const Reader = struct {
             },
         };
         font.truetype = try self.buildTrueTypeFont(font_obj, font.decoder.code_bytes, &font.outline_fallback);
-        font.cff_otf = try self.buildCffOpenTypeFont(font_obj, &font.outline_fallback);
+        font.cff_otf = try self.buildCffOpenTypeFont(font_obj, font.decoder.code_bytes, &font.outline_fallback);
         font.cff = self.buildEmbeddedCffFont(font_obj, font.decoder.code_bytes) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => blk: {
@@ -6704,96 +6737,28 @@ pub const Reader = struct {
         };
     }
 
-    fn buildCffOpenTypeFont(self: *const Reader, font_obj: *const syntax.Object, outline_fallback: *bool) !?CffOpenTypeFont {
-        const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
-        errdefer self.alloc.free(bytes);
-        var sfnt = font_lib.sfnt.Font.init(self.alloc, bytes) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                outline_fallback.* = true;
-                self.alloc.free(bytes);
-                return null;
-            },
-        };
-        errdefer sfnt.deinit(self.alloc);
-        const cff_bytes = sfnt.tableData(.{ 'C', 'F', 'F', ' ' }) catch {
-            outline_fallback.* = true;
-            sfnt.deinit(self.alloc);
-            self.alloc.free(bytes);
-            return null;
-        };
-        var cff = font_lib.cff.Font.init(self.alloc, cff_bytes) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                outline_fallback.* = true;
-                sfnt.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            },
-        };
-        errdefer cff.deinit(self.alloc);
-        const head = sfnt.head() catch {
-            outline_fallback.* = true;
-            cff.deinit(self.alloc);
-            sfnt.deinit(self.alloc);
-            self.alloc.free(bytes);
-            return null;
-        };
-
-        return .{
-            .bytes = bytes,
-            .sfnt = sfnt,
-            .cff = cff,
-            .units_per_em = head.units_per_em,
-        };
-    }
-
-    fn buildEmbeddedCffFont(self: *const Reader, font_obj: *const syntax.Object, decoder_code_bytes: usize) !?EmbeddedCffFont {
+    fn buildCffPdfGlyphMapAlloc(self: *const Reader, font_obj: *const syntax.Object, cff: font_lib.cff.Font, decoder_code_bytes: usize) !?CffPdfGlyphMap {
         const subtype = font_obj.get("Subtype") orelse return null;
         const composite = std.mem.eql(u8, subtype.asName() orelse "", "Type0");
-        if (composite) {
-            const encoding_obj = font_obj.get("Encoding") orelse return null;
-            var resolved_encoding = try self.resolveValue(encoding_obj);
-            defer resolved_encoding.deinit(self.alloc);
-            const encoding_name = resolved_encoding.asName() orelse "";
-            if (!std.mem.eql(u8, encoding_name, "Identity-H")) return null;
-        }
-
-        var descendant: ?syntax.Object = null;
-        defer if (descendant) |*obj| obj.deinit(self.alloc);
-        const descriptor_owner = if (composite) blk: {
-            const descendants_obj = font_obj.get("DescendantFonts") orelse return null;
-            var resolved_descendants = try self.resolveValue(descendants_obj);
-            defer resolved_descendants.deinit(self.alloc);
-            if (resolved_descendants != .array or resolved_descendants.array.len == 0) return null;
-            descendant = try self.resolveValue(&resolved_descendants.array[0]);
-            if (descendant.? != .dict) return null;
-            break :blk &descendant.?;
-        } else font_obj;
-
-        const descriptor_obj = descriptor_owner.get("FontDescriptor") orelse return null;
-        var descriptor = try self.resolveValue(descriptor_obj);
-        defer descriptor.deinit(self.alloc);
-        if (descriptor != .dict) return null;
-        const file_obj = descriptor.get("FontFile3") orelse return null;
-        var stream = try self.resolveValue(file_obj);
-        defer stream.deinit(self.alloc);
-        if (stream != .stream) return null;
-        const file_subtype = stream.get("Subtype") orelse return null;
-        const expected_subtype = if (composite) "CIDFontType0C" else "Type1C";
-        if (!std.mem.eql(u8, file_subtype.asName() orelse "", expected_subtype)) return null;
-
-        const bytes = try self.readDecodedStreamData(&stream);
-        errdefer self.alloc.free(bytes);
-        var cff = try font_lib.cff.Font.init(self.alloc, bytes);
-        errdefer cff.deinit(self.alloc);
         var glyphs = std.ArrayList(EmbeddedCffGlyph).empty;
         defer glyphs.deinit(self.alloc);
 
         if (composite) {
-            var cid_widths = self.parseCidWidthsAlloc(descriptor_owner) catch |err| switch (err) {
+            const encoding_obj = font_obj.get("Encoding") orelse return null;
+            var resolved_encoding = try self.resolveValue(encoding_obj);
+            defer resolved_encoding.deinit(self.alloc);
+            if (!std.mem.eql(u8, resolved_encoding.asName() orelse "", "Identity-H")) return null;
+
+            const descendants_obj = font_obj.get("DescendantFonts") orelse return null;
+            var resolved_descendants = try self.resolveValue(descendants_obj);
+            defer resolved_descendants.deinit(self.alloc);
+            if (resolved_descendants != .array or resolved_descendants.array.len == 0) return null;
+            var descendant = try self.resolveValue(&resolved_descendants.array[0]);
+            defer descendant.deinit(self.alloc);
+            if (descendant != .dict) return null;
+            var cid_widths = self.parseCidWidthsAlloc(&descendant) catch |err| switch (err) {
                 error.OutOfMemory => return err,
-                else => CidWidths{ .default_width = self.cidDefaultWidthAlloc(descriptor_owner) catch |default_err| switch (default_err) {
+                else => CidWidths{ .default_width = self.cidDefaultWidthAlloc(&descendant) catch |default_err| switch (default_err) {
                     error.OutOfMemory => return default_err,
                     else => 1000,
                 } },
@@ -6847,7 +6812,7 @@ pub const Reader = struct {
                 else
                     cffGlyphIndexForBaseEncoding(cff, base_encoding, @intCast(code))) orelse continue;
                 const width_index = if (code >= first_char) code - first_char else widths.len;
-                const advance = if (width_index < widths.len) numericObjectValue(&widths[width_index]) orelse 1000 else 1000;
+                const advance = if (width_index < widths.len) (try self.resolvedNumericObjectValue(&widths[width_index])) orelse 1000 else 1000;
                 try glyphs.append(self.alloc, .{ .code = @intCast(code), .glyph_index = glyph_index, .advance = advance });
             }
         }
@@ -6858,10 +6823,115 @@ pub const Reader = struct {
             }
         }.lessThan);
         return .{
-            .bytes = bytes,
-            .font = cff,
             .glyphs = try glyphs.toOwnedSlice(self.alloc),
             .code_bytes = if (composite) @max(@as(usize, 2), decoder_code_bytes) else 1,
+        };
+    }
+
+    fn buildCffOpenTypeFont(self: *const Reader, font_obj: *const syntax.Object, decoder_code_bytes: usize, outline_fallback: *bool) !?CffOpenTypeFont {
+        const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
+        errdefer self.alloc.free(bytes);
+        var sfnt = font_lib.sfnt.Font.init(self.alloc, bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                outline_fallback.* = true;
+                self.alloc.free(bytes);
+                return null;
+            },
+        };
+        errdefer sfnt.deinit(self.alloc);
+        const cff_bytes = sfnt.tableData(.{ 'C', 'F', 'F', ' ' }) catch {
+            outline_fallback.* = true;
+            sfnt.deinit(self.alloc);
+            self.alloc.free(bytes);
+            return null;
+        };
+        var cff = font_lib.cff.Font.init(self.alloc, cff_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                outline_fallback.* = true;
+                sfnt.deinit(self.alloc);
+                self.alloc.free(bytes);
+                return null;
+            },
+        };
+        errdefer cff.deinit(self.alloc);
+        const head = sfnt.head() catch {
+            outline_fallback.* = true;
+            cff.deinit(self.alloc);
+            sfnt.deinit(self.alloc);
+            self.alloc.free(bytes);
+            return null;
+        };
+        const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff, decoder_code_bytes)) orelse {
+            outline_fallback.* = true;
+            cff.deinit(self.alloc);
+            sfnt.deinit(self.alloc);
+            self.alloc.free(bytes);
+            return null;
+        };
+        errdefer if (mapping.glyphs.len > 0) self.alloc.free(mapping.glyphs);
+
+        return .{
+            .bytes = bytes,
+            .sfnt = sfnt,
+            .cff = cff,
+            .units_per_em = head.units_per_em,
+            .glyphs = mapping.glyphs,
+            .code_bytes = mapping.code_bytes,
+        };
+    }
+
+    fn buildEmbeddedCffFont(self: *const Reader, font_obj: *const syntax.Object, decoder_code_bytes: usize) !?EmbeddedCffFont {
+        const subtype = font_obj.get("Subtype") orelse return null;
+        const composite = std.mem.eql(u8, subtype.asName() orelse "", "Type0");
+        if (composite) {
+            const encoding_obj = font_obj.get("Encoding") orelse return null;
+            var resolved_encoding = try self.resolveValue(encoding_obj);
+            defer resolved_encoding.deinit(self.alloc);
+            const encoding_name = resolved_encoding.asName() orelse "";
+            if (!std.mem.eql(u8, encoding_name, "Identity-H")) return null;
+        }
+
+        var descendant: ?syntax.Object = null;
+        defer if (descendant) |*obj| obj.deinit(self.alloc);
+        const descriptor_owner = if (composite) blk: {
+            const descendants_obj = font_obj.get("DescendantFonts") orelse return null;
+            var resolved_descendants = try self.resolveValue(descendants_obj);
+            defer resolved_descendants.deinit(self.alloc);
+            if (resolved_descendants != .array or resolved_descendants.array.len == 0) return null;
+            descendant = try self.resolveValue(&resolved_descendants.array[0]);
+            if (descendant.? != .dict) return null;
+            break :blk &descendant.?;
+        } else font_obj;
+
+        const descriptor_obj = descriptor_owner.get("FontDescriptor") orelse return null;
+        var descriptor = try self.resolveValue(descriptor_obj);
+        defer descriptor.deinit(self.alloc);
+        if (descriptor != .dict) return null;
+        const file_obj = descriptor.get("FontFile3") orelse return null;
+        var stream = try self.resolveValue(file_obj);
+        defer stream.deinit(self.alloc);
+        if (stream != .stream) return null;
+        const file_subtype = stream.get("Subtype") orelse return null;
+        const expected_subtype = if (composite) "CIDFontType0C" else "Type1C";
+        if (!std.mem.eql(u8, file_subtype.asName() orelse "", expected_subtype)) return null;
+
+        const bytes = try self.readDecodedStreamData(&stream);
+        errdefer self.alloc.free(bytes);
+        var cff = try font_lib.cff.Font.init(self.alloc, bytes);
+        errdefer cff.deinit(self.alloc);
+        const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff, decoder_code_bytes)) orelse {
+            cff.deinit(self.alloc);
+            self.alloc.free(bytes);
+            return null;
+        };
+        errdefer if (mapping.glyphs.len > 0) self.alloc.free(mapping.glyphs);
+        return .{
+            .bytes = bytes,
+            .font = cff,
+            .glyphs = mapping.glyphs,
+            .code_bytes = mapping.code_bytes,
         };
     }
 
@@ -11486,7 +11556,16 @@ fn measureFontAdvanceAlloc(
         return try measureSfntAdvanceAlloc(alloc, decoded, state, truetype.font, truetype.units_per_em);
     }
     if (font.cff_otf) |cff_otf| {
-        return try measureSfntAdvanceAlloc(alloc, decoded, state, cff_otf.sfnt, cff_otf.units_per_em);
+        var advance: f64 = 0;
+        var offset: usize = 0;
+        while (offset < raw.len) {
+            const code_len = @min(cff_otf.code_bytes, raw.len - offset);
+            const code = parseRawCode(raw[offset .. offset + code_len]);
+            offset += code_len;
+            const glyph_advance = if (cff_otf.glyphForCode(code)) |glyph| glyph.advance * state.font_size / 1000.0 else state.font_size * 0.6;
+            advance += (glyph_advance + cff_otf.textSpacing(code, state.char_spacing, state.word_spacing)) * state.horizontal_scale;
+        }
+        return advance;
     }
     if (font.cff) |cff| {
         var advance: f64 = 0;
@@ -20147,6 +20226,20 @@ test "vector text reserves before long glyph materialization and reconciles meas
         .font_size = 12,
     }, font) == null);
     try std.testing.expect(constrained.exhausted);
+
+    var cid_budget = VectorTextWorkBudget.init(.{ .width = 10, .height = 10 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+    cid_budget.remaining_points = max_flattened_glyph_points * 2;
+    const cid_font = PageFont{ .name = @constCast("CID"), .decoder = .{ .code_bytes = 2 } };
+    const cid_reservation = cid_budget.reserveTextMaterialization(.{
+        .text = @constCast("A"),
+        .raw_text = @constCast(&[_]u8{ 0, 1 }),
+        .font_index = 0,
+        .x = 0,
+        .y = 0,
+        .font_size = 12,
+    }, cid_font) orelse return error.UnexpectedTextMaterializationRejection;
+    try std.testing.expectEqual(@as(u64, max_flattened_glyph_points * 2), cid_reservation.points);
+    try std.testing.expectEqual(@as(u64, 0), cid_budget.remaining_points);
 }
 
 test "image XObject occurrences retain one decoded sample buffer" {
