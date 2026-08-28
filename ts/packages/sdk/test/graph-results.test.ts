@@ -173,6 +173,15 @@ describe("graph result admission", () => {
         request,
       ])
     ).not.toThrow();
+    expect(() =>
+      validateGraphQueryResponses(
+        responses(
+          { type: "shortest_path", total: 1, paths: [{ total_weight: -0.5 }] },
+          "legacy operation"
+        ),
+        [request]
+      )
+    ).not.toThrow();
 
     for (const malformed of [
       { type: "neighbors" },

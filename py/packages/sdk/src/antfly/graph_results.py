@@ -354,7 +354,10 @@ def _validate_legacy_path(value: object, path: str) -> None:
         for index, edge in enumerate(_array(graph_path["edges"], f"{path}.edges")):
             _validate_legacy_path_edge(edge, f"{path}.edges[{index}]")
     if "total_weight" in graph_path:
-        _finite_nonnegative(graph_path["total_weight"], f"{path}.total_weight")
+        # The deprecated v0.2 Path contract allowed any finite double. Keep the
+        # compatibility decoder faithful even though canonical paths require
+        # non-negative weights.
+        _finite_number(graph_path["total_weight"], f"{path}.total_weight")
     if "length" in graph_path:
         _legacy_integer(graph_path["length"], f"{path}.length")
 

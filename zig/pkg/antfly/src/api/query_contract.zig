@@ -428,23 +428,13 @@ pub const QueryResponseMeta = struct {
 /// executors and storage graph plans always use the canonical IR.
 const GraphResponseFormat = graph_wire_envelope.Dialect;
 
-fn graphResponseFormat(
-    alloc: std.mem.Allocator,
-    req: db_mod.types.SearchRequest,
-) !GraphResponseFormat {
-    var parsed = graph_wire_envelope.parseEnvelopeAlloc(
-        alloc,
-        req.graph_queries_proxy_json,
-        req.graph_queries,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidRemoteResponse,
-    };
-    defer parsed.deinit();
-    return parsed.dialect;
+fn graphResponseFormat(req: db_mod.types.SearchRequest) !GraphResponseFormat {
+    const transport = req.graph_query_transport orelse return error.InvalidRemoteResponse;
+    if (!transport.matchesOperations(req.graph_queries)) return error.InvalidRemoteResponse;
+    return transport.dialect;
 }
 
-test "graph response format classifies the admitted envelope structurally" {
+test "graph response format uses admitted metadata and fails closed on plan drift" {
     const queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "walk",
         .query = .{
@@ -454,31 +444,33 @@ test "graph response format classifies the admitted envelope structurally" {
         },
     }};
     try std.testing.expectEqual(GraphResponseFormat.canonical, try graphResponseFormat(
-        std.testing.allocator,
         .{
             .graph_queries = &queries,
-            .graph_queries_proxy_json = "{ \n \t\"graph_queries\" : {\"walk\":{}} }",
+            .graph_query_transport = .{
+                .dialect = .canonical,
+                .operations_json = "{\"walk\":{}}",
+                .operation_names = &.{"walk"},
+            },
         },
     ));
     try std.testing.expectEqual(GraphResponseFormat.legacy, try graphResponseFormat(
-        std.testing.allocator,
         .{
             .graph_queries = &queries,
-            .graph_queries_proxy_json = "{ \n \t\"graph_searches\" : {\"walk\":{}} }",
+            .graph_query_transport = .{
+                .dialect = .legacy,
+                .operations_json = "{\"walk\":{}}",
+                .operation_names = &.{"walk"},
+            },
         },
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
-        std.testing.allocator,
         .{
             .graph_queries = &queries,
-            .graph_queries_proxy_json = "{\"graph_queries\":{}}",
-        },
-    ));
-    try std.testing.expectError(error.InvalidRemoteResponse, graphResponseFormat(
-        std.testing.allocator,
-        .{
-            .graph_queries = &queries,
-            .graph_queries_proxy_json = "{\"graph_queries\":{\"walk\":{}},\"graph_searches\":{}}",
+            .graph_query_transport = .{
+                .dialect = .canonical,
+                .operations_json = "{}",
+                .operation_names = &.{},
+            },
         },
     ));
 }
@@ -2728,7 +2720,7 @@ pub fn parseQueryRequestWithDeadline(
     req.sparse_queries = vector_queries.sparse;
     req.graph_queries = try buildGraphQueries(alloc, request);
     if (req.graph_queries.len > 0) {
-        req.graph_queries_proxy_json = try captureGraphQueriesProxyEnvelopeAlloc(alloc, effective_body);
+        req.graph_query_transport = try captureGraphQueryTransportAlloc(alloc, effective_body, req.graph_queries);
     }
     if (request.expand_strategy) |expand_strategy| {
         req.expand_strategy = try parseExpandStrategy(expand_strategy);
@@ -3422,7 +3414,7 @@ pub fn encodeQueryResponses(
     }
 
     const graph_dialect = if (req.graph_queries.len > 0)
-        try graphResponseFormat(arena, req)
+        try graphResponseFormat(req)
     else
         null;
     const graph_results = if (graph_dialect) |dialect|
@@ -6220,9 +6212,13 @@ test "deprecated graph search preserves its response envelope" {
         "docs",
         .{
             .graph_queries = &named_queries,
-            .graph_queries_proxy_json =
-            \\{"graph_searches":{"neighbors":{"type":"neighbors"}}}
-            ,
+            .graph_query_transport = .{
+                .dialect = .legacy,
+                .operations_json =
+                \\{"neighbors":{"type":"neighbors"}}
+                ,
+                .operation_names = &.{"neighbors"},
+            },
         },
         .{ .took_ms = 3 },
         .{
@@ -11143,7 +11139,7 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     freeNamedDenseQueries(alloc, req.dense_queries);
     freeNamedSparseQueries(alloc, req.sparse_queries);
     freeNamedGraphQueries(alloc, req.graph_queries);
-    if (req.graph_queries_proxy_json.len > 0) alloc.free(req.graph_queries_proxy_json);
+    if (req.graph_query_transport) |*transport| transport.deinit(alloc);
     freeNamedDocFilterBindings(alloc, req.doc_filter_bindings);
     if (req.sparse) |sparse| {
         alloc.free(sparse.indices);
@@ -11170,11 +11166,16 @@ fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest)
     req.* = undefined;
 }
 
-/// Capture only the admitted graph operation map for transparent single-owner
-/// proxying. This stays independent of generated OpenAPI representation details
-/// and avoids a reverse serializer that would have to evolve with the DSL.
-fn captureGraphQueriesProxyEnvelopeAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
-    return graph_wire_envelope.captureRequestEnvelopeAlloc(alloc, body) catch |err| switch (err) {
+/// Capture the admitted dialect, exact operation names, and normalized
+/// operation object once. This stays independent of generated OpenAPI
+/// representation details and avoids a reverse serializer that would have to
+/// evolve with the DSL.
+fn captureGraphQueryTransportAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    operations: []const db_mod.types.NamedGraphQuery,
+) !db_mod.types.GraphQueryTransport {
+    return graph_wire_envelope.captureRequestTransportAlloc(alloc, body, operations) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidQueryRequest,
     };
@@ -15313,10 +15314,11 @@ test "api query contract owns the admitted graph wire for exact proxying" {
 
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
     try std.testing.expectEqual(graph_mod.EdgeDirection.both, owned.req.graph_queries[0].query.params.direction);
-    var wire = try ant_json.parseFromSlice(std.json.Value, alloc, owned.req.graph_queries_proxy_json, .{});
+    const transport = owned.req.graph_query_transport orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.GraphQueryWireDialect.canonical, transport.dialect);
+    var wire = try ant_json.parseFromSlice(std.json.Value, alloc, transport.operations_json, .{});
     defer wire.deinit();
-    const graph_queries = wire.value.object.get("graph_queries") orelse return error.TestUnexpectedResult;
-    const walk = graph_queries.object.get("walk") orelse return error.TestUnexpectedResult;
+    const walk = wire.value.object.get("walk") orelse return error.TestUnexpectedResult;
     const traverse = walk.object.get("traverse") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("both", traverse.object.get("direction").?.string);
     const filter = traverse.object.get("filter") orelse return error.TestUnexpectedResult;

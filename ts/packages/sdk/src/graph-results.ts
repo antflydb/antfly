@@ -91,6 +91,13 @@ function finiteNonnegative(value: unknown, path: string, atMostOne = false): num
   return value;
 }
 
+function finiteNumber(value: unknown, path: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return invalid(path, "must be a finite number");
+  }
+  return value;
+}
+
 function endpoint(value: unknown, path: string): JsonObject {
   const result = object(value, path);
   exactKeys(result, path, ["key"], ["table"]);
@@ -454,8 +461,10 @@ function legacyPath(value: unknown, path: string): void {
     array(graphPath.edges, `${path}.edges`).forEach((edge, index) => {
       legacyPathEdge(edge, `${path}.edges[${index}]`);
     });
+  // The deprecated v0.2 Path contract allowed any finite double. Canonical
+  // paths retain their stronger non-negative invariant above.
   if (graphPath.total_weight !== undefined)
-    finiteNonnegative(graphPath.total_weight, `${path}.total_weight`);
+    finiteNumber(graphPath.total_weight, `${path}.total_weight`);
   if (graphPath.length !== undefined) legacySafeInteger(graphPath.length, `${path}.length`);
 }
 

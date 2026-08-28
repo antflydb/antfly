@@ -23533,7 +23533,9 @@ components:
         include_documents:
           type: boolean
           default: false
-          description: Include stored documents on each terminal result node returned alongside its path.
+          description: Include stored documents on terminal result nodes returned alongside each path
+            when they exist at the pinned snapshot. A dangling graph identity omits document. When false,
+            document is always omitted.
         fields:
           type: array
           items:

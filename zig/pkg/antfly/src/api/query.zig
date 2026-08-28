@@ -2331,7 +2331,9 @@ test "query parser adapts deprecated graph searches" {
     try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries.len);
     try std.testing.expectEqualStrings("neighbors", owned.req.graph_queries[0].name);
     try std.testing.expect(owned.req.graph_queries[0].query.query_type == .neighbors);
-    try std.testing.expect(std.mem.startsWith(u8, owned.req.graph_queries_proxy_json, "{\"graph_searches\":"));
+    const transport = owned.req.graph_query_transport orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(db_mod.types.GraphQueryWireDialect.legacy, transport.dialect);
+    try std.testing.expect(std.mem.startsWith(u8, transport.operations_json, "{\"neighbors\":"));
 }
 
 test "query parser rejects graph queries and graph searches together" {

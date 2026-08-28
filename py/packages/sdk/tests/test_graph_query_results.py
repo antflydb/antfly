@@ -324,6 +324,20 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
     assert not isinstance(legacy.responses[0].graph_results, Unset)
     assert isinstance(legacy.responses[0].graph_results["legacy operation name"], LegacyGraphQueryResult)
 
+    legacy_negative_weight = decode_query_responses(
+        _query_response(
+            {
+                "type": "shortest_path",
+                "total": 1,
+                "paths": [{"total_weight": -0.5}],
+            },
+            operation="legacy operation name",
+        ),
+        graph_dialect="legacy",
+        expected_graph_operations=frozenset({"legacy operation name"}),
+    )
+    assert not isinstance(legacy_negative_weight.responses, Unset)
+
 
 @pytest.mark.parametrize(
     "legacy_result",

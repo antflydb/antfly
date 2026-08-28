@@ -12271,7 +12271,7 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate for path nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
             /**
-             * @description Include stored documents on each terminal result node returned alongside its path.
+             * @description Include stored documents on terminal result nodes returned alongside each path when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
              * @default false
              */
             include_documents?: boolean;

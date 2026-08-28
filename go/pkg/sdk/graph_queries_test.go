@@ -595,6 +595,12 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 	if legacy.Type != GraphQueryTypeNeighbors {
 		t.Fatalf("legacy type = %q, want neighbors", legacy.Type)
 	}
+	if err := json.Unmarshal([]byte(`{"type":"shortest_path","total":1,"paths":[{"total_weight":-0.5}]}`), &result); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeGraphResult(result); err != nil {
+		t.Fatalf("v0.2 finite negative path weight must remain compatible: %v", err)
+	}
 
 	for _, malformed := range []string{
 		`{"type":"neighbors"}`,

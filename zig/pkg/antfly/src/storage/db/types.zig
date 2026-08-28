@@ -1302,6 +1302,44 @@ pub const ExecutionContext = struct {
     max_parallelism: ?usize = null,
 };
 
+/// API transport metadata retained alongside the canonical graph execution
+/// plan. Compatibility is deliberately represented only at this wire boundary;
+/// graph executors continue to consume `NamedGraphQuery` exclusively.
+pub const GraphQueryWireDialect = enum { canonical, legacy };
+
+pub const GraphQueryTransport = struct {
+    dialect: GraphQueryWireDialect,
+    /// Owned, normalized JSON object containing only the admitted named graph
+    /// operations. It is safe to embed directly after a JSON field name.
+    operations_json: []const u8,
+    /// Owned copy of the admitted operation names. Keeping this small sidecar
+    /// lets proxy boundaries fail closed if an internal derived request changes
+    /// the execution plan, without reparsing the potentially large DSL body.
+    operation_names: []const []const u8,
+
+    pub fn matchesOperations(self: GraphQueryTransport, operations: []const NamedGraphQuery) bool {
+        if (self.operation_names.len != operations.len) return false;
+        for (self.operation_names) |expected_name| {
+            var found = false;
+            for (operations) |operation| {
+                if (std.mem.eql(u8, expected_name, operation.name)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    pub fn deinit(self: *GraphQueryTransport, alloc: Allocator) void {
+        alloc.free(@constCast(self.operations_json));
+        for (self.operation_names) |name| alloc.free(@constCast(name));
+        if (self.operation_names.len > 0) alloc.free(@constCast(self.operation_names));
+        self.* = undefined;
+    }
+};
+
 pub const SearchRequest = struct {
     query: Query = .{ .match_all = {} },
     index_name: ?[]const u8 = null,
@@ -1333,11 +1371,9 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
-    /// Owned, validated API envelope containing exactly one `graph_queries` or
-    /// transitional `graph_searches` member. Execution never inspects this
-    /// transport sidecar; it is retained only for transparent owner proxying
-    /// and response shaping at the API boundary.
-    graph_queries_proxy_json: []const u8 = "",
+    /// Owned, validated API wire sidecar. Execution never inspects it; it is
+    /// retained only for allocation-light owner proxying and response shaping.
+    graph_query_transport: ?GraphQueryTransport = null,
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1405,7 +1441,7 @@ pub const SearchRequest = struct {
     /// wire state after graph execution has been disabled.
     pub fn clearGraphQueries(self: *SearchRequest) void {
         self.graph_queries = &.{};
-        self.graph_queries_proxy_json = "";
+        self.graph_query_transport = null;
     }
 };
 
@@ -1463,7 +1499,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "dense_queries",
     "sparse_queries",
     "graph_queries",
-    "graph_queries_proxy_json",
+    "graph_query_transport",
     "merge_config",
     "reranker",
     "reranker_query_text",

@@ -8,66 +8,21 @@
 
 const std = @import("std");
 const ant_json = @import("antfly-json");
+const db_mod = @import("../storage/db/mod.zig");
 
-pub const Dialect = enum { canonical, legacy };
+pub const Dialect = db_mod.types.GraphQueryWireDialect;
 pub const deprecation_header_name = "Deprecation";
 pub const deprecation_header_value = "@1787702400";
 
-pub const ParsedEnvelope = struct {
-    parsed: std.json.Parsed(std.json.Value),
-    dialect: Dialect,
-
-    pub fn deinit(self: *@This()) void {
-        self.parsed.deinit();
-        self.* = undefined;
-    }
-
-    pub fn operations(self: *const @This()) std.json.Value {
-        const field = switch (self.dialect) {
-            .canonical => "graph_queries",
-            .legacy => "graph_searches",
-        };
-        return self.parsed.value.object.get(field).?;
-    }
-};
-
-/// Parse the exact single-field envelope retained after public admission.
-/// Callers map InvalidGraphWireEnvelope to their boundary-specific public or
-/// internal error without duplicating dialect and operation-set invariants.
-pub fn parseEnvelopeAlloc(
+/// Capture an immutable, normalized transport sidecar once at public admission.
+/// The exact operation set is checked against the canonical execution plan here
+/// so proxy and response boundaries can validate it without rebuilding a JSON
+/// tree for every remote shard and execution phase.
+pub fn captureRequestTransportAlloc(
     alloc: std.mem.Allocator,
-    raw: []const u8,
+    body: []const u8,
     expected_operations: anytype,
-) !ParsedEnvelope {
-    const envelope = std.mem.trim(u8, raw, &std.ascii.whitespace);
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, envelope, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidGraphWireEnvelope,
-    };
-    errdefer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 1)
-        return error.InvalidGraphWireEnvelope;
-
-    const canonical = parsed.value.object.get("graph_queries");
-    const legacy = parsed.value.object.get("graph_searches");
-    if ((canonical == null) == (legacy == null)) return error.InvalidGraphWireEnvelope;
-    const operations = canonical orelse legacy.?;
-    if (operations != .object or operations.object.count() != expected_operations.len)
-        return error.InvalidGraphWireEnvelope;
-    for (expected_operations) |operation| {
-        if (operations.object.get(operation.name) == null)
-            return error.InvalidGraphWireEnvelope;
-    }
-    return .{
-        .parsed = parsed,
-        .dialect = if (legacy != null) .legacy else .canonical,
-    };
-}
-
-/// Retain only the populated public graph field from a complete QueryRequest.
-/// Optional explicit nulls have omission semantics, matching generated request
-/// models, while two populated dialects fail closed before graph execution.
-pub fn captureRequestEnvelopeAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+) !db_mod.types.GraphQueryTransport {
     var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidGraphWireEnvelope,
@@ -79,41 +34,62 @@ pub fn captureRequestEnvelopeAlloc(alloc: std.mem.Allocator, body: []const u8) !
     const legacy_value = parsed.value.object.get("graph_searches");
     const canonical = if (canonical_value != null and canonical_value.? != .null) canonical_value else null;
     const legacy = if (legacy_value != null and legacy_value.? != .null) legacy_value else null;
-    if (canonical != null and legacy != null) return error.InvalidGraphWireEnvelope;
-    const operations = canonical orelse legacy orelse return error.InvalidGraphWireEnvelope;
-    if (operations != .object) return error.InvalidGraphWireEnvelope;
+    if ((canonical == null) == (legacy == null)) return error.InvalidGraphWireEnvelope;
+    const operations = canonical orelse legacy.?;
+    if (operations != .object or operations.object.count() != expected_operations.len)
+        return error.InvalidGraphWireEnvelope;
+    for (expected_operations) |operation| {
+        if (operations.object.get(operation.name) == null)
+            return error.InvalidGraphWireEnvelope;
+    }
+    const operations_json = try std.json.Stringify.valueAlloc(alloc, operations, .{});
+    errdefer alloc.free(operations_json);
 
-    var envelope = std.json.ObjectMap.empty;
-    defer envelope.deinit(alloc);
-    try envelope.put(
-        alloc,
-        if (canonical != null) "graph_queries" else "graph_searches",
-        operations,
-    );
-    return std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = envelope }, .{});
+    const operation_names = try alloc.alloc([]const u8, expected_operations.len);
+    errdefer alloc.free(operation_names);
+    var initialized: usize = 0;
+    errdefer for (operation_names[0..initialized]) |name| alloc.free(@constCast(name));
+    for (expected_operations, 0..) |operation, index| {
+        operation_names[index] = try alloc.dupe(u8, operation.name);
+        initialized += 1;
+    }
+
+    return .{
+        .dialect = if (legacy != null) .legacy else .canonical,
+        .operations_json = operations_json,
+        .operation_names = operation_names,
+    };
 }
 
 test "graph wire envelope capture normalizes nulls and escaped dialect names" {
     const alloc = std.testing.allocator;
-    const canonical = try captureRequestEnvelopeAlloc(
+    const Named = struct { name: []const u8 };
+    const expected = [_]Named{.{ .name = "walk" }};
+    var canonical = try captureRequestTransportAlloc(
         alloc,
         "{\"graph_queries\":{\"walk\":{}},\"graph_searches\":null,\"limit\":1}",
+        &expected,
     );
-    defer alloc.free(canonical);
-    try std.testing.expectEqualStrings("{\"graph_queries\":{\"walk\":{}}}", canonical);
+    defer canonical.deinit(alloc);
+    try std.testing.expectEqual(Dialect.canonical, canonical.dialect);
+    try std.testing.expectEqualStrings("{\"walk\":{}}", canonical.operations_json);
+    try std.testing.expectEqualStrings("walk", canonical.operation_names[0]);
 
-    const legacy = try captureRequestEnvelopeAlloc(
+    var legacy = try captureRequestTransportAlloc(
         alloc,
         "{\"graph_\\u0073earches\":{\"walk\":{}},\"limit\":1}",
+        &expected,
     );
-    defer alloc.free(legacy);
-    try std.testing.expectEqualStrings("{\"graph_searches\":{\"walk\":{}}}", legacy);
+    defer legacy.deinit(alloc);
+    try std.testing.expectEqual(Dialect.legacy, legacy.dialect);
+    try std.testing.expectEqualStrings("{\"walk\":{}}", legacy.operations_json);
 
     try std.testing.expectError(
         error.InvalidGraphWireEnvelope,
-        captureRequestEnvelopeAlloc(
+        captureRequestTransportAlloc(
             alloc,
             "{\"graph_queries\":{},\"graph_searches\":{}}",
+            &expected,
         ),
     );
 }
@@ -122,26 +98,26 @@ test "graph wire envelope validates dialect and exact operation set once" {
     const Named = struct { name: []const u8 };
     const expected = [_]Named{.{ .name = "walk" }};
 
-    var canonical = try parseEnvelopeAlloc(
+    var canonical = try captureRequestTransportAlloc(
         std.testing.allocator,
         "{ \n \t\"graph_queries\" : {\"walk\":{}} }",
         &expected,
     );
-    defer canonical.deinit();
+    defer canonical.deinit(std.testing.allocator);
     try std.testing.expectEqual(Dialect.canonical, canonical.dialect);
-    try std.testing.expect(canonical.operations().object.get("walk") != null);
+    try std.testing.expectEqualStrings("{\"walk\":{}}", canonical.operations_json);
 
-    var legacy = try parseEnvelopeAlloc(
+    var legacy = try captureRequestTransportAlloc(
         std.testing.allocator,
         "{\"graph_searches\":{\"walk\":{}}}",
         &expected,
     );
-    defer legacy.deinit();
+    defer legacy.deinit(std.testing.allocator);
     try std.testing.expectEqual(Dialect.legacy, legacy.dialect);
 
     try std.testing.expectError(
         error.InvalidGraphWireEnvelope,
-        parseEnvelopeAlloc(
+        captureRequestTransportAlloc(
             std.testing.allocator,
             "{\"graph_queries\":{}}",
             &expected,
@@ -149,7 +125,7 @@ test "graph wire envelope validates dialect and exact operation set once" {
     );
     try std.testing.expectError(
         error.InvalidGraphWireEnvelope,
-        parseEnvelopeAlloc(
+        captureRequestTransportAlloc(
             std.testing.allocator,
             "{\"graph_queries\":{\"walk\":{}},\"graph_searches\":{}}",
             &expected,
@@ -158,33 +134,20 @@ test "graph wire envelope validates dialect and exact operation set once" {
 }
 
 fn expectEnvelopeCaptureAllocationSafe(alloc: std.mem.Allocator) !void {
-    const captured = try captureRequestEnvelopeAlloc(
-        alloc,
-        "{\"graph_queries\":{\"walk\":{}},\"limit\":1}",
-    );
-    defer alloc.free(captured);
-}
-
-fn expectEnvelopeParseAllocationSafe(alloc: std.mem.Allocator) !void {
     const Named = struct { name: []const u8 };
     const expected = [_]Named{.{ .name = "walk" }};
-    var parsed = try parseEnvelopeAlloc(
+    var captured = try captureRequestTransportAlloc(
         alloc,
-        "{\"graph_queries\":{\"walk\":{}}}",
+        "{\"graph_queries\":{\"walk\":{}},\"limit\":1}",
         &expected,
     );
-    defer parsed.deinit();
+    defer captured.deinit(alloc);
 }
 
 test "graph wire envelope preserves allocator failures" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         expectEnvelopeCaptureAllocationSafe,
-        .{},
-    );
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        expectEnvelopeParseAllocationSafe,
         .{},
     );
 }

@@ -60,7 +60,6 @@ const table_router = @import("table_router.zig");
 const tables_api = @import("tables.zig");
 const query_api = @import("query.zig");
 const query_contract = @import("query_contract.zig");
-const graph_wire_envelope = @import("graph_wire_envelope.zig");
 const public_limits = @import("public_limits.zig");
 const distributed_graph = @import("distributed_graph.zig");
 const runtime_status = @import("runtime_status.zig");
@@ -16960,7 +16959,7 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
         try appendTextQueryField(alloc, &out, &first, "exclusion_query", exclusion_text);
     }
     if (req.graph_queries.len > 0) {
-        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries, req.graph_queries_proxy_json);
+        try appendGraphQueriesField(alloc, &out, &first, req.graph_queries, req.graph_query_transport);
     }
     if (req.expand_strategy) |expand_strategy| {
         try appendJsonFieldString(alloc, &out, &first, "expand_strategy", switch (expand_strategy) {
@@ -16985,9 +16984,9 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
     return try out.toOwnedSlice(alloc);
 }
 
-test "generic shard query wire preserves admitted canonical graph operations" {
-    const graph_wire =
-        \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}}
+test "generic shard query wire preserves admitted canonical graph operations without reparsing" {
+    const graph_operations =
+        \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
     ;
     const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
         .name = "neighbors",
@@ -16999,7 +16998,11 @@ test "generic shard query wire preserves admitted canonical graph operations" {
     }};
     const encoded = try encodeQueryRequest(std.testing.allocator, .{
         .graph_queries = &graph_queries,
-        .graph_queries_proxy_json = graph_wire,
+        .graph_query_transport = .{
+            .dialect = .canonical,
+            .operations_json = graph_operations,
+            .operation_names = &.{"neighbors"},
+        },
     });
     defer std.testing.allocator.free(encoded);
     var parsed = try ant_json.parseFromSlice(std.json.Value, std.testing.allocator, encoded, .{});
@@ -17042,9 +17045,13 @@ test "generic shard query wire never drops graph table authorization" {
 
     try std.testing.expectError(error.UnsupportedQueryRequest, encodeQueryRequest(std.testing.allocator, .{
         .graph_queries = &graph_queries,
-        .graph_queries_proxy_json =
-        \\{"graph_queries":{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}}
-        ,
+        .graph_query_transport = .{
+            .dialect = .canonical,
+            .operations_json =
+            \\{"neighbors":{"index":"graph_idx","traverse":{"start":{"keys":["doc:a"]}}}}
+            ,
+            .operation_names = &.{"neighbors"},
+        },
         .graph_table_read_authorizer = .{
             .ctx = null,
             .authorize_table = Authorizer.authorize,
@@ -17060,27 +17067,21 @@ fn appendGraphQueriesField(
     out: *std.ArrayListUnmanaged(u8),
     first: *bool,
     graph_queries: []const db_mod.types.NamedGraphQuery,
-    graph_queries_proxy_json: []const u8,
+    graph_query_transport: ?db_mod.types.GraphQueryTransport,
 ) !void {
     if (graph_queries.len == 0) return;
-    var parsed = graph_wire_envelope.parseEnvelopeAlloc(
-        alloc,
-        graph_queries_proxy_json,
-        graph_queries,
-    ) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.UnsupportedQueryRequest,
-    };
-    defer parsed.deinit();
-    const operations = parsed.operations();
+    const transport = graph_query_transport orelse return error.UnsupportedQueryRequest;
+    if (!transport.matchesOperations(graph_queries) or
+        transport.operations_json.len < 2 or
+        transport.operations_json[0] != '{' or
+        transport.operations_json[transport.operations_json.len - 1] != '}')
+        return error.UnsupportedQueryRequest;
 
-    try appendJsonFieldName(alloc, out, first, switch (parsed.dialect) {
+    try appendJsonFieldName(alloc, out, first, switch (transport.dialect) {
         .canonical => "graph_queries",
         .legacy => "graph_searches",
     });
-    const encoded_operations = try std.json.Stringify.valueAlloc(alloc, operations, .{});
-    defer alloc.free(encoded_operations);
-    try out.appendSlice(alloc, encoded_operations);
+    try out.appendSlice(alloc, transport.operations_json);
 }
 
 fn appendQueryHierarchyField(
@@ -26881,11 +26882,15 @@ test "graph coordinator base request avoids an implicit retrieval scan" {
 
     const graph_only = graphCoordinatorBaseRequest(.{
         .graph_queries = &graph_queries,
-        .graph_queries_proxy_json = "{\"graph_queries\":{\"links\":{}}}",
+        .graph_query_transport = .{
+            .dialect = .canonical,
+            .operations_json = "{\"links\":{}}",
+            .operation_names = &.{"links"},
+        },
         .expand_strategy = .@"union",
     });
     try std.testing.expectEqual(@as(usize, 0), graph_only.graph_queries.len);
-    try std.testing.expectEqualStrings("", graph_only.graph_queries_proxy_json);
+    try std.testing.expect(graph_only.graph_query_transport == null);
     try std.testing.expectEqual(@as(?graph_query_mod.ExpandStrategy, null), graph_only.expand_strategy);
     try std.testing.expect(graph_only.query == .match_none);
     try std.testing.expect(graph_only.full_text == null);
