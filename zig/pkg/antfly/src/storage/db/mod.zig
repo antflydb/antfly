@@ -105,6 +105,7 @@ pub const QueryVisibilityHook = @import("db.zig").QueryVisibilityHook;
 pub const QueryVisibilityChange = @import("db.zig").QueryVisibilityChange;
 pub const QueryVisibilityEvent = @import("db.zig").QueryVisibilityEvent;
 pub const IndexRepairVisibility = @import("db.zig").IndexRepairVisibility;
+pub const IndexRepairAdmission = @import("db.zig").IndexRepairAdmission;
 pub const DerivedReplayDebtStatus = @import("db.zig").DerivedReplayDebtStatus;
 pub const BatchProfile = @import("db.zig").BatchProfile;
 pub const RuntimePreflight = query_search.RuntimePreflight;

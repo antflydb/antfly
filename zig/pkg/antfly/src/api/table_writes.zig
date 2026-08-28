@@ -9469,6 +9469,18 @@ pub const ProvisionedTableWriteSource = struct {
         );
     }
 
+    fn repairVisibilityEdgeRequiresReaderRetirement(event: db_mod.QueryVisibilityEvent) bool {
+        if (event.change == .index_repair_cleared) return true;
+        const repair = event.repair orelse return true;
+        // Reader DBs snapshot admission at open. Progress-only and
+        // action-required changes are status edges, not admission edges, so
+        // reopening on every checkpoint revision would turn a large repair
+        // into repeated index-open churn. Unknown classifications fail closed.
+        return repair.previous_admission == .unknown or
+            repair.admission == .unknown or
+            repair.previous_admission != repair.admission;
+    }
+
     fn invalidateSharedPathCaches(self: *ProvisionedTableWriteSource, path: []const u8) void {
         var write_lsm_cache: ?*lsm_backend.Cache = null;
         var startup_lsm_cache: ?*lsm_backend.Cache = null;
@@ -9613,10 +9625,9 @@ pub const ProvisionedTableWriteSource = struct {
         };
         switch (event.change) {
             .index_repair_pending => {
-                // Query DBs snapshot repair admission at open. Retire readers
-                // on both edges so a newly detected repair fails closed and a
-                // completed repair cannot leave an old reader quarantined.
-                self.invalidateReadCache(table_name);
+                if (repairVisibilityEdgeRequiresReaderRetirement(event)) {
+                    self.invalidateReadCache(table_name);
+                }
                 const targeted_repair = self.fenceRuntimeStatusForRepairEdgeBestEffort(table_name, event.repair);
                 if (!targeted_repair) self.markRepairHandoffPendingBestEffort(table_name, group_id);
                 // Preserve every exact debt edge even while structural
@@ -38130,6 +38141,31 @@ test "managed repair visibility edges retire cached readers and runtime status" 
 
     source.retireReadersAfterIndexRepairCompletion("docs", .{ .cleared_debt = true });
     try std.testing.expectEqual(@as(u64, 10), read_cache.table_epochs.get("docs").?);
+}
+
+test "repair visibility progress does not churn readers without an admission edge" {
+    const progress = db_mod.QueryVisibilityEvent{
+        .change = .index_repair_pending,
+        .repair = .{
+            .index_name = "semantic_idx",
+            .previous_admission = .serviceable,
+            .admission = .serviceable,
+            .previous_action_required = false,
+            .action_required = true,
+        },
+    };
+    try std.testing.expect(!ProvisionedTableWriteSource.repairVisibilityEdgeRequiresReaderRetirement(progress));
+
+    var blocking = progress;
+    blocking.repair.?.admission = .blocked;
+    try std.testing.expect(ProvisionedTableWriteSource.repairVisibilityEdgeRequiresReaderRetirement(blocking));
+    try std.testing.expect(ProvisionedTableWriteSource.repairVisibilityEdgeRequiresReaderRetirement(.{
+        .change = .index_repair_pending,
+    }));
+    try std.testing.expect(ProvisionedTableWriteSource.repairVisibilityEdgeRequiresReaderRetirement(.{
+        .change = .index_repair_cleared,
+        .repair = progress.repair,
+    }));
 }
 
 test "provisioned named index repair keeps group queued for aggregate debt audit" {

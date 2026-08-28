@@ -376,9 +376,19 @@ pub const TableRuntimeSnapshotCache = struct {
             self.invalidateTableStateLocked(state);
             return false;
         };
-        if (state.targeted_index_fences.getPtr(target) == null) {
+        const fence = state.targeted_index_fences.getPtr(target) orelse {
             self.invalidateTableStateLocked(state);
             return false;
+        };
+        // A repair edge is a new authority boundary even when the structural
+        // owner has already handed off an earlier observation. Re-arm the
+        // exact target under the same cache lock used to classify its scope;
+        // otherwise an edge racing reservation release can leave the target's
+        // formerly-authoritative snapshot visible until an unrelated refresh.
+        fence.accept_target_after_observation_generation = self.next_observation_generation;
+        fence.target_authority_handed_off = false;
+        if (fence.owner_count == 0) {
+            fence.release_after_observation_generation = self.next_observation_generation;
         }
         var status_it = state.groups.valueIterator();
         while (status_it.next()) |status| {
@@ -2991,6 +3001,14 @@ test "targeted publication fence waits for every overlapping owner" {
     fence = cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?;
     try std.testing.expectEqual(@as(usize, 0), fence.owner_count);
     try std.testing.expect(fence.release_after_observation_generation != null);
+
+    // A token captured after owner release but before the repair callback is
+    // not allowed to settle the newly observed durable repair edge.
+    const racing_token = try cache.capturePublicationToken("docs");
+    try std.testing.expect(cache.fenceIndexRepairPublications("docs", "thumbnail"));
+    fence = cache.tables.getPtr("docs").?.targeted_index_fences.getPtr("thumbnail").?;
+    try std.testing.expect(!fence.target_authority_handed_off);
+    try std.testing.expect(fence.accept_target_after_observation_generation > racing_token.observation_generation);
 }
 
 test "table runtime snapshot cache batch publication is table epoch atomic" {
