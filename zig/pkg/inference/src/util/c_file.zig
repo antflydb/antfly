@@ -311,6 +311,26 @@ pub const FileIdentity = struct {
     quick_fingerprint_sha256: [32]u8,
 };
 
+const file_identity_sample_bytes: u64 = 64 * 1024;
+const file_identity_sample_points: u64 = 16;
+
+fn fileIdentitySampleOffset(size: u64, sample_len: u64, point: u64, points: u64) u64 {
+    if (size <= sample_len or points <= 1) return 0;
+    const span = size - sample_len;
+    return @intCast((@as(u128, span) * point) / (points - 1));
+}
+
+test "file identity sampling spans interior ranges" {
+    const size: u64 = 16 * 1024 * 1024;
+    const first = fileIdentitySampleOffset(size, file_identity_sample_bytes, 0, file_identity_sample_points);
+    const middle = fileIdentitySampleOffset(size, file_identity_sample_bytes, 8, file_identity_sample_points);
+    const last = fileIdentitySampleOffset(size, file_identity_sample_bytes, 15, file_identity_sample_points);
+    try std.testing.expectEqual(@as(u64, 0), first);
+    try std.testing.expect(middle > file_identity_sample_bytes);
+    try std.testing.expect(middle < size - file_identity_sample_bytes);
+    try std.testing.expectEqual(size - file_identity_sample_bytes, last);
+}
+
 /// Stable local identity for immutable deployment artifacts. A prepared model
 /// pack binds to this tuple so admission can reject stale sidecars without
 /// hashing a multi-gigabyte checkpoint on every process start.
@@ -334,17 +354,26 @@ pub fn fileIdentity(allocator: std.mem.Allocator, path: []const u8) !FileIdentit
         }
     }
     if (!statx.mask.SIZE or !statx.mask.INO or !statx.mask.MTIME) return error.StatFailed;
-    const sample_bytes: usize = @intCast(@min(statx.size, 64 * 1024));
+    const sample_bytes: usize = @intCast(@min(statx.size, file_identity_sample_bytes));
     const sample = try allocator.alloc(u8, sample_bytes);
     defer allocator.free(sample);
-    try readRegionFromFd(fd, sample, 0);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("antfly-file-identity-sampled-v2\x00");
     var size_le: [@sizeOf(u64)]u8 = undefined;
     std.mem.writeInt(u64, &size_le, statx.size, .little);
     hasher.update(&size_le);
-    hasher.update(sample);
-    if (statx.size > sample_bytes) {
-        try readRegionFromFd(fd, sample, statx.size - sample_bytes);
+    const points: u64 = if (statx.size <= sample_bytes) 1 else file_identity_sample_points;
+    for (0..points) |point| {
+        const offset = fileIdentitySampleOffset(
+            statx.size,
+            sample_bytes,
+            point,
+            points,
+        );
+        var offset_le: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &offset_le, offset, .little);
+        hasher.update(&offset_le);
+        try readRegionFromFd(fd, sample, offset);
         hasher.update(sample);
     }
     var quick_fingerprint: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
@@ -608,11 +637,8 @@ fn closeFd(fd: std.posix.fd_t) void {
 }
 
 fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
-    if (comptime build_options.link_libc) {
-        const n = c.pread(fd, buf.ptr, buf.len, @intCast(offset));
-        if (n < 0) return error.ReadFailed;
-        return @intCast(n);
-    }
+    // Prefer the raw Linux syscall even in libc-linked builds so the hot
+    // prefetch/read path can distinguish and retry EINTR deterministically.
     if (builtin.os.tag == .linux) {
         while (true) {
             const rc = std.os.linux.pread(fd, buf.ptr, buf.len, @intCast(offset));
@@ -622,6 +648,11 @@ fn readAt(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
                 else => return error.ReadFailed,
             }
         }
+    }
+    if (comptime build_options.link_libc) {
+        const n = c.pread(fd, buf.ptr, buf.len, @intCast(offset));
+        if (n < 0) return error.ReadFailed;
+        return @intCast(n);
     }
     return error.ReadFailed;
 }

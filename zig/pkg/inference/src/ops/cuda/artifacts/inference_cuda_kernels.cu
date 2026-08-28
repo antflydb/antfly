@@ -1778,6 +1778,11 @@ extern "C" __global__ void termite_gemma4_a4b_parallel_ffn_post_residual_f32(
     }
     const float shared_scale = rsqrtf(shared_partial[0] / (float)dim + eps);
     const float routed_scale = rsqrtf(routed_partial[0] / (float)dim + eps);
+    // Every lane must consume the two completed reductions before any lane
+    // reuses shared_partial for the combined-value reduction below. Without
+    // this barrier thread 0 may overwrite shared_partial[0] while another
+    // warp is still loading the shared RMS denominator.
+    __syncthreads();
 
     float combined_sumsq = 0.0f;
     for (unsigned int i = tid; i < dim; i += blockDim.x) {

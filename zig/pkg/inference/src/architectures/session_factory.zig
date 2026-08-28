@@ -505,6 +505,27 @@ pub fn resolveA4bInferenceConfigForModelListing(
     return resolveA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
 }
 
+/// Resolve the qualified CUDA policy once for every caller that must agree on
+/// its resident envelope (resource admission, CLI preflight, and construction).
+pub fn resolveCudaA4bInferenceConfigForModelListing(
+    allocator: std.mem.Allocator,
+    model_path: []const u8,
+    manifest: manifest_mod.ModelManifest,
+    request: ?backend_contracts.A4bInferenceRequest,
+) !?backend_contracts.A4bInferenceConfig {
+    var report_opt = try inspectGgufModelForListing(allocator, model_path, manifest);
+    defer if (report_opt) |*report| report.deinit();
+    const report = report_opt orelse {
+        if (request != null) return error.A4bUnsupportedArtifact;
+        return null;
+    };
+    const config = report.gpt_config orelse {
+        if (request != null) return error.A4bUnsupportedGeometry;
+        return null;
+    };
+    return resolveCudaA4bGptInferenceConfig(config, request, qualifiedA4bArtifact(report));
+}
+
 pub fn inspectGgufModel(allocator: std.mem.Allocator, model_path: []const u8) !?GgufInspectionReport {
     var mf = try manifest_mod.loadFromDir(allocator, model_path);
     defer mf.deinit();
@@ -1300,28 +1321,13 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
 
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer model_manifest.deinit();
-    var a4b_inference = try resolveA4bInferenceConfigForModelListing(
+    const a4b_inference = try resolveCudaA4bInferenceConfigForModelListing(
         allocator,
         model_path,
         model_manifest,
         a4b_request,
     );
-    if (a4b_inference) |detected| {
-        // The qualified CUDA target is a full-residency server runtime. Do not
-        // require a second A4B-specific budget flag when the model fits the
-        // qualified L4 envelope; global process/device admission still applies
-        // independently. Explicit streamed/smaller requests remain explicit
-        // and fail closed until the expert-cache runtime is qualified.
-        var effective_request = a4b_request orelse backend_contracts.A4bInferenceRequest{};
-        if (effective_request.memory_budget_mb == 0)
-            effective_request.memory_budget_mb = 16 * 1024;
-        if (effective_request.residency_mode == .auto)
-            effective_request.residency_mode = .resident;
-        a4b_inference = try backend_contracts.buildA4bInferenceConfig(
-            effective_request,
-            detected.geometry,
-        );
-        const a4b = a4b_inference.?;
+    if (a4b_inference) |a4b| {
         if (a4b.residency_mode != .resident)
             return error.A4bCudaStreamingUnsupported;
 
@@ -1331,7 +1337,7 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
         if (a4b.prepared_pack != .off) {
             const source_artifact_path = model_manifest.gguf_path orelse
                 return error.A4bCudaPackedStoreUnavailable;
-            const installed = try a4b_prepared_pack_mod.preflightInstalled(
+            const installed = a4b_prepared_pack_mod.preflightInstalled(
                 allocator,
                 model_path,
                 source_artifact_path,
@@ -1343,7 +1349,17 @@ pub fn createCudaSessionWithTaskOverrideAndKernelJitAndLoadContext(
                     .expert_intermediate_size = a4b.geometry.expert_intermediate_size,
                     .encoded_expert_bytes = a4b.geometry.encoded_expert_bytes,
                 },
-            );
+            ) catch |err| switch (a4b.prepared_pack) {
+                .auto => blk: {
+                    std.log.warn(
+                        "cuda_a4b: ignoring unusable optional prepared pack during early preflight error={s}; using canonical GGUF",
+                        .{@errorName(err)},
+                    );
+                    break :blk false;
+                },
+                .required => return err,
+                .off => unreachable,
+            };
             if (!installed and a4b.prepared_pack == .required)
                 return error.A4bPreparedPackRequired;
         }
@@ -1493,7 +1509,7 @@ pub fn writeCudaA4bPreparedPack(
         model_manifest,
         .{
             .residency_mode = .resident,
-            .memory_budget_mb = 16 * 1024,
+            .memory_budget_mb = backend_contracts.qualified_cuda_a4b_memory_budget_mb,
             .prepared_pack = .off,
         },
     )) orelse return error.A4bUnsupportedGeometry;
@@ -1525,7 +1541,7 @@ pub fn verifyCudaA4bPreparedPack(
         model_manifest,
         .{
             .residency_mode = .resident,
-            .memory_budget_mb = 16 * 1024,
+            .memory_budget_mb = backend_contracts.qualified_cuda_a4b_memory_budget_mb,
             .prepared_pack = .off,
         },
     )) orelse return error.A4bUnsupportedGeometry;
@@ -4176,6 +4192,19 @@ fn resolveA4bGptInferenceConfig(
     );
 }
 
+fn resolveCudaA4bGptInferenceConfig(
+    gpt_config: gpt_mod.Config,
+    request: ?backend_contracts.A4bInferenceRequest,
+    artifact_qualified: bool,
+) !?backend_contracts.A4bInferenceConfig {
+    const detected = (try resolveA4bGptInferenceConfig(
+        gpt_config,
+        request,
+        artifact_qualified,
+    )) orelse return null;
+    return try backend_contracts.buildCudaA4bInferenceConfig(request, detected.geometry);
+}
+
 fn shouldRetainTensorStore(store_kind: tensor_store_mod.StoreKind, lazy_weight_count: usize) bool {
     // Safetensors stores mmap weights and resident tensors may borrow those
     // buffers directly, so the store must live for the entire session.
@@ -4334,6 +4363,17 @@ test "A4B geometry does not opt an unqualified artifact into A4B inference" {
         null,
         true,
     )) != null);
+
+    const cuda_default = (try resolveCudaA4bGptInferenceConfig(
+        matching_geometry,
+        null,
+        true,
+    )).?;
+    try std.testing.expectEqual(backend_contracts.A4bResidencyMode.resident, cuda_default.residency_mode);
+    try std.testing.expectEqual(
+        @as(u64, backend_contracts.qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        cuda_default.memory_budget_bytes,
+    );
 }
 
 test "A4B configured GGUF passes metadata-only production qualification" {

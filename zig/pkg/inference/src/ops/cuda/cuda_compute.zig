@@ -44,6 +44,7 @@ const kv_block_mod = @import("../../runtime/kv/block.zig");
 const prefetch_mod = @import("../../runtime/tier/prefetch.zig");
 const gpt_arch = @import("../../architectures/gpt.zig");
 const gemma4_runtime = @import("../../architectures/gemma4_runtime.zig");
+const a4b_qualification = @import("../../runtime/moe/a4b_qualification.zig");
 const gpt_model = @import("../../models/gpt.zig");
 const platform = @import("antfly_platform");
 const linalg = @import("inference_linalg");
@@ -86,7 +87,7 @@ pub const CudaTensorCoreQuantBuffer = struct {
 const max_a4b_layers = 256;
 // Match the scheduler's maximum idle prefill chunk so qualified server
 // requests never escape the device MoE path merely because a prompt is long.
-const max_a4b_prefill_rows = 2048;
+const max_a4b_prefill_rows = a4b_qualification.max_prefill_rows;
 
 const CudaA4bProjection = struct {
     source: buffer_mod.DeviceBuffer,
@@ -170,6 +171,35 @@ const CudaA4bLoadPipelineState = struct {
         platform.sync.lockYielding(&self.mutex);
     }
 
+    const Observation = struct {
+        ready_index: ?usize = null,
+        in_flight_index: ?usize = null,
+        workers_done: usize,
+    };
+
+    /// Take one ready slot and observe completion under one lock acquisition.
+    /// A worker may publish its final ready slot immediately before incrementing
+    /// workers_done; keeping these observations atomic prevents the consumer
+    /// from declaring an incomplete pipeline while completed work is waiting.
+    fn observe(self: *CudaA4bLoadPipelineState) Observation {
+        self.lock();
+        defer self.mutex.unlock();
+        var result = Observation{ .workers_done = self.workers_done };
+        for (self.slots, 0..) |slot, index| {
+            switch (slot.state) {
+                .ready => if (result.ready_index == null) {
+                    self.slots[index].state = .in_flight;
+                    result.ready_index = index;
+                },
+                .in_flight => if (result.in_flight_index == null) {
+                    result.in_flight_index = index;
+                },
+                else => {},
+            }
+        }
+        return result;
+    }
+
     fn workerMain(self: *CudaA4bLoadPipelineState) void {
         while (true) {
             self.lock();
@@ -219,6 +249,25 @@ const CudaA4bLoadPipelineState = struct {
         }
     }
 };
+
+test "CUDA A4B pipeline drains a final ready slot after workers finish" {
+    var slots = [_]CudaA4bLoadSlot{
+        .{ .state = .empty },
+        .{ .state = .ready, .task_index = 7 },
+        .{ .state = .in_flight, .task_index = 6 },
+    };
+    var state = CudaA4bLoadPipelineState{
+        .plan = undefined,
+        .tasks = &.{},
+        .slots = &slots,
+        .workers_done = 4,
+    };
+    const observation = state.observe();
+    try std.testing.expectEqual(@as(?usize, 1), observation.ready_index);
+    try std.testing.expectEqual(@as(?usize, 2), observation.in_flight_index);
+    try std.testing.expectEqual(@as(usize, 4), observation.workers_done);
+    try std.testing.expectEqual(CudaA4bLoadSlotState.in_flight, slots[1].state);
+}
 
 fn a4bSourceLoadLessThan(_: void, lhs: CudaA4bSourceLoad, rhs: CudaA4bSourceLoad) bool {
     if (lhs.load_order != rhs.load_order) return lhs.load_order < rhs.load_order;
@@ -2551,6 +2600,31 @@ pub const CudaCompute = struct {
         };
     }
 
+    fn loadA4bPreparedPackForConfig(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        source_artifact_path: []const u8,
+        config: backend_contracts.A4bInferenceConfig,
+    ) !?a4b_prepared_pack.Loaded {
+        if (config.prepared_pack == .off) return null;
+        return a4b_prepared_pack.load(
+            allocator,
+            model_path,
+            source_artifact_path,
+            a4bPreparedPackGeometry(config),
+        ) catch |err| switch (config.prepared_pack) {
+            .auto => blk: {
+                std.log.warn(
+                    "cuda_a4b: ignoring unusable optional prepared pack error={s}; using canonical GGUF",
+                    .{@errorName(err)},
+                );
+                break :blk null;
+            },
+            .required => return err,
+            .off => unreachable,
+        };
+    }
+
     fn a4bSourceLoadPlan(
         allocator: std.mem.Allocator,
         store: *native_compute_mod.WeightStore,
@@ -2650,23 +2724,20 @@ pub const CudaCompute = struct {
     ) !CudaA4bSourceLoadPlan {
         var plan = try a4bSourceLoadPlan(self.allocator, store, config);
         errdefer plan.deinit(self.allocator);
-        switch (config.prepared_pack) {
-            .off => {},
-            .auto, .required => {
-                if (try a4b_prepared_pack.load(
-                    self.allocator,
-                    model_path,
-                    source_artifact_path,
-                    a4bPreparedPackGeometry(config),
-                )) |loaded| {
-                    try a4bApplyPreparedPack(&plan, loaded);
-                    self.stats.a4b_load_prepared_pack_hits +|= 1;
-                } else if (config.prepared_pack == .required) {
-                    return error.A4bPreparedPackRequired;
-                } else {
-                    self.stats.a4b_load_prepared_pack_misses +|= 1;
-                }
-            },
+        if (config.prepared_pack != .off) {
+            if (try loadA4bPreparedPackForConfig(
+                self.allocator,
+                model_path,
+                source_artifact_path,
+                config,
+            )) |loaded| {
+                try a4bApplyPreparedPack(&plan, loaded);
+                self.stats.a4b_load_prepared_pack_hits +|= 1;
+            } else if (config.prepared_pack == .required) {
+                return error.A4bPreparedPackRequired;
+            } else {
+                self.stats.a4b_load_prepared_pack_misses +|= 1;
+            }
         }
         return plan;
     }
@@ -2684,11 +2755,11 @@ pub const CudaCompute = struct {
         if (config.prepared_pack == .off) return;
         var plan = try a4bSourceLoadPlan(allocator, store, config);
         defer plan.deinit(allocator);
-        if (try a4b_prepared_pack.load(
+        if (try loadA4bPreparedPackForConfig(
             allocator,
             model_path,
             source_artifact_path,
-            a4bPreparedPackGeometry(config),
+            config,
         )) |loaded| {
             try a4bApplyPreparedPack(&plan, loaded);
             // Metadata preflight must never undo an earlier explicit prefetch.
@@ -2872,7 +2943,15 @@ pub const CudaCompute = struct {
         var upload_stream: driver_mod.CUstream = null;
         try self.ctx.driver.check(self.ctx.driver.fns.cuStreamCreate(&upload_stream, 1));
         if (upload_stream == null) return error.InvalidCudaState;
-        defer _ = self.ctx.driver.fns.cuStreamDestroy(upload_stream);
+        // Worker teardown runs first (its defer is registered below), then this
+        // synchronization retires every submitted DMA before source buffers or
+        // pinned slots are released by their outer defers. cuStreamDestroy is
+        // not a completion fence and cannot provide this lifetime guarantee.
+        defer {
+            self.ctx.makeCurrent() catch {};
+            _ = self.ctx.driver.fns.cuStreamSynchronize(upload_stream);
+            _ = self.ctx.driver.fns.cuStreamDestroy(upload_stream);
+        }
 
         for (plan.sources.items) |source| {
             if (source.mmap_offset != null) c_file.MmapRegion.adviseBytesSequential(source.raw_bytes);
@@ -2901,18 +2980,8 @@ pub const CudaCompute = struct {
         const transfer_started_ns = platform.time.monotonicNs();
         var completed: usize = 0;
         while (completed < chunks.items.len) {
-            var ready_index: ?usize = null;
-            state.lock();
-            for (state.slots, 0..) |slot, index| {
-                if (slot.state == .ready) {
-                    state.slots[index].state = .in_flight;
-                    ready_index = index;
-                    break;
-                }
-            }
-            state.mutex.unlock();
-
-            if (ready_index) |slot_index| {
+            const observation = state.observe();
+            if (observation.ready_index) |slot_index| {
                 const slot = &state.slots[slot_index];
                 const task = chunks.items[slot.task_index];
                 const destination = sources.items[task.source_index].buffer;
@@ -2933,16 +3002,7 @@ pub const CudaCompute = struct {
                 continue;
             }
 
-            var in_flight_index: ?usize = null;
-            state.lock();
-            for (state.slots, 0..) |slot, index| {
-                if (slot.state == .in_flight) {
-                    in_flight_index = index;
-                    break;
-                }
-            }
-            state.mutex.unlock();
-            if (in_flight_index) |slot_index| {
+            if (observation.in_flight_index) |slot_index| {
                 const slot = &state.slots[slot_index];
                 try self.ctx.driver.check(self.ctx.driver.fns.cuEventSynchronize(slot.event));
                 state.lock();
@@ -2952,10 +3012,8 @@ pub const CudaCompute = struct {
                 continue;
             }
 
-            state.lock();
-            const workers_done = state.workers_done;
-            state.mutex.unlock();
-            if (workers_done == worker_count) return error.A4bCudaIncompleteLoadPipeline;
+            if (observation.workers_done == worker_count)
+                return error.A4bCudaIncompleteLoadPipeline;
             std.Thread.yield() catch std.atomic.spinLoopHint();
         }
         try self.ctx.driver.check(self.ctx.driver.fns.cuStreamSynchronize(upload_stream));
@@ -6349,7 +6407,9 @@ fn cudaF32LinearTiledEnabled() bool {
 }
 
 fn isA4bRouterDecodeShape(rows: usize, in_dim: usize, out_dim: usize) bool {
-    return rows == 1 and in_dim == 2816 and out_dim == 128;
+    return rows == 1 and
+        in_dim == a4b_qualification.hidden_size and
+        out_dim == a4b_qualification.expert_count;
 }
 
 fn cudaPleRmsEmbeddingFusionEnabled() bool {
@@ -14295,7 +14355,8 @@ fn linearNoBiasArgmaxRowsSuppressDevice(
         // handwritten dispatch, including suppressed-token requests.
         const generated_q8_1_candidate = cudaGeneratedQ6KQ8_1LmHeadArgmaxEnabled() and
             generatedQ6KQ8_1LmHeadArgmaxEligible(rows, in_dim, out_dim, suppress_token_ids.len);
-        const a4b_exact_candidate = self.a4b_runtime != null and rows == 1 and in_dim == 2816 and
+        const a4b_exact_candidate = self.a4b_runtime != null and rows == 1 and
+            in_dim == a4b_qualification.hidden_size and
             out_dim % 8 == 0 and suppress_token_ids.len == 0;
         const prefer_a4b_exact = a4b_exact_candidate and
             self.kernels.hasGemma4A4BExactLmHeadPrimitive();
@@ -16571,6 +16632,8 @@ fn parallelFfnPostResidualOp(
     request: *const ops.ParallelFfnPostResidualRequest,
 ) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (platform.env.getenvBool("ANTFLY_INFERENCE_CUDA_DISABLE_A4B_PARALLEL_FFN_POST_RESIDUAL"))
+        return null;
     const runtime = if (self.a4b_runtime) |*value| value else return null;
     if (!self.kernels.hasGemma4A4BNormFusionPrimitives() or
         request.dim != runtime.config.geometry.hidden_size) return null;

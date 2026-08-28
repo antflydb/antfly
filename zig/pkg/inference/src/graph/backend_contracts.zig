@@ -86,6 +86,20 @@ pub const A4bInferenceRequest = struct {
     drop_host_cache_after_load: bool = false,
 };
 
+/// The qualified CUDA lane owns the complete packed expert set. This value is
+/// the single source of truth for its implicit public request and must be used
+/// by device construction, resource admission, and CLI preflight alike.
+pub const qualified_cuda_a4b_memory_budget_mb: u32 = 16 * 1024;
+
+pub fn effectiveCudaA4bRequest(request: ?A4bInferenceRequest) A4bInferenceRequest {
+    var effective = request orelse A4bInferenceRequest{};
+    if (effective.memory_budget_mb == 0)
+        effective.memory_budget_mb = qualified_cuda_a4b_memory_budget_mb;
+    if (effective.residency_mode == .auto)
+        effective.residency_mode = .resident;
+    return effective;
+}
+
 pub const A4bExpertGeometry = struct {
     moe_layer_count: u16,
     expert_count: u16,
@@ -245,6 +259,13 @@ pub fn buildA4bInferenceConfig(
     return config;
 }
 
+pub fn buildCudaA4bInferenceConfig(
+    request: ?A4bInferenceRequest,
+    geometry: A4bExpertGeometry,
+) A4bConfigError!A4bInferenceConfig {
+    return buildA4bInferenceConfig(effectiveCudaA4bRequest(request), geometry);
+}
+
 test "A4B inference contract is qualified and budget derived" {
     const geometry = qualified_a4b_geometries[0];
     const floor = try buildA4bInferenceConfig(.{}, geometry);
@@ -273,6 +294,26 @@ test "A4B inference contract is qualified and budget derived" {
     try std.testing.expectEqual(A4bResidencyMode.resident, resident.residency_mode);
     try std.testing.expectEqual(@as(u8, 128), resident.expert_cache_slots);
     try std.testing.expect(resident.memory_budget_bytes >= resident.fullResidencyFloorBytes());
+}
+
+test "CUDA A4B effective policy defaults to the qualified resident envelope" {
+    const geometry = qualified_a4b_geometries[0];
+    const implicit = try buildCudaA4bInferenceConfig(null, geometry);
+    try std.testing.expectEqual(A4bResidencyMode.resident, implicit.residency_mode);
+    try std.testing.expectEqual(
+        @as(u64, qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        implicit.memory_budget_bytes,
+    );
+
+    const explicit_streamed = try buildCudaA4bInferenceConfig(.{
+        .residency_mode = .streamed,
+        .memory_budget_mb = 2048,
+    }, geometry);
+    try std.testing.expectEqual(A4bResidencyMode.streamed, explicit_streamed.residency_mode);
+    try std.testing.expectError(
+        error.A4bResidentBudgetTooSmall,
+        buildCudaA4bInferenceConfig(.{ .memory_budget_mb = 2048 }, geometry),
+    );
 }
 
 test "A4B inference contract fails closed" {

@@ -8219,13 +8219,22 @@ fn preflightModelLoadBudget(
 ) !void {
     const reservation_tier = predictedWeightTier(allocator, manifest, opts.backend) orelse return;
     const predicted_backend_type = predictedBackendType(opts.backend, reservation_tier);
-    if (predicted_backend_type == .metal) {
-        if (try session_factory.resolveA4bInferenceConfigForModelListing(
-            allocator,
-            opts.model_dir,
-            manifest.*,
-            a4bInferenceRequest(opts),
-        ) != null) {
+    if (predicted_backend_type == .metal or predicted_backend_type == .cuda) {
+        const a4b_config = if (predicted_backend_type == .cuda)
+            try session_factory.resolveCudaA4bInferenceConfigForModelListing(
+                allocator,
+                opts.model_dir,
+                manifest.*,
+                a4bInferenceRequest(opts),
+            )
+        else
+            try session_factory.resolveA4bInferenceConfigForModelListing(
+                allocator,
+                opts.model_dir,
+                manifest.*,
+                a4bInferenceRequest(opts),
+            );
+        if (a4b_config != null) {
             // Exact A4B loads are leased as one bounded weights+KV+scratch
             // envelope by ModelManager. Reserving the full encoded GGUF here
             // would reject the compact path before that authoritative gate.

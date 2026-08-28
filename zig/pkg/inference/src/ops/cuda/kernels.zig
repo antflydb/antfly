@@ -25,6 +25,7 @@ const quant_kernel_compiler = @import("../../graph/quant_kernel_compiler.zig");
 const quant_matmul = @import("../../graph/quant_matmul.zig");
 const cuda_kernel_renderer = @import("../../graph/quant_kernel_cuda_renderer.zig");
 const quant_codec = @import("../../gguf/quant_codec.zig");
+const a4b_qualification = @import("../../runtime/moe/a4b_qualification.zig");
 const platform = @import("antfly_platform");
 
 const turboquant = @import("../../runtime/kv/turboquant.zig");
@@ -6021,7 +6022,7 @@ pub const KernelModule = struct {
         prefer_a4b_exact: bool,
     ) driver_mod.Error!void {
         const use_a4b_stage1 =
-            prefer_a4b_exact and rows == 1 and in_dim == 2816 and out_dim % 8 == 0 and suppress_count == 0 and
+            prefer_a4b_exact and rows == 1 and in_dim == a4b_qualification.hidden_size and out_dim % 8 == 0 and suppress_count == 0 and
             self.linear_q6_k_q8_1_argmax_rows_stage1_tile8_a4b != null;
         const use_e4b_stage1 =
             !use_a4b_stage1 and rows == 1 and in_dim == 2560 and out_dim == 262144 and suppress_count == 0 and

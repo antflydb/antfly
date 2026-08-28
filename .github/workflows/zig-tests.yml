@@ -745,10 +745,15 @@ jobs:
       - name: Require the CUDA runner configuration
         env:
           CUDA_RUNNER: ${{ vars.ANTFLY_CUDA_RUNNER }}
+          A4B_MODEL_DIR: ${{ vars.ANTFLY_GEMMA4_A4B_MODEL_DIR }}
         run: |
           set -euo pipefail
           if [[ -z "$CUDA_RUNNER" ]]; then
             echo "Required Gemma4 A4B CUDA runner variable is unset: ANTFLY_CUDA_RUNNER" >&2
+            exit 1
+          fi
+          if [[ -z "$A4B_MODEL_DIR" ]]; then
+            echo "Required Gemma4 A4B model variable is unset: ANTFLY_GEMMA4_A4B_MODEL_DIR" >&2
             exit 1
           fi
 
@@ -762,6 +767,7 @@ jobs:
     timeout-minutes: 120
     env:
       TERMITE_REQUIRE_CUDA_TESTS: "1"
+      ANTFLY_GEMMA4_A4B_MODEL_DIR: ${{ vars.ANTFLY_GEMMA4_A4B_MODEL_DIR }}
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
@@ -792,7 +798,9 @@ jobs:
         run: >-
           zig build test -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false -j2 --
           --test-filter 'explicit A4B requests'
+          --test-filter 'CUDA-first automatic backend order'
           --test-filter 'A4B inference contract'
+          --test-filter 'CUDA A4B effective policy'
           --test-filter 'A4B artifact qualification'
           --test-filter 'A4B geometry does not opt'
           --test-filter 'server A4B telemetry'
@@ -803,6 +811,8 @@ jobs:
           --test-filter 'A4B GPU admission'
           --test-filter 'CUDA resident uploads'
           --test-filter 'CUDA A4B source upload order'
+          --test-filter 'CUDA A4B pipeline drains'
+          --test-filter 'file identity sampling spans interior ranges'
           --test-filter 'cuda A4B resident workspace'
           --test-filter 'cuda A4B router tiled decode shape'
           --test-filter 'cuda A4B packed projection'
@@ -816,6 +826,36 @@ jobs:
       - name: Run strict CUDA A4B kernel smoke
         working-directory: zig/pkg/inference
         run: zig-out/bin/antfly-inference cuda-info --smoke
+
+      - name: Run strict CUDA A4B model admission and inference
+        working-directory: zig/pkg/inference
+        run: |
+          set -euo pipefail
+          test -d "$ANTFLY_GEMMA4_A4B_MODEL_DIR"
+          timing="$RUNNER_TEMP/gemma4-a4b-cuda-timing.json"
+          timeout 900 zig-out/bin/antfly-inference generate \
+            "$ANTFLY_GEMMA4_A4B_MODEL_DIR" "Ants" \
+            --backend cuda --max-tokens 1 --temperature 0 \
+            --raw-prompt --no-chat-template --print-token-count \
+            --json-timing "$timing"
+          python3 - "$timing" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          assert report["backend"] == "cuda", report["backend"]
+          assert report["tokens"] == 1, report["tokens"]
+          load = report["cuda"]
+          run = report["cuda_generate"]
+          assert load["a4b_resident_source_count"] == 60, load
+          assert load["a4b_load_pipeline_attempts"] == 1, load
+          assert load["a4b_load_pipeline_successes"] == 1, load
+          assert load["a4b_load_pipeline_fallbacks"] == 0, load
+          assert load["a4b_load_workers"] > 0, load
+          assert run["a4b_route_calls"] > 0, run
+          assert run["a4b_exact_lm_head_hits"] > 0, run
+          PY
 
   zig-base:
     name: zig-base

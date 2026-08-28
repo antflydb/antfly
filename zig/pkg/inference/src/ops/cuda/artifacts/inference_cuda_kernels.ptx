@@ -9150,7 +9150,7 @@ $L__BB45_11:
 	ld.param.u64 	%rd11, [termite_gemma4_a4b_parallel_ffn_post_residual_f32_param_6];
 	ld.param.u32 	%r20, [termite_gemma4_a4b_parallel_ffn_post_residual_f32_param_7];
 	ld.param.u32 	%r19, [termite_gemma4_a4b_parallel_ffn_post_residual_f32_param_8];
-	ld.param.f32 	%f14, [termite_gemma4_a4b_parallel_ffn_post_residual_f32_param_9];
+	ld.param.f32 	%f16, [termite_gemma4_a4b_parallel_ffn_post_residual_f32_param_9];
 	cvta.to.global.u64 	%rd1, %rd14;
 	cvta.to.global.u64 	%rd2, %rd13;
 	cvta.to.global.u64 	%rd3, %rd12;
@@ -9175,10 +9175,10 @@ $L__BB46_4:
 	mul.wide.u32 	%rd15, %r21, 4;
 	add.s64 	%rd16, %rd2, %rd15;
 	add.s64 	%rd17, %rd1, %rd15;
-	ld.global.f32 	%f19, [%rd16];
-	fma.rn.f32 	%f56, %f19, %f19, %f56;
-	ld.global.f32 	%f20, [%rd17];
-	fma.rn.f32 	%f57, %f20, %f20, %f57;
+	ld.global.f32 	%f21, [%rd16];
+	fma.rn.f32 	%f56, %f21, %f21, %f56;
+	ld.global.f32 	%f22, [%rd17];
+	fma.rn.f32 	%f57, %f22, %f22, %f57;
 	add.s32 	%r32, %r32, %r4;
 	setp.lt.u32 	%p3, %r32, %r19;
 	@%p3 bra 	$L__BB46_4;
@@ -9210,15 +9210,15 @@ $L__BB46_7:
 
 	shl.b32 	%r25, %r33, 2;
 	add.s32 	%r26, %r7, %r25;
-	ld.shared.f32 	%f21, [%r7];
-	ld.shared.f32 	%f22, [%r26];
-	add.f32 	%f23, %f22, %f21;
-	st.shared.f32 	[%r7], %f23;
-	ld.shared.f32 	%f24, [%r8];
+	ld.shared.f32 	%f23, [%r7];
+	ld.shared.f32 	%f24, [%r26];
+	add.f32 	%f25, %f24, %f23;
+	st.shared.f32 	[%r7], %f25;
+	ld.shared.f32 	%f26, [%r8];
 	add.s32 	%r27, %r8, %r25;
-	ld.shared.f32 	%f25, [%r27];
-	add.f32 	%f26, %f25, %f24;
-	st.shared.f32 	[%r8], %f26;
+	ld.shared.f32 	%f27, [%r27];
+	add.f32 	%f28, %f27, %f26;
+	st.shared.f32 	[%r8], %f28;
 
 $L__BB46_9:
 	bar.sync 	0;
@@ -9229,19 +9229,20 @@ $L__BB46_9:
 $L__BB46_10:
 	setp.ge.u32 	%p7, %r36, %r19;
 	cvt.rn.f32.u32 	%f7, %r19;
+	ld.shared.f32 	%f8, [_ZZ49termite_gemma4_a4b_parallel_ffn_post_residual_f32E14shared_partial];
+	ld.shared.f32 	%f9, [_ZZ49termite_gemma4_a4b_parallel_ffn_post_residual_f32E14routed_partial];
+	bar.sync 	0;
 	mov.f32 	%f59, 0f00000000;
 	@%p7 bra 	$L__BB46_13;
 
-	ld.shared.f32 	%f29, [_ZZ49termite_gemma4_a4b_parallel_ffn_post_residual_f32E14shared_partial];
-	ld.shared.f32 	%f30, [_ZZ49termite_gemma4_a4b_parallel_ffn_post_residual_f32E14routed_partial];
 	cvta.to.global.u64 	%rd4, %rd9;
 	cvta.to.global.u64 	%rd5, %rd8;
-	div.rn.f32 	%f31, %f30, %f7;
-	add.f32 	%f32, %f31, %f14;
-	rsqrt.approx.f32 	%f8, %f32;
-	div.rn.f32 	%f33, %f29, %f7;
-	add.f32 	%f34, %f33, %f14;
-	rsqrt.approx.f32 	%f9, %f34;
+	div.rn.f32 	%f31, %f9, %f7;
+	add.f32 	%f32, %f31, %f16;
+	rsqrt.approx.f32 	%f10, %f32;
+	div.rn.f32 	%f33, %f8, %f7;
+	add.f32 	%f34, %f33, %f16;
+	rsqrt.approx.f32 	%f11, %f34;
 	mov.f32 	%f59, 0f00000000;
 	mov.u32 	%r34, %r36;
 
@@ -9250,13 +9251,13 @@ $L__BB46_12:
 	mul.wide.u32 	%rd18, %r28, 4;
 	add.s64 	%rd19, %rd2, %rd18;
 	ld.global.f32 	%f35, [%rd19];
-	mul.f32 	%f36, %f9, %f35;
+	mul.f32 	%f36, %f11, %f35;
 	mul.wide.u32 	%rd20, %r34, 4;
 	add.s64 	%rd21, %rd5, %rd20;
 	ld.global.f32 	%f37, [%rd21];
 	add.s64 	%rd22, %rd1, %rd18;
 	ld.global.f32 	%f38, [%rd22];
-	mul.f32 	%f39, %f8, %f38;
+	mul.f32 	%f39, %f10, %f38;
 	add.s64 	%rd23, %rd4, %rd20;
 	ld.global.f32 	%f40, [%rd23];
 	mul.f32 	%f41, %f39, %f40;
@@ -9297,15 +9298,15 @@ $L__BB46_17:
 	cvta.to.global.u64 	%rd6, %rd11;
 	cvta.to.global.u64 	%rd7, %rd10;
 	div.rn.f32 	%f47, %f46, %f7;
-	add.f32 	%f48, %f47, %f14;
-	rsqrt.approx.f32 	%f13, %f48;
+	add.f32 	%f48, %f47, %f16;
+	rsqrt.approx.f32 	%f15, %f48;
 
 $L__BB46_19:
 	add.s32 	%r31, %r36, %r3;
 	mul.wide.u32 	%rd25, %r31, 4;
 	add.s64 	%rd26, %rd3, %rd25;
 	ld.global.f32 	%f49, [%rd26];
-	mul.f32 	%f50, %f13, %f49;
+	mul.f32 	%f50, %f15, %f49;
 	mul.wide.u32 	%rd27, %r36, 4;
 	add.s64 	%rd28, %rd7, %rd27;
 	ld.global.f32 	%f51, [%rd28];

@@ -55,7 +55,7 @@ fn usage() void {
         \\Usage: antfly-inference a4b-pack <model-dir> [--output <dir>] [--shards <1..8>] [--verify]
         \\
         \\Creates a versioned, pre-sharded CUDA expert pack. The output is
-        \\<model-dir>/a4b-cuda-pack-v1 unless --output is specified. Creation
+        \\<model-dir>/a4b-cuda-pack-v2 unless --output is specified. Creation
         \\is exclusive and atomic; an existing output is never overwritten.
         \\--verify reads every installed default-pack shard and checks SHA-256.
         \\

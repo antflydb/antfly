@@ -5124,7 +5124,7 @@ pub const IndexType = enum {
     }
 };
 
-/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime.
+/// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits.
 pub const InferenceA4bResidencyMode = enum {
     auto,
     streamed,
@@ -6017,9 +6017,9 @@ pub const InferenceModelRef = struct {
     backend: ?InferenceModelBackend = null,
     format: ?InferenceModelFormat = null,
     quantization: ?InferenceModelQuantization = null,
-    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. Other model geometries reject this field. CUDA currently requires resident mode on an SM89 device.
+    /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
     residency_mode: ?InferenceA4bResidencyMode = null,
-    /// Per-model A4B memory envelope in MiB. Zero selects the conservative 2048 MiB streamed floor; explicit smaller values fail model load. Other model geometries reject this field.
+    /// Per-model A4B memory envelope in MiB. Zero selects the backend default (2048 MiB streamed on Metal or 16384 MiB resident on qualified CUDA); CUDA rejects any envelope too small for full residency. Other model geometries reject this field.
     memory_budget_mb: ?i64 = null,
 };
 

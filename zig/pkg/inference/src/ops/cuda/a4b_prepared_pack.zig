@@ -18,17 +18,18 @@
 //! source tensors into balanced, sequential shard files. Admission still
 //! validates the canonical GGUF catalog and matches every source by exact name
 //! and byte length before using a pack. The manifest binds the pack to the
-//! canonical artifact's stable file identity and records shard SHA-256 values
-//! for offline verification. The hot admission path checks immutable file
-//! identities and bounds instead of hashing 12+ GiB on every worker start.
+//! canonical artifact's stable sampled identity and records shard SHA-256
+//! values for offline verification. The hot admission path samples sixteen
+//! evenly distributed 64 KiB regions plus immutable bounds instead of hashing
+//! 12+ GiB on every worker start.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("../../io/compat.zig");
 const c_file = @import("../../util/c_file.zig");
 
-pub const schema = "antfly_gemma4_a4b_cuda_prepared_pack/v1";
-pub const default_directory_name = "a4b-cuda-pack-v1";
+pub const schema = "antfly_gemma4_a4b_cuda_prepared_pack/v2";
+pub const default_directory_name = "a4b-cuda-pack-v2";
 pub const manifest_name = "manifest.json";
 pub const max_shards: u8 = 8;
 pub const max_manifest_bytes: usize = 4 * 1024 * 1024;

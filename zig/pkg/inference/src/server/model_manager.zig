@@ -7185,13 +7185,22 @@ fn estimateModelLoadAdmission(
     const uses_onnx_artifact = backend_runtime.backend == .onnx or !manifestHasNativeAssets(man);
     if (uses_onnx_artifact) return onnxModelLoadAdmission(weights, backend_runtime);
     if (backend_runtime.backend == .metal or backend_runtime.backend == .cuda) {
-        if (try session_factory.resolveA4bInferenceConfigForModelListing(
-            man.allocator,
-            model_path,
-            man,
-            a4b_request,
-        )) |config| {
-            return a4bGpuModelLoadAdmission(config, weights, backend_runtime.backend);
+        const config = if (backend_runtime.backend == .cuda)
+            try session_factory.resolveCudaA4bInferenceConfigForModelListing(
+                man.allocator,
+                model_path,
+                man,
+                a4b_request,
+            )
+        else
+            try session_factory.resolveA4bInferenceConfigForModelListing(
+                man.allocator,
+                model_path,
+                man,
+                a4b_request,
+            );
+        if (config) |resolved| {
+            return a4bGpuModelLoadAdmission(resolved, weights, backend_runtime.backend);
         }
     }
     const extra_backend_resident = if (backend_runtime.backend == .metal)
@@ -7224,9 +7233,13 @@ fn a4bGpuModelLoadAdmission(
 }
 
 test "A4B GPU admission lease equals the configured memory envelope" {
-    const config = try backend_contracts.buildA4bInferenceConfig(
-        .{},
+    const config = try backend_contracts.buildCudaA4bInferenceConfig(
+        null,
         backend_contracts.qualified_a4b_geometries[0],
+    );
+    try std.testing.expectEqual(
+        @as(u64, backend_contracts.qualified_cuda_a4b_memory_budget_mb) * 1024 * 1024,
+        config.memory_budget_bytes,
     );
     const metal_plan = a4bGpuModelLoadAdmission(config, 1234, .metal);
     try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), metal_plan.resident.backendTotalBytes());
@@ -7348,11 +7361,26 @@ fn loadSessionForPreferredBackends(
     );
     var effective_scratch: [7]backends.BackendType = undefined;
     const effective_backends = effectiveLoadBackends(&effective_scratch, policy_backends, man);
+    const fail_closed_cuda_a4b = source_session_manager.a4b_inference_request == null and
+        backends.backendOrderSelectsCudaBeforeCpu(effective_backends) and
+        (try session_factory.resolveCudaA4bInferenceConfigForModelListing(
+            manager.allocator,
+            model_dir,
+            man,
+            null,
+        )) != null;
     // Keep the first real failure. Reporting a blanket NoModelFileFound hides the
     // actionable cause: a GGUF whose tensors could not be resolved fails with
     // MissingRequiredWeights, and callers were being told the file did not exist.
     var first_err: ?anyerror = null;
     for (effective_backends) |backend| {
+        if (fail_closed_cuda_a4b and !backend.supportsA4bSession()) {
+            std.log.err(
+                "loadModel({s}) qualified CUDA A4B artifact rejected CPU fallback after GPU admission failure",
+                .{model_dir},
+            );
+            return first_err orelse error.A4bCudaAutoFallbackForbidden;
+        }
         if (!backend.supportsDirectSessionLoad()) continue;
         if (source_session_manager.a4b_inference_request != null and
             backend != .metal and backend != .cuda)

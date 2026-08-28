@@ -63,14 +63,16 @@ never overwrites an existing directory):
 ./zig-out/bin/antfly-inference a4b-pack "$MODEL" --verify
 ```
 
-The default `auto` pack policy uses `$MODEL/a4b-cuda-pack-v1` when present;
-`--a4b-prepared-pack required` rejects an absent, stale, malformed, or
-geometry-mismatched pack, while `off` forces the canonical GGUF. Manifests bind
+The default `auto` pack policy uses `$MODEL/a4b-cuda-pack-v2` when present. An
+absent pack uses the canonical GGUF normally; a stale, malformed, or
+geometry-mismatched optional pack emits a warning before using the canonical
+GGUF. `--a4b-prepared-pack required` rejects any of those conditions, while
+`off` forces the canonical GGUF. Manifests bind
 to a relocatable source fingerprint, preserve per-shard SHA-256 digests for
 offline verification, and validate every source name, length, bound, overlap,
 and load order before device allocation. A custom output directory is useful
 for image construction, but it must be installed or symlinked as
-`$MODEL/a4b-cuda-pack-v1` before automatic admission. Shards may be placed on
+`$MODEL/a4b-cuda-pack-v2` before automatic admission. Shards may be placed on
 independent mounted volumes by the deployment while the same bounded worker
 pool consumes them in parallel.
 
@@ -92,6 +94,11 @@ measured 63.18 tok/s versus llama.cpp at 69.41 tok/s. A final ReleaseSafe
 device qualification reported 60 resident sources, positive exact-kernel
 hits, 150/150 device-KV successes, persistent graph replays, and zero host
 copies or fast-path fallbacks.
+
+For field isolation of the CUDA post-FFN normalization fusion, set
+`ANTFLY_INFERENCE_CUDA_DISABLE_A4B_PARALLEL_FFN_POST_RESIDUAL=1`. The request
+then uses the shared unfused graph path; model admission and every other
+qualified CUDA A4B kernel remain unchanged.
 
 ## 2026-08-25 frame-owned split-GQA and HD256 flash-prefill follow-up
 
