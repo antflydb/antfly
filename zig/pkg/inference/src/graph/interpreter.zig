@@ -1156,10 +1156,19 @@ fn cloneTensorForShape(
     shape: Shape,
 ) !CT {
     var dims: [8]i32 = undefined;
-    const rank = shape.rank();
+    const runtime_shape: ?[]i64 = cb.tensorShape(tensor, allocator) catch null;
+    defer if (runtime_shape) |actual| allocator.free(actual);
+
+    // Dynamic imported graphs retain their exported/static dimensions in the
+    // graph Shape while the backend tensor carries the dimensions for this
+    // request. An alias-safety clone must preserve that runtime shape; using
+    // the declaration can either reject a symbolic dimension or manufacture a
+    // larger element count than the tensor actually contains.
+    const rank = if (runtime_shape) |actual| actual.len else shape.rank();
     if (rank > dims.len) return error.UnsupportedShape;
     for (0..rank) |axis| {
-        dims[axis] = std.math.cast(i32, shape.dim(@intCast(axis))) orelse return error.UnsupportedShape;
+        const dim = if (runtime_shape) |actual| actual[axis] else shape.dim(@intCast(axis));
+        dims[axis] = std.math.cast(i32, dim) orelse return error.UnsupportedShape;
     }
 
     if (try cb.cloneTensorShape(tensor, dims[0..rank])) |cloned| return cloned;
@@ -1243,6 +1252,84 @@ fn computeRuntimeShapeCaptureSet(allocator: std.mem.Allocator, graph: *const Gra
     @memset(capture, true);
 
     return capture;
+}
+
+/// Request-scoped concrete shapes shared by partition executors. Imported
+/// graphs can retain symbolic dimensions in their declarations after the
+/// backend has resolved them for a particular request; interpreter fallbacks
+/// inside a partition need the same provenance as whole-graph interpretation.
+pub const RuntimeShapeTracker = struct {
+    allocator: std.mem.Allocator,
+    capture: []const bool = &.{},
+    owned_capture: ?[]bool = null,
+    shapes: ?[]?[]i64 = null,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        graph: *const Graph,
+        cached_analysis: ?CachedAnalysis,
+    ) !RuntimeShapeTracker {
+        var tracker = RuntimeShapeTracker{ .allocator = allocator };
+        errdefer tracker.deinit();
+
+        if (cached_analysis) |analysis| {
+            tracker.capture = analysis.runtime_shape_capture;
+        } else {
+            const capture = try computeRuntimeShapeCaptureSet(allocator, graph);
+            tracker.capture = capture;
+            tracker.owned_capture = capture;
+        }
+
+        if (shapeCaptureSetHasAny(tracker.capture) and graphNeedsRuntimeShapeTracking(graph)) {
+            const shapes = try allocator.alloc(?[]i64, graph.nodeCount());
+            @memset(shapes, null);
+            tracker.shapes = shapes;
+        }
+        return tracker;
+    }
+
+    pub fn deinit(self: *RuntimeShapeTracker) void {
+        if (self.shapes) |shapes| {
+            for (shapes) |maybe_shape| {
+                if (maybe_shape) |shape| self.allocator.free(shape);
+            }
+            self.allocator.free(shapes);
+            self.shapes = null;
+        }
+        if (self.owned_capture) |capture| {
+            self.allocator.free(capture);
+            self.owned_capture = null;
+        }
+        self.capture = &.{};
+    }
+
+    pub fn runtimeShapes(self: *const RuntimeShapeTracker) ?[]const ?[]const i64 {
+        return self.shapes;
+    }
+
+    pub fn record(
+        self: *RuntimeShapeTracker,
+        cb: *const ComputeBackend,
+        node_id: NodeId,
+        value: CT,
+    ) !void {
+        try recordRuntimeShape(self.allocator, cb, self.shapes, self.capture, node_id, value);
+    }
+};
+
+fn graphNeedsRuntimeShapeTracking(graph: *const Graph) bool {
+    for (0..graph.nodeCount()) |index| {
+        const node = graph.node(@intCast(index));
+        for (0..node.output_shape.rank()) |axis| {
+            if (node.output_shape.dim(@intCast(axis)) < 0) return true;
+        }
+        switch (node.op) {
+            .reshape => |attrs| if (attrs.runtime_shape) return true,
+            .broadcast_in_dim => if (node.num_inputs > 1) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 /// Convert a flat MoeRouteSelection (rows * top_k entries) into a grouped
@@ -1493,6 +1580,45 @@ fn ensureDeclaredShape(cb: *const ComputeBackend, val: CT, declared: Shape) ?CT 
     return cb.primReshape(val, dims[0..rank]) catch null;
 }
 
+fn resolveRuntimeBroadcastShape(lhs: []const i64, rhs: []const i64, out: *[8]i64) ?[]const i64 {
+    const rank = @max(lhs.len, rhs.len);
+    if (rank > out.len) return null;
+
+    for (0..rank) |axis| {
+        const lhs_axis = axis + lhs.len;
+        const rhs_axis = axis + rhs.len;
+        const lhs_dim: i64 = if (lhs_axis >= rank) lhs[lhs_axis - rank] else 1;
+        const rhs_dim: i64 = if (rhs_axis >= rank) rhs[rhs_axis - rank] else 1;
+        if (lhs_dim <= 0 or rhs_dim <= 0) return null;
+        if (lhs_dim == rhs_dim) {
+            out[axis] = lhs_dim;
+        } else if (lhs_dim == 1) {
+            out[axis] = rhs_dim;
+        } else if (rhs_dim == 1) {
+            out[axis] = lhs_dim;
+        } else {
+            return null;
+        }
+    }
+    return out[0..rank];
+}
+
+fn runtimeBroadcastOperand(
+    cb: *const ComputeBackend,
+    value: CT,
+    actual_shape: []const i64,
+    target_shape: []const i64,
+) !?CT {
+    if (std.mem.eql(i64, actual_shape, target_shape)) return null;
+    if (actual_shape.len > target_shape.len or target_shape.len > ml.graph.shape.max_rank)
+        return error.ShapeMismatch;
+
+    var axes: [ml.graph.shape.max_rank]u8 = undefined;
+    const offset = target_shape.len - actual_shape.len;
+    for (0..actual_shape.len) |axis| axes[axis] = @intCast(offset + axis);
+    return try cb.primBroadcastInDim(value, target_shape, axes[0..actual_shape.len], actual_shape);
+}
+
 fn executeGeluBackwardFallback(
     allocator: std.mem.Allocator,
     output_shape: Shape,
@@ -1658,6 +1784,51 @@ fn resolveSingleInferredDim(dims: []i64, input_numel: usize) bool {
     return known_product == input_numel;
 }
 
+fn resolveOnnxRuntimeReshapeDims(
+    shape_values: []const f32,
+    actual_input_shape: []const i64,
+    allow_zero: bool,
+    out: *[8]i64,
+) ![]const i64 {
+    if (shape_values.len == 0 or shape_values.len > out.len) return error.InvalidTensorShape;
+    const input_numel = safeElementCountFromDims(actual_input_shape) orelse return error.InvalidTensorShape;
+
+    var inferred_axis: ?usize = null;
+    var known_product: usize = 1;
+    for (shape_values, 0..) |value, axis| {
+        const rounded = @round(value);
+        if (!std.math.isFinite(rounded) or @abs(value - rounded) > 1e-3 or
+            rounded < @as(f32, @floatFromInt(std.math.minInt(i32))) or
+            rounded > @as(f32, @floatFromInt(std.math.maxInt(i32))))
+        {
+            return error.InvalidTensorShape;
+        }
+        var dim: i64 = @intFromFloat(rounded);
+        if (dim == 0 and !allow_zero) {
+            if (axis >= actual_input_shape.len or actual_input_shape[axis] <= 0) return error.InvalidTensorShape;
+            dim = actual_input_shape[axis];
+        }
+        if (dim < -1) return error.InvalidTensorShape;
+        if (dim == -1) {
+            if (inferred_axis != null) return error.InvalidTensorShape;
+            inferred_axis = axis;
+        } else if (dim == 0) {
+            known_product = 0;
+        } else {
+            known_product = std.math.mul(usize, known_product, @intCast(dim)) catch return error.InvalidTensorShape;
+        }
+        out[axis] = dim;
+    }
+
+    if (inferred_axis) |axis| {
+        if (known_product == 0 or input_numel % known_product != 0) return error.ShapeMismatch;
+        out[axis] = @intCast(input_numel / known_product);
+    } else if (known_product != input_numel) {
+        return error.ShapeMismatch;
+    }
+    return out[0..shape_values.len];
+}
+
 fn resolveRuntimeReshapeDims(actual: []const i64, declared: Shape, target: Shape, out: *[8]i64) ?[]const i64 {
     const rank = target.rank();
     if (rank < 1 or rank > out.len or actual.len == 0) return null;
@@ -1671,6 +1842,18 @@ fn resolveRuntimeReshapeDims(actual: []const i64, declared: Shape, target: Shape
         } else {
             out[i] = dim;
         }
+    }
+
+    // Unsqueeze is represented by the graph IR as a reshape. When its input
+    // contains dynamic dimensions, the converted target can contain multiple
+    // -1 placeholders (for example [-1, -1] -> [1, 1, -1, -1]). Recover the
+    // request dimensions by matching the declared input axes from the right;
+    // any unmatched target axes must be inserted singleton dimensions.
+    if (resolveRuntimeSingletonInsertion(actual, declared, target, input_numel, out)) |resolved| {
+        return resolved;
+    }
+    if (resolveRuntimeSingletonRemoval(actual, declared, target, input_numel, out)) |resolved| {
+        return resolved;
     }
 
     const declared_batch = if (declared.rank() > 0) declared.dim(0) else -1;
@@ -1728,6 +1911,87 @@ fn resolveRuntimeReshapeDims(actual: []const i64, declared: Shape, target: Shape
         return out[0..rank];
     }
     return null;
+}
+
+fn resolveRuntimeSingletonInsertion(
+    actual: []const i64,
+    declared: Shape,
+    target: Shape,
+    input_numel: usize,
+    out: *[8]i64,
+) ?[]const i64 {
+    const target_rank = target.rank();
+    const declared_rank = declared.rank();
+    if (actual.len != declared_rank or target_rank <= declared_rank or target_rank > out.len) return null;
+
+    for (0..target_rank) |axis| out[axis] = target.dim(@intCast(axis));
+
+    var target_pos = target_rank;
+    var declared_pos = declared_rank;
+    while (declared_pos > 0) {
+        declared_pos -= 1;
+        const declared_dim = declared.dim(@intCast(declared_pos));
+        var matched = false;
+        while (target_pos > 0) {
+            target_pos -= 1;
+            const target_dim = target.dim(@intCast(target_pos));
+            if (target_dim == declared_dim) {
+                if (actual[declared_pos] <= 0) return null;
+                out[target_pos] = actual[declared_pos];
+                matched = true;
+                break;
+            }
+            if (target_dim != 1) return null;
+            out[target_pos] = 1;
+        }
+        if (!matched) return null;
+    }
+    while (target_pos > 0) {
+        target_pos -= 1;
+        if (target.dim(@intCast(target_pos)) != 1) return null;
+        out[target_pos] = 1;
+    }
+
+    if (safeElementCountFromDims(out[0..target_rank]) != input_numel) return null;
+    return out[0..target_rank];
+}
+
+fn resolveRuntimeSingletonRemoval(
+    actual: []const i64,
+    declared: Shape,
+    target: Shape,
+    input_numel: usize,
+    out: *[8]i64,
+) ?[]const i64 {
+    const target_rank = target.rank();
+    const declared_rank = declared.rank();
+    if (actual.len != declared_rank or target_rank >= declared_rank or target_rank > out.len) return null;
+
+    var target_pos = target_rank;
+    var declared_pos = declared_rank;
+    while (target_pos > 0) {
+        target_pos -= 1;
+        const target_dim = target.dim(@intCast(target_pos));
+        var matched = false;
+        while (declared_pos > 0) {
+            declared_pos -= 1;
+            const declared_dim = declared.dim(@intCast(declared_pos));
+            if (target_dim == declared_dim) {
+                if (actual[declared_pos] <= 0) return null;
+                out[target_pos] = actual[declared_pos];
+                matched = true;
+                break;
+            }
+            if (declared_dim != 1 or actual[declared_pos] != 1) return null;
+        }
+        if (!matched) return null;
+    }
+    while (declared_pos > 0) {
+        declared_pos -= 1;
+        if (declared.dim(@intCast(declared_pos)) != 1 or actual[declared_pos] != 1) return null;
+    }
+    if (safeElementCountFromDims(out[0..target_rank]) != input_numel) return null;
+    return out[0..target_rank];
 }
 
 fn resolveRuntimeCollapsedResizeDims(actual: []const i64, target: Shape, input_numel: usize, out: *[8]i64) ?[]const i64 {
@@ -2586,10 +2850,12 @@ pub fn executeNode(
         .fused_moe_select_routes => |attrs| {
             const alloc = std.heap.page_allocator;
             const sel = (try cb.moeSelectRoutes(
+                attrs.layer_index,
                 V.get(ins[0]),
                 attrs.rows,
                 attrs.num_experts,
                 attrs.top_k,
+                1.0,
                 alloc,
             )) orelse return error.MissingRuntimeInput;
             // Free previous layer's routing state if any.
@@ -2804,9 +3070,27 @@ pub fn executeNode(
                 if (a_reshaped) |r| cb.free(r);
                 if (b_reshaped) |r| cb.free(r);
             }
-            const a_ct = a_reshaped orelse a_val;
-            const b_ct = b_reshaped orelse b_val;
-            if (n.op == .add and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
+            const a_declared_ct = a_reshaped orelse a_val;
+            const b_declared_ct = b_reshaped orelse b_val;
+            const a_actual = cb.tensorShape(a_declared_ct, std.heap.page_allocator) catch null;
+            defer if (a_actual) |shape| std.heap.page_allocator.free(shape);
+            const b_actual = cb.tensorShape(b_declared_ct, std.heap.page_allocator) catch null;
+            defer if (b_actual) |shape| std.heap.page_allocator.free(shape);
+            var a_broadcast: ?CT = null;
+            defer if (a_broadcast) |value| cb.free(value);
+            var b_broadcast: ?CT = null;
+            defer if (b_broadcast) |value| cb.free(value);
+            if (a_actual != null and b_actual != null and !std.mem.eql(i64, a_actual.?, b_actual.?)) {
+                var target_buf: [ml.graph.shape.max_rank]i64 = undefined;
+                const target = resolveRuntimeBroadcastShape(a_actual.?, b_actual.?, &target_buf) orelse
+                    return error.ShapeMismatch;
+                a_broadcast = try runtimeBroadcastOperand(cb, a_declared_ct, a_actual.?, target);
+                b_broadcast = try runtimeBroadcastOperand(cb, b_declared_ct, b_actual.?, target);
+            }
+            const a_ct = a_broadcast orelse a_declared_ct;
+            const b_ct = b_broadcast orelse b_declared_ct;
+            const can_donate = a_broadcast == null and b_broadcast == null;
+            if (can_donate and n.op == .add and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (cb.addConsumeLeft(a_ct, b_ct) catch |err| switch (err) {
                     error.ShapeMismatch, error.UnsupportedShape, error.UnsupportedPrimitiveOp => null,
                     else => return err,
@@ -2816,7 +3100,7 @@ pub fn executeNode(
                     return consumed;
                 }
             }
-            if (n.op == .add and state.isLastUseBy(ins[1], node_id) and !isNonDonatedRuntimeInput(state.options, ins[1])) {
+            if (can_donate and n.op == .add and state.isLastUseBy(ins[1], node_id) and !isNonDonatedRuntimeInput(state.options, ins[1])) {
                 if (cb.addConsumeRight(a_ct, b_ct) catch |err| switch (err) {
                     error.ShapeMismatch, error.UnsupportedShape, error.UnsupportedPrimitiveOp => null,
                     else => return err,
@@ -2826,7 +3110,7 @@ pub fn executeNode(
                     return consumed;
                 }
             }
-            if (n.op == .mul and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
+            if (can_donate and n.op == .mul and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (cb.multiplyConsumeLeft(a_ct, b_ct) catch |err| switch (err) {
                     error.ShapeMismatch, error.UnsupportedShape, error.UnsupportedPrimitiveOp => null,
                     else => return err,
@@ -2836,7 +3120,7 @@ pub fn executeNode(
                     return consumed;
                 }
             }
-            if (n.op == .mul and state.isLastUseBy(ins[1], node_id) and !isNonDonatedRuntimeInput(state.options, ins[1])) {
+            if (can_donate and n.op == .mul and state.isLastUseBy(ins[1], node_id) and !isNonDonatedRuntimeInput(state.options, ins[1])) {
                 if (cb.multiplyConsumeRight(a_ct, b_ct) catch |err| switch (err) {
                     error.ShapeMismatch, error.UnsupportedShape, error.UnsupportedPrimitiveOp => null,
                     else => return err,
@@ -2846,7 +3130,7 @@ pub fn executeNode(
                     return consumed;
                 }
             }
-            if (n.op == .sub and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
+            if (can_donate and n.op == .sub and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (cb.subtractConsumeLeft(a_ct, b_ct) catch |err| switch (err) {
                     error.ShapeMismatch, error.UnsupportedShape, error.UnsupportedPrimitiveOp => null,
                     else => return err,
@@ -2856,7 +3140,7 @@ pub fn executeNode(
                     return consumed;
                 }
             }
-            if (n.op == .div and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
+            if (can_donate and n.op == .div and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (cb.divideConsumeLeft(a_ct, b_ct) catch |err| switch (err) {
                     error.ShapeMismatch, error.UnsupportedShape, error.UnsupportedPrimitiveOp => null,
                     else => return err,
@@ -2866,7 +3150,7 @@ pub fn executeNode(
                     return consumed;
                 }
             }
-            if (n.op == .less_than and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
+            if (can_donate and n.op == .less_than and state.isLastUseBy(ins[0], node_id) and !isNonDonatedRuntimeInput(state.options, ins[0])) {
                 if (cb.lessThanConsumeLeft(a_ct, b_ct) catch |err| switch (err) {
                     error.ShapeMismatch, error.UnsupportedShape, error.UnsupportedPrimitiveOp => null,
                     else => return err,
@@ -3034,11 +3318,22 @@ pub fn executeNode(
             const rank = attrs.new_shape.rank();
             var dims: [8]i64 = undefined;
             for (0..rank) |d| dims[d] = attrs.new_shape.dim(@intCast(d));
-            var reshaped_input = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
+            var reshaped_input = if (attrs.runtime_shape)
+                null
+            else
+                ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
             defer if (reshaped_input) |v| cb.free(v);
             const input_value = reshaped_input orelse V.get(ins[0]);
             var resolved_dims: [8]i64 = undefined;
             const runtime_dims = blk: {
+                if (attrs.runtime_shape) {
+                    if (ins.len < 2 or ins[1] == null_node) return error.MissingRuntimeInput;
+                    const actual = try cb.tensorShape(input_value, std.heap.page_allocator);
+                    defer std.heap.page_allocator.free(actual);
+                    const shape_values = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
+                    defer std.heap.page_allocator.free(shape_values);
+                    break :blk try resolveOnnxRuntimeReshapeDims(shape_values, actual, attrs.allow_zero, &resolved_dims);
+                }
                 const actual = cb.tensorShape(input_value, std.heap.page_allocator) catch break :blk dims[0..rank];
                 defer std.heap.page_allocator.free(actual);
                 const input_numel = safeElementCountFromDims(actual) orelse break :blk dims[0..rank];
@@ -3118,9 +3413,46 @@ pub fn executeNode(
         .broadcast_in_dim => |attrs| {
             var sbuf: [8]i64 = undefined;
             const in_shape = fillShapeDims(graph, ins[0], &sbuf);
-            const rank = attrs.target_shape.rank();
+            var rank = @as(usize, attrs.target_shape.rank());
             var target_dims: [8]i64 = undefined;
             for (0..rank) |d| target_dims[d] = attrs.target_shape.dim(@intCast(d));
+
+            // ONNX Expand accepts its target as a tensor. The importer embeds
+            // any statically materializable values in target_shape and keeps
+            // the original shape input as input 1 for dynamic shape graphs.
+            if (ins.len > 1 and ins[1] != null_node) {
+                const shape_values = try cb.toFloat32(V.get(ins[1]), std.heap.page_allocator);
+                defer std.heap.page_allocator.free(shape_values);
+                if (shape_values.len > 0 and shape_values.len <= target_dims.len) {
+                    rank = shape_values.len;
+                    const actual_input_shape = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
+                    defer if (actual_input_shape) |actual| std.heap.page_allocator.free(actual);
+                    const effective_input_shape = actual_input_shape orelse in_shape;
+                    for (0..rank) |d| {
+                        const rounded = @round(shape_values[d]);
+                        if (!std.math.isFinite(rounded) or @abs(shape_values[d] - rounded) > 1e-3)
+                            return error.InvalidTensorShape;
+                        var target_dim: i64 = @intFromFloat(rounded);
+                        const aligned_input_axis = if (d + effective_input_shape.len >= rank)
+                            d + effective_input_shape.len - rank
+                        else
+                            effective_input_shape.len;
+                        const input_dim: i64 = if (aligned_input_axis < effective_input_shape.len)
+                            effective_input_shape[aligned_input_axis]
+                        else
+                            1;
+                        if (target_dim <= 0) {
+                            const declared = if (d < attrs.target_shape.rank()) attrs.target_shape.dim(@intCast(d)) else -1;
+                            target_dim = if (declared > 0) declared else if (input_dim > 0) input_dim else 1;
+                        } else if (target_dim == 1 and input_dim > 1) {
+                            target_dim = input_dim;
+                        } else if (input_dim > 1 and target_dim != input_dim) {
+                            return error.ShapeMismatch;
+                        }
+                        target_dims[d] = target_dim;
+                    }
+                }
+            }
             const reshaped = ensureDeclaredShape(cb, V.get(ins[0]), graph.node(ins[0]).output_shape);
             defer if (reshaped) |r| cb.free(r);
             const result = try cb.primBroadcastInDim(
@@ -3309,6 +3641,23 @@ pub fn executeNode(
         .gather => |attrs| {
             var sbuf: [8]i64 = undefined;
             const in_shape = runtimeOrDeclaredShape(state, graph, ins[0], &sbuf);
+            var indices_buf: [8]i64 = undefined;
+            const indices_shape = runtimeOrDeclaredShape(state, graph, ins[1], &indices_buf);
+            if (attrs.elements) {
+                const actual_in_shape = cb.tensorShape(V.get(ins[0]), std.heap.page_allocator) catch null;
+                defer if (actual_in_shape) |shape| std.heap.page_allocator.free(shape);
+                const actual_indices_shape = cb.tensorShape(V.get(ins[1]), std.heap.page_allocator) catch null;
+                defer if (actual_indices_shape) |shape| std.heap.page_allocator.free(shape);
+                return executeGatherElements(
+                    std.heap.page_allocator,
+                    cb,
+                    V.get(ins[0]),
+                    V.get(ins[1]),
+                    actual_in_shape orelse in_shape,
+                    actual_indices_shape orelse indices_shape,
+                    attrs.axis,
+                );
+            }
             if (attrs.axis == 0) gather_add_bias: {
                 const input_node = graph.node(ins[0]);
                 if (input_node.op != .add) break :gather_add_bias;
@@ -3607,6 +3956,80 @@ pub fn executeNode(
             return error.UnsupportedPrimitiveOp;
         },
     };
+}
+
+fn executeGatherElements(
+    allocator: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    input: CT,
+    indices: CT,
+    input_shape: []const i64,
+    indices_shape: []const i64,
+    axis: u8,
+) !CT {
+    const rank = input_shape.len;
+    if (rank == 0 or rank > 8 or indices_shape.len != rank or axis >= rank)
+        return error.InvalidTensorShape;
+
+    const input_count = safeElementCountFromDims(input_shape) orelse return error.InvalidTensorShape;
+    const output_count = safeElementCountFromDims(indices_shape) orelse return error.InvalidTensorShape;
+    const input_data = try cb.toFloat32(input, allocator);
+    defer allocator.free(input_data);
+    const index_data = try cb.toFloat32(indices, allocator);
+    defer allocator.free(index_data);
+    if (input_data.len != input_count or index_data.len != output_count)
+        return error.InvalidTensorShape;
+
+    var input_strides: [8]usize = undefined;
+    var output_strides: [8]usize = undefined;
+    var stride: usize = 1;
+    var rev = rank;
+    while (rev > 0) {
+        rev -= 1;
+        input_strides[rev] = stride;
+        stride = std.math.mul(usize, stride, @intCast(input_shape[rev])) catch
+            return error.InvalidTensorShape;
+    }
+    stride = 1;
+    rev = rank;
+    while (rev > 0) {
+        rev -= 1;
+        output_strides[rev] = stride;
+        stride = std.math.mul(usize, stride, @intCast(indices_shape[rev])) catch
+            return error.InvalidTensorShape;
+    }
+
+    const output = try allocator.alloc(f32, output_count);
+    defer allocator.free(output);
+    for (0..output_count) |flat_output| {
+        var remaining = flat_output;
+        var input_offset: usize = 0;
+        for (0..rank) |d| {
+            const coord = remaining / output_strides[d];
+            remaining %= output_strides[d];
+            if (d == axis) {
+                const raw_index = index_data[flat_output];
+                const rounded = @round(raw_index);
+                if (!std.math.isFinite(rounded) or @abs(raw_index - rounded) > 1e-3)
+                    return error.InvalidTensorIndex;
+                var gather_index: i64 = @intFromFloat(rounded);
+                if (gather_index < 0) gather_index += input_shape[d];
+                if (gather_index < 0 or gather_index >= input_shape[d])
+                    return error.IndexOutOfBounds;
+                input_offset += @as(usize, @intCast(gather_index)) * input_strides[d];
+            } else {
+                if (coord >= input_shape[d]) return error.InvalidTensorShape;
+                input_offset += coord * input_strides[d];
+            }
+        }
+        output[flat_output] = input_data[input_offset];
+    }
+
+    var dims: [8]i32 = undefined;
+    for (indices_shape, 0..) |dim, d| {
+        dims[d] = std.math.cast(i32, dim) orelse return error.InvalidTensorShape;
+    }
+    return cb.fromFloat32Shape(output, dims[0..rank]);
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -4028,7 +4451,8 @@ const TestCompute = struct {
         return self.makeBuf(try self.allocator.dupe(f32, testGetData(Q)), true);
     }
 
-    fn moeSelectRoutesOp(_: *anyopaque, logits: CT, rows: usize, num_experts: usize, top_k: usize, allocator: std.mem.Allocator) anyerror!?ops_mod.MoeRouteSelection {
+    fn moeSelectRoutesOp(_: *anyopaque, _: usize, logits: CT, rows: usize, num_experts: usize, top_k: usize, logit_scale: f32, allocator: std.mem.Allocator) anyerror!?ops_mod.MoeRouteSelection {
+        _ = logit_scale;
         // Simple routing: assign rows round-robin across experts
         const total = rows * top_k;
         const expert_ids = try allocator.alloc(u32, total);
@@ -4466,6 +4890,62 @@ test "shouldReshapeToDeclaredShape preserves concrete runtime batch" {
     ));
 }
 
+test "runtime shape tensors preserve distinct ONNX reshape layouts" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{16}));
+    const row_target = try builder.parameter("row_target", Shape.init(.i64, &.{3}));
+    const column_target = try builder.parameter("column_target", Shape.init(.i64, &.{3}));
+    const attrs = ml.graph.node.ReshapeAttrs{
+        .new_shape = Shape.init(.f32, &.{ 1, -1, -1 }),
+        .runtime_shape = true,
+    };
+    const row = try g.addNode(.{
+        .op = .{ .reshape = attrs },
+        .output_shape = attrs.new_shape,
+        .inputs = .{ x, row_target, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const column = try g.addNode(.{
+        .op = .{ .reshape = attrs },
+        .output_shape = attrs.new_shape,
+        .inputs = .{ x, column_target, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(row);
+    try g.markOutput(column);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const x_ct = try cb_val.fromFloat32Shape(&.{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, &.{16});
+    defer cb_val.free(x_ct);
+    const row_target_ct = try cb_val.fromFloat32Shape(&.{ 1, 1, 16 }, &.{3});
+    defer cb_val.free(row_target_ct);
+    const column_target_ct = try cb_val.fromFloat32Shape(&.{ 1, 16, 1 }, &.{3});
+    defer cb_val.free(column_target_ct);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+        .{ .node_id = row_target, .value = row_target_ct },
+        .{ .node_id = column_target, .value = column_target_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+
+    const row_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(row_shape);
+    const column_shape = try cb_val.tensorShape(result.outputs[1], allocator);
+    defer allocator.free(column_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1, 16 }, row_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 16, 1 }, column_shape);
+}
+
 test "resolveRuntimeReshapeDims preserves runtime batch for exported singleton reshape" {
     var out: [8]i64 = undefined;
     const resolved = resolveRuntimeReshapeDims(
@@ -4476,6 +4956,30 @@ test "resolveRuntimeReshapeDims preserves runtime batch for exported singleton r
     ) orelse return error.TestUnexpectedResult;
 
     try std.testing.expectEqualSlices(i64, &.{ 2, 6, 2, 2 }, resolved);
+}
+
+test "resolveRuntimeReshapeDims restores dynamic axes around inserted singleton dimensions" {
+    var out: [8]i64 = undefined;
+    const resolved = resolveRuntimeReshapeDims(
+        &.{ 19, 1 },
+        Shape.init(.i64, &.{ -1, -1 }),
+        Shape.init(.i64, &.{ 1, 1, -1, -1 }),
+        &out,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 1, 19, 1 }, resolved);
+}
+
+test "resolveRuntimeReshapeDims preserves dynamic axes while removing singleton dimensions" {
+    var out: [8]i64 = undefined;
+    const resolved = resolveRuntimeReshapeDims(
+        &.{ 1, 1, 19, 19 },
+        Shape.init(.i64, &.{ 1, 1, -1, -1 }),
+        Shape.init(.i64, &.{ 1, -1, -1 }),
+        &out,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualSlices(i64, &.{ 1, 19, 19 }, resolved);
 }
 
 test "resolveRuntimeReshapeDims expands concrete singleton batch reshape" {
@@ -5051,7 +5555,7 @@ test "MoE round-trip: trace grouped path → interpret with live routing" {
     const t_router_logits = try cb_t.linearNoBias(t_input, t_rw, total, hidden, num_experts);
 
     // moeSelectRoutes now returns dummy routing during tracing
-    const t_routes = (try cb_t.moeSelectRoutes(t_router_logits, total, num_experts, top_k, allocator)).?;
+    const t_routes = (try cb_t.moeSelectRoutes(0, t_router_logits, total, num_experts, top_k, 1.0, allocator)).?;
     defer allocator.free(t_routes.expert_ids);
     defer allocator.free(t_routes.route_weights);
 
@@ -5262,6 +5766,46 @@ test "execute clones aliased passthrough outputs that outlive their input branch
     try std.testing.expectEqual(@as(usize, 2), actual.len);
     try std.testing.expectApproxEqAbs(@as(f32, 1.5 + @exp(@as(f32, 1.5))), actual[0], 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, -0.5 + @exp(@as(f32, -0.5))), actual[1], 1e-4);
+}
+
+test "execute preserves runtime shape when cloning an aliased dynamic tensor" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ -1, 3 }));
+    const y = try builder.convertDtype(x, .f32);
+    const z = try builder.expOp(x);
+    const out = try builder.add(y, z);
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const input = [_]f32{ 1.5, -0.5, 2.0, -1.0, 0.0, 0.5 };
+    const x_ct = try cb_val.fromFloat32Shape(&input, &.{ 2, 3 });
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{
+        .runtime_inputs = &rt_inputs,
+    });
+    defer result.deinit(&cb_val);
+    defer cb_val.free(x_ct);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, actual_shape);
+
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    for (input, actual) |value, got| {
+        try std.testing.expectApproxEqAbs(value + @exp(value), got, 1e-4);
+    }
 }
 
 test "execution result deinit frees duplicate output handles once" {
@@ -5688,6 +6232,46 @@ test "runtime shape drives symbolic argmax" {
     try std.testing.expectEqualSlices(f32, &.{ 3, 0, 2, 0, 1, 2 }, actual);
 }
 
+test "runtime binary broadcasting expands complementary symbolic axes" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const lhs = try builder.parameter("lhs", Shape.init(.f32, &.{ -1, 1 }));
+    const rhs = try builder.parameter("rhs", Shape.init(.f32, &.{ 1, -1 }));
+    const out = try builder.sub(lhs, rhs);
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const lhs_ct = try cb_val.fromFloat32Shape(&.{ 0, 1, 2 }, &.{ 3, 1 });
+    defer cb_val.free(lhs_ct);
+    const rhs_ct = try cb_val.fromFloat32Shape(&.{ 0, 10, 20, 30 }, &.{ 1, 4 });
+    defer cb_val.free(rhs_ct);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = lhs, .value = lhs_ct },
+        .{ .node_id = rhs, .value = rhs_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, actual_shape);
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{
+        0, -10, -20, -30,
+        1, -9,  -19, -29,
+        2, -8,  -18, -28,
+    }, actual);
+}
+
 test "runtime shape drives symbolic broadcast_in_dim" {
     const allocator = std.testing.allocator;
 
@@ -5740,6 +6324,168 @@ test "runtime shape drives symbolic broadcast_in_dim" {
         4, 5, 6,
         4, 5, 6,
     }, actual);
+}
+
+test "runtime shape tensor drives dynamic broadcast_in_dim" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 1, 1, -1 }));
+    const target = try builder.parameter("target", Shape.init(.i64, &.{3}));
+    var attrs = ml.graph.node.BroadcastAttrs{ .target_shape = Shape.init(.f32, &.{ -1, -1, -1 }) };
+    attrs.broadcast_axes = .{ 0, 1, 2, 0, 0, 0, 0, 0 };
+    attrs.num_axes = 3;
+    const out = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = attrs },
+        .output_shape = attrs.target_shape,
+        .inputs = .{ x, target, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const x_ct = try cb_val.fromFloat32Shape(&.{ 1, 2, 3 }, &.{ 1, 1, 3 });
+    defer cb_val.free(x_ct);
+    const target_ct = try cb_val.fromFloat32Shape(&.{ 2, 4, 3 }, &.{3});
+    defer cb_val.free(target_ct);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = x, .value = x_ct },
+        .{ .node_id = target, .value = target_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 4, 3 }, actual_shape);
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqual(@as(usize, 24), actual.len);
+    for (0..8) |row| {
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3 }, actual[row * 3 ..][0..3]);
+    }
+}
+
+test "native interpreter executes GatherElements along the selected axis" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const data = try builder.parameter("data", Shape.init(.f32, &.{ -1, -1, 5 }));
+    const indices = try builder.parameter("indices", Shape.init(.i64, &.{ -1, -1, -1 }));
+    const out = try g.addNode(.{
+        .op = .{ .gather = .{ .axis = 2, .elements = true } },
+        .output_shape = Shape.init(.f32, &.{ -1, -1, -1 }),
+        .inputs = .{ data, indices, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const data_values = [_]f32{
+        10, 11, 12, 13, 14,
+        20, 21, 22, 23, 24,
+        30, 31, 32, 33, 34,
+        40, 41, 42, 43, 44,
+    };
+    const index_values = [_]f32{
+        4, 0,  2,
+        1, 3,  0,
+        2, 2,  4,
+        0, -1, 1,
+    };
+    const data_ct = try cb_val.fromFloat32Shape(&data_values, &.{ 2, 2, 5 });
+    defer cb_val.free(data_ct);
+    const indices_ct = try cb_val.fromFloat32Shape(&index_values, &.{ 2, 2, 3 });
+    defer cb_val.free(indices_ct);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = data, .value = data_ct },
+        .{ .node_id = indices, .value = indices_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 3 }, actual_shape);
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 14, 10, 12, 21, 23, 20, 32, 32, 34, 40, 44, 41 }, actual);
+}
+
+test "native GatherElements uses concrete shape of a dynamic broadcast result" {
+    const allocator = std.testing.allocator;
+
+    var g = Graph.init(allocator);
+    defer g.deinit();
+    var builder = ml.graph.Builder.init(&g);
+
+    const data = try builder.parameter("data", Shape.init(.f32, &.{ -1, -1, 5 }));
+    const indices_seed = try builder.parameter("indices_seed", Shape.init(.i64, &.{ 1, -1, -1 }));
+    const target = try builder.parameter("target", Shape.init(.i64, &.{3}));
+    var broadcast_attrs = ml.graph.node.BroadcastAttrs{ .target_shape = Shape.init(.i64, &.{ -1, -1, -1 }) };
+    broadcast_attrs.broadcast_axes = .{ 0, 1, 2, 0, 0, 0, 0, 0 };
+    broadcast_attrs.num_axes = 3;
+    const indices = try g.addNode(.{
+        .op = .{ .broadcast_in_dim = broadcast_attrs },
+        .output_shape = broadcast_attrs.target_shape,
+        .inputs = .{ indices_seed, target, null_node, null_node },
+        .num_inputs = 2,
+    });
+    const out = try g.addNode(.{
+        .op = .{ .gather = .{ .axis = 2, .elements = true } },
+        .output_shape = Shape.init(.f32, &.{ -1, -1, -1 }),
+        .inputs = .{ data, indices, null_node, null_node },
+        .num_inputs = 2,
+    });
+    try g.markOutput(out);
+
+    var ws = WeightStore{ .allocator = allocator, .resident_weights = .{}, .lazy_weights = .{} };
+    var compute = NativeCompute.init(allocator, &ws, null);
+    var cb_val = compute.computeBackend();
+
+    const data_values = [_]f32{
+        10, 11, 12, 13, 14,
+        20, 21, 22, 23, 24,
+        30, 31, 32, 33, 34,
+        40, 41, 42, 43, 44,
+    };
+    const index_values = [_]f32{
+        4, 0, 2,
+        1, 3, 0,
+    };
+    const data_ct = try cb_val.fromFloat32Shape(&data_values, &.{ 2, 2, 5 });
+    defer cb_val.free(data_ct);
+    const indices_ct = try cb_val.fromFloat32Shape(&index_values, &.{ 1, 2, 3 });
+    defer cb_val.free(indices_ct);
+    const target_ct = try cb_val.fromFloat32Shape(&.{ 2, 2, 3 }, &.{3});
+    defer cb_val.free(target_ct);
+    const rt_inputs = [_]RuntimeInput{
+        .{ .node_id = data, .value = data_ct },
+        .{ .node_id = indices_seed, .value = indices_ct },
+        .{ .node_id = target, .value = target_ct },
+    };
+
+    var result = try execute(allocator, &g, &cb_val, .{ .runtime_inputs = &rt_inputs });
+    defer result.deinit(&cb_val);
+    const actual_shape = try cb_val.tensorShape(result.outputs[0], allocator);
+    defer allocator.free(actual_shape);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 2, 3 }, actual_shape);
+    const actual = try cb_val.toFloat32(result.outputs[0], allocator);
+    defer allocator.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 14, 10, 12, 21, 23, 20, 34, 30, 32, 41, 43, 40 }, actual);
 }
 
 test "runtime shape drives dynamic integer resize broadcast values" {

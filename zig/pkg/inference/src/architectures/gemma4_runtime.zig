@@ -36,8 +36,44 @@ pub fn shouldSkipSharedDecoderPrewarm(config: gpt_mod.Config) bool {
     return config.gemma4_mtp_assistant;
 }
 
+pub fn isQualifiedA4bArchitecture(config: gpt_mod.Config) bool {
+    if (config.family != .gemma or !config.usesMoe()) return false;
+    if (config.gemma4_mtp_assistant or config.isMultimodal() or config.num_shared_experts != 1) return false;
+    const moe_layer_count = std.math.cast(u16, config.num_hidden_layers) orelse return false;
+    const expert_count = std.math.cast(u16, config.num_local_experts) orelse return false;
+    const top_k = std.math.cast(u8, config.num_experts_per_tok) orelse return false;
+    return contracts.isQualifiedA4bGeometry(.{
+        .moe_layer_count = moe_layer_count,
+        .expert_count = expert_count,
+        .top_k = top_k,
+        .hidden_size = config.hidden_size,
+        .expert_intermediate_size = config.expertIntermediateSize(),
+        .encoded_expert_bytes = contracts.qualified_a4b_geometries[0].encoded_expert_bytes,
+    });
+}
+
 pub fn supportsRuntimeConfig(config: gpt_mod.Config) bool {
+    return config.family == .gemma and (!config.usesMoe() or isQualifiedA4bArchitecture(config));
+}
+
+/// The existing prepared whole-frame decoder owns dense FFNs. Qualified A4B
+/// is accepted by the containing Metal executor but must use the MoE graph
+/// path until its dedicated prepared runtime is installed.
+pub fn supportsPreparedDenseRuntimeConfig(config: gpt_mod.Config) bool {
     return config.family == .gemma and !config.usesMoe();
+}
+
+/// The prepared A4B decoder intentionally sits behind the resident/high-memory
+/// lane. This keeps the compact 2 GiB contract unchanged while allowing larger
+/// Apple Silicon systems to retain all packed experts and backend descriptors.
+pub fn supportsPreparedA4bRuntimeConfig(config: gpt_mod.Config) bool {
+    if (!isQualifiedA4bArchitecture(config)) return false;
+    if (getenvBool("TERMITE_METAL_DISABLE_A4B_PREPARED_DECODE")) return false;
+    // Keep the backend-owned A4B frame independent from the qualified
+    // high-memory bundle until its token-level parity gate passes.  This also
+    // gives us a stable, same-binary rollback/control lane while iterating on
+    // the frame implementation.
+    return getenvBool("TERMITE_METAL_ENABLE_A4B_PREPARED_DECODE");
 }
 
 pub fn wholeFramePrefillExplicitlyDisabled() bool {
@@ -45,11 +81,32 @@ pub fn wholeFramePrefillExplicitlyDisabled() bool {
 }
 
 pub fn supportsWholeFramePrefill(config: gpt_mod.Config, configured_layer_count: usize) bool {
-    if (!supportsRuntimeConfig(config)) return false;
+    if (!supportsPreparedDenseRuntimeConfig(config)) return false;
     if (config.num_hidden_layers == 0 or config.num_hidden_layers > max_runtime_layers) return false;
     if (preparedLayers(@min(configured_layer_count, config.num_hidden_layers)) != config.num_hidden_layers) return false;
     if (wholeFramePrefillExplicitlyDisabled()) return false;
     return true;
+}
+
+test "Gemma4 runtime admits only the qualified A4B architecture" {
+    var config = gpt_mod.Config{
+        .family = .gemma,
+        .hidden_size = 2816,
+        .num_hidden_layers = 30,
+        .num_local_experts = 128,
+        .num_experts_per_tok = 8,
+        .num_shared_experts = 1,
+        .expert_intermediate_size = 704,
+    };
+    try std.testing.expect(isQualifiedA4bArchitecture(config));
+    try std.testing.expect(supportsRuntimeConfig(config));
+    try std.testing.expect(!supportsPreparedDenseRuntimeConfig(config));
+
+    config.num_local_experts = 64;
+    try std.testing.expect(!isQualifiedA4bArchitecture(config));
+    try std.testing.expect(!supportsRuntimeConfig(config));
+    config.num_local_experts = 65_536;
+    try std.testing.expect(!isQualifiedA4bArchitecture(config));
 }
 
 pub fn preparedLayers(configured_layers: usize) usize {
@@ -97,6 +154,13 @@ pub fn pleGateSlot(configured_layer_count: usize, layer: usize) usize {
 
 pub fn pleProjSlot(configured_layer_count: usize, layer: usize) usize {
     return configured_layer_count * 8 + layer * 2 + 1;
+}
+
+/// Dense Gemma uses seven fixed linear slots per layer. A4B reuses the three
+/// FFN slots for its shared expert and places the small router matrix in the
+/// otherwise unused gap immediately before the PLE slots.
+pub fn moeRouterSlot(configured_layer_count: usize, layer: usize) usize {
+    return configured_layer_count * 7 + layer;
 }
 
 pub fn finalLmHeadSlot(configured_layer_count: usize) usize {
@@ -169,10 +233,15 @@ pub fn layerSpec(
     output_scale_value: ?f32,
 ) contracts.DecoderRuntimeLayerSpec {
     const shares_kv = config.layerSharesKv(layer);
+    const a4b = isQualifiedA4bArchitecture(config);
+    const shared_intermediate_size = if (a4b and config.shared_expert_intermediate_size > 0)
+        config.shared_expert_intermediate_size
+    else
+        config.intermediateSize(layer);
     return .{
         .kv_heads = @intCast(config.effectiveKVHeadsForLayer(layer)),
         .head_dim = @intCast(config.effectiveHeadDimForLayer(layer)),
-        .intermediate_size = @intCast(config.intermediateSize(layer)),
+        .intermediate_size = @intCast(shared_intermediate_size),
         .kv_layer_index = if (shares_kv) config.kvDonorLayerIndex(layer).? else layer,
         .shares_kv = shares_kv,
         .sliding_window = if (config.layerUsesSlidingAttention(layer)) config.sliding_window else 0,
@@ -196,6 +265,13 @@ pub fn layerSpec(
         .ple_proj_linear_slot = if (config.hasPle()) pleProjSlot(configured_layer_count, layer) else null,
         .ple_post_norm_slot = if (config.hasPle()) plePostNormSlot(configured_layer_count, layer) else null,
         .output_scale_value = output_scale_value,
+        .moe = if (a4b) .{
+            .expert_intermediate_size = @intCast(config.expertIntermediateSize()),
+            .num_experts = @intCast(config.num_local_experts),
+            .top_k = @intCast(config.num_experts_per_tok),
+            .router_linear_slot = moeRouterSlot(configured_layer_count, layer),
+            .router_logit_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(config.hidden_size))),
+        } else null,
     };
 }
 
@@ -230,6 +306,11 @@ pub fn layerSpecConfigFingerprint(config: gpt_mod.Config, configured_layer_count
     std.hash.autoHash(&hasher, config.num_key_value_heads);
     std.hash.autoHash(&hasher, config.attention_head_dim);
     std.hash.autoHash(&hasher, config.intermediate_size);
+    std.hash.autoHash(&hasher, config.expert_intermediate_size);
+    std.hash.autoHash(&hasher, config.shared_expert_intermediate_size);
+    std.hash.autoHash(&hasher, config.num_local_experts);
+    std.hash.autoHash(&hasher, config.num_experts_per_tok);
+    std.hash.autoHash(&hasher, config.num_shared_experts);
     std.hash.autoHash(&hasher, config.sliding_window);
     std.hash.autoHash(&hasher, config.num_kv_shared_layers);
     std.hash.autoHash(&hasher, config.global_head_dim);

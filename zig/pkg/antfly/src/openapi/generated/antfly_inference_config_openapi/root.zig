@@ -3,6 +3,7 @@
 
 pub const types = @import("types.zig");
 
+pub const A4bResidencyMode = types.A4bResidencyMode;
 pub const AdmissionConfig = types.AdmissionConfig;
 pub const AudioChunkConfig = types.AudioChunkConfig;
 pub const BackendRuntimes = types.BackendRuntimes;

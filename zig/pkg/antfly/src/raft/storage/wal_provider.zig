@@ -82,6 +82,7 @@ pub const WalReplicaProvider = struct {
             .vtable = &.{
                 .build_descriptor = buildDescriptor,
                 .free_descriptor = freeDescriptor,
+                .accepts_record = acceptsRecord,
             },
         };
     }
@@ -142,6 +143,11 @@ pub const WalReplicaProvider = struct {
         desc.group.storage = state.storage();
         desc.group.raft_config.applied = state.appliedIndex();
         return desc;
+    }
+
+    fn acceptsRecord(ptr: *anyopaque, record: catalog.ReplicaRecord) bool {
+        const self: *WalReplicaProvider = @ptrCast(@alignCast(ptr));
+        return self.base_factory.acceptsRecord(record);
     }
 
     fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {

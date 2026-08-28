@@ -433,26 +433,14 @@ pub fn BoundStore(comptime BackendType: type) type {
             ctx: *anyopaque,
             callback: backend_erased.Store.ReplayCallback,
         ) !backend_types.ReplayLaneIterationStats {
-            // Replay lanes are monotonically consumed, bounded source scans.
-            // Their data blocks will not be revisited by the same cursor and
-            // downstream indexes own any useful derivative residency. Retain
-            // table indexes/bloom metadata, but do not let a catch-up scan
-            // displace foreground query data from the shared block cache.
-            var replay_namespace = self.namespace;
-            replay_namespace.block_cache_admission = .transient;
-            if (@hasDecl(BackendType, "cloneReplayLaneMutableRange")) {
-                return try forEachReplayLaneFromRangeSnapshot(
-                    BackendType,
-                    self.backend,
-                    replay_namespace,
-                    lane_ordinal,
-                    from_sequence,
-                    max_entries,
-                    ctx,
-                    callback,
-                );
-            }
-            var scan = try LocalCurrentScanTxn.open(self.backend, replay_namespace);
+            // Replay is a sequential, one-shot scan. It must neither retain
+            // the scanned data blocks in the shared cache nor clone an entire
+            // bulk-ingest mutable generation merely to establish visibility.
+            // A replay boundary freezes the current generation instead; the
+            // upstream replay window owns the byte/dimension bound.
+            var namespace = self.namespace;
+            namespace.block_cache_admission = .transient;
+            var scan = try LocalCurrentScanTxn.openReplay(self.backend, namespace);
             defer scan.abort();
 
             var cursor = try scan.openCursor();
@@ -3386,7 +3374,17 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
         l0_groups: []RunGroup = &.{},
         levels: []RunLevel = &.{},
 
+        const Purpose = enum { general, replay };
+
         pub fn open(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
+            return try openWithPurpose(backend, namespace, .general);
+        }
+
+        pub fn openReplay(backend: *BackendType, namespace: backend_types.Namespace) !@This() {
+            return try openWithPurpose(backend, namespace, .replay);
+        }
+
+        fn openWithPurpose(backend: *BackendType, namespace: backend_types.Namespace, purpose: Purpose) !@This() {
             const locked = lockBackend(BackendType, backend);
             defer unlockBackend(BackendType, backend, locked);
             const metadata_allocator = runtimeScratchAllocator(backend.allocator);
@@ -3401,7 +3399,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             var mutable_snapshot: MutableSnapshot = .none;
             var mutable_snapshot_is_bulk_current_scan_clone = false;
             var bulk_current_scan_clone_denied = false;
-            if (@hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
+            if (purpose == .general and @hasDecl(BackendType, "cloneCurrentScanMutableStateForBulkIngest")) {
                 if (try backend.cloneCurrentScanMutableStateForBulkIngest()) |snapshot| {
                     const owned = try backend.allocator.create(State);
                     errdefer backend.allocator.destroy(owned);
@@ -3411,6 +3409,8 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
                 } else if (@hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
                     bulk_current_scan_clone_denied = true;
                 }
+            } else if (purpose == .replay and @hasDecl(BackendType, "bulkIngestActive") and backend.bulkIngestActive()) {
+                bulk_current_scan_clone_denied = true;
             }
             errdefer {
                 if (mutable_snapshot_is_bulk_current_scan_clone and @hasDecl(BackendType, "releaseCurrentScanMutableStateForBulkIngest")) {
@@ -5998,34 +5998,13 @@ fn findExactEntryInBatchBlocks(
         backend.recordBloomNegative();
         return null;
     }
-    const window = index.blockWindow(block_index);
-    switch (window.compression) {
-        .prefix, .prefix_snappy => {
-            if (state.block_index != block_index and state.direct_prefix_block_index != block_index) {
-                // Sparse exact-rerank batches typically touch one large value
-                // per 32 KiB table block. Decoding and pinning the entire block
-                // creates roughly 10x read/copy amplification. Materialize the
-                // first entry directly from the physical prefix block. If the
-                // next sorted key lands in the same block, promote on demand.
-                try state.transferBlock(backend.allocator, held_blocks);
-                state.direct_prefix_block_index = block_index;
-                return try findExactEntryInCachedCompressedPrefixBlock(
-                    backend,
-                    run,
-                    index,
-                    block_index,
-                    held_values,
-                    value_allocator,
-                    namespace,
-                    key,
-                );
-            }
-            if (state.direct_prefix_block_index == block_index) {
-                state.direct_prefix_block_index = null;
-            }
-        },
-        .none, .snappy => {},
-    }
+    // A single point lookup can search a prefix-compressed physical block
+    // without retaining its decoded form. Repeating that work for every key
+    // in a batch is much more expensive than decoding the block once. Keep
+    // the decoded block in this run's batch state and reuse it until sorted
+    // iteration advances to another block.
+    _ = held_values;
+    _ = value_allocator;
     const block_bytes = try loadBatchBlock(backend, run, index, state, held_blocks, block_index, namespace.retainDataBlocks());
     const positioned = try lsm_table_file.findExactEntryInBlock(
         index,

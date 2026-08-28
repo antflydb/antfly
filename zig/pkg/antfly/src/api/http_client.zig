@@ -27,12 +27,14 @@ const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const txn_api = @import("distributed_txn.zig");
+const txn_contract = @import("distributed_txn_contract.zig");
 const table_writes_api = @import("table_writes.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const query_response = @import("query_response.zig");
 const backup_contract = @import("backup_contract.zig");
+const internal_service_auth = @import("internal_service_auth.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
 
@@ -84,6 +86,14 @@ pub const ScanResponse = struct {
 
 pub const RepairCancelStateResponse = struct {
     cancel_requested: bool = false,
+};
+
+/// Semantic result of a pre-decision transaction request. Only an explicit
+/// server marker enters the retryable channel; transport errors and unmarked
+/// HTTP statuses cannot masquerade as proof that no mutation was proposed.
+pub const TxnPreDecisionOutcome = enum {
+    applied,
+    not_proposed,
 };
 
 pub const QueryResponse = struct {
@@ -245,12 +255,42 @@ pub const EmptyResponse = struct {
 pub const ApiHttpClient = struct {
     alloc: std.mem.Allocator,
     executor: http_common.RequestExecutor,
+    internal_service: ?internal_service_auth.Config = null,
 
     pub fn init(alloc: std.mem.Allocator, executor: http_common.RequestExecutor) ApiHttpClient {
         return .{
             .alloc = alloc,
             .executor = executor,
         };
+    }
+
+    pub fn withInternalServiceAuth(
+        self: *ApiHttpClient,
+        secret: ?[]const u8,
+        issuer: ?[]const u8,
+    ) *ApiHttpClient {
+        self.internal_service = if (secret) |value|
+            if (value.len > 0) .{
+                .secret = value,
+                .issuer = issuer orelse "antfly-node",
+            } else null
+        else
+            null;
+        return self;
+    }
+
+    /// Execute one request, attaching node authority only when the resolved
+    /// request target is inside the internal API namespace. Keeping this at the
+    /// shared client boundary prevents new internal RPCs from silently omitting
+    /// authentication and prevents the credential from leaking to public API
+    /// requests made through the same client.
+    pub fn executeRequest(self: *ApiHttpClient, request: http_common.HttpRequest) !http_common.HttpResponse {
+        return internal_service_auth.executeRequest(
+            self.alloc,
+            self.executor,
+            request,
+            self.internal_service,
+        );
     }
 
     /// Public generated operations live below `/db/v1`. Internal forwarding
@@ -279,7 +319,7 @@ pub const ApiHttpClient = struct {
     pub fn fetchClusterStatus(self: *ApiHttpClient, base_uri: []const u8) !std.json.Parsed(cluster.ClusterStatus) {
         const uri = try self.joinRoute(base_uri, routes.Routes.status);
         defer self.alloc.free(uri);
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -296,7 +336,7 @@ pub const ApiHttpClient = struct {
     ) !u16 {
         const uri = try self.joinRoute(base_uri, routes.Routes.internal_capabilities);
         defer self.alloc.free(uri);
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
             .timeout_ms = timeout_ms,
@@ -347,7 +387,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -425,7 +465,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
             .timeout_ms = timeout_ms,
@@ -460,7 +500,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = if (body != null) "application/json" else null,
@@ -535,7 +575,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = self.executor.execute(self.alloc, .{
+        var resp = self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .headers = headers,
@@ -595,7 +635,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -614,7 +654,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, routes.Routes.backup);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -641,7 +681,7 @@ pub const ApiHttpClient = struct {
             const uri = try self.joinRoute(base_uri, path);
             defer self.alloc.free(uri);
 
-            var resp = try self.executor.execute(self.alloc, .{
+            var resp = try self.executeRequest(.{
                 .method = .POST,
                 .uri = uri,
                 .content_type = "application/json",
@@ -668,7 +708,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, routes.Routes.restore);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -689,7 +729,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -716,7 +756,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = if (body != null) "application/json" else null,
@@ -747,7 +787,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -769,7 +809,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, routes.Routes.agents_retrieval);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -812,7 +852,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -878,7 +918,7 @@ pub const ApiHttpClient = struct {
         };
         defer self.alloc.free(preflight_body);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -997,7 +1037,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1043,7 +1083,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1089,7 +1129,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1136,7 +1176,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1189,7 +1229,7 @@ pub const ApiHttpClient = struct {
             .name = algebraic_partials_wire.response_encoding_header,
             .value = algebraic_partials_wire.base64_v1,
         }};
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .headers = &response_headers,
@@ -1238,7 +1278,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1273,7 +1313,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1318,7 +1358,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1368,7 +1408,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1418,7 +1458,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1468,7 +1508,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1506,7 +1546,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1531,7 +1571,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, routes.Routes.transactions_commit);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1556,7 +1596,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, routes.Routes.transactions_begin);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1573,7 +1613,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, routes.Routes.transactions);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -1594,7 +1634,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
         });
@@ -1621,7 +1661,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1648,7 +1688,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -1675,7 +1715,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1730,7 +1770,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
         });
@@ -1759,7 +1799,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
         });
@@ -1785,7 +1825,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
         });
@@ -1813,7 +1853,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -1871,27 +1911,29 @@ pub const ApiHttpClient = struct {
 
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
-        var forwarding_headers: [3]http_common.RequestHeader = undefined;
-        const headers: []const http_common.RequestHeader = if (forwarding) |context| headers: {
-            forwarding_headers = .{
-                .{
-                    .name = internal_batch_forwarding.remaining_ms_header,
-                    .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{context.remaining_ms}),
-                },
-                .{
-                    .name = internal_batch_forwarding.forwards_remaining_header,
-                    .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{context.forwards_remaining}),
-                },
-                .{
-                    .name = internal_batch_forwarding.campaign_allowed_header,
-                    .value = if (context.campaign_allowed) "true" else "false",
-                },
+        var request_headers: [3]http_common.RequestHeader = undefined;
+        var header_count: usize = 0;
+        if (forwarding) |context| {
+            request_headers[header_count] = .{
+                .name = internal_batch_forwarding.remaining_ms_header,
+                .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{context.remaining_ms}),
             };
-            break :headers &forwarding_headers;
-        } else &.{};
+            header_count += 1;
+            request_headers[header_count] = .{
+                .name = internal_batch_forwarding.forwards_remaining_header,
+                .value = try std.fmt.bufPrint(&forwards_buf, "{d}", .{context.forwards_remaining}),
+            };
+            header_count += 1;
+            request_headers[header_count] = .{
+                .name = internal_batch_forwarding.campaign_allowed_header,
+                .value = if (context.campaign_allowed) "true" else "false",
+            };
+            header_count += 1;
+        }
+        const headers = request_headers[0..header_count];
 
         var delivery_tracker: http_common.RequestDeliveryTracker = .{};
-        var resp = self.executor.execute(self.alloc, .{
+        var resp = self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .headers = headers,
@@ -1978,7 +2020,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2014,7 +2056,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2055,7 +2097,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2093,7 +2135,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2126,7 +2168,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2159,7 +2201,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2197,7 +2239,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2241,7 +2283,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2284,7 +2326,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2306,6 +2348,51 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
+        return try self.fetchGroupTxnBeginWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            null,
+        );
+    }
+
+    pub fn fetchGroupTxnBeginWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+    ) !EmptyResponse {
+        return switch (try self.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            delivery_tracker,
+            null,
+            null,
+        )) {
+            .applied => .{},
+            .not_proposed => error.GroupLeaderUnavailable,
+        };
+    }
+
+    pub fn fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+        timeout_ms: ?u32,
+        server_budget_ms: ?u32,
+    ) !TxnPreDecisionOutcome {
+        // Establish the strongest safe default before URI construction,
+        // request signing, or any other client-local allocation can fail.
+        // The executor advances this state at its actual send boundary.
+        if (delivery_tracker) |tracker| tracker.markNotSent();
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2317,18 +2404,33 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var budget_buf: [10]u8 = undefined;
+        const headers: []const http_common.RequestHeader = if (server_budget_ms) |budget| blk: {
+            if (budget == 0 or budget > txn_contract.max_pre_decision_server_budget_ms)
+                return error.InvalidArgument;
+            const value = try std.fmt.bufPrint(&budget_buf, "{d}", .{budget});
+            break :blk &.{.{
+                .name = txn_contract.pre_decision_remaining_ms_header,
+                .value = value,
+            }};
+        } else &.{};
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .headers = headers,
+            .delivery_tracker = delivery_tracker,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
+        // Receiving any response proves that the request crossed the send
+        // boundary, even when a custom executor does not update the tracker.
+        if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+        if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         switch (resp.status) {
-            200 => return .{},
-            404 => return error.UnknownGroup,
+            200 => return .applied,
             409 => return remoteGroupConflictError(resp.body),
-            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2340,6 +2442,50 @@ pub const ApiHttpClient = struct {
         table_name: []const u8,
         body: []const u8,
     ) !EmptyResponse {
+        return try self.fetchGroupTxnPrepareWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            null,
+        );
+    }
+
+    pub fn fetchGroupTxnPrepareWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+    ) !EmptyResponse {
+        return switch (try self.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+            base_uri,
+            group_id,
+            table_name,
+            body,
+            delivery_tracker,
+            null,
+            null,
+        )) {
+            .applied => .{},
+            .not_proposed => error.GroupLeaderUnavailable,
+        };
+    }
+
+    pub fn fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+        self: *ApiHttpClient,
+        base_uri: []const u8,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        delivery_tracker: ?*http_common.RequestDeliveryTracker,
+        timeout_ms: ?u32,
+        server_budget_ms: ?u32,
+    ) !TxnPreDecisionOutcome {
+        // Match begin's delivery contract so callers can distinguish local
+        // request construction failures from an ambiguous transmitted write.
+        if (delivery_tracker) |tracker| tracker.markNotSent();
         const suffix = try std.fmt.allocPrint(self.alloc, "{s}{s}{s}", .{
             routes.Routes.tables_prefix,
             table_name,
@@ -2351,18 +2497,31 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var budget_buf: [10]u8 = undefined;
+        const headers: []const http_common.RequestHeader = if (server_budget_ms) |budget| blk: {
+            if (budget == 0 or budget > txn_contract.max_pre_decision_server_budget_ms)
+                return error.InvalidArgument;
+            const value = try std.fmt.bufPrint(&budget_buf, "{d}", .{budget});
+            break :blk &.{.{
+                .name = txn_contract.pre_decision_remaining_ms_header,
+                .value = value,
+            }};
+        } else &.{};
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
             .body = body,
+            .headers = headers,
+            .delivery_tracker = delivery_tracker,
+            .timeout_ms = timeout_ms,
         });
         defer resp.deinit(self.alloc);
+        if (delivery_tracker) |tracker| tracker.markMayHaveBeenSent();
+        if (isTxnPreDecisionNotProposedResponse(resp)) return .not_proposed;
         switch (resp.status) {
-            200 => return .{},
-            404 => return error.UnknownGroup,
+            200 => return .applied,
             409 => return remoteGroupTxnPrepareConflictError(resp.body),
-            503 => return error.GroupLeaderUnavailable,
             else => return error.UnexpectedHttpStatus,
         }
     }
@@ -2416,7 +2575,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2513,7 +2672,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2550,7 +2709,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2583,7 +2742,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2610,7 +2769,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2629,7 +2788,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2649,7 +2808,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2670,7 +2829,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .DELETE,
             .uri = uri,
         });
@@ -2690,7 +2849,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .PUT,
             .uri = uri,
             .content_type = "application/json",
@@ -2711,7 +2870,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2731,7 +2890,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .GET,
             .uri = uri,
         });
@@ -2752,7 +2911,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .POST,
             .uri = uri,
             .content_type = "application/json",
@@ -2777,7 +2936,7 @@ pub const ApiHttpClient = struct {
         const uri = try self.joinRoute(base_uri, path);
         defer self.alloc.free(uri);
 
-        var resp = try self.executor.execute(self.alloc, .{
+        var resp = try self.executeRequest(.{
             .method = .DELETE,
             .uri = uri,
         });
@@ -3217,15 +3376,44 @@ test "api http client encodes lookup route and query components" {
 
 test "api http client preserves retryable group transaction unavailability" {
     const UnavailableExecutor = struct {
+        marked_not_proposed: bool = true,
+
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
         }
 
-        fn execute(_: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) anyerror!http_common.HttpResponse {
-            return .{
-                .status = 503,
-                .body = try alloc.dupe(u8, "group leader unavailable"),
-            };
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const pre_decision = std.mem.endsWith(u8, req.uri, routes.Routes.txn_begin_suffix) or
+                std.mem.endsWith(u8, req.uri, routes.Routes.txn_prepare_suffix);
+            if (pre_decision and self.marked_not_proposed) {
+                return try http_route_helpers.textResponseWithHeaders(
+                    alloc,
+                    503,
+                    "group leader unavailable",
+                    &.{.{
+                        .name = txn_contract.pre_decision_outcome_header,
+                        .value = txn_contract.pre_decision_not_proposed_v1,
+                    }},
+                );
+            }
+            return try http_route_helpers.textResponse(alloc, 503, "group leader unavailable");
+        }
+    };
+
+    const UntrackedTimeoutExecutor = struct {
+        calls: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const tracker = req.delivery_tracker orelse return error.TestExpectedDeliveryTracker;
+            try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.unknown, tracker.load());
+            return error.Timeout;
         }
     };
 
@@ -3237,6 +3425,80 @@ test "api http client preserves retryable group transaction unavailability" {
     try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnResolve(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnAcknowledge(base_uri, 7, "docs", "{}"));
     try std.testing.expectError(error.GroupLeaderUnavailable, client.fetchGroupTxnStatus(base_uri, 7, "docs", "{}"));
+
+    executor.marked_not_proposed = false;
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnBegin(base_uri, 7, "docs", "{}"));
+    try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchGroupTxnPrepare(base_uri, 7, "docs", "{}"));
+
+    // Delivery provenance starts before client-local URI construction. An
+    // allocation failure here must never be mistaken for an ambiguous send by
+    // transaction coordination.
+    var begin_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var begin_setup_client = ApiHttpClient.init(begin_failing.allocator(), executor.executor());
+    var begin_delivery: http_common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.OutOfMemory, begin_setup_client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+        base_uri,
+        7,
+        "docs",
+        "{}",
+        &begin_delivery,
+        1_000,
+        500,
+    ));
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, begin_delivery.load());
+
+    var prepare_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var prepare_setup_client = ApiHttpClient.init(prepare_failing.allocator(), executor.executor());
+    var prepare_delivery: http_common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.OutOfMemory, prepare_setup_client.fetchGroupTxnPrepareOutcomeWithDeliveryTracking(
+        base_uri,
+        7,
+        "docs",
+        "{}",
+        &prepare_delivery,
+        1_000,
+        500,
+    ));
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, prepare_delivery.load());
+
+    // Crossing into an executor invalidates caller-side `not_sent` proof. An
+    // executor that cannot identify its send boundary may leave the state
+    // unknown, and transaction routing must fail closed rather than replay.
+    var untracked_executor = UntrackedTimeoutExecutor{};
+    var untracked_client = ApiHttpClient.init(std.testing.allocator, untracked_executor.executor());
+    var untracked_delivery: http_common.RequestDeliveryTracker = .{};
+    try std.testing.expectError(error.Timeout, untracked_client.fetchGroupTxnBeginOutcomeWithDeliveryTracking(
+        base_uri,
+        7,
+        "docs",
+        "{}",
+        &untracked_delivery,
+        1_000,
+        500,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), untracked_executor.calls);
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.unknown, untracked_delivery.load());
+
+    // Credential construction still occurs before the executor boundary, so
+    // a signing allocation failure retains definite no-delivery provenance.
+    var signing_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var signing_delivery: http_common.RequestDeliveryTracker = .{};
+    signing_delivery.markNotSent();
+    try std.testing.expectError(error.OutOfMemory, internal_service_auth.executeRequest(
+        signing_failing.allocator(),
+        untracked_executor.executor(),
+        .{
+            .method = .POST,
+            .uri = "http://127.0.0.1:1/internal/v1/groups/7/tables/docs/txn-begin",
+            .delivery_tracker = &signing_delivery,
+        },
+        .{
+            .secret = "0123456789abcdef0123456789abcdef",
+            .issuer = "cluster-a",
+        },
+    ));
+    try std.testing.expectEqual(@as(usize, 1), untracked_executor.calls);
+    try std.testing.expectEqual(http_common.RequestDeliveryTracker.State.not_sent, signing_delivery.load());
 }
 
 fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
@@ -3249,6 +3511,12 @@ fn isRetryableMetadataLeaderResponse(resp: http_common.HttpResponse) bool {
         }
     }
     return false;
+}
+
+fn isTxnPreDecisionNotProposedResponse(resp: http_common.HttpResponse) bool {
+    if (resp.status != 404 and resp.status != 503 and resp.status != 504) return false;
+    const outcome = resp.header(txn_contract.pre_decision_outcome_header) orelse return false;
+    return std.mem.eql(u8, outcome, txn_contract.pre_decision_not_proposed_v1);
 }
 
 fn remoteGroupTxnPrepareConflictError(body: []const u8) anyerror {
@@ -3483,6 +3751,7 @@ test "api http client preserves group doc identity conflicts" {
 test "api http client forwards bounded raft batch routing context without allocation" {
     const ForwardingExecutor = struct {
         response_body_address: usize = 0,
+        saw_service_token: bool = false,
 
         fn executor(self: *@This()) http_common.RequestExecutor {
             return .{
@@ -3500,6 +3769,11 @@ test "api http client forwards bounded raft batch routing context without alloca
             try std.testing.expectEqual(@as(u32, 425), forwarding.remaining_ms);
             try std.testing.expectEqual(@as(u8, 1), forwarding.forwards_remaining);
             try std.testing.expect(!forwarding.campaign_allowed);
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, "X-Antfly-Trusted-Principal")) continue;
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+                self.saw_service_token = true;
+            }
             const response_body = try alloc.dupe(u8, "{}");
             self.response_body_address = @intFromPtr(response_body.ptr);
             return .{ .status = 201, .body = response_body };
@@ -3509,6 +3783,7 @@ test "api http client forwards bounded raft batch routing context without alloca
     var executor = ForwardingExecutor{};
     var cancellation = http_common.RequestCancellation{};
     var client = ApiHttpClient.init(std.testing.allocator, executor.executor());
+    _ = client.withInternalServiceAuth("cluster-secret", "cluster-a");
     var response = try client.fetchGroupBatchWithForwarding(
         "http://127.0.0.1:1",
         7,
@@ -3519,7 +3794,55 @@ test "api http client forwards bounded raft batch routing context without alloca
         &cancellation,
     );
     try std.testing.expectEqual(executor.response_body_address, @intFromPtr(response.body.ptr));
+    try std.testing.expect(executor.saw_service_token);
     response.deinit(std.testing.allocator);
+}
+
+test "api http client authenticates only the internal API namespace" {
+    const CaptureExecutor = struct {
+        expected_internal: bool = false,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var service_headers: usize = 0;
+            for (req.headers) |header| {
+                if (!std.ascii.eqlIgnoreCase(header.name, internal_service_auth.header_name)) continue;
+                service_headers += 1;
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, header.value, "."));
+            }
+            try std.testing.expectEqual(@as(usize, if (self.expected_internal) 1 else 0), service_headers);
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+        }
+    };
+
+    var capture = CaptureExecutor{};
+    var client = ApiHttpClient.init(std.testing.allocator, capture.executor());
+    _ = client.withInternalServiceAuth("cluster-secret", "cluster-a");
+
+    capture.expected_internal = true;
+    var exact = try client.executeRequest(.{ .method = .GET, .uri = "http://node:8080/internal/v1?probe=1" });
+    exact.deinit(std.testing.allocator);
+    const spoofed_headers = [_]http_common.RequestHeader{
+        .{ .name = "x-antfly-trusted-principal", .value = "caller-controlled" },
+    };
+    var nested = try client.executeRequest(.{
+        .method = .POST,
+        .uri = "/internal/v1/groups/7/txn/prepare",
+        .headers = &spoofed_headers,
+    });
+    nested.deinit(std.testing.allocator);
+
+    capture.expected_internal = false;
+    var public = try client.executeRequest(.{ .method = .GET, .uri = "http://node:8080/status" });
+    public.deinit(std.testing.allocator);
+    var deceptive_host = try client.executeRequest(.{ .method = .GET, .uri = "http://internal.example/internal/v10/groups" });
+    deceptive_host.deinit(std.testing.allocator);
+    var deceptive_query = try client.executeRequest(.{ .method = .GET, .uri = "http://node:8080/status?next=/internal/v1/groups" });
+    deceptive_query.deinit(std.testing.allocator);
 }
 
 test "api http client preserves committed visibility outcomes for forwarded raft batches" {
@@ -3782,17 +4105,20 @@ test "api http client round-trips public status and internal capability routes" 
     };
 
     var source = FakeSource{};
-    var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{}, source.iface(), null, null);
+    const service_secret = "http-client-capability-test-secret";
+    var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{
+        .internal_service_secret = service_secret,
+    }, source.iface(), null, null);
     defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
     defer listener.deinit();
-
     const base_uri = try listener.baseUri(std.heap.page_allocator);
     defer std.heap.page_allocator.free(base_uri);
-
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
     defer executor.deinit();
     var client = ApiHttpClient.init(std.heap.page_allocator, executor.executor());
+    _ = client.withInternalServiceAuth(service_secret, null);
+    // Dedicated node auth must not make public endpoints require credentials.
     var status = try client.fetchClusterStatus(base_uri);
     defer status.deinit();
     try std.testing.expectEqual(cluster.ClusterHealth.degraded, status.value.health);
@@ -3857,6 +4183,7 @@ test "api http client round-trips shard median key route" {
     var source = FakeSource{};
     var server = http_server.ApiHttpServer.init(std.heap.page_allocator, .{
         .shard_db_adapter = FakeShardDb.adapter(),
+        .internal_service_secret = "http-client-shard-db-test-secret",
     }, source.iface(), null, null);
     defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.heap.page_allocator, &server);
@@ -3868,6 +4195,7 @@ test "api http client round-trips shard median key route" {
     var executor = std_http_executor.StdHttpExecutor.init(std.heap.page_allocator, .{});
     defer executor.deinit();
     var client = ApiHttpClient.init(std.heap.page_allocator, executor.executor());
+    _ = client.withInternalServiceAuth("http-client-shard-db-test-secret", null);
 
     const median_key = (try client.fetchGroupDbMedianKey(base_uri, 77)).?;
     defer std.heap.page_allocator.free(median_key);
@@ -4450,7 +4778,9 @@ test "api http client maps group txn resolve decision conflicts" {
     const alloc = std.testing.allocator;
     var source = FakeSource{};
     var writes = FakeWrites{};
-    var server = http_server.ApiHttpServer.init(alloc, .{}, source.iface(), null, writes.source());
+    var server = http_server.ApiHttpServer.init(alloc, .{
+        .internal_service_secret = "http-client-txn-test-secret",
+    }, source.iface(), null, writes.source());
     defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(alloc, &server);
     defer listener.deinit();
@@ -4461,6 +4791,7 @@ test "api http client maps group txn resolve decision conflicts" {
     var executor = std_http_executor.StdHttpExecutor.init(alloc, .{});
     defer executor.deinit();
     var client = ApiHttpClient.init(alloc, executor.executor());
+    _ = client.withInternalServiceAuth("http-client-txn-test-secret", null);
 
     const txn_id = try txn_api.parseTxnIdHex("00112233445566778899aabbccddeeff");
     const body = try txn_api.encodeTxnResolveRequest(alloc, .{

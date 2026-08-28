@@ -36,6 +36,12 @@ mirrored or available to your cluster, add `--inference-antfly-image=<image>` to
 the deployment args. The image must provide the `/antfly inference` runtime
 contract.
 
+The operator generates fully qualified internal Service and StatefulSet pod
+addresses using Kubernetes' default `cluster.local` DNS domain. On clusters
+configured with a different domain, add `--cluster-domain=<domain>` to the
+operator deployment args. The value must be a valid DNS subdomain; a trailing
+root dot is accepted and removed.
+
 For TPU-backed `InferencePool` resources, the controller downloads the
 checksum-pinned PJRT `libtpu.so` plugin into an ephemeral volume before starting
 the inference container. TPU pods therefore need outbound HTTPS access to

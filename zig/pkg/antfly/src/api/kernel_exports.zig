@@ -17,6 +17,7 @@ const ant_json = @import("antfly-json");
 const abi = @import("kernel_abi.zig");
 const server_mod = @import("http_server.zig");
 const handler_mod = @import("httpx_handler.zig");
+const distributed_txn_contract = @import("distributed_txn_contract.zig");
 const table_reads = @import("table_read_source.zig");
 const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
@@ -346,6 +347,78 @@ pub fn handlerRouteManifest(context: *const abi.RouteManifestContext) callconv(.
     return .ok;
 }
 
+fn exportHttpResponse(
+    alloc: std.mem.Allocator,
+    response: httpx.Response,
+    out_handle: *?*anyopaque,
+    out_view: *abi.HttpResponseView,
+) !void {
+    const response_state = try alloc.create(HttpResponseState);
+    errdefer alloc.destroy(response_state);
+    const response_headers = response.headers.iterator();
+    const header_views = try alloc.alloc(abi.HeaderView, response_headers.len);
+    errdefer alloc.free(header_views);
+    for (response_headers, 0..) |header, i| {
+        header_views[i] = .{
+            .name = abi.Bytes.init(header.name),
+            .value = abi.Bytes.init(header.value),
+        };
+    }
+    response_state.* = .{
+        .alloc = alloc,
+        .response = response,
+        .header_views = header_views,
+    };
+    out_handle.* = response_state;
+    out_view.* = .{
+        .status = response.status.code,
+        .content_type = abi.OptionalBytes.init(response.contentType()),
+        .headers_ptr = if (header_views.len == 0) null else header_views.ptr,
+        .headers_len = header_views.len,
+        .body = abi.Bytes.init(response.body orelse ""),
+    };
+}
+
+pub fn handlerAuthorizeInternalService(context: *const abi.InternalServiceAuthContext) callconv(.c) abi.Status {
+    if (validateContext(abi.InternalServiceAuthContext, context.abi_version, context.struct_size)) |failure| return failure;
+    const io = context.executor.get() catch |err| return fail(err);
+    const state: *HandlerState = @ptrCast(@alignCast(context.handler_handle));
+    const request = context.request;
+    const alloc = state.alloc;
+    context.out_response_handle.* = null;
+    context.out_legacy_accepted.* = 0;
+
+    const query = request.query.slice();
+    const target = if (query) |value|
+        std.fmt.allocPrint(alloc, "{s}?{s}", .{ request.path.slice(), value }) catch |err| return fail(err)
+    else
+        alloc.dupe(u8, request.path.slice()) catch |err| return fail(err);
+    defer alloc.free(target);
+
+    var http_request = httpx.Request.init(alloc, switch (request.method) {
+        .get => .GET,
+        .post => .POST,
+        .put => .PUT,
+        .delete => .DELETE,
+    }, target) catch |err| return fail(err);
+    defer http_request.deinit();
+    const input_headers = if (request.headers_ptr) |ptr| ptr[0..request.headers_len] else &.{};
+    for (input_headers) |header|
+        http_request.headers.append(header.name.slice(), header.value.slice()) catch |err| return fail(err);
+
+    var http_context = httpx.Context.init(alloc, io, &http_request);
+    defer http_context.deinit();
+    var legacy_accepted = false;
+    if (state.handler.authorizeHostInternalServiceRoute(&http_context, &legacy_accepted) catch |err| return fail(err)) |response| {
+        var owned_response = response;
+        errdefer owned_response.deinit();
+        exportHttpResponse(alloc, owned_response, context.out_response_handle, context.out_response) catch |err| return fail(err);
+    } else if (legacy_accepted) {
+        context.out_legacy_accepted.* = 1;
+    }
+    return .ok;
+}
+
 pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi.Status {
     if (validateContext(abi.HttpHandleContext, context.abi_version, context.struct_size)) |failure| return failure;
     const io = context.executor.get() catch |err| return fail(err);
@@ -387,30 +460,7 @@ pub fn handlerHandleHttp(context: *const abi.HttpHandleContext) callconv(.c) abi
     var response = state.handler.dispatchLinkedRoute(&http_context, route.handler) catch |err| return fail(err);
     errdefer response.deinit();
 
-    const response_state = alloc.create(HttpResponseState) catch |err| return fail(err);
-    errdefer alloc.destroy(response_state);
-    const response_headers = response.headers.iterator();
-    const header_views = alloc.alloc(abi.HeaderView, response_headers.len) catch |err| return fail(err);
-    errdefer alloc.free(header_views);
-    for (response_headers, 0..) |header, i| {
-        header_views[i] = .{
-            .name = abi.Bytes.init(header.name),
-            .value = abi.Bytes.init(header.value),
-        };
-    }
-    response_state.* = .{
-        .alloc = alloc,
-        .response = response,
-        .header_views = header_views,
-    };
-    context.out_response_handle.* = response_state;
-    context.out_response.* = .{
-        .status = response.status.code,
-        .content_type = abi.OptionalBytes.init(response.contentType()),
-        .headers_ptr = if (header_views.len == 0) null else header_views.ptr,
-        .headers_len = header_views.len,
-        .body = abi.Bytes.init(response.body orelse ""),
-    };
+    exportHttpResponse(alloc, response, context.out_response_handle, context.out_response) catch |err| return fail(err);
     return .ok;
 }
 
@@ -438,7 +488,8 @@ const function_table: abi.FunctionTable = .{
     .struct_size = @sizeOf(abi.FunctionTable),
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
-        abi.Capability.inference_admission_stats,
+        abi.Capability.inference_admission_stats |
+        abi.Capability.internal_service_ingress,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -463,6 +514,7 @@ const function_table: abi.FunctionTable = .{
     .handler_destroy_http_response = &handlerDestroyHttpResponse,
     .handler_destroy = &handlerDestroy,
     .inference_admission_stats = &inferenceAdmissionStats,
+    .handler_authorize_internal_service = &handlerAuthorizeInternalService,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {
@@ -619,7 +671,11 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     defer alloc.destroy(api_server);
     api_server.* = server_mod.ApiHttpServer.init(
         alloc,
-        .{ .ha_failover_safe_mutations_only = true },
+        .{
+            .ha_failover_safe_mutations_only = true,
+            .internal_service_secret = "kernel-ingress-test-internal-secret-v1",
+            .internal_service_issuer = "kernel-ingress-test",
+        },
         status_source.source(),
         null,
         null,
@@ -633,6 +689,43 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     };
     defer state.route_validator.deinit();
     const test_io = std.testing.io;
+
+    const internal_request = abi.HttpRequestView{
+        .method = .post,
+        .path = abi.Bytes.init("/internal/v1/tables/docs"),
+    };
+    var internal_response_handle: ?*anyopaque = null;
+    var internal_response: abi.HttpResponseView = undefined;
+    var legacy_accepted: u8 = 0;
+    const internal_status = handlerAuthorizeInternalService(&.{
+        .abi_version = abi.abi_version,
+        .handler_handle = &state,
+        .request = &internal_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &internal_response_handle,
+        .out_response = &internal_response,
+        .out_legacy_accepted = &legacy_accepted,
+    });
+    try std.testing.expect(internal_status.isOk());
+    try std.testing.expectEqual(@as(u16, 401), internal_response.status);
+    try std.testing.expectEqual(@as(u8, 0), legacy_accepted);
+    handlerDestroyHttpResponse(internal_response_handle.?);
+
+    api_server.cfg.internal_service_accept_legacy_unauthenticated = true;
+    internal_response_handle = null;
+    const migration_status = handlerAuthorizeInternalService(&.{
+        .abi_version = abi.abi_version,
+        .handler_handle = &state,
+        .request = &internal_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &internal_response_handle,
+        .out_response = &internal_response,
+        .out_legacy_accepted = &legacy_accepted,
+    });
+    try std.testing.expect(migration_status.isOk());
+    try std.testing.expect(internal_response_handle == null);
+    try std.testing.expectEqual(@as(u8, 1), legacy_accepted);
+    api_server.cfg.internal_service_accept_legacy_unauthenticated = false;
 
     KernelIngressTestRoutes.mutation_calls = 0;
     var mutation_route = RouteState{
@@ -659,6 +752,55 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     try std.testing.expectEqual(@as(u16, 503), mutation_response.status);
     try std.testing.expectEqual(@as(usize, 0), KernelIngressTestRoutes.mutation_calls);
     try std.testing.expect(std.mem.indexOf(u8, mutation_response.body.slice(), "ha_mutation_not_replicated") != null);
+
+    // Linked dispatch starts the transaction deadline before policy work, but
+    // malformed metadata must not let an unauthenticated caller distinguish
+    // an internal route. Validation runs only after service authentication.
+    api_server.cfg.ha_failover_safe_mutations_only = false;
+    const invalid_deadline_headers = [_]abi.HeaderView{.{
+        .name = abi.Bytes.init(distributed_txn_contract.pre_decision_remaining_ms_header),
+        .value = abi.Bytes.init("5001"),
+    }};
+    var invalid_deadline_route = RouteState{
+        .owner = &state,
+        .handler = httpx.Handler.from(KernelIngressTestRoutes.mutation),
+    };
+    const invalid_deadline_request = abi.HttpRequestView{
+        .method = .post,
+        .path = abi.Bytes.init("/internal/v1/groups/7/tables/docs/txn-begin"),
+        .headers_ptr = invalid_deadline_headers[0..].ptr,
+        .headers_len = invalid_deadline_headers.len,
+        .body = abi.OptionalBytes.init("{}"),
+    };
+    var invalid_deadline_response_handle: ?*anyopaque = null;
+    var invalid_deadline_response: abi.HttpResponseView = undefined;
+    const unauthenticated_deadline_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &invalid_deadline_route,
+        .request = &invalid_deadline_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &invalid_deadline_response_handle,
+        .out_response = &invalid_deadline_response,
+    });
+    try std.testing.expect(unauthenticated_deadline_status.isOk());
+    try std.testing.expectEqual(@as(u16, 401), invalid_deadline_response.status);
+    handlerDestroyHttpResponse(invalid_deadline_response_handle.?);
+
+    api_server.cfg.internal_service_accept_legacy_unauthenticated = true;
+    invalid_deadline_response_handle = null;
+    const authenticated_deadline_status = handlerHandleHttp(&.{
+        .abi_version = abi.abi_version,
+        .route_handle = &invalid_deadline_route,
+        .request = &invalid_deadline_request,
+        .executor = .init(&test_io),
+        .out_response_handle = &invalid_deadline_response_handle,
+        .out_response = &invalid_deadline_response,
+    });
+    try std.testing.expect(authenticated_deadline_status.isOk());
+    try std.testing.expectEqual(@as(u16, 400), invalid_deadline_response.status);
+    try std.testing.expectEqual(@as(usize, 0), KernelIngressTestRoutes.mutation_calls);
+    handlerDestroyHttpResponse(invalid_deadline_response_handle.?);
+    api_server.cfg.internal_service_accept_legacy_unauthenticated = false;
 
     var retry_route = RouteState{
         .owner = &state,
@@ -689,5 +831,5 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
         "{\"code\":\"metadata_leader_unavailable\",\"error\":\"metadata leader unavailable\",\"message\":\"metadata leader unavailable\",\"retryable\":true,\"retry_after_ms\":1000}",
         retry_response.body.slice(),
     );
-    try std.testing.expectEqual(@as(u64, 2), api_server.requestStats().request_count);
+    try std.testing.expectEqual(@as(u64, 6), api_server.requestStats().request_count);
 }

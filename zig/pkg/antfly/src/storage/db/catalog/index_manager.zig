@@ -253,6 +253,47 @@ pub const ManagedIndexRef = struct {
     estimated_dense_vector_bytes: u64 = 0,
 };
 
+pub const LsmOwnerStats = struct {
+    kind: types.IndexKind,
+    name: []u8,
+    maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+    /// Distinguishes the bounded synthetic aggregate from a user index that
+    /// happens to have the same display name.
+    owner_overflow: bool = false,
+    retired_labels_collapsed_total: u64 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.* = undefined;
+    }
+};
+
+fn accumulateCloneMaintenance(
+    dst: *lsm_backend_mod.Backend.MaintenanceStats,
+    src: lsm_backend_mod.Backend.MaintenanceStats,
+) void {
+    dst.mutable_snapshot_clone_calls +|= src.mutable_snapshot_clone_calls;
+    dst.mutable_snapshot_clone_bytes_total +|= src.mutable_snapshot_clone_bytes_total;
+    dst.mutable_snapshot_clone_peak_bytes = @max(dst.mutable_snapshot_clone_peak_bytes, src.mutable_snapshot_clone_peak_bytes);
+    for (&dst.mutable_snapshot_clone_by_reason, src.mutable_snapshot_clone_by_reason) |*dst_reason, src_reason| {
+        dst_reason.calls +|= src_reason.calls;
+        dst_reason.bytes_total +|= src_reason.bytes_total;
+        dst_reason.peak_bytes = @max(dst_reason.peak_bytes, src_reason.peak_bytes);
+    }
+    dst.bulk_ingest_current_scan_clone_peak_active_bytes = @max(
+        dst.bulk_ingest_current_scan_clone_peak_active_bytes,
+        src.bulk_ingest_current_scan_clone_peak_active_bytes,
+    );
+}
+
+fn cloneMaintenanceOnly(
+    src: lsm_backend_mod.Backend.MaintenanceStats,
+) lsm_backend_mod.Backend.MaintenanceStats {
+    var result = lsm_backend_mod.Backend.MaintenanceStats{};
+    accumulateCloneMaintenance(&result, src);
+    return result;
+}
+
 pub const IndexBatchOptions = struct {
     compact_text: bool = true,
     compact_text_segment_threshold: ?usize = null,
@@ -367,7 +408,13 @@ const PhaseTrackingAllocator = struct {
 const TextMergeBudgetAllocator = struct {
     backing: Allocator,
     reservation: ?resource_manager_mod.Reservation,
+    /// All bytes competing inside the reservation, including persistent
+    /// publication work temporarily charged through `chargeExternal`.
     live_bytes: std.atomic.Value(usize) = .init(0),
+    /// Task-owned allocations only. Keep this separate from `live_bytes` so
+    /// operational peak telemetry is not inflated by estimated external work.
+    task_live_bytes: std.atomic.Value(usize) = .init(0),
+    peak_task_live_bytes: std.atomic.Value(usize) = .init(0),
     budget_denied: std.atomic.Value(bool) = .init(false),
 
     fn init(backing: Allocator, reservation: ?resource_manager_mod.Reservation) TextMergeBudgetAllocator {
@@ -378,6 +425,8 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn deinit(self: *TextMergeBudgetAllocator) void {
+        std.debug.assert(self.live_bytes.load(.acquire) == 0);
+        std.debug.assert(self.task_live_bytes.load(.acquire) == 0);
         if (self.reservation) |*reservation| reservation.release();
         self.* = undefined;
     }
@@ -398,6 +447,20 @@ const TextMergeBudgetAllocator = struct {
         return self.budget_denied.load(.acquire);
     }
 
+    /// Task-owned and externally charged bytes live inside the admitted merge
+    /// reservation. This is the enforcement ledger, not task telemetry.
+    fn liveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.live_bytes.load(.acquire);
+    }
+
+    fn taskLiveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.task_live_bytes.load(.acquire);
+    }
+
+    fn peakTaskLiveBytes(self: *const TextMergeBudgetAllocator) usize {
+        return self.peak_task_live_bytes.load(.acquire);
+    }
+
     /// Account allocations which must be owned by the persistent index's
     /// allocator (and therefore cannot safely retain this task-local allocator
     /// after publication). The charge remains live across the external work so
@@ -409,12 +472,15 @@ const TextMergeBudgetAllocator = struct {
     }
 
     fn releaseExternal(self: *TextMergeBudgetAllocator, bytes: usize) void {
-        self.releaseBytes(bytes);
+        self.releaseReservedBytes(bytes);
     }
 
     fn reserveGrowth(self: *TextMergeBudgetAllocator, bytes: usize) bool {
-        if (bytes == 0 or self.reservation == null) return true;
-        const limit = std.math.cast(usize, self.reservation.?.bytes) orelse std.math.maxInt(usize);
+        if (bytes == 0) return true;
+        const limit = if (self.reservation) |reservation|
+            std.math.cast(usize, reservation.bytes) orelse std.math.maxInt(usize)
+        else
+            std.math.maxInt(usize);
         var live = self.live_bytes.load(.acquire);
         while (true) {
             if (bytes > limit -| live) {
@@ -425,49 +491,73 @@ const TextMergeBudgetAllocator = struct {
         }
     }
 
-    fn releaseBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
-        if (bytes == 0 or self.reservation == null) return;
+    fn releaseReservedBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
         const previous = self.live_bytes.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
     }
 
+    fn noteTaskGrowth(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
+        const previous = self.task_live_bytes.fetchAdd(bytes, .acq_rel);
+        const current = previous + bytes;
+        var peak = self.peak_task_live_bytes.load(.acquire);
+        while (current > peak) {
+            peak = self.peak_task_live_bytes.cmpxchgWeak(peak, current, .acq_rel, .acquire) orelse return;
+        }
+    }
+
+    fn reserveTaskGrowth(self: *TextMergeBudgetAllocator, bytes: usize) bool {
+        if (!self.reserveGrowth(bytes)) return false;
+        self.noteTaskGrowth(bytes);
+        return true;
+    }
+
+    fn releaseTaskBytes(self: *TextMergeBudgetAllocator, bytes: usize) void {
+        if (bytes == 0) return;
+        const previous = self.task_live_bytes.fetchSub(bytes, .acq_rel);
+        std.debug.assert(previous >= bytes);
+        self.releaseReservedBytes(bytes);
+    }
+
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
-        if (!self.reserveGrowth(len)) return null;
-        return self.backing.rawAlloc(len, alignment, ret_addr) orelse {
-            self.releaseBytes(len);
+        if (!self.reserveTaskGrowth(len)) return null;
+        const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse {
+            self.releaseTaskBytes(len);
             return null;
         };
+        return ptr;
     }
 
     fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return false;
+        if (growth > 0 and !self.reserveTaskGrowth(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) {
-            if (growth > 0) self.releaseBytes(growth);
+            if (growth > 0) self.releaseTaskBytes(growth);
             return false;
         }
-        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        if (new_len < memory.len) self.releaseTaskBytes(memory.len - new_len);
         return true;
     }
 
     fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         const growth = new_len -| memory.len;
-        if (growth > 0 and !self.reserveGrowth(growth)) return null;
+        if (growth > 0 and !self.reserveTaskGrowth(growth)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse {
-            if (growth > 0) self.releaseBytes(growth);
+            if (growth > 0) self.releaseTaskBytes(growth);
             return null;
         };
-        if (new_len < memory.len) self.releaseBytes(memory.len - new_len);
+        if (new_len < memory.len) self.releaseTaskBytes(memory.len - new_len);
         return ptr;
     }
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *TextMergeBudgetAllocator = @ptrCast(@alignCast(ctx));
         self.backing.rawFree(memory, alignment, ret_addr);
-        self.releaseBytes(memory.len);
+        self.releaseTaskBytes(memory.len);
     }
 };
 
@@ -498,6 +588,33 @@ test "text merge bounded task allocator enforces live reservation" {
     alloc.free(second);
     try std.testing.expectEqual(@as(usize, 40), stats.current_bytes);
     try std.testing.expectEqual(@as(usize, 64), stats.peak_bytes);
+}
+
+test "text merge task allocator tracks live and external bytes without reservation" {
+    var budget = TextMergeBudgetAllocator.init(std.testing.allocator, null);
+    defer budget.deinit();
+    const alloc = budget.allocator();
+
+    const task_bytes = try alloc.alloc(u8, 128);
+    defer alloc.free(task_bytes);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.peakTaskLiveBytes());
+
+    const external_charge = try budget.chargeExternal(64);
+    try std.testing.expectEqual(@as(usize, 192), budget.liveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 128), budget.peakTaskLiveBytes());
+
+    budget.releaseExternal(external_charge);
+    try std.testing.expectEqual(@as(usize, 128), budget.liveBytes());
+
+    const transient = try alloc.alloc(u8, 256);
+    try std.testing.expectEqual(@as(usize, 384), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 384), budget.peakTaskLiveBytes());
+    alloc.free(transient);
+    try std.testing.expectEqual(@as(usize, 128), budget.taskLiveBytes());
+    try std.testing.expectEqual(@as(usize, 384), budget.peakTaskLiveBytes());
 }
 
 pub const TextMemoryAttributionStats = struct {
@@ -1123,6 +1240,8 @@ const SplitSide = enum {
 };
 
 pub const IndexManager = struct {
+    const max_retired_lsm_owner_stats: usize = 1024;
+    const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     alloc: Allocator,
     base_path: []u8,
     byte_range: docstore_mod.ByteRange,
@@ -1194,6 +1313,9 @@ pub const IndexManager = struct {
     text_indexes: std.ArrayListUnmanaged(TextIndex),
     text_merge_scheduler: TextMergeScheduler,
     dense_indexes: std.ArrayListUnmanaged(DenseIndex),
+    retired_lsm_owner_stats: std.ArrayListUnmanaged(LsmOwnerStats) = .empty,
+    retired_lsm_owner_overflow_stats: [2]lsm_backend_mod.Backend.MaintenanceStats = .{ .{}, .{} },
+    retired_lsm_owner_labels_collapsed: [2]u64 = .{ 0, 0 },
     sparse_indexes: std.ArrayListUnmanaged(SparseIndex),
     graph_indexes: std.ArrayListUnmanaged(GraphIndex),
     algebraic_indexes: std.ArrayListUnmanaged(AlgebraicIndex),
@@ -1542,18 +1664,17 @@ pub const IndexManager = struct {
         prepared_owner: ?*persistent_mod.PersistentIndex = null,
         output_ordinals: []OrdinalSlot = &.{},
         output_ids: []IdSlot = &.{},
-        /// Stable allocator behind the build-scoped tracking wrapper. Result
-        /// storage must be released before the owning merge task is destroyed.
+        publication_lookup_built: bool = false,
+        /// Stable task allocator. Result storage must be released before the
+        /// owning merge task is destroyed.
         owned_alloc: ?Allocator = null,
         elapsed_ns: u64 = 0,
-        /// Peak bytes allocated through the merge task allocator. File-backed
-        /// and heap-backed builders both run through this allocator.
+        /// Exact high-water mark of task-owned bytes from task creation through
+        /// publication. Persistent publication charges are excluded.
         peak_task_alloc_bytes: u64 = 0,
 
-        // Lookup storage is allocated through the task's tracking wrapper.
-        // That wrapper delegates raw allocations unchanged to the backing
-        // allocator, so detached result ownership is released through `alloc`
-        // in deinit after the stack-scoped tracker has recorded its peak.
+        // Lookup storage uses the stable task allocator because it survives
+        // the off-lock preparation phase until atomic publication.
         fn buildPublicationLookup(self: *TextMergeResult, alloc: Allocator) !void {
             const output_count = if (self.prepared_segments.len > 0) self.prepared_segments.len else self.segments.len;
             var ordinal_count: usize = 0;
@@ -1607,6 +1728,7 @@ pub const IndexManager = struct {
             }
             self.output_ordinals = ordinals;
             self.output_ids = ids;
+            self.publication_lookup_built = true;
         }
 
         fn outputForOrdinal(self: *const TextMergeResult, identity: u32) ?OutputLocation {
@@ -3248,6 +3370,60 @@ pub const IndexManager = struct {
         self.deinitTextIndexEntry(entry, false);
     }
 
+    fn archiveLsmOwnerStats(
+        self: *IndexManager,
+        kind: types.IndexKind,
+        name: []const u8,
+        maintenance: lsm_backend_mod.Backend.MaintenanceStats,
+    ) void {
+        if (maintenance.mutable_snapshot_clone_calls == 0 and
+            maintenance.mutable_snapshot_clone_bytes_total == 0 and
+            maintenance.mutable_snapshot_clone_peak_bytes == 0 and
+            maintenance.bulk_ingest_current_scan_clone_peak_active_bytes == 0) return;
+        for (self.retired_lsm_owner_stats.items) |*retired| {
+            if (retired.kind != kind or !std.mem.eql(u8, retired.name, name)) continue;
+            accumulateCloneMaintenance(&retired.maintenance, maintenance);
+            return;
+        }
+        if (self.retired_lsm_owner_stats.items.len >= max_retired_lsm_owner_stats) {
+            const overflow_index: usize = switch (kind) {
+                .full_text => 0,
+                .dense_vector => 1,
+                else => unreachable,
+            };
+            accumulateCloneMaintenance(&self.retired_lsm_owner_overflow_stats[overflow_index], maintenance);
+            self.retired_lsm_owner_labels_collapsed[overflow_index] +|= 1;
+            return;
+        }
+        const owned_name = self.alloc.dupe(u8, name) catch |err| {
+            std.log.warn("failed to retain retired LSM owner name owner={s} err={s}", .{ name, @errorName(err) });
+            return;
+        };
+        self.retired_lsm_owner_stats.append(self.alloc, .{
+            .kind = kind,
+            .name = owned_name,
+            .maintenance = cloneMaintenanceOnly(maintenance),
+        }) catch |err| {
+            self.alloc.free(owned_name);
+            std.log.warn("failed to retain retired LSM owner metrics owner={s} err={s}", .{ name, @errorName(err) });
+        };
+    }
+
+    fn archiveTextIndexOwner(self: *IndexManager, entry: *TextIndex) void {
+        const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse return;
+        self.archiveLsmOwnerStats(.full_text, entry.config.name, stats);
+    }
+
+    fn archiveDenseIndexOwner(self: *IndexManager, entry: *DenseIndex) void {
+        const stats = entry.index.snapshotLsmMaintenanceStats() orelse return;
+        self.archiveLsmOwnerStats(.dense_vector, entry.config.name, stats);
+    }
+
+    fn retireTextIndexEntry(self: *IndexManager, entry: *TextIndex) void {
+        self.archiveTextIndexOwner(entry);
+        self.freeTextIndexEntry(entry);
+    }
+
     fn abandonTextIndexEntryAfterCrash(self: *IndexManager, entry: *TextIndex) void {
         self.deinitTextIndexEntry(entry, true);
     }
@@ -3363,6 +3539,11 @@ pub const IndexManager = struct {
         self.deinitDenseIndexEntry(entry, false);
     }
 
+    fn retireDenseIndexEntry(self: *IndexManager, entry: *DenseIndex) void {
+        self.archiveDenseIndexOwner(entry);
+        self.freeDenseIndexEntry(entry);
+    }
+
     fn abandonDenseIndexEntryAfterCrash(self: *IndexManager, entry: *DenseIndex) void {
         self.deinitDenseIndexEntry(entry, true);
     }
@@ -3433,6 +3614,7 @@ pub const IndexManager = struct {
         errdefer index.close();
 
         index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
+        index.setIo(self.io);
         if (self.hbc_cache) |cache| index.attachSharedCache(cache);
         if (self.resource_manager) |manager| {
             index.attachResourceManagerWithSharedCacheBinding(manager, self.bind_cache_resource_manager);
@@ -3673,6 +3855,8 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |*entry| {
             if (abandon_after_crash) self.abandonDenseIndexEntryAfterCrash(entry) else self.freeDenseIndexEntry(entry);
         }
+        for (self.retired_lsm_owner_stats.items) |*entry| entry.deinit(self.alloc);
+        self.retired_lsm_owner_stats.deinit(self.alloc);
         for (self.sparse_indexes.items) |*entry| {
             if (abandon_after_crash) self.abandonSparseIndexEntryAfterCrash(entry) else self.freeSparseIndexEntry(entry);
         }
@@ -4376,6 +4560,101 @@ pub const IndexManager = struct {
             }
         }
         return stats;
+    }
+
+    pub fn snapshotLsmOwnerStatsAlloc(self: *const IndexManager, alloc: Allocator) ![]LsmOwnerStats {
+        var owners = std.ArrayListUnmanaged(LsmOwnerStats).empty;
+        errdefer {
+            for (owners.items) |*owner| owner.deinit(alloc);
+            owners.deinit(alloc);
+        }
+        for (self.retired_lsm_owner_stats.items) |retired| {
+            try owners.append(alloc, .{
+                .kind = retired.kind,
+                .name = try alloc.dupe(u8, retired.name),
+                .maintenance = retired.maintenance,
+            });
+        }
+        const overflow_kinds = [_]types.IndexKind{ .full_text, .dense_vector };
+        for (overflow_kinds, 0..) |kind, i| {
+            if (self.retired_lsm_owner_labels_collapsed[i] == 0) continue;
+            try owners.append(alloc, .{
+                .kind = kind,
+                .name = try alloc.dupe(u8, retired_lsm_owner_overflow_name),
+                .maintenance = self.retired_lsm_owner_overflow_stats[i],
+                .owner_overflow = true,
+                .retired_labels_collapsed_total = self.retired_lsm_owner_labels_collapsed[i],
+            });
+        }
+        for (self.text_indexes.items) |*entry| {
+            const stats = entry.persistent.snapshotLsmMaintenanceStats() orelse continue;
+            for (owners.items) |*owner| {
+                if (owner.owner_overflow or owner.kind != .full_text or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                accumulateCloneMaintenance(&owner.maintenance, stats);
+                break;
+            } else {
+                try owners.ensureUnusedCapacity(alloc, 1);
+                const name = try alloc.dupe(u8, entry.config.name);
+                owners.appendAssumeCapacity(.{
+                    .kind = .full_text,
+                    .name = name,
+                    .maintenance = stats,
+                });
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            const stats = entry.index.snapshotLsmMaintenanceStats() orelse continue;
+            for (owners.items) |*owner| {
+                if (owner.owner_overflow or owner.kind != .dense_vector or !std.mem.eql(u8, owner.name, entry.config.name)) continue;
+                accumulateCloneMaintenance(&owner.maintenance, stats);
+                break;
+            } else {
+                try owners.ensureUnusedCapacity(alloc, 1);
+                const name = try alloc.dupe(u8, entry.config.name);
+                owners.appendAssumeCapacity(.{
+                    .kind = .dense_vector,
+                    .name = name,
+                    .maintenance = stats,
+                });
+            }
+        }
+        return try owners.toOwnedSlice(alloc);
+    }
+
+    /// Preserve clone attribution from a short-lived shadow manager before it
+    /// is torn down. Snapshot first and then lock the destination so repair
+    /// cleanup never holds two catalog locks at once.
+    pub fn transferLsmOwnerCloneStatsTo(self: *IndexManager, destination: *IndexManager) !void {
+        if (self == destination) return;
+        const owners = owners_blk: {
+            self.catalog_mutex.lockShared();
+            defer self.catalog_mutex.unlockShared();
+            break :owners_blk try self.snapshotLsmOwnerStatsAlloc(self.alloc);
+        };
+        defer {
+            for (owners) |*owner| owner.deinit(self.alloc);
+            self.alloc.free(owners);
+        }
+
+        destination.catalog_mutex.lockExclusive();
+        defer destination.catalog_mutex.unlockExclusive();
+        for (owners) |owner| {
+            if (owner.owner_overflow) {
+                const overflow_index: usize = switch (owner.kind) {
+                    .full_text => 0,
+                    .dense_vector => 1,
+                    else => unreachable,
+                };
+                accumulateCloneMaintenance(
+                    &destination.retired_lsm_owner_overflow_stats[overflow_index],
+                    owner.maintenance,
+                );
+                destination.retired_lsm_owner_labels_collapsed[overflow_index] +|=
+                    owner.retired_labels_collapsed_total;
+                continue;
+            }
+            destination.archiveLsmOwnerStats(owner.kind, owner.name, owner.maintenance);
+        }
     }
 
     pub fn snapshotLsmWriteStats(self: *const IndexManager) lsm_backend_mod.Backend.WriteStats {
@@ -5455,6 +5734,7 @@ pub const IndexManager = struct {
 
     pub fn setIo(self: *IndexManager, io: ?std.Io) void {
         self.io = io;
+        for (self.dense_indexes.items) |*entry| entry.index.setIo(io);
     }
 
     pub fn checkpointIo(self: *const IndexManager) std.Io {
@@ -6401,7 +6681,7 @@ pub const IndexManager = struct {
                 );
                 self.text_merge_scheduler.removeIndex(self.alloc, name);
                 entry.detachAllMergeDeletionStates();
-                self.freeTextIndexEntry(entry);
+                self.retireTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -6435,7 +6715,7 @@ pub const IndexManager = struct {
                 defer artifact_cleanup.deinit();
                 const commit_mutation = try combineRemovalCatalogMutation(atomic_mutation, &artifact_cleanup);
                 try self.persistCatalogExcludingWithAtomicMutation(store, name, commit_mutation);
-                self.freeDenseIndexEntry(entry);
+                self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 defer self.dropIndexLoadStateNoLock(name);
                 self.storeGeneratedEnrichmentTargetCache(has_generated_enrichment_targets);
@@ -6575,6 +6855,11 @@ pub const IndexManager = struct {
     }
 
     pub fn destroyDetachedReplacementIndex(self: *IndexManager, entry: *DetachedIndex) void {
+        switch (entry.*) {
+            .full_text => |*index| self.archiveTextIndexOwner(index),
+            .dense_vector => |*index| self.archiveDenseIndexOwner(index),
+            else => {},
+        }
         entry.deinit(self);
     }
 
@@ -10258,7 +10543,17 @@ pub const IndexManager = struct {
                 else => return err,
             };
             defer result.deinit(self.alloc);
-            _ = try self.finishTextMergeTask(&task, &result);
+            while (true) {
+                _ = self.finishTextMergeTask(&task, &result) catch |err| {
+                    if (err != error.TextMergePublicationLookupRequired) return err;
+                    // This synchronous scheduler does not acquire the runtime's
+                    // database-wide apply lock. Prepare outside IndexManager's
+                    // short per-index publication critical section and retry.
+                    try prepareTextMergeTaskPublicationLookup(&task, &result);
+                    continue;
+                };
+                break;
+            }
             completed += 1;
         }
         return completed;
@@ -12048,6 +12343,7 @@ pub const IndexManager = struct {
                     .cache = self.lsm_cache,
                     .root_generation = self.lsm_root_generation,
                 });
+                index.setIo(self.io);
                 index.setRetainedVectorCacheEnabled(self.retainedVectorCacheEnabled());
                 if (self.hbc_cache) |cache| index.attachSharedCache(cache);
                 if (self.resource_manager) |manager| {
@@ -12849,11 +13145,9 @@ pub const IndexManager = struct {
         const started_ns = platform_time.monotonicNs();
         defer task.discardSourceCleanPages();
         logTextMergeTaskMemory("before", task, 0);
-        var alloc_stats = PhaseAllocStats{};
-        var tracking = PhaseTrackingAllocator.init(task.mergeAllocator(), &alloc_stats);
-        const task_alloc = tracking.allocator();
+        const task_alloc = task.mergeAllocator();
         const deleted_docs = task_alloc.alloc(?roaring.RoaringBitmap, task.source.len) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+            if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
             return err;
         };
         defer task_alloc.free(deleted_docs);
@@ -12876,23 +13170,19 @@ pub const IndexManager = struct {
                 .prepared_owner = task.persistent,
                 .owned_alloc = task.mergeAllocator(),
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             };
             errdefer result.deinit(alloc);
-            result.buildPublicationLookup(task_alloc) catch |err| {
-                if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-                return err;
-            };
-            result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
             return result;
         } else |err| switch (err) {
             error.EmptySegment => return .{
                 .segments = &.{},
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             },
             error.Unsupported => {},
             else => {
-                if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+                if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
                 if (builtin.os.tag != .freestanding) {
                     std.log.err("scheduled text merge file-backed build failed index={s}: {s}", .{ task.index_name, @errorName(err) });
                 }
@@ -12900,14 +13190,14 @@ pub const IndexManager = struct {
             },
         }
 
-        const merged = merger_mod.mergeSegmentsBounded(tracking.allocator(), task.snapshot, task.merge_indices, .{
+        const merged = merger_mod.mergeSegmentsBounded(task_alloc, task.snapshot, task.merge_indices, .{
             .target_segment_bytes = @intCast(activeTextMergePolicy().max_segment_size),
             .deleted_docs = deleted_docs,
         }) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
+            if (task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
             if (err == error.EmptySegment) return .{
                 .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-                .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+                .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
             };
             if (builtin.os.tag != .freestanding) {
                 std.log.err("scheduled text merge failed index={s}: {s}", .{ task.index_name, @errorName(err) });
@@ -12921,15 +13211,25 @@ pub const IndexManager = struct {
             .segments = merged,
             .owned_alloc = task.mergeAllocator(),
             .elapsed_ns = platform_time.monotonicNs() -| started_ns,
-            .peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes),
+            .peak_task_alloc_bytes = @intCast(task.deletion_state.budget.peakTaskLiveBytes()),
         };
         errdefer result.deinit(alloc);
-        result.buildPublicationLookup(task_alloc) catch |err| {
-            if (tracking.limit_exceeded or task.deletion_state.budget.denied()) return error.ResourceBudgetExceeded;
-            return err;
-        };
-        result.peak_task_alloc_bytes = @intCast(alloc_stats.peak_bytes);
         return result;
+    }
+
+    /// Build the document-identity lookup required to reconcile deletions
+    /// which commit after the merge snapshot. The runtime calls this only
+    /// after publication reports that a lookup is necessary, and crucially
+    /// does so without holding the database-wide apply lock.
+    pub fn prepareTextMergeTaskPublicationLookup(task: *const TextMergeTask, result: *TextMergeResult) !void {
+        if (result.publication_lookup_built) return;
+        result.buildPublicationLookup(task.mergeAllocator()) catch |err| {
+            return task.deletion_state.allocationError(err);
+        };
+        result.peak_task_alloc_bytes = @max(
+            result.peak_task_alloc_bytes,
+            @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())),
+        );
     }
 
     fn logTextMergeTaskMemory(label: []const u8, task: *const TextMergeTask, output_bytes: u64) void {
@@ -12954,7 +13254,8 @@ pub const IndexManager = struct {
     }
 
     pub fn finishTextMergeTask(self: *IndexManager, task: *const TextMergeTask, result: *TextMergeResult) !bool {
-        defer self.completeTextMergeTaskTracking(task);
+        var retire_task = true;
+        defer if (retire_task) self.completeTextMergeTaskTracking(task);
 
         const entry = self.textIndexEntry(task.index_name) orelse return false;
         if (!self.text_merge_scheduler.taskInFlight(task.index_name, task.source, task.deletion_state)) {
@@ -12985,6 +13286,19 @@ pub const IndexManager = struct {
         }
         var merge_delta_locked = true;
         defer if (merge_delta_locked) entry.merge_delta_mutex.unlock();
+        var has_deletion_deltas = false;
+        for (task.deletion_state.deltas) |delta| {
+            if (delta.count == 0) continue;
+            has_deletion_deltas = true;
+            break;
+        }
+        if (has_deletion_deltas and !result.publication_lookup_built) {
+            // Do not scan the entire merge output while the caller holds the
+            // database-wide apply lock. Preserve task registration so the
+            // runtime can prepare the lookup off-lock and retry publication.
+            retire_task = false;
+            return error.TextMergePublicationLookupRequired;
+        }
         const publication_external_bytes = estimateTextMergePublicationExternalBytes(entry, task, result) catch |err| {
             return task.deletion_state.allocationError(err);
         };
@@ -13255,9 +13569,9 @@ pub const IndexManager = struct {
             // oversized exception would account the estimate without actually
             // bounding the live working set.
             .strict => try manager.reserve(.text_merge_buffers, reservation_bytes),
-            // Scheduled tasks execute through PhaseTrackingAllocator. Permit
-            // one task up to 2x the normal hard limit: ResourceManager keeps it
-            // exclusive and the task allocator enforces the same live cap.
+            // Permit one scheduled task up to 2x the normal hard limit:
+            // ResourceManager keeps it exclusive and the task's shared budget
+            // allocator enforces the same live cap through publication.
             .bounded_task => try manager.reserveBoundedOversizedSingle(.text_merge_buffers, reservation_bytes, 2),
         };
     }
@@ -13405,15 +13719,15 @@ pub const IndexManager = struct {
         const layout = seg.layoutStats(false);
 
         // Merge working memory is driven by doc renumbering, the largest term
-        // accumulator, compact dictionary/value builders, and the publication
-        // identity table. File-backed output streams separately; heap-backed
-        // output adds its serialized source-sized envelope at the caller.
-        // Keep generous capacity/headroom factors here and enforce the
-        // reservation with the bounded task allocator.
-        // Include the fixed-capacity publication identity table. Ordinal-backed
-        // documents use 32 bytes at the table's <= 50% load factor; retain more
-        // headroom for the less common string-identity fallback.
-        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 224 else 160;
+        // accumulator, and compact dictionary/value builders. File-backed
+        // output streams separately; heap-backed output adds its serialized
+        // source-sized envelope at the caller. The publication identity table
+        // is no longer part of the normal reservation: append-only publication
+        // does not build it, while a rare concurrent-delete publication may
+        // fail its lazy allocation and safely retry the merge. Charging that
+        // O(live documents) table here recreated a hard admission ceiling even
+        // after its eager allocation was removed from execution.
+        const per_doc_bytes: u64 = if (layout.index_sort_bytes > 0) 128 else 64;
         var bytes = try std.math.mul(u64, seg.reader.doc_count, per_doc_bytes);
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_term_dict_bytes, 3));
         bytes = try std.math.add(u64, bytes, try std.math.mul(u64, layout.inverted_bloom_bytes, 3));
@@ -13443,7 +13757,7 @@ pub const IndexManager = struct {
     fn textMergePublicationDeletes(
         entry: *TextIndex,
         task: *const TextMergeTask,
-        result: *const TextMergeResult,
+        result: *TextMergeResult,
         deletion_deltas: []const TextMergeDeletionDelta,
     ) !TextMergePublicationDeletes {
         if (deletion_deltas.len != task.source.len) return error.InvalidDeletionSnapshot;
@@ -13456,6 +13770,15 @@ pub const IndexManager = struct {
                 if (maybe_deleted.*) |*deleted| deleted.deinit();
             }
             publication_alloc.free(output_deleted);
+        }
+
+        // Publication requested the O(live documents) lookup only when a
+        // delete raced the unlocked build, and the runtime prepared it without
+        // holding the database-wide apply lock.
+        for (deletion_deltas) |delta| {
+            if (delta.count == 0) continue;
+            std.debug.assert(result.publication_lookup_built);
+            break;
         }
 
         const snap = entry.persistent.acquireSnapshot();
@@ -13489,6 +13812,14 @@ pub const IndexManager = struct {
                 try output_deleted[output_idx].?.add(output.doc);
             }
         }
+
+        // The shared allocator high-water mark includes task creation, merge
+        // build, the off-lock lookup, and publication bitmaps while excluding
+        // persistent publication charges by construction.
+        result.peak_task_alloc_bytes = @max(
+            result.peak_task_alloc_bytes,
+            @as(u64, @intCast(task.deletion_state.budget.peakTaskLiveBytes())),
+        );
 
         return .{
             .source_current = true,
@@ -13573,7 +13904,7 @@ pub const IndexManager = struct {
     fn removeInMemory(self: *IndexManager, name: []const u8) void {
         for (self.text_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
-                self.freeTextIndexEntry(entry);
+                self.retireTextIndexEntry(entry);
                 _ = self.text_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
                 return;
@@ -13581,7 +13912,7 @@ pub const IndexManager = struct {
         }
         for (self.dense_indexes.items, 0..) |*entry, i| {
             if (std.mem.eql(u8, entry.config.name, name)) {
-                self.freeDenseIndexEntry(entry);
+                self.retireDenseIndexEntry(entry);
                 _ = self.dense_indexes.orderedRemove(i);
                 self.dropIndexLoadStateNoLock(name);
                 return;
@@ -17881,7 +18212,9 @@ pub const IndexManager = struct {
             session.useLsmResidency();
             try session.getManySorted(store, keys, values);
         } else {
-            var txn = try store.beginProbeTxn();
+            var runtime_store = try initRuntimeStore(manager.alloc, store);
+            defer runtime_store.deinit();
+            var txn = try runtime_store.store.beginRead();
             defer txn.abort();
             try txn.getManySorted(keys, values);
         }
@@ -27045,6 +27378,7 @@ test "dense index manager accepts external embedding indexes without enrichments
 test "production external scorers use bounded cache-first artifact batches" {
     const alloc = std.testing.allocator;
     const dims: usize = 3;
+    const external_rerank_batch_size: usize = 128;
     const candidate_count = exact_dense_score_batch_size + 17;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -27070,7 +27404,7 @@ test "production external scorers use bounded cache-first artifact batches" {
     try manager.addAllNoBackfill(&store, &.{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"semantic_idx\",\"external\":true,\"rerank_policy\":\"always\"}",
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"semantic_idx\",\"external\":true}",
     }});
 
     const writes = try alloc.alloc(mapper.DenseEmbeddingWrite, candidate_count);
@@ -27084,12 +27418,11 @@ test "production external scorers use bounded cache-first artifact batches" {
     defer alloc.free(vectors);
     const candidate_ids = try alloc.alloc(u64, candidate_count);
     defer alloc.free(candidate_ids);
+    const candidate_id_order = try alloc.alloc(usize, candidate_count);
+    defer alloc.free(candidate_id_order);
     for (writes, 0..) |*write, i| {
         doc_keys[i] = try std.fmt.allocPrint(alloc, "doc:{d:0>6}", .{i});
         const vector = vectors[i * dims ..][0..dims];
-        vector[0] = @floatFromInt(i);
-        vector[1] = @floatFromInt(i % 17);
-        vector[2] = @floatFromInt(i % 31);
         write.* = .{
             .index_name = @constCast("semantic_idx"),
             .doc_key = doc_keys[i],
@@ -27097,11 +27430,33 @@ test "production external scorers use bounded cache-first artifact batches" {
             .artifact_key = null,
         };
         candidate_ids[i] = deterministicDenseVectorId(doc_keys[i]);
+        candidate_id_order[i] = i;
     }
+    std.mem.sort(usize, candidate_id_order, candidate_ids, struct {
+        fn lessThan(ids: []const u64, lhs: usize, rhs: usize) bool {
+            return ids[lhs] < ids[rhs];
+        }
+    }.lessThan);
+    // External batches are sorted by vector id for storage locality. Make the
+    // first complete batch a compact ordered range followed by a continuous
+    // tail. Queries from opposite ends then deterministically cover both
+    // halves of the stop invariant: a safe positive stop and a required
+    // continuation, without relying on hash ordering accidentally correlating
+    // with distance.
+    for (candidate_id_order, 0..) |candidate_idx, rank| {
+        const vector = vectors[candidate_idx * dims ..][0..dims];
+        const base: f32 = @floatFromInt(rank + if (rank < external_rerank_batch_size) @as(usize, 0) else 128);
+        vector[0] = base;
+        vector[1] = @floatFromInt(rank % 17);
+        vector[2] = @floatFromInt(rank % 31);
+    }
+    const far_query_idx = candidate_id_order[candidate_count - 1];
+    const missing_candidate_idx = candidate_id_order[external_rerank_batch_size];
     try manager.applyDenseEmbeddingWritesByNameWithOptions(&store, "semantic_idx", writes, .{ .mode = .bulk_ingest });
 
     const entry = manager.denseIndex("semantic_idx") orelse return error.IndexNotFound;
-    var residency_probe = entry.index.acquireDecodedVectorResidency(candidate_count) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(hbc_mod.HBCConfig.RerankPolicy.boundary, entry.index.config.rerank_policy);
+    var residency_probe = entry.index.acquireDecodedVectorResidency(candidate_count) orelse return error.ResidencyProbeUnavailable;
     residency_probe.deinit();
     try std.testing.expectEqual(@as(u64, candidate_count), entry.index.stats().active_count);
     try std.testing.expectEqual(@as(u64, 0), entry.index.hbcCacheStats().vector.used_bytes);
@@ -27156,7 +27511,7 @@ test "production external scorers use bounded cache-first artifact batches" {
 
     // Missing/corrupt external artifacts are candidate-local failures. They
     // must not fail the whole request (the old scalar fallback did).
-    const missing_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_keys[2], "semantic_idx");
+    const missing_artifact_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_keys[missing_candidate_idx], "semantic_idx");
     defer alloc.free(missing_artifact_key);
     try store.delete(missing_artifact_key);
 
@@ -27173,7 +27528,7 @@ test "production external scorers use bounded cache-first artifact batches" {
     defer hbc_mod.setTestGetVectorViewOrScratchHook(null, null);
 
     var outcome = try manager.exactScoreDenseEntryWithRequest(entry, .{
-        .query = vectors[(candidate_count - 1) * dims ..][0..dims],
+        .query = vectors[far_query_idx * dims ..][0..dims],
         .k = 10,
         .filter_ids = candidate_ids,
     });
@@ -27193,52 +27548,161 @@ test "production external scorers use bounded cache-first artifact batches" {
     try std.testing.expect(outcome.profile.workspace_bytes > 0);
     try std.testing.expect(outcome.profile.artifact_read_ns > 0);
     try std.testing.expectEqual(@as(usize, 10), outcome.results.getHits().len);
-    try std.testing.expectEqual(candidate_ids[candidate_count - 1], outcome.results.getHits()[0].vector_id);
+    try std.testing.expectEqual(candidate_ids[far_query_idx], outcome.results.getHits()[0].vector_id);
 
-    // Drive the complete production HBC search path through a rerank set large
-    // enough to exercise output-slot restoration, profile composition, and
-    // loader wiring that a direct two-candidate adapter call cannot observe.
-    // The bounded locality policy deliberately handles this sub-2 MiB set as
-    // one physical-read unit.
+    // Drive the complete production HBC search path with the default boundary
+    // policy. An ambiguous distance threshold selects the full >128 candidate
+    // set, after which exact sorted batches evaluate the stop proof. This
+    // fixture keeps the second batch's lower bounds overlapping the retained
+    // frontier, so skipping it would be a recall bug.
     for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
     entry.index.abortVectorCacheMutations();
-    var first_sorted_idx: usize = 0;
-    for (candidate_ids, 0..) |vector_id, i| {
-        if (vector_id < candidate_ids[first_sorted_idx]) first_sorted_idx = i;
-    }
-    var preload_lease = entry.index.acquireDecodedVectorResidency(1) orelse return error.TestUnexpectedResult;
-    defer preload_lease.deinit();
-    _ = try entry.index.cacheVectorForResidencyLease(
-        &preload_lease,
-        candidate_ids[first_sorted_idx],
-        vectors[first_sorted_idx * dims ..][0..dims],
-    );
-    var preloaded = entry.index.borrowCachedVector(candidate_ids[first_sorted_idx]) orelse return error.TestUnexpectedResult;
-    preloaded.deinit();
-    var full_profiled = try entry.index.searchProfiledRequest(.{
-        .query = vectors[(candidate_count - 1) * dims ..][0..dims],
-        .k = candidate_count,
-        .rerank_k = candidate_count,
+    const no_stop_query = [_]f32{ 20_000, 0, 0 };
+    var boundary_probe = try entry.index.searchProfiledRequest(.{
+        .query = &no_stop_query,
+        .k = 128,
         .search_width = @intCast(candidate_count),
         .load_metadata = false,
         .filter_ids = candidate_ids,
     });
-    defer full_profiled.results.deinit();
+    defer boundary_probe.results.deinit();
+    try std.testing.expect(boundary_probe.profile.approx_top_count > 0);
+    const approximate_top = boundary_probe.profile.approx_top[0];
+    try std.testing.expect(approximate_top.error_bound > 0);
+    // Equality with the approximate lower bound is ambiguous, while a query
+    // outside the indexed corpus keeps every true top-k distance eligible.
+    const ambiguous_distance_over = approximate_top.lower_bound;
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
 
+    var full_profiled = try entry.index.searchProfiledRequest(.{
+        .query = &no_stop_query,
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        // Equality with the retained approximate lower bound is ambiguous under
+        // the default boundary policy and therefore selects the complete
+        // candidate shell before progressive exact batches evaluate the stop.
+        .distance_over = ambiguous_distance_over,
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer full_profiled.results.deinit();
     try std.testing.expect(full_profiled.profile.approx_candidate_count > 128);
     try std.testing.expect(full_profiled.profile.rerank_candidate_count > 128);
-    try std.testing.expectEqual(@as(u64, 1), full_profiled.profile.rerank_batches);
-    try std.testing.expectEqual(full_profiled.profile.rerank_candidate_count, full_profiled.profile.rerank_max_batch_size);
-    try std.testing.expect(full_profiled.profile.rerank_artifact_cache_hits > 0);
-    try std.testing.expect(full_profiled.profile.rerank_artifact_vectors_loaded > 128);
+    try std.testing.expect(full_profiled.profile.full_rerank_due_to_threshold);
+    try std.testing.expect(full_profiled.profile.ambiguous_distance_over_hits > 0);
+    try std.testing.expect(full_profiled.profile.rerank_batches > 0);
+    try std.testing.expectEqual(@as(u64, 128), full_profiled.profile.rerank_max_batch_size);
+    try std.testing.expect(full_profiled.profile.rerank_artifact_vectors_loaded > 0);
     try std.testing.expectEqual(
         full_profiled.profile.rerank_artifact_vectors_loaded,
         full_profiled.profile.rerank_metadata_vectors_loaded,
     );
-    // The approximate result shell retains the candidate-local missing entry
-    // at infinite distance when k spans the entire corpus.
-    try std.testing.expectEqual(candidate_count, full_profiled.results.getHits().len);
-    try std.testing.expectEqual(candidate_ids[candidate_count - 1], full_profiled.results.getHits()[0].vector_id);
+    try std.testing.expectEqual(@as(u64, 0), full_profiled.profile.rerank_candidates_skipped_by_bound);
+    try std.testing.expectEqual(
+        std.math.divCeil(u64, full_profiled.profile.rerank_candidate_count, 128) catch unreachable,
+        full_profiled.profile.rerank_batches,
+    );
+
+    const ExpectedHit = struct {
+        vector_id: u64,
+        distance: f32,
+
+        fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+            if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
+            return lhs.vector_id < rhs.vector_id;
+        }
+    };
+    // Size for the complete shell so correctness of this oracle never depends
+    // on how many candidates the calibrated threshold admits.
+    const expected_storage = try alloc.alloc(ExpectedHit, candidate_count);
+    defer alloc.free(expected_storage);
+    var expected_count: usize = 0;
+    for (candidate_ids, 0..) |vector_id, i| {
+        if (i == missing_candidate_idx) continue; // Candidate-local artifact deleted above.
+        const distance = vector_mod.distance(&no_stop_query, vectors[i * dims ..][0..dims], .l2_squared);
+        if (distance <= ambiguous_distance_over) continue; // distance_over is strict.
+        expected_storage[expected_count] = .{ .vector_id = vector_id, .distance = distance };
+        expected_count += 1;
+    }
+    std.mem.sort(ExpectedHit, expected_storage[0..expected_count], {}, ExpectedHit.lessThan);
+    const hits = full_profiled.results.getHits();
+    try std.testing.expectEqual(@as(usize, 128), hits.len);
+    for (hits, expected_storage[0..hits.len], 0..) |hit, expected, rank| {
+        if (expected.vector_id != hit.vector_id) std.debug.print(
+            "external boundary no-stop mismatch rank={d} expected_id={d} actual_id={d}\n",
+            .{ rank, expected.vector_id, hit.vector_id },
+        );
+        try std.testing.expectEqual(expected.vector_id, hit.vector_id);
+        try std.testing.expectApproxEqRel(expected.distance, hit.distance, 0.000001);
+    }
+
+    // A separated vector-id-ordered shell must exercise the positive half of
+    // the production stop proof: after one bounded external batch establishes
+    // 128 exact upper bounds, candidates whose approximate lower bounds are
+    // strictly worse can be skipped. Keep the
+    // threshold ambiguity so this still enters through the default boundary
+    // policy rather than forcing rerank_policy=always.
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+    const early_stop_query = [_]f32{ -10_000, 0, 0 };
+    var early_stop_probe = try entry.index.searchProfiledRequest(.{
+        .query = &early_stop_query,
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer early_stop_probe.results.deinit();
+    try std.testing.expect(early_stop_probe.profile.approx_top_count > 0);
+    const early_stop_top = early_stop_probe.profile.approx_top[0];
+    try std.testing.expect(early_stop_top.error_bound > 0);
+    const early_stop_distance_over = early_stop_top.lower_bound;
+    for (candidate_ids) |vector_id| entry.index.invalidateVectorCache(vector_id);
+    entry.index.abortVectorCacheMutations();
+
+    var early_stopped = try entry.index.searchProfiledRequest(.{
+        .query = &early_stop_query,
+        .k = 128,
+        .search_width = @intCast(candidate_count),
+        .distance_over = early_stop_distance_over,
+        .load_metadata = false,
+        .filter_ids = candidate_ids,
+    });
+    defer early_stopped.results.deinit();
+    try std.testing.expect(early_stopped.profile.approx_candidate_count > 128);
+    try std.testing.expect(early_stopped.profile.rerank_candidate_count > 128);
+    try std.testing.expect(early_stopped.profile.full_rerank_due_to_threshold);
+    try std.testing.expect(early_stopped.profile.ambiguous_distance_over_hits > 0);
+    try std.testing.expect(early_stopped.profile.rerank_candidates_skipped_by_bound > 0);
+    try std.testing.expect(early_stopped.profile.rerank_batches > 0);
+    try std.testing.expect(early_stopped.profile.rerank_batches <
+        std.math.divCeil(u64, early_stopped.profile.rerank_candidate_count, 128) catch unreachable);
+    try std.testing.expectEqual(@as(u64, 128), early_stopped.profile.rerank_max_batch_size);
+    try std.testing.expectEqual(
+        early_stopped.profile.rerank_artifact_vectors_loaded,
+        early_stopped.profile.rerank_metadata_vectors_loaded,
+    );
+
+    expected_count = 0;
+    for (candidate_ids, 0..) |vector_id, i| {
+        if (i == missing_candidate_idx) continue;
+        const distance = vector_mod.distance(&early_stop_query, vectors[i * dims ..][0..dims], .l2_squared);
+        if (distance <= early_stop_distance_over) continue;
+        expected_storage[expected_count] = .{ .vector_id = vector_id, .distance = distance };
+        expected_count += 1;
+    }
+    std.mem.sort(ExpectedHit, expected_storage[0..expected_count], {}, ExpectedHit.lessThan);
+    const early_hits = early_stopped.results.getHits();
+    try std.testing.expectEqual(@as(usize, 128), early_hits.len);
+    for (early_hits, expected_storage[0..early_hits.len], 0..) |hit, expected, rank| {
+        if (expected.vector_id != hit.vector_id) std.debug.print(
+            "external boundary early-stop mismatch rank={d} expected_id={d} actual_id={d}\n",
+            .{ rank, expected.vector_id, hit.vector_id },
+        );
+        try std.testing.expectEqual(expected.vector_id, hit.vector_id);
+        try std.testing.expectApproxEqRel(expected.distance, hit.distance, 0.000001);
+    }
 }
 
 test "external dense embedding writes persist deterministic vector mappings" {
@@ -27949,6 +28413,21 @@ test "text merge task carries concurrent deletes into publication" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_limit_bytes = 64 * 1024 * 1024,
+        .hard_limit_bytes = 64 * 1024 * 1024,
+    };
+    var policies = resource_manager_mod.Options.defaultPolicies();
+    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+        .soft_action = .report,
+        .hard_action = .report,
+    };
+    var resource_manager = resource_manager_mod.ResourceManager.init(.{
+        .budgets = budgets,
+        .policies = policies,
+    });
+
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     const path_z = try alloc.dupeZ(u8, path);
@@ -27957,7 +28436,9 @@ test "text merge task carries concurrent deletes into publication" {
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
 
-    var manager = try IndexManager.init(alloc, path);
+    var manager = try IndexManager.initWithOptions(alloc, path, .{
+        .resource_manager = &resource_manager,
+    });
     defer manager.deinit();
     manager.updateRange(.{ .start = "", .end = "" });
 
@@ -28035,6 +28516,8 @@ test "text merge task carries concurrent deletes into publication" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     var merged_docs: u32 = 0;
     for (result.prepared_segments) |*prepared| {
         var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
@@ -28050,8 +28533,33 @@ test "text merge task carries concurrent deletes into publication" {
     // the later tombstone into the replacement rather than reject the useful
     // merge and retry forever under sustained mutation.
     try std.testing.expectEqual(frozen_live_docs, merged_docs);
+    // Keep a known task-local allocation live across publication. The peak
+    // must include this existing working set plus the lazy identity lookup,
+    // rather than treating build and publication as disjoint phases.
+    const build_peak = result.peak_task_alloc_bytes;
+    const telemetry_probe_len = std.math.cast(usize, build_peak +| 4096) orelse
+        return error.TestUnexpectedResult;
+    const telemetry_probe = try task.mergeAllocator().alloc(u8, telemetry_probe_len);
+    defer task.mergeAllocator().free(telemetry_probe);
+    const publication_task_live_bytes = task.deletion_state.budget.liveBytes();
+    try std.testing.expect(publication_task_live_bytes > build_peak);
+    // Publication must never perform the document-sized scan while its caller
+    // holds the database apply lock. It preserves the in-flight task and asks
+    // the runtime to prepare the lookup off-lock instead.
+    try std.testing.expectError(
+        error.TextMergePublicationLookupRequired,
+        manager.finishTextMergeTask(&task, &result),
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
+    try std.testing.expectEqual(@as(u64, 1), manager.textMergeStats().in_flight_merges);
+
+    try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
+    try std.testing.expect(result.publication_lookup_built);
     const applied = try manager.finishTextMergeTask(&task, &result);
     try std.testing.expect(applied);
+    try std.testing.expect(result.output_ordinals.len + result.output_ids.len > 0);
+    try std.testing.expect(result.peak_task_alloc_bytes >= publication_task_live_bytes);
     const merge_stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_merges);
     try std.testing.expectEqual(@as(u64, 0), merge_stats.in_flight_segments);
@@ -28526,8 +29034,13 @@ test "text merge task records input and output bytes" {
 
     var result = try IndexManager.executeTextMergeTask(alloc, &task);
     defer result.deinit(alloc);
+    // Append-only merges do not pay for a document-sized publication lookup.
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
     const expected_output = IndexManager.textMergeResultOutputStats(&result);
     try std.testing.expect(try manager.finishTextMergeTask(&task, &result));
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expectEqual(@as(usize, 0), result.output_ids.len);
 
     const stats = manager.textMergeStats();
     try std.testing.expectEqual(@as(u64, 1), stats.completed_merges);
@@ -29362,6 +29875,134 @@ test "stable native finalization certifies an empty dense index" {
     ));
     try std.testing.expectEqual(@as(?u64, 0), entry.index.experimentalPostingDurableAppliedSequence());
     try std.testing.expectEqual(@as(u64, 0), (try entry.index.postingBacklogStats()).dirty_postings);
+}
+
+test "retired LSM owner clone counters survive index generations" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "retired-lsm-owner-clones");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    var first = lsm_backend_mod.Backend.MaintenanceStats{
+        .mutable_snapshot_clone_calls = 2,
+        .mutable_snapshot_clone_bytes_total = 4096,
+        .mutable_snapshot_clone_peak_bytes = 3072,
+        .bulk_ingest_current_scan_clone_peak_active_bytes = 2048,
+    };
+    first.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bulk_current_scan)] = .{
+        .calls = 2,
+        .bytes_total = 4096,
+        .peak_bytes = 3072,
+    };
+    manager.archiveLsmOwnerStats(.dense_vector, "embedding", first);
+    manager.archiveLsmOwnerStats(.dense_vector, "embedding", .{
+        .mutable_snapshot_clone_calls = 1,
+        .mutable_snapshot_clone_bytes_total = 512,
+        .mutable_snapshot_clone_peak_bytes = 512,
+        .bulk_ingest_current_scan_clone_peak_active_bytes = 256,
+    });
+
+    const owners = try manager.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owners.len);
+    try std.testing.expectEqual(types.IndexKind.dense_vector, owners[0].kind);
+    try std.testing.expectEqualStrings("embedding", owners[0].name);
+    try std.testing.expectEqual(@as(u64, 3), owners[0].maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 4608), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
+    try std.testing.expectEqual(@as(u64, 3072), owners[0].maintenance.mutable_snapshot_clone_peak_bytes);
+    try std.testing.expectEqual(
+        @as(u64, 2048),
+        owners[0].maintenance.bulk_ingest_current_scan_clone_peak_active_bytes,
+    );
+}
+
+test "retired LSM owner clone attribution is bounded with loss-accounted overflow" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "bounded-retired-lsm-owner-clones");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+
+    // A user owner may legally have the synthetic aggregate's display name;
+    // identity must remain distinct even after the bounded tier fills.
+    manager.archiveLsmOwnerStats(.dense_vector, IndexManager.retired_lsm_owner_overflow_name, .{
+        .mutable_snapshot_clone_calls = 1,
+        .mutable_snapshot_clone_bytes_total = 64,
+        .mutable_snapshot_clone_peak_bytes = 64,
+    });
+    var name_buf: [64]u8 = undefined;
+    for (0..IndexManager.max_retired_lsm_owner_stats - 1) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "retired-{d}", .{i});
+        manager.archiveLsmOwnerStats(.dense_vector, name, .{
+            .mutable_snapshot_clone_calls = 1,
+            .mutable_snapshot_clone_bytes_total = 128,
+            .mutable_snapshot_clone_peak_bytes = 128,
+        });
+    }
+    for (0..2) |i| {
+        const name = try std.fmt.bufPrint(&name_buf, "collapsed-{d}", .{i});
+        manager.archiveLsmOwnerStats(.dense_vector, name, .{
+            .mutable_snapshot_clone_calls = 1,
+            .mutable_snapshot_clone_bytes_total = 128,
+            .mutable_snapshot_clone_peak_bytes = 128,
+        });
+    }
+
+    const owners = try manager.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(IndexManager.max_retired_lsm_owner_stats + 1, owners.len);
+    const overflow = for (owners) |owner| {
+        if (owner.owner_overflow) break owner;
+    } else return error.TestExpectedEqual;
+    const concrete = for (owners) |owner| {
+        if (!owner.owner_overflow and std.mem.eql(u8, owner.name, IndexManager.retired_lsm_owner_overflow_name)) break owner;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 1), concrete.maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 2), overflow.retired_labels_collapsed_total);
+    try std.testing.expectEqual(@as(u64, 2), overflow.maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 256), overflow.maintenance.mutable_snapshot_clone_bytes_total);
+}
+
+test "shadow manager transfers clone attribution before teardown" {
+    const alloc = std.testing.allocator;
+    var source_path_buf: [256]u8 = undefined;
+    var destination_path_buf: [256]u8 = undefined;
+    const source_path = indexManagerTmpPathWithSuffix(&source_path_buf, "shadow-clone-source");
+    const destination_path = indexManagerTmpPathWithSuffix(&destination_path_buf, "shadow-clone-destination");
+    defer cleanupIndexManagerDir(source_path);
+    defer cleanupIndexManagerDir(destination_path);
+
+    var source = try IndexManager.init(alloc, std.mem.span(source_path));
+    defer source.deinit();
+    var destination = try IndexManager.init(alloc, std.mem.span(destination_path));
+    defer destination.deinit();
+    source.archiveLsmOwnerStats(.dense_vector, "embedding", .{
+        .mutable_snapshot_clone_calls = 3,
+        .mutable_snapshot_clone_bytes_total = 1536,
+        .mutable_snapshot_clone_peak_bytes = 1024,
+    });
+
+    try source.transferLsmOwnerCloneStatsTo(&destination);
+    const owners = try destination.snapshotLsmOwnerStatsAlloc(alloc);
+    defer {
+        for (owners) |*owner| owner.deinit(alloc);
+        alloc.free(owners);
+    }
+    try std.testing.expectEqual(@as(usize, 1), owners.len);
+    try std.testing.expectEqualStrings("embedding", owners[0].name);
+    try std.testing.expectEqual(@as(u64, 3), owners[0].maintenance.mutable_snapshot_clone_calls);
+    try std.testing.expectEqual(@as(u64, 1536), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
 }
 
 test "dense replay keep mask keeps only the last write per doc and index" {

@@ -8,6 +8,26 @@
 
 const db_types = @import("../storage/db/types.zig");
 
+/// A pre-decision participant may be tried at another replica only when the
+/// responding node proves that it did not admit the mutation. A dedicated
+/// transaction header keeps that proof distinct from routed batch forwarding
+/// and lets clients fail closed across proxies and rolling upgrades.
+pub const pre_decision_outcome_header = "X-Antfly-Txn-Pre-Decision-Outcome";
+pub const pre_decision_not_proposed_v1 = "not-proposed-v1";
+/// Relative server-side budget. Monotonic clocks are process-local, so the
+/// coordinator sends a duration and ingress establishes the absolute deadline
+/// before authentication and request dispatch consume it.
+pub const pre_decision_remaining_ms_header = "X-Antfly-Txn-Pre-Decision-Remaining-Ms";
+pub const max_pre_decision_server_budget_ms: u32 = 5_000;
+pub const pre_decision_server_response_reserve_ms: u32 = 50;
+
+/// Process-local execution context established by the receiving node. This is
+/// never serialized directly across the wire.
+pub const PreDecisionContext = struct {
+    deadline_ns: ?u64 = null,
+    cancellation: db_types.CancellationToken = .none,
+};
+
 pub const TableCommitRequest = struct {
     table_name: []const u8,
     writes: []const db_types.TransactionWrite = &.{},

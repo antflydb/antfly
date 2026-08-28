@@ -198,23 +198,108 @@ pub fn reconstructU16Sample(sample: i32, bits_per_component: u8, is_signed: bool
     return @intCast(clamped);
 }
 
-fn roundF32PlaneToI32(dst: []i32, src: []const f32) void {
+fn roundedF32FitsI32(value: f32) bool {
+    const rounded = @round(value);
+    // 2^31 is exactly representable as f32 but is one past i32 max, so the
+    // upper comparison must remain strict. These comparisons also reject NaN
+    // and infinities without a separate branch.
+    return rounded >= -2147483648.0 and rounded < 2147483648.0;
+}
+
+fn roundF32PlaneToI32(dst: []i32, src: []const f32) !void {
     std.debug.assert(dst.len == src.len);
 
     var i: usize = 0;
     while (i + simd_lanes_f32_i32 <= src.len) : (i += simd_lanes_f32_i32) {
+        // Validate the SIMD block before conversion so @intFromFloat can never
+        // trap on attacker-controlled irreversible coefficients. Valid pixels
+        // still use the vectorized conversion below.
         const values: F32x8 = src[i..][0..simd_lanes_f32_i32].*;
-        dst[i..][0..simd_lanes_f32_i32].* = @as(I32x8, @intFromFloat(@round(values)));
+        const rounded = @round(values);
+        const lower: F32x8 = @splat(-2147483648.0);
+        const upper: F32x8 = @splat(2147483648.0);
+        if (!@reduce(.And, rounded >= lower) or !@reduce(.And, rounded < upper))
+            return error.InvalidReconstructedSample;
+        dst[i..][0..simd_lanes_f32_i32].* = @as(I32x8, @intFromFloat(rounded));
     }
 
     while (i < src.len) : (i += 1) {
+        if (!roundedF32FitsI32(src[i])) return error.InvalidReconstructedSample;
         dst[i] = @intFromFloat(@round(src[i]));
     }
 }
 
-fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes: [][]i32) void {
+test "irreversible sample rounding validates SIMD and scalar boundaries" {
+    const valid = [_]f32{
+        -2147483648.0,
+        2147483520.0,
+        -1.5,
+        1.5,
+        0.0,
+        42.25,
+        -42.25,
+        127.0,
+    };
+    var converted: [valid.len]i32 = undefined;
+    try roundF32PlaneToI32(&converted, &valid);
+    try std.testing.expectEqual(std.math.minInt(i32), converted[0]);
+    try std.testing.expectEqual(@as(i32, 2147483520), converted[1]);
+    try std.testing.expectEqual(@as(i32, -2), converted[2]);
+    try std.testing.expectEqual(@as(i32, 2), converted[3]);
+
+    var invalid_simd = [_]f32{0.0} ** simd_lanes_f32_i32;
+    invalid_simd[simd_lanes_f32_i32 - 1] = 2147483648.0;
+    var simd_output: [simd_lanes_f32_i32]i32 = undefined;
+    try std.testing.expectError(
+        error.InvalidReconstructedSample,
+        roundF32PlaneToI32(&simd_output, &invalid_simd),
+    );
+
+    const invalid_scalar = [_]f32{std.math.nan(f32)};
+    var scalar_output: [1]i32 = undefined;
+    try std.testing.expectError(
+        error.InvalidReconstructedSample,
+        roundF32PlaneToI32(&scalar_output, &invalid_scalar),
+    );
+}
+
+test "small-scale custom MCT cannot overflow irreversible reconstruction" {
+    const scale: f32 = 1e-7;
+    const inverse_scale: f32 = 1.0 / scale;
+    const forward = [_]f32{
+        scale, 0,     0,
+        0,     scale, 0,
+        0,     0,     scale,
+    };
+    const inverse = [_]f32{
+        inverse_scale, 0,             0,
+        0,             inverse_scale, 0,
+        0,             0,             inverse_scale,
+    };
+    const offsets = [_]f32{ 0, 0, 0 };
+    const matrix = color_transform.CustomMctMatrix{
+        .num_components = 3,
+        .forward = &forward,
+        .inverse = &inverse,
+        .offsets = &offsets,
+    };
+    var p0 = [_]f32{256.0};
+    var p1 = [_]f32{256.0};
+    var p2 = [_]f32{256.0};
+    const planes = [_][]f32{ &p0, &p1, &p2 };
+    try color_transform.applyCustomMctInverse(matrix, &planes);
+
+    var converted: [1]i32 = undefined;
+    try std.testing.expectError(
+        error.InvalidReconstructedSample,
+        roundF32PlaneToI32(&converted, &p0),
+    );
+}
+
+fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes: [][]i32) !void {
     const coding_style = state.coding_style orelse return;
     if (!coding_style.multiple_component_transform or planes.len < 3) return;
+    if (!state.hasSupportedMctInputs()) return error.UnsupportedMultiComponentTransform;
     const first_dims = tile.componentDimensions(
         state.header.width,
         state.header.height,
@@ -223,7 +308,8 @@ fn applyReversibleMctOnEqualComponentGrid(state: *const codestream.State, planes
     );
     for (state.header.components[1..3]) |comp| {
         const dims = tile.componentDimensions(state.header.width, state.header.height, comp.xrsiz, comp.yrsiz);
-        if (dims.width != first_dims.width or dims.height != first_dims.height) return;
+        if (dims.width != first_dims.width or dims.height != first_dims.height)
+            return error.UnsupportedMultiComponentTransform;
     }
     color_transform.inverseRct(planes[0], planes[1], planes[2]);
 }
@@ -242,15 +328,6 @@ pub fn reconstructTier1ComponentPlanesU8AtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) !ComponentPlanesU8 {
-    if (state.header.components.len == 0) return error.UnsupportedPlaneCount;
-    const bits_per_component = state.header.components[0].bits_per_component;
-    const is_signed = state.header.components[0].is_signed;
-    for (state.header.components[1..]) |component| {
-        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed) {
-            return error.UnsupportedPlaneCount;
-        }
-    }
-
     const coding_style = state.coding_style orelse return error.MissingCodingStyle;
     const use_irreversible = coding_style.wavelet_transform == 0;
     const use_component_wavelets = try hasMixedComponentWaveletTransforms(state);
@@ -265,7 +342,28 @@ pub fn reconstructTier1ComponentPlanesU8AtResolution(
         allocator.free(raw_planes);
     }
 
-    if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+
+    return componentPlanesU8FromRawAtResolution(allocator, state, raw_planes, discard_levels);
+}
+
+/// Convert reconstructed, level-shifted component planes into compact native
+/// U8 samples. This is shared by retained Tier-1 execution and the bounded
+/// codeblock visitor path so clipping happens before reference-grid resampling.
+pub fn componentPlanesU8FromRawAtResolution(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: []const []const i32,
+    discard_levels: u8,
+) !ComponentPlanesU8 {
+    if (state.header.components.len == 0 or raw_planes.len != state.header.components.len)
+        return error.UnsupportedPlaneCount;
+    const bits_per_component = state.header.components[0].bits_per_component;
+    const is_signed = state.header.components[0].is_signed;
+    for (state.header.components[1..]) |component| {
+        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed)
+            return error.UnsupportedPlaneCount;
+    }
 
     const widths = try allocator.alloc(usize, raw_planes.len);
     errdefer allocator.free(widths);
@@ -316,15 +414,6 @@ pub fn reconstructTier1ComponentPlanesU16AtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) !ComponentPlanesU16 {
-    if (state.header.components.len == 0) return error.UnsupportedPlaneCount;
-    const bits_per_component = state.header.components[0].bits_per_component;
-    const is_signed = state.header.components[0].is_signed;
-    for (state.header.components[1..]) |component| {
-        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed) {
-            return error.UnsupportedPlaneCount;
-        }
-    }
-
     const coding_style = state.coding_style orelse return error.MissingCodingStyle;
     const use_irreversible = coding_style.wavelet_transform == 0;
     const use_component_wavelets = try hasMixedComponentWaveletTransforms(state);
@@ -339,7 +428,27 @@ pub fn reconstructTier1ComponentPlanesU16AtResolution(
         allocator.free(raw_planes);
     }
 
-    if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+
+    return componentPlanesU16FromRawAtResolution(allocator, state, raw_planes, discard_levels);
+}
+
+/// U16 counterpart to `componentPlanesU8FromRawAtResolution`, preserving the
+/// declared 9-16 bit component precision for later resampling and color-key use.
+pub fn componentPlanesU16FromRawAtResolution(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: []const []const i32,
+    discard_levels: u8,
+) !ComponentPlanesU16 {
+    if (state.header.components.len == 0 or raw_planes.len != state.header.components.len)
+        return error.UnsupportedPlaneCount;
+    const bits_per_component = state.header.components[0].bits_per_component;
+    const is_signed = state.header.components[0].is_signed;
+    for (state.header.components[1..]) |component| {
+        if (component.bits_per_component != bits_per_component or component.is_signed != is_signed)
+            return error.UnsupportedPlaneCount;
+    }
 
     const widths = try allocator.alloc(usize, raw_planes.len);
     errdefer allocator.free(widths);
@@ -384,7 +493,7 @@ pub fn interleavePlanesU8(
     bits_per_component: u8,
     is_signed: bool,
 ) ![]u8 {
-    if (planes.len != 1 and planes.len != 3 and planes.len != 4) return error.UnsupportedPlaneCount;
+    if (planes.len < 1 or planes.len > 5) return error.UnsupportedPlaneCount;
     const plane_len = width * height;
     for (planes) |plane| {
         if (plane.len != plane_len) return error.InvalidPlaneLength;
@@ -410,7 +519,7 @@ pub fn interleavePlanesU16(
     bits_per_component: u8,
     is_signed: bool,
 ) ![]u16 {
-    if (planes.len != 1 and planes.len != 3) return error.UnsupportedPlaneCount;
+    if (planes.len < 1 or planes.len > 5) return error.UnsupportedPlaneCount;
     const plane_len = width * height;
     for (planes) |plane| {
         if (plane.len != plane_len) return error.InvalidPlaneLength;
@@ -426,6 +535,202 @@ pub fn interleavePlanesU16(
         }
     }
     return out;
+}
+
+/// Interleave reconstructed native-precision component planes, upsampling any
+/// subsampled plane to the image grid. Keeping this path in U16 avoids the
+/// quantization that would make 9-16 bit PDF color keys inexact.
+pub fn interleaveComponentPlanesU16(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU16,
+    state: *const codestream.State,
+) ![]u16 {
+    const component_count = component_planes.planes.len;
+    if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
+        component_planes.widths.len != component_count or
+        component_planes.heights.len != component_count) return error.UnsupportedPlaneCount;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch return error.InvalidPlaneLength;
+    const output_len = std.math.mul(usize, pixel_count, component_count) catch return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u16, output_len);
+    errdefer allocator.free(output);
+
+    for (component_planes.planes, 0..) |source, component_index| {
+        const source_width = component_planes.widths[component_index];
+        const source_height = component_planes.heights[component_index];
+        if (source_width == 0 or source_height == 0 or source.len != source_width * source_height)
+            return error.InvalidPlaneLength;
+        var upsampled: ?[]u16 = null;
+        defer if (upsampled) |plane| allocator.free(plane);
+        const plane = if (source_width == image_width and source_height == image_height)
+            source
+        else blk: {
+            const component = state.header.components[component_index];
+            const geometry = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            if (source_width != geometry.width or source_height != geometry.height)
+                return error.InvalidPlaneLength;
+            upsampled = try upsample.bilinearU16ReferenceGrid(
+                allocator,
+                source,
+                source_width,
+                source_height,
+                image_width,
+                image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                geometry.origin_x,
+                geometry.origin_y,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            break :blk upsampled.?;
+        };
+        for (plane, 0..) |sample, pixel_index| {
+            output[pixel_index * component_count + component_index] = sample;
+        }
+    }
+    return output;
+}
+
+/// Interleave reconstructed U8 component samples, upsampling one component at
+/// a time on the JPEG 2000 reference grid. Processing one plane at a time keeps
+/// peak memory bounded for dense multi-tile PDF images.
+pub fn interleaveComponentSamplesU8(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU8,
+    state: *const codestream.State,
+) ![]u8 {
+    const component_count = component_planes.planes.len;
+    if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
+        component_planes.widths.len != component_count or
+        component_planes.heights.len != component_count) return error.UnsupportedPlaneCount;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch return error.InvalidPlaneLength;
+    const output_len = std.math.mul(usize, pixel_count, component_count) catch return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+
+    for (component_planes.planes, 0..) |source, component_index| {
+        const source_width = component_planes.widths[component_index];
+        const source_height = component_planes.heights[component_index];
+        const source_len = std.math.mul(usize, source_width, source_height) catch return error.InvalidPlaneLength;
+        if (source_width == 0 or source_height == 0 or source.len != source_len)
+            return error.InvalidPlaneLength;
+        var upsampled: ?[]u8 = null;
+        defer if (upsampled) |plane| allocator.free(plane);
+        const plane = if (source_width == image_width and source_height == image_height)
+            source
+        else blk: {
+            const component = state.header.components[component_index];
+            const geometry = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            if (source_width != geometry.width or source_height != geometry.height)
+                return error.InvalidPlaneLength;
+            upsampled = try upsample.bilinearU8ReferenceGrid(
+                allocator,
+                source,
+                source_width,
+                source_height,
+                image_width,
+                image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                geometry.origin_x,
+                geometry.origin_y,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            break :blk upsampled.?;
+        };
+        for (plane, 0..) |sample, pixel_index| {
+            output[pixel_index * component_count + component_index] = sample;
+        }
+    }
+    return output;
+}
+
+/// Interleave native-precision component samples into U8 output. This is used
+/// for non-8-bit multi-tile streams so interpolation happens before the final
+/// precision conversion, matching the single-tile decode path exactly.
+pub fn interleaveNativeComponentSamplesU8(
+    allocator: std.mem.Allocator,
+    component_planes: *const ComponentPlanesU16,
+    state: *const codestream.State,
+) ![]u8 {
+    const component_count = component_planes.planes.len;
+    if (component_count < 1 or component_count > 5 or component_count != state.header.components.len or
+        component_planes.widths.len != component_count or
+        component_planes.heights.len != component_count) return error.UnsupportedPlaneCount;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch return error.InvalidPlaneLength;
+    const output_len = std.math.mul(usize, pixel_count, component_count) catch return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+
+    for (component_planes.planes, 0..) |source, component_index| {
+        const source_width = component_planes.widths[component_index];
+        const source_height = component_planes.heights[component_index];
+        const source_len = std.math.mul(usize, source_width, source_height) catch return error.InvalidPlaneLength;
+        if (source_width == 0 or source_height == 0 or source.len != source_len)
+            return error.InvalidPlaneLength;
+        var upsampled: ?[]u16 = null;
+        defer if (upsampled) |plane| allocator.free(plane);
+        const component = state.header.components[component_index];
+        const plane = if (source_width == image_width and source_height == image_height)
+            source
+        else blk: {
+            const geometry = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            if (source_width != geometry.width or source_height != geometry.height)
+                return error.InvalidPlaneLength;
+            upsampled = try upsample.bilinearU16ReferenceGrid(
+                allocator,
+                source,
+                source_width,
+                source_height,
+                image_width,
+                image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                geometry.origin_x,
+                geometry.origin_y,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            break :blk upsampled.?;
+        };
+        const center: i32 = @as(i32, 1) << @intCast(component.bits_per_component - 1);
+        for (plane, 0..) |sample, pixel_index| {
+            output[pixel_index * component_count + component_index] = try reconstructU8Sample(
+                @as(i32, sample) - center,
+                component.bits_per_component,
+                component.is_signed,
+            );
+        }
+    }
+    return output;
 }
 
 /// Stitch decoded tile pixels into a single output image buffer.
@@ -649,27 +954,29 @@ fn assemblePlanesFromTier1ComponentWaveletsAtResolution(
     }
 
     if (default_coding_style.multiple_component_transform and component_count >= 3) {
+        if (!state.hasSupportedMctInputs()) return error.UnsupportedMultiComponentTransform;
         if (irreversible[0] and irreversible[1] and irreversible[2]) {
             const all_same = comp_widths[0] == comp_widths[1] and comp_widths[1] == comp_widths[2] and
                 comp_heights[0] == comp_heights[1] and comp_heights[1] == comp_heights[2];
-            if (all_same) {
-                if (try buildCustomMctMatrixFromState(allocator, state, 3)) |matrix| {
-                    defer allocator.free(matrix.forward);
-                    defer allocator.free(matrix.inverse);
-                    defer allocator.free(matrix.offsets);
-                    try color_transform.applyCustomMctInverse(matrix, f32_planes[0..3]);
-                } else {
-                    color_transform.inverseIct(f32_planes[0], f32_planes[1], f32_planes[2]);
-                }
+            if (!all_same) return error.UnsupportedMultiComponentTransform;
+            if (try buildCustomMctMatrixFromState(allocator, state, 3)) |matrix| {
+                defer allocator.free(matrix.forward);
+                defer allocator.free(matrix.inverse);
+                defer allocator.free(matrix.offsets);
+                try color_transform.applyCustomMctInverse(matrix, f32_planes[0..3]);
+            } else {
+                color_transform.inverseIct(f32_planes[0], f32_planes[1], f32_planes[2]);
             }
         } else if (!irreversible[0] and !irreversible[1] and !irreversible[2]) {
-            applyReversibleMctOnEqualComponentGrid(state, planes);
+            try applyReversibleMctOnEqualComponentGrid(state, planes);
+        } else {
+            return error.UnsupportedMultiComponentTransform;
         }
     }
 
     for (state.header.components, 0..) |_, component_index| {
         if (irreversible[component_index]) {
-            roundF32PlaneToI32(planes[component_index], f32_planes[component_index]);
+            try roundF32PlaneToI32(planes[component_index], f32_planes[component_index]);
         }
     }
 
@@ -982,63 +1289,36 @@ pub fn buildCustomMctMatrixFromState(
     state: *const codestream.State,
     num_components: u8,
 ) !?color_transform.CustomMctMatrix {
-    const mco = state.mco orelse return null;
-    if (mco.ids.len == 0) return null;
-    if (num_components == 0) return null;
+    if (state.mco == null) return null;
+    if (num_components != 3) return error.UnsupportedCustomMct;
+    const payload = state.supportedCustomMctPayload() orelse return error.UnsupportedCustomMct;
+    const nn: usize = @as(usize, num_components) * @as(usize, num_components);
+    const expected_bytes = nn * @sizeOf(f32);
+    if (payload.len != expected_bytes) return error.UnsupportedCustomMct;
 
-    // Walk the MCO chain. The encoder only emits a single MCC reference, so
-    // we resolve the first id that successfully yields an f32 MCT. If none
-    // resolve, return null so the caller can fall back to the built-in ICT.
-    for (mco.ids) |mcc_id| {
-        const mcc = findMcc(state, mcc_id) orelse continue;
-        // Placeholder payload layout: [u16 mct_index, u16 reserved].
-        if (mcc.payload.len < 2) continue;
-        const mct_index = std.mem.readInt(u16, mcc.payload[0..2], .big);
-        const mct = findMct(state, mct_index) orelse continue;
-        if (mct.element_type != 2) continue; // only f32 supported
-        const nn: usize = @as(usize, num_components) * @as(usize, num_components);
-        const expected_bytes = nn * @sizeOf(f32);
-        if (mct.payload.len < expected_bytes) continue;
-
-        const forward = try allocator.alloc(f32, nn);
-        errdefer allocator.free(forward);
-        var k: usize = 0;
-        while (k < nn) : (k += 1) {
-            const raw = std.mem.readInt(u32, mct.payload[k * 4 ..][0..4], .big);
-            forward[k] = @bitCast(raw);
-        }
-
-        const inverse = color_transform.invertMctMatrixGaussJordan(forward, num_components, allocator) catch |err| {
-            allocator.free(forward);
-            return err;
-        };
-        errdefer allocator.free(inverse);
-
-        const offsets = try allocator.alloc(f32, num_components);
-        @memset(offsets, 0.0);
-
-        return color_transform.CustomMctMatrix{
-            .num_components = num_components,
-            .forward = forward,
-            .inverse = inverse,
-            .offsets = offsets,
-        };
+    const forward = try allocator.alloc(f32, nn);
+    errdefer allocator.free(forward);
+    var k: usize = 0;
+    while (k < nn) : (k += 1) {
+        const raw = std.mem.readInt(u32, payload[k * 4 ..][0..4], .big);
+        forward[k] = @bitCast(raw);
     }
-    return null;
-}
 
-fn findMcc(state: *const codestream.State, id: u16) ?*const codestream.McCCollection {
-    for (state.mcc_collections) |*m| {
-        if (m.index == id) return m;
-    }
-    return null;
-}
+    const inverse = color_transform.invertMctMatrixGaussJordan(forward, num_components, allocator) catch |err| {
+        allocator.free(forward);
+        return err;
+    };
+    errdefer allocator.free(inverse);
 
-fn findMct(state: *const codestream.State, id: u16) ?*const codestream.McTSegment {
-    for (state.mct_segments) |*m| {
-        if (m.index == id) return m;
-    }
-    return null;
+    const offsets = try allocator.alloc(f32, num_components);
+    @memset(offsets, 0.0);
+
+    return color_transform.CustomMctMatrix{
+        .num_components = num_components,
+        .forward = forward,
+        .inverse = inverse,
+        .offsets = offsets,
+    };
 }
 
 /// Assemble coefficient planes and apply the irreversible (9/7) pipeline:
@@ -1057,145 +1337,534 @@ pub fn assemblePlanesFromTier1IrreversibleAtResolution(
     execution: *const packet.Tier1Execution,
     discard_levels: u8,
 ) ![][]i32 {
-    const default_coding_style = state.coding_style orelse return error.MissingCodingStyle;
+    var assembler = try StreamingPlaneAssembler.initAtResolution(allocator, state, discard_levels);
+    defer assembler.deinit();
+    for (execution.codeblocks) |*codeblock_state| {
+        try assembler.appendCodeblock(codeblock_state);
+    }
+    return assembler.finish(discard_levels);
+}
 
-    const tile_w: u32 = state.header.width;
-    const tile_h: u32 = state.header.height;
+pub const StreamingPlaneAssembler = struct {
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    comp_widths: []usize,
+    comp_heights: []usize,
+    comp_origin_x: []usize,
+    comp_origin_y: []usize,
+    plane_storage: [][]f32,
+    initialized_planes: usize = 0,
+    plane_buffers_owned: bool = true,
+    finished: bool = false,
+    discard_levels: u8 = 0,
 
-    // Per-component dimensions accounting for SIZ XRsiz/YRsiz subsampling.
-    const comp_widths = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_widths);
-    const comp_heights = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_heights);
-    const comp_origin_x = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_origin_x);
-    const comp_origin_y = try allocator.alloc(usize, state.header.components.len);
-    defer allocator.free(comp_origin_y);
-    for (state.header.components, 0..) |comp, component_index| {
-        const dims = tile.componentDimensionsAt(state.header.x_offset, state.header.y_offset, tile_w, tile_h, comp.xrsiz, comp.yrsiz);
-        comp_widths[component_index] = @intCast(dims.width);
-        comp_heights[component_index] = @intCast(dims.height);
-        comp_origin_x[component_index] = @intCast(dims.origin_x);
-        comp_origin_y[component_index] = @intCast(dims.origin_y);
+    /// The streaming assembler stores one four-byte coefficient plane per
+    /// component: f32 for irreversible 9/7 and i32 for reversible 5/3. A mixed
+    /// transform with MCT stays on the established reconstruction path because
+    /// the component transform is defined across all participating planes.
+    pub fn canAssemble(state: *const codestream.State) !bool {
+        const default_style = state.coding_style orelse return error.MissingCodingStyle;
+        if (default_style.wavelet_transform != 0) return false;
+        if (state.header.components.len == 0) return false;
+        var has_reversible_component = false;
+        for (state.header.components, 0..) |_, component_index| {
+            const coding_style = try tile.effectiveCodingStyle(state, component_index);
+            if (coding_style.wavelet_transform > 1) return false;
+            has_reversible_component = has_reversible_component or coding_style.wavelet_transform == 1;
+        }
+        return !default_style.multiple_component_transform or !has_reversible_component;
     }
 
-    // Allocate f32 planes for the irreversible pipeline.
-    const f32_planes = try allocator.alloc([]f32, state.header.components.len);
-    defer {
-        for (f32_planes) |p| allocator.free(p);
-        allocator.free(f32_planes);
-    }
-    for (f32_planes, 0..) |*fp, i| {
-        fp.* = try allocator.alloc(f32, comp_widths[i] * comp_heights[i]);
-        @memset(fp.*, 0.0);
+    pub fn init(allocator: std.mem.Allocator, state: *const codestream.State) !StreamingPlaneAssembler {
+        return initAtResolution(allocator, state, 0);
     }
 
-    // Place dequantized coefficients into the f32 planes.
-    for (execution.codeblocks) |codeblock_state| {
+    pub fn initAtResolution(allocator: std.mem.Allocator, state: *const codestream.State, discard_levels: u8) !StreamingPlaneAssembler {
+        if (!try canAssemble(state)) return error.UnsupportedWaveletTransform;
+        const component_count = state.header.components.len;
+        const comp_widths = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_widths);
+        const comp_heights = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_heights);
+        const comp_origin_x = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_origin_x);
+        const comp_origin_y = try allocator.alloc(usize, component_count);
+        errdefer allocator.free(comp_origin_y);
+        const plane_storage = try allocator.alloc([]f32, component_count);
+        errdefer allocator.free(plane_storage);
+        var initialized_planes: usize = 0;
+        errdefer {
+            for (plane_storage[0..initialized_planes]) |plane| allocator.free(plane);
+        }
+        for (state.header.components, 0..) |component, component_index| {
+            const dims = tile.componentDimensionsAt(
+                state.header.x_offset,
+                state.header.y_offset,
+                state.header.width,
+                state.header.height,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            const coding_style = try tile.effectiveCodingStyle(state, component_index);
+            const component_discard = @min(discard_levels, coding_style.decomposition_levels);
+            comp_widths[component_index] = resolutionWidthAt(@intCast(dims.origin_x), @intCast(dims.width), component_discard);
+            comp_heights[component_index] = resolutionWidthAt(@intCast(dims.origin_y), @intCast(dims.height), component_discard);
+            comp_origin_x[component_index] = resolutionOriginAt(@intCast(dims.origin_x), component_discard);
+            comp_origin_y[component_index] = resolutionOriginAt(@intCast(dims.origin_y), component_discard);
+            plane_storage[component_index] = try allocator.alloc(
+                f32,
+                comp_widths[component_index] * comp_heights[component_index],
+            );
+            initialized_planes += 1;
+            @memset(plane_storage[component_index], 0.0);
+        }
+        return .{
+            .allocator = allocator,
+            .state = state,
+            .comp_widths = comp_widths,
+            .comp_heights = comp_heights,
+            .comp_origin_x = comp_origin_x,
+            .comp_origin_y = comp_origin_y,
+            .plane_storage = plane_storage,
+            .initialized_planes = initialized_planes,
+            .discard_levels = discard_levels,
+        };
+    }
+
+    pub fn appendCodeblock(self: *StreamingPlaneAssembler, codeblock_state: *const packet.Tier1CodeblockState) !void {
+        if (self.finished) return error.InvalidPlaneAssemblyState;
         const component_index: usize = codeblock_state.coordinate.component_index;
-        if (component_index >= f32_planes.len) return error.InvalidPlaneIndex;
-        const coding_style = try tile.effectiveCodingStyle(state, component_index);
-        const qcd = quantizationStyleForComponent(state, component_index) orelse return error.MissingQuantizationStyle;
-        const fp = f32_planes[component_index];
-        const cw = comp_widths[component_index];
-        const ch = comp_heights[component_index];
+        if (component_index >= self.plane_storage.len) return error.InvalidPlaneIndex;
+        const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
+        const component_discard = @min(self.discard_levels, coding_style.decomposition_levels);
+        const active_decomposition_levels = coding_style.decomposition_levels - component_discard;
+        if (codeblock_state.coordinate.resolution_index > active_decomposition_levels) return;
+        const storage = self.plane_storage[component_index];
+        const component_width = self.comp_widths[component_index];
+        const component_height = self.comp_heights[component_index];
         const rect = codeblock_state.rect;
-        const rect_w: usize = rect.width();
-        const rect_h: usize = rect.height();
-        const bo = bandOffsetOrigin(
-            cw,
-            ch,
-            comp_origin_x[component_index],
-            comp_origin_y[component_index],
-            coding_style.decomposition_levels,
+        const rect_width: usize = rect.width();
+        const rect_height: usize = rect.height();
+        const band_offset = bandOffsetOrigin(
+            component_width,
+            component_height,
+            self.comp_origin_x[component_index],
+            self.comp_origin_y[component_index],
+            active_decomposition_levels,
             codeblock_state.coordinate.resolution_index,
             codeblock_state.subband,
         );
+        const roi_shift = roiShiftForComponent(self.state, component_index);
 
-        const step_value = quantization.stepValueForSubband(
-            qcd.style,
-            qcd.step_values,
-            codeblock_state.coordinate.resolution_index,
-            codeblock_state.subband,
-        ) orelse return error.InvalidQuantizationSegment;
-        const precision = state.header.components[component_index].bits_per_component;
-        const openjpeg_compat = !producedByAntfly(state.comments);
-        const gain: u8 = if (openjpeg_compat) 0 else quantization.irreversibleSubbandGain(codeblock_state.subband);
-        const step_size: f32 = @floatCast(quantization.stepSizeIrreversible(step_value, precision, gain));
-        const roi_shift = roiShiftForComponent(state, component_index);
+        if (coding_style.wavelet_transform == 0) {
+            const quantization_style = quantizationStyleForComponent(self.state, component_index) orelse
+                return error.MissingQuantizationStyle;
+            const step_value = quantization.stepValueForSubband(
+                quantization_style.style,
+                quantization_style.step_values,
+                codeblock_state.coordinate.resolution_index,
+                codeblock_state.subband,
+            ) orelse return error.InvalidQuantizationSegment;
+            const precision = self.state.header.components[component_index].bits_per_component;
+            const openjpeg_compat = !producedByAntfly(self.state.comments);
+            const gain: u8 = if (openjpeg_compat)
+                0
+            else
+                quantization.irreversibleSubbandGain(codeblock_state.subband);
+            const step_size: f32 = @floatCast(quantization.stepSizeIrreversible(step_value, precision, gain));
 
-        var y: usize = 0;
-        while (y < rect_h) : (y += 1) {
-            var x: usize = 0;
-            while (x < rect_w) : (x += 1) {
-                const dst_x: usize = bo.x + rect.x0 + x;
-                const dst_y: usize = bo.y + rect.y0 + y;
-                if (dst_x >= cw or dst_y >= ch) return error.InvalidPlaneIndex;
-                const cell = codeblock_state.grid.cells[y * rect_w + x];
-                const signed_i: i32 = if (cell.flags.sign) -cell.magnitude else cell.magnitude;
-                const signed_mag = dequantizedMagnitudeForRoi(signed_i, roi_shift, codeblock_state.magnitude_scale);
-                fp[dst_y * cw + dst_x] = signed_mag * step_size;
+            var y: usize = 0;
+            while (y < rect_height) : (y += 1) {
+                var x: usize = 0;
+                while (x < rect_width) : (x += 1) {
+                    const dst_x: usize = band_offset.x + rect.x0 + x;
+                    const dst_y: usize = band_offset.y + rect.y0 + y;
+                    if (dst_x >= component_width or dst_y >= component_height)
+                        return error.InvalidPlaneIndex;
+                    const cell = codeblock_state.grid.cells[y * rect_width + x];
+                    const signed_value: i32 = if (cell.flags.sign) -cell.magnitude else cell.magnitude;
+                    const magnitude = dequantizedMagnitudeForRoi(
+                        signed_value,
+                        roi_shift,
+                        codeblock_state.magnitude_scale,
+                    );
+                    storage[dst_y * component_width + dst_x] = magnitude * step_size;
+                }
+            }
+        } else {
+            const plane: []i32 = @as(
+                [*]i32,
+                @ptrCast(@alignCast(storage.ptr)),
+            )[0..storage.len];
+            var y: usize = 0;
+            while (y < rect_height) : (y += 1) {
+                var x: usize = 0;
+                while (x < rect_width) : (x += 1) {
+                    const dst_x: usize = band_offset.x + rect.x0 + x;
+                    const dst_y: usize = band_offset.y + rect.y0 + y;
+                    if (dst_x >= component_width or dst_y >= component_height)
+                        return error.InvalidPlaneIndex;
+                    const cell = codeblock_state.grid.cells[y * rect_width + x];
+                    var signed_value: i32 = if (cell.flags.sign) -cell.magnitude else cell.magnitude;
+                    if (roi_shift > 0) signed_value = applyRoiShiftMagnitude(signed_value, roi_shift);
+                    plane[dst_y * component_width + dst_x] = signed_value;
+                }
             }
         }
     }
 
-    // Apply iterative inverse 9/7 wavelet transform.
-    for (f32_planes, 0..) |fp, component_index| {
-        const coding_style = try tile.effectiveCodingStyle(state, component_index);
-        if (coding_style.decomposition_levels > 0) {
-            const component_discard = @min(discard_levels, coding_style.decomposition_levels);
-            try inverseWavelet97MultiLevelOriginAtResolution(
+    pub fn finish(self: *StreamingPlaneAssembler, discard_levels: u8) ![][]i32 {
+        if (self.finished or self.initialized_planes != self.plane_storage.len)
+            return error.InvalidPlaneAssemblyState;
+        if (discard_levels != self.discard_levels) return error.InvalidPlaneAssemblyState;
+        const default_coding_style = self.state.coding_style orelse
+            return error.MissingCodingStyle;
+
+        for (self.plane_storage, 0..) |plane, component_index| {
+            const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
+            if (coding_style.decomposition_levels == 0) continue;
+            const component_discard = @min(self.discard_levels, coding_style.decomposition_levels);
+            const active_decomposition_levels = coding_style.decomposition_levels - component_discard;
+            if (coding_style.wavelet_transform == 0) {
+                try inverseWavelet97MultiLevelOriginAtResolution(
+                    self.allocator,
+                    plane,
+                    self.comp_widths[component_index],
+                    self.comp_heights[component_index],
+                    self.comp_origin_x[component_index],
+                    self.comp_origin_y[component_index],
+                    active_decomposition_levels,
+                    0,
+                    !producedByAntfly(self.state.comments),
+                );
+            } else {
+                const reversible_plane: []i32 = @as(
+                    [*]i32,
+                    @ptrCast(@alignCast(plane.ptr)),
+                )[0..plane.len];
+                try inverseWaveletMultiLevelOriginAtResolution(
+                    self.allocator,
+                    reversible_plane,
+                    self.comp_widths[component_index],
+                    self.comp_heights[component_index],
+                    self.comp_origin_x[component_index],
+                    self.comp_origin_y[component_index],
+                    active_decomposition_levels,
+                    0,
+                );
+            }
+        }
+
+        if (default_coding_style.multiple_component_transform and self.plane_storage.len >= 3) {
+            if (!self.state.hasSupportedMctInputs()) return error.UnsupportedMultiComponentTransform;
+            const all_same = self.comp_widths[0] == self.comp_widths[1] and
+                self.comp_widths[1] == self.comp_widths[2] and
+                self.comp_heights[0] == self.comp_heights[1] and
+                self.comp_heights[1] == self.comp_heights[2];
+            if (!all_same) return error.UnsupportedMultiComponentTransform;
+            if (try buildCustomMctMatrixFromState(
+                self.allocator,
+                self.state,
+                3,
+            )) |matrix| {
+                defer self.allocator.free(matrix.forward);
+                defer self.allocator.free(matrix.inverse);
+                defer self.allocator.free(matrix.offsets);
+                try color_transform.applyCustomMctInverse(matrix, self.plane_storage[0..3]);
+            } else {
+                color_transform.inverseIct(
+                    self.plane_storage[0],
+                    self.plane_storage[1],
+                    self.plane_storage[2],
+                );
+            }
+        }
+
+        const planes = try self.allocator.alloc([]i32, self.plane_storage.len);
+        errdefer self.allocator.free(planes);
+        for (self.plane_storage, 0..) |float_plane, component_index| {
+            const plane: []i32 = @as(
+                [*]i32,
+                @ptrCast(@alignCast(float_plane.ptr)),
+            )[0..float_plane.len];
+            const coding_style = try tile.effectiveCodingStyle(self.state, component_index);
+            if (coding_style.wavelet_transform == 0) {
+                try roundF32PlaneToI32(plane, float_plane);
+            }
+            planes[component_index] = plane;
+        }
+        self.plane_buffers_owned = false;
+        errdefer {
+            for (planes) |plane| self.allocator.free(plane);
+        }
+
+        self.finished = true;
+        return planes;
+    }
+
+    pub fn deinit(self: *StreamingPlaneAssembler) void {
+        if (self.plane_buffers_owned) {
+            for (self.plane_storage[0..self.initialized_planes]) |plane| {
+                self.allocator.free(plane);
+            }
+        }
+        self.allocator.free(self.plane_storage);
+        self.allocator.free(self.comp_widths);
+        self.allocator.free(self.comp_heights);
+        self.allocator.free(self.comp_origin_x);
+        self.allocator.free(self.comp_origin_y);
+        self.* = undefined;
+    }
+};
+
+test "streaming plane assembly honors per-component COC wavelet overrides" {
+    var components = [_]codestream.Component{
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+    };
+    const irreversible_style = codestream.CodingStyle{
+        .progression_order = 0,
+        .num_layers = 1,
+        .multiple_component_transform = false,
+        .decomposition_levels = 0,
+        .code_block_width_exponent = 2,
+        .code_block_height_exponent = 2,
+        .code_block_style = 0,
+        .wavelet_transform = 0,
+        .precincts_present = false,
+    };
+    var reversible_override = irreversible_style;
+    reversible_override.wavelet_transform = 1;
+    var component_styles = [_]?codestream.CodingStyle{ null, reversible_override, null };
+    var state = codestream.State{
+        .header = .{
+            .width = 1,
+            .height = 1,
+            .components = &components,
+            .tile_width = 1,
+            .tile_height = 1,
+            .uses_multiple_tiles = false,
+        },
+        .coding_style = irreversible_style,
+        .component_coding_styles = &component_styles,
+        .comments = &.{},
+        .tile_parts = &.{},
+    };
+
+    try std.testing.expect(try StreamingPlaneAssembler.canAssemble(&state));
+
+    var mixed_mct_style = irreversible_style;
+    mixed_mct_style.multiple_component_transform = true;
+    state.coding_style = mixed_mct_style;
+    try std.testing.expect(!try StreamingPlaneAssembler.canAssemble(&state));
+    state.coding_style = irreversible_style;
+
+    var grid = try codeblock.CoefficientGrid.init(std.testing.allocator, 1, 1);
+    defer grid.deinit();
+    grid.clear();
+    grid.cells[0].magnitude = 17;
+    const reversible_codeblock = packet.Tier1CodeblockState{
+        .coordinate = .{
+            .tile_index = 0,
+            .layer_index = 0,
+            .resolution_index = 0,
+            .component_index = 1,
+            .precinct_index = 0,
+        },
+        .subband = .ll,
+        .rect = .{ .x0 = 0, .y0 = 0, .x1 = 1, .y1 = 1 },
+        .zero_bit_planes = 0,
+        .executed_passes = 1,
+        .grid = grid,
+    };
+
+    var assembler = try StreamingPlaneAssembler.init(std.testing.allocator, &state);
+    defer assembler.deinit();
+    try assembler.appendCodeblock(&reversible_codeblock);
+    const planes = try assembler.finish(0);
+    defer {
+        for (planes) |plane| std.testing.allocator.free(plane);
+        std.testing.allocator.free(planes);
+    }
+    try std.testing.expectEqual(@as(i32, 17), planes[1][0]);
+}
+
+test "irreversible MCT transforms RGB planes when an alpha plane is present" {
+    var components = [_]codestream.Component{
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+        .{ .bits_per_component = 8, .is_signed = false, .xrsiz = 1, .yrsiz = 1 },
+    };
+    const style = codestream.CodingStyle{
+        .progression_order = 0,
+        .num_layers = 1,
+        .multiple_component_transform = true,
+        .decomposition_levels = 0,
+        .code_block_width_exponent = 2,
+        .code_block_height_exponent = 2,
+        .code_block_style = 0,
+        .wavelet_transform = 0,
+        .precincts_present = false,
+    };
+    var state = codestream.State{
+        .header = .{
+            .width = 1,
+            .height = 1,
+            .components = &components,
+            .tile_width = 1,
+            .tile_height = 1,
+            .uses_multiple_tiles = false,
+        },
+        .coding_style = style,
+        .comments = &.{},
+        .tile_parts = &.{},
+    };
+    var assembler = try StreamingPlaneAssembler.init(std.testing.allocator, &state);
+    defer assembler.deinit();
+    assembler.plane_storage[0][0] = 100;
+    assembler.plane_storage[1][0] = 0;
+    assembler.plane_storage[2][0] = 0;
+    assembler.plane_storage[3][0] = 77;
+
+    const planes = try assembler.finish(0);
+    defer {
+        for (planes) |plane| std.testing.allocator.free(plane);
+        std.testing.allocator.free(planes);
+    }
+    try std.testing.expectEqual(@as(i32, 100), planes[0][0]);
+    try std.testing.expectEqual(@as(i32, 100), planes[1][0]);
+    try std.testing.expectEqual(@as(i32, 100), planes[2][0]);
+    try std.testing.expectEqual(@as(i32, 77), planes[3][0]);
+}
+
+fn interleaveComponentPlanesU8WithUpsampling(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: [][]i32,
+) ![]u8 {
+    if (raw_planes.len != state.header.components.len) return error.InvalidPlaneLength;
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const planes = try allocator.alloc([]i32, raw_planes.len);
+    defer allocator.free(planes);
+    const owned_upsampled = try allocator.alloc(bool, raw_planes.len);
+    defer allocator.free(owned_upsampled);
+    @memset(owned_upsampled, false);
+    defer {
+        for (planes, 0..) |plane, component_index| {
+            if (owned_upsampled[component_index]) allocator.free(plane);
+        }
+    }
+
+    for (state.header.components, 0..) |component, component_index| {
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
+        const component_width: usize = @intCast(dims.width);
+        const component_height: usize = @intCast(dims.height);
+        if (component_width == image_width and component_height == image_height) {
+            planes[component_index] = raw_planes[component_index];
+        } else {
+            planes[component_index] = try upsample.bilinearI32ReferenceGrid(
                 allocator,
-                fp,
-                comp_widths[component_index],
-                comp_heights[component_index],
-                comp_origin_x[component_index],
-                comp_origin_y[component_index],
-                coding_style.decomposition_levels,
-                component_discard,
-                !producedByAntfly(state.comments),
+                raw_planes[component_index],
+                component_width,
+                component_height,
+                image_width,
+                image_height,
+                state.header.x_offset,
+                state.header.y_offset,
+                dims.origin_x,
+                dims.origin_y,
+                component.xrsiz,
+                component.yrsiz,
+            );
+            owned_upsampled[component_index] = true;
+        }
+    }
+
+    const first_component = state.header.components[0];
+    return interleavePlanesU8(
+        allocator,
+        planes,
+        state.header.width,
+        state.header.height,
+        first_component.bits_per_component,
+        first_component.is_signed,
+    );
+}
+
+/// Interleave full-resolution component planes without allocating the output
+/// on top of every four-byte coefficient plane. The first plane is converted
+/// to bytes in place and shrunk before the output allocation, keeping the
+/// three-component production path within the PDF decoder's bounded working set.
+pub fn interleaveComponentPlanesU8(
+    allocator: std.mem.Allocator,
+    state: *const codestream.State,
+    raw_planes: [][]i32,
+) ![]u8 {
+    if (raw_planes.len != state.header.components.len) return error.InvalidPlaneLength;
+    if (raw_planes.len < 1 or raw_planes.len > 5)
+        return error.UnsupportedPlaneCount;
+
+    const image_width: usize = @intCast(state.header.width);
+    const image_height: usize = @intCast(state.header.height);
+    const pixel_count = std.math.mul(usize, image_width, image_height) catch
+        return error.InvalidPlaneLength;
+    for (state.header.components, raw_planes) |component, plane| {
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            component.xrsiz,
+            component.yrsiz,
+        );
+        if (dims.width != state.header.width or dims.height != state.header.height)
+            return interleaveComponentPlanesU8WithUpsampling(allocator, state, raw_planes);
+        if (plane.len != pixel_count) return error.InvalidPlaneLength;
+    }
+
+    const first_component = state.header.components[0];
+    var first_bytes = std.mem.sliceAsBytes(raw_planes[0]);
+    for (raw_planes[0], 0..) |sample, pixel_index| {
+        first_bytes[pixel_index] = try reconstructU8Sample(
+            sample,
+            first_component.bits_per_component,
+            first_component.is_signed,
+        );
+    }
+
+    const compact_word_count = std.math.divCeil(
+        usize,
+        pixel_count,
+        @sizeOf(i32),
+    ) catch return error.InvalidPlaneLength;
+    raw_planes[0] = try allocator.realloc(raw_planes[0], compact_word_count);
+    first_bytes = std.mem.sliceAsBytes(raw_planes[0])[0..pixel_count];
+
+    const output_len = std.math.mul(usize, pixel_count, raw_planes.len) catch
+        return error.InvalidPlaneLength;
+    const output = try allocator.alloc(u8, output_len);
+    errdefer allocator.free(output);
+    for (0..pixel_count) |pixel_index| {
+        output[pixel_index * raw_planes.len] = first_bytes[pixel_index];
+        for (1..raw_planes.len) |component_index| {
+            output[pixel_index * raw_planes.len + component_index] = try reconstructU8Sample(
+                raw_planes[component_index][pixel_index],
+                first_component.bits_per_component,
+                first_component.is_signed,
             );
         }
     }
-
-    // Apply inverse ICT (or a custom MCT reconstructed from MCT/MCC/MCO
-    // markers) if multiple component transform is enabled. ICT requires all
-    // three components to share dimensions; skip when subsampling disagrees
-    // between components.
-    if (default_coding_style.multiple_component_transform and f32_planes.len == 3) {
-        const all_same = comp_widths[0] == comp_widths[1] and comp_widths[1] == comp_widths[2] and
-            comp_heights[0] == comp_heights[1] and comp_heights[1] == comp_heights[2];
-        if (all_same) {
-            if (try buildCustomMctMatrixFromState(allocator, state, @intCast(f32_planes.len))) |matrix| {
-                defer allocator.free(matrix.forward);
-                defer allocator.free(matrix.inverse);
-                defer allocator.free(matrix.offsets);
-                try color_transform.applyCustomMctInverse(matrix, f32_planes);
-            } else {
-                color_transform.inverseIct(f32_planes[0], f32_planes[1], f32_planes[2]);
-            }
-        }
-    }
-
-    // Convert f32 planes to i32 (round to nearest).
-    const planes = try allocator.alloc([]i32, state.header.components.len);
-    errdefer allocator.free(planes);
-    var allocated: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < allocated) : (i += 1) allocator.free(planes[i]);
-    }
-    for (f32_planes, 0..) |fp, component_index| {
-        planes[component_index] = try allocator.alloc(i32, comp_widths[component_index] * comp_heights[component_index]);
-        allocated += 1;
-        roundF32PlaneToI32(planes[component_index], fp);
-    }
-
-    if (discard_levels > 0) {
-        try cropPlanesToResolution(allocator, state, planes, comp_widths, comp_heights, comp_origin_x, comp_origin_y, discard_levels);
-    }
-
-    return planes;
+    return output;
 }
 
 /// Apply N-level inverse 9/7 wavelet transform iteratively on f32 data.
@@ -1242,22 +1911,26 @@ fn inverseWavelet97MultiLevelOriginAtResolution(
         const phase_y: u1 = @intCast(resolutionOriginAt(origin_y, reduce) & 1);
         if (active_w == 0 or active_h == 0) continue;
 
-        const sub = try allocator.alloc(f32, active_w * active_h);
-        defer allocator.free(sub);
-        var y: usize = 0;
-        while (y < active_h) : (y += 1) {
-            @memcpy(sub[y * active_w .. y * active_w + active_w], plane[y * width .. y * width + active_w]);
-        }
-
         if (openjpeg_compat) {
-            try wavelet.inverse97LevelInPlacePhaseOpenJpeg(allocator, sub, active_w, active_h, phase_x, phase_y);
+            try wavelet.inverse97LevelInPlaceStridedPhaseOpenJpeg(
+                allocator,
+                plane,
+                active_w,
+                active_h,
+                width,
+                phase_x,
+                phase_y,
+            );
         } else {
-            try wavelet.inverse97LevelInPlacePhase(allocator, sub, active_w, active_h, phase_x, phase_y);
-        }
-
-        y = 0;
-        while (y < active_h) : (y += 1) {
-            @memcpy(plane[y * width .. y * width + active_w], sub[y * active_w .. y * active_w + active_w]);
+            try wavelet.inverse97LevelInPlaceStridedPhase(
+                allocator,
+                plane,
+                active_w,
+                active_h,
+                width,
+                phase_x,
+                phase_y,
+            );
         }
     }
 }
@@ -1309,10 +1982,10 @@ pub fn reconstructTier1ExecutionReportWithOptions(
         allocator.free(raw_planes);
     }
 
-    // RCT inverse operates on component-grid samples. When all components have
-    // matching subsampled dimensions, run it before upsampling to the reference
-    // grid instead of skipping color transform for subsampled streams.
-    if (!use_component_wavelets and !use_irreversible) applyReversibleMctOnEqualComponentGrid(state, raw_planes);
+    // RCT inverse operates on corresponding unsubsampled component samples.
+    // The capability gate rejects incompatible grids; retain the same check in
+    // reconstruction so internal callers cannot accidentally skip the transform.
+    if (!use_component_wavelets and !use_irreversible) try applyReversibleMctOnEqualComponentGrid(state, raw_planes);
 
     // Upsample any subsampled components to the full image grid using bilinear
     // filtering. The common 1:1 case leaves planes untouched (pointers reused).
@@ -1328,14 +2001,34 @@ pub fn reconstructTier1ExecutionReportWithOptions(
     }
     var any_subsampled = false;
     for (state.header.components, 0..) |comp, i| {
-        const dims = tile.componentDimensions(state.header.width, state.header.height, comp.xrsiz, comp.yrsiz);
+        const dims = tile.componentDimensionsAt(
+            state.header.x_offset,
+            state.header.y_offset,
+            state.header.width,
+            state.header.height,
+            comp.xrsiz,
+            comp.yrsiz,
+        );
         const cw: usize = @intCast(dims.width);
         const ch: usize = @intCast(dims.height);
         if (cw == image_w and ch == image_h) {
             planes[i] = raw_planes[i];
         } else {
             any_subsampled = true;
-            planes[i] = try upsample.upsampleI32(allocator, .bilinear, raw_planes[i], cw, ch, image_w, image_h);
+            planes[i] = try upsample.bilinearI32ReferenceGrid(
+                allocator,
+                raw_planes[i],
+                cw,
+                ch,
+                image_w,
+                image_h,
+                state.header.x_offset,
+                state.header.y_offset,
+                dims.origin_x,
+                dims.origin_y,
+                comp.xrsiz,
+                comp.yrsiz,
+            );
             owned_upsampled[i] = true;
         }
     }

@@ -143,7 +143,7 @@ drift-checked from the same renderer. The CUDA route is gated by
 `ANTFLY_INFERENCE_CUDA_GENERATED_ATTENTION_DECODE=1`, fails closed when its
 symbol is missing, and records `launch_attention_gqa_decode_generated`.
 Because attention feeds the whole model, their correctness gate is
-**bit-identical model tokens** (`scripts/compare_metal_gemma4_e4b_qat.sh` oracle
+**bit-identical model tokens** (`scripts/gemma4/compare_metal_gemma4_e4b_qat.sh` oracle
 text + greedy token-id prefix), not raw-float conformance — argmax is robust to
 summation-order drift. Promotion also requires reviewed performance evidence
 across representative models, context lengths, masks, and sliding windows.
@@ -397,7 +397,7 @@ kernels explicitly enabled vs disabled, interleaved runs, bit-identical output):
 Q4_K-only models are unaffected by construction (the promoted routes are keyed
 to Q4_0): clipclap embeddings are bit-identical with the kernels on/off (all
 quant matmuls ride the q4_k tensor-core route), and gliner2 passes the
-`scripts/verify_gliner2_cuda.sh` native/CUDA parity gate with identical entity
+`scripts/gliner2/verify_gliner2_cuda.sh` native/CUDA parity gate with identical entity
 counts and warm extraction timing unchanged (12.0 vs 12.1 ms).
 
 Runtime dispatch for the five promoted CUDA routes is default-off. Their

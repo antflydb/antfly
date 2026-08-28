@@ -231,7 +231,7 @@ quality is instead gated statistically on held-out metrics. Python is the
 pinned oracle and timing baseline, not a production runtime dependency:
 
 ```sh
-scripts/run_gliner2_lora_production_readiness.sh \
+scripts/gliner2/run_gliner2_lora_production_readiness.sh \
   --model-dir /models/gliner2 \
   --python-model /models/gliner2 \
   --release-adapter-dir /runs/gliner2-release-adapter \
@@ -340,7 +340,7 @@ Parity review notes (vs the frozen fastino-ai/GLiNER2 oracle
 
 - The oracle environment is frozen as well as its source: Python 3.12 / Unicode
   15 plus every direct numerical/runtime dependency in
-  `scripts/requirements-gliner2-oracle.txt`. Generated trainers, held-out
+  `scripts/gliner2/requirements-gliner2-oracle.txt`. Generated trainers, held-out
   evaluation, repeated performance summaries, convergence evidence, and the
   final readiness report all reject a missing or mismatched package version.
 
@@ -483,8 +483,8 @@ that can participate as the second half of canonical composition; U+2581 and
 U+FFFD; leading, trailing, or repeated ASCII spaces; and emoji sequences
 containing marks or joiners fail closed. Regenerate and exhaustively verify the
 scalar/category/context tables with
-`python3.12 scripts/generate_gliner2_unicode_tables.py --write` and verify with
-`python3.12 scripts/generate_gliner2_unicode_tables.py --check`.
+`python3.12 scripts/gliner2/generate_gliner2_unicode_tables.py --write` and verify with
+`python3.12 scripts/gliner2/generate_gliner2_unicode_tables.py --check`.
 With the pinned model available, add
 `--tokenizer-json <model_dir>/tokenizer.json` to verify the normalizer shape,
 charsmap fingerprint, and every admitted scalar against the real tokenizer.
@@ -1303,7 +1303,7 @@ The earlier cached probe-surrogate bundle route
 (`train-eval-gliner2-lora-bundle`, MSE against deterministic probe targets)
 was removed — it was a smoke fixture, not real GLiNER2 training. Python↔Zig
 loss parity is gated by
-`scripts/compare_gliner2_lora_python_zig.py --strict` (see
+`scripts/gliner2/compare_gliner2_lora_python_zig.py --strict` (see
 `zig/e2e/inference/test_gliner2_lora_parity.py`).
 
 Adapters are saved in PEFT-compatible format

@@ -24,6 +24,7 @@ pub const OpenApiConfig = openapi.EmbedderConfig;
 pub const Config = struct {
     provider: Provider,
     model: []const u8 = "",
+    request_format: []const u8 = "",
     url: []const u8 = "",
     api_key: ?[]const u8 = null,
     project_id: []const u8 = "",
@@ -42,6 +43,7 @@ pub const Config = struct {
         return .{
             .provider = self.provider,
             .model = if (self.model.len > 0) try alloc.dupe(u8, self.model) else "",
+            .request_format = if (self.request_format.len > 0) try alloc.dupe(u8, self.request_format) else "",
             .url = if (self.url.len > 0) try alloc.dupe(u8, self.url) else "",
             .api_key = if (self.api_key) |api_key| try alloc.dupe(u8, api_key) else null,
             .project_id = if (self.project_id.len > 0) try alloc.dupe(u8, self.project_id) else "",
@@ -60,6 +62,7 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, alloc: Allocator) void {
         if (self.model.len > 0) alloc.free(self.model);
+        if (self.request_format.len > 0) alloc.free(self.request_format);
         if (self.url.len > 0) alloc.free(self.url);
         if (self.api_key) |api_key| alloc.free(api_key);
         if (self.project_id.len > 0) alloc.free(self.project_id);
@@ -75,6 +78,10 @@ pub const Config = struct {
         switch (self.provider) {
             .antfly, .mock => {},
             else => if (self.model.len == 0) return error.InvalidEmbedderConfig,
+        }
+        if (self.request_format.len > 0) {
+            if (self.provider != .bedrock) return error.InvalidEmbedderConfig;
+            if (!validBedrockRequestFormat(self.request_format)) return error.InvalidEmbedderConfig;
         }
         if (self.dimension) |dimension| {
             if (dimension == 0) return error.InvalidEmbedderConfig;
@@ -119,6 +126,7 @@ pub fn configFromOpenApi(alloc: Allocator, generated: openapi.EmbedderConfig) !C
     var cfg = Config{
         .provider = generated.provider,
         .model = if (generated.model) |model| try alloc.dupe(u8, model) else "",
+        .request_format = if (generated.request_format) |request_format| try alloc.dupe(u8, request_format) else "",
         .url = if (generated.url) |url|
             try alloc.dupe(u8, url)
         else if (generated.api_url) |api_url|
@@ -156,6 +164,7 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
     return .{
         .provider = cfg.provider,
         .model = if (cfg.model.len > 0) cfg.model else null,
+        .request_format = if (cfg.request_format.len > 0) cfg.request_format else null,
         .url = switch (cfg.provider) {
             .antfly => null,
             else => if (cfg.url.len > 0) cfg.url else null,
@@ -177,6 +186,14 @@ pub fn openApiFromConfig(cfg: Config) openapi.EmbedderConfig {
         .strip_new_lines = cfg.strip_new_lines,
         .multimodal = if (cfg.multimodal) true else null,
     };
+}
+
+fn validBedrockRequestFormat(value: []const u8) bool {
+    return std.mem.eql(u8, value, "auto") or
+        std.mem.eql(u8, value, "titan_text") or
+        std.mem.eql(u8, value, "titan_multimodal") or
+        std.mem.eql(u8, value, "cohere_v3") or
+        std.mem.eql(u8, value, "cohere_v4");
 }
 
 test "embedder config round trip" {
@@ -209,6 +226,25 @@ test "embedder config supports antfly api_url normalization" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(.antfly, cfg.provider);
     try std.testing.expectEqualStrings("http://localhost:8082", cfg.url);
+}
+
+test "embedder config preserves explicit Bedrock request format" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"provider":"bedrock","model":"arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/team-embeddings","request_format":"titan_multimodal","region":"us-east-1"}
+    ;
+    var cfg = try parseConfigFromSlice(alloc, raw);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("titan_multimodal", cfg.request_format);
+
+    const encoded = try stringifyAlloc(alloc, cfg);
+    defer alloc.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"request_format\":\"titan_multimodal\"") != null);
+
+    try std.testing.expectError(
+        error.InvalidEmbedderConfig,
+        parseConfigFromSlice(alloc, "{\"provider\":\"bedrock\",\"model\":\"profile\",\"request_format\":\"unknown\"}"),
+    );
 }
 
 test "embedder config validates model for remote providers" {

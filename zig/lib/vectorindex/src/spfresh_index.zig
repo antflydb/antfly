@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const centroid_directory = @import("centroid_directory.zig");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const hbc = @import("hbc.zig");
 const hbc_runtime = @import("hbc_runtime.zig");
@@ -81,6 +82,11 @@ pub const FlatCentroidDirectory = struct {
     posting_count: usize = 0,
     owned_shadowed_posting_bits: []u64 = &.{},
     backing: ?FlatCentroidBackingLease = null,
+    missing_node_count: usize = 0,
+    invalid_posting_count: usize = 0,
+    accounting_context: ?*anyopaque = null,
+    release_accounting: ?*const fn (*anyopaque, u64) void = null,
+    accounted_bytes: u64 = 0,
 
     pub fn retain(self: *FlatCentroidDirectory) void {
         _ = self.ref_count.fetchAdd(1, .acq_rel);
@@ -93,11 +99,45 @@ pub const FlatCentroidDirectory = struct {
     }
 
     fn deinit(self: *FlatCentroidDirectory, alloc: std.mem.Allocator) void {
+        const accounting_context = self.accounting_context;
+        const release_accounting = self.release_accounting;
+        const accounted_bytes = self.accounted_bytes;
         for (self.blocks) |*block| block.deinit(alloc);
         alloc.free(self.blocks);
         alloc.free(self.owned_shadowed_posting_bits);
         if (self.backing) |backing| backing.release();
         self.* = .{};
+        if (release_accounting) |release_fn| release_fn(accounting_context.?, accounted_bytes);
+    }
+
+    fn complete(self: *const FlatCentroidDirectory) bool {
+        return self.missing_node_count == 0 and self.invalid_posting_count == 0;
+    }
+
+    pub fn bytes(self: *const FlatCentroidDirectory) u64 {
+        var total: u64 = @sizeOf(FlatCentroidDirectory) +|
+            @as(u64, @intCast(self.blocks.len * @sizeOf(FlatCentroidBlock)));
+        for (self.blocks) |*block| {
+            if (!block.owned) continue;
+            total +|= @as(u64, @intCast(block.posting_ids.len * @sizeOf(u64)));
+            total +|= @as(u64, @intCast(block.covering_radii.len * @sizeOf(f32)));
+            switch (block.encoding) {
+                .rabitq => |quantized| {
+                    total +|= @as(u64, @intCast(quantized.centroid.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(quantized.codes.data.len * @sizeOf(u64)));
+                    total +|= @as(u64, @intCast(quantized.code_counts.len * @sizeOf(u32)));
+                    total +|= @as(u64, @intCast(quantized.centroid_distances.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(quantized.quantized_dot_products.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(quantized.centroid_dot_products.len * @sizeOf(f32)));
+                },
+                .exact => |exact| {
+                    total +|= @as(u64, @intCast(exact.vectors.len * @sizeOf(f32)));
+                    total +|= @as(u64, @intCast(exact.measures.len * @sizeOf(f32)));
+                },
+            }
+        }
+        total +|= @as(u64, @intCast(self.owned_shadowed_posting_bits.len * @sizeOf(u64)));
+        return total;
     }
 };
 
@@ -254,20 +294,80 @@ pub fn layeredExactFlatCentroidDirectoryFromReader(
     };
 }
 
-pub const FlatCentroidProbe = struct {
-    posting_id: u64,
-    distance: f32,
-    error_bound: f32,
-    member_lower_bound: f32 = -std.math.inf(f32),
-    bound_resolved: bool = false,
-    suffix_member_lower_bound: f32 = -std.math.inf(f32),
-    suffix_bounds_resolved: bool = false,
-};
-
 pub const FlatCentroidSelection = struct {
     probes: []FlatCentroidProbe,
     total_postings: usize,
 };
+
+fn checkedAddMul(total: *u64, count: u64, element_size: u64) !void {
+    const bytes = std.math.mul(u64, count, element_size) catch return error.OutOfMemory;
+    total.* = std.math.add(u64, total.*, bytes) catch return error.OutOfMemory;
+}
+
+pub const FlatCentroidBuildReservation = struct {
+    transient_bytes: u64 = 0,
+    retained_bytes: u64 = 0,
+
+    fn empty(self: @This()) bool {
+        return self.transient_bytes == 0 and self.retained_bytes == 0;
+    }
+};
+
+pub const FlatCentroidBuildClaim = union(enum) {
+    owner,
+    retry,
+    /// Owns one retained reference; the caller must eventually release it.
+    ready: *FlatCentroidDirectory,
+};
+
+pub const FlatCentroidBuildOutcome = union(enum) {
+    retry,
+    failed: anyerror,
+    /// The flight retains its own reference until every waiter has consumed
+    /// the outcome.
+    ready: *FlatCentroidDirectory,
+};
+
+/// Conservative peak allocation for a cold flat-directory build. It covers
+/// the retained RaBitQ output for the worst case (every published node is a
+/// leaf), traversal arrays, raw centroid blocks, and RaBitQ's normalization
+/// workspace. ArrayList growth is budgeted at twice its logical capacity.
+pub fn projectedFlatCentroidDirectoryBuildBytes(
+    node_count: u64,
+    dims: usize,
+    block_size_raw: usize,
+    max_node_entries: usize,
+) !FlatCentroidBuildReservation {
+    const block_size = @max(block_size_raw, @as(usize, 1));
+    const block_count = std.math.divCeil(u64, node_count, @as(u64, @intCast(block_size))) catch return error.OutOfMemory;
+    const code_width = std.math.divCeil(u64, @as(u64, @intCast(dims)), 64) catch return error.OutOfMemory;
+    const visited_words = std.math.divCeil(u64, node_count, @bitSizeOf(usize)) catch return error.OutOfMemory;
+
+    var retained: u64 = @sizeOf(FlatCentroidDirectory);
+    // Retained directory and its worst-case block-array capacity.
+    try checkedAddMul(&retained, @max(block_count *| 2, 16), @sizeOf(FlatCentroidBlock));
+    try checkedAddMul(&retained, node_count, @sizeOf(u64) + @sizeOf(f32));
+    try checkedAddMul(&retained, node_count, code_width *| @sizeOf(u64));
+    try checkedAddMul(&retained, node_count, 4 * @sizeOf(f32) + @sizeOf(u32));
+    try checkedAddMul(&retained, block_count, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    // Traversal and block construction workspace. Quantization temporarily
+    // holds a normalized copy alongside the raw centroid block.
+    var transient: u64 = 0;
+    try checkedAddMul(&transient, @max(node_count *| 2, 16), @sizeOf(u64));
+    try checkedAddMul(&transient, visited_words, @sizeOf(usize));
+    try checkedAddMul(&transient, @intCast(block_size), @sizeOf(u64) + @sizeOf(f32));
+    try checkedAddMul(&transient, @intCast(block_size), @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    try checkedAddMul(&transient, @min(node_count, @as(u64, @intCast(block_size))), @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    // One decoded node is live at a time while traversing the directory.
+    try checkedAddMul(&transient, 1, @sizeOf(types.Node));
+    try checkedAddMul(&transient, 1, @as(u64, @intCast(dims)) *| @sizeOf(f32));
+    try checkedAddMul(&transient, @intCast(max_node_entries), @sizeOf(u64));
+    return .{ .transient_bytes = transient, .retained_bytes = retained };
+}
+
+pub const FlatCentroidProbe = search_types.FlatCentroidProbe;
+const cancellable_flat_sort_chunk_size: usize = 4_096;
 
 fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
@@ -328,9 +428,38 @@ fn flatProbeWorseThan(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) s
     return std.math.order(rhs.posting_id, lhs.posting_id);
 }
 
+fn insertFlatProbe(probes: []FlatCentroidProbe, count: *usize, candidate: FlatCentroidProbe) void {
+    if (probes.len == 0) return;
+    if (count.* < probes.len) {
+        probes[count.*] = candidate;
+        count.* += 1;
+    } else {
+        var worst_index: usize = 0;
+        var worst_score = flatAnnScore(probes[0]);
+        for (probes[1..], 1..) |probe, i| {
+            const score = flatAnnScore(probe);
+            if (score > worst_score) {
+                worst_score = score;
+                worst_index = i;
+            }
+        }
+        if (flatAnnScore(candidate) >= worst_score) return;
+        probes[worst_index] = candidate;
+    }
+}
+
+fn flatAnnScore(probe: FlatCentroidProbe) f32 {
+    return flatProbeScore(probe);
+}
+
 fn flatProbeLess(_: void, lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
-    const lhs_score = flatProbeScore(lhs);
-    const rhs_score = flatProbeScore(rhs);
+    const lhs_score = flatAnnScore(lhs);
+    const rhs_score = flatAnnScore(rhs);
+    if (std.math.isNan(lhs_score)) {
+        if (std.math.isNan(rhs_score)) return lhs.posting_id < rhs.posting_id;
+        return false;
+    }
+    if (std.math.isNan(rhs_score)) return true;
     if (lhs_score != rhs_score) return lhs_score < rhs_score;
     return lhs.posting_id < rhs.posting_id;
 }
@@ -406,6 +535,177 @@ test "flat cosine member bound uses the persisted chord radius" {
     try std.testing.expect(flatMemberLowerBound(.inner_product, centroid_distance, 0, covering_radius) == null);
 }
 
+fn sortFlatProbesCancellable(
+    probes: []FlatCentroidProbe,
+    merge_buffer: []FlatCentroidProbe,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    try checkCancellation(cancellation);
+    if (probes.len < 2) return;
+
+    // Preserve the standard adaptive block sort for the overwhelmingly common
+    // small frontier and for direct library callers without cancellation. Large
+    // cancellable frontiers are sorted in bounded chunks and merged linearly;
+    // this avoids heapsort's poor locality and O(n log n) work on already sorted
+    // inputs while keeping cancellation latency independent of total index size.
+    if (cancellation == null or probes.len <= cancellable_flat_sort_chunk_size) {
+        std.mem.sort(FlatCentroidProbe, probes, {}, flatProbeLess);
+        try checkCancellation(cancellation);
+        return;
+    }
+
+    var chunk_start: usize = 0;
+    while (chunk_start < probes.len) {
+        try checkCancellation(cancellation);
+        const chunk_end = chunk_start + @min(cancellable_flat_sort_chunk_size, probes.len - chunk_start);
+        std.mem.sort(FlatCentroidProbe, probes[chunk_start..chunk_end], {}, flatProbeLess);
+        chunk_start = chunk_end;
+    }
+
+    if (merge_buffer.len < probes.len) return error.BufferTooSmall;
+    var source = probes;
+    var destination = merge_buffer;
+    var run_width: usize = cancellable_flat_sort_chunk_size;
+    while (run_width < probes.len) {
+        try checkCancellation(cancellation);
+        var start: usize = 0;
+        while (start < probes.len) {
+            const middle = start + @min(run_width, probes.len - start);
+            const end = middle + @min(run_width, probes.len - middle);
+            try mergeFlatProbeRunsCancellable(source, destination, start, middle, end, cancellation);
+            start = end;
+        }
+        const previous_source = source;
+        source = destination;
+        destination = previous_source;
+        if (run_width > probes.len / 2) break;
+        run_width *= 2;
+    }
+
+    if (source.ptr != probes.ptr) {
+        var offset: usize = 0;
+        while (offset < probes.len) {
+            try checkCancellation(cancellation);
+            const end = offset + @min(cancellable_flat_sort_chunk_size, probes.len - offset);
+            @memcpy(probes[offset..end], source[offset..end]);
+            offset = end;
+        }
+    }
+    try checkCancellation(cancellation);
+}
+
+fn mergeFlatProbeRunsCancellable(
+    source: []const FlatCentroidProbe,
+    destination: []FlatCentroidProbe,
+    start: usize,
+    middle: usize,
+    end: usize,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    var left = start;
+    var right = middle;
+    var out = start;
+    while (left < middle and right < end) : (out += 1) {
+        if ((out & 0xff) == 0) try checkCancellation(cancellation);
+        if (flatProbeLess({}, source[right], source[left])) {
+            destination[out] = source[right];
+            right += 1;
+        } else {
+            destination[out] = source[left];
+            left += 1;
+        }
+    }
+    while (left < middle) : ({
+        left += 1;
+        out += 1;
+    }) {
+        if ((out & 0xff) == 0) try checkCancellation(cancellation);
+        destination[out] = source[left];
+    }
+    while (right < end) : ({
+        right += 1;
+        out += 1;
+    }) {
+        if ((out & 0xff) == 0) try checkCancellation(cancellation);
+        destination[out] = source[right];
+    }
+}
+
+fn checkCancellation(cancellation: ?search_types.CancellationToken) !void {
+    if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+}
+
+pub fn flatProbeLessForTesting(lhs: FlatCentroidProbe, rhs: FlatCentroidProbe) bool {
+    if (!builtin.is_test) @compileError("test-only flat probe ordering seam");
+    return flatProbeLess({}, lhs, rhs);
+}
+
+test "flat frontier cancellable sort preserves deterministic ordering" {
+    var probes = [_]FlatCentroidProbe{
+        .{ .posting_id = 9, .distance = 4, .error_bound = 1 },
+        .{ .posting_id = 7, .distance = 2, .error_bound = 0 },
+        .{ .posting_id = 3, .distance = 3, .error_bound = 1 },
+        .{ .posting_id = 1, .distance = 2, .error_bound = 0 },
+        .{ .posting_id = 5, .distance = 1, .error_bound = 0 },
+    };
+    try sortFlatProbesCancellable(&probes, &.{}, null);
+    for (probes[0 .. probes.len - 1], probes[1..]) |lhs, rhs| {
+        try std.testing.expect(!flatProbeLess({}, rhs, lhs));
+    }
+    try std.testing.expectEqualSlices(u64, &.{ 5, 1, 7, 3, 9 }, &.{
+        probes[0].posting_id,
+        probes[1].posting_id,
+        probes[2].posting_id,
+        probes[3].posting_id,
+        probes[4].posting_id,
+    });
+}
+
+test "flat frontier scoring sort honors cancellation" {
+    var cancelled = std.atomic.Value(bool).init(true);
+    var probes = [_]FlatCentroidProbe{
+        .{ .posting_id = 2, .distance = 2, .error_bound = 0 },
+        .{ .posting_id = 1, .distance = 1, .error_bound = 0 },
+    };
+    try std.testing.expectError(
+        error.Cancelled,
+        sortFlatProbesCancellable(&probes, &.{}, search_types.CancellationToken.fromAtomic(&cancelled)),
+    );
+}
+
+test "large cancellable flat frontier uses deterministic chunked merge" {
+    const probe_count = 4_097;
+    const probes = try std.testing.allocator.alloc(FlatCentroidProbe, probe_count);
+    defer std.testing.allocator.free(probes);
+    const merge_buffer = try std.testing.allocator.alloc(FlatCentroidProbe, probe_count);
+    defer std.testing.allocator.free(merge_buffer);
+    for (probes, 0..) |*probe, i| {
+        const reverse_id: u64 = @intCast(probe_count - i);
+        probe.* = .{
+            .posting_id = reverse_id,
+            .distance = @floatFromInt(reverse_id % 31),
+            .error_bound = 0,
+        };
+    }
+    var cancelled = std.atomic.Value(bool).init(false);
+    try sortFlatProbesCancellable(
+        probes,
+        merge_buffer,
+        search_types.CancellationToken.fromAtomic(&cancelled),
+    );
+    for (probes[0 .. probes.len - 1], probes[1..]) |lhs, rhs| {
+        try std.testing.expect(!flatProbeLess({}, rhs, lhs));
+    }
+}
+
+fn flatL2MemberLowerBound(distance: f32, error_bound: f32, covering_radius: f32) ?f32 {
+    if (!std.math.isFinite(covering_radius) or covering_radius < 0) return null;
+    const centroid_squared_lower = @max(@as(f32, 0), distance - error_bound);
+    if (!std.math.isFinite(centroid_squared_lower)) return null;
+    const member_distance_lower = @max(@as(f32, 0), @sqrt(centroid_squared_lower) - covering_radius);
+    return member_distance_lower * member_distance_lower;
+}
+
 fn publishedRootNodeSnapshot(self: anytype) u64 {
     const Index = comptime @TypeOf(self.*);
     if (comptime @hasDecl(Index, "publishedRootNode")) return self.publishedRootNode();
@@ -424,13 +724,33 @@ fn publishedGenerationSnapshot(self: anytype) u64 {
     return 0;
 }
 
-const PublishedSnapshot = struct {
+pub const PublishedSnapshot = struct {
     root_node: u64,
     node_count: u64,
     publish_generation: u64,
 };
 
-fn loadStablePublishedSnapshot(self: anytype) PublishedSnapshot {
+fn waitForStablePublicationIfSupported(
+    self: anytype,
+    generation: u64,
+    cancellation: ?search_types.CancellationToken,
+) !void {
+    const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "waitForPublishedSearchState")) {
+        return try self.waitForPublishedSearchState(generation, cancellation);
+    }
+    if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+    if (builtin.os.tag == .freestanding) {
+        std.atomic.spinLoopHint();
+    } else {
+        std.Thread.yield() catch {};
+    }
+}
+
+fn loadStablePublishedSnapshot(
+    self: anytype,
+    cancellation: ?search_types.CancellationToken,
+) !PublishedSnapshot {
     const Index = comptime @TypeOf(self.*);
     if (comptime !@hasDecl(Index, "publishedGeneration")) {
         return .{
@@ -443,7 +763,7 @@ fn loadStablePublishedSnapshot(self: anytype) PublishedSnapshot {
     while (true) {
         const generation = publishedGenerationSnapshot(self);
         if ((generation & 1) != 0) {
-            std.atomic.spinLoopHint();
+            try waitForStablePublicationIfSupported(self, generation, cancellation);
             continue;
         }
         const root_node = publishedRootNodeSnapshot(self);
@@ -456,12 +776,15 @@ fn loadStablePublishedSnapshot(self: anytype) PublishedSnapshot {
                 .publish_generation = generation,
             };
         }
-        std.atomic.spinLoopHint();
+        try waitForStablePublicationIfSupported(self, generation_after, cancellation);
     }
 }
 
 fn loadPublishedNode(self: anytype, txn: anytype, node_id: u64) !types.Node {
     const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "loadFlatCentroidDirectoryNodeFromStorage")) {
+        return try self.loadFlatCentroidDirectoryNodeFromStorage(txn, node_id);
+    }
     if (comptime @hasDecl(Index, "loadSearchNodeFromStorage")) {
         return try self.loadSearchNodeFromStorage(txn, node_id);
     }
@@ -472,6 +795,34 @@ fn directoryMatches(directory: *const FlatCentroidDirectory, root_node: u64, nod
     return directory.root_node_snapshot == root_node and
         directory.node_count_snapshot == node_count and
         directory.publish_generation_snapshot == publish_generation;
+}
+
+fn snapshotStillPublished(self: anytype, snapshot: PublishedSnapshot) bool {
+    const generation = publishedGenerationSnapshot(self);
+    return (generation & 1) == 0 and
+        generation == snapshot.publish_generation and
+        publishedRootNodeSnapshot(self) == snapshot.root_node and
+        publishedNodeCountSnapshot(self) == snapshot.node_count;
+}
+
+fn finishFlatCentroidBuildIfSupported(
+    self: anytype,
+    generation: u64,
+    outcome: FlatCentroidBuildOutcome,
+) void {
+    const Index = comptime @TypeOf(self.*);
+    if (comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild")) {
+        self.finishFlatCentroidDirectoryBuild(generation, outcome);
+    }
+}
+
+fn flatCentroidBuildFailureOutcome(err: anyerror) FlatCentroidBuildOutcome {
+    return switch (err) {
+        // A request-local cancellation or publication race says nothing about
+        // whether another waiter can build the same generation successfully.
+        error.Cancelled, error.StalePublishedSnapshot => .retry,
+        else => .{ .failed = err },
+    };
 }
 
 fn appendFlatCentroidBlock(
@@ -535,7 +886,10 @@ pub fn usesFlatCentroidDirectory(self: anytype) bool {
             else
                 self.metadata.active_count;
             const leaf_size = @max(@as(u64, self.config.leaf_size), 1);
-            const estimated_postings = std.math.divCeil(u64, active_count, leaf_size) catch std.math.maxInt(u64);
+            // Use the completed-leaf scale here. A partially filled final
+            // leaf should not switch the whole index to a flat directory one
+            // batch before the configured posting boundary.
+            const estimated_postings = active_count / leaf_size;
             break :blk estimated_postings >= self.config.flat_exact_min_postings;
         },
     };
@@ -570,7 +924,14 @@ test "automatic centroid routing switches only at the posting scale boundary" {
     try std.testing.expect(usesFlatCentroidDirectory(&index));
 }
 
-fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_count: u64, publish_generation: u64) !FlatCentroidDirectory {
+fn buildFlatCentroidDirectory(
+    self: anytype,
+    txn: anytype,
+    root_node: u64,
+    node_count: u64,
+    publish_generation: u64,
+    cancellation: ?search_types.CancellationToken,
+) !FlatCentroidDirectory {
     const dims: usize = @intCast(self.config.dims);
     const block_size = @max(self.config.flat_centroid_block_size, @as(usize, 1));
     var blocks = std.ArrayListUnmanaged(FlatCentroidBlock).empty;
@@ -587,24 +948,72 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
     defer self.alloc.free(covering_radii);
     var pending = std.ArrayListUnmanaged(u64).empty;
     defer pending.deinit(self.alloc);
-    try pending.append(self.alloc, root_node);
+    // Published node ids are bounded by node_count. A dense bitset is exact,
+    // has predictable resource use, and avoids an O(nodes) hash-table peak on
+    // cold large-index directory construction.
+    const visited_word_bits = @bitSizeOf(usize);
+    const visited_words_u64 = std.math.divCeil(u64, node_count, visited_word_bits) catch return error.OutOfMemory;
+    const visited_word_count = std.math.cast(usize, visited_words_u64) orelse return error.OutOfMemory;
+    const visited_words = try self.alloc.alloc(usize, visited_word_count);
+    defer self.alloc.free(visited_words);
+    @memset(visited_words, 0);
 
     var block_count: usize = 0;
     var posting_count: usize = 0;
+    var missing_node_count: usize = 0;
+    var invalid_posting_count: usize = 0;
+
+    if (root_node == 0 or root_node > node_count) {
+        invalid_posting_count += 1;
+    } else {
+        const zero_based = root_node - 1;
+        const visited_word_index: usize = @intCast(zero_based / visited_word_bits);
+        const visited_bit_index: std.math.Log2Int(usize) = @intCast(zero_based % visited_word_bits);
+        visited_words[visited_word_index] |= @as(usize, 1) << visited_bit_index;
+        try pending.append(self.alloc, root_node);
+    }
 
     var cursor: usize = 0;
     while (cursor < pending.items.len) : (cursor += 1) {
         const node_id = pending.items[cursor];
+        if (cursor % 64 == 0) {
+            if (cancellation) |token| if (token.isCancelled()) return error.Cancelled;
+        }
         var node = loadPublishedNode(self, txn, node_id) catch |err| {
-            if (isNotFoundGeneric(err)) continue;
+            if (isNotFoundGeneric(err)) {
+                missing_node_count += 1;
+                continue;
+            }
             return err;
         };
         defer node.deinit(self.alloc);
         if (!node.is_leaf) {
-            for (node.children) |child_id| try pending.append(self.alloc, child_id);
+            for (node.children) |child_id| {
+                if (child_id == 0 or child_id > node_count) {
+                    invalid_posting_count += 1;
+                    continue;
+                }
+                const zero_based = child_id - 1;
+                const visited_word_index: usize = @intCast(zero_based / visited_word_bits);
+                const visited_bit_index: std.math.Log2Int(usize) = @intCast(zero_based % visited_word_bits);
+                const visited_mask = @as(usize, 1) << visited_bit_index;
+                if (visited_words[visited_word_index] & visited_mask != 0) {
+                    // A valid HBC topology is a strict tree. Mark children when
+                    // they are scheduled so corrupt duplicate edges and cycles
+                    // cannot grow the traversal queue beyond node_count.
+                    invalid_posting_count += 1;
+                    continue;
+                }
+                visited_words[visited_word_index] |= visited_mask;
+                try pending.append(self.alloc, child_id);
+            }
             continue;
         }
-        if (node.members.len == 0 or node.centroid.len != dims) continue;
+        if (node.members.len == 0) continue;
+        if (node.centroid.len != dims) {
+            invalid_posting_count += 1;
+            continue;
+        }
 
         posting_ids[block_count] = node.id;
         covering_radii[block_count] = node.covering_radius;
@@ -627,6 +1036,8 @@ fn buildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64, node_
         .node_count_snapshot = node_count,
         .publish_generation_snapshot = publish_generation,
         .posting_count = posting_count,
+        .missing_node_count = missing_node_count,
+        .invalid_posting_count = invalid_posting_count,
     };
 }
 
@@ -637,7 +1048,7 @@ fn loadOrBuildFlatCentroidDirectory(self: anytype, txn: anytype, root_node: u64,
             return persisted;
         }
     }
-    return try buildFlatCentroidDirectory(self, txn, root_node, node_count, publish_generation);
+    return try buildFlatCentroidDirectory(self, txn, root_node, node_count, publish_generation, null);
 }
 
 pub fn clearFlatCentroidDirectory(self: anytype) void {
@@ -649,9 +1060,18 @@ pub fn clearFlatCentroidDirectory(self: anytype) void {
     if (stale) |directory| directory.release(self.alloc);
 }
 
-fn acquireFlatCentroidDirectory(self: anytype, txn: anytype) !*FlatCentroidDirectory {
+fn acquireFlatCentroidDirectory(
+    self: anytype,
+    txn: anytype,
+    expected_snapshot: ?PublishedSnapshot,
+    cancellation: ?search_types.CancellationToken,
+) !*FlatCentroidDirectory {
+    const Index = comptime @TypeOf(self.*);
     while (true) {
-        const snapshot = loadStablePublishedSnapshot(self);
+        // Complete callers retain the generation-bound transaction supplied by
+        // their snapshot. Best-effort callers open a fresh runtime transaction
+        // for the elected build owner below.
+        const snapshot = expected_snapshot orelse try loadStablePublishedSnapshot(self, cancellation);
 
         var stale: ?*FlatCentroidDirectory = null;
         lockAtomicMutex(&self.flat_centroid_mu);
@@ -661,16 +1081,52 @@ fn acquireFlatCentroidDirectory(self: anytype, txn: anytype) !*FlatCentroidDirec
                 self.flat_centroid_mu.unlock();
                 return directory;
             }
-            stale = directory;
-            self.flat_centroid_directory = null;
         }
         self.flat_centroid_mu.unlock();
-        if (stale) |directory| directory.release(self.alloc);
+
+        if (comptime @hasDecl(Index, "beginFlatCentroidDirectoryBuild")) {
+            switch (try self.beginFlatCentroidDirectoryBuild(snapshot.publish_generation, cancellation)) {
+                .owner => {},
+                .retry => continue,
+                .ready => |directory| {
+                    // The adapter keys flights by generation, but retain the
+                    // full snapshot check at this generic boundary. This
+                    // keeps a buggy or wrapped generation from handing a
+                    // caller a directory for different topology.
+                    if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
+                        return directory;
+                    }
+                    directory.release(self.alloc);
+                    continue;
+                },
+            }
+        }
+        var build_flight_open = comptime @hasDecl(Index, "finishFlatCentroidDirectoryBuild");
+        var build_outcome: FlatCentroidBuildOutcome = .retry;
+        defer if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, build_outcome);
+        errdefer |err| build_outcome = flatCentroidBuildFailureOutcome(err);
+
+        var build_reservation: FlatCentroidBuildReservation = .{};
+        if (comptime @hasDecl(Index, "reserveFlatCentroidDirectoryBuildBytes")) {
+            build_reservation = try self.reserveFlatCentroidDirectoryBuildBytes(
+                try projectedFlatCentroidDirectoryBuildBytes(
+                    snapshot.node_count,
+                    @intCast(self.config.dims),
+                    self.config.flat_centroid_block_size,
+                    @max(self.config.leaf_size, self.config.branching_factor),
+                ),
+            );
+        }
+        var build_reservation_open = !build_reservation.empty();
+        errdefer if (comptime @hasDecl(Index, "releaseFlatCentroidDirectoryBuildBytes")) {
+            if (build_reservation_open) self.releaseFlatCentroidDirectoryBuildBytes(build_reservation);
+        };
 
         const built = try self.alloc.create(FlatCentroidDirectory);
         errdefer self.alloc.destroy(built);
-        const Index = comptime @TypeOf(self.*);
-        if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
+        if (expected_snapshot != null) {
+            built.* = try buildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation, cancellation);
+        } else if (comptime @hasDecl(Index, "beginRuntimeSearchTxn")) {
             var build_txn = try self.beginRuntimeSearchTxn();
             defer build_txn.abort();
             built.* = try loadOrBuildFlatCentroidDirectory(self, &build_txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
@@ -678,24 +1134,45 @@ fn acquireFlatCentroidDirectory(self: anytype, txn: anytype) !*FlatCentroidDirec
             built.* = try loadOrBuildFlatCentroidDirectory(self, txn, snapshot.root_node, snapshot.node_count, snapshot.publish_generation);
         }
         errdefer built.deinit(self.alloc);
+        if (comptime @hasDecl(Index, "accountFlatCentroidDirectory")) {
+            try self.accountFlatCentroidDirectory(built, build_reservation);
+            build_reservation_open = false;
+        } else if (comptime @hasDecl(Index, "releaseFlatCentroidDirectoryBuildBytes")) {
+            if (build_reservation_open) {
+                self.releaseFlatCentroidDirectoryBuildBytes(build_reservation);
+                build_reservation_open = false;
+            }
+        }
 
-        const current = loadStablePublishedSnapshot(self);
-        if (current.root_node != snapshot.root_node or
-            current.node_count != snapshot.node_count or
-            current.publish_generation != snapshot.publish_generation)
-        {
-            built.deinit(self.alloc);
-            self.alloc.destroy(built);
-            continue;
+        if (expected_snapshot == null) {
+            const current = try loadStablePublishedSnapshot(self, cancellation);
+            if (current.root_node != snapshot.root_node or
+                current.node_count != snapshot.node_count or
+                current.publish_generation != snapshot.publish_generation)
+            {
+                built.deinit(self.alloc);
+                self.alloc.destroy(built);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .retry);
+                build_flight_open = false;
+                continue;
+            }
         }
 
         lockAtomicMutex(&self.flat_centroid_mu);
+        if (expected_snapshot != null and !snapshotStillPublished(self, snapshot)) {
+            self.flat_centroid_mu.unlock();
+            if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = built });
+            build_flight_open = false;
+            return built;
+        }
         if (self.flat_centroid_directory) |directory| {
             if (directoryMatches(directory, snapshot.root_node, snapshot.node_count, snapshot.publish_generation)) {
                 directory.retain();
                 self.flat_centroid_mu.unlock();
                 built.deinit(self.alloc);
                 self.alloc.destroy(built);
+                if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = directory });
+                build_flight_open = false;
                 return directory;
             }
             stale = directory;
@@ -707,6 +1184,8 @@ fn acquireFlatCentroidDirectory(self: anytype, txn: anytype) !*FlatCentroidDirec
         self.flat_centroid_directory = built;
         self.flat_centroid_mu.unlock();
         if (stale) |directory| directory.release(self.alloc);
+        if (build_flight_open) finishFlatCentroidBuildIfSupported(self, snapshot.publish_generation, .{ .ready = built });
+        build_flight_open = false;
         return built;
     }
 }
@@ -721,11 +1200,14 @@ pub fn selectFlatPostingsAlloc(
     max_postings: usize,
     scratch: anytype,
     profile: *search_types.SearchProfile,
+    coverage_policy: search_types.CoveragePolicy,
+    expected_snapshot: ?PublishedSnapshot,
+    cancellation: ?search_types.CancellationToken,
     now_fn_u64: fn () u64,
     elapsed_fn_u64: fn (u64) u64,
 ) !FlatCentroidSelection {
     const start = now_fn_u64();
-    const directory = try acquireFlatCentroidDirectory(self, txn);
+    const directory = try acquireFlatCentroidDirectory(self, txn, expected_snapshot, cancellation);
     defer directory.release(self.alloc);
     defer profile.child_expand_ns += elapsed_fn_u64(start);
 
@@ -737,7 +1219,13 @@ pub fn selectFlatPostingsAlloc(
         }
     }
     std.debug.assert(posting_count == directory.posting_count);
-    const selection_limit = @min(max_postings, posting_count);
+    // Complete-snapshot searches promise exhaustive coverage of the
+    // published directory. Approximate searches retain the bounded ANN
+    // frontier so their latency remains governed by the caller's effort.
+    const selection_limit = if (coverage_policy == .complete_snapshot)
+        posting_count
+    else
+        @min(max_postings, posting_count);
     var selected = std.PriorityQueue(FlatCentroidProbe, void, flatProbeWorseThan).initContext({});
     defer selected.deinit(self.alloc);
     try selected.ensureTotalCapacity(self.alloc, selection_limit);
@@ -746,8 +1234,12 @@ pub fn selectFlatPostingsAlloc(
         .cosine => vec.norm(query),
         .inner_product => 0,
     };
+    if (coverage_policy == .complete_snapshot and !directory.complete()) {
+        return error.IncompletePublishedSnapshot;
+    }
 
     for (directory.blocks) |*block| {
+        try checkCancellation(cancellation);
         const count = block.posting_ids.len;
         try scratch.ensureVectorFetchCapacity(self.alloc, count);
         const distances = scratch.distances[0..count];
@@ -769,6 +1261,7 @@ pub fn selectFlatPostingsAlloc(
             },
         }
         for (block.posting_ids, 0..) |posting_id, i| {
+            if ((i & 0xff) == 0) try checkCancellation(cancellation);
             if (postingBitIsSet(block.shadowed_posting_bits, posting_id)) continue;
             const member_lower_bound = flatMemberLowerBound(
                 self.config.metric,
@@ -951,6 +1444,43 @@ fn replaceOwnedU64Slice(alloc: std.mem.Allocator, target: *[]u64, replacement: *
     replacement.* = null;
 }
 
+fn removeUniqueChildLinkAlloc(
+    alloc: std.mem.Allocator,
+    children: []const u64,
+    child_id: u64,
+) !?[]u64 {
+    var match_count: usize = 0;
+    for (children) |cid| {
+        if (cid == child_id) match_count += 1;
+    }
+    // A merge is safe only when the recorded parent owns exactly one link to
+    // the leaf. Zero links are a stale parent pointer; duplicate links are
+    // tree corruption. In either case, leave both postings untouched for the
+    // tree-link repair sweep instead of sizing a len-1 array incorrectly.
+    if (match_count != 1) return null;
+
+    const replacement = try alloc.alloc(u64, children.len - 1);
+    errdefer alloc.free(replacement);
+    var wi: usize = 0;
+    for (children) |cid| {
+        if (cid == child_id) continue;
+        replacement[wi] = cid;
+        wi += 1;
+    }
+    std.debug.assert(wi == replacement.len);
+    return replacement;
+}
+
+fn noteTreeLinkInconsistencyIfSupported(self: anytype) void {
+    const Index = comptime switch (@typeInfo(@TypeOf(self))) {
+        .pointer => |pointer| pointer.child,
+        else => @TypeOf(self),
+    };
+    if (comptime @hasDecl(Index, "noteTreeLinkInconsistency")) {
+        self.noteTreeLinkInconsistency();
+    }
+}
+
 fn mergeUnderfullPostingWithNearestSibling(
     self: anytype,
     txn: anytype,
@@ -962,6 +1492,17 @@ fn mergeUnderfullPostingWithNearestSibling(
     var parent = try self.loadNode(txn, leaf.parent);
     defer parent.deinit(self.alloc);
     try parent.ensureUnbacked(self.alloc);
+
+    var new_children: ?[]u64 = try removeUniqueChildLinkAlloc(self.alloc, parent.children, leaf.id);
+    defer if (new_children) |owned| self.alloc.free(owned);
+    if (new_children == null) {
+        std.log.warn(
+            "hbc: underfull leaf {d} is not uniquely linked by recorded parent {d}; skipping merge",
+            .{ leaf.id, leaf.parent },
+        );
+        noteTreeLinkInconsistencyIfSupported(self);
+        return false;
+    }
 
     var best_sibling_id: u64 = 0;
     var best_dist: f32 = std.math.inf(f32);
@@ -1001,14 +1542,6 @@ fn mergeUnderfullPostingWithNearestSibling(
 
     for (leaf.members) |mid| try self.putVecLeaf(txn, mid, best_sibling_id);
 
-    var new_children: ?[]u64 = try self.alloc.alloc(u64, parent.children.len - 1);
-    errdefer if (new_children) |owned| self.alloc.free(owned);
-    var wi_child: usize = 0;
-    for (parent.children) |cid| {
-        if (cid == leaf.id) continue;
-        new_children.?[wi_child] = cid;
-        wi_child += 1;
-    }
     replaceOwnedU64Slice(self.alloc, &parent.children, &new_children);
     try self.recomputeInternalCentroid(txn, &parent);
     try self.saveNodeWithOptionsMode(txn, &parent, save_options, false);
@@ -1322,11 +1855,32 @@ test "owned slice replacement survives later error cleanup" {
     try std.testing.expectError(error.InjectedFailure, Runner.run(std.testing.allocator));
 }
 
+test "underfull merge child unlink requires exactly one parent link" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expect((try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 4 }, 9)) == null);
+    try std.testing.expect((try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 2 }, 2)) == null);
+
+    const replacement = (try removeUniqueChildLinkAlloc(alloc, &.{ 2, 3, 4 }, 3)) orelse
+        return error.TestUnexpectedResult;
+    defer alloc.free(replacement);
+    try std.testing.expectEqualSlices(u64, &.{ 2, 4 }, replacement);
+}
+
 test "posting backlog stats starts clean" {
     const TestIndex = struct {
         alloc: std.mem.Allocator,
-        metadata: hbc.IndexMetadata = .{ .node_count = 0 },
-        config: types.HBCConfig = .{},
+        metadata: hbc.IndexMetadata = .{
+            .dims = 0,
+            .branching_factor = 0,
+            .leaf_size = 0,
+            .node_count = 0,
+        },
+        config: types.HBCConfig = .{ .dims = 0 },
+
+        fn loadNode(_: *@This(), _: anytype, _: u64) !types.Node {
+            return error.NotFound;
+        }
     };
     var index = TestIndex{ .alloc = std.testing.allocator };
     const txn = {};
@@ -1344,4 +1898,19 @@ test "flat centroid directory match includes publish generation" {
 
     try std.testing.expect(directoryMatches(&directory, 11, 42, 7));
     try std.testing.expect(!directoryMatches(&directory, 11, 42, 8));
+}
+
+test "flat centroid build failures retry only request-local outcomes" {
+    for ([_]anyerror{ error.Cancelled, error.StalePublishedSnapshot }) |err| {
+        switch (flatCentroidBuildFailureOutcome(err)) {
+            .retry => {},
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    for ([_]anyerror{ error.Canceled, error.ResourceBudgetExceeded }) |expected| {
+        switch (flatCentroidBuildFailureOutcome(expected)) {
+            .failed => |err| try std.testing.expectEqual(expected, err),
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }

@@ -25,7 +25,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
         pub const reader = struct {
             pub const DecodeLimits = struct {
                 max_decoded_stream_bytes: usize = 64 * 1024 * 1024,
-                max_working_set_bytes: usize = 96 * 1024 * 1024,
+                max_working_set_bytes: usize = 128 * 1024 * 1024,
             };
 
             pub const Reader = struct {

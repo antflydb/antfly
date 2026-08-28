@@ -136,6 +136,11 @@ pub const ArgReduceAttrs = struct {
 
 pub const ReshapeAttrs = struct {
     new_shape: Shape,
+    /// ONNX Reshape may compute its target from request-dependent shape
+    /// arithmetic. In that case input 1 carries the exact target dimensions
+    /// and the static new_shape is only an import/planning approximation.
+    runtime_shape: bool = false,
+    allow_zero: bool = false,
 };
 
 pub const TransposeAttrs = struct {
@@ -178,6 +183,7 @@ pub const TakeRowsAttrs = struct {
 
 pub const GatherAttrs = struct {
     axis: u8 = 0,
+    elements: bool = false,
 };
 
 pub const ScatterAddAttrs = struct {
@@ -328,6 +334,7 @@ pub const MoeScatterAddAttrs = struct {
 };
 
 pub const MoeSelectRoutesAttrs = struct {
+    layer_index: u32 = 0,
     rows: u32,
     num_experts: u32,
     top_k: u32,

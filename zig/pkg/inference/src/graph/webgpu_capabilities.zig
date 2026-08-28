@@ -283,6 +283,7 @@ fn webGpuNodeHasSupportedShape(query: CapabilityQuery) bool {
     const node = query.graph.node(query.node_id);
     if (node.output_shape.numElements() == null and node.output_shape.maxElements() == null) return false;
     return switch (query.op) {
+        .reshape => |attrs| !attrs.runtime_shape,
         .fused_linear_no_bias, .fused_linear_no_bias_pair => |attrs| webGpuLinearAttrsHaveSupportedShape(attrs),
         .fused_layer_norm, .fused_rms_norm => |attrs| blk: {
             if (attrs.dim == 0) break :blk false;

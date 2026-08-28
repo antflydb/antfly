@@ -889,9 +889,17 @@ state machine has validated it. Index serviceability is therefore:
 ```text
 runtime index loaded
     and no quarantined load failure
-    and no repair intent in detected..validating
+    and no blocking repair intent in detected..validating
     and clean projection checkpoint matches the active config and generation
 ```
+
+The managed progressive-admission intent is the narrow exception to the repair
+gate: while it remains in `detected`, the canonical generation may serve only
+after the generation-scoped partial-publication proof succeeds. That proof is
+defined in [DB.md](DB.md#publication-policy-and-readiness) and requires matching
+catalog, coverage, admission, and durable projection identities plus the
+engine-specific physical invariant. It does not make a shadow candidate or an
+arbitrary repair intent queryable.
 
 An intent in `cleanup` does not block queries after the replacement has passed
 validation and the clean checkpoint is durable. A crash after pointer swap but
@@ -1640,6 +1648,12 @@ when an explicit operation needs both:
 
 - permission to build cross-transaction structural state, and
 - continued service from a previous complete index
+
+Progressive initial admission is not generation replacement: it publishes
+durable checkpoints of the canonical generation under the stricter managed
+admission proof in [DB.md](DB.md#publication-policy-and-readiness). Atomic
+initial admission and replacement rebuilds continue to use the isolated
+candidate flow below.
 
 Examples include a full rebuild of a live index or a large import replacing an
 existing index.
