@@ -1764,11 +1764,10 @@ fn aggregateIndexStatusIndexed(
                 aggregate.load_error = load_error;
             }
         }
-        const repair_proves_catch_up_serviceability = runtime.metadata.freshness == .catching_up and
-            publicIndexRepairState(item) != null and
+        const repair_proves_serviceability = publicIndexRepairState(item) != null and
             item.index_repair_active_generation_serviceable;
-        const identity_scoped_transition_observation =
-            (item.runtime_observation_serviceable or repair_proves_catch_up_serviceability) and
+        const identity_scoped_transition_observation = runtime.metadata.freshness == .catching_up and
+            (item.runtime_observation_serviceable or repair_proves_serviceability) and
             (item.kind == .dense_vector or item.kind == .sparse_vector) and
             item.coverage_identity_ready and
             item.coverage_summary_ready and
@@ -2798,6 +2797,7 @@ test "opening embeddings observation cannot publish cached queryability" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "semantic_idx",
         .kind = .dense_vector,
+        .runtime_observation_serviceable = true,
         .doc_count = 2,
         .node_count = 1,
         .coverage_produced_count = 2,
@@ -2809,6 +2809,44 @@ test "opening embeddings observation cannot publish cached queryability" {
     const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 7,
         .metadata = .{ .source = .startup_catch_up, .freshness = .opening },
+        .stats = .{
+            .source_doc_count = 2,
+            .doc_count = 2,
+            .index_count = 1,
+            .indexes = indexes[0..],
+        },
+    }};
+    const aggregate = aggregateIndexStatusIndexed(
+        &runtimes,
+        "semantic_idx",
+        &.{7},
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(@as(u64, 0), aggregate.fresh_group_count);
+    try std.testing.expectEqual(@as(u64, 1), aggregate.stale_group_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), aggregate.coverage_produced_count);
+}
+
+test "stale embeddings observation cannot publish cached queryability" {
+    var indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .runtime_observation_serviceable = true,
+        .doc_count = 2,
+        .node_count = 1,
+        .coverage_produced_count = 2,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 7,
+        .metadata = .{ .source = .cached_snapshot, .freshness = .stale },
         .stats = .{
             .source_doc_count = 2,
             .doc_count = 2,

@@ -14341,6 +14341,7 @@ pub const DataServer = struct {
         status.metadata.source = source;
         status.metadata.freshness = freshness;
         status.metadata.updated_at_ns = platform_time.monotonicNs();
+        runtime_status.clearInactiveRuntimeObservationServiceability(status);
     }
 
     fn syntheticConfiguredRuntimeStatus(

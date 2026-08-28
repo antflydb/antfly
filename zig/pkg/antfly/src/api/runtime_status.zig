@@ -822,11 +822,11 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
             same_runtime_root and
             previous_observation_serviceable and
             !cached.runtime_observation_stale and
-            cached.coverage_summary_ready;
+            cached.coverage_summary_ready and
+            indexHasPublishedGenerationVisibility(cached, previous.stats.source_doc_count);
         dst.runtime_observation_serviceable = serviceable_catch_up_continuity;
         const visibility_regressed_without_newer_replay = serviceable_catch_up_continuity and
             target_not_older and
-            indexHasPublishedGenerationVisibility(cached, previous.stats.source_doc_count) and
             !indexHasPublishedGenerationVisibility(dst.*, incoming.stats.source_doc_count) and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
         if (!applied_regressed and !projection_regressed and !visibility_regressed_without_newer_replay) continue;
@@ -985,6 +985,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     if (placeholder.stats.indexes.len == 0) {
         var cloned = try previous.clone(alloc);
         cloned.metadata = cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns);
+        clearInactiveRuntimeObservationServiceability(&cloned);
         return cloned;
     }
 
@@ -1010,7 +1011,16 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
         dst.name = owned_name;
     }
     merged.metadata = cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns);
+    clearInactiveRuntimeObservationServiceability(&merged);
     return merged;
+}
+
+// The proof is meaningful only while the exact runtime observation is in its
+// catch-up transition. Relabeling a cached snapshot must not let the proof
+// hitchhike into stale/opening/fresh status and later be reused.
+pub fn clearInactiveRuntimeObservationServiceability(status: *LocalTableRuntimeStatus) void {
+    if (status.metadata.freshness == .catching_up) return;
+    for (status.stats.indexes) |*item| item.runtime_observation_serviceable = false;
 }
 
 fn cachedSnapshotMetadata(
@@ -2807,6 +2817,41 @@ test "catching up observation cannot preserve across an lsm root change" {
     try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
 }
 
+test "unpublished embeddings incarnation cannot mint catch up serviceability" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+        .stats = .{ .source_doc_count = 2, .doc_count = 2, .index_count = 1, .indexes = previous_indexes[0..] },
+    };
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    var incoming = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+        .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
+    };
+
+    preserveArtifactVisibilityOnReplayRegression(previous, &incoming);
+    try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
+    try std.testing.expectEqual(@as(u64, 0), incoming.stats.source_doc_count);
+    try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].coverage_produced_count);
+}
+
 test "empty embeddings incarnation preserves serviceability during catch up" {
     var previous_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
@@ -2840,6 +2885,41 @@ test "empty embeddings incarnation preserves serviceability during catch up" {
     try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expect(incoming.stats.indexes[0].coverage_identity_ready);
     try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
+}
+
+test "synthetic stale relabel clears cached catch up serviceability" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .runtime_observation_serviceable = true,
+        .doc_count = 2,
+        .node_count = 1,
+        .coverage_produced_count = 2,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+        .stats = .{ .source_doc_count = 2, .doc_count = 2, .index_count = 1, .indexes = previous_indexes[0..] },
+    };
+
+    var placeholder_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+    }};
+    const placeholder = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .synthetic_config, .freshness = .stale, .lsm_root_generation = 9 },
+        .stats = .{ .index_count = 1, .indexes = placeholder_indexes[0..] },
+    };
+
+    var merged = try mergeCachedStatusWithSyntheticPlaceholder(std.testing.allocator, previous, placeholder, 100);
+    defer merged.deinit(std.testing.allocator);
+    try std.testing.expectEqual(RuntimeStatusFreshness.stale, merged.metadata.freshness);
+    try std.testing.expect(!merged.stats.indexes[0].runtime_observation_serviceable);
 }
 
 test "all-skipped embeddings incarnation preserves logical publication during catch up" {
