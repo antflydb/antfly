@@ -1157,7 +1157,23 @@ pub fn deriveTableRecord(table_name: []const u8, req: CreateTableRequest) metada
 }
 
 pub fn deriveInitialRange(table: metadata_table_manager.TableRecord) metadata_table_manager.RangeRecord {
-    const group_id = deriveDataGroupId(table.name, 0x47525031);
+    return deriveInitialRangeForGeneration(table, 0);
+}
+
+/// Derives the initial data-group identity for one catalog incarnation.
+/// Generation zero intentionally preserves the historical identity so an
+/// in-place upgrade does not move existing tables. A recreate observes the
+/// durable transition-fence generation left by the preceding drop and gets a
+/// fresh group path, preventing delayed cleanup from touching the new table.
+pub fn deriveInitialRangeForGeneration(
+    table: metadata_table_manager.TableRecord,
+    transition_generation: u64,
+) metadata_table_manager.RangeRecord {
+    const group_id = deriveDataGroupIdForGeneration(
+        table.name,
+        0x47525031,
+        transition_generation,
+    );
     return .{
         .group_id = group_id,
         .range_id = group_id,
@@ -1171,11 +1187,19 @@ pub fn deriveInitialRanges(
     alloc: std.mem.Allocator,
     table: metadata_table_manager.TableRecord,
 ) ![]metadata_table_manager.RangeRecord {
+    return deriveInitialRangesForGeneration(alloc, table, 0);
+}
+
+pub fn deriveInitialRangesForGeneration(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+    transition_generation: u64,
+) ![]metadata_table_manager.RangeRecord {
     if (table.min_ranges == 0) return error.InvalidCreateTableRequest;
     if (table.min_ranges > max_table_initial_ranges)
         return error.CreateTableShardCountOutOfRange;
     if (table.min_ranges <= 1) {
-        const initial_range = deriveInitialRange(table);
+        const initial_range = deriveInitialRangeForGeneration(table, transition_generation);
         const out = try alloc.alloc(metadata_table_manager.RangeRecord, 1);
         out[0] = .{
             .group_id = initial_range.group_id,
@@ -1211,7 +1235,7 @@ pub fn deriveInitialRanges(
             try deriveShardBoundaryKey(alloc, i + 1, shard_count);
         errdefer if (end_key) |value| alloc.free(value);
 
-        const group_id = deriveShardGroupId(table.name, i);
+        const group_id = deriveShardGroupIdForGeneration(table.name, i, transition_generation);
         out[i] = .{
             .group_id = group_id,
             .range_id = group_id,
@@ -3432,11 +3456,40 @@ fn deriveDataGroupId(name: []const u8, seed: u64) u64 {
     return group_ids.dataGroupIdFromHash(std.hash.Wyhash.hash(seed, name));
 }
 
+fn deriveDataGroupIdForGeneration(name: []const u8, seed: u64, transition_generation: u64) u64 {
+    if (transition_generation == 0) return deriveDataGroupId(name, seed);
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update("antfly-table-incarnation-v1");
+    hasher.update(name);
+    var encoded_generation: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded_generation, transition_generation, .little);
+    hasher.update(&encoded_generation);
+    return group_ids.dataGroupIdFromHash(hasher.final());
+}
+
 fn deriveShardGroupId(table_name: []const u8, shard_index: u32) u64 {
     var hasher = std.hash.Wyhash.init(0x47525031);
     hasher.update(table_name);
     hasher.update(&[_]u8{0});
     hasher.update(std.mem.asBytes(&shard_index));
+    return group_ids.dataGroupIdFromHash(hasher.final());
+}
+
+fn deriveShardGroupIdForGeneration(
+    table_name: []const u8,
+    shard_index: u32,
+    transition_generation: u64,
+) u64 {
+    if (transition_generation == 0) return deriveShardGroupId(table_name, shard_index);
+    var hasher = std.hash.Wyhash.init(0x47525031);
+    hasher.update("antfly-table-shard-incarnation-v1");
+    hasher.update(table_name);
+    var encoded: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, transition_generation, .little);
+    hasher.update(&encoded);
+    var encoded_shard: [@sizeOf(u32)]u8 = undefined;
+    std.mem.writeInt(u32, &encoded_shard, shard_index, .little);
+    hasher.update(&encoded_shard);
     return group_ids.dataGroupIdFromHash(hasher.final());
 }
 
@@ -4644,6 +4697,30 @@ test "derive initial ranges honors shard count" {
     try std.testing.expectEqualStrings("c0", ranges[2].end_key.?);
     try std.testing.expectEqualStrings("c0", ranges[3].start_key);
     try std.testing.expect(ranges[3].end_key == null);
+}
+
+test "table recreation derives incarnation-specific data groups" {
+    const table = deriveTableRecord("docs", .{ .num_shards = 4 });
+    const original = try deriveInitialRangesForGeneration(std.testing.allocator, table, 0);
+    defer {
+        for (original) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(original);
+    }
+    const recreated = try deriveInitialRangesForGeneration(std.testing.allocator, table, 2);
+    defer {
+        for (recreated) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(recreated);
+    }
+    const replay = try deriveInitialRangesForGeneration(std.testing.allocator, table, 2);
+    defer {
+        for (replay) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(replay);
+    }
+
+    for (original, recreated, replay) |old_range, new_range, replay_range| {
+        try std.testing.expect(old_range.group_id != new_range.group_id);
+        try std.testing.expectEqual(new_range.group_id, replay_range.group_id);
+    }
 }
 
 test "create table parser rejects zero shards" {

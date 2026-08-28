@@ -2470,7 +2470,6 @@ pub const MetadataService = struct {
         receipt: MetadataProposalReceipt,
         request: api_operation.RequestContext,
     ) !void {
-        try request.ensureActive();
         self.lockRuntime();
         const tracked_receipt = self.raft.host.host.acquireProposalReceipt(
             self.metadata_group_id,
@@ -2487,6 +2486,10 @@ pub const MetadataService = struct {
             );
             self.unlockRuntime();
         };
+        // Acquire before observing cancellation. A proposal can be admitted
+        // immediately before the caller cancels; releasing this lease is what
+        // removes the zero-waiter receipt from the bounded tracker.
+        try request.ensureActive();
 
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
         const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
@@ -2573,6 +2576,21 @@ pub const MetadataService = struct {
             };
         }
         return error.InvalidDerivedCatalogIndex;
+    }
+
+    pub fn captureTableCreateGeneration(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+        table_id: u64,
+    ) !u64 {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        if (try store.getTable(alloc, self.metadata_group_id, table_id)) |existing| {
+            metadata_table_manager.freeTable(alloc, existing);
+            return error.TableAlreadyExists;
+        }
+        const fence = try store.getTableTransitionFence(self.metadata_group_id, table_id);
+        if (fence.active()) return error.TableTransitionActive;
+        return fence.generation;
     }
 
     pub fn lockCatalogMutation(self: *MetadataService) void {
@@ -6363,6 +6381,21 @@ pub const MetadataHttpService = struct {
             };
         }
         return error.InvalidDerivedCatalogIndex;
+    }
+
+    pub fn captureTableCreateGeneration(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+        table_id: u64,
+    ) !u64 {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        if (try store.getTable(alloc, self.metadata_group_id, table_id)) |existing| {
+            metadata_table_manager.freeTable(alloc, existing);
+            return error.TableAlreadyExists;
+        }
+        const fence = try store.getTableTransitionFence(self.metadata_group_id, table_id);
+        if (fence.active()) return error.TableTransitionActive;
+        return fence.generation;
     }
 
     pub fn freeAdminSnapshot(self: *MetadataHttpService, snapshot: *metadata_api.AdminSnapshot) void {

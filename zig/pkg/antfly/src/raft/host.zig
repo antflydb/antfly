@@ -203,6 +203,7 @@ pub const HttpHostConfig = struct {
     executor: transport.StdHttpExecutorConfig = .{},
     transport: transport.HttpTransportStackConfig,
     listener: transport.StdHttpListenerConfig = .{},
+    max_snapshot_bytes: usize = 1 << 30,
 };
 
 pub const HttpHostDeps = struct {
@@ -1006,6 +1007,7 @@ pub const HttpHost = struct {
             errdefer alloc.destroy(snapshot_store);
             snapshot_store.* = try transport.FileSnapshotStore.init(alloc, .{
                 .root_dir = cfg.transport.snapshot.root_dir,
+                .max_snapshot_bytes = cfg.max_snapshot_bytes,
             });
             break :blk snapshot_store;
         } else null;

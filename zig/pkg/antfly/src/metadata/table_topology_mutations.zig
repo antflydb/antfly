@@ -53,7 +53,17 @@ pub fn create(
     try request.ensureActive();
     try svc.ensureTableTopologyProtocolReadyWithContext(request);
     const table = tables_api.deriveTableRecord(table_name, req);
-    const ranges = try tables_api.deriveInitialRanges(alloc, table);
+    // Read the durable fence on the leader while holding the catalog mutation
+    // lock. Its generation is both the apply precondition and the storage
+    // incarnation salt, so a recreate cannot reuse paths owned by an earlier
+    // drop even when post-commit cleanup is delayed or the caller crashes.
+    try svc.ensureLinearizableReadWithContext(request);
+    const transition_generation = try svc.captureTableCreateGeneration(alloc, table.table_id);
+    const ranges = try tables_api.deriveInitialRangesForGeneration(
+        alloc,
+        table,
+        transition_generation,
+    );
     defer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
@@ -64,6 +74,7 @@ pub fn create(
     try request.ensureActive();
     const receipt = svc.proposeTransitionCommandWithReceipt(.{
         .apply_table_topology = .{ .create = .{
+            .expected_transition_generation = transition_generation,
             .table = table,
             .ranges = ranges,
         } },

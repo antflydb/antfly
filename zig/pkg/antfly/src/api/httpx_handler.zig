@@ -4334,7 +4334,7 @@ pub const AntflyApiHandler = struct {
         defer drop_result.deinit(alloc);
         var repair_required = false;
         if (self.api_server.table_writes) |write_source| {
-            _ = write_source.dropTable(alloc, decoded_table_name, drop_result.group_ids) catch |err| switch (err) {
+            _ = write_source.dropTable(alloc, decoded_table_name, drop_result.cleanupContract()) catch |err| switch (err) {
                 error.TableNotFound => null,
                 error.DropCleanupIntentNotDurable => {
                     std.log.err("public drop table committed but cleanup intent was not durable table={s}", .{decoded_table_name});

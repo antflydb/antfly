@@ -12308,7 +12308,7 @@ pub const ApiHttpServer = struct {
         defer drop_result.deinit(self.alloc);
         var repair_required = false;
         if (self.table_writes) |writes| {
-            _ = writes.dropTable(self.alloc, table_name, drop_result.group_ids) catch |err| switch (err) {
+            _ = writes.dropTable(self.alloc, table_name, drop_result.cleanupContract()) catch |err| switch (err) {
                 error.TableNotFound => null,
                 error.DropCleanupIntentNotDurable => {
                     std.log.err("MCP drop table committed but cleanup intent was not durable table={s}", .{table_name});
@@ -35346,11 +35346,11 @@ test "api http server drop table waits for metadata lifecycle absence" {
             return;
         }
 
-        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, group_ids: []const u64) !?void {
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, contract: table_writes.DropCleanupContract) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            try std.testing.expectEqual(@as(usize, 1), group_ids.len);
-            self.observed_group_id = group_ids[0];
+            try std.testing.expectEqual(@as(usize, 1), contract.group_ids.len);
+            self.observed_group_id = contract.group_ids[0];
             if (self.fail_cleanup) return error.InjectedCleanupFailure;
         }
     };
@@ -37871,10 +37871,10 @@ test "api http server cluster overwrite restores from read-only repository witho
             return error.UnsupportedOperation;
         }
 
-        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, group_ids: []const u64) !?void {
+        fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, contract: table_writes.DropCleanupContract) !?void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", table_name);
-            _ = group_ids;
+            _ = contract;
             self.state.local_drop_called = true;
             return error.TestUnexpectedResult;
         }

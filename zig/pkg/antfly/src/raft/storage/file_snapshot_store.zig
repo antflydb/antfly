@@ -57,6 +57,7 @@ pub const FileSnapshotStore = struct {
         _ = alloc;
         const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
         try validateSnapshotId(snapshot_id);
+        if (body.len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         const path = try self.snapshotPath(snapshot_id);
         defer self.alloc.free(path);
 
@@ -124,4 +125,23 @@ test "file snapshot store rejects invalid snapshot ids" {
     defer store.deinit();
 
     try std.testing.expectError(error.InvalidSnapshotId, store.store().putSnapshot(std.testing.allocator, "../bad", "x"));
+}
+
+test "file snapshot store rejects oversized uploads before persistence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
+
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{
+        .root_dir = root_dir,
+        .max_snapshot_bytes = 4,
+    });
+    defer store.deinit();
+
+    try std.testing.expectError(
+        error.SnapshotTooLarge,
+        store.store().putSnapshot(std.testing.allocator, "snap-large", "12345"),
+    );
 }

@@ -27,6 +27,7 @@ const metadata_mod = @import("../metadata/domain.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_provisioner = @import("../metadata/table_provisioner.zig");
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_mod = @import("../raft/mod.zig");
 const backup_restore = @import("../raft/storage/backup_restore.zig");
@@ -466,7 +467,8 @@ fn consumeTestWriterOpenPersistentDescriptorFailure() bool {
 
 const dropped_table_trash_dir_name = ".antfly-drop-trash";
 const dropped_table_repair_dir_name = ".antfly-drop-repair";
-const dropped_table_repair_magic = "AFDROP1\x00";
+const dropped_table_repair_magic_v1 = "AFDROP1\x00";
+const dropped_table_repair_magic = "AFDROP2\x00";
 const max_dropped_table_repair_bytes: usize = 256 * 1024 * 1024;
 const max_dropped_table_repair_name_bytes: usize = 16 * 1024;
 
@@ -968,16 +970,20 @@ fn droppedTableRepairIntentPath(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     table_name: []const u8,
-    group_ids: []const u64,
+    contract: metadata_topology_protocol.DropCleanupContract,
 ) ![]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     var encoded_len: [8]u8 = undefined;
     std.mem.writeInt(u64, &encoded_len, table_name.len, .little);
     hasher.update(&encoded_len);
     hasher.update(table_name);
-    std.mem.writeInt(u64, &encoded_len, group_ids.len, .little);
+    std.mem.writeInt(u64, &encoded_len, contract.table_id, .little);
     hasher.update(&encoded_len);
-    for (group_ids) |group_id| {
+    std.mem.writeInt(u64, &encoded_len, contract.expected_transition_generation, .little);
+    hasher.update(&encoded_len);
+    std.mem.writeInt(u64, &encoded_len, contract.group_ids.len, .little);
+    hasher.update(&encoded_len);
+    for (contract.group_ids) |group_id| {
         std.mem.writeInt(u64, &encoded_len, group_id, .little);
         hasher.update(&encoded_len);
     }
@@ -993,6 +999,8 @@ fn droppedTableRepairIntentPath(
 
 const DroppedTableRepairIntent = struct {
     table_name: []u8,
+    table_id: u64,
+    expected_transition_generation: u64,
     group_ids: []u64,
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
@@ -1006,16 +1014,17 @@ fn persistDroppedTableRepairIntent(
     alloc: std.mem.Allocator,
     replica_root_dir: []const u8,
     table_name: []const u8,
-    group_ids: []const u64,
+    contract: metadata_topology_protocol.DropCleanupContract,
 ) ![]u8 {
+    const group_ids = contract.group_ids;
     if (table_name.len > max_dropped_table_repair_name_bytes) return error.NameTooLong;
     const payload_bytes = std.math.add(usize, table_name.len, std.math.mul(usize, group_ids.len, @sizeOf(u64)) catch return error.DropRepairIntentTooLarge) catch return error.DropRepairIntentTooLarge;
     const checksum_len = std.crypto.hash.sha2.Sha256.digest_length;
-    if (payload_bytes > max_dropped_table_repair_bytes - 20 - checksum_len) return error.DropRepairIntentTooLarge;
+    if (payload_bytes > max_dropped_table_repair_bytes - 36 - checksum_len) return error.DropRepairIntentTooLarge;
 
     const repair_dir = try droppedTableRepairDirPath(alloc, replica_root_dir);
     defer alloc.free(repair_dir);
-    const path = try droppedTableRepairIntentPath(alloc, replica_root_dir, table_name, group_ids);
+    const path = try droppedTableRepairIntentPath(alloc, replica_root_dir, table_name, contract);
     errdefer alloc.free(path);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
@@ -1038,6 +1047,12 @@ fn persistDroppedTableRepairIntent(
         try writer.interface.writeAll(encoded[0..4]);
         checksum.update(encoded[0..4]);
         std.mem.writeInt(u64, &encoded, @intCast(group_ids.len), .little);
+        try writer.interface.writeAll(&encoded);
+        checksum.update(&encoded);
+        std.mem.writeInt(u64, &encoded, contract.table_id, .little);
+        try writer.interface.writeAll(&encoded);
+        checksum.update(&encoded);
+        std.mem.writeInt(u64, &encoded, contract.expected_transition_generation, .little);
         try writer.interface.writeAll(&encoded);
         checksum.update(&encoded);
         try writer.interface.writeAll(table_name);
@@ -1066,28 +1081,40 @@ fn loadDroppedTableRepairIntent(
     const encoded = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(max_dropped_table_repair_bytes));
     defer alloc.free(encoded);
     const checksum_len = std.crypto.hash.sha2.Sha256.digest_length;
-    if (encoded.len < 20 + checksum_len or !std.mem.eql(u8, encoded[0..8], dropped_table_repair_magic)) return error.InvalidDropRepairIntent;
+    if (encoded.len < 20 + checksum_len) return error.InvalidDropRepairIntent;
+    const is_v2 = std.mem.eql(u8, encoded[0..8], dropped_table_repair_magic);
+    const is_v1 = std.mem.eql(u8, encoded[0..8], dropped_table_repair_magic_v1);
+    if (!is_v2 and !is_v1) return error.InvalidDropRepairIntent;
     const name_len: usize = std.mem.readInt(u32, encoded[8..12], .little);
     const group_count_u64 = std.mem.readInt(u64, encoded[12..20], .little);
+    const header_len: usize = if (is_v2) 36 else 20;
+    if (encoded.len < header_len + checksum_len) return error.InvalidDropRepairIntent;
+    const table_id = if (is_v2) std.mem.readInt(u64, encoded[20..28], .little) else 0;
+    const expected_transition_generation = if (is_v2) std.mem.readInt(u64, encoded[28..36], .little) else 0;
     const group_count = std.math.cast(usize, group_count_u64) orelse return error.InvalidDropRepairIntent;
     if (name_len > max_dropped_table_repair_name_bytes) return error.InvalidDropRepairIntent;
     const group_bytes = std.math.mul(usize, group_count, @sizeOf(u64)) catch return error.InvalidDropRepairIntent;
-    const payload_end = std.math.add(usize, 20 + name_len, group_bytes) catch return error.InvalidDropRepairIntent;
+    const payload_end = std.math.add(usize, header_len + name_len, group_bytes) catch return error.InvalidDropRepairIntent;
     const expected_len = std.math.add(usize, payload_end, checksum_len) catch return error.InvalidDropRepairIntent;
     if (expected_len != encoded.len) return error.InvalidDropRepairIntent;
     var actual_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded[0..payload_end], &actual_digest, .{});
     if (!std.mem.eql(u8, &actual_digest, encoded[payload_end..])) return error.InvalidDropRepairIntent;
-    const table_name = try alloc.dupe(u8, encoded[20 .. 20 + name_len]);
+    const table_name = try alloc.dupe(u8, encoded[header_len .. header_len + name_len]);
     errdefer alloc.free(table_name);
     const group_ids = try alloc.alloc(u64, group_count);
     errdefer alloc.free(group_ids);
-    var offset = 20 + name_len;
+    var offset = header_len + name_len;
     for (group_ids) |*group_id| {
         group_id.* = std.mem.readInt(u64, encoded[offset..][0..8], .little);
         offset += 8;
     }
-    return .{ .table_name = table_name, .group_ids = group_ids };
+    return .{
+        .table_name = table_name,
+        .table_id = table_id,
+        .expected_transition_generation = expected_transition_generation,
+        .group_ids = group_ids,
+    };
 }
 
 fn droppedTableTrashPath(
@@ -3927,6 +3954,7 @@ const TestEmbeddingRequest = struct {
 };
 
 pub const TableWriteSource = table_write_source.TableWriteSource;
+pub const DropCleanupContract = metadata_topology_protocol.DropCleanupContract;
 
 const LegacyTableWriteSource = struct {
     ptr: *anyopaque,
@@ -3975,7 +4003,7 @@ const LegacyTableWriteSource = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
-            group_ids: []const u64,
+            contract: metadata_topology_protocol.DropCleanupContract,
         ) anyerror!?void = null,
         backup_table: ?*const fn (
             ptr: *anyopaque,
@@ -4335,10 +4363,10 @@ const LegacyTableWriteSource = struct {
         self: TableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        group_ids: []const u64,
+        contract: metadata_topology_protocol.DropCleanupContract,
     ) !?void {
         const fn_ptr = self.vtable.drop_table orelse return null;
-        return try fn_ptr(self.ptr, alloc, table_name, group_ids);
+        return try fn_ptr(self.ptr, alloc, table_name, contract);
     }
 
     pub fn backupTable(
@@ -6974,7 +7002,11 @@ pub const ProvisionedTableWriteSource = struct {
                 continue;
             };
             defer intent.deinit(alloc);
-            self.executeDroppedTableCleanup(alloc, intent.table_name, intent.group_ids, false) catch |err| {
+            self.executeDroppedTableCleanup(alloc, intent.table_name, .{
+                .table_id = intent.table_id,
+                .expected_transition_generation = intent.expected_transition_generation,
+                .group_ids = intent.group_ids,
+            }, false) catch |err| {
                 std.log.warn("dropped-table repair deferred table={s} path={s} err={s}", .{ intent.table_name, path, @errorName(err) });
                 continue;
             };
@@ -14962,9 +14994,10 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        group_ids: []const u64,
+        contract: metadata_topology_protocol.DropCleanupContract,
         retire_publication_authority: bool,
     ) !void {
+        const group_ids = contract.group_ids;
         // A durable index repair owns group admission while it advances one
         // bounded build slice. Publish cancellation before waiting for the
         // table-wide structural barrier so dropping a table cannot sit behind
@@ -14972,7 +15005,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (group_ids) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .cancel);
         }
-        defer for (group_ids) |group_id| {
+        errdefer for (group_ids) |group_id| {
             self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
         };
 
@@ -14986,11 +15019,20 @@ pub const ProvisionedTableWriteSource = struct {
                 self.abortLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
             }
         };
-        // Publication handoffs are process-local and belong to the table
-        // incarnation that just committed its drop. Retire them before the
-        // first fallible cleanup step. A later durable replay skips this step
-        // so a newly created table with the same name remains authoritative.
-        if (retire_publication_authority) {
+        // A restore may intentionally republish historical group ids, and an
+        // older binary may have created a same-name table without incarnation
+        // salting. Once local structural admission is exclusive, snapshot the
+        // current catalog and fence every currently-owned group from cleanup.
+        // If publication races after this read, its local provisioning waits
+        // on the same barrier and therefore starts only after old paths move.
+        var current_catalog = try self.catalog.adminSnapshot();
+        defer self.catalog.freeAdminSnapshot(&current_catalog);
+        // Publication handoffs are name-scoped process state. Retire them only
+        // while the committed catalog still confirms absence; a delayed
+        // initial cleanup must not revoke authority from a replacement table.
+        if (retire_publication_authority and
+            tables_api.findTableByName(&current_catalog, table_name) == null)
+        {
             self.retireDroppedTablePublicationAuthority(table_name);
         }
         var read_cache_exclusive = try self.beginReadCacheExclusive(table_name);
@@ -15003,6 +15045,13 @@ pub const ProvisionedTableWriteSource = struct {
 
         var moved_any_group = false;
         for (group_ids) |group_id| {
+            if (metadata_mod.findAdminRange(&current_catalog, group_id) != null) {
+                std.log.info(
+                    "dropped-table cleanup fenced by current catalog ownership table={s} table_id={d} generation={d} group_id={d}",
+                    .{ table_name, contract.table_id, contract.expected_transition_generation, group_id },
+                );
+                continue;
+            }
             const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
             defer alloc.free(path);
             self.invalidateSharedPathCaches(path);
@@ -15025,7 +15074,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.finishLocalStructuralMutationUnlockedForGroups(table_name, group_ids);
         structural_mutation_active = false;
         for (group_ids) |group_id| {
-            self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+            if (metadata_mod.findAdminRange(&current_catalog, group_id) != null) {
+                // The cancellation may have raced a replacement-table repair
+                // before the post-barrier catalog fence identified ownership.
+                // Restore its runnable state instead of deleting live debt.
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .enqueue_runnable);
+            } else {
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .remove);
+                self.notifyLocalIndexRepairDebt(table_name, group_id, .clear_cancel);
+            }
         }
         self.notifyLocalChange(table_name, .structural);
     }
@@ -15034,10 +15092,11 @@ pub const ProvisionedTableWriteSource = struct {
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        group_ids: []const u64,
+        contract: metadata_topology_protocol.DropCleanupContract,
     ) !?void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
-        if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, group_ids);
+        if (self.localWriteOwnerSource()) |owner| return try owner.dropTable(alloc, table_name, contract);
+        const group_ids = contract.group_ids;
         if (group_ids.len == 0) return null;
 
         // Metadata has already committed. Persist the exact cleanup contract
@@ -15047,14 +15106,14 @@ pub const ProvisionedTableWriteSource = struct {
             alloc,
             self.replica_root_dir,
             table_name,
-            group_ids,
+            contract,
         ) catch return error.DropCleanupIntentNotDurable;
         defer alloc.free(intent_path);
 
         // This is convergence for a metadata mutation that has already
         // committed, not admission of a new user write. It must run on a
         // standby as well as the active writer owner.
-        self.executeDroppedTableCleanup(alloc, table_name, group_ids, true) catch |err| {
+        self.executeDroppedTableCleanup(alloc, table_name, contract, true) catch |err| {
             if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
             return err;
         };
@@ -28048,7 +28107,7 @@ test "provisioned native backup restore repeats through shared read and write ow
             .sync_level = .full_text,
         });
 
-        _ = try source.source().dropTable(alloc, "docs", &.{7001});
+        _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
         _ = try source.source().createTable(alloc, "docs", .{});
 
         _ = try source.source().restoreTable(alloc, "docs", .{
@@ -42853,7 +42912,7 @@ test "provisioned table write source drop table cancels index repair before stru
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }
@@ -42936,7 +42995,7 @@ test "provisioned table drop persists cleanup intent before filesystem failure a
         var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
         defer source.deinit();
         var cleanup_failed = false;
-        _ = source.source().dropTable(alloc, "docs", &.{7001}) catch blk: {
+        _ = source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch blk: {
             cleanup_failed = true;
             break :blk null;
         };
@@ -42950,6 +43009,13 @@ test "provisioned table drop persists cleanup intent before filesystem failure a
         var iterator = repair_dir.iterate();
         const entry = (try iterator.next(io_impl.io())) orelse return error.MissingDropRepairIntent;
         try std.testing.expect(std.mem.endsWith(u8, entry.name, ".bin"));
+        const intent_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ repair_dir_path, entry.name });
+        defer alloc.free(intent_path);
+        var intent = try loadDroppedTableRepairIntent(alloc, io_impl.io(), intent_path);
+        defer intent.deinit(alloc);
+        try std.testing.expectEqual(@as(u64, 7), intent.table_id);
+        try std.testing.expectEqual(@as(u64, 1), intent.expected_transition_generation);
+        try std.testing.expectEqualSlices(u64, &.{7001}, intent.group_ids);
     }
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), trash_dir_path);
 
@@ -43007,7 +43073,7 @@ test "provisioned table write source drop table retires old publication authorit
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("docs"));
     try std.testing.expect(source.structuralStatusSnapshotOnlyBestEffort("other"));
 
-    _ = try source.source().dropTable(alloc, "docs", &.{7001});
+    _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
 
     // A same-name table with a different group incarnation must immediately be
     // eligible for live status; no deleted group can publish another release.
@@ -43063,7 +43129,7 @@ test "provisioned table write source drop table does not hold local db mutex dur
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }
@@ -43179,7 +43245,7 @@ test "provisioned table write source drop table waits for in-flight group batch 
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }
@@ -43284,7 +43350,7 @@ test "provisioned table write source drop table closes schema-bearing cached wri
         .writes = &.{.{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"content\":\"body\"}" }},
         .sync_level = .write,
     });
-    _ = try source.source().dropTable(alloc, "docs", &.{7001});
+    _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
 }
@@ -43370,7 +43436,7 @@ test "provisioned table write source drop table waits for active read cache leas
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", &.{7001}) catch |err| {
+            _ = self.source.source().dropTable(std.heap.page_allocator, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} }) catch |err| {
                 self.err = err;
             };
         }

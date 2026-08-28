@@ -42,15 +42,19 @@ fn isExpectedControlRoundError(err: anyerror) bool {
     return antfly.metadata.authority.isRetryableError(err);
 }
 
+const metadata_raft_max_single_ready_bytes: usize = 256 * 1024 * 1024;
+
 fn metadataRaftRuntimeConfig() raft_engine.runtime.RuntimeConfig {
     return .{
         .max_tick_batch = 32,
         .max_pending_outbound_messages = 4096,
         .max_pending_outbound_bytes = 16 * 1024 * 1024,
+        .max_single_outbound_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_transport_messages_per_round = 64,
         .max_transport_bytes_per_round = 512 * 1024,
         .max_pending_apply_tasks = 1024,
         .max_pending_apply_bytes = 16 * 1024 * 1024,
+        .max_single_apply_ready_bytes = metadata_raft_max_single_ready_bytes,
         .max_apply_tasks_per_round = 16,
         .applied_log_retained_entries = metadata_raft_retained_entries,
         .applied_log_compaction_min_interval_entries = metadata_raft_compaction_min_interval_entries,
@@ -493,6 +497,7 @@ pub const Server = struct {
                         .trace_logger = if (build_options.with_tla) tracing.stderrRaftTraceLogger() else null,
                     },
                     .listener = antfly.raft.httpListenerConfig(result.bind_host, cfg.bind_port),
+                    .max_snapshot_bytes = metadata_raft_max_single_ready_bytes,
                     .transport = .{
                         .snapshot = .{
                             .root_dir = result.snapshot_root_dir,

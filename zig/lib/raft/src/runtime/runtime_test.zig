@@ -2096,6 +2096,7 @@ test "multi raft drainReady admits one oversized outbound ready only into an emp
     var host = runtime.MultiRaft.init(std.testing.allocator, .{
         .max_pending_outbound_messages = 8,
         .max_pending_outbound_bytes = 1,
+        .max_single_outbound_ready_bytes = 4096,
         .max_transport_messages_per_round = 0,
     }, .{ .transport = transport.iface() });
     defer host.deinit();
@@ -2175,6 +2176,7 @@ test "multi raft drainReady admits one oversized apply ready only into an empty 
     var host = runtime.MultiRaft.init(std.testing.allocator, .{
         .max_pending_apply_tasks = 8,
         .max_pending_apply_bytes = 1,
+        .max_single_apply_ready_bytes = 4096,
         .max_apply_tasks_per_round = 0,
     }, .{
         .group_storage = storage_recorder.iface(),
@@ -2215,6 +2217,64 @@ test "multi raft drainReady always makes progress on one oversized Ready" {
 
     try std.testing.expectEqual(@as(usize, 1), (try host.drainReady(1)).processed_ready_steps);
     try std.testing.expect(!host.group(257).?.hasReady());
+}
+
+test "multi raft drainReady never exceeds the single Ready hard ceiling" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_outbound_bytes = 1,
+        .max_single_outbound_ready_bytes = 1,
+    }, .{});
+    defer host.deinit();
+
+    var peers = [_]core.types.NodeId{ 1, 2 };
+    try host.addGroup(.{
+        .group_id = 258,
+        .local_node_id = 1,
+        .raft_config = .{
+            .id = 1,
+            .group_id = 258,
+            .peers = peers[0..],
+            .election_tick = 5,
+            .heartbeat_tick = 1,
+            .pre_vote = false,
+        },
+        .storage = store.storage(),
+    });
+    try host.campaignGroup(258);
+
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_bytes);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().transport_queue_denials);
+    try std.testing.expect(host.group(258).?.hasReady());
+}
+
+test "multi raft drainReady never exceeds the single apply Ready hard ceiling" {
+    var store = core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+
+    var storage_recorder = StorageRecorder{ .alloc = std.testing.allocator };
+    defer storage_recorder.deinit();
+    try storage_recorder.registerStore(259, &store);
+    var apply_recorder = ApplyRecorder{ .alloc = std.testing.allocator };
+    var host = runtime.MultiRaft.init(std.testing.allocator, .{
+        .max_pending_apply_bytes = 1,
+        .max_single_apply_ready_bytes = 1,
+    }, .{
+        .group_storage = storage_recorder.iface(),
+        .state_machine = apply_recorder.iface(),
+    });
+    defer host.deinit();
+
+    try addSingleNodeGroup(&host, 259, &store, false);
+    try host.campaignGroup(259);
+
+    try std.testing.expectEqual(@as(usize, 0), (try host.drainReady(1)).processed_ready_steps);
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_apply_bytes);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().apply_queue_denials);
+    try std.testing.expect(host.group(259).?.hasReady());
 }
 
 test "multi raft removal drops pending applies and retires replica storage" {

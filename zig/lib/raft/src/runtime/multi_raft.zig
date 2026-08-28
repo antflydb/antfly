@@ -31,10 +31,17 @@ pub const RuntimeConfig = struct {
     max_tick_batch: usize = 128,
     max_pending_outbound_messages: usize = std.math.maxInt(usize),
     max_pending_outbound_bytes: usize = std.math.maxInt(usize),
+    /// Hard ceiling for the one-Ready liveness exception when the outbound
+    /// queue is empty. Unlike the backlog limit, this is never exceeded.
+    max_single_outbound_ready_bytes: usize = std.math.maxInt(usize),
     max_transport_messages_per_round: usize = std.math.maxInt(usize),
     max_transport_bytes_per_round: usize = std.math.maxInt(usize),
     max_pending_apply_tasks: usize = std.math.maxInt(usize),
     max_pending_apply_bytes: usize = std.math.maxInt(usize),
+    /// Hard ceiling for the one-Ready liveness exception when the apply queue
+    /// is empty. Operators should size this above the largest accepted entry
+    /// or snapshot representation while keeping it below an OOM-scale value.
+    max_single_apply_ready_bytes: usize = std.math.maxInt(usize),
     max_apply_tasks_per_round: usize = std.math.maxInt(usize),
     applied_log_retained_entries: u64 = 4096,
     applied_log_compaction_min_interval_entries: u64 = 4096,
@@ -1053,7 +1060,8 @@ pub const MultiRaft = struct {
         const outbound_single_ready_progress =
             self.pending_outbox.items.items.len == 0 and
             outbox.items.items.len == 0 and
-            ready_pressure.message_count <= self.cfg.max_pending_outbound_messages;
+            ready_pressure.message_count <= self.cfg.max_pending_outbound_messages and
+            ready_pressure.message_bytes <= self.cfg.max_single_outbound_ready_bytes;
         if (!outbound_capacity_available and !outbound_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);
@@ -1069,7 +1077,8 @@ pub const MultiRaft = struct {
             apply_ready_bytes,
         );
         const apply_single_ready_progress = self.pending_apply.items.len == 0 and
-            new_apply_tasks <= self.cfg.max_pending_apply_tasks;
+            new_apply_tasks <= self.cfg.max_pending_apply_tasks and
+            apply_ready_bytes <= self.cfg.max_single_apply_ready_bytes;
         if (!apply_capacity_available and !apply_single_ready_progress) {
             if (diagnostics) |diag| {
                 diag.capacity_check_elapsed_ns = clock.elapsedSinceNs(capacity_check_start_ns);

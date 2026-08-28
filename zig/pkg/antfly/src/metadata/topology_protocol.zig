@@ -16,8 +16,10 @@ const std = @import("std");
 
 /// Wire capability required to decode atomic table-topology transitions.
 /// Version 2 replaces the unbounded explicit range-id list in table drops
-/// with a fixed-size membership contract.
-pub const current_version: u16 = 2;
+/// with a fixed-size membership contract. Version 3 fences create against the
+/// replicated transition generation so recreated tables receive fresh data
+/// group identities and stale drop cleanup cannot delete their storage.
+pub const current_version: u16 = 3;
 
 /// Creating thousands of Raft groups is an operational workflow, not one
 /// catalog request. Keep one create bounded in CPU, memory, and log growth.
@@ -50,6 +52,22 @@ pub const DropResult = struct {
         alloc.free(self.group_ids);
         self.* = undefined;
     }
+
+    pub fn cleanupContract(self: @This()) DropCleanupContract {
+        return .{
+            .table_id = self.table_id,
+            .expected_transition_generation = self.expected_transition_generation,
+            .group_ids = self.group_ids,
+        };
+    }
+};
+
+/// Borrowed storage-cleanup view of a committed drop. Keeping ownership out of
+/// the callback ABI lets request handlers retain and free the routed result.
+pub const DropCleanupContract = struct {
+    table_id: u64,
+    expected_transition_generation: u64,
+    group_ids: []const u64,
 };
 
 pub const range_membership_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
