@@ -3057,8 +3057,8 @@ components:
           maximum: 64
           default: 1
           description: Maximum traversal depth. Defaults to one hop to keep fan-out explicit.
-        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
-        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        min_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
         limit:
           type: integer
           minimum: 1
@@ -3145,8 +3145,8 @@ components:
           minimum: 1
           maximum: 64
           default: 10
-        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
-        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        min_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
         weight_mode: { $ref: '#/components/schemas/PathWeightMode' }
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
@@ -3188,8 +3188,8 @@ components:
           minimum: 1
           maximum: 64
           default: 10
-        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
-        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        min_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
         weight_mode: { $ref: '#/components/schemas/PathWeightMode' }
         filter:
           $ref: '#/components/schemas/GraphDocumentFilter'
@@ -3267,8 +3267,8 @@ components:
           minimum: 1
           maximum: 64
           default: 1
-        min_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
-        max_weight: { type: number, format: double, x-go-type-skip-optional-pointer: false }
+        min_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
+        max_weight: { type: number, format: double, minimum: 0, x-go-type-skip-optional-pointer: false }
     GraphAliasOperand:
       type: object
       additionalProperties: false

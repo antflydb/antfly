@@ -649,6 +649,34 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match=r"not_exists\.edges\[0\]\.direction must be out, in, or both"):
             client.query(table="docs", graph_queries={"people": anti_join_query})
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            {
+                "match": {
+                    "anchor": "person",
+                    "nodes": {"person": {}, "author": {}},
+                    "edges": [{"from": "person", "to": "author", "min_weight": -0.1}],
+                },
+                "return": {"bindings": ["person"]},
+            },
+            {"traverse": {"start": {"keys": ["doc:a"]}, "max_weight": -0.1}},
+            {"shortest_path": {"from": {"key": "doc:a"}, "to": {"key": "doc:b"}, "min_weight": -0.1}},
+            {
+                "k_shortest_paths": {
+                    "from": {"key": "doc:a"},
+                    "to": {"key": "doc:b"},
+                    "k": 2,
+                    "max_weight": -0.1,
+                }
+            },
+        ],
+    )
+    def test_query_rejects_negative_canonical_graph_weight_bounds(self, query: dict[str, object]) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+        with pytest.raises(AntflyException, match="finite non-negative number"):
+            client.query(table="docs", graph_queries={"walk": {"index": "graph_idx", **query}})
+
     @pytest.mark.parametrize("operation", ["traverse", "shortest_path", "k_shortest_paths"])
     def test_query_validates_graph_operation_direction(self, operation: str) -> None:
         if operation == "traverse":

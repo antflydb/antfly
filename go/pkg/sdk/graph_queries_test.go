@@ -440,6 +440,24 @@ func TestGraphOpaqueUnionValidationRejectsUnknownMembers(t *testing.T) {
 			t.Fatalf("expected unknown graph query member error, got %v", err)
 		}
 	})
+	t.Run("query nested", func(t *testing.T) {
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]},"unexpected":true}}`), &query); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "unexpected") {
+			t.Fatalf("expected unknown nested graph query member error, got %v", err)
+		}
+	})
+	t.Run("query cross variant return", func(t *testing.T) {
+		var query GraphQuery
+		if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}},"return":null}`), &query); err != nil {
+			t.Fatal(err)
+		}
+		if err := validateGraphQuery(query); err == nil || !strings.Contains(err.Error(), "unknown field") {
+			t.Fatalf("expected cross-variant return member error, got %v", err)
+		}
+	})
 
 	for name, encoded := range map[string]string{
 		"unknown":         `{"keys":["doc:a"],"unexpected":true}`,
@@ -1195,6 +1213,12 @@ func TestGraphMatchEdgeValidationMatchesServerDefaultsAndBudgets(t *testing.T) {
 	}
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinWeight: &zero, MaxWeight: &negative}); err == nil {
 		t.Fatal("expected inverted graph weight range to fail")
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MinWeight: &negative}); err == nil || !strings.Contains(err.Error(), "non-negative") {
+		t.Fatalf("expected negative graph minimum weight to fail, got %v", err)
+	}
+	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", MaxWeight: &negative}); err == nil || !strings.Contains(err.Error(), "non-negative") {
+		t.Fatalf("expected negative graph maximum weight to fail, got %v", err)
 	}
 	if err := validateGraphMatchEdgeShape(GraphMatchEdge{From: "a", To: "b", Types: []string{"links", "links"}}); err == nil {
 		t.Fatal("expected duplicate graph edge types to fail")

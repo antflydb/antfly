@@ -77,22 +77,45 @@ func validateGraphQuery(query GraphQuery) error {
 	return err
 }
 
+type graphQueryReturnEnvelopeMember struct {
+	present bool
+	value   GraphReturn
+}
+
+// UnmarshalJSON retains presence even for an explicit null while decoding the
+// small MATCH return union. Operation bodies use ordinary typed pointers below,
+// so the outer strict decoder parses each selected body only once.
+func (m *graphQueryReturnEnvelopeMember) UnmarshalJSON(encoded []byte) error {
+	m.present = true
+	if bytes.Equal(bytes.TrimSpace(encoded), []byte("null")) {
+		return nil
+	}
+	return json.Unmarshal(encoded, &m.value)
+}
+
+type graphQueryValidationEnvelope struct {
+	Index          string                         `json:"index"`
+	Return         graphQueryReturnEnvelopeMember `json:"return"`
+	Match          *GraphMatch                    `json:"match"`
+	Traverse       *GraphTraversal                `json:"traverse"`
+	ShortestPath   *GraphShortestPath             `json:"shortest_path"`
+	KShortestPaths *GraphKShortestPaths           `json:"k_shortest_paths"`
+}
+
 // validateGraphQueryWithKind validates a query and reports whether it is a
-// MATCH without encoding the generated union a second time. Request-level
-// admission uses that bit to enforce the independent complete-anchor scan cap.
+// MATCH. Request-level admission uses that bit to enforce the independent
+// complete-anchor scan cap. The generated union already retains its JSON, so
+// decode it once into typed optional members instead of marshaling and copying
+// the entire query through a RawMessage map before decoding the selected arm.
 func validateGraphQueryWithKind(query GraphQuery) (bool, error) {
-	encoded, err := json.Marshal(query)
-	if err != nil {
+	var envelope graphQueryValidationEnvelope
+	if err := query.DecodeStrictInto(&envelope); err != nil {
 		return false, fmt.Errorf("invalid graph query: %w", err)
 	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(encoded, &members); err != nil {
-		return false, fmt.Errorf("invalid graph query: %w", err)
-	}
-	match, hasMatch := members["match"]
-	traverse, hasTraverse := members["traverse"]
-	shortestPath, hasShortestPath := members["shortest_path"]
-	kShortestPaths, hasKShortestPaths := members["k_shortest_paths"]
+	hasMatch := envelope.Match != nil
+	hasTraverse := envelope.Traverse != nil
+	hasShortestPath := envelope.ShortestPath != nil
+	hasKShortestPaths := envelope.KShortestPaths != nil
 	variants := 0
 	for _, present := range []bool{hasMatch, hasTraverse, hasShortestPath, hasKShortestPaths} {
 		if present {
@@ -104,40 +127,25 @@ func validateGraphQueryWithKind(query GraphQuery) (bool, error) {
 	}
 	switch {
 	case hasMatch:
-		if isNullGraphJSON(match) {
-			return false, fmt.Errorf("graph query match must not be null")
-		}
-		var value GraphMatchQuery
-		if err := query.DecodeStrictInto(&value); err != nil {
-			return false, fmt.Errorf("antfly: invalid graph match query: %w", err)
-		}
+		value := GraphMatchQuery{Index: envelope.Index, Match: *envelope.Match, Return: envelope.Return.value}
 		return true, validateGraphMatchQuery(value)
 	case hasTraverse:
-		if isNullGraphJSON(traverse) {
-			return false, fmt.Errorf("graph query traverse must not be null")
+		if envelope.Return.present {
+			return false, fmt.Errorf("invalid graph query: json: unknown field %q", "return")
 		}
-		var value GraphTraverseQuery
-		if err := query.DecodeStrictInto(&value); err != nil {
-			return false, fmt.Errorf("antfly: invalid graph traverse query: %w", err)
-		}
+		value := GraphTraverseQuery{Index: envelope.Index, Traverse: *envelope.Traverse}
 		return false, validateGraphTraverseQuery(value)
 	case hasShortestPath:
-		if isNullGraphJSON(shortestPath) {
-			return false, fmt.Errorf("graph query shortest_path must not be null")
+		if envelope.Return.present {
+			return false, fmt.Errorf("invalid graph query: json: unknown field %q", "return")
 		}
-		var value GraphShortestPathQuery
-		if err := query.DecodeStrictInto(&value); err != nil {
-			return false, fmt.Errorf("antfly: invalid graph shortest-path query: %w", err)
-		}
+		value := GraphShortestPathQuery{Index: envelope.Index, ShortestPath: *envelope.ShortestPath}
 		return false, validateGraphPathQuery(value.Index, value.ShortestPath.From, value.ShortestPath.To, value.ShortestPath.Direction, value.ShortestPath.Filter, value.ShortestPath.EdgeTypes, value.ShortestPath.MaxDepth, value.ShortestPath.MinWeight, value.ShortestPath.MaxWeight, value.ShortestPath.IncludeDocuments, value.ShortestPath.Fields)
 	default:
-		if isNullGraphJSON(kShortestPaths) {
-			return false, fmt.Errorf("graph query k_shortest_paths must not be null")
+		if envelope.Return.present {
+			return false, fmt.Errorf("invalid graph query: json: unknown field %q", "return")
 		}
-		var value GraphKShortestPathsQuery
-		if err := query.DecodeStrictInto(&value); err != nil {
-			return false, fmt.Errorf("antfly: invalid graph k-shortest-paths query: %w", err)
-		}
+		value := GraphKShortestPathsQuery{Index: envelope.Index, KShortestPaths: *envelope.KShortestPaths}
 		if value.KShortestPaths.K < 1 || value.KShortestPaths.K > 100 {
 			return false, fmt.Errorf("graph k must be between 1 and 100")
 		}
@@ -2823,11 +2831,11 @@ func validGraphQueryName(value string) bool {
 }
 
 func validateGraphWeightBounds(minWeight, maxWeight *float64) error {
-	if minWeight != nil && (math.IsNaN(*minWeight) || math.IsInf(*minWeight, 0)) {
-		return fmt.Errorf("antfly: graph minimum weight must be finite")
+	if minWeight != nil && (math.IsNaN(*minWeight) || math.IsInf(*minWeight, 0) || *minWeight < 0) {
+		return fmt.Errorf("antfly: graph minimum weight must be finite and non-negative")
 	}
-	if maxWeight != nil && (math.IsNaN(*maxWeight) || math.IsInf(*maxWeight, 0)) {
-		return fmt.Errorf("antfly: graph maximum weight must be finite")
+	if maxWeight != nil && (math.IsNaN(*maxWeight) || math.IsInf(*maxWeight, 0) || *maxWeight < 0) {
+		return fmt.Errorf("antfly: graph maximum weight must be finite and non-negative")
 	}
 	if minWeight != nil && maxWeight != nil && *minWeight > *maxWeight {
 		return fmt.Errorf("antfly: graph minimum weight must not exceed maximum weight")

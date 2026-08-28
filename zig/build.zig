@@ -3819,6 +3819,7 @@ pub fn build(b: *std.Build) void {
         "traverse counts only target-admitted nodes toward result limit",
         "graph query engine shares traversal work across start nodes",
         "stored graph weights are finite and non-negative",
+        "canonical graph admission preserves and validates weight bounds",
         "graph edge type policy is byte-bounded UTF-8",
         "graph durable writes reject invalid edge types before mutation",
         "graph edge encoding round-trip",

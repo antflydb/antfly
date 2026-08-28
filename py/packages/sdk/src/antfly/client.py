@@ -2,6 +2,7 @@
 
 import base64
 import json
+import math
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, TypeAlias, cast
@@ -97,6 +98,25 @@ def _require_graph_edge_types(value: object, path: str) -> None:
             raise AntflyException(f"{path} must encode to at most {MAX_GRAPH_EDGE_TYPE_UTF8_BYTES} UTF-8 bytes")
 
 
+def _validate_graph_weight_bounds(value: Mapping[str, Any], path: str) -> None:
+    bounds: dict[str, float] = {}
+    for field, label in (("min_weight", "minimum"), ("max_weight", "maximum")):
+        if field not in value:
+            continue
+        bound = value[field]
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+            raise AntflyException(f"{path}.{field} must be a finite non-negative number")
+        try:
+            normalized = float(bound)
+        except (OverflowError, ValueError) as exc:
+            raise AntflyException(f"{path}.{field} must be a finite non-negative number") from exc
+        if not math.isfinite(normalized) or normalized < 0:
+            raise AntflyException(f"{path}.{field} must be a finite non-negative number")
+        bounds[label] = normalized
+    if bounds.get("minimum", 0) > bounds.get("maximum", math.inf):
+        raise AntflyException(f"{path}.min_weight must not exceed max_weight")
+
+
 def _validate_graph_edges(edges: object, path: str) -> None:
     if not isinstance(edges, list):
         return
@@ -108,6 +128,7 @@ def _validate_graph_edges(edges: object, path: str) -> None:
         _require_graph_identifier(edge.get("to"), f"{edge_path}.to")
         _validate_graph_direction(edge, edge_path)
         _require_graph_edge_types(edge.get("types"), f"{edge_path}.types")
+        _validate_graph_weight_bounds(edge, edge_path)
 
 
 def _validate_graph_direction(value: Mapping[str, Any], path: str) -> None:
@@ -212,6 +233,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
         if isinstance(traverse, Mapping):
             _validate_graph_direction(traverse, f"graph_queries[{name!r}].traverse")
             _require_graph_edge_types(traverse.get("edge_types"), f"graph_queries[{name!r}].traverse.edge_types")
+            _validate_graph_weight_bounds(traverse, f"graph_queries[{name!r}].traverse")
             start = traverse.get("start")
             if isinstance(start, Mapping) and "result_ref" in start:
                 path = f"graph_queries[{name!r}].traverse.start"
@@ -232,6 +254,7 @@ def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]
             path_query = encoded_query.get(operation)
             if isinstance(path_query, Mapping):
                 _validate_graph_direction(path_query, f"graph_queries[{name!r}].{operation}")
+                _validate_graph_weight_bounds(path_query, f"graph_queries[{name!r}].{operation}")
                 _require_graph_edge_types(
                     path_query.get("edge_types"),
                     f"graph_queries[{name!r}].{operation}.edge_types",

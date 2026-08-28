@@ -131,6 +131,37 @@ describe("graph identifier policy", () => {
   });
 
   it.each([
+    {
+      match: {
+        anchor: "person",
+        nodes: { person: {}, author: {} },
+        edges: [{ from: "person", to: "author", min_weight: -0.1 }],
+      },
+      return: { bindings: ["person"] },
+    },
+    { traverse: { start: { keys: ["doc:a"] }, max_weight: -0.1 } },
+    {
+      shortest_path: {
+        from: { key: "doc:a" },
+        to: { key: "doc:b" },
+        min_weight: -0.1,
+      },
+    },
+    {
+      k_shortest_paths: {
+        from: { key: "doc:a" },
+        to: { key: "doc:b" },
+        k: 2,
+        max_weight: -0.1,
+      },
+    },
+  ])("rejects negative canonical graph weight bounds", (query) => {
+    expect(() => validateGraphQueryIdentifiers({ walk: { index: "graph_idx", ...query } })).toThrow(
+      "finite non-negative number"
+    );
+  });
+
+  it.each([
     "traverse",
     "shortest_path",
     "k_shortest_paths",

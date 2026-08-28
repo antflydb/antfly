@@ -23017,10 +23017,12 @@ components:
         min_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
     GraphWhereAnd:
       type: object
@@ -23367,10 +23369,12 @@ components:
         min_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
         limit:
           type: integer
@@ -23451,10 +23455,12 @@ components:
         min_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
         weight_mode:
           $ref: '#/components/schemas/PathWeightMode'
@@ -23520,10 +23526,12 @@ components:
         min_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
         max_weight:
           type: number
           format: double
+          minimum: 0
           x-go-type-skip-optional-pointer: false
         weight_mode:
           $ref: '#/components/schemas/PathWeightMode'

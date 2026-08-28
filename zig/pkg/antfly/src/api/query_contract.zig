@@ -10379,15 +10379,15 @@ fn legacyWeightBound(value: ?f64) ?f64 {
 }
 
 fn validateGraphWeightBounds(min_weight: ?f64, max_weight: ?f64) !void {
-    if (min_weight) |value| if (!std.math.isFinite(value)) return error.InvalidQueryRequest;
-    if (max_weight) |value| if (!std.math.isFinite(value)) return error.InvalidQueryRequest;
+    if (min_weight) |value| if (!std.math.isFinite(value) or value < 0) return error.InvalidQueryRequest;
+    if (max_weight) |value| if (!std.math.isFinite(value) or value < 0) return error.InvalidQueryRequest;
     if (min_weight != null and max_weight != null and min_weight.? > max_weight.?)
         return error.InvalidQueryRequest;
 }
 
 test "canonical graph admission preserves and validates weight bounds" {
     try validateGraphWeightBounds(0, 0);
-    try validateGraphWeightBounds(-2, -1);
+    try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(-2, -1));
     try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(1, 0));
     try std.testing.expectError(error.InvalidQueryRequest, validateGraphWeightBounds(std.math.nan(f64), null));
     try std.testing.expectEqual(@as(?f64, null), legacyWeightBound(0));
