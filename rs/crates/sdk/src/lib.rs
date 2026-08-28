@@ -253,7 +253,7 @@ pub fn graph_index_sources(
                 && !valid_graph_materialized_source_template(source_template)
             {
                 return Err(IndexConfigError(format!(
-                    "sources[{source_index}].nodes.source must use _doc.key or _artifact.value"
+                    "sources[{source_index}].nodes.source must use _doc.key"
                 )));
             }
             if let Some(GraphTemplateOrNumber::Number(value)) = nodes.target.as_ref()
@@ -307,19 +307,7 @@ fn valid_graph_materialized_source_template(value: &str) -> bool {
     else {
         return false;
     };
-    if expression == "_doc.key" || expression == "_artifact.value" {
-        return true;
-    }
-    let Some(path) = expression.strip_prefix("_artifact.value.") else {
-        return false;
-    };
-    !path.is_empty()
-        && path.split('.').all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        })
+    expression == "_doc.key"
 }
 
 fn valid_graph_artifact_path(path: &str) -> bool {
@@ -910,6 +898,7 @@ mod tests {
             "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
             "{{ _artifact.value.owner-id }}",
             "{{ _artifact.value. }}",
+            "{{ _artifact.value.owner.id }}",
         ] {
             assert!(
                 graph_index_sources(vec![GraphIndexSourceSpec {
@@ -936,7 +925,7 @@ mod tests {
                 mention_edge_type: None,
                 nodes: Some(GraphNodeMappingSpec {
                     model: None,
-                    source: Some("{{ _artifact.value.owner.id }}".into()),
+                    source: Some("{{ _doc.key }}".into()),
                     target: None,
                 }),
                 edge: None,

@@ -15861,8 +15861,10 @@ pub const DB = struct {
             return true;
         }
         if (std.mem.eql(u8, phase, "rebuild_graph")) {
-            std.log.info("restore runtime repair phase=rebuild_graph", .{});
-            _ = try self.rebuildGraphDerivedState();
+            std.log.info("restore runtime repair phase=rebuild_graph_ownership", .{});
+            const ownership_count = try self.rebuildGraphArtifactOwnershipForRestore(alloc);
+            const graph_count = try self.rebuildGraphDerivedState();
+            std.log.info("restore runtime repair rebuilt graph ownership sources={d} mutations={d}", .{ ownership_count, graph_count });
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_artifacts", false);
             return true;
         }
@@ -15989,6 +15991,61 @@ pub const DB = struct {
             self.getRange().start,
             self.getRange().end,
         );
+    }
+
+    /// Reconstruct the private graph materialization state omitted from a
+    /// portable backup. Visible graph edges alone cannot preserve source
+    /// precedence: after restore, deleting the current winner must reveal the
+    /// next surviving source. Replay every durable graph input in bounded
+    /// pages before rebuilding the runtime graph projection.
+    fn rebuildGraphArtifactOwnershipForRestore(self: *DB, alloc: Allocator) !usize {
+        lockApply(self);
+        defer self.core.unlockApply();
+
+        if (!self.core.index_manager.hasGraphIndexes()) return 0;
+        const page_size = 512;
+        const user_prefix = [_]u8{internal_keys.user_namespace};
+        var cursor: ?[]u8 = null;
+        defer if (cursor) |key| alloc.free(key);
+        var replayed: usize = 0;
+
+        while (true) {
+            const rows = try self.core.store.scanPrefixPage(alloc, &user_prefix, cursor, page_size);
+            defer docstore_mod.DocStore.freeResults(alloc, rows);
+            if (rows.len == 0) break;
+
+            var source_keys = std.ArrayListUnmanaged([]const u8).empty;
+            defer source_keys.deinit(alloc);
+            for (rows) |row| {
+                if (internal_keys.isAssetArtifactKey(row.key) or
+                    internal_keys.isChunkArtifactRecordKey(row.key) or
+                    internal_keys.isResolutionArtifactKey(row.key))
+                {
+                    try source_keys.append(alloc, row.key);
+                }
+            }
+
+            if (source_keys.items.len > 0) {
+                for (self.core.index_manager.graphIndexes()) |graph_entry| {
+                    const changed = try materializeGraphSourceArtifactsForIndex(
+                        alloc,
+                        self.core.store,
+                        self.core.index_manager,
+                        source_keys.items,
+                        graph_entry.config.name,
+                        .{},
+                    );
+                    freeOwnedKeySlice(alloc, changed);
+                }
+                replayed += source_keys.items.len;
+            }
+
+            const next_cursor = try alloc.dupe(u8, rows[rows.len - 1].key);
+            if (cursor) |key| alloc.free(key);
+            cursor = next_cursor;
+            if (rows.len < page_size) break;
+        }
+        return replayed;
     }
 
     pub fn clearDenseHbcCaches(self: *DB) void {
@@ -44024,6 +44081,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     dest_indexes.updateRange(byte_range);
     try range_state_mod.saveRange(dest_store, byte_range);
     try self.core.saveSchemaCloneTo(dest_store);
+    try dest_indexes.seedSplitArtifactCatalogsFrom(dest_store, self.core.index_manager);
 
     const configs = try self.core.listIndexes(self.alloc);
     defer types.freeIndexConfigs(self.alloc, configs);
@@ -54142,7 +54200,7 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
         .config_json =
         \\{
         \\  "source":{"artifact":"document_chunks_v1","format":"extraction_relation",
-        \\    "nodes":{"source":"{{ _artifact.value._parent_unit_key }}","target":"{{ _artifact.value.text }}"},
+        \\    "nodes":{"source":"{{ _doc.key }}","target":"{{ _artifact.value.text }}"},
         \\    "edge":{"type":"mentions","metadata":{"unit":"{{ _artifact.value._parent_unit_id }}","artifact":"{{ _artifact.name }}"}}}
         \\}
         ,
@@ -54159,7 +54217,7 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
 
     const unit_key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "document_units_v1", "document:000001");
     defer alloc.free(unit_key);
-    const edges = try db.getEdges(alloc, "chunk_graph", unit_key, "mentions", .out);
+    const edges = try db.getEdges(alloc, "chunk_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 1), edges.len);
     try std.testing.expectEqualStrings("doc:b", edges[0].target);
@@ -54205,7 +54263,7 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
         .name = "selected_graph",
         .kind = .graph,
         .config_json =
-        \\{"sources":[{"artifact":"graph_chunks_v1","format":"extraction_relation","nodes":{"source":"{{ _artifact.value._parent_doc_key }}","target":"{{ _artifact.value.relation }}"},"edge":{"type":"mentions"}}]}
+        \\{"sources":[{"artifact":"graph_chunks_v1","format":"extraction_relation","nodes":{"source":"{{ _doc.key }}","target":"{{ _artifact.value.relation }}"},"edge":{"type":"mentions"}}]}
         ,
     });
 
@@ -55564,69 +55622,131 @@ test "db multi-source graph precedence falls back after winner deletion and reop
     try std.testing.expect(std.mem.indexOf(u8, reopened_edges[0].metadata, "\"winner\":\"fallback\"") != null);
 }
 
-test "db graph contenders arbitrate identical mapped edges across source documents" {
+test "db portable restore rebuilds multi-source graph contender provenance" {
+    const alloc = std.testing.allocator;
+
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .primary_backend = primary_backend });
+        defer source.close();
+        try source.addEnrichment(.{
+            .name = "primary_relations_v1",
+            .kind = .asset,
+            .field = "primary_relations",
+            .content_type = "application/json",
+        });
+        try source.addEnrichment(.{
+            .name = "fallback_relations_v1",
+            .kind = .asset,
+            .field = "fallback_relations",
+            .content_type = "application/json",
+        });
+        try source.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{"sources":[{"artifact":"primary_relations_v1"},{"artifact":"fallback_relations_v1"}]}
+            ,
+        });
+        try source.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2,"winner":"primary"},"fallback_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":1,"winner":"fallback"}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try source.runUntilIdle();
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    {
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .start_optional_runtimes = false,
+        });
+        defer restored.close();
+        try portable_backup.importPortable(alloc, restored.core.store, portable.items);
+    }
+
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        std.mem.span(restore_path),
+        "graph-snapshot",
+        "file:///tmp/backups",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "snapshots/graph-snapshot",
+        7002,
+    );
+    try DB.markRestoreRuntimeRepairNeeded(alloc, std.mem.span(restore_path));
+    while (try DB.restoreRuntimeRepairNeededForPath(alloc, std.mem.span(restore_path))) {
+        var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+            .primary_backend = primary_backend,
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .enrichment = .{
+                .owner_id = "restore-worker",
+                .enable_without_producers = true,
+            },
+        });
+        defer restored.close();
+        try std.testing.expect(try restored.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    }
+
+    var restored = try DB.open(alloc, std.mem.span(restore_path), .{
+        .primary_backend = primary_backend,
+        .enrichment = .{
+            .owner_id = "restore-worker",
+            .enable_without_producers = true,
+        },
+    });
+    defer restored.close();
+    try restored.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"fallback_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":1,"winner":"fallback"}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try restored.runUntilIdle();
+
+    const edges = try restored.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqual(@as(f64, 1), edges[0].weight);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"fallback\"") != null);
+}
+
+test "db graph config rejects cross-document materialized source ownership" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    {
-        var db = try DB.open(alloc, std.mem.span(path), .{});
-        defer db.close();
-        try db.addEnrichment(.{
-            .name = "relations_v1",
-            .kind = .asset,
-            .field = "relation",
-            .content_type = "application/json",
-        });
-        try db.addIndex(.{
-            .name = "entity_graph",
-            .kind = .graph,
-            .config_json =
-            \\{"sources":[{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.owner }}"}}]}
-            ,
-        });
-
-        // Both producer documents own a contender for the same public edge.
-        // Process them in one batch to exercise the pending-write overlay.
-        try db.batch(.{
-            .writes = &.{
-                .{ .key = "doc:a", .value = "{\"relation\":{\"owner\":\"entity:ada\",\"type\":\"mentions\",\"target\":{\"document_id\":\"entity:math\"},\"producer\":\"a\"}}" },
-                .{ .key = "doc:b", .value = "{\"relation\":{\"owner\":\"entity:ada\",\"type\":\"mentions\",\"target\":{\"document_id\":\"entity:math\"},\"producer\":\"b\"}}" },
-            },
-            .sync_level = .enrichments,
-        });
-        try db.runUntilIdle();
-
-        {
-            const edges = try db.getEdges(alloc, "entity_graph", "entity:ada", "mentions", .out);
-            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
-            try std.testing.expectEqual(@as(usize, 1), edges.len);
-            try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"producer\":\"a\"") != null);
-        }
-
-        // Removing the lexicographically preferred owner must reveal doc:b's
-        // still-live contender, not delete their shared logical edge.
-        try db.batch(.{
-            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"relation removed\"}" }},
-            .sync_level = .enrichments,
-        });
-        try db.runUntilIdle();
-        {
-            const edges = try db.getEdges(alloc, "entity_graph", "entity:ada", "mentions", .out);
-            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
-            try std.testing.expectEqual(@as(usize, 1), edges.len);
-            try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"producer\":\"b\"") != null);
-        }
-        try db.sync(true);
-    }
-
-    var reopened = try DB.open(alloc, std.mem.span(path), .{});
-    defer reopened.close();
-    const edges = try reopened.getEdges(alloc, "entity_graph", "entity:ada", "mentions", .out);
-    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
-    try std.testing.expectEqual(@as(usize, 1), edges.len);
-    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"producer\":\"b\"") != null);
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expectError(error.InvalidIndexConfig, db.addIndex(.{
+        .name = "entity_graph",
+        .kind = .graph,
+        .config_json =
+        \\{"sources":[{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.owner }}"}}]}
+        ,
+    }));
 }
 
 test "db graph relation artifact materializer deletes edges when asset source disappears" {
@@ -91634,6 +91754,74 @@ test "db split prepare and finalize produce destination shard and trim parent ra
     const parent_incoming = try db.getEdges(alloc, "graph_v1", "doc:y", "cites", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, parent_incoming);
     try std.testing.expectEqual(@as(usize, 0), parent_incoming.len);
+}
+
+test "db split preserves multi-source graph fallback ownership on destination" {
+    const alloc = std.testing.allocator;
+
+    var parent_buf: [256]u8 = undefined;
+    const parent_path = tempPath(&parent_buf);
+    defer cleanupTempDir(parent_path);
+    var child_buf: [256]u8 = undefined;
+    const child_path = tempPath(&child_buf);
+    defer cleanupTempDir(child_path);
+
+    var parent = try DB.open(alloc, std.mem.span(parent_path), .{});
+    defer parent.close();
+    try parent.addEnrichment(.{
+        .name = "primary_relations_v1",
+        .kind = .asset,
+        .field = "primary_relations",
+        .content_type = "application/json",
+    });
+    try parent.addEnrichment(.{
+        .name = "fallback_relations_v1",
+        .kind = .asset,
+        .field = "fallback_relations",
+        .content_type = "application/json",
+    });
+    try parent.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{"sources":[{"artifact":"primary_relations_v1"},{"artifact":"fallback_relations_v1"}]}
+        ,
+    });
+    try parent.batch(.{
+        .writes = &.{.{
+            .key = "doc:z",
+            .value =
+            \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:y"},"weight":2,"winner":"primary"},"fallback_relations":{"type":"mentions","target":{"document_id":"doc:y"},"weight":1,"winner":"fallback"}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try parent.runUntilIdle();
+    try parent.split(parent.getRange(), "doc:m", "", std.mem.span(child_path), true);
+
+    var child = try DB.open(alloc, std.mem.span(child_path), .{});
+    defer child.close();
+    try child.batch(.{
+        .writes = &.{.{
+            .key = "doc:z",
+            .value =
+            \\{"fallback_relations":{"type":"mentions","target":{"document_id":"doc:y"},"weight":1,"winner":"fallback"}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try child.runUntilIdle();
+
+    const child_edges = try child.getEdges(alloc, "relations_graph", "doc:z", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, child_edges);
+    try std.testing.expectEqual(@as(usize, 1), child_edges.len);
+    try std.testing.expectEqual(@as(f64, 1), child_edges[0].weight);
+    try std.testing.expect(std.mem.indexOf(u8, child_edges[0].metadata, "\"winner\":\"fallback\"") != null);
+
+    try parent.finalizeSplit(.{ .start = "", .end = "doc:m" });
+    const parent_edges = try parent.getEdges(alloc, "relations_graph", "doc:z", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, parent_edges);
+    try std.testing.expectEqual(@as(usize, 0), parent_edges.len);
 }
 
 test "db split prepare and finalize work with durable lsm primary backend" {

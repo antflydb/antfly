@@ -507,6 +507,7 @@ func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
 		"{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
 		"{{ _artifact.value.owner-id }}",
 		"{{ _artifact.value. }}",
+		"{{ _artifact.value.owner.id }}",
 	} {
 		if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
 			Artifact: "relations",
@@ -517,9 +518,9 @@ func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
 	}
 	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
 		Artifact: "relations",
-		Nodes:    GraphArtifactNodeMappingConfig{Source: "{{ _artifact.value.owner.id }}"},
+		Nodes:    GraphArtifactNodeMappingConfig{Source: "{{ _doc.key }}"},
 	}); err != nil {
-		t.Fatalf("stable nested artifact source identity rejected: %v", err)
+		t.Fatalf("document-owned graph source identity rejected: %v", err)
 	}
 }
 

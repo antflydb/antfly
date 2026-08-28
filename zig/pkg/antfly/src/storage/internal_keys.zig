@@ -82,8 +82,10 @@ pub const enrichment_terminal_failure_generation_counter_kind: u8 = 0x3d;
 /// another replay metadata protocol or one another.
 pub const artifact_source_revision_kind: u8 = 0x3e;
 /// Generation-fenced graph contenders keyed by logical edge rather than by the
-/// document that produced them. Records are ordered by source priority and
-/// state identity so winner fallback can stop at the first surviving record.
+/// artifact state that produced them. The record lives under the edge source's
+/// document prefix so range splits preserve graph ownership. Records are
+/// ordered by source priority and state identity so winner fallback can stop at
+/// the first surviving record.
 pub const graph_global_edge_contender_kind: u8 = 0x3f;
 pub const enrichment_terminal_failure_generation_counter_key = [_]u8{
     replay_namespace,
@@ -385,26 +387,13 @@ pub fn graphGlobalEdgeContenderIndexPrefixAlloc(
     alloc: Allocator,
     index_name: []const u8,
 ) ![]u8 {
+    // Compatibility cleanup prefix for contender records written by prerelease
+    // builds. New contender records live in the owning document keyspace and
+    // are removed by the graph-artifact cleanup scan.
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
     try list.appendSlice(alloc, &.{ replay_namespace, 0xff, graph_global_edge_contender_kind });
     try appendEncodedComponent(&list, alloc, index_name);
-    return try list.toOwnedSlice(alloc);
-}
-
-pub fn graphGlobalEdgeContenderGenerationPrefixAlloc(
-    alloc: Allocator,
-    index_name: []const u8,
-    generation: u64,
-) ![]u8 {
-    var list = std.ArrayListUnmanaged(u8).empty;
-    defer list.deinit(alloc);
-    const index_prefix = try graphGlobalEdgeContenderIndexPrefixAlloc(alloc, index_name);
-    defer alloc.free(index_prefix);
-    try list.appendSlice(alloc, index_prefix);
-    var generation_buf: [@sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, &generation_buf, generation, .big);
-    try list.appendSlice(alloc, &generation_buf);
     return try list.toOwnedSlice(alloc);
 }
 
@@ -414,11 +403,16 @@ pub fn graphGlobalEdgeContenderEdgePrefixAlloc(
     generation: u64,
     edge_key: []const u8,
 ) ![]u8 {
+    if (!isGraphEdgeArtifactKey(edge_key)) return error.InvalidInternalUserKey;
+    const doc_term = findComponentTerminator(edge_key, 1) orelse return error.InvalidInternalUserKey;
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
-    const index_prefix = try graphGlobalEdgeContenderGenerationPrefixAlloc(alloc, index_name, generation);
-    defer alloc.free(index_prefix);
-    try list.appendSlice(alloc, index_prefix);
+    try list.appendSlice(alloc, edge_key[0 .. doc_term + 2]);
+    try list.append(alloc, graph_global_edge_contender_kind);
+    try appendEncodedComponent(&list, alloc, index_name);
+    var generation_buf: [@sizeOf(u64)]u8 = undefined;
+    std.mem.writeInt(u64, &generation_buf, generation, .big);
+    try list.appendSlice(alloc, &generation_buf);
     var edge_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(edge_key, &edge_digest, .{});
     try appendEncodedComponent(&list, alloc, &edge_digest);
@@ -447,8 +441,11 @@ pub fn graphGlobalEdgeContenderKeyAlloc(
 }
 
 pub fn isGraphGlobalEdgeContenderKey(key: []const u8) bool {
-    if (key.len < 3 or key[0] != replay_namespace or key[1] != 0xff or key[2] != graph_global_edge_contender_kind) return false;
-    var pos: usize = 3;
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != graph_global_edge_contender_kind) return false;
+    pos += 1;
     const index_term = findComponentTerminator(key, pos) orelse return false;
     pos = index_term + 2;
     if (key.len - pos < @sizeOf(u64)) return false;
@@ -462,7 +459,9 @@ pub fn isGraphGlobalEdgeContenderKey(key: []const u8) bool {
 }
 
 pub fn matchesGraphGlobalEdgeContenderIndexName(key: []const u8, index_name: []const u8) bool {
-    return isGraphGlobalEdgeContenderKey(key) and componentEquals(key, 3, index_name);
+    if (!isGraphGlobalEdgeContenderKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    return componentEquals(key, doc_term + 2 + 1, index_name);
 }
 
 pub fn artifactTypePrefixAlloc(alloc: Allocator, doc_key: []const u8, artifact_type: []const u8) ![]u8 {
@@ -2224,6 +2223,9 @@ test "global graph contender keys are generation fenced and priority ordered" {
     defer alloc.free(fallback);
 
     try std.testing.expect(isGraphGlobalEdgeContenderKey(preferred));
+    const owner_prefix = try documentExactPrefixAlloc(alloc, "shared\x00source");
+    defer alloc.free(owner_prefix);
+    try std.testing.expect(std.mem.startsWith(u8, preferred, owner_prefix));
     try std.testing.expect(matchesGraphGlobalEdgeContenderIndexName(preferred, "gr\x00v1"));
     try std.testing.expect(!matchesGraphGlobalEdgeContenderIndexName(preferred, "gr\x00v10"));
     try std.testing.expectEqual(std.math.Order.lt, std.mem.order(u8, preferred, fallback));

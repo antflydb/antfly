@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 MAX_ARTIFACT_SOURCES = 64
 _GRAPH_ARTIFACT_PATH = re.compile(r"^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$")
-_GRAPH_MATERIALIZED_SOURCE = re.compile(r"^\{\{\s*(?:_doc\.key|_artifact\.value(?:\.[A-Za-z0-9_]+)*)\s*\}\}$")
+_GRAPH_MATERIALIZED_SOURCE = re.compile(r"^\{\{\s*_doc\.key\s*\}\}$")
 
 
 def _relationship_field_active(value: Any) -> bool:
@@ -217,7 +217,7 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
                 not isinstance(source.nodes.source, str)
                 or _GRAPH_MATERIALIZED_SOURCE.fullmatch(source.nodes.source) is None
             ):
-                raise ValueError(f"sources[{index}].nodes.source must use _doc.key or _artifact.value")
+                raise ValueError(f"sources[{index}].nodes.source must use _doc.key")
             target = source.nodes.target
             if target is not None and (isinstance(target, bool) or not isinstance(target, (str, int, float))):
                 raise ValueError(f"sources[{index}].nodes.target must be a string or number")

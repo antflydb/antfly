@@ -90,7 +90,7 @@ function validateOptionalString(value: unknown, path: string): asserts value is 
 
 /** Returns whether a graph source-owner template is stable across replay and deletion. */
 export function isValidGraphMaterializedSourceTemplate(value: string): boolean {
-  return /^\{\{\s*(?:_doc\.key|_artifact\.value(?:\.[A-Za-z0-9_]+)*)\s*\}\}$/.test(value.trim());
+  return /^\{\{\s*_doc\.key\s*\}\}$/.test(value.trim());
 }
 
 function validateOnlyKeys(
@@ -286,7 +286,7 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
       (typeof source.nodes.source !== "string" ||
         !isValidGraphMaterializedSourceTemplate(source.nodes.source))
     ) {
-      throw new TypeError(`sources[${index}].nodes.source must use _doc.key or _artifact.value`);
+      throw new TypeError(`sources[${index}].nodes.source must use _doc.key`);
     }
     for (const [fieldName, value] of [["target", source.nodes?.target]] as const) {
       if (

@@ -12132,6 +12132,44 @@ pub const IndexManager = struct {
         try txn.commit();
     }
 
+    /// Seed a newly-created split destination with the source shard's durable
+    /// artifact producer and resolver contracts before registering indexes.
+    /// Artifact-backed index validation depends on these catalogs, and copying
+    /// the internal configs preserves write-only producer settings that are not
+    /// available through the public list APIs.
+    pub fn seedSplitArtifactCatalogsFrom(
+        self: *IndexManager,
+        store: anytype,
+        source: *const IndexManager,
+    ) !void {
+        if (self.enrichments.items.len != 0 or self.resolvers.items.len != 0) return error.InvalidState;
+        const enrichment_checkpoint = self.enrichments.items.len;
+        const resolver_checkpoint = self.resolvers.items.len;
+        errdefer {
+            self.truncateEnrichments(enrichment_checkpoint);
+            self.truncateResolvers(resolver_checkpoint);
+        }
+        for (source.enrichments.items) |cfg| {
+            try self.enrichments.append(self.alloc, try enrichment_catalog.EnrichmentConfig.clone(self.alloc, cfg));
+        }
+        for (source.resolvers.items) |cfg| {
+            try self.resolvers.append(self.alloc, try resolver_catalog.ResolverConfig.clone(self.alloc, cfg));
+        }
+
+        const enrichment_data = try enrichment_catalog.serializeCatalog(self.alloc, self.enrichments.items);
+        defer self.alloc.free(enrichment_data);
+        const resolver_data = try resolver_catalog.serializeCatalog(self.alloc, self.resolvers.items);
+        defer self.alloc.free(resolver_data);
+        var runtime_store = try initRuntimeStore(self.alloc, store);
+        defer runtime_store.deinit();
+        var txn = try runtime_store.store.beginWrite();
+        errdefer txn.abort();
+        try txn.put(enrichment_catalog_key, enrichment_data);
+        try txn.put(resolver_catalog_key, resolver_data);
+        try txn.commit();
+        self.storeGeneratedEnrichmentTargetCache(try self.computeGeneratedEnrichmentTargetCache());
+    }
+
     fn loadResolverCatalog(self: *IndexManager, store: anytype) !void {
         var runtime_store = try initRuntimeStore(self.alloc, store);
         defer runtime_store.deinit();
@@ -20540,18 +20578,7 @@ fn validateGraphMaterializedSourceTemplate(template_source: []const u8) !void {
     if (trimmed.len == 0) return;
     if (!std.mem.startsWith(u8, trimmed, "{{") or !std.mem.endsWith(u8, trimmed, "}}")) return error.InvalidIndexConfig;
     const expr = std.mem.trim(u8, trimmed[2 .. trimmed.len - 2], &std.ascii.whitespace);
-    if (std.mem.eql(u8, expr, "_doc.key")) return;
-    if (std.mem.eql(u8, expr, "_artifact.value")) return;
-    const prefix = "_artifact.value.";
-    if (!std.mem.startsWith(u8, expr, prefix)) return error.InvalidIndexConfig;
-    var parts = std.mem.splitScalar(u8, expr[prefix.len..], '.');
-    while (parts.next()) |part| {
-        if (part.len == 0) return error.InvalidIndexConfig;
-        for (part) |ch| {
-            if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) return error.InvalidIndexConfig;
-        }
-    }
-    return;
+    if (!std.mem.eql(u8, expr, "_doc.key")) return error.InvalidIndexConfig;
 }
 
 fn validateGraphTemplateDocFields(template_source: []const u8, declared_fields: []const []u8) !void {
@@ -20823,12 +20850,15 @@ test "graph config rejects undeclared doc value template fields and unsupported 
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.owner-id }}"}}}
     ));
-
-    var stable = try parseGraphConfig(alloc,
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1","nodes":{"source":"{{ _artifact.value.owner.id }}"}}}
+    ));
+
+    var owned = try parseGraphConfig(alloc,
+        \\{"source":{"artifact":"relations_v1","nodes":{"source":"{{ _doc.key }}"}}}
     );
-    defer stable.deinit(alloc);
-    try std.testing.expectEqualStrings("{{ _artifact.value.owner.id }}", stable.artifact_sources[0].mapping.source_template);
+    defer owned.deinit(alloc);
+    try std.testing.expectEqualStrings("{{ _doc.key }}", owned.artifact_sources[0].mapping.source_template);
 }
 
 test "graph config rejects artifact source combined with document field edge types" {

@@ -197,7 +197,7 @@ const indexFormSchema = z
               code: "custom",
               path: ["graphSources", index, "sourceNode"],
               message:
-                "Use {{ _doc.key }} or one {{ _artifact.value... }} path for the source node.",
+                "Use {{ _doc.key }} for the source node so graph state stays with its routing owner.",
             });
           }
           const fields = splitContextFields(source.contextFields);

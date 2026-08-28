@@ -1414,6 +1414,8 @@ pub const GraphIndex = struct {
         const owned_pairs = try self.mainStoreScanRange(alloc, range_lower, range_upper);
         defer backend_scan.freeResults(alloc, owned_pairs);
 
+        var outgoing_batch = try self.beginWriteOutgoingBatch();
+        errdefer outgoing_batch.abort();
         var reverse_txn = try self.beginWriteReverseTxn();
         errdefer reverse_txn.abort();
 
@@ -1424,6 +1426,10 @@ pub const GraphIndex = struct {
 
             const rev_key = try reverseEdgeKeyAlloc(alloc, parsed.target, self.index_name, parsed.edge_type, parsed.source);
             defer alloc.free(rev_key);
+            outgoing_batch.delete(pair.key) catch |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            };
             reverse_txn.delete(rev_key) catch |err| switch (err) {
                 error.NotFound => {},
                 else => return err,
@@ -1465,6 +1471,9 @@ pub const GraphIndex = struct {
             removed += 1;
         }
 
+        // Match normal graph batch publication order: make forward ownership
+        // authoritative first, then retire its reverse projection.
+        try outgoing_batch.commit();
         try reverse_txn.commit();
         try self.rebuildCounterMetadata();
         return removed;
@@ -1990,6 +1999,16 @@ test "graph pruneOwnedRange removes reverse edges for removed split range" {
     const incoming_q = try graph.getEdges(alloc, "doc:q", "ref", .in);
     defer GraphIndex.freeEdges(alloc, incoming_q);
     try std.testing.expectEqual(@as(usize, 0), incoming_q.len);
+
+    const outgoing_a = try graph.getEdges(alloc, "doc:a", "ref", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing_a);
+    try std.testing.expectEqual(@as(usize, 1), outgoing_a.len);
+    const outgoing_z = try graph.getEdges(alloc, "doc:z", "ref", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing_z);
+    try std.testing.expectEqual(@as(usize, 0), outgoing_z.len);
+    const outgoing_m = try graph.getEdges(alloc, "doc:m", "ref", .out);
+    defer GraphIndex.freeEdges(alloc, outgoing_m);
+    try std.testing.expectEqual(@as(usize, 0), outgoing_m.len);
 }
 
 test "tree topology rejects second outgoing edge" {

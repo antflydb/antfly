@@ -109,7 +109,7 @@ describe("CreateIndexDialog", () => {
 
   it("validates graph materialized source templates with the server grammar", () => {
     expect(isValidGraphMaterializedSourceTemplate("{{ _doc.key }}")).toBe(true);
-    expect(isValidGraphMaterializedSourceTemplate("{{ _artifact.value.owner.id }}")).toBe(true);
+    expect(isValidGraphMaterializedSourceTemplate("{{ _artifact.value.owner.id }}")).toBe(false);
     expect(
       isValidGraphMaterializedSourceTemplate("{{ _artifact.value.source }}:{{ _doc.key }}")
     ).toBe(false);

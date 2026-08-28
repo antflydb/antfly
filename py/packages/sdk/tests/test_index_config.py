@@ -138,11 +138,12 @@ def test_graph_sources_reject_duplicates_and_invalid_values() -> None:
         "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
         "{{ _artifact.value.owner-id }}",
         "{{ _artifact.value. }}",
+        "{{ _artifact.value.owner.id }}",
     ):
         with pytest.raises(ValueError, match="nodes.source"):
             graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(source=source)))
     assert graph_index_sources(
-        GraphArtifactSource("relations", nodes=GraphNodeMapping(source="{{ _artifact.value.owner.id }}"))
+        GraphArtifactSource("relations", nodes=GraphNodeMapping(source="{{ _doc.key }}"))
     )
     with pytest.raises(ValueError, match="nodes.target"):
         graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(target=float("inf"))))

@@ -183,6 +183,7 @@ describe("artifact embedding index configuration", () => {
       "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
       "{{ _artifact.value.owner-id }}",
       "{{ _artifact.value. }}",
+      "{{ _artifact.value.owner.id }}",
     ]) {
       expect(() => graphIndexSources({ artifact: "relations", nodes: { source } })).toThrow(
         /nodes.source/
@@ -191,7 +192,7 @@ describe("artifact embedding index configuration", () => {
     expect(() =>
       graphIndexSources({
         artifact: "relations",
-        nodes: { source: "{{ _artifact.value.owner.id }}" },
+        nodes: { source: "{{ _doc.key }}" },
       })
     ).not.toThrow();
     expect(() =>

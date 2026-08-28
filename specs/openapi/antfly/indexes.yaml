@@ -196,14 +196,12 @@ components:
           format: double
     GraphMaterializedSourceTemplate:
       type: string
-      pattern: '^\{\{\s*(_doc\.key|_artifact\.value(\.[A-Za-z0-9_]+)*)\s*\}\}$'
+      pattern: '^\{\{\s*_doc\.key\s*\}\}$'
       description: >-
-        Stable owner identity for edges materialized from one artifact item.
-        It must resolve from the source document key or the durable artifact
-        payload through a dot-separated ASCII field path so replay and deletion
-        can deterministically replace prior edges. Helpers, literals, multiple
-        expressions, and document-value fields are rejected. Omit it to use the
-        source document key.
+        Owner identity for edges materialized from one artifact item. Omit it
+        to use the source document key. When present, it must be exactly the
+        source document key template so edge state remains colocated with its
+        routing and range-split owner.
     GraphArtifactNodeMappingConfig:
       type: object
       additionalProperties: false
