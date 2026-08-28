@@ -1798,6 +1798,11 @@ fn isOperationalEmbeddingProbeError(err: anyerror) bool {
         error.UnexpectedReadFailure,
         error.SendFailed,
         error.RecvFailed,
+        // Executor admission is transport capacity, not a malformed index
+        // definition. Surface it through the retryable probe-unavailable
+        // contract so clients do not turn transient saturation into a
+        // permanent configuration failure.
+        error.ConcurrencyUnavailable,
         => true,
         else => false,
     };
@@ -3749,6 +3754,10 @@ fn testChunkerOnlyDenseIndexPreservesDeclaredDimensions() !void {
 
 test "managed embedder strict dimension probe failure is retryable" {
     try testManagedEmbedderStrictDimensionProbeFailureIsRetryable();
+}
+
+test "managed embedder treats executor saturation as an operational probe failure" {
+    try std.testing.expect(isOperationalEmbeddingProbeError(error.ConcurrencyUnavailable));
 }
 
 pub fn testDimensionProbeValidationModes() !void {

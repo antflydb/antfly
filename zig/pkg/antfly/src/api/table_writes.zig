@@ -31911,10 +31911,14 @@ test "failed full index enrichment does not make resident reads unavailable" {
     FakeEmbeddingProvider.rate_limited_count.store(0, .monotonic);
     FakeEmbeddingProvider.allow_first_success.store(false, .monotonic);
 
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
 
     var source = ProvisionedTableWriteSource.init(path, FakeCatalog.iface());
+    defer source.deinit();
+    source.backend_runtime = backend_runtime.ptr();
     source.write_cache = &write_cache;
 
     _ = try source.source().batch(alloc, "stable", .{

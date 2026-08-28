@@ -2919,6 +2919,11 @@ pub const ApiHttpClient = struct {
         });
         defer resp.deinit(self.alloc);
         if (resp.status != 201) {
+            if (resp.status == 503 and std.mem.indexOf(
+                u8,
+                resp.body,
+                "\"error\":\"index_probe_unavailable\"",
+            ) != null) return error.ProbeUnavailable;
             std.debug.print("createTableIndex unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
             return error.UnexpectedHttpStatus;
         }

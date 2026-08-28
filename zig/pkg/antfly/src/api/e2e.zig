@@ -69,6 +69,29 @@ fn runMetadataUntilIncarnationReady(svc: *metadata_service.MetadataService) !voi
     return error.MetadataIncarnationUnavailable;
 }
 
+fn createTableIndexWithProbeRetry(
+    client: *http_client.ApiHttpClient,
+    wait_io: std.Io,
+    base_uri: []const u8,
+    table_name: []const u8,
+    index_name: []const u8,
+    body: []const u8,
+) !http_client.TablesResponse {
+    for (0..600) |_| {
+        return client.createTableIndex(base_uri, table_name, index_name, body) catch |err| switch (err) {
+            // Index validation has not mutated catalog state. Retry only the
+            // server's explicit pre-admission saturation contract; all other
+            // transport and HTTP failures remain terminal and visible.
+            error.ProbeUnavailable => {
+                try wait_io.sleep(.fromMilliseconds(50), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+    return error.EmbeddingProbeUnavailable;
+}
+
 fn metadataServiceProgressSource(svc: *metadata_service.MetadataService) raft_mod.ProgressSource {
     return .{
         .ptr = svc,
@@ -3336,6 +3359,13 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
         table_catalog.CatalogSource.fromMetadataService(&svc),
     );
     defer provisioned_write_source.deinit();
+    // This integration test issues real embedding validation requests. Give
+    // it the same dedicated executor ownership as production so unrelated
+    // parallel tests cannot exhaust the process-global fallback executor.
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    provisioned_write_source.backend_runtime = backend_runtime.ptr();
+    const probe_retry_io = backend_runtime.ptr().controlIo() orelse return error.BackendRuntimeUnavailable;
     const DirectWriterOwner = struct {
         fn metadataMayOpenReplicaRoots(_: *anyopaque) bool {
             return false;
@@ -3349,11 +3379,12 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     defer svc.setLocalReplicaRootReconcilePermitHook(null);
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
-        .{ .deployment_mode = .standalone },
+        .{ .deployment_mode = .standalone, .backend_runtime = backend_runtime.ptr() },
         http_server.StatusSource.fromMetadataService(&svc),
         provisioned_read_source.source(),
         provisioned_write_source.source(),
     );
+    defer server.deinit();
     var listener = try http_test_runtime.Runtime.startOwned(std.testing.allocator, &server);
     defer listener.deinit();
 
@@ -3391,7 +3422,14 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
         null,
     );
     defer std.testing.allocator.free(semantic_index_body);
-    var semantic_index_resp = try client.createTableIndex(base_uri, "docs", "semantic_idx", semantic_index_body);
+    var semantic_index_resp = try createTableIndexWithProbeRetry(
+        &client,
+        probe_retry_io,
+        base_uri,
+        "docs",
+        "semantic_idx",
+        semantic_index_body,
+    );
     defer semantic_index_resp.deinit(std.testing.allocator);
 
     rounds = 0;
@@ -3416,7 +3454,14 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
     defer dropped.deinit(std.testing.allocator);
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchTableIndex(base_uri, "docs", "semantic_idx"));
 
-    var recreated = try client.createTableIndex(base_uri, "docs", "semantic_idx", semantic_index_body);
+    var recreated = try createTableIndexWithProbeRetry(
+        &client,
+        probe_retry_io,
+        base_uri,
+        "docs",
+        "semantic_idx",
+        semantic_index_body,
+    );
     defer recreated.deinit(std.testing.allocator);
 
     // Index creation is accepted before the writer-owned generation has
