@@ -1096,10 +1096,17 @@ fn droppedTableTrashPath(
     table_name: []const u8,
     group_id: u64,
 ) ![]u8 {
+    // Table names are API identifiers, not path components: valid names may
+    // contain separators, dot components, spaces, or platform-reserved bytes.
+    // Keep quarantine entries flat and portable while retaining a stable
+    // diagnostic correlation token that does not disclose the raw name.
+    var name_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(table_name, &name_digest, .{});
+    const name_digest_hex = std.fmt.bytesToHex(name_digest, .lower);
     return try std.fmt.allocPrint(alloc, "{s}/{s}/table-{s}-group-{d}-{d}", .{
         replica_root_dir,
         dropped_table_trash_dir_name,
-        table_name,
+        &name_digest_hex,
         group_id,
         platform_time.monotonicNs(),
     });
@@ -42885,6 +42892,22 @@ test "provisioned table write source drop table cancels index repair before stru
     try std.testing.expect(probe.remove_seen.isSet());
     try std.testing.expect(probe.clear_seen.isSet());
     try std.testing.expect(!probe.invalid_sequence.isSet());
+}
+
+test "dropped table quarantine path keeps valid API names in one portable component" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = "replicas";
+    const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
+    defer alloc.free(trash_dir_path);
+
+    for ([_][]const u8{ "sales/archive", "..", "sales%2Farchive", "quarterly reports" }) |table_name| {
+        const path = try droppedTableTrashPath(alloc, replica_root_dir, table_name, 7001);
+        defer alloc.free(path);
+        try std.testing.expectEqualStrings(trash_dir_path, std.fs.path.dirname(path).?);
+        const basename = std.fs.path.basename(path);
+        try std.testing.expect(std.mem.startsWith(u8, basename, "table-"));
+        try std.testing.expect(std.mem.indexOf(u8, basename, table_name) == null);
+    }
 }
 
 test "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart" {

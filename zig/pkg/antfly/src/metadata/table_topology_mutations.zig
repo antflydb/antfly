@@ -18,13 +18,13 @@ const std = @import("std");
 const operation = @import("../api/operation.zig");
 const tables_api = @import("../api/tables.zig");
 const metadata_authority = @import("authority.zig");
-const metadata_service = @import("service.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const topology_protocol = @import("topology_protocol.zig");
 
-fn afterAdmission(_: anyerror) anyerror {
+fn afterAdmission(err: anyerror) anyerror {
     // Once Raft returned a receipt, no local failure can prove that the entry
     // was not committed. Fail closed so callers never blindly replay it.
+    std.log.warn("metadata topology mutation outcome became ambiguous after admission err={s}", .{@errorName(err)});
     return error.MetadataMutationOutcomeUnknown;
 }
 
@@ -38,26 +38,10 @@ fn findRangeByGroupId(
     return null;
 }
 
-fn runPostCommitControlRound(
-    svc: *metadata_service.MetadataHttpService,
-    operation_name: []const u8,
-    table_name: []const u8,
-) void {
-    svc.runControlRoundOnly() catch |err| {
-        // The exact receipt and projection check already proved the metadata
-        // outcome. Background reconciliation remains responsible for
-        // convergence; do not mislabel a committed mutation as ambiguous.
-        std.log.warn(
-            "table topology {s} committed; immediate reconciliation deferred table={s} err={s}",
-            .{ operation_name, table_name, @errorName(err) },
-        );
-    };
-}
-
 pub const DropResult = topology_protocol.DropResult;
 
 pub fn create(
-    svc: *metadata_service.MetadataHttpService,
+    svc: anytype,
     alloc: std.mem.Allocator,
     request: operation.RequestContext,
     table_name: []const u8,
@@ -105,11 +89,10 @@ pub fn create(
     }
     svc.unlockCatalogMutation();
     catalog_locked = false;
-    runPostCommitControlRound(svc, "create", table_name);
 }
 
 pub fn drop(
-    svc: *metadata_service.MetadataHttpService,
+    svc: anytype,
     alloc: std.mem.Allocator,
     request: operation.RequestContext,
     table_name: []const u8,
@@ -144,7 +127,6 @@ pub fn drop(
         return error.TableTransitionActive;
     svc.unlockCatalogMutation();
     catalog_locked = false;
-    runPostCommitControlRound(svc, "drop", table_name);
     const result = DropResult{
         .table_id = admission.table_id,
         .expected_transition_generation = admission.expected_transition_generation,

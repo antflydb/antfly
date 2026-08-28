@@ -1236,7 +1236,7 @@ pub const StatusSource = struct {
             }
 
             fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
-                return try createTableOnService(cast(ptr), alloc, table_name, req);
+                return try metadata_table_topology_mutations.create(cast(ptr), alloc, .{}, table_name, req);
             }
 
             fn replaceTableDefinition(ptr: *anyopaque, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) anyerror!void {
@@ -1256,7 +1256,12 @@ pub const StatusSource = struct {
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
-                return try dropTableOnService(cast(ptr), alloc, table_name);
+                var result = try @This().dropTableExact(ptr, alloc, table_name);
+                defer result.deinit(alloc);
+            }
+
+            fn dropTableExact(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult {
+                return try metadata_table_topology_mutations.drop(cast(ptr), alloc, .{}, table_name);
             }
 
             fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
@@ -1358,6 +1363,7 @@ pub const StatusSource = struct {
             .replace_table_definition = Gen.replaceTableDefinition,
             .restore_table = Gen.restoreTable,
             .drop_table = Gen.dropTable,
+            .drop_table_exact = Gen.dropTableExact,
             .update_schema = Gen.updateSchema,
             .update_schema_versioned = Gen.updateSchemaVersioned,
             .create_index = Gen.createIndex,
@@ -14718,12 +14724,17 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
 
         fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) anyerror!void {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            return try createTableOnService(service, alloc, table_name, req);
+            return try metadata_table_topology_mutations.create(service, alloc, .{}, table_name, req);
         }
 
         fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
+            var result = try dropTableExact(ptr, alloc, table_name);
+            defer result.deinit(alloc);
+        }
+
+        fn dropTableExact(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!metadata_table_topology_mutations.DropResult {
             const service: *metadata_service.MetadataService = @ptrCast(@alignCast(ptr));
-            return try dropTableOnService(service, alloc, table_name);
+            return try metadata_table_topology_mutations.drop(service, alloc, .{}, table_name);
         }
 
         fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) anyerror!void {
@@ -14756,6 +14767,7 @@ fn testMetadataServiceSourceWithoutLifecycle(svc: *metadata_service.MetadataServ
             .free_admin_snapshot = V.freeAdminSnapshot,
             .create_table = V.createTable,
             .drop_table = V.dropTable,
+            .drop_table_exact = V.dropTableExact,
             .update_schema = V.updateSchema,
             .update_schema_versioned = V.updateSchemaVersioned,
             .create_index = V.createIndex,
@@ -15635,6 +15647,7 @@ fn contextualInferenceCapacityResponse(alloc: std.mem.Allocator) !contextual_ope
 
 fn extensionLifecycleContextualResponse(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
     return switch (err) {
+        error.MetadataMutationOutcomeUnknown => try contextualRetryableJsonErrorResponse(alloc, 503, "extension mutation outcome is unknown; observe extension state before retrying"),
         error.UnsupportedOperation => try contextualJsonErrorResponse(alloc, 405, "method not allowed"),
         error.PackageNotFound, error.ExtensionNotInstalled, error.TableNotFound => try contextualJsonErrorResponse(alloc, 404, "not found"),
         error.ExtensionAlreadyInstalled => try contextualJsonErrorResponse(alloc, 409, "extension already installed"),
@@ -35694,6 +35707,14 @@ test "api http server serves table metadata routes against real metadata service
     });
     defer invalid_batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), invalid_batch_resp.status);
+
+    var drop_result = try StatusSource.fromMetadataService(&svc).dropTableExact(std.testing.allocator, "docs");
+    defer drop_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, tables_api.deriveTableRecord("docs", .{}).table_id), drop_result.table_id);
+    try std.testing.expectEqual(@as(usize, 1), drop_result.group_ids.len);
+    var dropped_snapshot = try svc.adminSnapshot();
+    defer svc.freeAdminSnapshot(&dropped_snapshot);
+    try std.testing.expect(tables_api.findTableByName(&dropped_snapshot, "docs") == null);
 }
 
 test "api http server create table with replication sources returns encoded table detail" {

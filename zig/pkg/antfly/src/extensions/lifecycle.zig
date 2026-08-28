@@ -42,6 +42,79 @@ fn unlockCatalogMutation(service: anytype, locked: bool) void {
         service.unlockCatalogMutation();
 }
 
+fn proposeCatalogMutation(service: anytype, command: metadata_storage.TransitionCommand) !void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "proposeTransitionCommandWithReceipt") and
+        @hasDecl(ServiceDeclType, "waitForTransitionApplied"))
+    {
+        const receipt = try service.proposeTransitionCommandWithReceipt(command);
+        service.waitForTransitionApplied(receipt) catch
+            return error.MetadataMutationOutcomeUnknown;
+        return;
+    }
+    try service.proposeTransitionCommand(command);
+}
+
+test "extension lifecycle proposal holds serialization through exact apply receipt" {
+    const FakeService = struct {
+        const Receipt = struct { term: u64, index: u64 };
+        proposed: bool = false,
+        waited: bool = false,
+
+        pub fn proposeTransitionCommandWithReceipt(
+            self: *@This(),
+            _: metadata_storage.TransitionCommand,
+        ) !Receipt {
+            self.proposed = true;
+            return .{ .term = 3, .index = 9 };
+        }
+
+        pub fn waitForTransitionApplied(
+            self: *@This(),
+            receipt: Receipt,
+        ) !void {
+            try std.testing.expect(self.proposed);
+            try std.testing.expectEqual(@as(u64, 3), receipt.term);
+            try std.testing.expectEqual(@as(u64, 9), receipt.index);
+            self.waited = true;
+        }
+    };
+
+    var service = FakeService{};
+    try proposeCatalogMutation(&service, .{ .remove_reconcile_lease = .{} });
+    try std.testing.expect(service.proposed);
+    try std.testing.expect(service.waited);
+}
+
+test "extension lifecycle proposal preserves post-admission ambiguity" {
+    const FakeService = struct {
+        const Receipt = struct { term: u64, index: u64 };
+        pub fn proposeTransitionCommandWithReceipt(
+            _: *@This(),
+            _: metadata_storage.TransitionCommand,
+        ) !Receipt {
+            return .{ .term = 3, .index = 9 };
+        }
+
+        pub fn waitForTransitionApplied(
+            _: *@This(),
+            _: Receipt,
+        ) !void {
+            return error.NotLeader;
+        }
+    };
+
+    var service = FakeService{};
+    try std.testing.expectError(
+        error.MetadataMutationOutcomeUnknown,
+        proposeCatalogMutation(&service, .{ .remove_reconcile_lease = .{} }),
+    );
+}
+
 pub fn installOnService(
     service: anytype,
     alloc: std.mem.Allocator,
@@ -71,7 +144,7 @@ pub fn installOnService(
         const table_upserts = try planStorageMemberDeltaAlloc(alloc, &snapshot, &.{}, members);
         defer freeLifecycleTables(alloc, table_upserts);
 
-        try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+        try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
             .upsert_tables = table_upserts,
             .upsert_installed_extensions = &.{installed},
             .upsert_extension_dependencies = dependencies,
@@ -118,7 +191,7 @@ pub fn updateOnService(
         const remove_member_keys = try memberRemoveKeysAlloc(alloc, old_members);
         defer freeMemberRemoveKeys(alloc, remove_member_keys);
 
-        try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+        try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
             .upsert_tables = table_upserts,
             .remove_extension_dependencies = remove_dependency_keys,
             .remove_extension_members = remove_member_keys,
@@ -166,7 +239,7 @@ pub fn dropOnService(
     const remove_installed_names = try missingInstalledNamesAlloc(alloc, snapshot.installed_extensions, remaining_installed);
     defer freeInstalledRemoveNames(alloc, remove_installed_names);
 
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
         .upsert_tables = table_upserts,
         .remove_extension_dependencies = remove_dependency_keys,
         .remove_extension_members = remove_member_keys,
@@ -185,7 +258,7 @@ pub fn enableOnService(service: anytype, alloc: std.mem.Allocator, extension_nam
     try catalog.enableInstalled(extension_name);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
         .upsert_installed_extensions = &.{installed},
     } });
     return installed;
@@ -202,7 +275,7 @@ pub fn disableOnService(service: anytype, alloc: std.mem.Allocator, extension_na
     try catalog.disableInstalled(extension_name);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
         .upsert_installed_extensions = &.{installed},
     } });
     return installed;
@@ -224,7 +297,7 @@ pub fn configureOnService(
     try catalog.configureInstalled(extension_name, request);
     var installed = try catalog.getInstalledAlloc(alloc, extension_name);
     errdefer installed.deinitOwned(alloc);
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
         .upsert_installed_extensions = &.{installed},
     } });
     return installed;
@@ -239,7 +312,7 @@ pub fn restoreOnService(
     if (installed.len == 0 and members.len == 0 and dependencies.len == 0) return;
     const catalog_locked = lockCatalogMutation(service);
     defer unlockCatalogMutation(service, catalog_locked);
-    try service.proposeTransitionCommand(.{ .apply_extension_lifecycle = .{
+    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = .{
         .upsert_installed_extensions = installed,
         .upsert_extension_dependencies = dependencies,
         .upsert_extension_members = members,

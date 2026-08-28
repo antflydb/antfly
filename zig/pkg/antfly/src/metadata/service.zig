@@ -2055,6 +2055,7 @@ pub const MetadataService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
+    catalog_mutation_mutex: std.Io.Mutex = .init,
     catalog_validation_mutex: std.Io.Mutex = .init,
     catalog_validation_cache: CatalogValidationSnapshotCache = .{},
     local_group_status_provider: ?LocalGroupStatusProvider = null,
@@ -2379,6 +2380,25 @@ pub const MetadataService = struct {
         if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return error.NotLeader;
     }
 
+    /// In-process metadata peers are instantiated from this binary and do not
+    /// cross an independently deployable HTTP boundary. Local leadership is
+    /// therefore the complete decoder-capability barrier for this service
+    /// variant; the HTTP service probes every separately deployed member.
+    pub fn ensureTableTopologyProtocolReadyWithContext(
+        self: *MetadataService,
+        request: api_operation.RequestContext,
+    ) !void {
+        try request.ensureActive();
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
+            return error.TableTopologyProtocolUpgradeRequired;
+        const local_node_id = self.raft.host.host.cfg.local_node_id;
+        if (raft_status.soft.role != .leader or raft_status.soft.leader_id == null or
+            raft_status.soft.leader_id.? != local_node_id)
+            return error.NotLeader;
+    }
+
     pub fn proposeTransitionCommand(self: *MetadataService, command: metadata_storage.TransitionCommand) !void {
         var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
         defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
@@ -2390,6 +2410,177 @@ pub const MetadataService = struct {
         defer self.alloc.free(encoded);
         try self.raft.host.host.propose(self.metadata_group_id, encoded);
         self.lifecycle_signal.notify(null);
+    }
+
+    /// Admit one transition with an exact Raft log receipt. Catalog workflows
+    /// use this to keep their serialization lock until the snapshot read by a
+    /// following request can observe the mutation.
+    pub fn proposeTransitionCommandWithReceipt(
+        self: *MetadataService,
+        command: metadata_storage.TransitionCommand,
+    ) !MetadataProposalReceipt {
+        var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
+        defer if (owned_legacy_store) |record| metadata_table_manager.freeStore(self.alloc, record);
+        const safe_command = try runtimeStatusProtocolSafeCommand(self, command, &owned_legacy_store);
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
+        const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        if (raft_status.soft.role != .leader or
+            raft_status.soft.leader_id == null or
+            raft_status.soft.leader_id.? != raft_status.id)
+            return error.NotLeader;
+        const encoded = try metadata_storage.encodeTransitionCommand(self.alloc, safe_command);
+        defer self.alloc.free(encoded);
+        if (safe_command == .apply_table_topology and
+            encoded.len > metadata_topology_protocol.max_transition_command_bytes)
+            return error.MetadataTopologyCommandTooLarge;
+        try self.raft.host.host.prepareProposalReceiptTracking(self.metadata_group_id);
+        var accepted_index: ?u64 = null;
+        var dispatch_error: ?anyerror = null;
+        self.raft.host.host.proposeWithReceipt(self.metadata_group_id, encoded, &accepted_index) catch |err| {
+            dispatch_error = err;
+        };
+        const index = try acceptedMetadataProposalIndex(accepted_index, dispatch_error);
+        try self.raft.host.host.trackProposalReceipt(
+            self.metadata_group_id,
+            raft_status.hard.current_term,
+            index,
+        );
+        if (dispatch_error) |err| {
+            std.log.warn(
+                "metadata proposal accepted before dispatch failure group_id={} index={} err={s}",
+                .{ self.metadata_group_id, index, @errorName(err) },
+            );
+        }
+        self.lifecycle_signal.notify(null);
+        return .{ .term = raft_status.hard.current_term, .index = index };
+    }
+
+    pub fn waitForTransitionApplied(
+        self: *MetadataService,
+        receipt: MetadataProposalReceipt,
+    ) !void {
+        return self.waitForTransitionAppliedWithContext(receipt, .{});
+    }
+
+    pub fn waitForTransitionAppliedWithContext(
+        self: *MetadataService,
+        receipt: MetadataProposalReceipt,
+        request: api_operation.RequestContext,
+    ) !void {
+        try request.ensureActive();
+        self.lockRuntime();
+        const tracked_receipt = self.raft.host.host.acquireProposalReceipt(
+            self.metadata_group_id,
+            receipt.term,
+            receipt.index,
+        );
+        self.unlockRuntime();
+        defer if (tracked_receipt) {
+            self.lockRuntime();
+            self.raft.host.host.releaseProposalReceipt(
+                self.metadata_group_id,
+                receipt.term,
+                receipt.index,
+            );
+            self.unlockRuntime();
+        };
+
+        const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
+        const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
+            @min(local_deadline_ns, caller_deadline_ns)
+        else
+            local_deadline_ns;
+        while (platform_time.monotonicNs() < deadline_ns) {
+            try request.ensureActive();
+            self.lockRuntime();
+            const maybe_raft_status = self.raft.host.host.raftStatus(self.metadata_group_id);
+            const applied_entry_term = if (maybe_raft_status) |raft_status|
+                if (raft_status.applied_index >= receipt.index)
+                    self.raft.host.host.raftTermAtTrackedProposalReceipt(
+                        self.metadata_group_id,
+                        receipt.term,
+                        receipt.index,
+                    ) catch |err| term: {
+                        std.log.warn(
+                            "metadata proposal receipt term lookup failed group_id={} receipt_term={} index={} applied_index={} err={s}",
+                            .{ self.metadata_group_id, receipt.term, receipt.index, raft_status.applied_index, @errorName(err) },
+                        );
+                        break :term null;
+                    }
+                else
+                    null
+            else
+                null;
+            const observation = observeMetadataProposalApply(maybe_raft_status, applied_entry_term, receipt);
+            self.unlockRuntime();
+            switch (observation) {
+                .applied => return,
+                .superseded => {
+                    if (maybe_raft_status) |raft_status| {
+                        std.log.warn(
+                            "metadata proposal receipt superseded group_id={} receipt_term={} index={} current_term={} applied_index={} applied_term={?}",
+                            .{ self.metadata_group_id, receipt.term, receipt.index, raft_status.hard.current_term, raft_status.applied_index, applied_entry_term },
+                        );
+                    }
+                    return error.NotLeader;
+                },
+                .pending => {},
+            }
+            try self.runRaftProgressOnly();
+            platform_clock.Clock.real().sleepMs(1);
+        }
+        try request.ensureActive();
+        return error.MetadataProposalApplyTimeout;
+    }
+
+    pub fn captureTableDropAdmission(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) !TableDropAdmission {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        var attempt: u8 = 0;
+        while (attempt < 2) : (attempt += 1) {
+            if (attempt == 0) {
+                try store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            } else {
+                try store.rebuildDerivedCatalogIndexes(self.metadata_group_id);
+            }
+            var projection = (store.captureTableDropProjection(
+                alloc,
+                self.metadata_group_id,
+                table_name,
+            ) catch |err| switch (err) {
+                error.InvalidDerivedCatalogIndex => continue,
+                else => return err,
+            }) orelse return error.TableNotFound;
+            defer projection.deinit(alloc);
+            if (projection.fence.active()) return error.TableTransitionActive;
+            if (projection.extension_owned) return error.ExtensionOwnedObject;
+            const expected_name = try alloc.dupe(u8, projection.table.name);
+            errdefer alloc.free(expected_name);
+            const range_group_ids = projection.range_group_ids;
+            projection.range_group_ids = &.{};
+            return .{
+                .table_id = projection.table.table_id,
+                .expected_name = expected_name,
+                .expected_transition_generation = projection.fence.generation,
+                .range_membership = projection.fence.membership(projection.table.table_id),
+                .range_group_ids = range_group_ids,
+            };
+        }
+        return error.InvalidDerivedCatalogIndex;
+    }
+
+    pub fn lockCatalogMutation(self: *MetadataService) void {
+        self.catalog_mutation_mutex.lockUncancelable(std.Options.debug_io);
+    }
+
+    pub fn unlockCatalogMutation(self: *MetadataService) void {
+        self.catalog_mutation_mutex.unlock(std.Options.debug_io);
     }
 
     pub fn upsertNode(self: *MetadataService, record: metadata_table_manager.NodeRecord) !void {
@@ -2917,6 +3108,16 @@ pub const MetadataService = struct {
         };
         try self.completeRestoreIntentsIfReady();
         try self.runLifecycleReconcileHookIfRequested();
+    }
+
+    /// Drains accepted proposals and inbound consensus work without coupling
+    /// an exact proposal waiter to reconciliation or transition execution.
+    fn runRaftProgressOnly(self: *MetadataService) !void {
+        self.control_round_mutex.lockUncancelable(std.Options.debug_io);
+        defer self.control_round_mutex.unlock(std.Options.debug_io);
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        try self.raft.runRaftProgressOnly();
     }
 
     pub fn waitForTableLifecycle(self: *MetadataService, table_name: []const u8, expected: TableLifecycleExpectation) !void {
@@ -6519,10 +6720,10 @@ pub const MetadataHttpService = struct {
     }
 
     /// Serializes snapshot-derived catalog commands through Raft admission.
-    /// Table topology waits for its accepted entry while holding this lock;
-    /// extension lifecycle commands are admitted before releasing it. This
-    /// makes their snapshots and log order agree without holding the Raft
-    /// runtime lock across disk or network waits.
+    /// Table topology and extension lifecycle both wait for their accepted
+    /// entry while holding this lock. This makes successive snapshots and log
+    /// order agree without holding the Raft runtime lock across disk or
+    /// network waits.
     pub fn lockCatalogMutation(self: *MetadataHttpService) void {
         self.catalog_mutation_mutex.lockUncancelable(std.Options.debug_io);
     }
