@@ -5667,6 +5667,11 @@ pub const ProvisionedTableWriteSource = struct {
         quarantine_retry_scheduled: bool = false,
         retry_at_ms: u64 = 0,
         index_repair_pending: bool = false,
+        // Automatic load failures still exist whose exact incarnations have
+        // not all been classified into durable repair or terminal debt. This
+        // remains independent from terminal degradation because both may
+        // coexist during a bounded discovery sweep.
+        automatic_index_repair_discovery_pending: bool = false,
         // Durable repair debt exists, but operator-controlled automation is
         // paused. This is parked status debt, never runnable scheduler work.
         index_repair_paused: bool = false,
@@ -10825,6 +10830,12 @@ pub const ProvisionedTableWriteSource = struct {
 
         const final_repair_summary = try db.indexRepairIntentSummary(alloc);
         const final_index_load_failure = try managedDbHasIndexLoadFailure(alloc, db);
+        const final_automatic_queue = db.core.index_manager.failedIndexLoadRecoveryQueueState(.rebuild_from_artifacts);
+        const final_automatic_discovery_pending = automaticIndexRepairDiscoveryPendingAtFinalAudit(
+            result.automatic_index_repair_discovery_pending,
+            final_automatic_queue,
+        );
+        result.automatic_index_repair_discovery_pending = final_automatic_discovery_pending;
         const final_restore_repair_needed = try db.restoreRuntimeRepairNeeded();
         const final_broad_debt = metadata.advance_index_repairs and try managedDbHasBroadCatchUpDebt(alloc, db);
         result.index_repair_paused = false;
@@ -10835,7 +10846,8 @@ pub const ProvisionedTableWriteSource = struct {
             // precedence even if that generation also has a runnable intent.
             result.had_debt = true;
             result.terminal_degraded = true;
-            result.index_repair_pending = !try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            result.index_repair_pending = final_automatic_discovery_pending or !terminal_status_published;
             startup_status_active = false;
         } else if (final_repair_summary.runnable != 0) {
             result.had_debt = true;
@@ -10843,7 +10855,8 @@ pub const ProvisionedTableWriteSource = struct {
         } else if (final_repair_summary.terminal != 0 or final_index_load_failure) {
             result.had_debt = true;
             result.terminal_degraded = true;
-            result.index_repair_pending = !try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            const terminal_status_published = try publishTerminalStartupRuntimeStatusSnapshot(self, alloc, table_name, group_id, db);
+            result.index_repair_pending = final_automatic_discovery_pending or !terminal_status_published;
             startup_status_active = false;
         } else if (final_broad_debt) {
             result.had_debt = true;
@@ -22016,6 +22029,41 @@ fn managedDbHasIndexLoadFailure(alloc: std.mem.Allocator, db: *db_mod.DB) !bool 
     return db.core.index_manager.failedIndexLoadSummary().total != 0;
 }
 
+fn automaticIndexRepairDiscoveryPendingAtFinalAudit(
+    previously_pending: bool,
+    queue: index_manager_mod.IndexManager.FailedIndexLoadRecoveryQueueState,
+) bool {
+    return queue.action_total != 0 and
+        (previously_pending or !queue.sweep_complete);
+}
+
+test "final repair audit preserves bounded automatic discovery alongside terminal debt" {
+    try std.testing.expect(automaticIndexRepairDiscoveryPendingAtFinalAudit(false, .{
+        .action_total = 10,
+        .queue_epoch = 2,
+        .sweep_complete = false,
+    }));
+    // A completed queue scan can still have work explicitly deferred by the
+    // execution budget. The caller's pending fact survives the terminal audit.
+    try std.testing.expect(automaticIndexRepairDiscoveryPendingAtFinalAudit(true, .{
+        .action_total = 10,
+        .queue_epoch = 2,
+        .sweep_complete = true,
+    }));
+    try std.testing.expect(!automaticIndexRepairDiscoveryPendingAtFinalAudit(false, .{
+        .action_total = 10,
+        .queue_epoch = 2,
+        .sweep_complete = true,
+    }));
+    // If the automatic queue drained concurrently, stale pending state must
+    // not keep an otherwise clean group scheduled forever.
+    try std.testing.expect(!automaticIndexRepairDiscoveryPendingAtFinalAudit(true, .{
+        .action_total = 0,
+        .queue_epoch = 3,
+        .sweep_complete = true,
+    }));
+}
+
 fn seedManagedIndexReplayFromStoredDocsIfNeeded(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -24505,6 +24553,9 @@ fn mergeLiveIndexRepairResult(
     result.made_progress = result.made_progress or repair.made_progress;
     result.busy = repair.busy;
     result.index_repair_pending = repair.index_repair_pending;
+    result.automatic_index_repair_discovery_pending =
+        result.automatic_index_repair_discovery_pending or
+        repair.automatic_index_repair_discovery_pending;
     result.index_repair_paused = repair.index_repair_paused;
     result.index_repair_attempted = repair.index_repair_attempted;
     result.index_repair_repaired = repair.index_repair_repaired;
@@ -24821,6 +24872,7 @@ fn catchUpManagedDb(
                 .had_debt = true,
                 .made_progress = made_progress,
                 .index_repair_pending = true,
+                .automatic_index_repair_discovery_pending = automatic_discovery_pending,
             };
         }
         const repair = try db.repairRecoverableStartupIndexFailures(alloc, 1, index_repair_options);
@@ -24836,6 +24888,7 @@ fn catchUpManagedDb(
                 .made_progress = made_progress,
                 .busy = repair.busy != 0,
                 .index_repair_pending = true,
+                .automatic_index_repair_discovery_pending = automatic_discovery_pending,
                 .index_repair_attempted = repair.attempted != 0,
                 .index_repair_repaired = repair.repaired != 0,
                 .index_repair_degraded = repair.degraded != 0,
@@ -24902,6 +24955,7 @@ fn catchUpManagedDb(
             // inspected automatic-load-failure sweep. Preserve both truths:
             // status remains degraded while the owner retains the repair route.
             .index_repair_pending = automatic_discovery_pending,
+            .automatic_index_repair_discovery_pending = automatic_discovery_pending,
         };
     }
     if (automatic_discovery_pending) {
@@ -24909,6 +24963,7 @@ fn catchUpManagedDb(
             .had_debt = true,
             .made_progress = made_progress,
             .index_repair_pending = true,
+            .automatic_index_repair_discovery_pending = true,
             .index_repair_paused = repair_summary.paused != 0,
             .index_repair_attempted = attempted_index_repairs != 0,
             .index_repair_repaired = repaired_indexes != 0,

@@ -12987,7 +12987,7 @@ pub const DB = struct {
             );
         }
         self.core.index_manager.releaseFailedIndexLoadRepairClaim(entry.intent.index_name);
-        _ = try self.retryQuarantinedIndexLoads(true);
+        _ = try self.retryQuarantinedIndexLoad(entry.intent.index_name, true);
         try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
         return true;
     }
@@ -13148,9 +13148,13 @@ pub const DB = struct {
             );
             result.discovered += 1;
         }
-        const failure_summary = self.core.index_manager.failedIndexLoadSummary();
-        result.automatic_remaining = failure_summary.rebuild_from_artifacts;
-        if (result.automatic_remaining == 0) result.automatic_sweep_complete = true;
+        const final_queue = self.core.index_manager.finishFailedIndexLoadRecoveryQuantum(
+            .rebuild_from_artifacts,
+            quantum.queue_epoch,
+            result.automatic_sweep_complete,
+        );
+        result.automatic_remaining = final_queue.action_total;
+        result.automatic_sweep_complete = final_queue.sweep_complete;
         return result;
     }
 
@@ -14423,10 +14427,10 @@ pub const DB = struct {
             const recovery_action = self.core.index_manager.recoveryActionForIndex(cfg.name).?;
             switch (recovery_action) {
                 .retry_open, .manual_intervention => {
-                    // Explicit named operator repair may first retry any
-                    // quarantined open. This does not broaden the automatic
-                    // destructive-rebuild allowlist.
-                    _ = try self.retryQuarantinedIndexLoads(true);
+                    // Explicit named operator repair may first retry that
+                    // exact quarantined index. This does not broaden either
+                    // its scope or the automatic destructive-rebuild allowlist.
+                    _ = try self.retryQuarantinedIndexLoad(cfg.name, true);
                     if (self.core.index_manager.loadFailure(cfg.name) != null and recovery_action == .retry_open) {
                         result.failed += 1;
                         result.unresolved += 1;
@@ -19943,7 +19947,27 @@ pub const DB = struct {
             self.core.store,
             monotonicTimeNs(),
             force,
+            null,
             execution_limit,
+            publication_fence.iface(),
+        );
+    }
+
+    /// Retry exactly one quarantined index. Ignoring backoff is orthogonal to
+    /// scope: targeted rollback and operator repair must never inspect, clone,
+    /// open, or publish unrelated failed indexes.
+    pub fn retryQuarantinedIndexLoad(
+        self: *DB,
+        index_name: []const u8,
+        force: bool,
+    ) !index_manager_mod.IndexManager.QuarantineRetryResult {
+        var publication_fence = QuarantineIndexPublicationFence{ .db = self };
+        return try self.core.index_manager.retryFailedIndexLoads(
+            self.core.store,
+            monotonicTimeNs(),
+            force,
+            index_name,
+            1,
             publication_fence.iface(),
         );
     }
@@ -62565,6 +62589,39 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     });
     defer search_result.deinit();
     try std.testing.expectEqual(@as(u32, 400), search_result.total_hits);
+}
+
+test "db targeted quarantine retry does not open unrelated failed indexes" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.core.index_manager.addAllNoBackfill(db.core.store, &.{
+            .{ .name = "ft_target", .kind = .full_text, .config_json = "{}" },
+            .{ .name = "ft_unrelated", .kind = .full_text, .config_json = "{}" },
+        });
+    }
+
+    index_manager_mod.test_inject_index_open_error = error.InvalidIndexConfig;
+    defer index_manager_mod.test_inject_index_open_error = null;
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_target") != null);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
+
+    index_manager_mod.test_inject_index_open_error = null;
+    const result = try db.retryQuarantinedIndexLoad("ft_target", true);
+    try std.testing.expectEqual(@as(usize, 1), result.recovered);
+    try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_target") == null);
+    try std.testing.expect(db.core.textIndexEntry("ft_target") != null);
+    try std.testing.expect(db.core.index_manager.loadFailure("ft_unrelated") != null);
+    try std.testing.expect(db.core.textIndexEntry("ft_unrelated") == null);
 }
 
 test "db read-only open propagates transient index load errors instead of quarantining" {
