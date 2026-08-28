@@ -2521,6 +2521,10 @@ pub const ArtifactRepairIssue = struct {
     doc_key: []const u8 = "",
     parent_doc_key: []const u8 = "",
     unit_id: []const u8 = "",
+    /// Canonical artifact stream configured on the affected index. This is
+    /// deliberately distinct from `source_artifact_name` (the producer input)
+    /// and `artifact_name` (the unreadable derived value).
+    index_source_artifact_name: []const u8 = "",
     source_artifact_name: []const u8 = "",
     artifact_name: []const u8 = "",
     artifact_key: []const u8 = "",
@@ -2543,6 +2547,7 @@ pub const ArtifactRepairIssue = struct {
         if (self.doc_key.len > 0) alloc.free(@constCast(self.doc_key));
         if (self.parent_doc_key.len > 0) alloc.free(@constCast(self.parent_doc_key));
         if (self.unit_id.len > 0) alloc.free(@constCast(self.unit_id));
+        if (self.index_source_artifact_name.len > 0) alloc.free(@constCast(self.index_source_artifact_name));
         if (self.source_artifact_name.len > 0) alloc.free(@constCast(self.source_artifact_name));
         if (self.artifact_name.len > 0) alloc.free(@constCast(self.artifact_name));
         if (self.artifact_key.len > 0) alloc.free(@constCast(self.artifact_key));

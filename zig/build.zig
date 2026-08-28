@@ -6196,6 +6196,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "api distributed graph preserves per-shard snapshots across result refs expansion and hydration",
             "distributed graph incoming probe expands only positive source shards",
+            "distributed graph authoritative incoming routes avoid shard probes",
             "distributed graph root probe retires resolved keys between shard waves",
             "distributed graph supports cross-range traverse target selectors",
             "distributed graph edge reader carries identity generation",

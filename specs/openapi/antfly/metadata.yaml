@@ -2606,6 +2606,9 @@ components:
         unit_id:
           type: string
           description: Unit identifier for unit-scoped artifacts, when applicable.
+        index_source_artifact_name:
+          type: string
+          description: Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired.
         source_artifact_name:
           type: string
           description: Source artifact stream used to produce this artifact, when applicable.

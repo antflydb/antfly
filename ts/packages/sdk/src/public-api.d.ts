@@ -3461,6 +3461,8 @@ export interface components {
             parent_doc_key?: string;
             /** @description Unit identifier for unit-scoped artifacts, when applicable. */
             unit_id?: string;
+            /** @description Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired. */
+            index_source_artifact_name?: string;
             /** @description Source artifact stream used to produce this artifact, when applicable. */
             source_artifact_name?: string;
             /** @description Derived artifact name that must be reprocessed or made readable. */
@@ -9424,7 +9426,7 @@ export interface components {
         GraphArtifactContextConfig: {
             doc_fields?: string[];
         };
-        /** @description Artifact stream materialized into graph edges. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments. */
+        /** @description Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are rejected by serverless deployments. */
         GraphArtifactSourceConfig: {
             artifact: string;
             /** @description Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`. */
@@ -10062,7 +10064,7 @@ export interface components {
          * @description Stable machine-readable reason why an artifact source is pending or failed.
          * @enum {string}
          */
-        IndexSourceReadinessReason: "index_failed" | "enrichment_failure" | "runtime_unavailable" | "shard_observation_incomplete" | "source_observation_incomplete" | "publication";
+        IndexSourceReadinessReason: "index_failed" | "enrichment_failure" | "repair" | "runtime_unavailable" | "shard_observation_incomplete" | "source_observation_incomplete" | "publication";
         IndexSourceReadinessStatus: {
             /** @description Configured artifact stream identity. */
             artifact: string;

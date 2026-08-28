@@ -316,6 +316,27 @@ pub fn graphAssetStateIndexPrefixAlloc(alloc: Allocator, doc_key: []const u8, in
     return try list.toOwnedSlice(alloc);
 }
 
+/// Restore-only ownership segments are deterministic children of the logical
+/// graph state key. Keeping them below the document prefix preserves split,
+/// backup cleanup, and index-retirement ownership without introducing a
+/// second routing identity.
+pub fn graphAssetStateSegmentKeyAlloc(alloc: Allocator, state_key: []const u8, segment_index: u32) ![]u8 {
+    if (!isGraphAssetStateRootKey(state_key)) return error.InvalidInternalUserKey;
+    const out = try alloc.alloc(u8, state_key.len + 1 + @sizeOf(u32));
+    @memcpy(out[0..state_key.len], state_key);
+    out[state_key.len] = 0xff;
+    std.mem.writeInt(u32, out[state_key.len + 1 ..][0..4], segment_index, .big);
+    return out;
+}
+
+pub fn graphAssetStateSegmentPrefixAlloc(alloc: Allocator, state_key: []const u8) ![]u8 {
+    if (!isGraphAssetStateRootKey(state_key)) return error.InvalidInternalUserKey;
+    const out = try alloc.alloc(u8, state_key.len + 1);
+    @memcpy(out[0..state_key.len], state_key);
+    out[state_key.len] = 0xff;
+    return out;
+}
+
 pub fn graphEdgeContenderRootPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     var list = std.ArrayListUnmanaged(u8).empty;
     defer list.deinit(alloc);
@@ -1429,16 +1450,26 @@ pub fn matchesGraphEdgeIndexName(key: []const u8, index_name: []const u8) bool {
     return componentEquals(key, pos, index_name);
 }
 
-pub fn isGraphAssetStateKey(key: []const u8) bool {
-    if (!isInternalUserKey(key)) return false;
-    const doc_term = findComponentTerminator(key, 1) orelse return false;
+fn graphAssetStateRootEnd(key: []const u8) ?usize {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
     var pos = doc_term + 2;
-    if (pos >= key.len or key[pos] != graph_asset_state_kind) return false;
+    if (pos >= key.len or key[pos] != graph_asset_state_kind) return null;
     pos += 1;
-    const index_term = findComponentTerminator(key, pos) orelse return false;
+    const index_term = findComponentTerminator(key, pos) orelse return null;
     pos = index_term + 2;
-    const state_term = findComponentTerminator(key, pos) orelse return false;
-    return state_term + 2 == key.len;
+    const state_term = findComponentTerminator(key, pos) orelse return null;
+    return state_term + 2;
+}
+
+pub fn isGraphAssetStateRootKey(key: []const u8) bool {
+    return (graphAssetStateRootEnd(key) orelse return false) == key.len;
+}
+
+pub fn isGraphAssetStateKey(key: []const u8) bool {
+    const end = graphAssetStateRootEnd(key) orelse return false;
+    return end == key.len or
+        (key.len == end + 1 + @sizeOf(u32) and key[end] == 0xff);
 }
 
 pub fn matchesGraphAssetStateIndexName(key: []const u8, index_name: []const u8) bool {

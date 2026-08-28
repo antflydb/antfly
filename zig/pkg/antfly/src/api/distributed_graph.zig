@@ -75,6 +75,13 @@ pub const Worker = struct {
             req: GraphEdgesRequest,
             consistency: raft_mod.ReadConsistency,
         ) anyerror!GraphEdgesResponse = null,
+        resolve_incoming_source_groups: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: IncomingSourceGroupsRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) anyerror!IncomingSourceGroupsResponse = null,
         fanout_io: ?*const fn (ptr: *anyopaque) ?std.Io = null,
         fanout_width_cap: ?*const fn (ptr: *anyopaque) usize = null,
     };
@@ -134,6 +141,21 @@ pub const Worker = struct {
         return response;
     }
 
+    pub fn resolveIncomingSourceGroups(
+        self: Worker,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        req: IncomingSourceGroupsRequest,
+        consistency: raft_mod.ReadConsistency,
+    ) !?IncomingSourceGroupsResponse {
+        try self.ensureActive();
+        const func = self.vtable.resolve_incoming_source_groups orelse return null;
+        var response = try func(self.ptr, alloc, table_name, req, consistency);
+        errdefer response.deinit(alloc);
+        try self.ensureActive();
+        return response;
+    }
+
     pub fn fanoutIo(self: Worker) ?std.Io {
         const func = self.vtable.fanout_io orelse return null;
         return func(self.ptr);
@@ -160,6 +182,37 @@ pub const Worker = struct {
         const remaining_ns = deadline_ns - now_ns;
         const rounded_ms = @max(@as(u64, 1), std.math.divCeil(u64, remaining_ns, std.time.ns_per_ms) catch 1);
         return @intCast(@min(rounded_ms, @as(u64, std.math.maxInt(u32))));
+    }
+};
+
+pub const IncomingSourceGroupsRequest = struct {
+    index_name: []const u8,
+    keys: []const []const u8,
+    topology_epoch: u64,
+    identity_read_generation: ?u64 = null,
+    identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration = &.{},
+};
+
+pub const IncomingSourceGroupEntry = struct {
+    source_group_ids: []u64 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.source_group_ids.len > 0) alloc.free(self.source_group_ids);
+        self.* = undefined;
+    }
+};
+
+pub const IncomingSourceGroupsResponse = struct {
+    entries: []IncomingSourceGroupEntry = &.{},
+    /// Complete is a correctness assertion, not a cache freshness hint. It may
+    /// be true only when the target-owned projection is fenced through the
+    /// requested read and topology generations for every source shard.
+    complete: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(alloc);
+        if (self.entries.len > 0) alloc.free(self.entries);
+        self.* = undefined;
     }
 };
 
@@ -2585,10 +2638,9 @@ fn batchFrontierByGroup(
     }
 
     // Reverse rows remain colocated with their authoritative source-owned
-    // edge. First issue a compact, batched existence probe to each shard, then
-    // send full expansion requests only to positive shards. This avoids
-    // multiplying graph decoding, filtering, and response materialization by
-    // the table's shard count while retaining exact incoming-edge semantics.
+    // edge. Resolve their target-owned source-group directory first; a
+    // rebuilding or unavailable directory falls back to compact, batched
+    // existence probes. Full expansion is sent only to proven source shards.
     var incoming_it = incoming_frontier_by_table.iterator();
     while (incoming_it.next()) |entry| {
         const table_name = entry.key_ptr.*;
@@ -2634,7 +2686,7 @@ fn appendIncomingProbeBatches(
     // Keep the exact source-owned reverse-adjacency fallback bounded. This is
     // deliberately independent of fanout width: width bounds concurrent
     // shards, while these windows bound the request bytes duplicated to each
-    // shard until target-owned reverse routing is available.
+    // shard during mixed-version rollout or route-projection rebuilds.
     const max_window_keys: usize = 256;
     const max_window_bytes: usize = 256 * 1024;
     var window_start: usize = 0;
@@ -2676,6 +2728,32 @@ fn appendIncomingProbeBatchWindow(
     consistency: raft_mod.ReadConsistency,
 ) !void {
     if (frontier_ids.len != keys.len) return error.InvalidQueryResult;
+    if (try worker.resolveIncomingSourceGroups(
+        alloc,
+        table_state.table_name,
+        .{
+            .index_name = index_name,
+            .keys = keys,
+            .topology_epoch = table_state.topology_epoch,
+            .identity_read_generation = table_state.identity_read_generation,
+            .identity_read_generations = table_state.identity_read_generations,
+        },
+        consistency,
+    )) |route_response_value| {
+        var route_response = route_response_value;
+        defer route_response.deinit(alloc);
+        if (route_response.entries.len != keys.len) return error.InvalidGraphIncomingRouteResult;
+        for (route_response.entries, frontier_ids) |route, frontier_id| {
+            for (route.source_group_ids) |source_group_id| {
+                if (!std.mem.containsAtLeast(u64, group_ids, 1, &.{source_group_id})) {
+                    if (route_response.complete) return error.InvalidGraphIncomingRouteResult;
+                    continue;
+                }
+                try appendFrontierBatch(alloc, batches, table_state, source_group_id, frontier_id);
+            }
+        }
+        if (route_response.complete) return;
+    }
     const Entry = struct {
         group_id: u64,
         identity_read_generation: ?u64,
@@ -2913,6 +2991,82 @@ test "distributed graph incoming probe expands only positive source shards" {
     try std.testing.expectEqual(@as(usize, 9), state.calls);
     try std.testing.expectEqual(@as(usize, 256), state.max_keys_per_call);
     try std.testing.expectEqual(@as(usize, 0), bounded_batches.count());
+}
+
+test "distributed graph authoritative incoming routes avoid shard probes" {
+    const alloc = std.testing.allocator;
+    const FakeWorker = struct {
+        fn iface() Worker {
+            return .{ .ptr = undefined, .vtable = &.{
+                .execute_graph_expand = executeGraphExpand,
+                .execute_graph_hydrate = executeGraphHydrate,
+                .resolve_incoming_source_groups = resolveIncomingSourceGroups,
+            } };
+        }
+
+        fn executeGraphExpand(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: GraphExpandRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphExpandResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn executeGraphHydrate(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: u64,
+            _: []const u8,
+            _: GraphHydrateRequest,
+            _: raft_mod.ReadConsistency,
+        ) !GraphHydrateResponse {
+            return error.UnexpectedTestCall;
+        }
+
+        fn resolveIncomingSourceGroups(
+            _: *anyopaque,
+            a: std.mem.Allocator,
+            table_name: []const u8,
+            req: IncomingSourceGroupsRequest,
+            _: raft_mod.ReadConsistency,
+        ) !IncomingSourceGroupsResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqualStrings("graph_idx", req.index_name);
+            try std.testing.expectEqual(@as(u64, 9), req.topology_epoch);
+            try std.testing.expectEqual(@as(usize, 2), req.keys.len);
+            const entries = try a.alloc(IncomingSourceGroupEntry, 2);
+            entries[0] = .{ .source_group_ids = try a.dupe(u64, &.{11}) };
+            entries[1] = .{ .source_group_ids = try a.dupe(u64, &.{ 11, 22 }) };
+            return .{ .entries = entries, .complete = true };
+        }
+    };
+
+    const table_state = GraphAdmissionTableState{
+        .table_name = @constCast("docs"),
+        .topology_epoch = 9,
+        .allowed = true,
+        .requires_admission = false,
+        .requires_hydration = false,
+    };
+    var batches = GraphExpandBatches.empty;
+    defer freeFrontierBatches(alloc, &batches);
+    try appendIncomingProbeBatches(
+        alloc,
+        FakeWorker.iface(),
+        &batches,
+        &table_state,
+        &.{ 11, 22, 33 },
+        &.{ 0, 1 },
+        &.{ "doc:a", "doc:z" },
+        "graph_idx",
+        .read_index,
+    );
+    try std.testing.expectEqual(@as(usize, 2), batches.count());
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, batches.get(.{ .table_name = "docs", .group_id = 11 }).?.frontier_ids.items);
+    try std.testing.expectEqualSlices(u32, &.{1}, batches.get(.{ .table_name = "docs", .group_id = 22 }).?.frontier_ids.items);
 }
 
 fn freeFrontierBatches(
@@ -3484,10 +3638,50 @@ pub fn probeIncomingEdgesForKeys(
     try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
     if (group_ids.len == 0) return error.TableNotFound;
 
+    var route_projection_available = true;
+    var route_projection_complete = true;
+    const route_window_size: usize = 256;
+    var route_start: usize = 0;
+    while (route_start < keys.len) {
+        const route_end = @min(keys.len, route_start + route_window_size);
+        const maybe_routes = try worker.resolveIncomingSourceGroups(
+            alloc,
+            table_name,
+            .{
+                .index_name = index_name,
+                .keys = keys[route_start..route_end],
+                .topology_epoch = topology_epoch,
+                .identity_read_generation = identity_read_generation,
+            },
+            consistency,
+        );
+        if (maybe_routes) |route_response_value| {
+            var route_response = route_response_value;
+            defer route_response.deinit(alloc);
+            if (route_response.entries.len != route_end - route_start) return error.InvalidGraphIncomingRouteResult;
+            route_projection_complete = route_projection_complete and route_response.complete;
+            for (route_response.entries, route_start..) |route, output_index| {
+                for (route.source_group_ids) |source_group_id| {
+                    if (!std.mem.containsAtLeast(u64, group_ids, 1, &.{source_group_id})) {
+                        if (route_response.complete) return error.InvalidGraphIncomingRouteResult;
+                        continue;
+                    }
+                    if (route_response.complete) result[output_index] = true;
+                }
+            }
+        } else {
+            route_projection_available = false;
+            route_projection_complete = false;
+            break;
+        }
+        route_start = route_end;
+    }
+    if (route_projection_available and route_projection_complete) return result;
+
     var unresolved = std.ArrayListUnmanaged(usize).empty;
     defer unresolved.deinit(alloc);
     try unresolved.ensureTotalCapacityPrecise(alloc, keys.len);
-    for (keys, 0..) |_, i| unresolved.appendAssumeCapacity(i);
+    for (keys, 0..) |_, i| if (!result[i]) unresolved.appendAssumeCapacity(i);
 
     const Entry = struct {
         group_id: u64,

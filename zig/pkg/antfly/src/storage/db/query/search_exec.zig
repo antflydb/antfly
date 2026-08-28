@@ -13328,7 +13328,11 @@ fn searchDenseInternal(
             vector_mod.similarityFromDistance(raw_hits[raw_hits.len - 1].distance, entry.metric)
         else
             null;
-        const candidate_window_incomplete = candidateWindowIncomplete(hbc_effective_k, bounded_full_candidate_count);
+        const candidate_window_incomplete = denseCandidateWindowIncomplete(
+            results.candidate_coverage,
+            hbc_effective_k,
+            bounded_full_candidate_count,
+        );
         const candidate_ceiling_reached = candidate_window >= candidate_ceiling;
         if (!candidate_window_incomplete and exhaustive_broad_live_window) {
             score_exactness = .exact;
@@ -13861,6 +13865,18 @@ fn candidateWindowIncomplete(candidate_window: u32, bounded_full_candidate_count
     return candidate_window < bounded_full_candidate_count;
 }
 
+fn denseCandidateWindowIncomplete(
+    coverage: vectorindex_mod.CandidateCoverage,
+    candidate_window: u32,
+    bounded_full_candidate_count: u32,
+) bool {
+    return switch (coverage) {
+        .exhausted => false,
+        .more => true,
+        .unknown => candidateWindowIncomplete(candidate_window, bounded_full_candidate_count),
+    };
+}
+
 /// Return whether adaptive collection has discovered the requested component
 /// page of groups. Nested `max_chunks_per_parent` is an output cap, not a fill
 /// target: a group may legitimately have fewer matching descendants, and
@@ -13926,6 +13942,9 @@ test "adaptive candidate window covers requested offset page and grows bounded" 
     try std.testing.expectEqual(@as(u32, 2000), growAdaptiveCandidateWindow(1025, 2000, 1025));
     try std.testing.expect(candidateWindowIncomplete(1025, 2000));
     try std.testing.expect(!candidateWindowIncomplete(2000, 2000));
+    try std.testing.expect(!denseCandidateWindowIncomplete(.exhausted, 10, 1_000_000));
+    try std.testing.expect(denseCandidateWindowIncomplete(.more, 10, 10));
+    try std.testing.expect(denseCandidateWindowIncomplete(.unknown, 10, 1_000_000));
     try std.testing.expectEqual(@as(u32, 7), initialAdaptiveCandidateWindow(7, paging));
 
     // Group collection starts with an overfetch window and may grow it again.
@@ -14231,6 +14250,7 @@ fn exactScoreNativeDenseFilter(
     defer alloc.free(vector_scratch);
     const query_measure = vector_mod.norm(req.query);
     var vectors_scored: u64 = 0;
+    var matching_vectors: u64 = 0;
 
     for (unique_candidate_ids, 0..) |vector_id, i| {
         if (i % exact_native_filter_cancellation_stride == 0) try checkVectorSearchCancelled(req);
@@ -14258,9 +14278,11 @@ fn exactScoreNativeDenseFilter(
         if (req.distance_under) |threshold| {
             if (distance >= threshold) continue;
         }
+        matching_vectors += 1;
         results.addResult(vector_id, distance, 0);
     }
     results.sort();
+    results.candidate_coverage = if (matching_vectors > @as(u64, @intCast(results.getHits().len))) .more else .exhausted;
     return .{
         .results = results,
         .vectors_scored = vectors_scored,

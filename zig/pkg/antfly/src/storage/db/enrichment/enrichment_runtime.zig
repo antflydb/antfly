@@ -7477,6 +7477,7 @@ fn materializeGraphAssetForRuntime(
         defer runtime.alloc.free(state_key);
         const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
+        try appendRuntimeGraphAssetStateSegmentDeletes(runtime, state_key, &deletes);
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -7569,6 +7570,7 @@ fn materializeGraphAssetDeleteForRuntime(
         defer runtime.alloc.free(state_key);
         const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
+        try appendRuntimeGraphAssetStateSegmentDeletes(runtime, state_key, &deletes);
         if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
@@ -11934,6 +11936,28 @@ fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []c
     return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
+fn appendRuntimeGraphAssetStateSegmentDeletes(
+    runtime: *EnrichmentRuntime,
+    state_key: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer runtime.alloc.free(raw);
+    if (try graph_asset_state.format(raw) != .v5) return;
+    const root = try graph_asset_state.segmentedRoot(raw);
+    for (0..root.segment_count) |segment_index| {
+        const key = try internal_keys.graphAssetStateSegmentKeyAlloc(runtime.alloc, state_key, @intCast(segment_index));
+        if (runtimeContainsConstKey(deletes.items, key)) {
+            runtime.alloc.free(key);
+        } else {
+            try deletes.append(runtime.alloc, key);
+        }
+    }
+}
+
 fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]const u8 {
     const alloc = runtime.alloc;
     const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
@@ -11942,7 +11966,28 @@ fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const 
     };
     defer alloc.free(raw);
     if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
-    const decoded_keys = try graph_asset_state.decodeKeysAlloc(alloc, raw);
+    const decoded_keys = switch (try graph_asset_state.format(raw)) {
+        .v4 => try graph_asset_state.decodeKeysAlloc(alloc, raw),
+        .v5 => blk: {
+            const root = try graph_asset_state.segmentedRoot(raw);
+            var all = std.ArrayListUnmanaged([]u8).empty;
+            errdefer {
+                for (all.items) |key| alloc.free(key);
+                all.deinit(alloc);
+            }
+            for (0..root.segment_count) |segment_index| {
+                const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
+                defer alloc.free(segment_key);
+                const segment_raw = storeGetAlloc(runtime, segment_key) catch return error.InvalidGraphAssetState;
+                defer alloc.free(segment_raw);
+                const segment_keys = try graph_asset_state.decodeSegmentKeysAlloc(alloc, segment_raw, expected_generation);
+                defer if (segment_keys.len > 0) alloc.free(segment_keys);
+                try all.appendSlice(alloc, segment_keys);
+            }
+            if (all.items.len != root.key_count) return error.InvalidGraphAssetState;
+            break :blk try all.toOwnedSlice(alloc);
+        },
+    };
     defer graph_asset_state.freeKeys(alloc, decoded_keys);
     const keys = if (decoded_keys.len > 0) try alloc.alloc([]const u8, decoded_keys.len) else return &.{};
     var initialized: usize = 0;

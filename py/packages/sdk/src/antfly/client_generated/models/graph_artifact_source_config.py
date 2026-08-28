@@ -19,8 +19,9 @@ T = TypeVar("T", bound="GraphArtifactSourceConfig")
 
 @_attrs_define
 class GraphArtifactSourceConfig:
-    """Artifact stream materialized into graph edges. Artifact-backed graph sources require
-    index_capabilities.artifact_sources=true and are rejected by serverless deployments.
+    """Artifact stream materialized into graph edges. Each source artifact is limited to 16 MiB and 1,000,000 relation
+    items so live apply, repair, split, and restore share one bounded admission contract. Artifact-backed graph sources
+    require index_capabilities.artifact_sources=true and are rejected by serverless deployments.
 
         Attributes:
             artifact (str):

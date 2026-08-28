@@ -3331,6 +3331,8 @@ pub const TableRepairIssue = struct {
     parent_doc_key: ?[]const u8 = null,
     /// Unit identifier for unit-scoped artifacts, when applicable.
     unit_id: ?[]const u8 = null,
+    /// Canonical artifact stream configured on the affected index. This is the authoritative source-readiness identity and is distinct from the producer input and the derived artifact being repaired.
+    index_source_artifact_name: ?[]const u8 = null,
     /// Source artifact stream used to produce this artifact, when applicable.
     source_artifact_name: ?[]const u8 = null,
     /// Derived artifact name that must be reprocessed or made readable.

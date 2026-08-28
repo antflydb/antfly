@@ -9581,6 +9581,12 @@ pub const DB = struct {
     }
 
     fn rebuildArtifactRepairSummaryIfMissing(self: *DB, alloc: Allocator) !bool {
+        // Issue writers publish the ledger mutation and summary invalidation in
+        // one store batch under this mutex. Hold the same fence for each bounded
+        // rebuild quantum so a writer cannot commit a dirty marker after our
+        // scan and then have final publication overwrite it with stale `ready`.
+        lockAtomicWithBackoff(&self.async_context.artifact_repair_issue_mutex);
+        defer self.async_context.artifact_repair_issue_mutex.unlock();
         if (try self.artifactRepairSummaryReady(alloc)) return false;
 
         const root_summary_key = try internal_keys.artifactRepairSummaryRootKeyAlloc(alloc);
@@ -9637,6 +9643,7 @@ pub const DB = struct {
             const batch_limit: usize = 1024;
 
             alloc: Allocator,
+            index_manager: *const index_manager_mod.IndexManager,
             root_count: u64 = 0,
             per_index: std.StringHashMapUnmanaged(u64) = .empty,
             // Keys are already encoded shadow-summary keys. This avoids a
@@ -9656,6 +9663,51 @@ pub const DB = struct {
                 if (state.last_key) |key| state.alloc.free(key);
             }
 
+            fn addSource(state: *@This(), index_name: []const u8, configured_source: []const u8) !void {
+                if (configured_source.len == 0) return;
+                const source_key = try internal_keys.artifactRepairSummaryRebuildSourceKeyAlloc(
+                    state.alloc,
+                    index_name,
+                    configured_source,
+                );
+                const source_result = try state.per_source.getOrPut(state.alloc, source_key);
+                if (source_result.found_existing) {
+                    state.alloc.free(source_key);
+                } else {
+                    source_result.key_ptr.* = source_key;
+                    source_result.value_ptr.* = 0;
+                }
+                source_result.value_ptr.* += 1;
+            }
+
+            fn addIssueSources(state: *@This(), issue: types.ArtifactRepairIssue) !void {
+                if (issue.index_source_artifact_name.len > 0) {
+                    return state.addSource(issue.index_name, issue.index_source_artifact_name);
+                }
+
+                const configured = try state.index_manager.artifactSourceNamesForIndexAlloc(state.alloc, issue.index_name);
+                defer {
+                    for (configured) |name| state.alloc.free(name);
+                    if (configured.len > 0) state.alloc.free(configured);
+                }
+                for (configured) |name| {
+                    if (std.mem.eql(u8, name, issue.artifact_name)) {
+                        return state.addSource(issue.index_name, name);
+                    }
+                }
+
+                // Old graph repair records did not carry configured-source
+                // identity for resolution and materialized-edge failures. Such
+                // debt cannot be attributed safely after the fact, so fail
+                // closed for every configured graph source rather than publish
+                // a false source-local ready state.
+                if (issue.artifact_kind == .graph and configured.len > 0) {
+                    for (configured) |name| try state.addSource(issue.index_name, name);
+                    return;
+                }
+                try state.addSource(issue.index_name, issue.artifact_name);
+            }
+
             fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                 const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
                 var issue = try decodeArtifactRepairIssueValueAlloc(state.alloc, value);
@@ -9668,25 +9720,7 @@ pub const DB = struct {
                     result.value_ptr.* = 0;
                 }
                 result.value_ptr.* += 1;
-                const artifact_name = if (issue.artifact_name.len > 0)
-                    issue.artifact_name
-                else
-                    issue.source_artifact_name;
-                if (artifact_name.len > 0) {
-                    const source_key = try internal_keys.artifactRepairSummaryRebuildSourceKeyAlloc(
-                        state.alloc,
-                        issue.index_name,
-                        artifact_name,
-                    );
-                    const source_result = try state.per_source.getOrPut(state.alloc, source_key);
-                    if (source_result.found_existing) {
-                        state.alloc.free(source_key);
-                    } else {
-                        source_result.key_ptr.* = source_key;
-                        source_result.value_ptr.* = 0;
-                    }
-                    source_result.value_ptr.* += 1;
-                }
+                try state.addIssueSources(issue);
                 if (state.last_key) |existing| state.alloc.free(existing);
                 state.last_key = try state.alloc.dupe(u8, key);
                 if (state.rows >= batch_limit) return .stop;
@@ -9694,7 +9728,7 @@ pub const DB = struct {
             }
         };
 
-        var state = ScanState{ .alloc = alloc };
+        var state = ScanState{ .alloc = alloc, .index_manager = self.core.index_manager };
         defer state.deinit();
         try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
 
@@ -16124,20 +16158,36 @@ pub const DB = struct {
         }
     };
 
-    const graph_ownership_restore_cursor_magic = "GRC1";
+    const graph_ownership_restore_cursor_magic_v1 = "GRC1";
+    const graph_ownership_restore_cursor_magic = "GRC2";
 
     const GraphOwnershipRestoreCursor = struct {
         artifact_key: []const u8,
         graph_index_offset: u32,
+        item_offset: u32 = 0,
+        segment_index: u32 = 0,
+        key_count: u32 = 0,
     };
 
     fn decodeGraphOwnershipRestoreCursor(cursor: ?[]const u8) ?GraphOwnershipRestoreCursor {
         const raw = cursor orelse return null;
-        const header_len = graph_ownership_restore_cursor_magic.len + @sizeOf(u32);
+        if (std.mem.startsWith(u8, raw, graph_ownership_restore_cursor_magic_v1)) {
+            const header_len = graph_ownership_restore_cursor_magic_v1.len + @sizeOf(u32);
+            if (raw.len < header_len) return null;
+            return .{
+                .artifact_key = raw[header_len..],
+                .graph_index_offset = std.mem.readInt(u32, raw[graph_ownership_restore_cursor_magic_v1.len..header_len], .big),
+            };
+        }
+        const header_len = graph_ownership_restore_cursor_magic.len + 4 * @sizeOf(u32);
         if (raw.len < header_len or !std.mem.startsWith(u8, raw, graph_ownership_restore_cursor_magic)) return null;
+        var pos = graph_ownership_restore_cursor_magic.len;
         return .{
             .artifact_key = raw[header_len..],
-            .graph_index_offset = std.mem.readInt(u32, raw[graph_ownership_restore_cursor_magic.len..header_len], .big),
+            .graph_index_offset = readU32Big(raw, &pos) catch return null,
+            .item_offset = readU32Big(raw, &pos) catch return null,
+            .segment_index = readU32Big(raw, &pos) catch return null,
+            .key_count = readU32Big(raw, &pos) catch return null,
         };
     }
 
@@ -16145,17 +16195,20 @@ pub const DB = struct {
         alloc: Allocator,
         artifact_key: []const u8,
         graph_index_offset: usize,
+        item_offset: usize,
+        segment_index: usize,
+        key_count: usize,
     ) ![]u8 {
-        if (graph_index_offset > std.math.maxInt(u32)) return error.InvalidRestoreState;
-        const header_len = graph_ownership_restore_cursor_magic.len + @sizeOf(u32);
+        if (graph_index_offset > std.math.maxInt(u32) or item_offset > std.math.maxInt(u32) or
+            segment_index > std.math.maxInt(u32) or key_count > std.math.maxInt(u32)) return error.InvalidRestoreState;
+        const header_len = graph_ownership_restore_cursor_magic.len + 4 * @sizeOf(u32);
         const out = try alloc.alloc(u8, header_len + artifact_key.len);
         @memcpy(out[0..graph_ownership_restore_cursor_magic.len], graph_ownership_restore_cursor_magic);
-        std.mem.writeInt(
-            u32,
-            out[graph_ownership_restore_cursor_magic.len..header_len],
-            @intCast(graph_index_offset),
-            .big,
-        );
+        var pos = graph_ownership_restore_cursor_magic.len;
+        for ([_]usize{ graph_index_offset, item_offset, segment_index, key_count }) |value| {
+            std.mem.writeInt(u32, out[pos..][0..4], @intCast(value), .big);
+            pos += 4;
+        }
         @memcpy(out[header_len..], artifact_key);
         return out;
     }
@@ -16165,6 +16218,9 @@ pub const DB = struct {
         alloc: Allocator,
         artifact_key: []const u8,
         graph_index_offset: usize,
+        item_offset: usize,
+        segment_index: usize,
+        key_count: usize,
     ) !GraphOwnershipRestorePage {
         const graph_indexes = self.core.index_manager.graphIndexes();
         if (graph_index_offset >= graph_indexes.len) return error.InvalidRestoreState;
@@ -16179,25 +16235,62 @@ pub const DB = struct {
         // or produce an unbounded store batch. Invalid/oversized inputs are
         // durable source-local repair debt: they must not brick the remainder
         // of an otherwise healthy restore.
-        const changed = materializeGraphSourceArtifactsForIndex(
+        const materialized: ?GraphArtifactRestoreMaterializationPage = materializeGraphSourceArtifactRestorePage(
             alloc,
             self.core.store,
             self.core.index_manager,
-            &.{artifact_key},
+            artifact_key,
             graph_indexes[graph_index_offset].config.name,
-            .{
-                .repair_ctx = self.async_context,
-            },
+            item_offset,
+            segment_index,
+            key_count,
         ) catch |err| switch (err) {
             error.ArtifactRepairRequired => null,
+            error.ResourceLimitExceeded, error.InvalidGraphArtifact => blk: {
+                var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse break :blk null;
+                defer artifact_ref.deinit(alloc);
+                const source = self.core.index_manager.graphArtifactSourceForArtifact(
+                    graph_indexes[graph_index_offset].config.name,
+                    artifact_ref.name,
+                ) orelse break :blk null;
+                try recordArtifactRepairIssueContextForIndexSource(
+                    self.async_context,
+                    .graph,
+                    graph_indexes[graph_index_offset].config.name,
+                    artifact_ref.document_id,
+                    "",
+                    artifact_ref.unit_id orelse "",
+                    source.artifact_name,
+                    if (artifact_ref.source) |source_ref| source_ref.name else "",
+                    artifact_ref.name,
+                    artifact_key,
+                    artifact_ref.chunk_id,
+                    0,
+                    if (err == error.ResourceLimitExceeded) .resource_limit_exceeded else .corrupt_artifact,
+                );
+                break :blk null;
+            },
             else => return err,
         };
-        if (changed) |keys| freeOwnedKeySlice(alloc, keys);
+
+        if (materialized) |page| {
+            if (page.next_item_offset) |next_item_offset| return .{
+                .replayed = 1,
+                .next_cursor = try encodeGraphOwnershipRestoreCursorAlloc(
+                    alloc,
+                    artifact_key,
+                    graph_index_offset,
+                    next_item_offset,
+                    page.next_segment_index,
+                    page.key_count,
+                ),
+            };
+        }
 
         return .{
             .replayed = 1,
             .next_cursor = if (graph_index_offset + 1 < graph_indexes.len)
-                try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset + 1)
+                try encodeGraphOwnershipRestoreCursorAlloc(alloc, artifact_key, graph_index_offset + 1, 0, 0, 0)
             else
                 try alloc.dupe(u8, artifact_key),
         };
@@ -16214,6 +16307,9 @@ pub const DB = struct {
                 alloc,
                 continuation.artifact_key,
                 continuation.graph_index_offset,
+                continuation.item_offset,
+                continuation.segment_index,
+                continuation.key_count,
             );
         }
 
@@ -16234,7 +16330,7 @@ pub const DB = struct {
                 internal_keys.isResolutionArtifactKey(key);
             consumed_rows += 1;
             if (artifact_row) {
-                return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, key, 0);
+                return try self.rebuildOneGraphArtifactOwnershipForRestore(alloc, key, 0, 0, 0, 0);
             }
         }
 
@@ -17824,6 +17920,7 @@ pub const DB = struct {
                 try appendUniqueOwnedKey(self.alloc, changed, previous_key);
             }
         }
+        try appendGraphAssetStateSegmentDeleteKeys(self.alloc, self.core.store, state_key, deletes);
 
         if (!containsDeleteKey(deletes.items, state_key)) {
             try deletes.append(self.alloc, state_key);
@@ -32043,7 +32140,31 @@ fn loadGraphAssetStateKeysAlloc(
     };
     defer alloc.free(raw);
     if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
-    const decoded_keys = try graph_asset_state.decodeKeysAlloc(alloc, raw);
+    const decoded_keys = switch (try graph_asset_state.format(raw)) {
+        .v4 => try graph_asset_state.decodeKeysAlloc(alloc, raw),
+        .v5 => blk: {
+            const root = try graph_asset_state.segmentedRoot(raw);
+            var all = std.ArrayListUnmanaged([]u8).empty;
+            errdefer {
+                for (all.items) |key| alloc.free(key);
+                all.deinit(alloc);
+            }
+            for (0..root.segment_count) |segment_index| {
+                const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
+                defer alloc.free(segment_key);
+                const segment_raw = store.get(alloc, segment_key) catch |err| switch (err) {
+                    error.NotFound => return error.InvalidGraphAssetState,
+                    else => return err,
+                };
+                defer alloc.free(segment_raw);
+                const segment_keys = try graph_asset_state.decodeSegmentKeysAlloc(alloc, segment_raw, expected_generation);
+                defer if (segment_keys.len > 0) alloc.free(segment_keys);
+                try all.appendSlice(alloc, segment_keys);
+            }
+            if (all.items.len != root.key_count) return error.InvalidGraphAssetState;
+            break :blk try all.toOwnedSlice(alloc);
+        },
+    };
     defer graph_asset_state.freeKeys(alloc, decoded_keys);
     const keys = if (decoded_keys.len > 0) try alloc.alloc([]const u8, decoded_keys.len) else return &.{};
     var initialized: usize = 0;
@@ -32056,6 +32177,29 @@ fn loadGraphAssetStateKeysAlloc(
         initialized += 1;
     }
     return keys;
+}
+
+fn appendGraphAssetStateSegmentDeleteKeys(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    state_key: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const raw = store.get(alloc, state_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (try graph_asset_state.format(raw) != .v5) return;
+    const root = try graph_asset_state.segmentedRoot(raw);
+    for (0..root.segment_count) |segment_index| {
+        const key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
+        if (containsDeleteKey(deletes.items, key)) {
+            alloc.free(key);
+        } else {
+            try deletes.append(alloc, key);
+        }
+    }
 }
 
 fn pendingStoreWriteValue(writes: []const docstore_mod.KVPair, key: []const u8) ?[]const u8 {
@@ -34558,6 +34702,24 @@ fn preparePrecomputedGraphSourceArtifactMutation(
         const previous_keys = try loadGraphAssetStateKeysAlloc(scratch, self.core.store, state_key, graph_entry.config.coverage_generation);
         var all_previous_keys = std.ArrayListUnmanaged([]const u8).empty;
         if (previous_keys) |keys| try all_previous_keys.appendSlice(scratch, keys);
+        const previous_state_raw = self.core.store.get(scratch, state_key) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+        if (previous_state_raw) |state_raw| {
+            if (try graph_asset_state.format(state_raw) == .v5) {
+                const segmented = try graph_asset_state.segmentedRoot(state_raw);
+                for (0..segmented.segment_count) |segment_index| {
+                    const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(self.alloc, state_key, @intCast(segment_index));
+                    if (containsDeleteKey(delete_keys.items, segment_key)) {
+                        self.alloc.free(segment_key);
+                    } else {
+                        try owned_delete_keys.append(self.alloc, segment_key);
+                        try delete_keys.append(self.alloc, segment_key);
+                    }
+                }
+            }
+        }
         if (previous_keys == null and self.core.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(scratch, self.core.store, self.core.index_manager, artifact_ref.document_id, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(scratch, protected_keys);
@@ -38066,6 +38228,7 @@ fn recordEnrichmentRequestFailure(ctx_ptr: *anyopaque, failure: enrichment_runti
         failure.doc_key,
         "",
         "",
+        failure.artifact_name,
         failure.source_artifact_name,
         failure.artifact_name,
         artifact_key,
@@ -39764,6 +39927,7 @@ fn decodeArtifactRepairIssueValueAlloc(alloc: Allocator, raw: []const u8) !types
     issue.doc_key = try alloc.dupe(u8, Fields.string(obj, "doc_key"));
     issue.parent_doc_key = try alloc.dupe(u8, Fields.string(obj, "parent_doc_key"));
     issue.unit_id = try alloc.dupe(u8, Fields.string(obj, "unit_id"));
+    issue.index_source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "index_source_artifact_name"));
     issue.source_artifact_name = try alloc.dupe(u8, Fields.string(obj, "source_artifact_name"));
     issue.artifact_name = try alloc.dupe(u8, Fields.string(obj, "artifact_name"));
     issue.artifact_key = try alloc.dupe(u8, Fields.string(obj, "artifact_key"));
@@ -39804,6 +39968,7 @@ fn cloneArtifactRepairIssueAlloc(alloc: Allocator, issue: types.ArtifactRepairIs
     out.doc_key = try alloc.dupe(u8, issue.doc_key);
     out.parent_doc_key = try alloc.dupe(u8, issue.parent_doc_key);
     out.unit_id = try alloc.dupe(u8, issue.unit_id);
+    out.index_source_artifact_name = try alloc.dupe(u8, issue.index_source_artifact_name);
     out.source_artifact_name = try alloc.dupe(u8, issue.source_artifact_name);
     out.artifact_name = try alloc.dupe(u8, issue.artifact_name);
     out.artifact_key = try alloc.dupe(u8, issue.artifact_key);
@@ -40213,6 +40378,7 @@ fn recordArtifactRepairIssueContextDetailed(
     doc_key: []const u8,
     parent_doc_key: []const u8,
     unit_id: []const u8,
+    index_source_artifact_name: []const u8,
     source_artifact_name: []const u8,
     artifact_name: []const u8,
     artifact_key: []const u8,
@@ -40263,6 +40429,7 @@ fn recordArtifactRepairIssueContextDetailed(
             .doc_key = try ctx.alloc.dupe(u8, doc_key),
             .parent_doc_key = try ctx.alloc.dupe(u8, parent_doc_key),
             .unit_id = try ctx.alloc.dupe(u8, unit_id),
+            .index_source_artifact_name = try ctx.alloc.dupe(u8, index_source_artifact_name),
             .source_artifact_name = try ctx.alloc.dupe(u8, source_artifact_name),
             .artifact_name = try ctx.alloc.dupe(u8, artifact_name),
             .artifact_key = if (artifact_key_hex.len > 0) try ctx.alloc.dupe(u8, artifact_key_hex) else "",
@@ -40297,6 +40464,9 @@ fn recordArtifactRepairIssueContextDetailed(
     }
     if (issue.unit_id.len == 0 and unit_id.len > 0) {
         issue.unit_id = try ctx.alloc.dupe(u8, unit_id);
+    }
+    if (issue.index_source_artifact_name.len == 0 and index_source_artifact_name.len > 0) {
+        issue.index_source_artifact_name = try ctx.alloc.dupe(u8, index_source_artifact_name);
     }
     if (issue.source_artifact_name.len == 0 and source_artifact_name.len > 0) {
         issue.source_artifact_name = try ctx.alloc.dupe(u8, source_artifact_name);
@@ -40455,7 +40625,25 @@ fn recordArtifactRepairIssueContext(
     sequence: u64,
     reason: types.ArtifactRepairReason,
 ) !void {
-    return recordArtifactRepairIssueContextDetailed(ctx, artifact_kind, index_name, doc_key, parent_doc_key, unit_id, source_artifact_name, artifact_name, artifact_key, chunk_id, sequence, reason, 0, "");
+    return recordArtifactRepairIssueContextDetailed(ctx, artifact_kind, index_name, doc_key, parent_doc_key, unit_id, artifact_name, source_artifact_name, artifact_name, artifact_key, chunk_id, sequence, reason, 0, "");
+}
+
+fn recordArtifactRepairIssueContextForIndexSource(
+    ctx: *const AsyncContext,
+    artifact_kind: types.ArtifactRepairKind,
+    index_name: []const u8,
+    doc_key: []const u8,
+    parent_doc_key: []const u8,
+    unit_id: []const u8,
+    index_source_artifact_name: []const u8,
+    source_artifact_name: []const u8,
+    artifact_name: []const u8,
+    artifact_key: []const u8,
+    chunk_id: ?u32,
+    sequence: u64,
+    reason: types.ArtifactRepairReason,
+) !void {
+    return recordArtifactRepairIssueContextDetailed(ctx, artifact_kind, index_name, doc_key, parent_doc_key, unit_id, index_source_artifact_name, source_artifact_name, artifact_name, artifact_key, chunk_id, sequence, reason, 0, "");
 }
 
 fn recordArtifactRepairIssueForRefContext(
@@ -42291,13 +42479,14 @@ fn recordGraphResolutionResourceLimitForRepair(
     const parsed = (try internal_keys.parseResolutionArtifactKeyAlloc(alloc, resolution_key)) orelse return false;
     defer alloc.free(parsed.doc_key);
     defer alloc.free(parsed.artifact_name);
-    try recordArtifactRepairIssueContext(
+    try recordArtifactRepairIssueContextForIndexSource(
         repair_ctx,
         .graph,
         index_name,
         parsed.doc_key,
         "",
         "",
+        source.artifact_name,
         source.artifact_name,
         parsed.artifact_name,
         resolution_key,
@@ -42411,6 +42600,7 @@ fn materializeGraphSourceArtifactsForIndex(
         defer alloc.free(state_key);
         const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key, generation);
         defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
+        try appendGraphAssetStateSegmentDeleteKeys(alloc, store, state_key, &deletes);
         if (previous_keys == null and sources.len <= 1 and graphArtifactRefUsesDocumentWideFallback(artifact_ref)) {
             const protected_keys = try resolutionMentionStateKeysForGraphSourceAlloc(alloc, store, index_manager, artifact_ref.document_id, index_name, source);
             defer freeOwnedConstKeySlice(alloc, protected_keys);
@@ -42499,6 +42689,176 @@ fn materializeGraphSourceArtifactsForIndex(
     }
 
     return try changed.toOwnedSlice(alloc);
+}
+
+const GraphArtifactRestoreMaterializationPage = struct {
+    next_item_offset: ?usize,
+    next_segment_index: usize,
+    key_count: usize,
+};
+
+fn materializeGraphSourceArtifactRestorePage(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    artifact_key: []const u8,
+    index_name: []const u8,
+    item_offset: usize,
+    segment_index: usize,
+    prior_key_count: usize,
+) !GraphArtifactRestoreMaterializationPage {
+    const graph_index = index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const generation = graph_index.config.coverage_generation;
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return .{
+        .next_item_offset = null,
+        .next_segment_index = segment_index,
+        .key_count = prior_key_count,
+    };
+    defer artifact_ref.deinit(alloc);
+    const source = index_manager.graphArtifactSourceForArtifact(index_name, artifact_ref.name) orelse return .{
+        .next_item_offset = null,
+        .next_segment_index = segment_index,
+        .key_count = prior_key_count,
+    };
+    if (!graphArtifactSourceConsumesRef(index_manager, source, artifact_ref)) return .{
+        .next_item_offset = null,
+        .next_segment_index = segment_index,
+        .key_count = prior_key_count,
+    };
+
+    const raw = try store.get(alloc, artifact_key);
+    defer alloc.free(raw);
+    if (raw.len > graph_asset_state.hard_max_relation_artifact_bytes) return error.ResourceLimitExceeded;
+    const raw_doc = try storeDocumentValueForGraphSource(alloc, store, artifact_ref.document_id);
+    defer if (raw_doc) |value| alloc.free(value);
+    const page = graphWritesFromArtifactValuePageAlloc(
+        alloc,
+        index_name,
+        artifact_ref.document_id,
+        raw,
+        source,
+        graphArtifactContentType(index_manager, source.artifact_name),
+        raw_doc,
+        item_offset,
+        2048,
+        4 * 1024 * 1024,
+        graph_asset_state.hard_max_relation_items_per_artifact,
+    ) catch |err| switch (err) {
+        error.OutOfMemory, error.ResourceLimitExceeded => return err,
+        else => return error.InvalidGraphArtifact,
+    };
+    defer freeGraphWrites(alloc, page.writes);
+
+    var writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    defer {
+        for (writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        writes.deinit(alloc);
+    }
+    var write_positions = StoreWritePositions.empty;
+    defer write_positions.deinit(alloc);
+    for (page.writes) |write| {
+        const key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(alloc, null, generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
+        var payload_owned = true;
+        errdefer if (payload_owned) alloc.free(payload);
+        try upsertOwnedStoreWrite(alloc, &writes, &write_positions, key, payload);
+        key_owned = false;
+        payload_owned = false;
+    }
+    const graph_write_count = writes.items.len;
+
+    const state_name = try graphArtifactStateNameAlloc(alloc, artifact_ref);
+    defer alloc.free(state_name);
+    const state_key = try graphAssetStateKeyAlloc(alloc, artifact_ref.document_id, index_name, state_name);
+    defer alloc.free(state_key);
+    var reconciled = try reconcileSingleGraphStateContenders(
+        alloc,
+        store,
+        artifact_ref.document_id,
+        index_name,
+        state_key,
+        &.{},
+        writes.items[0..graph_write_count],
+        index_manager.graphArtifactSources(index_name),
+        generation,
+    );
+    defer reconciled.deinit(alloc);
+    const configured_edge_limit = graph_asset_state.effectiveEdgeLimit(graph_index.max_edges_per_document);
+    if (reconciled.visible_count > configured_edge_limit) return error.ResourceLimitExceeded;
+
+    for (writes.items[0..graph_write_count]) |write| {
+        if (reconciled.winners.map.get(write.key)) |winner| {
+            const payload = try alloc.dupe(u8, winner.payload);
+            var payload_owned = true;
+            errdefer if (payload_owned) alloc.free(payload);
+            try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, write.key, payload);
+            payload_owned = false;
+        }
+    }
+    for (reconciled.writes.items) |write| {
+        const value = try alloc.dupe(u8, write.value);
+        var value_owned = true;
+        errdefer if (value_owned) alloc.free(value);
+        try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, write.key, value);
+        value_owned = false;
+    }
+
+    var next_segment_index = segment_index;
+    const key_count = std.math.add(usize, prior_key_count, graph_write_count) catch return error.ResourceLimitExceeded;
+    if (key_count > graph_asset_state.hard_max_edges_per_document) return error.ResourceLimitExceeded;
+    if (graph_write_count > 0) {
+        if (segment_index > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
+        const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
+        var segment_key_owned = true;
+        errdefer if (segment_key_owned) alloc.free(segment_key);
+        const segment_value = try graph_asset_state.encodeSegmentAlloc(alloc, generation, writes.items[0..graph_write_count]);
+        var segment_value_owned = true;
+        errdefer if (segment_value_owned) alloc.free(segment_value);
+        try upsertOwnedStoreWrite(alloc, &writes, &write_positions, segment_key, segment_value);
+        segment_key_owned = false;
+        segment_value_owned = false;
+        next_segment_index += 1;
+    }
+    if (page.next_item_offset == null) {
+        const root_value = try graph_asset_state.encodeSegmentedRootAlloc(alloc, generation, next_segment_index, key_count);
+        var root_value_owned = true;
+        errdefer if (root_value_owned) alloc.free(root_value);
+        try upsertOwnedStoreWriteDupeKey(alloc, &writes, &write_positions, state_key, root_value);
+        root_value_owned = false;
+    }
+
+    var deletes = std.ArrayListUnmanaged([]const u8).empty;
+    defer deletes.deinit(alloc);
+    try deletes.appendSlice(alloc, reconciled.deletes.items);
+    const existing_segments = if (page.next_item_offset == null) blk: {
+        const segment_prefix = try internal_keys.graphAssetStateSegmentPrefixAlloc(alloc, state_key);
+        defer alloc.free(segment_prefix);
+        break :blk try store.scanPrefix(alloc, segment_prefix);
+    } else try alloc.alloc(docstore_mod.OwnedKVPair, 0);
+    defer docstore_mod.DocStore.freeResults(alloc, existing_segments);
+    if (page.next_item_offset == null) {
+        for (existing_segments) |entry| {
+            if (entry.key.len < @sizeOf(u32)) return error.InvalidGraphAssetState;
+            const existing_index = std.mem.readInt(u32, entry.key[entry.key.len - 4 ..][0..4], .big);
+            if (existing_index >= next_segment_index) try deletes.append(alloc, entry.key);
+        }
+    }
+
+    var changed_batch = try filterChangedGraphMaterializationBatch(alloc, store, writes.items, deletes.items);
+    defer changed_batch.deinit(alloc);
+    if (changed_batch.writes.len > 0 or changed_batch.deletes.len > 0) {
+        try store.putBatch(changed_batch.writes, changed_batch.deletes);
+    }
+    return .{
+        .next_item_offset = page.next_item_offset,
+        .next_segment_index = next_segment_index,
+        .key_count = key_count,
+    };
 }
 
 fn materializeMentionEdgesForResolutionKey(
@@ -42601,6 +42961,7 @@ fn materializeMentionEdgesForResolutionKey(
 
     const previous_keys = try loadGraphAssetStateKeysAlloc(alloc, store, state_key, generation);
     defer if (previous_keys) |keys| freeOwnedConstKeySlice(alloc, keys);
+    try appendGraphAssetStateSegmentDeleteKeys(alloc, store, state_key, &deletes);
     const graph_write_count = writes.items.len;
     const state_value = try encodeGraphAssetStateKeysAlloc(alloc, generation, writes.items[0..graph_write_count]);
     var state_value_owned = true;
@@ -43085,6 +43446,130 @@ fn graphWritesFromArtifactValueAlloc(
     }
 
     return try writes.toOwnedSlice(alloc);
+}
+
+const GraphArtifactWritePage = struct {
+    writes: []types.GraphEdgeWrite,
+    next_item_offset: ?usize,
+    item_count: usize,
+};
+
+/// Restore parsing is bounded by raw relation items as well as materialized
+/// bytes. The cursor is an ordinal in the selected relation arrays, so retrying
+/// a page after a crash deterministically rewrites the same segment.
+fn graphWritesFromArtifactValuePageAlloc(
+    alloc: Allocator,
+    index_name: []const u8,
+    doc_key: []const u8,
+    raw: []const u8,
+    source: index_manager_mod.GraphArtifactSource,
+    artifact_content_type: []const u8,
+    raw_doc: ?[]const u8,
+    item_offset: usize,
+    item_limit: usize,
+    output_byte_limit: usize,
+    relation_limit: usize,
+) !GraphArtifactWritePage {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    var parsed_doc = if (raw_doc) |doc| try std.json.parseFromSlice(std.json.Value, alloc, doc, .{}) else null;
+    defer if (parsed_doc) |*doc| doc.deinit();
+    const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
+
+    var values: [2]std.json.Value = undefined;
+    var value_count: usize = 0;
+    switch (source.format) {
+        .extraction_relation => {
+            if (source.path.len == 0 or std.mem.eql(u8, source.path, "$")) {
+                values[0] = parsed.value;
+                value_count = 1;
+            } else if (selectGraphArtifactPath(parsed.value, source.path)) |selected| {
+                values[0] = selected;
+                value_count = 1;
+            }
+        },
+        .extraction_graph => {
+            if (source.path.len > 0) {
+                if (selectGraphArtifactPath(parsed.value, source.path)) |selected| {
+                    values[0] = selected;
+                    value_count = 1;
+                }
+            } else if (parsed.value == .object) {
+                if (parsed.value.object.get("relations")) |relations| {
+                    values[value_count] = relations;
+                    value_count += 1;
+                }
+                if (parsed.value.object.get("edges")) |edges| {
+                    values[value_count] = edges;
+                    value_count += 1;
+                }
+            }
+        },
+    }
+
+    var item_count: usize = 0;
+    for (values[0..value_count]) |value| {
+        item_count = std.math.add(usize, item_count, if (value == .array) value.array.items.len else 1) catch
+            return error.ResourceLimitExceeded;
+        if (item_count > relation_limit) return error.ResourceLimitExceeded;
+    }
+    if (item_offset > item_count) return error.InvalidRestoreState;
+
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    errdefer {
+        for (writes.items) |write| freeGraphWriteFields(alloc, write);
+        writes.deinit(alloc);
+    }
+    var ordinal: usize = 0;
+    var processed_until = item_offset;
+    var output_bytes: usize = 0;
+    outer: for (values[0..value_count]) |value| {
+        const items = if (value == .array) value.array.items else @as([]const std.json.Value, &.{value});
+        for (items) |item| {
+            defer ordinal += 1;
+            if (ordinal < item_offset) continue;
+            if (processed_until - item_offset >= item_limit) break :outer;
+
+            const before = writes.items.len;
+            try appendRelationItem(
+                alloc,
+                &writes,
+                index_name,
+                doc_key,
+                doc_value,
+                item,
+                ordinal,
+                source.mapping,
+                source.artifact_name,
+                artifact_content_type,
+                parsed.value,
+                relation_limit,
+            );
+            if (writes.items.len > before) {
+                const write = writes.items[writes.items.len - 1];
+                const write_bytes = write.index_name.len +| write.source.len +| write.target.len +|
+                    write.edge_type.len +| write.metadata_json.len +| 128;
+                if (writes.items.len > 1 and output_bytes +| write_bytes > output_byte_limit) {
+                    const removed = writes.pop().?;
+                    freeGraphWriteFields(alloc, removed);
+                    break :outer;
+                }
+                output_bytes +|= write_bytes;
+            }
+            processed_until = ordinal + 1;
+        }
+    }
+
+    // A zero-output run still consumes raw relation items. This is essential
+    // for malformed/filtered arrays to make deterministic cursor progress.
+    if (processed_until == item_offset and item_offset < item_count) {
+        processed_until = @min(item_count, item_offset + item_limit);
+    }
+    return .{
+        .writes = try writes.toOwnedSlice(alloc),
+        .next_item_offset = if (processed_until < item_count) processed_until else null,
+        .item_count = item_count,
+    };
 }
 
 fn appendRelationItemsFromPath(
@@ -43589,11 +44074,12 @@ fn collectGraphMutationsForArtifacts(
                     if (options.repair_ctx) |repair_ctx| {
                         const artifact_name = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ parsed.edge_type, parsed.target_doc_key });
                         defer alloc.free(artifact_name);
-                        try recordArtifactRepairIssueContext(
+                        try recordArtifactRepairIssueContextForIndexSource(
                             repair_ctx,
                             .graph,
                             parsed.index_name,
                             parsed.doc_key,
+                            "",
                             "",
                             "",
                             "",
@@ -44929,11 +45415,12 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
                 else => {
                     const artifact_name = try std.fmt.allocPrint(state.ctx.alloc, "{s}:{s}", .{ parsed.edge_type, parsed.target_doc_key });
                     defer state.ctx.alloc.free(artifact_name);
-                    try recordArtifactRepairIssueContext(
+                    try recordArtifactRepairIssueContextForIndexSource(
                         state.ctx,
                         .graph,
                         parsed.index_name,
                         parsed.doc_key,
+                        "",
                         "",
                         "",
                         "",
@@ -66522,6 +67009,7 @@ test "db terminal enrichment sequence index survives coalescing and retires with
             "doc:a",
             "",
             "",
+            "relations_v1",
             "",
             "relations_v1",
             artifact_key,
@@ -66570,6 +67058,7 @@ test "db terminal enrichment sequence index survives coalescing and retires with
         "doc:b",
         "",
         "",
+        "relations_v1",
         "",
         "relations_v1",
         live_artifact_key,
@@ -67045,6 +67534,7 @@ test "db asset repair reports a missing source document precisely" {
         "doc:missing",
         "",
         "",
+        "body_copy_v1",
         "",
         "body_copy_v1",
         artifact_key,
@@ -67091,6 +67581,7 @@ test "db enrichment repair never clears a newer failure revision" {
         "doc:race",
         "",
         "",
+        "dense_v1",
         "",
         "dense_v1",
         artifact_key,
@@ -67116,6 +67607,7 @@ test "db enrichment repair never clears a newer failure revision" {
         "doc:race",
         "",
         "",
+        "dense_v1",
         "",
         "dense_v1",
         artifact_key,
@@ -95627,12 +96119,107 @@ test "db restore state uses strict structured content identity markers" {
 
 test "db graph ownership restore cursor resumes one artifact index exactly" {
     const alloc = std.testing.allocator;
-    const encoded = try DB.encodeGraphOwnershipRestoreCursorAlloc(alloc, "\x01artifact:key", 37);
+    const encoded = try DB.encodeGraphOwnershipRestoreCursorAlloc(alloc, "\x01artifact:key", 37, 4096, 2, 3072);
     defer alloc.free(encoded);
     const decoded = DB.decodeGraphOwnershipRestoreCursor(encoded) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("\x01artifact:key", decoded.artifact_key);
     try std.testing.expectEqual(@as(u32, 37), decoded.graph_index_offset);
+    try std.testing.expectEqual(@as(u32, 4096), decoded.item_offset);
+    try std.testing.expectEqual(@as(u32, 2), decoded.segment_index);
+    try std.testing.expectEqual(@as(u32, 3072), decoded.key_count);
     try std.testing.expect(DB.decodeGraphOwnershipRestoreCursor("\x01legacy-scan-cursor") == null);
+}
+
+test "db graph ownership restore materializes large artifacts in published segments" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{"source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}}
+        ,
+    });
+
+    var raw = std.ArrayListUnmanaged(u8).empty;
+    defer raw.deinit(alloc);
+    try raw.appendSlice(alloc, "{\"relations\":[");
+    for (0..2050) |i| {
+        if (i > 0) try raw.append(alloc, ',');
+        const item = try std.fmt.allocPrint(alloc, "{{\"type\":\"mentions\",\"target\":\"doc:{d}\"}}", .{i});
+        defer alloc.free(item);
+        try raw.appendSlice(alloc, item);
+    }
+    try raw.appendSlice(alloc, "]}");
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(artifact_key);
+    try db.core.store.put(artifact_key, raw.items);
+
+    const first = try materializeGraphSourceArtifactRestorePage(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        artifact_key,
+        "relations_graph",
+        0,
+        0,
+        0,
+    );
+    try std.testing.expectEqual(@as(?usize, 2048), first.next_item_offset);
+    try std.testing.expectEqual(@as(usize, 1), first.next_segment_index);
+    try std.testing.expectEqual(@as(usize, 2048), first.key_count);
+
+    const second = try materializeGraphSourceArtifactRestorePage(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        artifact_key,
+        "relations_graph",
+        first.next_item_offset.?,
+        first.next_segment_index,
+        first.key_count,
+    );
+    try std.testing.expectEqual(@as(?usize, null), second.next_item_offset);
+    try std.testing.expectEqual(@as(usize, 2), second.next_segment_index);
+    try std.testing.expectEqual(@as(usize, 2050), second.key_count);
+
+    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, artifact_key)) orelse return error.TestUnexpectedResult;
+    defer artifact_ref.deinit(alloc);
+    const state_name = try graphArtifactStateNameAlloc(alloc, artifact_ref);
+    defer alloc.free(state_name);
+    const state_key = try graphAssetStateKeyAlloc(alloc, "doc:a", "relations_graph", state_name);
+    defer alloc.free(state_key);
+    const root_raw = try db.core.store.get(alloc, state_key);
+    defer alloc.free(root_raw);
+    try std.testing.expectEqual(graph_asset_state.Format.v5, try graph_asset_state.format(root_raw));
+    const restored_keys = (try loadGraphAssetStateKeysAlloc(alloc, db.core.store, state_key, db.core.index_manager.graphIndex("relations_graph").?.config.coverage_generation)).?;
+    defer freeOwnedConstKeySlice(alloc, restored_keys);
+    try std.testing.expectEqual(@as(usize, 2050), restored_keys.len);
+
+    try db.core.store.put(artifact_key, "{\"relations\":[{\"type\":\"mentions\",\"target\":\"doc:replacement\"}]}");
+    const changed = try materializeGraphSourceArtifactsForIndex(
+        alloc,
+        db.core.store,
+        db.core.index_manager,
+        &.{artifact_key},
+        "relations_graph",
+        .{},
+    );
+    defer freeOwnedKeySlice(alloc, changed);
+    const first_segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, 0);
+    defer alloc.free(first_segment_key);
+    const second_segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, 1);
+    defer alloc.free(second_segment_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, first_segment_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, second_segment_key));
+    const compact_root = try db.core.store.get(alloc, state_key);
+    defer alloc.free(compact_root);
+    try std.testing.expectEqual(graph_asset_state.Format.v4, try graph_asset_state.format(compact_root));
 }
 
 test "db restore graph ownership replay persists a bounded page cursor" {
