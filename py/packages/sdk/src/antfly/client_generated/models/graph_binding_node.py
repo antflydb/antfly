@@ -23,7 +23,8 @@ class GraphBindingNode:
         Attributes:
             key (str): Exact document key.
             table (str | Unset): Owning table for a cross-table binding; omitted for the queried table.
-            document (GraphBindingNodeDocument | Unset): Stored document when include_documents=true.
+            document (GraphBindingNodeDocument | Unset): Stored document when include_documents=true and the identity exists
+                at the pinned snapshot; otherwise omitted.
     """
 
     key: str

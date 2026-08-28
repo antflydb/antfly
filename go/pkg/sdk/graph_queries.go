@@ -257,11 +257,12 @@ func validateQueryGraphResponses(requests []QueryRequest, result *QueryResponses
 }
 
 type canonicalGraphResultContract struct {
-	kind         string
-	names        []string
-	maxItems     int
-	nodeMode     canonicalGraphNodeMode
-	includePaths bool
+	kind             string
+	names            []string
+	maxItems         int
+	nodeMode         canonicalGraphNodeMode
+	includePaths     bool
+	includeDocuments bool
 }
 
 type canonicalGraphNodeMode uint8
@@ -306,9 +307,10 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 				limit = defaultGraphBindingsLimit
 			}
 			return canonicalGraphResultContract{
-				kind:     string(GraphBindingsResultKindBindings),
-				names:    append([]string(nil), value.Bindings...),
-				maxItems: limit,
+				kind:             string(GraphBindingsResultKindBindings),
+				names:            append([]string(nil), value.Bindings...),
+				maxItems:         limit,
+				includeDocuments: value.IncludeDocuments,
 			}, nil
 		}
 		if _, ok := returnMembers["aggregates"]; ok {
@@ -336,10 +338,11 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 			limit = defaultGraphBindingsLimit
 		}
 		return canonicalGraphResultContract{
-			kind:         string(GraphNodesResultKindNodes),
-			maxItems:     limit,
-			nodeMode:     canonicalGraphNodeModeTraversal,
-			includePaths: value.Traverse.IncludePaths,
+			kind:             string(GraphNodesResultKindNodes),
+			maxItems:         limit,
+			nodeMode:         canonicalGraphNodeModeTraversal,
+			includePaths:     value.Traverse.IncludePaths,
+			includeDocuments: value.Traverse.IncludeDocuments,
 		}, nil
 	}
 	if raw, ok := members["shortest_path"]; ok && !isNullGraphJSON(raw) {
@@ -348,9 +351,10 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph shortest path query: %w", err)
 		}
 		return canonicalGraphResultContract{
-			kind:     string(GraphNodesResultKindNodes),
-			maxItems: 1,
-			nodeMode: canonicalGraphNodeModeShortestPath,
+			kind:             string(GraphNodesResultKindNodes),
+			maxItems:         1,
+			nodeMode:         canonicalGraphNodeModeShortestPath,
+			includeDocuments: value.ShortestPath.IncludeDocuments,
 		}, nil
 	}
 	if raw, ok := members["k_shortest_paths"]; ok && !isNullGraphJSON(raw) {
@@ -359,9 +363,10 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 			return canonicalGraphResultContract{}, fmt.Errorf("antfly: inspect graph k-shortest-paths query: %w", err)
 		}
 		return canonicalGraphResultContract{
-			kind:     string(GraphNodesResultKindNodes),
-			maxItems: value.KShortestPaths.K,
-			nodeMode: canonicalGraphNodeModeKShortestPaths,
+			kind:             string(GraphNodesResultKindNodes),
+			maxItems:         value.KShortestPaths.K,
+			nodeMode:         canonicalGraphNodeModeKShortestPaths,
+			includeDocuments: value.KShortestPaths.IncludeDocuments,
 		}, nil
 	}
 	return canonicalGraphResultContract{}, fmt.Errorf("antfly: graph query has no supported operation")
@@ -408,11 +413,16 @@ func validateCanonicalGraphResultForQuery(query GraphQuery, result GraphResult) 
 // retaining object contents. Hydrated documents, evidence, and edge metadata
 // are schema-defined opaque JSON objects; their keys are not graph protocol
 // fields and must not be subjected to DisallowUnknownFields.
-type graphOpaqueJSONObject struct{}
+type graphOpaqueJSONObject struct {
+	present bool
+}
 
-func (*graphOpaqueJSONObject) UnmarshalJSON(encoded []byte) error {
+func (object *graphOpaqueJSONObject) UnmarshalJSON(encoded []byte) error {
 	trimmed := bytes.TrimSpace(encoded)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
+		// UnmarshalJSON is called only for a present member. Retain presence without
+		// materializing opaque document contents a second time.
+		object.present = true
 		return nil
 	}
 	return fmt.Errorf("expected an object")
@@ -547,6 +557,9 @@ func validateBindingsResultPayload(contract canonicalGraphResultContract, result
 				if err := validateDecodedGraphIdentity(binding.Key, binding.Table.pointer()); err != nil {
 					return fmt.Errorf("antfly: bindings graph result row %d alias %q: %w", rowIndex, alias, err)
 				}
+				if !contract.includeDocuments && binding.Document.present {
+					return fmt.Errorf("antfly: bindings graph result row %d alias %q contains a document that was not requested", rowIndex, alias)
+				}
 			}
 		}
 	}
@@ -592,6 +605,9 @@ func validateNodesResultPayload(contract canonicalGraphResultContract, result st
 	for i := range value.Nodes {
 		if err := validateGraphResultNodePayload(&value.Nodes[i]); err != nil {
 			return fmt.Errorf("antfly: nodes graph result node %d: %w", i, err)
+		}
+		if !contract.includeDocuments && value.Nodes[i].Document.present {
+			return fmt.Errorf("antfly: nodes graph result node %d contains a document that was not requested", i)
 		}
 	}
 	for i := range value.Paths {
@@ -806,6 +822,13 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 					return fmt.Errorf("antfly: bindings graph result row %d contains unrequested alias %q", rowIndex, name)
 				}
 			}
+			if !contract.includeDocuments {
+				for name, binding := range row {
+					if binding != nil && binding.Document != nil {
+						return fmt.Errorf("antfly: bindings graph result row %d alias %q contains a document that was not requested", rowIndex, name)
+					}
+				}
+			}
 		}
 		return nil
 	case GraphAggregatesResult:
@@ -827,6 +850,13 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 		}
 		if len(value.Nodes) > contract.maxItems || len(value.Paths) > contract.maxItems {
 			return fmt.Errorf("antfly: nodes graph result exceeds the requested limit of %d items", contract.maxItems)
+		}
+		if !contract.includeDocuments {
+			for i := range value.Nodes {
+				if value.Nodes[i].Document != nil {
+					return fmt.Errorf("antfly: nodes graph result node %d contains a document that was not requested", i)
+				}
+			}
 		}
 		switch contract.nodeMode {
 		case canonicalGraphNodeModeTraversal:
@@ -874,6 +904,20 @@ type graphQueryResultEnvelope struct {
 	Type  json.RawMessage               `json:"type"`
 	Total json.RawMessage               `json:"total"`
 	Stats *graphQueryStatsPresenceProbe `json:"stats"`
+}
+
+// legacyGraphResultTopLevelValidation keeps strictness at the v0.2 envelope
+// boundary without recursively applying canonical closed-world rules to legacy
+// nested objects. RawMessage fields preserve the legacy schemas' extension
+// behavior while DecodeStrictInto rejects unknown top-level protocol members.
+type legacyGraphResultTopLevelValidation struct {
+	Kind    json.RawMessage `json:"kind,omitempty"`
+	Matches json.RawMessage `json:"matches,omitempty"`
+	Nodes   json.RawMessage `json:"nodes,omitempty"`
+	Paths   json.RawMessage `json:"paths,omitempty"`
+	Took    json.RawMessage `json:"took,omitempty"`
+	Total   json.RawMessage `json:"total"`
+	Type    json.RawMessage `json:"type"`
 }
 
 type graphQueryStatsPresenceProbe struct {
@@ -1149,6 +1193,24 @@ func isUnsignedDecimal(value string) bool {
 }
 
 func decodeLegacyGraphQueryResult(result GraphResult, envelope graphQueryResultEnvelope) (LegacyGraphQueryResult, error) {
+	var strictEnvelope legacyGraphResultTopLevelValidation
+	if err := result.DecodeStrictInto(&strictEnvelope); err != nil {
+		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: invalid legacy graph result: %w", err)
+	}
+	for _, member := range [...]struct {
+		name  string
+		value json.RawMessage
+	}{
+		{name: "kind", value: strictEnvelope.Kind},
+		{name: "matches", value: strictEnvelope.Matches},
+		{name: "nodes", value: strictEnvelope.Nodes},
+		{name: "paths", value: strictEnvelope.Paths},
+		{name: "took", value: strictEnvelope.Took},
+	} {
+		if len(member.value) != 0 && bytes.Equal(bytes.TrimSpace(member.value), []byte("null")) {
+			return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result %s must be omitted or non-null", member.name)
+		}
+	}
 	if envelope.Type == nil || envelope.Total == nil {
 		return LegacyGraphQueryResult{}, fmt.Errorf("antfly: legacy graph result requires type and total")
 	}

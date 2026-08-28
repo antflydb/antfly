@@ -11,7 +11,7 @@ T = TypeVar("T", bound="GraphBindingNodeDocument")
 
 @_attrs_define
 class GraphBindingNodeDocument:
-    """Stored document when include_documents=true."""
+    """Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted."""
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

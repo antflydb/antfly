@@ -23174,10 +23174,11 @@ components:
         include_documents:
           type: boolean
           default: false
-          description: Hydrate documents for projected non-null bindings. The product of `limit` and the
-            number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated
-            by coordinator-backed deployments; runtimes with only a source-table snapshot reject such
-            requests instead of silently omitting the document.
+          description: Hydrate documents for projected non-null bindings when they exist at the pinned
+            snapshot. A dangling graph identity omits document. When false, document is always omitted.
+            The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified
+            bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table
+            snapshot reject such requests instead of silently omitting an available document.
         fields:
           type: array
           items:
@@ -23382,7 +23383,8 @@ components:
         include_documents:
           type: boolean
           default: false
-          description: Include each result node's stored document.
+          description: Include each result node's stored document when it exists at the pinned snapshot.
+            A dangling graph identity omits document. When false, document is always omitted.
         fields:
           type: array
           items:
@@ -23462,7 +23464,9 @@ components:
         include_documents:
           type: boolean
           default: false
-          description: Include stored documents on terminal result nodes returned alongside the path.
+          description: Include stored documents on terminal result nodes returned alongside the path when
+            they exist at the pinned snapshot. A dangling graph identity omits document. When false, document
+            is always omitted.
         fields:
           type: array
           items:
@@ -23850,7 +23854,8 @@ components:
         document:
           type: object
           additionalProperties: true
-          description: Stored document when include_documents=true.
+          description: Stored document when include_documents=true and the identity exists at the pinned
+            snapshot; otherwise omitted.
     GraphResultBinding:
       x-go-type: '*GraphBindingNode'
       oneOf:
@@ -24014,7 +24019,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: object
           additionalProperties: true
-          description: Full document (if include_documents=true)
+          description: Stored document when include_documents=true and the identity exists at the pinned
+            snapshot; otherwise omitted.
         path:
           x-go-type-skip-optional-pointer: true
           type: array

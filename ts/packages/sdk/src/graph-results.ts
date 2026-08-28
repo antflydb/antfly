@@ -15,6 +15,7 @@ type CanonicalResultContract = {
   maxItems?: number;
   nodeMode?: "traversal" | "shortest_path" | "k_shortest_paths";
   includePaths?: boolean;
+  includeDocuments?: boolean;
 };
 type RequestGraphContract = {
   dialect: GraphDialect;
@@ -265,6 +266,8 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
         if (binding.table !== undefined) nonemptyString(binding.table, `${rowPath}.${alias}.table`);
         if (binding.document !== undefined)
           object(binding.document, `${rowPath}.${alias}.document`);
+        if (!contract.includeDocuments && binding.document !== undefined)
+          invalid(`${rowPath}.${alias}.document`, "was returned without being requested");
       }
       if (contract.names && !sameNameSet(Object.keys(row), contract.names)) {
         invalid(rowPath, "binding aliases do not match the requested projection");
@@ -307,6 +310,12 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
       invalid(path, "exceeds the requested result limit");
     const nodes = rawNodes.map((node, index) => resultNode(node, `${path}.nodes[${index}]`));
     const paths = rawPaths.map((item, index) => graphPath(item, `${path}.paths[${index}]`));
+    if (!contract.includeDocuments) {
+      nodes.forEach((node, index) => {
+        if (node.document !== undefined)
+          invalid(`${path}.nodes[${index}].document`, "was returned without being requested");
+      });
+    }
     if (contract.nodeMode === "traversal") {
       if (paths.length !== 0) invalid(`${path}.paths`, "traversal paths belong on result nodes");
       nodes.forEach((node, index) => {
@@ -364,7 +373,12 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
         rawLimit === undefined
           ? 100
           : boundedInteger(rawLimit, `${path}.return.limit`, 1, MAX_ITEMS);
-      return { kind: "bindings", names, maxItems };
+      return {
+        kind: "bindings",
+        names,
+        maxItems,
+        includeDocuments: returned.include_documents === true,
+      };
     }
     if (returned.aggregates !== undefined) {
       return {
@@ -386,10 +400,17 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
       maxItems,
       nodeMode: "traversal",
       includePaths: traversal.include_paths === true,
+      includeDocuments: traversal.include_documents === true,
     };
   }
   if (operation.shortest_path !== undefined) {
-    return { kind: "nodes", maxItems: 1, nodeMode: "shortest_path" };
+    const shortestPath = object(operation.shortest_path, `${path}.shortest_path`);
+    return {
+      kind: "nodes",
+      maxItems: 1,
+      nodeMode: "shortest_path",
+      includeDocuments: shortestPath.include_documents === true,
+    };
   }
   if (operation.k_shortest_paths !== undefined) {
     const kShortestPaths = object(operation.k_shortest_paths, `${path}.k_shortest_paths`);
@@ -397,6 +418,7 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
       kind: "nodes",
       maxItems: boundedInteger(kShortestPaths.k, `${path}.k_shortest_paths.k`, 1, 100),
       nodeMode: "k_shortest_paths",
+      includeDocuments: kShortestPaths.include_documents === true,
     };
   }
   return invalid(path, "does not contain a supported graph operation");

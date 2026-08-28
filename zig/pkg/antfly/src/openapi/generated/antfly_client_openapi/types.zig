@@ -5609,7 +5609,7 @@ pub const GraphBindingNode = struct {
     key: []const u8,
     /// Owning table for a cross-table binding; omitted for the queried table.
     table: ?[]const u8 = null,
-    /// Stored document when include_documents=true.
+    /// Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted.
     document: ?std.json.Value = null,
 };
 
@@ -5624,7 +5624,7 @@ pub const GraphBindingsResult = struct {
 pub const GraphBindingsReturn = struct {
     bindings: []const GraphIdentifier,
     limit: ?i64 = null,
-    /// Hydrate documents for projected non-null bindings. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting the document.
+    /// Hydrate documents for projected non-null bindings when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting an available document.
     include_documents: ?bool = null,
     /// Document fields to hydrate. Requires include_documents=true; omit to include all fields.
     fields: ?[]const []const u8 = null,
@@ -6707,7 +6707,7 @@ pub const GraphResultNode = struct {
     table: ?[]const u8 = null,
     /// Hop count from the start node; when path is present this equals path length minus one
     depth: i64,
-    /// Full document (if include_documents=true)
+    /// Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted.
     document: ?std.json.Value = null,
     /// Exact ordered traversal identities from the start node, terminating at this node's fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding uses GraphNodesResult.paths.
     path: ?[]const GraphPathEndpoint = null,
@@ -6824,7 +6824,7 @@ pub const GraphShortestPath = struct {
     weight_mode: ?PathWeightMode = null,
     /// Non-scoring structured stored-document predicate for path nodes.
     filter: ?GraphDocumentFilter = null,
-    /// Include stored documents on terminal result nodes returned alongside the path.
+    /// Include stored documents on terminal result nodes returned alongside the path when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
@@ -6851,7 +6851,7 @@ pub const GraphTraversal = struct {
     max_weight: ?f64 = null,
     limit: ?i64 = null,
     include_paths: ?bool = null,
-    /// Include each result node's stored document.
+    /// Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,

@@ -601,6 +601,8 @@ func TestGraphQueryResultUsesStableDiscriminator(t *testing.T) {
 		`{"type":"neighbors","total":null}`,
 		`{"type":"unknown","total":0}`,
 		`{"kind":null,"type":"neighbors","total":0}`,
+		`{"type":"neighbors","total":0,"unexpected":true}`,
+		`{"type":"neighbors","total":0,"nodes":null}`,
 	} {
 		if err := json.Unmarshal([]byte(malformed), &result); err != nil {
 			t.Fatal(err)
@@ -630,7 +632,11 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 	canonical := decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"application_field":{"nested":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
 	legacy := decode(`{"type":"neighbors","nodes":[],"paths":[],"total":0,"took":0}`)
 	var traversal GraphQuery
-	if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}}}`), &traversal); err != nil {
+	if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]},"include_documents":true}}`), &traversal); err != nil {
+		t.Fatal(err)
+	}
+	var traversalWithoutDocuments GraphQuery
+	if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]}}}`), &traversalWithoutDocuments); err != nil {
 		t.Fatal(err)
 	}
 	var aggregation GraphQuery
@@ -763,6 +769,14 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 			contains: "expected an object",
 		},
 		{
+			name:     "canonical payload rejects unrequested documents",
+			requests: []QueryRequest{{GraphQueries: map[string]GraphQuery{"walk": traversalWithoutDocuments}}},
+			responses: QueryResponses{Responses: []QueryResult{{
+				GraphResults: map[string]GraphResult{"walk": canonical},
+			}}},
+			contains: "document that was not requested",
+		},
+		{
 			name:     "non graph request rejects graph results",
 			requests: []QueryRequest{{}},
 			responses: QueryResponses{Responses: []QueryResult{{
@@ -807,6 +821,31 @@ func TestDecodeGraphResultForQueryValidatesRequestedProjection(t *testing.T) {
 	wrongBindings := decodeResult(`{"kind":"bindings","rows":[{"a":{"key":"1"},"c":null}],"stats":{"returned_items":1,"truncated":false}}`)
 	if _, err := DecodeGraphResultForQuery(bindingsQuery, wrongBindings); err == nil || !strings.Contains(err.Error(), "unrequested alias") {
 		t.Fatalf("expected projected alias mismatch, got %v", err)
+	}
+	unrequestedBindingDocument := decodeResult(`{"kind":"bindings","rows":[{"a":{"key":"1","document":{"private":true}},"b":null}],"stats":{"returned_items":1,"truncated":false}}`)
+	if _, err := DecodeGraphResultForQuery(bindingsQuery, unrequestedBindingDocument); err == nil || !strings.Contains(err.Error(), "document that was not requested") {
+		t.Fatalf("expected unrequested binding document to fail, got %v", err)
+	}
+	hydratedBindingsQuery := decodeQuery(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b"}]},"return":{"bindings":["a","b"],"include_documents":true}}`)
+	if _, err := DecodeGraphResultForQuery(hydratedBindingsQuery, unrequestedBindingDocument); err != nil {
+		t.Fatalf("requested binding document: %v", err)
+	}
+	if _, err := DecodeGraphResultForQuery(hydratedBindingsQuery, validBindings); err != nil {
+		t.Fatalf("requested sparse binding hydration: %v", err)
+	}
+
+	traversalQuery := decodeQuery(`{"index":"graph","traverse":{"start":{"keys":["a"]}}}`)
+	traversalWithDocument := decodeResult(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"private":true}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
+	if _, err := DecodeGraphResultForQuery(traversalQuery, traversalWithDocument); err == nil || !strings.Contains(err.Error(), "document that was not requested") {
+		t.Fatalf("expected unrequested traversal document to fail, got %v", err)
+	}
+	hydratedTraversalQuery := decodeQuery(`{"index":"graph","traverse":{"start":{"keys":["a"]},"include_documents":true}}`)
+	if _, err := DecodeGraphResultForQuery(hydratedTraversalQuery, traversalWithDocument); err != nil {
+		t.Fatalf("requested traversal document: %v", err)
+	}
+	sparseTraversal := decodeResult(`{"kind":"nodes","nodes":[{"key":"a","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
+	if _, err := DecodeGraphResultForQuery(hydratedTraversalQuery, sparseTraversal); err != nil {
+		t.Fatalf("requested sparse traversal hydration: %v", err)
 	}
 
 	aggregatesQuery := decodeQuery(`{"index":"graph","match":{"anchor":"a","nodes":{"a":{}},"edges":[]},"return":{"aggregates":{"rows":{"count":"*"}}}}`)

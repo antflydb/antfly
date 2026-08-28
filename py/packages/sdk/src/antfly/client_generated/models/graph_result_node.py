@@ -27,7 +27,8 @@ class GraphResultNode:
             key (str): Document key
             depth (int): Hop count from the start node; when path is present this equals path length minus one
             table (str | Unset): Owning table for a cross-table node; omitted for nodes in the queried table
-            document (GraphResultNodeDocument | Unset): Full document (if include_documents=true)
+            document (GraphResultNodeDocument | Unset): Stored document when include_documents=true and the identity exists
+                at the pinned snapshot; otherwise omitted.
             path (list[GraphPathEndpoint] | Unset): Exact ordered traversal identities from the start node, terminating at
                 this node's fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding
                 uses GraphNodesResult.paths.

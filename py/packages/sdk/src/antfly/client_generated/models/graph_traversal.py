@@ -50,7 +50,8 @@ class GraphTraversal:
             max_weight (float | Unset):
             limit (int | Unset):  Default: 100.
             include_paths (bool | Unset):  Default: False.
-            include_documents (bool | Unset): Include each result node's stored document. Default: False.
+            include_documents (bool | Unset): Include each result node's stored document when it exists at the pinned
+                snapshot. A dangling graph identity omits document. When false, document is always omitted. Default: False.
             fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
             filter_ (GraphDocumentBoolFieldFilter | GraphDocumentDateRangeFilter | GraphDocumentFilterBoolean |
                 GraphDocumentFilterConjunction | GraphDocumentFilterDisjunction | GraphDocumentFuzzyFilter |

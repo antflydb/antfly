@@ -30,6 +30,7 @@ class _CanonicalResultContract(NamedTuple):
     max_items: int | None = None
     node_mode: GraphNodeResultMode | None = None
     include_paths: bool = False
+    include_documents: bool = False
 
 
 def _invalid(path: str, message: str) -> NoReturn:
@@ -92,6 +93,18 @@ def _finite_nonnegative(value: object, path: str, *, at_most_one: bool = False) 
         _invalid(path, "must be a finite non-negative number")
     if not isfinite(number) or number < 0 or (at_most_one and number > 1):
         _invalid(path, "must be a finite number in [0,1]" if at_most_one else "must be a finite non-negative number")
+    return number
+
+
+def _finite_number(value: object, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _invalid(path, "must be a finite number")
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        _invalid(path, "must be a finite number")
+    if not isfinite(number):
+        _invalid(path, "must be a finite number")
     return number
 
 
@@ -314,6 +327,102 @@ def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
     _validate_stats(value["stats"], f"{path}.stats", len(paths) if paths else len(nodes), allow_truncated=True)
 
 
+def _legacy_integer(value: object, path: str) -> int:
+    if type(value) is not int:
+        _invalid(path, "must be an integer")
+    return value
+
+
+def _validate_legacy_path_edge(value: object, path: str) -> None:
+    edge = _object(value, path)
+    for name in ("source", "target", "type"):
+        if name in edge and not isinstance(edge[name], str):
+            _invalid(f"{path}.{name}", "must be a string")
+    if "weight" in edge:
+        _finite_number(edge["weight"], f"{path}.weight")
+    if "metadata" in edge:
+        _object(edge["metadata"], f"{path}.metadata")
+
+
+def _validate_legacy_path(value: object, path: str) -> None:
+    graph_path = _object(value, path)
+    if "nodes" in graph_path:
+        for index, node in enumerate(_array(graph_path["nodes"], f"{path}.nodes")):
+            if not isinstance(node, str):
+                _invalid(f"{path}.nodes[{index}]", "must be a string")
+    if "edges" in graph_path:
+        for index, edge in enumerate(_array(graph_path["edges"], f"{path}.edges")):
+            _validate_legacy_path_edge(edge, f"{path}.edges[{index}]")
+    if "total_weight" in graph_path:
+        _finite_nonnegative(graph_path["total_weight"], f"{path}.total_weight")
+    if "length" in graph_path:
+        _legacy_integer(graph_path["length"], f"{path}.length")
+
+
+def _validate_legacy_node(value: object, path: str) -> None:
+    node = _object(value, path)
+    if "key" not in node or not isinstance(node["key"], str):
+        _invalid(f"{path}.key", "must be a string")
+    if "table" in node and not isinstance(node["table"], str):
+        _invalid(f"{path}.table", "must be a string")
+    if "depth" in node:
+        _legacy_integer(node["depth"], f"{path}.depth")
+    if "distance" in node:
+        _finite_number(node["distance"], f"{path}.distance")
+    if "document" in node:
+        _object(node["document"], f"{path}.document")
+    if "evidence" in node:
+        _object(node["evidence"], f"{path}.evidence")
+    for name in ("path", "provenance"):
+        if name in node:
+            for index, item in enumerate(_array(node[name], f"{path}.{name}")):
+                if not isinstance(item, str):
+                    _invalid(f"{path}.{name}[{index}]", "must be a string")
+    if "path_edges" in node:
+        for index, edge in enumerate(_array(node["path_edges"], f"{path}.path_edges")):
+            _validate_legacy_path_edge(edge, f"{path}.path_edges[{index}]")
+    if "edges" in node:
+        _array(node["edges"], f"{path}.edges")
+
+
+def _validate_legacy_result(value: Mapping[str, Any], path: str) -> None:
+    _exact_keys(
+        value,
+        path,
+        required=frozenset({"type", "total"}),
+        optional=frozenset({"kind", "nodes", "paths", "matches", "took"}),
+    )
+    if "kind" in value and value["kind"] != "legacy":
+        _invalid(f"{path}.kind", "must be 'legacy' when present")
+    if not isinstance(value["type"], str) or value["type"] not in {
+        "neighbors",
+        "traverse",
+        "shortest_path",
+        "k_shortest_paths",
+        "pattern",
+    }:
+        _invalid(f"{path}.type", "has an unknown legacy graph query type")
+    _legacy_integer(value["total"], f"{path}.total")
+    if "took" in value:
+        _legacy_integer(value["took"], f"{path}.took")
+    if "nodes" in value:
+        for index, node in enumerate(_array(value["nodes"], f"{path}.nodes")):
+            _validate_legacy_node(node, f"{path}.nodes[{index}]")
+    if "paths" in value:
+        for index, graph_path in enumerate(_array(value["paths"], f"{path}.paths")):
+            _validate_legacy_path(graph_path, f"{path}.paths[{index}]")
+    if "matches" in value:
+        for index, raw_match in enumerate(_array(value["matches"], f"{path}.matches")):
+            match_path = f"{path}.matches[{index}]"
+            match = _object(raw_match, match_path)
+            if "bindings" in match:
+                for name, binding in _object(match["bindings"], f"{match_path}.bindings").items():
+                    _validate_legacy_node(binding, f"{match_path}.bindings.{name}")
+            if "path" in match:
+                for edge_index, edge in enumerate(_array(match["path"], f"{match_path}.path")):
+                    _validate_legacy_path_edge(edge, f"{match_path}.path[{edge_index}]")
+
+
 def _canonical_result_contract(value: object, path: str) -> _CanonicalResultContract:
     operation = _object(value, path)
     if "match" in operation:
@@ -327,7 +436,12 @@ def _canonical_result_contract(value: object, path: str) -> _CanonicalResultCont
                 names.append(name)
             raw_limit = returned.get("limit", 100)
             limit = _bounded_integer(raw_limit, f"{path}.return.limit", 1, _MAX_GRAPH_ITEMS)
-            return _CanonicalResultContract("bindings", frozenset(names), limit)
+            return _CanonicalResultContract(
+                "bindings",
+                frozenset(names),
+                limit,
+                include_documents=returned.get("include_documents") is True,
+            )
         if "aggregates" in returned:
             aggregates = _object(returned["aggregates"], f"{path}.return.aggregates")
             return _CanonicalResultContract("aggregates", frozenset(aggregates))
@@ -340,13 +454,25 @@ def _canonical_result_contract(value: object, path: str) -> _CanonicalResultCont
             max_items=limit,
             node_mode="traversal",
             include_paths=traversal.get("include_paths") is True,
+            include_documents=traversal.get("include_documents") is True,
         )
     if "shortest_path" in operation:
-        return _CanonicalResultContract("nodes", max_items=1, node_mode="shortest_path")
+        shortest_path = _object(operation["shortest_path"], f"{path}.shortest_path")
+        return _CanonicalResultContract(
+            "nodes",
+            max_items=1,
+            node_mode="shortest_path",
+            include_documents=shortest_path.get("include_documents") is True,
+        )
     if "k_shortest_paths" in operation:
         k_shortest_paths = _object(operation["k_shortest_paths"], f"{path}.k_shortest_paths")
         k = _bounded_integer(k_shortest_paths.get("k", _MISSING), f"{path}.k_shortest_paths.k", 1, 100)
-        return _CanonicalResultContract("nodes", max_items=k, node_mode="k_shortest_paths")
+        return _CanonicalResultContract(
+            "nodes",
+            max_items=k,
+            node_mode="k_shortest_paths",
+            include_documents=k_shortest_paths.get("include_documents") is True,
+        )
     _invalid(path, "does not contain a supported graph operation")
 
 
@@ -363,6 +489,7 @@ def _validate_graph_result(
     if kind is _MISSING or kind == "legacy":
         if dialect == "canonical":
             _invalid(f"{path}.kind", "canonical graph results require a discriminator")
+        _validate_legacy_result(result, path)
         return
     if dialect == "legacy":
         _invalid(f"{path}.kind", "legacy graph results must use the legacy result shape")
@@ -382,6 +509,15 @@ def _validate_graph_result(
                 row = _object(raw_row, f"{path}.rows[{row_index}]")
                 if frozenset(row) != expected:
                     _invalid(f"{path}.rows[{row_index}]", "binding aliases do not match the requested projection")
+                if not contract.include_documents:
+                    for alias, raw_binding in row.items():
+                        if raw_binding is not None and "document" in _object(
+                            raw_binding, f"{path}.rows[{row_index}].{alias}"
+                        ):
+                            _invalid(
+                                f"{path}.rows[{row_index}].{alias}.document",
+                                "was returned without being requested",
+                            )
     elif kind == "aggregates":
         _validate_aggregates_result(result, path)
         if contract is not None and contract.names is not None:
@@ -397,6 +533,10 @@ def _validate_graph_result(
                 _invalid(path, "has no node operation contract")
             if len(raw_nodes) > contract.max_items or len(raw_paths) > contract.max_items:
                 _invalid(path, "exceeds the requested result limit")
+            if not contract.include_documents:
+                for index, raw_node in enumerate(raw_nodes):
+                    if "document" in _object(raw_node, f"{path}.nodes[{index}]"):
+                        _invalid(f"{path}.nodes[{index}].document", "was returned without being requested")
             if contract.node_mode == "traversal":
                 if raw_paths:
                     _invalid(f"{path}.paths", "traversal paths belong on result nodes")

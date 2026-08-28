@@ -12118,7 +12118,7 @@ export interface components {
             /** @default 100 */
             limit?: number;
             /**
-             * @description Hydrate documents for projected non-null bindings. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting the document.
+             * @description Hydrate documents for projected non-null bindings when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted. The product of `limit` and the number of projected bindings may not exceed 10,000. Table-qualified bindings are hydrated by coordinator-backed deployments; runtimes with only a source-table snapshot reject such requests instead of silently omitting an available document.
              * @default false
              */
             include_documents?: boolean;
@@ -12202,7 +12202,7 @@ export interface components {
             /** @default false */
             include_paths?: boolean;
             /**
-             * @description Include each result node's stored document.
+             * @description Include each result node's stored document when it exists at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
              * @default false
              */
             include_documents?: boolean;
@@ -12241,7 +12241,7 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate for path nodes. */
             filter?: components["schemas"]["GraphDocumentFilter"];
             /**
-             * @description Include stored documents on terminal result nodes returned alongside the path.
+             * @description Include stored documents on terminal result nodes returned alongside the path when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
              * @default false
              */
             include_documents?: boolean;
@@ -12439,7 +12439,7 @@ export interface components {
             key: string;
             /** @description Owning table for a cross-table binding; omitted for the queried table. */
             table?: string;
-            /** @description Stored document when include_documents=true. */
+            /** @description Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted. */
             document?: {
                 [key: string]: unknown;
             };
@@ -12516,7 +12516,7 @@ export interface components {
             table?: string;
             /** @description Hop count from the start node; when path is present this equals path length minus one */
             depth: number;
-            /** @description Full document (if include_documents=true) */
+            /** @description Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted. */
             document?: {
                 [key: string]: unknown;
             };

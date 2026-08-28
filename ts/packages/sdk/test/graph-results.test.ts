@@ -188,6 +188,76 @@ describe("graph result admission", () => {
     }
   });
 
+  it("rejects unrequested documents while allowing sparse requested hydration", () => {
+    const nodeResult = (document?: Record<string, unknown>) => ({
+      kind: "nodes",
+      nodes: [{ key: "b", depth: 1, ...(document === undefined ? {} : { document }) }],
+      paths: [
+        {
+          nodes: [{ key: "a" }, { key: "b" }],
+          edges: [
+            {
+              from: { key: "a" },
+              to: { key: "b" },
+              direction: "out",
+              type: "related",
+              weight: 1,
+            },
+          ],
+          length: 1,
+          weight_mode: "min_hops",
+          weight_sum: 1,
+          objective_value: 1,
+        },
+      ],
+      stats: { returned_items: 1, truncated: false },
+    });
+    expect(() =>
+      validateGraphQueryResponses(responses(nodeResult({ private: true })), [canonicalRequest])
+    ).toThrow("was returned without being requested");
+
+    const hydratedPathRequest = {
+      graph_queries: {
+        path: {
+          index: "graph_idx",
+          shortest_path: {
+            from: { key: "a" },
+            to: { key: "b" },
+            include_documents: true,
+          },
+        },
+      },
+    } as QueryRequest;
+    expect(() =>
+      validateGraphQueryResponses(responses(nodeResult({ private: true })), [hydratedPathRequest])
+    ).not.toThrow();
+    expect(() =>
+      validateGraphQueryResponses(responses(nodeResult()), [hydratedPathRequest])
+    ).not.toThrow();
+
+    const bindingsRequest = (includeDocuments: boolean) =>
+      ({
+        graph_queries: {
+          matched: {
+            index: "graph_idx",
+            match: { anchor: "a", nodes: { a: {} }, edges: [] },
+            return: { bindings: ["a"], include_documents: includeDocuments },
+          },
+        },
+      }) as QueryRequest;
+    const bindingResult = {
+      kind: "bindings",
+      rows: [{ a: { key: "a", document: { private: true } } }],
+      stats: { returned_items: 1, truncated: false },
+    };
+    expect(() =>
+      validateGraphQueryResponses(responses(bindingResult, "matched"), [bindingsRequest(false)])
+    ).toThrow("was returned without being requested");
+    expect(() =>
+      validateGraphQueryResponses(responses(bindingResult, "matched"), [bindingsRequest(true)])
+    ).not.toThrow();
+  });
+
   it("enforces request-derived cardinality and path ownership", () => {
     const zeroHopPath = {
       nodes: [{ key: "a" }],

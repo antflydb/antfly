@@ -326,6 +326,100 @@ def test_public_query_decoder_accepts_valid_canonical_and_legacy_results() -> No
 
 
 @pytest.mark.parametrize(
+    "legacy_result",
+    [
+        {"type": "neighbors", "total": "wrong"},
+        {"type": "neighbors", "total": 1, "unexpected": True},
+        {"type": "neighbors", "total": 1, "nodes": None},
+        {"type": "neighbors", "total": 1, "nodes": [{"key": 42}]},
+    ],
+)
+def test_legacy_query_decoder_rejects_malformed_known_shape(legacy_result: object) -> None:
+    with pytest.raises(AntflyException):
+        decode_query_responses(
+            _query_response(legacy_result, operation="legacy"),
+            graph_dialect="legacy",
+            expected_graph_operations=frozenset({"legacy"}),
+        )
+
+
+def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse_hydration() -> None:
+    path_query = {
+        "path": {
+            "index": "graph",
+            "shortest_path": {"from": {"key": "a"}, "to": {"key": "b"}},
+        }
+    }
+
+    def node_result(*, include_document: bool) -> dict[str, object]:
+        node: dict[str, object] = {"key": "b", "depth": 1}
+        if include_document:
+            node["document"] = {"private": True}
+        return {
+            "kind": "nodes",
+            "nodes": [node],
+            "paths": [
+                {
+                    "nodes": [{"key": "a"}, {"key": "b"}],
+                    "edges": [
+                        {
+                            "from": {"key": "a"},
+                            "to": {"key": "b"},
+                            "direction": "out",
+                            "type": "related",
+                            "weight": 1,
+                        }
+                    ],
+                    "length": 1,
+                    "weight_mode": "min_hops",
+                    "weight_sum": 1,
+                    "objective_value": 1,
+                }
+            ],
+            "stats": {"returned_items": 1, "truncated": False},
+        }
+
+    with pytest.raises(AntflyException, match="was returned without being requested"):
+        decode_query_responses(
+            _query_response(node_result(include_document=True), operation="path"),
+            expected_graph_queries=path_query,
+        )
+
+    path_query["path"]["shortest_path"]["include_documents"] = True
+    decode_query_responses(
+        _query_response(node_result(include_document=True), operation="path"),
+        expected_graph_queries=path_query,
+    )
+    decode_query_responses(
+        _query_response(node_result(include_document=False), operation="path"),
+        expected_graph_queries=path_query,
+    )
+
+    bindings_query = {
+        "matched": {
+            "index": "graph",
+            "match": {"anchor": "a", "nodes": {"a": {}}, "edges": []},
+            "return": {"bindings": ["a"]},
+        }
+    }
+    binding_result = {
+        "kind": "bindings",
+        "rows": [{"a": {"key": "a", "document": {"private": True}}}],
+        "stats": {"returned_items": 1, "truncated": False},
+    }
+    with pytest.raises(AntflyException, match="was returned without being requested"):
+        decode_query_responses(
+            _query_response(binding_result, operation="matched"),
+            expected_graph_queries=bindings_query,
+        )
+    bindings_query["matched"]["return"]["include_documents"] = True
+    decode_query_responses(
+        _query_response(binding_result, operation="matched"),
+        expected_graph_queries=bindings_query,
+    )
+
+
+@pytest.mark.parametrize(
     "graph_result",
     [
         {

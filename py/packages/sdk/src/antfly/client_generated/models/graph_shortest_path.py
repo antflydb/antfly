@@ -60,8 +60,9 @@ class GraphShortestPath:
             Fuzzy predicates require an explicit fuzziness. Range predicates use numeric_range, term_range, or date_range
             wrappers, and every stored value is addressed by an RFC 6901 JSON Pointer in `path`. Alias-to-alias predicates
             belong in GraphMatch.where.
-        include_documents (bool | Unset): Include stored documents on terminal result nodes returned alongside the path.
-            Default: False.
+        include_documents (bool | Unset): Include stored documents on terminal result nodes returned alongside the path
+            when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always
+            omitted. Default: False.
         fields (list[str] | Unset): Requires include_documents=true. Omit to include all document fields.
     """
 
