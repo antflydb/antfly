@@ -32,7 +32,6 @@ import {
   type GeneratorConfig,
   graphIndexSources,
   type IndexConfig,
-  isValidGraphMaterializedSourceTemplate,
 } from "@antfly/sdk";
 import { zodResolver } from "@hookform/resolvers/zod";
 import type React from "react";
@@ -119,7 +118,6 @@ const indexFormSchema = z
           format: z.enum(["extraction_relation", "extraction_graph"]),
           mentionEdgeType: z.string().optional(),
           nodeModel: z.enum(["document", "external"]),
-          sourceNode: z.string().optional(),
           targetNode: z.string().optional(),
           edgeType: z.string().optional(),
           edgeWeight: z.string().optional(),
@@ -189,17 +187,6 @@ const indexFormSchema = z
       } else {
         validateNamedSources(data.graphSources, "graphSources", context);
         data.graphSources.forEach((source, index) => {
-          if (
-            source.sourceNode?.trim() &&
-            !isValidGraphMaterializedSourceTemplate(source.sourceNode)
-          ) {
-            context.addIssue({
-              code: "custom",
-              path: ["graphSources", index, "sourceNode"],
-              message:
-                "Use {{ _doc.key }} for the source node so graph state stays with its routing owner.",
-            });
-          }
           const fields = splitContextFields(source.contextFields);
           if (new Set(fields).size !== fields.length) {
             context.addIssue({
@@ -361,7 +348,6 @@ export function buildGraphEdgeTypeConfig(edgeType: GraphEdgeTypeFormData) {
 }
 
 export function buildGraphSourceConfig(source: GraphSourceFormData) {
-  const sourceNode = source.sourceNode?.trim();
   const targetNode = source.targetNode?.trim();
   const edgeType = source.edgeType?.trim();
   const edgeWeight = source.edgeWeight?.trim();
@@ -384,11 +370,10 @@ export function buildGraphSourceConfig(source: GraphSourceFormData) {
     ...(source.path?.trim() ? { path: source.path.trim() } : {}),
     format: source.format,
     ...(source.mentionEdgeType?.trim() ? { mention_edge_type: source.mentionEdgeType.trim() } : {}),
-    ...(source.nodeModel === "external" || sourceNode || targetNode
+    ...(source.nodeModel === "external" || targetNode
       ? {
           nodes: {
             model: source.nodeModel,
-            ...(sourceNode ? { source: sourceNode } : {}),
             ...(targetNode ? { target: targetNode } : {}),
           },
         }
@@ -853,19 +838,6 @@ const IndexKindForm: React.FC<{
                     />
                     <FormField
                       control={control}
-                      name={`graphSources.${index}.sourceNode`}
-                      render={({ field }) => (
-                        <FormItem>
-                          <FormLabel>Source node template</FormLabel>
-                          <FormControl>
-                            <Input placeholder="{{ _doc.key }}" {...field} />
-                          </FormControl>
-                          <FormMessage />
-                        </FormItem>
-                      )}
-                    />
-                    <FormField
-                      control={control}
                       name={`graphSources.${index}.targetNode`}
                       render={({ field }) => (
                         <FormItem>
@@ -974,7 +946,6 @@ const IndexKindForm: React.FC<{
                     format: "extraction_relation",
                     mentionEdgeType: "",
                     nodeModel: "document",
-                    sourceNode: "",
                     targetNode: "",
                     edgeType: "",
                     edgeWeight: "",
@@ -1056,7 +1027,6 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
           format: "extraction_relation",
           mentionEdgeType: "",
           nodeModel: "document",
-          sourceNode: "",
           targetNode: "",
           edgeType: "",
           edgeWeight: "",
@@ -1125,7 +1095,6 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
                         format: source?.format ?? "extraction_relation",
                         mentionEdgeType: source?.mentionEdgeType,
                         nodeModel: source?.nodeModel ?? "document",
-                        sourceNode: source?.sourceNode,
                         targetNode: source?.targetNode,
                         edgeType: source?.edgeType,
                         edgeWeight: source?.edgeWeight,
@@ -1387,8 +1356,8 @@ const CreateIndexDialog: React.FC<CreateIndexDialogProps> = ({
         {artifactSourcesState === "upgrade_pending" && (
           <Alert>
             <AlertDescription>
-              Artifact-backed index drafts remain editable, but creation is temporarily paused
-              until every table-serving store completes the rolling upgrade.
+              Artifact-backed index drafts remain editable, but creation is temporarily paused until
+              every table-serving store completes the rolling upgrade.
             </AlertDescription>
           </Alert>
         )}

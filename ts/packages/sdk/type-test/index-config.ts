@@ -7,7 +7,6 @@ const graph: CreateIndexRequest = {
     format: "extraction_graph",
     nodes: {
       model: "document",
-      source: "{{ _doc.key }}",
       target: "{{ _item.target.text }}",
     },
     edge: {

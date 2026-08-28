@@ -2387,6 +2387,7 @@ pub const RestoreState = struct {
     phase: []u8,
     primary_restored: bool,
     runtime_repair_complete: bool,
+    graph_ownership_cursor: []u8,
     last_error: []u8,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
@@ -2395,6 +2396,7 @@ pub const RestoreState = struct {
         alloc.free(self.artifact_sha256);
         alloc.free(self.snapshot_path);
         alloc.free(self.phase);
+        alloc.free(self.graph_ownership_cursor);
         alloc.free(self.last_error);
         self.* = undefined;
     }
@@ -2421,6 +2423,7 @@ const RestoreStateDisk = struct {
     phase: []const u8,
     primary_restored: bool,
     runtime_repair_complete: bool,
+    graph_ownership_cursor: []const u8 = "",
     last_error: []const u8,
 };
 
@@ -2444,6 +2447,7 @@ fn restoreStateAlloc(
     phase: []const u8,
     primary_restored: bool,
     runtime_repair_complete: bool,
+    graph_ownership_cursor: []const u8,
     last_error: []const u8,
 ) !RestoreState {
     const backup_id_owned = try alloc.dupe(u8, backup_id);
@@ -2456,6 +2460,8 @@ fn restoreStateAlloc(
     errdefer alloc.free(snapshot_path_owned);
     const phase_owned = try alloc.dupe(u8, phase);
     errdefer alloc.free(phase_owned);
+    const graph_ownership_cursor_owned = try alloc.dupe(u8, graph_ownership_cursor);
+    errdefer alloc.free(graph_ownership_cursor_owned);
     const last_error_owned = try alloc.dupe(u8, last_error);
     errdefer alloc.free(last_error_owned);
 
@@ -2468,6 +2474,7 @@ fn restoreStateAlloc(
         .phase = phase_owned,
         .primary_restored = primary_restored,
         .runtime_repair_complete = runtime_repair_complete,
+        .graph_ownership_cursor = graph_ownership_cursor_owned,
         .last_error = last_error_owned,
     };
 }
@@ -2485,6 +2492,14 @@ const RestoreImportState = struct {
 
 fn validRestoreArtifactSha256(value: []const u8) bool {
     if (value.len != std.crypto.hash.sha2.Sha256.digest_length * 2) return false;
+    for (value) |c| {
+        if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
+    }
+    return true;
+}
+
+fn validRestoreCursorHex(value: []const u8) bool {
+    if (value.len % 2 != 0) return false;
     for (value) |c| {
         if (!std.ascii.isDigit(c) and !(c >= 'a' and c <= 'f')) return false;
     }
@@ -2558,7 +2573,8 @@ fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8
         !validRestoreArtifactSha256(disk.artifact_sha256) or
         disk.snapshot_path.len == 0 or
         disk.group_id == 0 or
-        disk.phase.len == 0)
+        disk.phase.len == 0 or
+        !validRestoreCursorHex(disk.graph_ownership_cursor))
     {
         return error.InvalidRestoreState;
     }
@@ -2572,6 +2588,7 @@ fn readRestoreStateForPathAllocWithIo(alloc: Allocator, io: Io, path: []const u8
         disk.phase,
         disk.primary_restored,
         disk.runtime_repair_complete,
+        disk.graph_ownership_cursor,
         disk.last_error,
     );
 }
@@ -2602,6 +2619,7 @@ fn writeRestoreStateForPathWithIo(alloc: Allocator, io: Io, path: []const u8, st
         .phase = state.phase,
         .primary_restored = state.primary_restored,
         .runtime_repair_complete = state.runtime_repair_complete,
+        .graph_ownership_cursor = state.graph_ownership_cursor,
         .last_error = state.last_error,
     }, .{});
     defer alloc.free(raw);
@@ -2649,6 +2667,7 @@ fn readRestoreImportStateAllocWithIo(alloc: Allocator, io: Io, path: []const u8)
         "runtime_repair",
         true,
         false,
+        "",
         "",
     );
     return .{
@@ -15759,7 +15778,7 @@ pub const DB = struct {
         snapshot_path: []const u8,
         group_id: u64,
     ) !void {
-        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "");
+        var state = try restoreStateAlloc(alloc, backup_id, location, artifact_sha256, snapshot_path, group_id, "runtime_repair", true, false, "", "");
         defer state.deinit(alloc);
         try writeRestoreStateForPathWithIo(alloc, io, path, state);
         const import_marker_path = try restoreImportMarkerPathAlloc(alloc, path);
@@ -15796,6 +15815,9 @@ pub const DB = struct {
         state.phase = new_phase;
         state.primary_restored = true;
         state.runtime_repair_complete = false;
+        const empty_cursor = try alloc.dupe(u8, "");
+        alloc.free(state.graph_ownership_cursor);
+        state.graph_ownership_cursor = empty_cursor;
         try writeRestoreStateForPathWithIo(alloc, io, path, state);
         try deleteFileIfExists(io, import_marker_path);
     }
@@ -15808,6 +15830,9 @@ pub const DB = struct {
         state.phase = new_phase;
         state.primary_restored = true;
         state.runtime_repair_complete = true;
+        const empty_cursor = try alloc.dupe(u8, "");
+        alloc.free(state.graph_ownership_cursor);
+        state.graph_ownership_cursor = empty_cursor;
         try writeRestoreStateForPathWithIo(alloc, io, path, state);
     }
 
@@ -15832,9 +15857,29 @@ pub const DB = struct {
         state.phase = new_phase;
         state.primary_restored = true;
         state.runtime_repair_complete = complete;
+        const empty_cursor = try alloc.dupe(u8, "");
+        alloc.free(state.graph_ownership_cursor);
+        state.graph_ownership_cursor = empty_cursor;
         const new_last_error = try alloc.dupe(u8, "");
         alloc.free(state.last_error);
         state.last_error = new_last_error;
+        try writeRestoreStateForPathWithIo(alloc, io, self.core.path, state);
+    }
+
+    fn updateRestoreGraphOwnershipCursorWithIo(
+        self: *DB,
+        alloc: Allocator,
+        io: Io,
+        cursor: []const u8,
+    ) !void {
+        var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return error.InvalidRestoreState;
+        defer state.deinit(alloc);
+        if (!std.mem.eql(u8, state.phase, "rebuild_graph") or state.runtime_repair_complete) {
+            return error.InvalidRestoreState;
+        }
+        const encoded_cursor = try bytesToHexAlloc(alloc, cursor);
+        alloc.free(state.graph_ownership_cursor);
+        state.graph_ownership_cursor = encoded_cursor;
         try writeRestoreStateForPathWithIo(alloc, io, self.core.path, state);
     }
 
@@ -15862,9 +15907,24 @@ pub const DB = struct {
         }
         if (std.mem.eql(u8, phase, "rebuild_graph")) {
             std.log.info("restore runtime repair phase=rebuild_graph_ownership", .{});
-            const ownership_count = try self.rebuildGraphArtifactOwnershipForRestore(alloc);
+            const cursor = if (state.graph_ownership_cursor.len > 0)
+                try hexToBytesAlloc(alloc, state.graph_ownership_cursor)
+            else
+                null;
+            defer if (cursor) |key| alloc.free(key);
+            var ownership_page = try self.rebuildGraphArtifactOwnershipForRestorePage(alloc, cursor);
+            defer ownership_page.deinit(alloc);
+            if (!ownership_page.complete) {
+                try self.updateRestoreGraphOwnershipCursorWithIo(
+                    alloc,
+                    io,
+                    ownership_page.next_cursor.?,
+                );
+                std.log.info("restore runtime repair rebuilt graph ownership page sources={d}", .{ownership_page.replayed});
+                return true;
+            }
             const graph_count = try self.rebuildGraphDerivedState();
-            std.log.info("restore runtime repair rebuilt graph ownership sources={d} mutations={d}", .{ ownership_count, graph_count });
+            std.log.info("restore runtime repair rebuilt final graph ownership page sources={d} mutations={d}", .{ ownership_page.replayed, graph_count });
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "rebuild_artifacts", false);
             return true;
         }
@@ -15997,55 +16057,68 @@ pub const DB = struct {
     /// portable backup. Visible graph edges alone cannot preserve source
     /// precedence: after restore, deleting the current winner must reveal the
     /// next surviving source. Replay every durable graph input in bounded
-    /// pages before rebuilding the runtime graph projection.
-    fn rebuildGraphArtifactOwnershipForRestore(self: *DB, alloc: Allocator) !usize {
+    /// pages before rebuilding the runtime graph projection. One invocation is
+    /// deliberately one durable work quantum so large restores do not hold the
+    /// apply lock for an unbounded table scan.
+    const GraphOwnershipRestorePage = struct {
+        replayed: usize = 0,
+        next_cursor: ?[]u8 = null,
+        complete: bool = false,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            if (self.next_cursor) |cursor| alloc.free(cursor);
+            self.* = undefined;
+        }
+    };
+
+    fn rebuildGraphArtifactOwnershipForRestorePage(
+        self: *DB,
+        alloc: Allocator,
+        cursor: ?[]const u8,
+    ) !GraphOwnershipRestorePage {
         lockApply(self);
         defer self.core.unlockApply();
 
-        if (!self.core.index_manager.hasGraphIndexes()) return 0;
-        const page_size = 512;
+        if (!self.core.index_manager.hasGraphIndexes()) return .{ .complete = true };
+        const page_size: usize = 512;
         const user_prefix = [_]u8{internal_keys.user_namespace};
-        var cursor: ?[]u8 = null;
-        defer if (cursor) |key| alloc.free(key);
-        var replayed: usize = 0;
+        const rows = try self.core.store.scanPrefixPage(alloc, &user_prefix, cursor, page_size);
+        defer docstore_mod.DocStore.freeResults(alloc, rows);
+        if (rows.len == 0) return .{ .complete = true };
 
-        while (true) {
-            const rows = try self.core.store.scanPrefixPage(alloc, &user_prefix, cursor, page_size);
-            defer docstore_mod.DocStore.freeResults(alloc, rows);
-            if (rows.len == 0) break;
-
-            var source_keys = std.ArrayListUnmanaged([]const u8).empty;
-            defer source_keys.deinit(alloc);
-            for (rows) |row| {
-                if (internal_keys.isAssetArtifactKey(row.key) or
-                    internal_keys.isChunkArtifactRecordKey(row.key) or
-                    internal_keys.isResolutionArtifactKey(row.key))
-                {
-                    try source_keys.append(alloc, row.key);
-                }
+        var source_keys = std.ArrayListUnmanaged([]const u8).empty;
+        defer source_keys.deinit(alloc);
+        for (rows) |row| {
+            if (internal_keys.isAssetArtifactKey(row.key) or
+                internal_keys.isChunkArtifactRecordKey(row.key) or
+                internal_keys.isResolutionArtifactKey(row.key))
+            {
+                try source_keys.append(alloc, row.key);
             }
-
-            if (source_keys.items.len > 0) {
-                for (self.core.index_manager.graphIndexes()) |graph_entry| {
-                    const changed = try materializeGraphSourceArtifactsForIndex(
-                        alloc,
-                        self.core.store,
-                        self.core.index_manager,
-                        source_keys.items,
-                        graph_entry.config.name,
-                        .{},
-                    );
-                    freeOwnedKeySlice(alloc, changed);
-                }
-                replayed += source_keys.items.len;
-            }
-
-            const next_cursor = try alloc.dupe(u8, rows[rows.len - 1].key);
-            if (cursor) |key| alloc.free(key);
-            cursor = next_cursor;
-            if (rows.len < page_size) break;
         }
-        return replayed;
+
+        if (source_keys.items.len > 0) {
+            for (self.core.index_manager.graphIndexes()) |graph_entry| {
+                const changed = try materializeGraphSourceArtifactsForIndex(
+                    alloc,
+                    self.core.store,
+                    self.core.index_manager,
+                    source_keys.items,
+                    graph_entry.config.name,
+                    .{},
+                );
+                freeOwnedKeySlice(alloc, changed);
+            }
+        }
+
+        return .{
+            .replayed = source_keys.items.len,
+            .next_cursor = if (rows.len == page_size)
+                try alloc.dupe(u8, rows[rows.len - 1].key)
+            else
+                null,
+            .complete = rows.len < page_size,
+        };
     }
 
     pub fn clearDenseHbcCaches(self: *DB) void {
@@ -42936,18 +43009,10 @@ fn appendRelationItem(
         jsonStringField(item, "type") orelse jsonStringField(item, "edge_type") orelse jsonStringField(item, "relation") orelse return;
     if (edge_type.len == 0) return;
 
-    const mapped_source = if (mapping.source_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_source) |value| alloc.free(value);
-    const source_doc = if (mapped_source) |value| blk: {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-        break :blk if (trimmed.len > 0) trimmed else doc_key;
-    } else if (item.object.get("source")) |source_value|
-        jsonEndpointDocumentIdResolved(source_value, artifact_value) orelse doc_key
-    else
-        doc_key;
+    // Materialized edges are routed and retired with their source document.
+    // Artifact payloads may describe a source endpoint, but allowing it to
+    // replace the owner would make writes and split ownership disagree.
+    const source_doc = doc_key;
 
     const mapped_target = if (mapping.target_template.len > 0)
         try renderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
@@ -54200,7 +54265,7 @@ test "db graph index materializes unit-derived chunk artifacts into graph edge a
         .config_json =
         \\{
         \\  "source":{"artifact":"document_chunks_v1","format":"extraction_relation",
-        \\    "nodes":{"source":"{{ _doc.key }}","target":"{{ _artifact.value.text }}"},
+        \\    "nodes":{"target":"{{ _artifact.value.text }}"},
         \\    "edge":{"type":"mentions","metadata":{"unit":"{{ _artifact.value._parent_unit_id }}","artifact":"{{ _artifact.name }}"}}}
         \\}
         ,
@@ -54263,7 +54328,7 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
         .name = "selected_graph",
         .kind = .graph,
         .config_json =
-        \\{"sources":[{"artifact":"graph_chunks_v1","format":"extraction_relation","nodes":{"source":"{{ _doc.key }}","target":"{{ _artifact.value.relation }}"},"edge":{"type":"mentions"}}]}
+        \\{"sources":[{"artifact":"graph_chunks_v1","format":"extraction_relation","nodes":{"target":"{{ _artifact.value.relation }}"},"edge":{"type":"mentions"}}]}
         ,
     });
 
@@ -55313,7 +55378,7 @@ test "db graph relation artifact materializer uses mapping templates" {
         .config_json =
         \\{
         \\  "source":{"artifact":"relations_v1","path":"$.items[*]","format":"extraction_relation",
-        \\    "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.to }}"},
+        \\    "nodes":{"target":"{{ _item.to }}"},
         \\    "edge":{"type":"{{ _item.rel }}","weight":"{{ default _item.score 1.0 }}","metadata":{"evidence":"{{ _item.evidence }}","ordinal":"{{ _item_index }}","tenant":"{{ _doc.value.tenant_id }}"}},
         \\    "context":{"doc_fields":["tenant_id"]}},
         \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
@@ -55444,7 +55509,7 @@ test "db graph relation artifact materializer resolves entity refs and artifact 
         .config_json =
         \\{
         \\  "source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_graph",
-        \\    "nodes":{"source":"{{ _doc.key }}","target":"{{ _item.target.doc_ref.key }}"},
+        \\    "nodes":{"target":"{{ _item.target.doc_ref.key }}"},
         \\    "edge":{"type":"{{ _item.type }}","metadata":{"artifact":"{{ _artifact.name }}","content_type":"{{ _artifact.content_type }}","source_text":"{{ _item.source.text }}","target_text":"{{ _item.target.text }}"}}},
         \\  "artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"relations"},"content_type":"application/json"}
         \\}
@@ -95291,6 +95356,18 @@ test "db restore state uses strict structured content identity markers" {
         try std.testing.expectEqualStrings(location, state.location);
         try std.testing.expectEqualStrings(artifact_sha256, state.artifact_sha256);
         try std.testing.expectEqualStrings("runtime_repair", state.phase);
+        try std.testing.expectEqualStrings("", state.graph_ownership_cursor);
+        const cursor = try bytesToHexAlloc(alloc, "\x01artifact:cursor");
+        alloc.free(state.graph_ownership_cursor);
+        state.graph_ownership_cursor = cursor;
+        try writeRestoreStateForPath(alloc, std.mem.span(path), state);
+    }
+    {
+        var state = (try DB.readRestoreStateForPath(alloc, std.mem.span(path))).?;
+        defer state.deinit(alloc);
+        const cursor = try hexToBytesAlloc(alloc, state.graph_ownership_cursor);
+        defer alloc.free(cursor);
+        try std.testing.expectEqualStrings("\x01artifact:cursor", cursor);
     }
 
     const state_path = try restoreStateMarkerPathAlloc(alloc, std.mem.span(path));
@@ -95305,6 +95382,76 @@ test "db restore state uses strict structured content identity markers" {
         error.InvalidRestoreState,
         DB.readRestoreStateForPath(alloc, std.mem.span(path)),
     );
+}
+
+test "db restore graph ownership replay persists a bounded page cursor" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}",
+    });
+
+    const document_count = 513;
+    const writes = try alloc.alloc(types.BatchWrite, document_count);
+    defer alloc.free(writes);
+    var initialized: usize = 0;
+    defer for (writes[0..initialized]) |write| alloc.free(write.key);
+    for (writes, 0..) |*write, i| {
+        write.* = .{
+            .key = try std.fmt.allocPrint(alloc, "doc:{d:0>4}", .{i}),
+            .value = "{}",
+        };
+        initialized += 1;
+    }
+    try db.batch(.{ .writes = writes });
+
+    try DB.markRestorePrimaryRestoredForPathWithArtifact(
+        alloc,
+        std.mem.span(path),
+        "snap1",
+        "file:///tmp/backups",
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "snapshots/snap1",
+        7001,
+    );
+    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "rebuild_graph", false);
+
+    try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+    {
+        var state = (try DB.readRestoreStateForPath(alloc, std.mem.span(path))).?;
+        defer state.deinit(alloc);
+        try std.testing.expectEqualStrings("rebuild_graph", state.phase);
+        try std.testing.expect(state.graph_ownership_cursor.len > 0);
+    }
+
+    var page_steps: usize = 1;
+    while (true) {
+        var before = (try DB.readRestoreStateForPath(alloc, std.mem.span(path))).?;
+        defer before.deinit(alloc);
+        if (!std.mem.eql(u8, before.phase, "rebuild_graph")) break;
+        try std.testing.expect(page_steps < 8);
+        const cursor_before = try alloc.dupe(u8, before.graph_ownership_cursor);
+        defer alloc.free(cursor_before);
+
+        try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
+        page_steps += 1;
+        var after = (try DB.readRestoreStateForPath(alloc, std.mem.span(path))).?;
+        defer after.deinit(alloc);
+        if (std.mem.eql(u8, after.phase, "rebuild_graph")) {
+            try std.testing.expect(!std.mem.eql(u8, cursor_before, after.graph_ownership_cursor));
+        } else {
+            try std.testing.expectEqualStrings("rebuild_artifacts", after.phase);
+            try std.testing.expectEqualStrings("", after.graph_ownership_cursor);
+        }
+    }
+    try std.testing.expect(page_steps > 1);
 }
 
 test "db rebuild dense indexes preserves corrupt stored embedding artifacts" {

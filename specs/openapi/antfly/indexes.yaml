@@ -194,14 +194,6 @@ components:
         - type: string
         - type: number
           format: double
-    GraphMaterializedSourceTemplate:
-      type: string
-      pattern: '^\{\{\s*_doc\.key\s*\}\}$'
-      description: >-
-        Owner identity for edges materialized from one artifact item. Omit it
-        to use the source document key. When present, it must be exactly the
-        source document key template so edge state remains colocated with its
-        routing and range-split owner.
     GraphArtifactNodeMappingConfig:
       type: object
       additionalProperties: false
@@ -211,7 +203,6 @@ components:
           type: string
           enum: [document, external]
           default: document
-        source: { $ref: "#/components/schemas/GraphMaterializedSourceTemplate" }
         target: { $ref: "#/components/schemas/GraphTemplateValue" }
     GraphArtifactEdgeMappingConfig:
       type: object

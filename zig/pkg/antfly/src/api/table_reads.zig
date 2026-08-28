@@ -25655,6 +25655,12 @@ test "hosted cross-range graph query expands explicit local start keys" {
         try left_db.addIndex(.{ .name = "relations_graph", .kind = .graph, .config_json = "{\"edge_types\":[{\"name\":\"mentions\"}]}" });
         try left_db.batch(.{
             .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"left\"}" }},
+            .graph_writes = &.{.{
+                .index_name = "relations_graph",
+                .source = "doc:a",
+                .target = "entity:ada",
+                .edge_type = "mentions",
+            }},
             .sync_level = .full_index,
         });
     }
@@ -25816,6 +25822,24 @@ test "hosted cross-range graph query expands explicit local start keys" {
 
     try std.testing.expect(std.mem.indexOf(u8, response.json, "\"graph_results\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, response.json, "\"entity:ada\"") != null);
+
+    var incoming_response = (try hosted.source().query(alloc, "docs", .{
+        .query = .{ .match_all = {} },
+        .limit = 10,
+        .graph_queries = &.{.{
+            .name = "mentioned_by",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "relations_graph",
+                .start_nodes = .{ .keys = &.{"entity:ada"} },
+                .params = .{ .edge_types = &.{"mentions"}, .direction = .in, .max_results = 10 },
+            },
+        }},
+    }, .read_index)).?;
+    defer incoming_response.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, incoming_response.json, "\"doc:a\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, incoming_response.json, "\"zdoc:a\"") != null);
 }
 
 test "provisioned read cache keys entries by lsm root generation" {

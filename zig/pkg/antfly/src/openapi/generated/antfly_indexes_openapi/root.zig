@@ -53,7 +53,6 @@ pub const GraphArtifactSourceConfig = types.GraphArtifactSourceConfig;
 pub const GraphBoundedTraversalConfig = types.GraphBoundedTraversalConfig;
 pub const GraphIndexConfig = types.GraphIndexConfig;
 pub const GraphIndexStats = types.GraphIndexStats;
-pub const GraphMaterializedSourceTemplate = types.GraphMaterializedSourceTemplate;
 pub const GraphNodeSelector = types.GraphNodeSelector;
 pub const GraphQuery = types.GraphQuery;
 pub const GraphQueryParams = types.GraphQueryParams;

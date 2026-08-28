@@ -35,7 +35,6 @@ def test_created_graph_index_exposes_artifact_mapping_and_planning() -> None:
                     "artifact": "relations_v1",
                     "nodes": {
                         "model": "document",
-                        "source": "{{ _doc.key }}",
                         "target": "{{ _item.target.text }}",
                     },
                     "edge": {

@@ -1246,7 +1246,6 @@ pub const GraphArtifactEdgeMappingConfig = struct {
 /// Maps each artifact item to graph node identifiers.
 pub const GraphArtifactNodeMappingConfig = struct {
     model: ?[]const u8 = null,
-    source: ?GraphMaterializedSourceTemplate = null,
     target: ?GraphTemplateValue = null,
 };
 
@@ -1401,9 +1400,6 @@ pub const GraphIndexStats = struct {
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
 };
-
-/// Owner identity for edges materialized from one artifact item. Omit it to use the source document key. When present, it must be exactly the source document key template so edge state remains colocated with its routing and range-split owner.
-pub const GraphMaterializedSourceTemplate = []const u8;
 
 /// Defines how to select start/target nodes for graph queries
 pub const GraphNodeSelector = struct {

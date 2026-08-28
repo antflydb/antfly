@@ -121,6 +121,14 @@ the earlier source wins. Mapping (`path`, `format`, `nodes`, `edge`, and
 shapes. The optional `source` object is the one-source convenience form and is
 mutually exclusive with `sources`.
 
+Artifact-backed edges are owned by the source document key; `nodes.target`
+maps the other endpoint. Source ownership is intentionally not configurable,
+so replay, deletion, routing, and range splits share one identity contract.
+Outgoing traversal routes directly to that source owner. Incoming and
+bidirectional traversal fan out across source shards in parallel and
+deduplicate results, which preserves cross-range edges without cross-shard
+dual writes.
+
 ## Readiness And Operations
 
 Creation starts materialization and replay; it does not imply complete coverage.

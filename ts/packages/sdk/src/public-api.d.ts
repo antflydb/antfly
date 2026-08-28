@@ -9400,8 +9400,6 @@ export interface components {
             /** @description Non-semantic execution policy for shorthand-created chunking or embedding producers. */
             execution?: components["schemas"]["IndexExecutionConfig"];
         };
-        /** @description Owner identity for edges materialized from one artifact item. Omit it to use the source document key. When present, it must be exactly the source document key template so edge state remains colocated with its routing and range-split owner. */
-        GraphMaterializedSourceTemplate: string;
         /** @description A literal string or finite numeric value, or a Handlebars template evaluated for each materialized graph item. */
         GraphTemplateValue: string | number;
         /** @description Maps each artifact item to graph node identifiers. */
@@ -9411,7 +9409,6 @@ export interface components {
              * @enum {string}
              */
             model?: "document" | "external";
-            source?: components["schemas"]["GraphMaterializedSourceTemplate"];
             target?: components["schemas"]["GraphTemplateValue"];
         };
         /** @description Maps each artifact item to an edge type, weight, and public metadata. */

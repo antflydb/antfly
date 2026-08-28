@@ -1437,42 +1437,14 @@ pub const GraphIndex = struct {
             removed += 1;
         }
 
-        var keys_to_delete = std.ArrayListUnmanaged([]u8).empty;
-        defer {
-            for (keys_to_delete.items) |key| alloc.free(key);
-            keys_to_delete.deinit(alloc);
-        }
-
-        {
-            var cur = try reverse_txn.openCursor();
-            defer cur.close();
-
-            if (try cur.seekAtOrAfter(range_lower)) |initial_entry| {
-                var entry = initial_entry;
-                while (true) {
-                    if (range_upper.len > 0 and std.mem.order(u8, entry.key, range_upper) != .lt) break;
-                    if (try parseReverseEdgeKeyAlloc(alloc, entry.key)) |parsed_owned| {
-                        var parsed = parsed_owned;
-                        defer parsed.deinit(alloc);
-                        if (std.mem.eql(u8, parsed.index_name, self.index_name)) {
-                            try keys_to_delete.append(alloc, try alloc.dupe(u8, entry.key));
-                        }
-                    }
-                    entry = (try cur.next()) orelse break;
-                }
-            }
-        }
-
-        for (keys_to_delete.items) |key| {
-            reverse_txn.delete(key) catch |err| switch (err) {
-                error.NotFound => {},
-                else => return err,
-            };
-            removed += 1;
-        }
-
+        // Reverse rows are projections of source-owned outgoing edges, not
+        // target-owned records. Keep projections whose target moved to another
+        // range; distributed incoming reads fan out across source owners. The
+        // loop above already removes the exact reverse projection for every
+        // outgoing edge whose source is leaving this range.
+        //
         // Match normal graph batch publication order: make forward ownership
-        // authoritative first, then retire its reverse projection.
+        // authoritative first, then retire the corresponding projections.
         try outgoing_batch.commit();
         try reverse_txn.commit();
         try self.rebuildCounterMetadata();
@@ -1968,7 +1940,7 @@ test "graph rebuildReverseFromOwnedOutgoingEdges respects split ownership bounds
     try std.testing.expectEqual(@as(usize, 0), incoming_y.len);
 }
 
-test "graph pruneOwnedRange removes reverse edges for removed split range" {
+test "graph pruneOwnedRange preserves reverse edges for retained cross-range sources" {
     const alloc = std.testing.allocator;
     var store_buf: [256]u8 = undefined;
     const store_path = tmpPath(&store_buf, "store");
@@ -1990,7 +1962,8 @@ test "graph pruneOwnedRange removes reverse edges for removed split range" {
 
     const incoming_z = try graph.getEdges(alloc, "doc:z", "ref", .in);
     defer GraphIndex.freeEdges(alloc, incoming_z);
-    try std.testing.expectEqual(@as(usize, 0), incoming_z.len);
+    try std.testing.expectEqual(@as(usize, 1), incoming_z.len);
+    try std.testing.expectEqualStrings("doc:a", incoming_z[0].source);
 
     const incoming_y = try graph.getEdges(alloc, "doc:y", "ref", .in);
     defer GraphIndex.freeEdges(alloc, incoming_y);

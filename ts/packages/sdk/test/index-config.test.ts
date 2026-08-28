@@ -154,7 +154,7 @@ describe("artifact embedding index configuration", () => {
       {
         artifact: "relations_v1",
         path: "$.relations[*]",
-        nodes: { source: "{{ _doc.key }}", target: 42 },
+        nodes: { target: 42 },
         edge: { type: "{{relation}}", metadata },
         context: { doc_fields: ["title", "url"] },
       },
@@ -177,24 +177,8 @@ describe("artifact embedding index configuration", () => {
       /path/
     );
     expect(() =>
-      graphIndexSources({ artifact: "relations", nodes: { source: "{{ source }}" } })
-    ).toThrow(/nodes.source/);
-    for (const source of [
-      "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
-      "{{ _artifact.value.owner-id }}",
-      "{{ _artifact.value. }}",
-      "{{ _artifact.value.owner.id }}",
-    ]) {
-      expect(() => graphIndexSources({ artifact: "relations", nodes: { source } })).toThrow(
-        /nodes.source/
-      );
-    }
-    expect(() =>
-      graphIndexSources({
-        artifact: "relations",
-        nodes: { source: "{{ _doc.key }}" },
-      })
-    ).not.toThrow();
+      graphIndexSources({ artifact: "relations", nodes: { source: "{{ _doc.key }}" } } as never)
+    ).toThrow(/not supported/);
     expect(() =>
       graphIndexSources({ artifact: "relations", nodes: { target: Number.POSITIVE_INFINITY } })
     ).toThrow(/nodes.target/);

@@ -696,7 +696,14 @@ pub fn supportsCrossRange(req: db_mod.types.SearchRequest) bool {
     if (req.expand_strategy != null) return false;
 
     for (req.graph_queries) |graph_query| {
-        if (graph_query.query.params.direction != .out) return false;
+        // Incoming projections are partitioned with their source-owned edge.
+        // Neighbors/traverse can therefore fan out one frontier across source
+        // owners. The path and pattern executors still assume key routing, so
+        // reject their incoming variants instead of returning partial results.
+        if (graph_query.query.params.direction != .out) switch (graph_query.query.query_type) {
+            .neighbors, .traverse => {},
+            else => return false,
+        };
         if (!graph_query.query.params.deduplicate) return false;
         if (!supportsSelectorRef(req, graph_query.query.start_nodes)) return false;
         if (graph_query.query.target_nodes) |target_nodes| {
@@ -1689,6 +1696,7 @@ fn executeDistributedTraverse(
             table_name,
             frontier,
             effective_max_depth,
+            graph_query.query.params.direction,
             admission,
         );
         defer freeFrontierBatches(alloc, &batches);
@@ -2442,44 +2450,84 @@ fn supportsResultRef(req: db_mod.types.SearchRequest, ref: []const u8) bool {
     return req.full_text_queries.len == 0 and req.dense_queries.len == 0 and req.sparse_queries.len == 0 and req.merge_config == null;
 }
 
+fn appendFrontierBatch(
+    alloc: std.mem.Allocator,
+    batches: *GraphExpandBatches,
+    table_state: *const GraphAdmissionTableState,
+    group_id: u64,
+    frontier_id: u32,
+) !void {
+    const generation = try table_state.generationForGroup(group_id);
+    const gop = try batches.getOrPut(alloc, .{
+        .table_name = table_state.table_name,
+        .group_id = group_id,
+    });
+    if (!gop.found_existing) {
+        gop.value_ptr.* = .{
+            .topology_epoch = table_state.topology_epoch,
+            .identity_read_generation = generation,
+        };
+    } else if (gop.value_ptr.topology_epoch != table_state.topology_epoch or
+        gop.value_ptr.identity_read_generation != generation)
+    {
+        return error.InvalidQueryResult;
+    }
+    try gop.value_ptr.frontier_ids.append(alloc, frontier_id);
+}
+
 fn batchFrontierByGroup(
     alloc: std.mem.Allocator,
     catalog: table_catalog.CatalogSource,
     source_table: []const u8,
     frontier: []const FrontierState,
     max_depth: u32,
+    direction: graph_mod.EdgeDirection,
     admission: *GraphNodeAdmissionContext,
 ) !GraphExpandBatches {
     var batches = GraphExpandBatches.empty;
     errdefer freeFrontierBatches(alloc, &batches);
+    var incoming_groups_by_table = std.StringHashMapUnmanaged([]u64).empty;
+    defer {
+        var it = incoming_groups_by_table.valueIterator();
+        while (it.next()) |group_ids| if (group_ids.len > 0) alloc.free(group_ids.*);
+        incoming_groups_by_table.deinit(alloc);
+    }
 
     for (frontier, 0..) |item, i| {
         if (item.depth >= max_depth) continue;
         const table_name = item.table orelse source_table;
         const table_state = try admission.ensureTable(table_name);
         if (!table_state.allowed) return error.TableNotFound;
-        const group_id = (try table_catalog.resolveGroupForKeyPinned(
-            alloc,
-            catalog,
-            table_name,
-            item.key,
-            table_state.topology_epoch,
-        )) orelse return error.TableNotFound;
-        const gop = try batches.getOrPut(alloc, .{
-            .table_name = table_state.table_name,
-            .group_id = group_id,
-        });
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{
-                .topology_epoch = table_state.topology_epoch,
-                .identity_read_generation = try table_state.generationForGroup(group_id),
-            };
-        } else if (gop.value_ptr.topology_epoch != table_state.topology_epoch or
-            gop.value_ptr.identity_read_generation != try table_state.generationForGroup(group_id))
-        {
-            return error.InvalidQueryResult;
+        switch (direction) {
+            .out => {
+                const group_id = (try table_catalog.resolveGroupForKeyPinned(
+                    alloc,
+                    catalog,
+                    table_name,
+                    item.key,
+                    table_state.topology_epoch,
+                )) orelse return error.TableNotFound;
+                try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
+            },
+            .in, .both => {
+                // Reverse projections live with their source-owned outgoing
+                // edge, so a target may have incoming edges on any source
+                // shard. The existing fanout executor runs these batches in
+                // parallel and QueryState deduplicates converging nodes. Cache
+                // the range set once per table for the whole frontier quantum.
+                const gop = try incoming_groups_by_table.getOrPut(alloc, table_state.table_name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = @constCast(&.{});
+                    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
+                    gop.value_ptr.* = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
+                    try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, table_state.topology_epoch);
+                }
+                if (gop.value_ptr.len == 0) return error.TableNotFound;
+                for (gop.value_ptr.*) |group_id| {
+                    try appendFrontierBatch(alloc, &batches, table_state, group_id, @intCast(i));
+                }
+            },
         }
-        try gop.value_ptr.frontier_ids.append(alloc, @intCast(i));
     }
     return batches;
 }

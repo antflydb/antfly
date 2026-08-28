@@ -5179,10 +5179,10 @@ test "public index config encoders omit root write-only producer documents" {
 
 test "created graph index response projects closed nested schemas" {
     const config =
-        \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"},"nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}","client_value":"private-node-value"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","api_key":"private-metadata-key","nested":{"label":"public","authorization":"private-authorization"}},"client_value":"private-edge-mapping-value"},"context":{"doc_fields":["title","body"],"client_value":"private-context-value"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}","client_value":"private-source-value"},"content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"execution":{"batch_items":8,"settings":{"opaque":"private-execution-settings"}},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true,"client_value":"private-bounded-value"},"client_value":"private-planning-value"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
+        \\{"type":"graph","template":{"client_value":"private-root-value"},"source":{"artifact":"relations_v1","path":"$.relations[*]","format":{"client_value":"private-format-value"},"client_value":"private-source-value","settings":{"opaque":"private-source-settings"},"nodes":{"model":"document","target":"{{ _item.target.text }}","client_value":"private-node-value"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","api_key":"private-metadata-key","nested":{"label":"public","authorization":"private-authorization"}},"client_value":"private-edge-mapping-value"},"context":{"doc_fields":["title","body"],"client_value":"private-context-value"}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}","client_value":"private-source-value"},"content_type":{"client_value":"private-content-type"},"producer_json":{"provider":"private","api_key":"private-key"},"execution":{"batch_items":8,"settings":{"opaque":"private-execution-settings"}},"client_value":"private-artifact-value","settings":{"opaque":"private-artifact-settings"}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring","enabled":true,"client_value":"private-bounded-value"},"client_value":"private-planning-value"},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"],"client_value":"private-edge-value"},{"name":"malformed","required_metadata":{"client_value":"private-metadata-value"}},{"name":{"client_value":"private-required-value"}}],"resolvers":["private-malformed-resolver",{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix","candidate_limit":{"client_value":"private-limit-value"},"client_value":"private-resolver-value","settings":{"opaque":"private-resolver-settings"}}]}
     ;
     const expected =
-        \\{"name":"relations_graph","type":"graph","sources":[{"artifact":"relations_v1","path":"$.relations[*]","nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","nested":{"label":"public"}}},"context":{"doc_fields":["title","body"]}}],"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"execution":{"batch_items":8}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
+        \\{"name":"relations_graph","type":"graph","sources":[{"artifact":"relations_v1","path":"$.relations[*]","nodes":{"model":"document","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"extractor","nested":{"label":"public"}}},"context":{"doc_fields":["title","body"]}}],"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"execution":{"batch_items":8}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions","field":"relations","topology":"graph","max_weight":0.9,"min_weight":0,"allow_self_loops":false,"required_metadata":["source","confidence"]},{"name":"malformed"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{label}}","candidate_search":"prefix"}]}
     ;
     const created = try encodeCreatedIndexConfig(std.testing.allocator, "relations_graph", config);
     defer std.testing.allocator.free(created);
@@ -5948,6 +5948,11 @@ test "index status aggregation reports selected algebraic progress summary shard
 }
 
 test "index encoders preserve sibling replay debt during serviceable repair" {
+    const config_json = "{\"type\":\"full_text\"}";
+    var parsed_config = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, config_json, .{});
+    defer parsed_config.deinit();
+    const identity = (try indexRuntimeIdentity(std.testing.allocator, "search_idx", parsed_config.value)).?;
+
     const shard_a_indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(shard_a_indexes);
     shard_a_indexes[0] = .{
@@ -5962,6 +5967,9 @@ test "index encoders preserve sibling replay debt during serviceable repair" {
         .projection_checkpoint_applied_sequence = 2,
         .index_repair_status = .rebuilding,
         .index_repair_active_generation_serviceable = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
     };
     defer std.testing.allocator.free(shard_a_indexes[0].name);
 
@@ -5977,6 +5985,9 @@ test "index encoders preserve sibling replay debt during serviceable repair" {
         .replay_applied_sequence = 5,
         .replay_target_sequence = 8,
         .replay_catch_up_required = true,
+        .coverage_generation = identity.incarnation,
+        .coverage_config_hash = identity.config_hash,
+        .coverage_identity_ready = true,
     };
     defer std.testing.allocator.free(shard_b_indexes[0].name);
 
@@ -6007,7 +6018,7 @@ test "index encoders preserve sibling replay debt during serviceable repair" {
         .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = "{\"search_idx\":{\"type\":\"full_text\"}}",
+            .indexes_json = "{\"search_idx\":" ++ config_json ++ "}",
             .placement_role = "data",
         }})[0..]),
         .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),

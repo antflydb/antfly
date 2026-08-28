@@ -1,4 +1,4 @@
-import { type IndexConfig, isValidGraphMaterializedSourceTemplate } from "@antfly/sdk";
+import type { IndexConfig } from "@antfly/sdk";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TableSchema } from "../api";
@@ -81,7 +81,6 @@ describe("CreateIndexDialog", () => {
         format: "extraction_relation",
         mentionEdgeType: " mentions ",
         nodeModel: "external",
-        sourceNode: " {{ _doc.key }} ",
         targetNode: " {{ _item.target.text }} ",
         edgeType: " {{ _item.predicate }} ",
         edgeWeight: " {{ _item.confidence }} ",
@@ -95,7 +94,6 @@ describe("CreateIndexDialog", () => {
       mention_edge_type: "mentions",
       nodes: {
         model: "external",
-        source: "{{ _doc.key }}",
         target: "{{ _item.target.text }}",
       },
       edge: {
@@ -105,16 +103,6 @@ describe("CreateIndexDialog", () => {
       },
       context: { doc_fields: ["title", "body"] },
     });
-  });
-
-  it("validates graph materialized source templates with the server grammar", () => {
-    expect(isValidGraphMaterializedSourceTemplate("{{ _doc.key }}")).toBe(true);
-    expect(isValidGraphMaterializedSourceTemplate("{{ _artifact.value.owner.id }}")).toBe(false);
-    expect(
-      isValidGraphMaterializedSourceTemplate("{{ _artifact.value.source }}:{{ _doc.key }}")
-    ).toBe(false);
-    expect(isValidGraphMaterializedSourceTemplate("{{ _artifact.value.owner-id }}")).toBe(false);
-    expect(isValidGraphMaterializedSourceTemplate("{{ _artifact.value.owner. }}")).toBe(false);
   });
 
   it("recognizes every supported artifact-backed request form", () => {
@@ -287,7 +275,6 @@ describe("CreateIndexDialog", () => {
         format: "extraction_graph",
         mentionEdgeType: "",
         nodeModel: "external",
-        sourceNode: "",
         targetNode: "",
         edgeType: "",
         contextFields: "",

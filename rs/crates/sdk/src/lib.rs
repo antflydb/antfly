@@ -191,11 +191,10 @@ pub struct GraphIndexSourceSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct GraphNodeMappingSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<GraphNodeModel>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<GraphTemplateOrNumber>,
 }
@@ -249,13 +248,6 @@ pub fn graph_index_sources(
             )));
         }
         if let Some(nodes) = source.nodes.as_ref() {
-            if let Some(source_template) = nodes.source.as_deref()
-                && !valid_graph_materialized_source_template(source_template)
-            {
-                return Err(IndexConfigError(format!(
-                    "sources[{source_index}].nodes.source must use _doc.key"
-                )));
-            }
             if let Some(GraphTemplateOrNumber::Number(value)) = nodes.target.as_ref()
                 && !value.is_finite()
             {
@@ -296,18 +288,6 @@ pub fn graph_index_sources(
         }
     }
     Ok(sources)
-}
-
-fn valid_graph_materialized_source_template(value: &str) -> bool {
-    let trimmed = value.trim();
-    let Some(expression) = trimmed
-        .strip_prefix("{{")
-        .and_then(|value| value.strip_suffix("}}"))
-        .map(str::trim)
-    else {
-        return false;
-    };
-    expression == "_doc.key"
 }
 
 fn valid_graph_artifact_path(path: &str) -> bool {
@@ -841,7 +821,6 @@ mod tests {
             mention_edge_type: None,
             nodes: Some(GraphNodeMappingSpec {
                 model: Some(GraphNodeModel::Document),
-                source: Some("{{ _doc.key }}".into()),
                 target: Some(GraphTemplateOrNumber::Number(42.0)),
             }),
             edge: Some(GraphEdgeMappingSpec {
@@ -885,54 +864,10 @@ mod tests {
             }])
             .is_err()
         );
-        let mut invalid_source = duplicate;
-        invalid_source.artifact = "relations".into();
-        invalid_source.nodes = Some(GraphNodeMappingSpec {
-            model: None,
-            source: Some("{{ source }}".into()),
-            target: None,
-        });
-        assert!(graph_index_sources(vec![invalid_source]).is_err());
-
-        for source in [
-            "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
-            "{{ _artifact.value.owner-id }}",
-            "{{ _artifact.value. }}",
-            "{{ _artifact.value.owner.id }}",
-        ] {
-            assert!(
-                graph_index_sources(vec![GraphIndexSourceSpec {
-                    artifact: "relations".into(),
-                    path: None,
-                    format: None,
-                    mention_edge_type: None,
-                    nodes: Some(GraphNodeMappingSpec {
-                        model: None,
-                        source: Some(source.into()),
-                        target: None,
-                    }),
-                    edge: None,
-                    context: None,
-                }])
-                .is_err()
-            );
-        }
-        assert!(
-            graph_index_sources(vec![GraphIndexSourceSpec {
-                artifact: "relations".into(),
-                path: None,
-                format: None,
-                mention_edge_type: None,
-                nodes: Some(GraphNodeMappingSpec {
-                    model: None,
-                    source: Some("{{ _doc.key }}".into()),
-                    target: None,
-                }),
-                edge: None,
-                context: None,
-            }])
-            .is_ok()
-        );
+        assert!(serde_json::from_str::<GraphNodeMappingSpec>(
+            r#"{"source":"{{ _doc.key }}"}"#
+        )
+        .is_err());
     }
 
     #[test]

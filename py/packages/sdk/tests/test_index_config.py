@@ -112,7 +112,7 @@ def test_graph_sources_preserve_source_specific_mapping_and_copy_metadata() -> N
         GraphArtifactSource(
             "relations_v1",
             path="$.relations[*]",
-            nodes=GraphNodeMapping(source="{{ _doc.key }}", target=42),
+            nodes=GraphNodeMapping(target=42),
             edge=GraphEdgeMapping(type="{{relation}}", metadata=metadata),
             context=GraphContextMapping(doc_fields=("title", "url")),
         ),
@@ -132,19 +132,8 @@ def test_graph_sources_reject_duplicates_and_invalid_values() -> None:
         graph_index_sources(GraphArtifactSource("relations", edge=GraphEdgeMapping(weight=float("nan"))))
     with pytest.raises(ValueError, match="path"):
         graph_index_sources(GraphArtifactSource("relations", path="$.relations[0]"))
-    with pytest.raises(ValueError, match="nodes.source"):
-        graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(source="{{ source }}")))
-    for source in (
-        "{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
-        "{{ _artifact.value.owner-id }}",
-        "{{ _artifact.value. }}",
-        "{{ _artifact.value.owner.id }}",
-    ):
-        with pytest.raises(ValueError, match="nodes.source"):
-            graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(source=source)))
-    assert graph_index_sources(
-        GraphArtifactSource("relations", nodes=GraphNodeMapping(source="{{ _doc.key }}"))
-    )
+    with pytest.raises(TypeError, match="source"):
+        GraphNodeMapping(source="{{ _doc.key }}")  # type: ignore[call-arg]
     with pytest.raises(ValueError, match="nodes.target"):
         graph_index_sources(GraphArtifactSource("relations", nodes=GraphNodeMapping(target=float("inf"))))
 

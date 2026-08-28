@@ -263,7 +263,6 @@ func TestNewCreateIndexRequestSupportsTypedGraphMapping(t *testing.T) {
 			Format:   GraphArtifactSourceConfigFormatExtractionGraph,
 			Nodes: GraphArtifactNodeMappingConfig{
 				Model:  GraphArtifactNodeMappingConfigModelDocument,
-				Source: "{{ _doc.key }}",
 				Target: target,
 			},
 			Edge: GraphArtifactEdgeMappingConfig{
@@ -496,31 +495,6 @@ func TestNewGraphIndexSourcesValidatesAndCopies(t *testing.T) {
 	}
 	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{Artifact: "relations", Path: "$.relations[0]"}); err == nil {
 		t.Fatal("unsupported graph artifact paths must be rejected")
-	}
-	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
-		Artifact: "relations",
-		Nodes:    GraphArtifactNodeMappingConfig{Source: "{{ source }}"},
-	}); err == nil {
-		t.Fatal("unstable graph source identities must be rejected")
-	}
-	for _, source := range []string{
-		"{{ _artifact.value.id }}{{ _doc.value.tenant_id }}",
-		"{{ _artifact.value.owner-id }}",
-		"{{ _artifact.value. }}",
-		"{{ _artifact.value.owner.id }}",
-	} {
-		if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
-			Artifact: "relations",
-			Nodes:    GraphArtifactNodeMappingConfig{Source: source},
-		}); err == nil {
-			t.Fatalf("unsafe graph source identity %q must be rejected", source)
-		}
-	}
-	if _, err := NewGraphIndexSources(GraphArtifactSourceConfig{
-		Artifact: "relations",
-		Nodes:    GraphArtifactNodeMappingConfig{Source: "{{ _doc.key }}"},
-	}); err != nil {
-		t.Fatalf("document-owned graph source identity rejected: %v", err)
 	}
 }
 

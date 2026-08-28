@@ -8068,18 +8068,7 @@ fn runtimeAppendRelationItem(
         runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
     if (edge_type.len == 0) return;
 
-    const mapped_source = if (mapping.source_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_source) |value| alloc.free(value);
-    const source_doc = if (mapped_source) |value| blk: {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-        break :blk if (trimmed.len > 0) trimmed else doc_key;
-    } else if (item.object.get("source")) |source_value|
-        runtimeJsonEndpointDocumentIdResolved(source_value, artifact_value) orelse doc_key
-    else
-        doc_key;
+    const source_doc = doc_key;
 
     const mapped_target = if (mapping.target_template.len > 0)
         try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)

@@ -18443,12 +18443,6 @@ components:
         execution:
           $ref: '#/components/schemas/IndexExecutionConfig'
           description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
-    GraphMaterializedSourceTemplate:
-      type: string
-      pattern: ^\{\{\s*_doc\.key\s*\}\}$
-      description: Owner identity for edges materialized from one artifact item. Omit it to use the source
-        document key. When present, it must be exactly the source document key template so edge state
-        remains colocated with its routing and range-split owner.
     GraphTemplateValue:
       description: A literal string or finite numeric value, or a Handlebars template evaluated for each
         materialized graph item.
@@ -18467,8 +18461,6 @@ components:
             - document
             - external
           default: document
-        source:
-          $ref: '#/components/schemas/GraphMaterializedSourceTemplate'
         target:
           $ref: '#/components/schemas/GraphTemplateValue'
     GraphArtifactEdgeMappingConfig:

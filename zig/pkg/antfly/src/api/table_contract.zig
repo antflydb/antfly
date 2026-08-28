@@ -1083,7 +1083,7 @@ test "table contract enforces stable graph source identities and numeric targets
     const config_json = try parseCreateIndexRequest(
         std.testing.allocator,
         "document_graph",
-        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":\"{{ _doc.key }}\",\"target\":42}}]}",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"target\":42}}]}",
     );
     defer std.testing.allocator.free(config_json);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"target\":42") != null);
@@ -1177,7 +1177,7 @@ test "table contract canonicalizes generated optional null fields" {
 
 test "table contract preserves typed artifact-backed graph configuration" {
     const body =
-        \\{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions","nodes":{"model":"document","source":"{{ _doc.key }}","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
+        \\{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions","nodes":{"model":"document","target":"{{ _item.target.text }}"},"edge":{"type":"{{ _item.predicate }}","weight":0.75,"metadata":{"source":"{{ _item.source }}"}},"context":{"doc_fields":["title","body"]}},"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"template","value":"{{ body }}"},"content_type":"application/json","producer_json":{"type":"document_extraction","api_key":"write-only"},"execution":{"batch_items":8,"batch_bytes":262144}},"algebraic_planning":{"bounded_traversal":{"law":"provenance_semiring"}},"edge_types":[{"name":"mentions"}],"resolvers":[{"name":"kg","table":"entities","source_artifact":"relations_v1","resolution_artifact":"resolution_v1","key_template":"{{ lower _entity.label }}/{{ slug _entity.text }}","candidate_search":"prefix","config_generation":1}]}
     ;
     const config_json = try parseCreateIndexRequest(std.testing.allocator, "relations_graph", body);
     defer std.testing.allocator.free(config_json);

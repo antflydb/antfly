@@ -61,7 +61,6 @@ export {
   type FullTextArtifactSourceConfig,
   fullTextArtifactIndexSources,
   graphIndexSources,
-  isValidGraphMaterializedSourceTemplate,
   validateCreateIndexRequestRelationships,
 } from "./index-config.js";
 export {
