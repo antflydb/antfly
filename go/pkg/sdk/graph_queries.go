@@ -359,10 +359,10 @@ type graphOpaqueJSONObject struct{}
 
 func (*graphOpaqueJSONObject) UnmarshalJSON(encoded []byte) error {
 	trimmed := bytes.TrimSpace(encoded)
-	if bytes.Equal(trimmed, []byte("null")) || len(trimmed) > 0 && trimmed[0] == '{' {
+	if len(trimmed) > 0 && trimmed[0] == '{' {
 		return nil
 	}
-	return fmt.Errorf("expected an object or null")
+	return fmt.Errorf("expected an object")
 }
 
 // graphOptionalNonNullString preserves the distinction between an omitted
@@ -472,23 +472,28 @@ func validateBindingsResultPayload(contract canonicalGraphResultContract, result
 	if len(value.Rows) > maxGraphHydratedBindings {
 		return fmt.Errorf("antfly: bindings graph result exceeds %d rows", maxGraphHydratedBindings)
 	}
-	expected := make(map[string]struct{}, len(contract.names))
-	for _, name := range contract.names {
-		expected[name] = struct{}{}
+	var expected map[string]struct{}
+	if contract.names != nil {
+		expected = make(map[string]struct{}, len(contract.names))
+		for _, name := range contract.names {
+			expected[name] = struct{}{}
+		}
 	}
 	for rowIndex, row := range value.Rows {
 		if len(row) == 0 || len(row) > maxGraphMatchNodes {
 			return fmt.Errorf("antfly: bindings graph result row %d must contain between 1 and %d properties", rowIndex, maxGraphMatchNodes)
 		}
-		if len(row) != len(expected) {
+		if expected != nil && len(row) != len(expected) {
 			return fmt.Errorf("antfly: bindings graph result row %d does not match the requested projection", rowIndex)
 		}
 		for alias, binding := range row {
 			if !validGraphIdentifier(alias) {
 				return fmt.Errorf("antfly: bindings graph result row %d has an invalid alias", rowIndex)
 			}
-			if _, ok := expected[alias]; !ok {
-				return fmt.Errorf("antfly: bindings graph result row %d contains unrequested alias %q", rowIndex, alias)
+			if expected != nil {
+				if _, ok := expected[alias]; !ok {
+					return fmt.Errorf("antfly: bindings graph result row %d contains unrequested alias %q", rowIndex, alias)
+				}
 			}
 			if binding != nil {
 				if err := validateDecodedGraphIdentity(binding.Key, binding.Table.pointer()); err != nil {
@@ -519,7 +524,7 @@ func validateAggregatesResultPayload(contract canonicalGraphResultContract, resu
 		actual = append(actual, name)
 	}
 	sort.Strings(actual)
-	if !slices.Equal(actual, contract.names) {
+	if contract.names != nil && !slices.Equal(actual, contract.names) {
 		return fmt.Errorf("antfly: aggregate graph result names %v do not match requested names %v", actual, contract.names)
 	}
 	return validateDecodedGraphStats(envelope, len(value.Aggregates), false)
@@ -772,6 +777,13 @@ func decodeCanonicalGraphResult(
 	kind string,
 	envelope graphQueryResultEnvelope,
 ) (any, error) {
+	// Validate the complete canonical wire shape before materializing opaque
+	// application JSON. Generated map fields cannot distinguish an omitted
+	// optional object from an invalid explicit null, while the structural view
+	// does so without retaining document, evidence, or metadata contents.
+	if err := validateCanonicalGraphResultPayload(canonicalGraphResultContract{kind: kind}, result, envelope); err != nil {
+		return nil, err
+	}
 	switch kind {
 	case string(GraphBindingsResultKindBindings):
 		var value GraphBindingsResult

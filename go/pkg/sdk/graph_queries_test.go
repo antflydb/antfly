@@ -760,7 +760,7 @@ func TestQueryGraphResponsesHonorRequestedDialectAndOperations(t *testing.T) {
 			responses: QueryResponses{Responses: []QueryResult{{
 				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":"not-an-object"}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)},
 			}}},
-			contains: "expected an object or null",
+			contains: "expected an object",
 		},
 		{
 			name:     "non graph request rejects graph results",
@@ -880,8 +880,12 @@ func TestCanonicalGraphResultDecodersFailClosed(t *testing.T) {
 		`{"kind":"nodes","nodes":[{"key":"","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","table":"","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"a","table":null,"depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":null}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"a","depth":0,"evidence":null}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"nodes","nodes":[{"key":"b","depth":1,"path":[{"key":"a"},{"key":"b"}],"path_edges":[{"from":{"key":"a"},"to":{"key":"b"},"direction":"out","type":"edge","weight":1,"metadata":null}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{"key":"a","table":""}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"bindings","rows":[{"a":{"key":"a","table":null}}],"stats":{"returned_items":1,"truncated":false}}`,
+		`{"kind":"bindings","rows":[{"a":{"key":"a","document":null}}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a"}],"edges":[],"weight_mode":"min_hops"}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[],"paths":[{"nodes":[{"key":"a","table":""}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,
 		`{"kind":"nodes","nodes":[{"key":"wrong","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"length":0,"weight_mode":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`,

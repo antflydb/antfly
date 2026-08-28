@@ -24702,7 +24702,11 @@ test "api http server serves user management routes when auth is enabled" {
     var created_user = try std.json.parseFromSlice(usermgr_openapi.User, alloc, create_resp.body, .{});
     defer created_user.deinit();
     try std.testing.expectEqualStrings("alice", created_user.value.username);
-    try std.testing.expectEqualStrings("acme", created_user.value.metadata.?.map.get("tenant_id").?.string);
+    const created_metadata = switch (created_user.value.metadata) {
+        .value => |metadata| metadata,
+        .absent, .null_value => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqualStrings("acme", created_metadata.map.get("tenant_id").?.string);
 
     var me_resp = try executeHttpxTestRequest(&server, .{
         .method = .GET,
