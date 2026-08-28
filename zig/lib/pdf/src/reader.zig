@@ -2726,45 +2726,102 @@ pub const Reader = struct {
         if (streams.len == 1)
             return try self.readDecodedStreamDataWithLimits(&streams[0], self.decode_limits);
 
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
+        const Part = struct {
+            decoded_len: usize = 0,
+            retained: ?[]u8 = null,
+        };
+        const parts = try self.alloc.alloc(Part, streams.len);
+        defer self.alloc.free(parts);
+        for (parts) |*part| part.* = .{};
+        defer for (parts) |*part| {
+            if (part.retained) |decoded| self.alloc.free(decoded);
+        };
+
+        var total_len: usize = 0;
+        var retained_bytes: usize = 0;
+        var retain_decoded = true;
         for (streams, 0..) |*stream, stream_index| {
             const separator_len: usize = @intFromBool(stream_index != 0);
-            const next_len = std.math.add(usize, out.items.len, separator_len) catch
+            const next_len = std.math.add(usize, total_len, separator_len) catch
                 return error.PdfDecodeWorkingSetTooLarge;
-            if (next_len > self.decode_limits.max_decoded_stream_bytes)
-                return error.DecodedStreamTooLarge;
-            if (out.capacity >= self.decode_limits.max_working_set_bytes)
-                return error.PdfDecodeWorkingSetTooLarge;
-            // The content collected so far remains live while this stream is
-            // decoded. Give the filter pipeline only the unoccupied portion of
-            // both limits so its internal peak cannot escape page accounting.
-            const decoded = try self.readDecodedStreamDataWithLimits(stream, .{
-                .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes - next_len,
-                .max_working_set_bytes = self.decode_limits.max_working_set_bytes - out.capacity,
-            });
-            defer self.alloc.free(decoded);
+
+            // Keep decoded chunks for the common case where they and the final
+            // contiguous stream fit together. If retained chunks constrain a
+            // later filter pipeline, release them and retry that stream once;
+            // the measured lengths still let the construction pass allocate
+            // exactly once without quadratic prefix copies.
+            const decoded = first_pass: {
+                const available = self.decode_limits.max_working_set_bytes - retained_bytes;
+                break :first_pass self.readDecodedStreamDataWithLimits(stream, .{
+                    .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes,
+                    .max_working_set_bytes = available,
+                }) catch |err| {
+                    if (err != error.PdfDecodeWorkingSetTooLarge or !retain_decoded) return err;
+                    for (parts[0..stream_index]) |*part| {
+                        if (part.retained) |retained| self.alloc.free(retained);
+                        part.retained = null;
+                    }
+                    retained_bytes = 0;
+                    retain_decoded = false;
+                    break :first_pass try self.readDecodedStreamDataWithLimits(stream, self.decode_limits);
+                };
+            };
+            var decoded_owned: ?[]u8 = decoded;
+            defer if (decoded_owned) |owned| self.alloc.free(owned);
 
             const required_len = std.math.add(usize, next_len, decoded.len) catch
                 return error.PdfDecodeWorkingSetTooLarge;
-            if (required_len > self.decode_limits.max_decoded_stream_bytes)
-                return error.DecodedStreamTooLarge;
+            if (required_len > self.decode_limits.max_working_set_bytes)
+                return error.PdfDecodeWorkingSetTooLarge;
+            parts[stream_index].decoded_len = decoded.len;
+            total_len = required_len;
 
-            if (required_len > out.capacity) {
-                // Account for the old and replacement buffers during realloc,
-                // plus the independently owned decoded stream being appended.
-                const replacement_peak = std.math.add(usize, out.capacity, required_len) catch
+            if (retain_decoded) {
+                const candidate_retained = std.math.add(usize, retained_bytes, decoded.len) catch
                     return error.PdfDecodeWorkingSetTooLarge;
-                const working_peak = std.math.add(usize, replacement_peak, decoded.len) catch
+                const join_peak = std.math.add(usize, candidate_retained, total_len) catch
                     return error.PdfDecodeWorkingSetTooLarge;
-                if (working_peak > self.decode_limits.max_working_set_bytes)
-                    return error.PdfDecodeWorkingSetTooLarge;
-                try out.ensureTotalCapacityPrecise(self.alloc, required_len);
+                if (join_peak <= self.decode_limits.max_working_set_bytes) {
+                    parts[stream_index].retained = decoded;
+                    decoded_owned = null;
+                    retained_bytes = candidate_retained;
+                } else {
+                    for (parts[0..stream_index]) |*part| {
+                        if (part.retained) |retained| self.alloc.free(retained);
+                        part.retained = null;
+                    }
+                    retained_bytes = 0;
+                    retain_decoded = false;
+                }
             }
-            if (separator_len != 0) out.appendAssumeCapacity('\n');
-            out.appendSliceAssumeCapacity(decoded);
         }
-        return try out.toOwnedSlice(self.alloc);
+
+        if (!retain_decoded and total_len >= self.decode_limits.max_working_set_bytes)
+            return error.PdfDecodeWorkingSetTooLarge;
+        const combined = try self.alloc.alloc(u8, total_len);
+        errdefer self.alloc.free(combined);
+        var cursor: usize = 0;
+        for (streams, parts, 0..) |*stream, *part, stream_index| {
+            if (stream_index != 0) {
+                combined[cursor] = '\n';
+                cursor += 1;
+            }
+            const decoded = if (part.retained) |retained|
+                retained
+            else blk: {
+                const available = self.decode_limits.max_working_set_bytes - total_len;
+                break :blk try self.readDecodedStreamDataWithLimits(stream, .{
+                    .max_decoded_stream_bytes = self.decode_limits.max_decoded_stream_bytes,
+                    .max_working_set_bytes = available,
+                });
+            };
+            defer if (part.retained == null) self.alloc.free(decoded);
+            if (decoded.len != part.decoded_len) return error.InvalidContents;
+            @memcpy(combined[cursor .. cursor + decoded.len], decoded);
+            cursor += decoded.len;
+        }
+        std.debug.assert(cursor == combined.len);
+        return combined;
     }
 
     fn appendContentStreams(self: *const Reader, out: *std.ArrayList(syntax.Object), value: *const syntax.Object, depth: usize, guard: *TraversalGuard) anyerror!void {
@@ -12780,6 +12837,57 @@ test "reader retains a single decoded content stream without a second full copy"
     const text = try reader.extractPageTextAlloc(1);
     defer alloc.free(text);
     try std.testing.expectEqualStrings("Bounded", std.mem.trim(u8, text, &std.ascii.whitespace));
+}
+
+test "reader combines content arrays beyond the per-stream decode limit" {
+    const alloc = std.testing.allocator;
+    var first_content: [48]u8 = @splat(' ');
+    var second_content: [48]u8 = @splat(' ');
+    const first_operand = "(Aggregate)";
+    const second_operator = "Tj";
+    @memcpy(first_content[first_content.len - first_operand.len ..], first_operand);
+    @memcpy(second_content[0..second_operator.len], second_operator);
+
+    const first_stream = try std.fmt.allocPrint(
+        alloc,
+        "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ first_content.len, &first_content },
+    );
+    defer alloc.free(first_stream);
+    const second_stream = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ second_content.len, &second_content },
+    );
+    defer alloc.free(second_stream);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /Contents [4 0 R 5 0 R] >>\nendobj\n",
+        first_stream,
+        second_stream,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    // Each physical stream is exactly at its 48-byte limit. Their logical
+    // concatenation is allowed to use the independent working-set envelope,
+    // and the bounded two-pass path constructs it with one final allocation.
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 48,
+        .max_working_set_bytes = 160,
+    });
+    defer reader.deinit();
+    var page = try reader.readPageObject(1);
+    defer page.deinit(alloc);
+    const contents = page.get("Contents") orelse return error.TestUnexpectedResult;
+    const combined = try reader.readCombinedContentStreamsAlloc(contents);
+    defer alloc.free(combined);
+
+    try std.testing.expectEqual(@as(usize, first_content.len + 1 + second_content.len), combined.len);
+    try std.testing.expectEqualSlices(u8, &first_content, combined[0..first_content.len]);
+    try std.testing.expectEqual(@as(u8, '\n'), combined[first_content.len]);
+    try std.testing.expectEqualSlices(u8, &second_content, combined[first_content.len + 1 ..]);
 }
 
 test "graphics matrices pre-concatenate PDF cm operators" {
