@@ -5970,6 +5970,11 @@ pub const ProvisionedTableWriteSource = struct {
         // writes, restores, and generation changes remain read-exclusive.
         operation_allows_reads: bool = false,
         structural_active: bool = false,
+        // Set only by the synchronous create/drop path while structural
+        // admission is held for one named index. Status may retain sibling
+        // freshness during this activity because the exact target is already
+        // represented in targeted_structural_reconcile_indexes.
+        targeted_structural_mutation_active: bool = false,
         structural_reconcile_active: bool = false,
         structural_reconcile_queued: usize = 0,
         structural_reconcile_waiters: usize = 0,
@@ -6980,6 +6985,14 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
+        self.reserveTargetedStructuralReconcileStatusLocked(table_name, index_name);
+    }
+
+    fn reserveTargetedStructuralReconcileStatusLocked(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
         const entry = self.activityEntryLocked(table_name, null);
         entry.structural_reconcile_status_pending += 1;
         entry.targeted_structural_reconcile_status_pending += 1;
@@ -7014,6 +7027,16 @@ pub const ProvisionedTableWriteSource = struct {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
+        self.releaseTargetedStructuralReconcileStatusLocked(table_name, index_name);
+        self.pruneTableActivityLocked(table_name, null);
+        self.table_activity_ready.broadcast(io);
+    }
+
+    fn releaseTargetedStructuralReconcileStatusLocked(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
         const index = self.findTableActivityLocked(table_name, null) orelse return;
         const entry = &self.active_table_activities.items[index];
         std.debug.assert(entry.structural_reconcile_status_pending > 0);
@@ -7030,8 +7053,6 @@ pub const ProvisionedTableWriteSource = struct {
             }
             break;
         } else unreachable;
-        self.pruneTableActivityLocked(table_name, null);
-        self.table_activity_ready.broadcast(io);
     }
 
     fn releaseStructuralReconcileRequestStatus(
@@ -7525,8 +7546,11 @@ pub const ProvisionedTableWriteSource = struct {
         var targeted_fence = false;
         if (self.findTableActivityLocked(table_name, null)) |index| {
             const entry = self.active_table_activities.items[index];
-            if (entry.structural_active or entry.structural_waiters > 0 or
-                entry.structuralReconcileReserved() or entry.restore_preparations > 0)
+            const untargeted_structural_mutation =
+                (entry.structural_active or entry.structural_waiters > 0) and
+                !entry.targeted_structural_mutation_active;
+            if (untargeted_structural_mutation or entry.structuralReconcileReserved() or
+                entry.restore_preparations > 0)
             {
                 return false;
             }
@@ -7791,6 +7815,14 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn beginStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
+        self.beginStructuralTableActivityLockedForTarget(table_name, null);
+    }
+
+    fn beginStructuralTableActivityLockedForTarget(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        target_index_name: ?[]const u8,
+    ) void {
         const io = self.table_activity_threaded.io();
         // Reserve before draining foreground activity. This closes admission
         // to new reads/writes and routes new status calls to the immutable
@@ -7804,7 +7836,13 @@ pub const ProvisionedTableWriteSource = struct {
                     continue;
                 }
             }
-            self.activityEntryLocked(table_name, null).structural_waiters = 1;
+            const entry = self.activityEntryLocked(table_name, null);
+            entry.structural_waiters = 1;
+            if (target_index_name) |index_name| {
+                std.debug.assert(!entry.targeted_structural_mutation_active);
+                entry.targeted_structural_mutation_active = true;
+                self.reserveTargetedStructuralReconcileStatusLocked(table_name, index_name);
+            }
             break;
         }
         while (true) {
@@ -7834,7 +7872,25 @@ pub const ProvisionedTableWriteSource = struct {
     fn endStructuralTableActivityLocked(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
+        std.debug.assert(!self.active_table_activities.items[index].targeted_structural_mutation_active);
         self.active_table_activities.items[index].structural_active = false;
+        self.pruneTableActivityLocked(table_name, null);
+        self.table_activity_ready.broadcast(io);
+    }
+
+    fn endTargetedStructuralTableActivityLocked(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
+        const io = self.table_activity_threaded.io();
+        const index = self.findTableActivityLocked(table_name, null) orelse unreachable;
+        const entry = &self.active_table_activities.items[index];
+        std.debug.assert(entry.structural_active);
+        std.debug.assert(entry.targeted_structural_mutation_active);
+        entry.targeted_structural_mutation_active = false;
+        entry.structural_active = false;
+        self.releaseTargetedStructuralReconcileStatusLocked(table_name, index_name);
         self.pruneTableActivityLocked(table_name, null);
         self.table_activity_ready.broadcast(io);
     }
@@ -8207,11 +8263,33 @@ pub const ProvisionedTableWriteSource = struct {
         self.beginStructuralTableActivityLocked(table_name);
     }
 
+    fn beginTargetedStructuralTableActivity(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        self.beginStructuralTableActivityLockedForTarget(table_name, index_name);
+    }
+
     fn endStructuralTableActivity(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         const io = self.table_activity_threaded.io();
         self.table_activity_mutex.lockUncancelable(io);
         defer self.table_activity_mutex.unlock(io);
         self.endStructuralTableActivityLocked(table_name);
+    }
+
+    fn endTargetedStructuralTableActivity(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
+        const io = self.table_activity_threaded.io();
+        self.table_activity_mutex.lockUncancelable(io);
+        defer self.table_activity_mutex.unlock(io);
+        self.endTargetedStructuralTableActivityLocked(table_name, index_name);
     }
 
     fn beginLocalStructuralMutation(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
@@ -8265,8 +8343,12 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateRuntimeStatusCache(table_name);
     }
 
-    fn beginLocalStructuralIndexCacheUpdate(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
-        self.beginStructuralTableActivity(table_name);
+    fn beginLocalStructuralIndexCacheUpdate(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
+        self.beginTargetedStructuralTableActivity(table_name, index_name);
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         // An index-targeted mutation retains the storage root and cannot
@@ -8285,6 +8367,17 @@ pub const ProvisionedTableWriteSource = struct {
         self.endStructuralTableActivity(table_name);
     }
 
+    fn finishLocalStructuralIndexCacheUpdate(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        index_name: []const u8,
+    ) void {
+        self.invalidateReadCache(table_name);
+        self.local_db_mutex.unlock();
+        self.drainWriteCachePendingCloses();
+        self.endTargetedStructuralTableActivity(table_name, index_name);
+    }
+
     fn abortLocalStructuralIndexCacheUpdate(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
@@ -8295,7 +8388,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.invalidateRuntimeStatusCache(table_name);
         self.local_db_mutex.unlock();
         self.drainWriteCachePendingCloses();
-        self.endStructuralTableActivity(table_name);
+        self.endTargetedStructuralTableActivity(table_name, index_name);
         // Some groups may already have committed the target mutation. Hand
         // that exact desired-state edge to the bounded reconciler before the
         // synchronous caller observes the failure.
@@ -14746,9 +14839,10 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
+        index_name: []const u8,
         managed_visibility_changed: bool,
     ) void {
-        self.finishLocalStructuralCacheUpdate(table_name);
+        self.finishLocalStructuralIndexCacheUpdate(table_name, index_name);
         _ = alloc;
         // The targeted reconciler already owns the status fence. Publishing a
         // whole-DB observation here would replace ready sibling entries with
@@ -14772,7 +14866,7 @@ pub const ProvisionedTableWriteSource = struct {
         index_name: []const u8,
     ) !void {
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginLocalStructuralIndexCacheUpdate(table_name);
+        self.beginLocalStructuralIndexCacheUpdate(table_name, index_name);
         errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
         const group_ids = try table_catalog.resolveGroupsForSpanEventually(
             alloc,
@@ -14802,7 +14896,7 @@ pub const ProvisionedTableWriteSource = struct {
         // the retained snapshot instead of replacing ready siblings with the
         // target's transient startup-catch-up observation.
         try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
-        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
+        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, index_name, managed_visibility_changed);
 
         // Reconciliation records debt while each DB is already leased. Publish
         // those exact edges only after every structural and DB reservation is
@@ -14837,7 +14931,7 @@ pub const ProvisionedTableWriteSource = struct {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         if (self.localWriteOwnerSource()) |owner| return try owner.dropIndex(alloc, table_name, index_name);
         try enforceHAWriteGateOptional(self.ha_write_gate);
-        self.beginLocalStructuralIndexCacheUpdate(table_name);
+        self.beginLocalStructuralIndexCacheUpdate(table_name, index_name);
         errdefer self.abortLocalStructuralIndexCacheUpdate(table_name, index_name);
         runTestBeforeDropIndexWorkHook();
         const managed_visibility_changed = if (self.write_cache) |cache|
@@ -14847,7 +14941,7 @@ pub const ProvisionedTableWriteSource = struct {
             break :blk false;
         };
         try self.enqueueTableIndexStructuralReconcile(table_name, index_name);
-        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, managed_visibility_changed);
+        self.finishLocalIndexCacheUpdateAndNotify(alloc, table_name, index_name, managed_visibility_changed);
     }
 
     fn dropTable(
@@ -35579,12 +35673,16 @@ test "targeted index cache update retains the published sibling snapshot through
     source.runtime_status_cache = &snapshot_cache;
 
     var indexes = [_]db_mod.types.DBIndexStats{
-        .{ .name = "ready_sibling", .kind = .dense_vector, .doc_count = 4, .node_count = 1 },
+        .{ .name = "new_target", .kind = .full_text, .doc_count = 4, .term_count = 8 },
+        .{ .name = "ready_dense", .kind = .dense_vector, .doc_count = 4, .node_count = 1 },
+        .{ .name = "ready_text", .kind = .full_text, .doc_count = 4, .term_count = 8 },
+        .{ .name = "ready_graph", .kind = .graph, .edge_count = 3, .node_count = 4 },
+        .{ .name = "ready_algebraic", .kind = .algebraic, .doc_count = 4 },
     };
     const published = runtime_status.LocalTableRuntimeStatus{
         .group_id = 7001,
         .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
-        .stats = .{ .doc_count = 4, .index_count = 1, .indexes = &indexes },
+        .stats = .{ .doc_count = 4, .index_count = indexes.len, .indexes = &indexes },
     };
     const publication_token = try snapshot_cache.capturePublicationToken("docs");
     try std.testing.expectEqual(
@@ -35595,16 +35693,33 @@ test "targeted index cache update retains the published sibling snapshot through
     // Park the worker so the assertion observes the handoff between the
     // synchronous index mutation and its targeted reconciler.
     source.structural_reconcile_scheduled.store(true, .release);
-    source.beginLocalStructuralIndexCacheUpdate("docs");
+    source.beginLocalStructuralIndexCacheUpdate("docs", "new_target");
+
+    var during_mutation = (try source.snapshotRuntimeStatusesBestEffort(alloc, "docs")).?;
+    defer during_mutation.deinit(alloc);
+    try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, during_mutation.items[0].metadata.freshness);
+    for (during_mutation.items[0].stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "new_target")) {
+            try std.testing.expect(item.runtime_observation_stale);
+        } else {
+            try std.testing.expect(!item.runtime_observation_stale);
+        }
+    }
+
     try source.enqueueTableIndexStructuralReconcile("docs", "new_target");
-    source.finishLocalStructuralCacheUpdate("docs");
+    source.finishLocalStructuralIndexCacheUpdate("docs", "new_target");
 
     var cached = (try source.snapshotRuntimeStatusesBestEffort(alloc, "docs")).?;
     defer cached.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), cached.items.len);
     try std.testing.expectEqual(runtime_status.RuntimeStatusFreshness.fresh, cached.items[0].metadata.freshness);
-    try std.testing.expectEqualStrings("ready_sibling", cached.items[0].stats.indexes[0].name);
-    try std.testing.expect(!cached.items[0].stats.indexes[0].runtime_observation_stale);
+    for (cached.items[0].stats.indexes) |item| {
+        if (std.mem.eql(u8, item.name, "new_target")) {
+            try std.testing.expect(item.runtime_observation_stale);
+        } else {
+            try std.testing.expect(!item.runtime_observation_stale);
+        }
+    }
 }
 
 test "structural repair handoff keeps status fenced through final shard visibility" {

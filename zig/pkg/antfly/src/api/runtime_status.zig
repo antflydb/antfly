@@ -787,8 +787,19 @@ fn lessThanGroupId(_: void, lhs: LocalTableRuntimeStatus, rhs: LocalTableRuntime
 fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatus, incoming: *LocalTableRuntimeStatus) void {
     var preserved_visibility = false;
     for (incoming.stats.indexes) |*dst| {
+        // Serviceability is a cache-local continuity proof. Re-derive it for
+        // every publication instead of trusting a copied incoming snapshot.
+        dst.runtime_observation_serviceable = false;
         const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
-        const applied_regressed = dst.replay_applied_sequence < cached.replay_applied_sequence;
+        const derived_index = dst.kind == .dense_vector or dst.kind == .sparse_vector;
+        const same_runtime_root = incoming.metadata.lsm_root_generation == previous.metadata.lsm_root_generation;
+        const same_derived_incarnation = derived_index and
+            dst.coverage_identity_ready and
+            cached.coverage_identity_ready and
+            dst.coverage_generation != 0 and
+            dst.coverage_generation == cached.coverage_generation and
+            dst.coverage_config_hash != 0 and
+            dst.coverage_config_hash == cached.coverage_config_hash;
         const target_not_older = dst.replay_target_sequence >= cached.replay_target_sequence;
         const same_projection_config = if (dst.projection_checkpoint_config_hash != 0 and
             cached.projection_checkpoint_config_hash != 0)
@@ -796,19 +807,27 @@ fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatu
         else
             dst.coverage_config_hash != 0 and
                 dst.coverage_config_hash == cached.coverage_config_hash;
-        const same_projection = same_projection_config and
+        const same_projection_identity = same_runtime_root and
+            (if (derived_index) same_derived_incarnation else same_projection_config);
+        const applied_regressed = same_projection_identity and
+            dst.replay_applied_sequence < cached.replay_applied_sequence;
+        const same_projection = same_projection_identity and
             dst.projection_checkpoint_generation <= cached.projection_checkpoint_generation;
         const projection_regressed = same_projection and
             dst.projection_checkpoint_applied_sequence < cached.projection_checkpoint_applied_sequence;
-        const transitional_observation = switch (incoming.metadata.freshness) {
-            .stale, .opening, .catching_up => true,
-            else => false,
-        };
-        const visibility_regressed_without_newer_replay = transitional_observation and
-            same_projection_config and
+        const previous_observation_serviceable = previous.metadata.freshness == .fresh or
+            cached.runtime_observation_serviceable;
+        const serviceable_catch_up_continuity = incoming.metadata.freshness == .catching_up and
+            same_derived_incarnation and
+            same_runtime_root and
+            previous_observation_serviceable and
+            !cached.runtime_observation_stale and
+            cached.coverage_summary_ready;
+        dst.runtime_observation_serviceable = serviceable_catch_up_continuity;
+        const visibility_regressed_without_newer_replay = serviceable_catch_up_continuity and
             target_not_older and
-            indexHasPublishedArtifactVisibility(cached) and
-            !indexHasPublishedArtifactVisibility(dst.*) and
+            indexHasPublishedGenerationVisibility(cached, previous.stats.source_doc_count) and
+            !indexHasPublishedGenerationVisibility(dst.*, incoming.stats.source_doc_count) and
             dst.replay_applied_sequence <= cached.replay_applied_sequence;
         if (!applied_regressed and !projection_regressed and !visibility_regressed_without_newer_replay) continue;
 
@@ -934,6 +953,16 @@ fn indexHasPublishedArtifactVisibility(index: db_mod.types.DBIndexStats) bool {
         index.edge_count > 0 or
         index.node_count > 0 or
         index.root_node > 0;
+}
+
+fn indexHasPublishedGenerationVisibility(index: db_mod.types.DBIndexStats, source_doc_count: u64) bool {
+    if (indexHasPublishedArtifactVisibility(index)) return true;
+    if (index.kind != .dense_vector and index.kind != .sparse_vector) return false;
+    if (!index.coverage_identity_ready or !index.coverage_summary_ready) return false;
+    const settled = index.coverage_produced_count +|
+        index.coverage_skipped_count +|
+        index.coverage_terminal_failed_count;
+    return settled >= source_doc_count;
 }
 
 fn preserveIndexArtifactVisibility(dst: *db_mod.types.DBIndexStats, cached: db_mod.types.DBIndexStats) void {
@@ -1372,6 +1401,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .name = try alloc.dupe(u8, item.name),
             .kind = item.kind,
             .runtime_observation_stale = item.runtime_observation_stale,
+            .runtime_observation_serviceable = item.runtime_observation_serviceable,
             .load_error = load_error,
             .doc_count = item.doc_count,
             .term_count = item.term_count,
@@ -2210,6 +2240,9 @@ test "table runtime snapshot cache preserves dense visibility when live publish 
         .doc_count = 25_000,
         .node_count = 469,
         .root_node = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 77,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 100,
         .replay_target_sequence = 200,
         .replay_catch_up_required = true,
@@ -2219,6 +2252,7 @@ test "table runtime snapshot cache preserves dense visibility when live publish 
     };
     var cached_status = LocalTableRuntimeStatus{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
         .stats = .{
             .doc_count = 25_000,
             .index_count = 1,
@@ -2235,6 +2269,9 @@ test "table runtime snapshot cache preserves dense visibility when live publish 
         .doc_count = 0,
         .node_count = 1,
         .root_node = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 77,
+        .coverage_identity_ready = true,
         .replay_applied_sequence = 0,
         .replay_target_sequence = 200,
         .replay_catch_up_required = true,
@@ -2244,6 +2281,7 @@ test "table runtime snapshot cache preserves dense visibility when live publish 
     };
     var regressed_status = LocalTableRuntimeStatus{
         .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
         .stats = .{
             .doc_count = 0,
             .index_count = 1,
@@ -2591,6 +2629,8 @@ test "live writer artifact regression keeps authoritative source deletions" {
         .kind = .dense_vector,
         .doc_count = 1,
         .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
         .projection_checkpoint_applied_sequence = 2,
         .projection_checkpoint_config_hash = 77,
         .replay_applied_sequence = 2,
@@ -2598,6 +2638,7 @@ test "live writer artifact regression keeps authoritative source deletions" {
     }};
     const previous = LocalTableRuntimeStatus{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
         .stats = .{
             .source_doc_count = 1,
             .doc_count = 1,
@@ -2610,6 +2651,8 @@ test "live writer artifact regression keeps authoritative source deletions" {
         .name = @constCast("semantic_idx"),
         .kind = .dense_vector,
         .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
         .projection_checkpoint_applied_sequence = 0,
         .projection_checkpoint_config_hash = 77,
         .replay_applied_sequence = 2,
@@ -2617,7 +2660,7 @@ test "live writer artifact regression keeps authoritative source deletions" {
     }};
     var incoming = LocalTableRuntimeStatus{
         .group_id = 7,
-        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
         .stats = .{
             .source_doc_count = 0,
             .doc_count = 0,
@@ -2645,6 +2688,7 @@ test "catching up observation preserves same-incarnation published visibility" {
     }};
     const previous = LocalTableRuntimeStatus{
         .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
         .stats = .{
             .source_doc_count = 2,
             .doc_count = 2,
@@ -2658,10 +2702,11 @@ test "catching up observation preserves same-incarnation published visibility" {
         .kind = .dense_vector,
         .coverage_config_hash = 77,
         .coverage_generation = 42,
+        .coverage_identity_ready = true,
     }};
     var incoming = LocalTableRuntimeStatus{
         .group_id = 7,
-        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up },
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
         .stats = .{
             .source_doc_count = 2,
             .index_count = 1,
@@ -2674,8 +2719,163 @@ test "catching up observation preserves same-incarnation published visibility" {
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].doc_count);
     try std.testing.expectEqual(@as(u64, 1), incoming.stats.indexes[0].node_count);
     try std.testing.expect(incoming.stats.indexes[0].coverage_identity_ready);
+    try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
     try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
     try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].coverage_produced_count);
+}
+
+test "catching up observation cannot preserve a same-config replacement incarnation" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 2,
+        .node_count = 1,
+        .coverage_produced_count = 2,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+        .stats = .{
+            .source_doc_count = 2,
+            .doc_count = 2,
+            .index_count = 1,
+            .indexes = previous_indexes[0..],
+        },
+    };
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 43,
+        .coverage_identity_ready = true,
+    }};
+    var incoming = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+        .stats = .{
+            .source_doc_count = 2,
+            .index_count = 1,
+            .indexes = incoming_indexes[0..],
+        },
+    };
+
+    preserveArtifactVisibilityOnReplayRegression(previous, &incoming);
+    try std.testing.expectEqual(@as(u64, 0), incoming.stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].doc_count);
+    try std.testing.expectEqual(@as(u64, 43), incoming.stats.indexes[0].coverage_generation);
+    try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
+}
+
+test "catching up observation cannot preserve across an lsm root change" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 2,
+        .node_count = 1,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+        .stats = .{ .doc_count = 2, .index_count = 1, .indexes = previous_indexes[0..] },
+    };
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+    }};
+    var incoming = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 10 },
+        .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
+    };
+
+    preserveArtifactVisibilityOnReplayRegression(previous, &incoming);
+    try std.testing.expectEqual(@as(u64, 0), incoming.stats.doc_count);
+    try std.testing.expectEqual(@as(u64, 0), incoming.stats.indexes[0].doc_count);
+    try std.testing.expect(!incoming.stats.indexes[0].runtime_observation_serviceable);
+}
+
+test "empty embeddings incarnation preserves serviceability during catch up" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+        .stats = .{ .index_count = 1, .indexes = previous_indexes[0..] },
+    };
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    var incoming = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+        .stats = .{ .index_count = 1, .indexes = incoming_indexes[0..] },
+    };
+
+    preserveArtifactVisibilityOnReplayRegression(previous, &incoming);
+    try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
+    try std.testing.expect(incoming.stats.indexes[0].coverage_identity_ready);
+    try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
+}
+
+test "all-skipped embeddings incarnation preserves logical publication during catch up" {
+    var previous_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_skipped_count = 2,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    const previous = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh, .lsm_root_generation = 9 },
+        .stats = .{ .source_doc_count = 2, .doc_count = 2, .index_count = 1, .indexes = previous_indexes[0..] },
+    };
+
+    var incoming_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = @constCast("semantic_idx"),
+        .kind = .dense_vector,
+        .coverage_config_hash = 77,
+        .coverage_generation = 42,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    var incoming = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{ .source = .startup_catch_up, .freshness = .catching_up, .lsm_root_generation = 9 },
+        .stats = .{ .source_doc_count = 2, .index_count = 1, .indexes = incoming_indexes[0..] },
+    };
+
+    preserveArtifactVisibilityOnReplayRegression(previous, &incoming);
+    try std.testing.expect(incoming.stats.indexes[0].runtime_observation_serviceable);
+    try std.testing.expectEqual(@as(u64, 2), incoming.stats.indexes[0].coverage_skipped_count);
+    try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
 }
 
 test "table runtime snapshot cache preserves live completion over regressing persisted projection" {

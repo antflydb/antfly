@@ -2849,6 +2849,11 @@ pub const DBIndexStats = struct {
     // authoritative observations for unaffected sibling indexes. This is an
     // internal observation fact and is not serialized in the public API.
     runtime_observation_stale: bool = false,
+    // A cache merge may retain serviceability for one exact derived-index
+    // incarnation while its already-open runtime publishes catch-up status.
+    // This proof never originates in persisted DB stats and is cleared by a
+    // fresh observation, a root change, or an incarnation change.
+    runtime_observation_serviceable: bool = false,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
