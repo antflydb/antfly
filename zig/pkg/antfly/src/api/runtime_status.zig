@@ -985,7 +985,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     if (placeholder.stats.indexes.len == 0) {
         var cloned = try previous.clone(alloc);
         cloned.metadata = cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns);
-        clearInactiveRuntimeObservationServiceability(&cloned);
+        clearRuntimeObservationServiceability(&cloned);
         return cloned;
     }
 
@@ -1011,15 +1011,15 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
         dst.name = owned_name;
     }
     merged.metadata = cachedSnapshotMetadata(previous.metadata, placeholder.metadata, now_ns);
-    clearInactiveRuntimeObservationServiceability(&merged);
+    clearRuntimeObservationServiceability(&merged);
     return merged;
 }
 
-// The proof is meaningful only while the exact runtime observation is in its
-// catch-up transition. Relabeling a cached snapshot must not let the proof
-// hitchhike into stale/opening/fresh status and later be reused.
-pub fn clearInactiveRuntimeObservationServiceability(status: *LocalTableRuntimeStatus) void {
-    if (status.metadata.freshness == .catching_up) return;
+// Relabeling never proves serviceability, including when the destination is a
+// catch-up state. Clear copied proofs unconditionally; the cache merge is the
+// sole authority that may mint one after checking root, incarnation, and
+// published-generation continuity.
+pub fn clearRuntimeObservationServiceability(status: *LocalTableRuntimeStatus) void {
     for (status.stats.indexes) |*item| item.runtime_observation_serviceable = false;
 }
 
@@ -2887,7 +2887,7 @@ test "empty embeddings incarnation preserves serviceability during catch up" {
     try std.testing.expect(incoming.stats.indexes[0].coverage_summary_ready);
 }
 
-test "synthetic stale relabel clears cached catch up serviceability" {
+test "synthetic relabel cannot reuse cached catch up serviceability" {
     var previous_indexes = [_]db_mod.types.DBIndexStats{.{
         .name = @constCast("semantic_idx"),
         .kind = .dense_vector,
@@ -2910,16 +2910,18 @@ test "synthetic stale relabel clears cached catch up serviceability" {
         .name = @constCast("semantic_idx"),
         .kind = .dense_vector,
     }};
-    const placeholder = LocalTableRuntimeStatus{
-        .group_id = 7,
-        .metadata = .{ .source = .synthetic_config, .freshness = .stale, .lsm_root_generation = 9 },
-        .stats = .{ .index_count = 1, .indexes = placeholder_indexes[0..] },
-    };
+    for ([_]RuntimeStatusFreshness{ .stale, .catching_up }) |freshness| {
+        const placeholder = LocalTableRuntimeStatus{
+            .group_id = 7,
+            .metadata = .{ .source = .synthetic_config, .freshness = freshness, .lsm_root_generation = 9 },
+            .stats = .{ .index_count = 1, .indexes = placeholder_indexes[0..] },
+        };
 
-    var merged = try mergeCachedStatusWithSyntheticPlaceholder(std.testing.allocator, previous, placeholder, 100);
-    defer merged.deinit(std.testing.allocator);
-    try std.testing.expectEqual(RuntimeStatusFreshness.stale, merged.metadata.freshness);
-    try std.testing.expect(!merged.stats.indexes[0].runtime_observation_serviceable);
+        var merged = try mergeCachedStatusWithSyntheticPlaceholder(std.testing.allocator, previous, placeholder, 100);
+        defer merged.deinit(std.testing.allocator);
+        try std.testing.expectEqual(freshness, merged.metadata.freshness);
+        try std.testing.expect(!merged.stats.indexes[0].runtime_observation_serviceable);
+    }
 }
 
 test "all-skipped embeddings incarnation preserves logical publication during catch up" {

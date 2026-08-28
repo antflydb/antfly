@@ -6350,7 +6350,7 @@ pub fn build(b: *std.Build) void {
             "catching up observation cannot preserve across an lsm root change",
             "unpublished embeddings incarnation cannot mint catch up serviceability",
             "empty embeddings incarnation preserves serviceability during catch up",
-            "synthetic stale relabel clears cached catch up serviceability",
+            "synthetic relabel cannot reuse cached catch up serviceability",
             "all-skipped embeddings incarnation preserves logical publication during catch up",
             "table runtime snapshot cache table fences isolate unrelated invalidations",
             "runtime status cache publishes unaffected tables and retries only invalidated tables",

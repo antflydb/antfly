@@ -11562,7 +11562,7 @@ pub const ProvisionedTableWriteSource = struct {
             .source = .live_writer_publish,
             .freshness = .fresh,
         };
-        runtime_status.clearInactiveRuntimeObservationServiceability(status);
+        runtime_status.clearRuntimeObservationServiceability(status);
     }
 
     fn lsmStorageStatsFromDb(db: *db_mod.DB) runtime_status.LsmStorageStats {
@@ -11818,7 +11818,7 @@ pub const ProvisionedTableWriteSource = struct {
             item.metadata = item.metadata.withDefaults(.cached_snapshot, now_ns);
             item.metadata.source = .cached_snapshot;
             item.metadata.freshness = .fresh;
-            runtime_status.clearInactiveRuntimeObservationServiceability(item);
+            runtime_status.clearRuntimeObservationServiceability(item);
         }
     }
 
@@ -11826,7 +11826,7 @@ pub const ProvisionedTableWriteSource = struct {
         for (statuses.items) |*item| {
             if (item.metadata.freshness == .fresh) {
                 item.metadata.freshness = .stale;
-                runtime_status.clearInactiveRuntimeObservationServiceability(item);
+                runtime_status.clearRuntimeObservationServiceability(item);
             }
         }
     }
@@ -11935,7 +11935,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.local_change_hook != null) {
                 for (cached.items) |*status| {
                     status.metadata.freshness = .stale;
-                    runtime_status.clearInactiveRuntimeObservationServiceability(status);
+                    runtime_status.clearRuntimeObservationServiceability(status);
                 }
                 self.notifyLocalChange(table_name, .runtime_status);
                 return cached;
@@ -24124,7 +24124,7 @@ fn setRuntimeStatusMetadata(
     status.metadata.source = source;
     status.metadata.freshness = freshness;
     status.metadata.updated_at_ns = platform_time.monotonicNs();
-    runtime_status.clearInactiveRuntimeObservationServiceability(status);
+    runtime_status.clearRuntimeObservationServiceability(status);
 }
 
 fn markStartupRuntimeStatus(
