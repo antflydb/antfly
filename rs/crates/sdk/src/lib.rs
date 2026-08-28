@@ -864,10 +864,9 @@ mod tests {
             }])
             .is_err()
         );
-        assert!(serde_json::from_str::<GraphNodeMappingSpec>(
-            r#"{"source":"{{ _doc.key }}"}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<GraphNodeMappingSpec>(r#"{"source":"{{ _doc.key }}"}"#).is_err()
+        );
     }
 
     #[test]
