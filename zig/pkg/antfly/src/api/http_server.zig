@@ -912,6 +912,14 @@ pub const ApiHttpServerConfig = struct {
     /// Optional live source supplied by HA-aware runtimes. Static fields above
     /// remain the policy for kernels and tests without a mutable role.
     ha_mutation_policy_source: ?HAMutationPolicySource = null,
+    /// Optional production-neutral durable-join microstep observer. The hook
+    /// can coordinate process lifecycle or deterministic faults, but does not
+    /// replace the planner, worker protocol, or persistence implementation.
+    distributed_join_lifecycle_hook: ?distributed_join.LifecycleHook = null,
+    /// Caller-owned runtime store for durable join state. Prefer this in
+    /// borrowed-I/O runtimes so job durability stays inside their registered
+    /// storage domain instead of opening a native path-backed backend.
+    join_job_store: ?*backend_erased.Store = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -2211,6 +2219,7 @@ pub const ApiHttpServer = struct {
                 break :blk registry;
             },
             .join_job_store = distributed_join.JoinJobStore.init(owner_alloc, .{
+                .join_job_store = cfg.join_job_store,
                 .join_job_store_path = cfg.join_job_store_path,
                 .join_job_lease_ttl_ms = cfg.join_job_lease_ttl_ms,
                 .join_job_retention_ms = cfg.join_job_retention_ms,
@@ -2465,7 +2474,14 @@ pub const ApiHttpServer = struct {
             );
             server.txn_sessions.durable_scope = effective_cfg.session_store_scope;
         }
-        if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
+        if (cfg.join_job_store != null and cfg.join_job_store_path != null)
+            return error.InvalidApiServerConfig;
+        if (cfg.join_job_store) |runtime_store| {
+            const opened = try alloc.create(distributed_join.OpenedJoinJobStore);
+            errdefer alloc.destroy(opened);
+            opened.* = try distributed_join.OpenedJoinJobStore.openRuntime(alloc, runtime_store);
+            server.join_job_store.opened_join_job_store = opened;
+        } else if (cfg.join_job_store_path orelse cfg.session_store_path) |base_path| {
             const join_job_path = if (cfg.join_job_store_path != null)
                 try alloc.dupe(u8, base_path)
             else
@@ -2769,6 +2785,7 @@ pub const ApiHttpServer = struct {
         return .{
             .ptr = self,
             .vtable = &join_context_vtable,
+            .lifecycle_hook = self.cfg.distributed_join_lifecycle_hook,
         };
     }
 
@@ -2779,6 +2796,8 @@ pub const ApiHttpServer = struct {
         .get_join_shuffle_lease = joinCtxGetJoinShuffleLease,
         .upsert_join_shuffle_lease = joinCtxUpsertJoinShuffleLease,
         .remove_join_shuffle_lease = joinCtxRemoveJoinShuffleLease,
+        .realtime_now_millis = joinCtxRealtimeNowMillis,
+        .monotonic_now_ns = joinCtxMonotonicNowNs,
         .execute_plain_query = joinCtxExecutePlainQuery,
         .execute_query_dispatch = joinCtxExecuteQueryDispatch,
         .build_owned_search_request = joinCtxBuildOwnedSearchRequest,
@@ -2793,6 +2812,19 @@ pub const ApiHttpServer = struct {
     fn joinCtxFreeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         self.source.freeAdminSnapshot(snapshot);
+    }
+
+    fn joinCtxRealtimeNowMillis(ptr: *anyopaque) u64 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const io = self.sharedApiIo() orelse return joinJobNowMillis();
+        const now_ns = @max(0, std.Io.Clock.now(.real, io).nanoseconds);
+        return @intCast(@divTrunc(now_ns, std.time.ns_per_ms));
+    }
+
+    fn joinCtxMonotonicNowNs(ptr: *anyopaque) u64 {
+        const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
+        const io = self.sharedApiIo() orelse return platform_time.monotonicNs();
+        return @intCast(@max(0, std.Io.Clock.now(.awake, io).nanoseconds));
     }
 
     fn joinCtxLocalTableStats(

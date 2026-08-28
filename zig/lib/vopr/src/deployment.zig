@@ -12,7 +12,7 @@ const ids = @import("id.zig");
 
 pub const StableId = ids.StableId;
 pub const DomainKind = enum { process, storage, resource, link };
-pub const FaultKind = enum { network, node_pause, storage, resource, clock };
+pub const FaultKind = enum { network, node_pause, storage, resource, clock, service_rate, custom };
 pub const InstanceState = enum { stopped, starting, ready, failed };
 
 pub const ResourcePolicy = struct {
@@ -379,6 +379,8 @@ fn faultCompatible(fault: FaultKind, domain: DomainKind) bool {
     return switch (fault) {
         .network => domain == .link,
         .node_pause, .clock => domain == .process,
+        .service_rate => domain == .process or domain == .resource,
+        .custom => true,
         .storage => domain == .storage,
         .resource => domain == .resource,
     };
@@ -437,6 +439,10 @@ test "deployment composer enforces readiness fault scopes resources and quiet su
     try composer.publishReady(1003);
     try composer.publishReady(2003);
 
+    try composer.activateFault(8999, .service_rate, 101);
+    try composer.activateFault(9000, .service_rate, 103);
+    try composer.healFault(8999);
+    try composer.healFault(9000);
     try composer.activateFault(9001, .network, 301);
     const epoch = try composer.requestQuietSuffix();
     try std.testing.expectEqual(@as(u64, 1), epoch);

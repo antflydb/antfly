@@ -18,6 +18,7 @@ const background_runtime = @import("../storage/background_runtime.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_server = @import("../api/http_server.zig");
 const api_distributed_graph = @import("../api/distributed_graph.zig");
+const api_distributed_join = @import("../api/distributed_join.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const common_http = @import("../common/http/http_common.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
@@ -27,6 +28,8 @@ const shard_ops = @import("../raft/shard_ops.zig");
 const transition_state = @import("../metadata/transition_state.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const resource_manager = @import("../storage/resource_manager.zig");
+const mem_backend = @import("../storage/mem_backend.zig");
+const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 
 // The composed deployment uses the same service identity as the metadata
@@ -85,6 +88,7 @@ pub const Fixture = struct {
         graph_owner_restart,
         graph_partial_write,
         resource_pressure,
+        join_finalizer_ack_failure,
     };
 
     pub const Phase = enum(u8) {
@@ -151,6 +155,9 @@ pub const Fixture = struct {
         "{\"inserts\":{\"tenant:q\":{\"title\":\"production-tenant\",\"body\":\"production join left\",\"customer_id\":\"doc:c\"},\"tenant:r\":{\"title\":\"production-tenant\",\"body\":\"production join left\",\"customer_id\":\"doc:x\"}},\"sync_level\":\"full_index\"}";
     const join_query_body =
         "{\"query\":{\"match_all\":{}},\"fields\":[\"title\"],\"limit\":10,\"profile\":true,\"join\":{\"right_table\":\"docs\",\"join_type\":\"inner\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\",\"operator\":\"eq\"},\"right_fields\":[\"title\"]}}";
+    const durable_join_row_count: usize = 64;
+    const durable_join_query_body =
+        "{\"query\":{\"match_all\":{}},\"fields\":[\"title\"],\"limit\":64,\"profile\":true,\"join\":{\"right_table\":\"docs\",\"join_type\":\"inner\",\"on\":{\"left_field\":\"customer_id\",\"right_field\":\"_id\",\"operator\":\"eq\"},\"strategy_hint\":\"shuffle\",\"right_fields\":[\"title\"]}}";
     const resource_probe_body =
         "{\"inserts\":{\"pressure:probe\":{\"title\":\"pressure\",\"body\":\"production-owner-resource-recovery\"}},\"sync_level\":\"write\"}";
     const DataServer = data_runtime.DataServer;
@@ -176,6 +183,10 @@ pub const Fixture = struct {
     backend_runtimes: [node_count]background_runtime.BackendRuntimeHandle = undefined,
     backend_runtime_count: usize = 0,
     backend_runtime_owners_started: usize = 0,
+    join_job_backends: [node_count]mem_backend.Backend = undefined,
+    join_job_backend_count: usize = 0,
+    join_job_stores: [node_count]backend_erased.Store = undefined,
+    join_job_store_count: usize = 0,
     data_roots: [node_count][]u8 = undefined,
     data_root_count: usize = 0,
     capacity_sources: [node_count]ModeledCapacitySource = undefined,
@@ -236,6 +247,9 @@ pub const Fixture = struct {
     join_sound: bool = false,
     split_join_sound: bool = false,
     post_split_join_sound: bool = false,
+    join_finalizer_ack_failure_injected: bool = false,
+    join_finalizer_persisted_group_id: u64 = 0,
+    durable_join_takeover_sound: bool = false,
     graph_sound: bool = false,
     split_graph_inflight_started: bool = false,
     split_graph_inflight_complete: bool = false,
@@ -361,8 +375,13 @@ pub const Fixture = struct {
 
     pub fn bootstrap(self: *Fixture) !void {
         if (self.phase != .created) return error.ProductionFixtureAlreadyBootstrapped;
-        if (self.fault_mode != .clean and (!self.graph_enabled or !self.active_split_enabled))
-            return error.InvalidProductionClusterFaultMode;
+        switch (self.fault_mode) {
+            .clean => {},
+            .join_finalizer_ack_failure => if (!self.join_enabled or self.active_split_enabled)
+                return error.InvalidProductionClusterFaultMode,
+            else => if (!self.graph_enabled or !self.active_split_enabled)
+                return error.InvalidProductionClusterFaultMode,
+        }
         const alloc = self.alloc;
         const sim = self.sim;
         self.metadata = try metadata_sim.VoprPublicClusterFixture.create(alloc, sim);
@@ -464,6 +483,12 @@ pub const Fixture = struct {
                     index + 1,
                 )),
             };
+            self.join_job_backends[index] = mem_backend.Backend.init(alloc, .{});
+            self.join_job_backend_count += 1;
+            self.join_job_stores[index] = try self.join_job_backends[index].runtimeStore(alloc, .{
+                .name = "system/distributed-join-jobs",
+            });
+            self.join_job_store_count += 1;
             try self.initializeDataServer(index);
             self.data_server_count += 1;
             self.data_raft_listener_count += 1;
@@ -514,6 +539,11 @@ pub const Fixture = struct {
             .api_server_cfg = .{
                 .internal_service_secret = internal_service_secret,
                 .internal_service_issuer = internal_service_issuer,
+                .distributed_join_lifecycle_hook = .{
+                    .ptr = self,
+                    .reach_fn = observeDistributedJoinLifecycle,
+                },
+                .join_job_store = &self.join_job_stores[index],
                 .request_lifecycle_hook = .{
                     .ptr = self,
                     .reach_fn = observePublicRequestLifecycle,
@@ -562,6 +592,8 @@ pub const Fixture = struct {
             self.data_raft_uri_live[index] = false;
         }
         try self.data_servers[index].startPublicHttp();
+        if (!self.data_servers[index].http_server.?.join_job_store.hasDurableStore())
+            return error.DurableJoinStoreUnavailable;
         self.data_api_uris[index] = try self.data_servers[index].baseUri(self.alloc);
         self.data_api_uri_live[index] = true;
         self.data_api_ports[index] = (try parseHttpBaseUriAddress(self.data_api_uris[index])).getPort();
@@ -637,7 +669,8 @@ pub const Fixture = struct {
         event: api_distributed_graph.LifecycleEvent,
     ) void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
-        if (self.fault_mode == .clean or self.fault_mode == .resource_pressure) return;
+        if (self.fault_mode == .clean or self.fault_mode == .resource_pressure or
+            self.fault_mode == .join_finalizer_ack_failure) return;
         switch (event.phase) {
             .expand_round_completed => {
                 if (!self.graph_transport_fault_armed or event.depth != 1) return;
@@ -665,7 +698,7 @@ pub const Fixture = struct {
                         self.sim.setOutboundEndpointPayloadPartialWrite(endpoint, "/graph-expand", 1) catch unreachable;
                         self.graph_partial_write_injected = true;
                     },
-                    .resource_pressure => unreachable,
+                    .resource_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             .attempt_failed => {
@@ -689,11 +722,30 @@ pub const Fixture = struct {
                         self.graph_restart_recovered.wait(self.sim.io()) catch return;
                     },
                     .graph_partial_write => {},
-                    .resource_pressure => unreachable,
+                    .resource_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             else => {},
         }
+    }
+
+    fn observeDistributedJoinLifecycle(
+        ptr: *anyopaque,
+        event: api_distributed_join.LifecycleEvent,
+    ) !void {
+        const self: *Fixture = @ptrCast(@alignCast(ptr));
+        if (self.fault_mode != .join_finalizer_ack_failure or
+            event.phase != .finalizer_result_persisted or
+            self.join_finalizer_ack_failure_injected)
+            return;
+        if (event.owner_group_id == 0) return;
+        self.join_finalizer_ack_failure_injected = true;
+        self.join_finalizer_persisted_group_id = event.owner_group_id;
+        // The result and shared ownership record are durable, but the worker
+        // process fails before acknowledging the internal finalizer request.
+        // The coordinator must hand the stable job to another owner, which
+        // imports the cached result instead of repeating completed work.
+        return error.InjectedJoinFinalizerAcknowledgementFailure;
     }
 
     fn ensureMetadataIncarnation(self: *Fixture) !void {
@@ -1162,6 +1214,12 @@ pub const Fixture = struct {
             join_right_batch_body
         else
             ordinary_right_batch_body;
+        const durable_tenant_body = if (self.fault_mode == .join_finalizer_ack_failure)
+            try self.durableJoinTenantBatchAlloc()
+        else
+            null;
+        defer if (durable_tenant_body) |body| self.alloc.free(body);
+        const effective_tenant_body = durable_tenant_body orelse tenant_batch_body;
         for (initial_groups) |group_id| {
             try self.waitForDataLeader(group_id);
             std.log.debug("production data-plane VOPR elected group leader group={}", .{group_id});
@@ -1187,7 +1245,7 @@ pub const Fixture = struct {
             2,
             self.data_api_uris[1],
             "tenant_b_docs",
-            tenant_batch_body,
+            effective_tenant_body,
         });
         const left_write_result = left_write.await(self.sim.io());
         const right_write_result = right_write.await(self.sim.io());
@@ -1241,7 +1299,7 @@ pub const Fixture = struct {
             self.data_api_uris[1],
             0,
             "tenant_b_docs",
-            tenant_batch_body,
+            effective_tenant_body,
             "tenant:q",
             "production-tenant",
         );
@@ -1340,7 +1398,7 @@ pub const Fixture = struct {
                                     return error.ProductionGraphPartialWriteTargetLeadershipChanged;
                                 break :blk try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
                             },
-                        .resource_pressure => unreachable,
+                        .resource_pressure, .join_finalizer_ack_failure => unreachable,
                     }
                     self.graph_transport_fault_armed = true;
                 }
@@ -1417,6 +1475,28 @@ pub const Fixture = struct {
         }
     }
 
+    fn durableJoinTenantBatchAlloc(self: *Fixture) ![]u8 {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        try out.writer.writeAll("{\"inserts\":{");
+        for (0..durable_join_row_count) |index| {
+            if (index != 0) try out.writer.writeByte(',');
+            if (index == 0)
+                try out.writer.writeAll("\"tenant:q\"")
+            else
+                // The projected tenant range begins at `tenant:a`. A numeric
+                // byte directly after `tenant:` sorts before that boundary
+                // and is correctly rejected by public routing as NotFound.
+                try out.writer.print("\"tenant:r{d:0>3}\"", .{index});
+            try out.writer.print(
+                ":{{\"title\":\"production-tenant\",\"body\":\"production durable join left\",\"customer_id\":\"{s}\"}}",
+                .{if (index % 2 == 0) "doc:c" else "doc:x"},
+            );
+        }
+        try out.writer.writeAll("},\"sync_level\":\"full_index\"}");
+        return try out.toOwnedSlice();
+    }
+
     fn runJoinQuery(self: *Fixture) !bool {
         // Public queries are idempotent. Preserve typed topology/availability
         // responses as retryable, and accept 200 only when the response itself
@@ -1424,7 +1504,11 @@ pub const Fixture = struct {
         // execution spanning at least two production groups.
         for (0..node_count * 4) |attempt| {
             const uri = self.data_api_uris[attempt % node_count];
-            var response = self.client.fetchQueryRaw(uri, "tenant_b_docs", join_query_body) catch |err| switch (err) {
+            const query_body = if (self.fault_mode == .join_finalizer_ack_failure)
+                durable_join_query_body
+            else
+                join_query_body;
+            var response = self.client.fetchQueryRaw(uri, "tenant_b_docs", query_body) catch |err| switch (err) {
                 error.Canceled => return err,
                 else => {
                     try self.sim.io().sleep(.fromMilliseconds(1), .awake);
@@ -1467,7 +1551,9 @@ pub const Fixture = struct {
         const hits_value = response_value.object.get("hits") orelse return false;
         if (hits_value != .object) return false;
         const hit_items_value = hits_value.object.get("hits") orelse return false;
-        if (hit_items_value != .array or hit_items_value.array.items.len != 2) return false;
+        const durable = self.fault_mode == .join_finalizer_ack_failure;
+        const expected_rows: usize = if (durable) durable_join_row_count else 2;
+        if (hit_items_value != .array or hit_items_value.array.items.len != expected_rows) return false;
 
         var saw_left = false;
         var saw_right = false;
@@ -1490,9 +1576,48 @@ pub const Fixture = struct {
         const distributed = join_value.object.get("distributed_execution") orelse return false;
         const groups = join_value.object.get("groups_queried") orelse return false;
         const rows = join_value.object.get("rows_matched") orelse return false;
-        return saw_left and saw_right and distributed == .bool and distributed.bool and
-            groups == .integer and groups.integer >= 2 and
-            rows == .integer and rows.integer == 2;
+        const worker_attempts = join_value.object.get("worker_attempts") orelse return false;
+        // Broadcast reports each right owner in groups_queried. A shuffle
+        // finalizer delegates partitions instead, so its production witness
+        // is the exact-group worker-attempt ledger plus the finalizer ledger
+        // checked below; groups_queried is not populated by that protocol.
+        const ownership_sound = if (durable)
+            worker_attempts == .array and worker_attempts.array.items.len > 0
+        else
+            groups == .integer and groups.integer >= 2;
+        const base_sound = saw_left and saw_right and distributed == .bool and distributed.bool and
+            ownership_sound and
+            rows == .integer and rows.integer == expected_rows;
+        if (!base_sound or !durable) return base_sound;
+
+        const strategy = join_value.object.get("strategy_used") orelse return false;
+        const execution_mode = join_value.object.get("execution_mode") orelse return false;
+        const job_phase = join_value.object.get("job_phase") orelse return false;
+        const finalizer_retries = join_value.object.get("finalizer_retries") orelse return false;
+        const imported_owner = join_value.object.get("imported_owner_group_id") orelse return false;
+        const imported_cached = join_value.object.get("imported_cached_result") orelse return false;
+        const attempts = join_value.object.get("finalizer_attempts") orelse return false;
+        if (strategy != .string or !std.mem.eql(u8, strategy.string, "shuffle") or
+            execution_mode != .string or !std.mem.eql(u8, execution_mode.string, "distributed_durable") or
+            job_phase != .string or !std.mem.eql(u8, job_phase.string, "succeeded") or
+            finalizer_retries != .integer or finalizer_retries.integer != 1 or
+            imported_owner != .integer or imported_owner.integer != self.join_finalizer_persisted_group_id or
+            imported_cached != .bool or !imported_cached.bool or
+            attempts != .array or attempts.array.items.len != 2)
+            return false;
+        const failed_attempt = attempts.array.items[0];
+        const successful_attempt = attempts.array.items[1];
+        if (failed_attempt != .object or successful_attempt != .object) return false;
+        const failed_group = failed_attempt.object.get("worker_group_id") orelse return false;
+        const failed_ok = failed_attempt.object.get("succeeded") orelse return false;
+        const successful_group = successful_attempt.object.get("worker_group_id") orelse return false;
+        const successful_ok = successful_attempt.object.get("succeeded") orelse return false;
+        self.durable_join_takeover_sound = self.join_finalizer_ack_failure_injected and
+            failed_group == .integer and failed_group.integer == self.join_finalizer_persisted_group_id and
+            failed_ok == .bool and !failed_ok.bool and
+            successful_group == .integer and successful_group.integer != failed_group.integer and
+            successful_ok == .bool and successful_ok.bool;
+        return self.durable_join_takeover_sound;
     }
 
     fn runGraphQuery(
@@ -2124,6 +2249,18 @@ pub const Fixture = struct {
             self.data_server_live[server_index] = false;
         }
         self.data_server_count = 0;
+        var join_store_index = self.join_job_store_count;
+        while (join_store_index > 0) {
+            join_store_index -= 1;
+            self.join_job_stores[join_store_index].deinit();
+        }
+        self.join_job_store_count = 0;
+        var join_backend_index = self.join_job_backend_count;
+        while (join_backend_index > 0) {
+            join_backend_index -= 1;
+            self.join_job_backends[join_backend_index].close();
+        }
+        self.join_job_backend_count = 0;
         if (!self.complete and !self.workload_done and !self.teardown_started and self.executor_live and self.raft_executor_live and self.public_executor_live) std.log.err(
             "production data-plane VOPR after DataServer deinit active_http_requests metadata={} raft={} public={}",
             .{ self.executor.activeRequestCount(), self.raft_executor.activeRequestCount(), self.public_executor.activeRequestCount() },
@@ -2311,6 +2448,9 @@ pub const Fixture = struct {
         join_query_ok: bool,
         split_join_query_ok: bool,
         post_split_join_query_ok: bool,
+        join_finalizer_ack_failure_injected: bool,
+        join_finalizer_persisted_group_id: u64,
+        durable_join_takeover_ok: bool,
         graph_query_ok: bool,
         split_graph_inflight_started: bool,
         split_graph_inflight_complete: bool,
@@ -2357,6 +2497,9 @@ pub const Fixture = struct {
             .join_query_ok = self.join_sound,
             .split_join_query_ok = self.split_join_sound,
             .post_split_join_query_ok = self.post_split_join_sound,
+            .join_finalizer_ack_failure_injected = self.join_finalizer_ack_failure_injected,
+            .join_finalizer_persisted_group_id = self.join_finalizer_persisted_group_id,
+            .durable_join_takeover_ok = self.durable_join_takeover_sound,
             .graph_query_ok = self.graph_sound,
             .split_graph_inflight_started = self.split_graph_inflight_started,
             .split_graph_inflight_complete = self.split_graph_inflight_complete,

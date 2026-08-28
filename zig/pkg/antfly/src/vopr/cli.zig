@@ -231,45 +231,82 @@ fn resultsCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
 }
 
 fn eventsCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    var trace_path: ?[]const u8 = null;
+    var trace_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer trace_paths.deinit(alloc);
     var query_path: ?[]const u8 = null;
     var output_path: ?[]const u8 = null;
+    var count_only = false;
+    var validate_only = false;
     var index: usize = 0;
     while (index < args.len) {
         if (std.mem.eql(u8, args[index], "--trace")) {
-            trace_path = try nextValue(args, &index);
+            try trace_paths.append(alloc, try nextValue(args, &index));
         } else if (std.mem.eql(u8, args[index], "--query")) {
             query_path = try nextValue(args, &index);
         } else if (std.mem.eql(u8, args[index], "--out")) {
             output_path = try nextValue(args, &index);
+        } else if (std.mem.eql(u8, args[index], "--count")) {
+            count_only = true;
+        } else if (std.mem.eql(u8, args[index], "--validate")) {
+            validate_only = true;
         } else return error.UnknownArgument;
         index += 1;
     }
-    const input = trace_path orelse return error.TracePathRequired;
     const query_input = query_path orelse return error.EventQueryPathRequired;
-    const output = output_path orelse return error.EventQueryOutputRequired;
-    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
-    defer alloc.free(encoded);
-    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
-    defer recorded.deinit();
-    var replayed = try replayKnownScenario(alloc, &recorded);
-    replayed.deinit();
     const query_bytes = try std.Io.Dir.cwd().readFileAlloc(io, query_input, alloc, .limited(1024 * 1024));
     defer alloc.free(query_bytes);
-    var parsed = try std.json.parseFromSlice(vopr.event_query.Query, alloc, query_bytes, .{});
-    defer parsed.deinit();
-    const matches = try vopr.event_query.searchAlloc(alloc, &recorded, parsed.value);
-    defer alloc.free(matches);
+
+    var parsed_plan = try vopr.event_set.parseAlloc(alloc, query_bytes);
+    defer parsed_plan.deinit();
+    const plan = parsed_plan.value;
+    try plan.validate();
+    if (validate_only) {
+        std.debug.print("VOPR event query valid format={s} name={s}\n", .{ plan.format, plan.name });
+        return;
+    }
+    if (trace_paths.items.len == 0) return error.TracePathRequired;
+    const output = output_path orelse return error.EventQueryOutputRequired;
+
+    var traces: std.ArrayListUnmanaged(vopr.trace.Trace) = .empty;
+    defer {
+        for (traces.items) |*recorded| recorded.deinit();
+        traces.deinit(alloc);
+    }
+    for (trace_paths.items) |input| {
+        const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
+        defer alloc.free(encoded);
+        var recorded = try vopr.trace.parseAlloc(alloc, encoded);
+        errdefer recorded.deinit();
+        var replayed = try replayKnownScenario(alloc, &recorded);
+        replayed.deinit();
+        try traces.append(alloc, recorded);
+    }
+    const histories = try alloc.alloc(vopr.event_set.History, traces.items.len);
+    defer alloc.free(histories);
+    for (histories, traces.items, trace_paths.items) |*history, *recorded, input|
+        history.* = .{ .id = input, .artifact = recorded };
+
+    var matches: []vopr.event_set.Match = &.{};
+    defer if (matches.len > 0) alloc.free(matches);
+    const match_count = if (count_only)
+        try vopr.event_set.count(alloc, histories, plan)
+    else blk: {
+        var evaluated = try vopr.event_set.evaluateAlloc(alloc, histories, plan);
+        matches = evaluated.matches;
+        evaluated.matches = &.{};
+        break :blk matches.len;
+    };
     const result = try std.json.Stringify.valueAlloc(alloc, .{
-        .format = "vopr-event-query-v1",
-        .trace = input,
-        .query = parsed.value,
-        .match_count = matches.len,
+        .format = "vopr-event-set-result-v1",
+        .traces = trace_paths.items,
+        .query_name = plan.name,
+        .count_only = count_only,
+        .match_count = match_count,
         .matches = matches,
     }, .{ .whitespace = .indent_2 });
     defer alloc.free(result);
     try writeDebugArtifact(io, output, result);
-    std.debug.print("VOPR event query matches={d} trace={s} out={s}\n", .{ matches.len, input, output });
+    std.debug.print("VOPR event query matches={d} histories={d} out={s}\n", .{ match_count, histories.len, output });
 }
 
 fn recipeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
@@ -2342,9 +2379,7 @@ const CampaignContext = struct {
         var walker = try dir.walk(alloc);
         defer walker.deinit();
         while (try walker.next(self.io)) |entry| {
-            if (entry.kind != .file or
-                (!std.mem.endsWith(u8, entry.path, ".voprtrace") and
-                    !std.mem.endsWith(u8, entry.path, ".simtrace"))) continue;
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".voprtrace")) continue;
             try names.append(alloc, try alloc.dupe(u8, entry.path));
         }
         std.mem.sort([]u8, names.items, {}, struct {
@@ -2464,7 +2499,7 @@ fn usage() error{InvalidUsage} {
         \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
         \\  vopr debug --trace <path> [--prefix <choice-index>] [--out <path.json>] [--commands <path>] [--interactive]
         \\  vopr results --trace <path> [--run-id <id>] [--history-id <id>] [--json-out <path>] [--html-out <path>]
-        \\  vopr events --trace <path> --query <query.json> --out <matches.json>
+        \\  vopr events [--trace <path> ...] --query <query.json> [--validate] [--count] [--out <matches.json>]
         \\  vopr recipe --trace <path> [--failure <ordinal>] [--attempts <n>] [--flight-filter <filter.json>] [--flight-before <n>] [--flight-after <n>] [--flight-limit <n>] [--flight-capacity <n>] [--flight-anywhere] --out <recipe.json> --reduced-out <reduced.voprtrace>
         \\  vopr index --index <index.json> [--add <results.json> ...] [--run-id <id>] [--revision <revision>] [--scenario <name>] [--property <id>] [--property-name <name>] [--fingerprint <id>] [--corpus retained|quarantined] [--artifact-contains <text>] [--min-transitions <n>] [--max-transitions <n>] [--min-resources <n>] [--max-resources <n>] [--min-histories <n>] [--limit <n>] [--json-out <query.json>] [--html-out <summary.html>]
         \\  vopr corpus-merge --base <trace> [--trace <trace> ...] --out-dir <directory> [--force]
@@ -2576,18 +2611,35 @@ test "Antfly injected bug is discovered replayed reduced and promoted" {
     const query_path = try std.fmt.allocPrint(alloc, "{s}/query.json", .{corpus_path});
     defer alloc.free(query_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = query_path, .data =
-        \\{"selector":{},"limit":16}
+        \\{"format":"vopr-event-set-v1","name":"all-events","steps":[{"name":"events","operation":"select","query":{"selector":{},"limit":16}}],"result":0}
     });
+    try eventsCommand(alloc, io, &.{ "--query", query_path, "--validate" });
     const query_result_path = try std.fmt.allocPrint(alloc, "{s}/query-result.json", .{corpus_path});
     defer alloc.free(query_result_path);
     try eventsCommand(alloc, io, &.{ "--trace", promoted_path, "--query", query_path, "--out", query_result_path });
     const query_result = try std.Io.Dir.cwd().readFileAlloc(io, query_result_path, alloc, .limited(max_trace_bytes));
     defer alloc.free(query_result);
-    try std.testing.expect(std.mem.indexOf(u8, query_result, "vopr-event-query-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, query_result, "vopr-event-set-result-v1") != null);
     var parsed_query_result = try std.json.parseFromSlice(std.json.Value, alloc, query_result, .{});
     defer parsed_query_result.deinit();
     const match_count = parsed_query_result.value.object.get("match_count") orelse return error.TestUnexpectedResult;
     try std.testing.expect(match_count.integer > 0);
+
+    const count_result_path = try std.fmt.allocPrint(alloc, "{s}/query-count.json", .{corpus_path});
+    defer alloc.free(count_result_path);
+    const promoted_copy_path = try std.fmt.allocPrint(alloc, "{s}/promoted-copy.voprtrace", .{corpus_path});
+    defer alloc.free(promoted_copy_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = promoted_copy_path, .data = encoded });
+    try eventsCommand(alloc, io, &.{
+        "--trace",         promoted_path,
+        "--trace",         promoted_copy_path,
+        "--query",         query_path,
+        "--count",         "--out",
+        count_result_path,
+    });
+    const count_result = try std.Io.Dir.cwd().readFileAlloc(io, count_result_path, alloc, .limited(max_trace_bytes));
+    defer alloc.free(count_result);
+    try std.testing.expect(std.mem.indexOf(u8, count_result, "\"count_only\": true") != null);
 
     const merge_invalid_path = try std.fmt.allocPrint(alloc, "{s}/invalid.voprtrace", .{corpus_path});
     defer alloc.free(merge_invalid_path);

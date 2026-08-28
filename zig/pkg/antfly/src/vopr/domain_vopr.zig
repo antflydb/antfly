@@ -432,7 +432,7 @@ pub const DataPlaneScenario = struct {
             try writer.interface.flush();
             state.stage = .packet;
         } else if (state.stage == .packet) {
-            const dropped = std.mem.eql(u8, selected.name, "sim-io.packet_drop");
+            const dropped = std.mem.eql(u8, selected.name, "vopr-io.packet_drop");
             try state.sim.scheduler().executeReady(selected.id, events, allocator);
             if (state.sim.scheduler().quiescent()) state.stage = if (dropped) .route else .persist;
         } else if (selected.id == persist_id) {

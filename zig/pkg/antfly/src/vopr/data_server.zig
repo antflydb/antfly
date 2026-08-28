@@ -207,14 +207,14 @@ fn runProductionDataServerScenario(options: ScenarioOptions) !void {
         var selected = enabled.items.items[0];
         if (options.prioritize_time) {
             for (enabled.items.items) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+                if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                     selected = candidate;
                     break;
                 }
             }
         } else {
             for (enabled.items.items) |candidate| {
-                if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+                if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                     selected = candidate;
                     break;
                 }

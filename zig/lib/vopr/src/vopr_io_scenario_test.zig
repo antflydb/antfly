@@ -15,7 +15,7 @@ const vopr_io = @import("vopr_io.zig");
 const transition = @import("transition.zig");
 
 const Scenario = struct {
-    pub const name: []const u8 = "sim-io-fiber-replay";
+    pub const name: []const u8 = "vopr-io-fiber-replay";
     pub const version: u32 = 1;
     pub const properties = &[_]property.Declaration{};
 
@@ -76,12 +76,12 @@ const Scenario = struct {
     }
 
     pub fn observe(world: *World, builder: *observation.Builder, allocator: std.mem.Allocator) !void {
-        try builder.addNamed(allocator, "sim-io.completed", @intFromBool(world.shared.completed));
-        try builder.addNamed(allocator, "sim-io.sum", world.shared.sum);
-        try builder.addNamed(allocator, "sim-io.active_tasks", @intCast(world.sim.tasks.activeTaskCount()));
+        try builder.addNamed(allocator, "vopr-io.completed", @intFromBool(world.shared.completed));
+        try builder.addNamed(allocator, "vopr-io.sum", world.shared.sum);
+        try builder.addNamed(allocator, "vopr-io.active_tasks", @intCast(world.sim.tasks.activeTaskCount()));
         try builder.addNamed(
             allocator,
-            "sim-io.monotonic_ns",
+            "vopr-io.monotonic_ns",
             @intCast(std.Io.Clock.awake.now(world.shared.io).toNanoseconds()),
         );
     }
@@ -101,7 +101,7 @@ test "VoprIo fiber histories exact replay through the VOPR runner" {
         .seed = 0x51_4d_49_4f,
         .transition_budget = 32,
         .backend_ids = &backend_ids,
-        .source_revision = "sim-io-task-kernel-v1",
+        .source_revision = "vopr-io-task-kernel-v1",
         .target = @tagName(@import("builtin").target.cpu.arch),
         .optimize = @tagName(@import("builtin").mode),
     });

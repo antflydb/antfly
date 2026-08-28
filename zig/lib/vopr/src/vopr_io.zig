@@ -105,11 +105,10 @@ pub fn metadata() Metadata {
 }
 
 pub fn capabilityDigest(capabilities: CapabilitySet) u64 {
-    // Keep the pre-rename namespace: these strings are serialized replay ABI,
-    // not source-level type names. Changing them would invalidate trace-v1
-    // artifacts produced when VoprIo was called SimIo.
+    // These repository-owned names are the canonical VOPR replay ABI. VOPR is
+    // new code, so there is deliberately no legacy namespace or translation.
     return ids.derive(
-        "sim-io-capabilities-v1",
+        "vopr-io-capabilities-v1",
         ids.digest(builtin.zig_version_string),
         capabilities.bits,
     );
@@ -120,12 +119,12 @@ pub fn capabilityDigest(capabilities: CapabilitySet) u64 {
 /// surface, so toolchain and virtual-OS compatibility are replay inputs without
 /// coupling the stable trace schema to Zig's evolving public vtable layout.
 pub fn artifactBackendIds() [4]ids.StableId {
-    // See capabilityDigest: the sim-io strings remain stable trace-v1 IDs.
+    // See capabilityDigest: vopr-io strings are stable trace-v1 IDs.
     var result = [4]ids.StableId{
-        ids.stable("sim-io-zig", builtin.zig_version_string),
+        ids.stable("vopr-io-zig", builtin.zig_version_string),
         capabilityDigest(supported_capabilities),
-        ids.derive("sim-io-model", ids.stable("sim-io", "virtual-os"), model_version),
-        ids.derive("sim-io-instrumentation", ids.stable("sim-io", "safepoints"), 0),
+        ids.derive("vopr-io-model", ids.stable("vopr-io", "virtual-os"), model_version),
+        ids.derive("vopr-io-instrumentation", ids.stable("vopr-io", "safepoints"), 0),
     };
     ids.sort(&result);
     return result;
@@ -350,7 +349,7 @@ pub const VoprIo = struct {
             var next_task: ?transition.Transition = null;
             var first_non_task: ?transition.Transition = null;
             for (enabled.items.items) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "sim-io.task_resume")) {
+                if (std.mem.eql(u8, candidate.name, "vopr-io.task_resume")) {
                     const actor_id = candidate.actor_id orelse continue;
                     if (first_task == null or actor_id < first_task.?.actor_id.?)
                         first_task = candidate;
@@ -367,7 +366,7 @@ pub const VoprIo = struct {
                 first_non_task.?
             else
                 next_task orelse first_task orelse first_non_task.?;
-            if (std.mem.eql(u8, selected.name, "sim-io.task_resume")) {
+            if (std.mem.eql(u8, selected.name, "vopr-io.task_resume")) {
                 last_task_actor = selected.actor_id.?;
                 task_resume_streak +|= 1;
             } else {
@@ -405,10 +404,10 @@ pub const VoprIo = struct {
 
     pub fn artifactIds(self: *const VoprIo) [4]ids.StableId {
         var result = artifactBackendIds();
-        const old_instrumentation = ids.derive("sim-io-instrumentation", ids.stable("sim-io", "safepoints"), 0);
+        const old_instrumentation = ids.derive("vopr-io-instrumentation", ids.stable("vopr-io", "safepoints"), 0);
         const new_instrumentation = ids.derive(
-            "sim-io-instrumentation",
-            ids.stable("sim-io", "safepoints"),
+            "vopr-io-instrumentation",
+            ids.stable("vopr-io", "safepoints"),
             self.instrumentation.config.map_digest,
         );
         for (&result) |*value| if (value.* == old_instrumentation) {
@@ -684,7 +683,7 @@ pub const VoprIo = struct {
     }
 
     fn timeAdvanceId(delta_ns: u64) ids.StableId {
-        return ids.derive("sim-io.time-advance", ids.stable("sim-io", "global-time"), delta_ns);
+        return ids.derive("vopr-io.time-advance", ids.stable("vopr-io", "global-time"), delta_ns);
     }
 
     fn bindNetwork(self: *VoprIo) void {
@@ -1269,7 +1268,7 @@ fn netBindIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, option
 
 fn netConnectIp(userdata: ?*anyopaque, address: *const std.Io.net.IpAddress, options: std.Io.net.IpAddress.ConnectOptions) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
     const self = state(userdata);
-    const owner_id = self.tasks.currentTaskId() orelse ids.stable("sim-io", "root-network-owner");
+    const owner_id = self.tasks.currentTaskId() orelse ids.stable("vopr-io", "root-network-owner");
     return self.network.connectIp(address, options, owner_id);
 }
 
@@ -1279,13 +1278,13 @@ fn netListenUnix(userdata: ?*anyopaque, address: *const std.Io.net.UnixAddress, 
 
 fn netConnectUnix(userdata: ?*anyopaque, address: *const std.Io.net.UnixAddress) std.Io.net.UnixAddress.ConnectError!std.Io.net.Socket.Handle {
     const self = state(userdata);
-    const owner_id = self.tasks.currentTaskId() orelse ids.stable("sim-io", "root-network-owner");
+    const owner_id = self.tasks.currentTaskId() orelse ids.stable("vopr-io", "root-network-owner");
     return self.network.connectUnix(address, owner_id);
 }
 
 fn netSocketCreatePair(userdata: ?*anyopaque, options: std.Io.net.Socket.CreatePairOptions) std.Io.net.Socket.CreatePairError![2]std.Io.net.Socket {
     const self = state(userdata);
-    const owner_id = self.tasks.currentTaskId() orelse ids.stable("sim-io", "root-network-owner");
+    const owner_id = self.tasks.currentTaskId() orelse ids.stable("vopr-io", "root-network-owner");
     return self.network.createPair(options, owner_id);
 }
 
@@ -1368,9 +1367,9 @@ fn enumerateReady(ptr: *anyopaque, list: *transition.List, allocator: std.mem.Al
         if (delta_ns == 0) return error.VoprIoDueTimerNotWoken;
         try list.append(allocator, .{
             .id = VoprIo.timeAdvanceId(delta_ns),
-            .name = "sim-io.time_advance",
+            .name = "vopr-io.time_advance",
             .kind = .scheduler,
-            .resource_id = ids.stable("sim-io", "global-time"),
+            .resource_id = ids.stable("vopr-io", "global-time"),
             .parameter = @intCast(@min(delta_ns, @as(u64, std.math.maxInt(i64)))),
         });
     }
@@ -1386,14 +1385,14 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
         try self.ensureNoCapabilityViolation();
         try sink.emit(allocator, .{
             .id = ids.stable("event", switch (execution.kind) {
-                .task => if (execution.completed) "sim-io.task_completed" else "sim-io.task_parked",
-                .futex_wake => "sim-io.futex_waiter_selected",
-                .external_wake => "sim-io.external_waiter_selected",
+                .task => if (execution.completed) "vopr-io.task_completed" else "vopr-io.task_parked",
+                .futex_wake => "vopr-io.futex_waiter_selected",
+                .external_wake => "vopr-io.external_waiter_selected",
             }),
             .name = switch (execution.kind) {
-                .task => if (execution.completed) "sim-io.task_completed" else "sim-io.task_parked",
-                .futex_wake => "sim-io.futex_waiter_selected",
-                .external_wake => "sim-io.external_waiter_selected",
+                .task => if (execution.completed) "vopr-io.task_completed" else "vopr-io.task_parked",
+                .futex_wake => "vopr-io.futex_waiter_selected",
+                .external_wake => "vopr-io.external_waiter_selected",
             },
             .kind = .state_change,
             .actor_id = execution.task_id,
@@ -1413,10 +1412,10 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
         return error.UnknownVoprIoTransition;
     try self.advance(delta_ns);
     try sink.emit(allocator, .{
-        .id = ids.stable("event", "sim-io.time_advanced"),
-        .name = "sim-io.time_advanced",
+        .id = ids.stable("event", "vopr-io.time_advanced"),
+        .name = "vopr-io.time_advanced",
         .kind = .state_change,
-        .resource_id = ids.stable("sim-io", "global-time"),
+        .resource_id = ids.stable("vopr-io", "global-time"),
         .payload_digest = delta_ns,
     });
 }
@@ -1966,7 +1965,7 @@ test "VoprIo groups and futex wake ordering remain scheduler visible" {
         try std.testing.expect(enabled.items.items.len != 0);
         var selected = enabled.items.items[0];
         for (enabled.items.items) |candidate| {
-            if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                 selected = candidate;
                 break;
             }
@@ -2323,8 +2322,8 @@ test "VoprIo stream sockets expose packet delivery and waiter wake choices" {
         try enabled.canonicalize();
         try std.testing.expect(enabled.items.items.len != 0);
         const selected = enabled.items.items[0];
-        saw_packet_delivery = saw_packet_delivery or std.mem.eql(u8, selected.name, "sim-io.packet_deliver");
-        saw_external_wake = saw_external_wake or std.mem.eql(u8, selected.name, "sim-io.external_wake");
+        saw_packet_delivery = saw_packet_delivery or std.mem.eql(u8, selected.name, "vopr-io.packet_deliver");
+        saw_external_wake = saw_external_wake or std.mem.eql(u8, selected.name, "vopr-io.external_wake");
         try scheduler.executeReady(selected.id, &sink, std.testing.allocator);
     }
     try std.testing.expect(shared.server_done and shared.client_done);
@@ -2373,7 +2372,7 @@ test "VoprIo accept readiness identity is independent of producer arrival order"
             try scheduler.enumerateReady(&enabled, std.testing.allocator);
             try enabled.canonicalize();
             const initial_task = for (enabled.items.items) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "sim-io.task_resume")) break candidate;
+                if (std.mem.eql(u8, candidate.name, "vopr-io.task_resume")) break candidate;
             } else return error.MissingAcceptTask;
             try scheduler.executeReady(initial_task.id, &sink, std.testing.allocator);
             if (!connect_first) client = try address.connect(io, .{ .mode = .stream });
@@ -2384,7 +2383,7 @@ test "VoprIo accept readiness identity is independent of producer arrival order"
             try scheduler.enumerateReady(&enabled, std.testing.allocator);
             try enabled.canonicalize();
             const wake = for (enabled.items.items) |candidate| {
-                if (std.mem.eql(u8, candidate.name, "sim-io.external_wake")) break candidate;
+                if (std.mem.eql(u8, candidate.name, "vopr-io.external_wake")) break candidate;
             } else return error.MissingAcceptWake;
             try scheduler.executeReady(wake.id, &sink, std.testing.allocator);
 

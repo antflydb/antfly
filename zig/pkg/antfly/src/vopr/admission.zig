@@ -30,7 +30,7 @@ fn drive(
         var selected = enabled.items.items[0];
         if (prefer_work) {
             for (enabled.items.items) |candidate| {
-                if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+                if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                     selected = candidate;
                     break;
                 }
@@ -111,7 +111,7 @@ test "resource admission VOPR denies contention and recovers after release" {
     try scheduler.enumerateReady(&enabled, std.testing.allocator);
     try enabled.canonicalize();
     const contender_transition = for (enabled.items.items) |candidate| {
-        if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) break candidate;
+        if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) break candidate;
     } else return error.MissingContenderTransition;
     try scheduler.executeReady(contender_transition.id, &events, std.testing.allocator);
     try std.testing.expect(shared.contender_denied);
@@ -335,7 +335,7 @@ test "resource admission VOPR preserves foreground priority and bounded minimum 
         try scheduler.enumerateReady(&enabled, alloc);
         try enabled.canonicalize();
         const selected = for (enabled.items.items) |candidate| {
-            if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) break candidate;
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) break candidate;
         } else return error.ResourceAdmissionVoprHolderDeadlock;
         try scheduler.executeReady(selected.id, &events, alloc);
     }

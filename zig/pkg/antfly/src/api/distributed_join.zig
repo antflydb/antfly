@@ -21,12 +21,14 @@ const query_contract = @import("query_contract.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 const foreign_sources_api = @import("foreign_sources.zig");
 const docstore_mod = @import("../storage/docstore.zig");
+const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const tables_api = @import("tables.zig");
 const platform_time = @import("antfly_platform").time;
+const platform_clock = @import("antfly_platform").clock;
 const db_mod = @import("../storage/db/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const public_table_http = @import("public_table_http.zig");
@@ -65,6 +67,7 @@ pub fn normalizeDistributedJoinOperationalError(err: anyerror) anyerror {
         error.NameServerFailure,
         error.RecvFailed,
         error.SendFailed,
+        error.FinalizerAcknowledgementUnavailable,
         => error.DistributedQueryUnavailable,
         else => err,
     };
@@ -74,8 +77,31 @@ test "distributed join ownership and transport failures remain retryable and fai
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.UnknownGroup));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.NotLeader));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.FinalizerAcknowledgementUnavailable));
     try std.testing.expectEqual(error.InternalFailure, normalizeDistributedJoinOperationalError(error.InternalFailure));
 }
+
+/// Production-neutral observation points for durable distributed-join work.
+/// Callers may use these to coordinate process lifecycle, fault injection, or
+/// diagnostics without replacing the planner, worker protocol, or job store.
+pub const LifecyclePhase = enum {
+    finalizer_result_persisted,
+};
+
+pub const LifecycleEvent = struct {
+    phase: LifecyclePhase,
+    job_id: u64,
+    owner_group_id: u64,
+};
+
+pub const LifecycleHook = struct {
+    ptr: *anyopaque,
+    reach_fn: *const fn (*anyopaque, LifecycleEvent) anyerror!void,
+
+    pub fn reach(self: LifecycleHook, event: LifecycleEvent) !void {
+        try self.reach_fn(self.ptr, event);
+    }
+};
 
 // ---------------------------------------------------------------------------
 // JoinContext vtable
@@ -86,6 +112,7 @@ pub const JoinContext = struct {
     vtable: *const VTable,
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
+    lifecycle_hook: ?LifecycleHook = null,
 
     pub const VTable = struct {
         admin_snapshot: *const fn (*anyopaque) anyerror!?metadata_api.AdminSnapshot,
@@ -98,6 +125,8 @@ pub const JoinContext = struct {
         get_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!?metadata_table_manager.ShuffleJoinLeaseRecord = null,
         upsert_join_shuffle_lease: ?*const fn (*anyopaque, metadata_table_manager.ShuffleJoinLeaseRecord) anyerror!void = null,
         remove_join_shuffle_lease: ?*const fn (*anyopaque, u64) anyerror!void = null,
+        realtime_now_millis: ?*const fn (*anyopaque) u64 = null,
+        monotonic_now_ns: ?*const fn (*anyopaque) u64 = null,
         execute_plain_query: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64, ?CancellationToken) anyerror!query_api.QueryResponse,
         execute_query_dispatch: *const fn (*anyopaque, std.mem.Allocator, table_reads.TableReadSource, []const u8, []const u8, ?[]const u8, ?u64, ?CancellationToken) anyerror![]u8,
         build_owned_search_request: *const fn (*anyopaque, std.mem.Allocator, []const u8, std.json.Value, ?u64, ?CancellationToken) anyerror!query_api.OwnedQueryRequest,
@@ -121,7 +150,7 @@ pub const JoinContext = struct {
     pub fn withRemainingExecutionBudgetMs(self: JoinContext, remaining_ms: ?u64) !JoinContext {
         const budget_ms = remaining_ms orelse return self;
         if (budget_ms == 0) return error.Timeout;
-        const remote_deadline_ns = platform_time.monotonicNs() +| budget_ms *| std.time.ns_per_ms;
+        const remote_deadline_ns = self.monotonicNowNs() +| budget_ms *| std.time.ns_per_ms;
         var out = self;
         out.execution_deadline_ns = if (self.execution_deadline_ns) |local_deadline|
             @min(local_deadline, remote_deadline_ns)
@@ -135,7 +164,7 @@ pub const JoinContext = struct {
     /// a live sub-millisecond deadline expire early on the receiving node.
     pub fn remainingExecutionBudgetMs(self: JoinContext) !?u64 {
         const deadline_ns = self.execution_deadline_ns orelse return null;
-        const now_ns = platform_time.monotonicNs();
+        const now_ns = self.monotonicNowNs();
         if (now_ns >= deadline_ns) return error.Timeout;
         const remaining_ns = deadline_ns - now_ns;
         return @max(@as(u64, 1), (remaining_ns +| std.time.ns_per_ms - 1) / std.time.ns_per_ms);
@@ -146,7 +175,7 @@ pub const JoinContext = struct {
             if (value.isCancelled()) return error.Cancelled;
         }
         const deadline_ns = self.execution_deadline_ns orelse return;
-        if (platform_time.monotonicNs() >= deadline_ns) return error.Timeout;
+        if (self.monotonicNowNs() >= deadline_ns) return error.Timeout;
     }
 
     pub fn adminSnapshot(self: JoinContext) !?metadata_api.AdminSnapshot {
@@ -228,6 +257,20 @@ pub const JoinContext = struct {
         return self.vtable.get_join_shuffle_lease != null and
             self.vtable.upsert_join_shuffle_lease != null;
     }
+
+    pub fn realtimeNowMillis(self: JoinContext) u64 {
+        const now = self.vtable.realtime_now_millis orelse return joinJobNowMillis();
+        return now(self.ptr);
+    }
+
+    pub fn monotonicNowNs(self: JoinContext) u64 {
+        const now = self.vtable.monotonic_now_ns orelse return platform_time.monotonicNs();
+        return now(self.ptr);
+    }
+
+    pub fn reachLifecycle(self: JoinContext, event: LifecycleEvent) !void {
+        if (self.lifecycle_hook) |hook| try hook.reach(event);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -235,6 +278,7 @@ pub const JoinContext = struct {
 // ---------------------------------------------------------------------------
 
 pub const JoinJobStoreConfig = struct {
+    join_job_store: ?*backend_erased.Store = null,
     join_job_store_path: ?[]const u8 = null,
     join_job_lease_ttl_ms: ?u64 = null,
     join_job_retention_ms: ?u64 = null,
@@ -246,7 +290,7 @@ pub const JoinJobStoreConfig = struct {
 
 pub const OpenedJoinJobStore = struct {
     alloc: std.mem.Allocator,
-    path_z: [:0]u8,
+    path_z: ?[:0]u8 = null,
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedJoinJobStore {
@@ -263,10 +307,21 @@ pub const OpenedJoinJobStore = struct {
         };
     }
 
+    pub fn openRuntime(alloc: std.mem.Allocator, runtime_store: *backend_erased.Store) !OpenedJoinJobStore {
+        const docstore = try alloc.create(docstore_mod.DocStore);
+        errdefer alloc.destroy(docstore);
+        docstore.* = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+        errdefer docstore.close();
+        return .{
+            .alloc = alloc,
+            .docstore = docstore,
+        };
+    }
+
     pub fn deinit(self: *OpenedJoinJobStore) void {
         self.docstore.close();
         self.alloc.destroy(self.docstore);
-        self.alloc.free(self.path_z);
+        if (self.path_z) |path| self.alloc.free(path);
         self.* = undefined;
     }
 };
@@ -804,8 +859,15 @@ pub const JoinJobStore = struct {
     }
 
     pub fn initWithStore(alloc: std.mem.Allocator, cfg: JoinJobStoreConfig) !JoinJobStore {
+        if (cfg.join_job_store != null and cfg.join_job_store_path != null)
+            return error.InvalidJoinJobStoreConfig;
         var self = init(alloc, cfg);
-        if (cfg.join_job_store_path) |path| {
+        if (cfg.join_job_store) |runtime_store| {
+            const store = try alloc.create(OpenedJoinJobStore);
+            errdefer alloc.destroy(store);
+            store.* = try OpenedJoinJobStore.openRuntime(alloc, runtime_store);
+            self.opened_join_job_store = store;
+        } else if (cfg.join_job_store_path) |path| {
             const store = try alloc.create(OpenedJoinJobStore);
             errdefer alloc.destroy(store);
             store.* = try OpenedJoinJobStore.open(alloc, path);
@@ -829,6 +891,14 @@ pub const JoinJobStore = struct {
 
     pub fn setContext(self: *JoinJobStore, ctx: JoinContext) void {
         self.ctx = ctx;
+    }
+
+    pub fn hasDurableStore(self: *const JoinJobStore) bool {
+        return self.opened_join_job_store != null;
+    }
+
+    fn nowMillis(self: *const JoinJobStore) u64 {
+        return if (self.ctx) |ctx| ctx.realtimeNowMillis() else joinJobNowMillis();
     }
 
     // -- timing helpers --
@@ -902,7 +972,7 @@ pub const JoinJobStore = struct {
         _ = ctx.upsertJoinShuffleLease(.{
             .job_id = job_id,
             .owner_group_id = owner,
-            .expires_at_ms = self.joinJobExpiryForPhase(phase, joinJobNowMillis()),
+            .expires_at_ms = self.joinJobExpiryForPhase(phase, self.nowMillis()),
         }) catch |err| {
             std.log.warn("distributed join lease sync failed job_id={d} owner_group_id={d} err={}", .{ job_id, owner, err });
             return;
@@ -920,7 +990,7 @@ pub const JoinJobStore = struct {
     pub fn sharedJoinShuffleFinalizerStartIndex(self: *JoinJobStore, job_id: u64, worker_group_ids: []const u64) usize {
         const deterministic_index = preferredFinalizerStartIndex(job_id, worker_group_ids);
         const ctx = self.ctx orelse return deterministic_index;
-        const now_ms = joinJobNowMillis();
+        const now_ms = self.nowMillis();
         const projected = ctx.getJoinShuffleLease(job_id) catch |err| {
             std.log.warn("distributed join lease lookup failed job_id={d} err={}", .{ job_id, err });
             self.syncSharedJoinShuffleLease(job_id, worker_group_ids[deterministic_index], .finalizing);
@@ -984,7 +1054,7 @@ pub const JoinJobStore = struct {
     // -- cleanup --
 
     pub fn cleanupExpiredJoinJobs(self: *JoinJobStore) void {
-        const now_ms = joinJobNowMillis();
+        const now_ms = self.nowMillis();
         lockAtomic(&self.join_jobs_mutex);
         defer self.join_jobs_mutex.unlock();
         var expired = std.ArrayListUnmanaged(u64).empty;
@@ -1033,7 +1103,7 @@ pub const JoinJobStore = struct {
         entry.value_ptr.worker_retries = 0;
         entry.value_ptr.finalizer_retries = 0;
         entry.value_ptr.coordinator_finalized = false;
-        entry.value_ptr.last_updated_at_millis = joinJobNowMillis();
+        entry.value_ptr.last_updated_at_millis = self.nowMillis();
         entry.value_ptr.expires_at_millis = self.joinJobExpiryForPhase(.dispatching, entry.value_ptr.last_updated_at_millis);
         try self.persistJoinJobState(job_id, entry.value_ptr.*);
     }
@@ -1055,7 +1125,7 @@ pub const JoinJobStore = struct {
         state.next_partition_index = next_partition_index;
         state.worker_retries = partial_result.worker_retries;
         state.phase = .finalizing;
-        state.last_updated_at_millis = joinJobNowMillis();
+        state.last_updated_at_millis = self.nowMillis();
         state.expires_at_millis = self.joinJobExpiryForPhase(.finalizing, state.last_updated_at_millis);
         try self.persistJoinJobState(job_id, state.*);
     }
@@ -1087,7 +1157,7 @@ pub const JoinJobStore = struct {
         state.finalizer_retries = finalizer_retries;
         state.coordinator_finalized = coordinator_finalized;
         state.cached_response = try self.alloc.dupe(u8, encoded_response);
-        state.last_updated_at_millis = joinJobNowMillis();
+        state.last_updated_at_millis = self.nowMillis();
         state.expires_at_millis = self.joinJobExpiryForPhase(.succeeded, state.last_updated_at_millis);
         try self.persistJoinJobState(job_id, state.*);
     }
@@ -1103,7 +1173,7 @@ pub const JoinJobStore = struct {
         }
         state.phase = .failed;
         state.last_error = try std.fmt.allocPrint(self.alloc, "{s}", .{@errorName(err)});
-        state.last_updated_at_millis = joinJobNowMillis();
+        state.last_updated_at_millis = self.nowMillis();
         state.expires_at_millis = self.joinJobExpiryForPhase(.failed, state.last_updated_at_millis);
         try self.persistJoinJobState(job_id, state.*);
         self.clearSharedJoinShuffleLease(job_id);
@@ -1113,7 +1183,7 @@ pub const JoinJobStore = struct {
 
     pub fn loadJoinJobCachedResult(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64) !?JoinPartitionExecutionResult {
         self.cleanupExpiredJoinJobs();
-        const now_ms = joinJobNowMillis();
+        const now_ms = self.nowMillis();
         lockAtomic(&self.join_jobs_mutex);
         if (self.join_jobs.getPtr(job_id)) |state| {
             const cached = state.cached_response orelse {
@@ -1182,7 +1252,7 @@ pub const JoinJobStore = struct {
 
     pub fn loadJoinJobResumeState(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64) !?JoinShuffleResumeState {
         self.cleanupExpiredJoinJobs();
-        const now_ms = joinJobNowMillis();
+        const now_ms = self.nowMillis();
         lockAtomic(&self.join_jobs_mutex);
         if (self.join_jobs.getPtr(job_id)) |state| {
             const partial = state.partial_response orelse {
@@ -1247,7 +1317,7 @@ pub const JoinJobStore = struct {
 
     pub fn loadJoinJobStateSnapshot(self: *JoinJobStore, alloc: std.mem.Allocator, job_id: u64) !?[]u8 {
         self.cleanupExpiredJoinJobs();
-        const now_ms = joinJobNowMillis();
+        const now_ms = self.nowMillis();
         lockAtomic(&self.join_jobs_mutex);
         if (self.join_jobs.getPtr(job_id)) |state| {
             if (state.expires_at_millis != 0 and state.expires_at_millis <= now_ms) {
@@ -1486,7 +1556,7 @@ pub const JoinJobStore = struct {
             .finalizing,
             total_partitions,
             completed_partitions,
-            self.joinJobExpiryForPhase(.finalizing, joinJobNowMillis()),
+            self.joinJobExpiryForPhase(.finalizing, self.nowMillis()),
             worker_retries,
             worker_attempts,
         );
@@ -1508,6 +1578,12 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
     join: SupportedJoinRequest,
     foreign_sources: foreign_mod.PostgresSourceMap,
 ) (public_table_http.TableApi.ExecuteQueryError || error{ OutOfMemory, DocIdentityNamespaceMismatch, Timeout, Cancelled })![]u8 {
+    // This is a public core entry point, not only an ApiHttpServer wrapper.
+    // Install the production context before durable eligibility and lease
+    // operations inspect the store. Requiring every transport caller to do
+    // this separately silently downgraded direct public queries to transient
+    // shuffle execution.
+    job_store.setContext(ctx);
     try ctx.ensureExecutionDeadline();
     const uses_foreign = joinUsesForeignSource(join, foreign_sources);
     var contract_request = metadata_openapi.server.parseQueryTableBody(alloc, body) catch return error.InvalidQueryRequest;
@@ -1745,6 +1821,11 @@ const StatefulShuffleFinalizerState = struct {
             null;
     }
 
+    fn noteFailedOwner(self: *StatefulShuffleFinalizerState, finalizer_group_id: u64) void {
+        if (self.durable and finalizer_group_id != 0)
+            self.previous_owner_group_id = finalizer_group_id;
+    }
+
     fn recordAttempt(
         self: *StatefulShuffleFinalizerState,
         alloc: std.mem.Allocator,
@@ -1900,7 +1981,7 @@ const StatefulShufflePartitionState = struct {
             if (job_id != null) .finalizing else null,
             partition_count,
             self.completed_partitions,
-            if (job_id != null) job_store.joinJobExpiryForPhase(.finalizing, joinJobNowMillis()) else 0,
+            if (job_id != null) job_store.joinJobExpiryForPhase(.finalizing, job_store.nowMillis()) else 0,
             self.worker_retries,
             self.worker_attempts.items,
         );
@@ -2023,6 +2104,7 @@ const StatefulShufflePreparedJob = union(enum) {
 };
 
 const StatefulShuffleJobLifecycle = struct {
+    ctx: ?JoinContext = null,
     job_store: *JoinJobStore,
     alloc: std.mem.Allocator,
     source: table_reads.TableReadSource,
@@ -2087,7 +2169,7 @@ const StatefulShuffleJobLifecycle = struct {
         result.job_phase = if (self.job_id != null) .finalizing else null;
         result.total_partitions = shuffle_partitions;
         result.expires_at_millis = if (self.job_id != null)
-            self.job_store.joinJobExpiryForPhase(.finalizing, joinJobNowMillis())
+            self.job_store.joinJobExpiryForPhase(.finalizing, self.job_store.nowMillis())
         else
             0;
         if (self.finalizer_group_id != 0) result.finalizer_group_id = self.finalizer_group_id;
@@ -2104,7 +2186,14 @@ const StatefulShuffleJobLifecycle = struct {
             self.job_store.syncSharedJoinShuffleLease(job_id, result.finalizer_group_id, .succeeded);
             result.job_phase = .succeeded;
             result.completed_partitions = result.total_partitions;
-            result.expires_at_millis = self.job_store.joinJobExpiryForPhase(.succeeded, joinJobNowMillis());
+            result.expires_at_millis = self.job_store.joinJobExpiryForPhase(.succeeded, self.job_store.nowMillis());
+            if (self.ctx) |ctx| {
+                ctx.reachLifecycle(.{
+                    .phase = .finalizer_result_persisted,
+                    .job_id = job_id,
+                    .owner_group_id = self.finalizer_group_id,
+                }) catch return error.FinalizerAcknowledgementUnavailable;
+            }
         }
     }
 };
@@ -2288,6 +2377,7 @@ const StatefulDistributedShuffleEngine = struct {
         handoff_owner_group_id: ?u64,
     ) !JoinPartitionExecutionResult {
         const lifecycle: StatefulShuffleJobLifecycle = .{
+            .ctx = self.ctx,
             .job_store = self.job_store,
             .alloc = self.alloc,
             .source = self.source,
@@ -2326,6 +2416,7 @@ const StatefulDistributedShuffleEngine = struct {
             try lifecycle.recordFailure(error.UnknownGroup);
             return error.UnknownGroup;
         };
+        errdefer result.deinit(self.alloc);
         return try self.completeFinalizerResultAlloc(lifecycle, &result, left_fields);
     }
 
@@ -2452,13 +2543,42 @@ const StatefulDistributedShuffleEngine = struct {
                 try self.ctx.remainingExecutionBudgetMs(),
             );
             defer self.alloc.free(body);
-            if (try self.source.joinFinalizeGroupLocalWithTimeout(
+            const response_opt = self.source.joinFinalizeGroupLocalWithTimeout(
                 self.alloc,
                 finalizer_group_id,
                 self.join.right_table,
                 body,
                 try internalTransportTimeoutMs(self.ctx),
-            )) |response_value| {
+            ) catch |err| {
+                if (err == error.JoinWorkerOwnedLocally) {
+                    var local_result = executeJoinFinalizeWorkerLocal(
+                        self.ctx,
+                        self.job_store,
+                        self.alloc,
+                        self.source,
+                        finalizer_group_id,
+                        self.join.right_table,
+                        body,
+                    ) catch |local_err| {
+                        try coordinator.recordAttempt(self.alloc, finalizer_group_id, false);
+                        coordinator.noteFailedOwner(finalizer_group_id);
+                        if (local_err == error.Timeout or local_err == error.Cancelled) return local_err;
+                        if (normalizeDistributedJoinOperationalError(local_err) == error.DistributedQueryUnavailable)
+                            continue;
+                        return local_err;
+                    };
+                    try coordinator.recordAttempt(self.alloc, finalizer_group_id, true);
+                    try coordinator.finalizeResult(self.alloc, self.job_store, &local_result, finalizer_group_id, attempt, false);
+                    return local_result;
+                }
+                try coordinator.recordAttempt(self.alloc, finalizer_group_id, false);
+                coordinator.noteFailedOwner(finalizer_group_id);
+                if (err == error.Timeout or err == error.Cancelled) return err;
+                if (normalizeDistributedJoinOperationalError(err) == error.DistributedQueryUnavailable)
+                    continue;
+                return err;
+            };
+            if (response_opt) |response_value| {
                 var response = response_value;
                 defer response.deinit(self.alloc);
                 try coordinator.recordAttempt(self.alloc, finalizer_group_id, true);
@@ -2474,6 +2594,7 @@ const StatefulDistributedShuffleEngine = struct {
                 return result;
             }
             try coordinator.recordAttempt(self.alloc, finalizer_group_id, false);
+            coordinator.noteFailedOwner(finalizer_group_id);
         }
         return null;
     }
@@ -2894,6 +3015,10 @@ pub fn executeJoinFinalizeWorkerLocalTyped(
     req: JoinFinalizeRequest,
 ) !JoinPartitionExecutionResult {
     const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    // Typed, transport-neutral callers do not pass through ApiHttpServer's
+    // convenience wrappers. Bind the effective request context here so lease
+    // and retention timestamps use the borrowed runtime clock as well.
+    job_store.setContext(worker_ctx);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
     const engine: StatefulDistributedShuffleEngine = .{
@@ -3142,6 +3267,7 @@ pub fn executeJoinPartitionWorkerLocalTyped(
     req: JoinPartitionRequest,
 ) !JoinPartitionExecutionResult {
     const worker_ctx = try ctx.withRemainingExecutionBudgetMs(req.remaining_timeout_ms);
+    job_store.setContext(worker_ctx);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
 
@@ -3215,13 +3341,17 @@ fn collectJoinPartitionRightRows(
             continue;
         }
 
-        if (try source.joinRowsGroupLocalWithTimeout(
+        const response_opt = source.joinRowsGroupLocalWithTimeout(
             alloc,
             target_group_id,
             req.join.right_table,
             body,
             try internalTransportTimeoutMs(ctx),
-        )) |response_value| {
+        ) catch |err| switch (err) {
+            error.JoinWorkerOwnedLocally => null,
+            else => return err,
+        };
+        if (response_opt) |response_value| {
             var response = response_value;
             defer response.deinit(alloc);
             const remote_hits = try parseJoinRowsResponse(alloc, response.json);
@@ -3272,13 +3402,16 @@ fn dispatchJoinPartitionToWorker(
     );
     defer alloc.free(body);
 
-    const partition_response_opt = try source.joinPartitionGroupLocalWithTimeout(
+    const partition_response_opt = source.joinPartitionGroupLocalWithTimeout(
         alloc,
         worker_group_id,
         join.right_table,
         body,
         try internalTransportTimeoutMs(ctx),
-    );
+    ) catch |err| switch (err) {
+        error.JoinWorkerOwnedLocally => null,
+        else => return err,
+    };
     if (partition_response_opt) |response_value| {
         var response = response_value;
         defer response.deinit(alloc);
@@ -3430,13 +3563,17 @@ fn buildDistributedRightJoinUnmatchedCompletionAcrossGroupsAlloc(
             try ctx.remainingExecutionBudgetMs(),
         );
         defer alloc.free(body);
-        const response_value = if (try source.joinUnmatchedGroupLocalWithTimeout(
+        const response_opt = source.joinUnmatchedGroupLocalWithTimeout(
             alloc,
             group_id,
             join.right_table,
             body,
             try internalTransportTimeoutMs(ctx),
-        )) |response|
+        ) catch |err| switch (err) {
+            error.JoinWorkerOwnedLocally => null,
+            else => return err,
+        };
+        const response_value = if (response_opt) |response|
             response
         else blk: {
             const local_body = executeGroupJoinUnmatchedRequest(ctx, alloc, source, group_id, join.right_table, body) catch |err| switch (err) {
@@ -6782,7 +6919,10 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 }
 
 pub fn joinJobNowMillis() u64 {
-    return @divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms);
+    // Persisted expirations and shared ownership records cross process and
+    // machine clock domains, so they must be Unix-time values rather than
+    // absolute monotonic timestamps.
+    return platform_clock.Clock.real().nowRealtimeMs();
 }
 
 pub fn preferredFinalizerStartIndex(job_id: u64, worker_group_ids: []const u64) usize {
@@ -7891,6 +8031,7 @@ test "distributed join lifecycle prepare returns fresh and records start when no
     defer job_store.deinit();
 
     const lifecycle: StatefulShuffleJobLifecycle = .{
+        .ctx = null,
         .job_store = &job_store,
         .alloc = alloc,
         .source = undefined,
@@ -7948,6 +8089,7 @@ test "distributed join lifecycle prepare reuses persisted resume state" {
     try job_store.recordJoinJobProgress(102, 2, partial);
 
     const lifecycle: StatefulShuffleJobLifecycle = .{
+        .ctx = null,
         .job_store = &job_store,
         .alloc = alloc,
         .source = undefined,
@@ -8007,6 +8149,7 @@ test "distributed join lifecycle prepare reuses persisted cached result" {
     try job_store.recordJoinJobSucceeded(103, 31, 0, false, encoded);
 
     const lifecycle: StatefulShuffleJobLifecycle = .{
+        .ctx = null,
         .job_store = &job_store,
         .alloc = alloc,
         .source = undefined,

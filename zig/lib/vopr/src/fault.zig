@@ -14,7 +14,7 @@ const transition = @import("transition.zig");
 
 pub const FaultId = ids.StableId;
 
-pub const Kind = enum { node, partitioned_link, delayed_message, storage, resource, custom };
+pub const Kind = enum { node, partitioned_link, delayed_message, storage, resource, service_rate, custom };
 pub const Lifecycle = enum { persistent, one_shot };
 
 /// Cross-domain identity used to define overlap independently of a scenario's
@@ -25,6 +25,7 @@ pub const Family = enum {
     node_pause,
     storage_corruption,
     resource_exhaustion,
+    service_rate,
     clock,
     custom,
 };
@@ -89,7 +90,7 @@ pub const Spec = struct {
     pub fn validate(self: Spec) !void {
         if (self.id == 0) return error.InvalidFaultId;
         if (self.name.len == 0) return error.EmptyFaultName;
-        if ((self.kind == .node or self.kind == .partitioned_link or self.kind == .delayed_message or self.kind == .storage) and self.resource_id == null)
+        if ((self.kind == .node or self.kind == .partitioned_link or self.kind == .delayed_message or self.kind == .storage or self.kind == .service_rate) and self.resource_id == null)
             return error.FaultResourceRequired;
     }
 
@@ -100,6 +101,7 @@ pub const Spec = struct {
             .delayed_message => .delay,
             .storage => .storage_corruption,
             .resource => .resource_exhaustion,
+            .service_rate => .service_rate,
             .custom => .custom,
         };
     }
@@ -207,7 +209,7 @@ pub const Controller = struct {
             return .{ .rejected = .quiet_suffix };
         for (self.active.items) |active| {
             if (active.spec.id == spec.id) return .{ .rejected = .duplicate_fault };
-            if (active.spec.kind == spec.kind and active.spec.resource_id != null and active.spec.resource_id == spec.resource_id)
+            if (spec.kind != .service_rate and active.spec.kind == spec.kind and active.spec.resource_id != null and active.spec.resource_id == spec.resource_id)
                 return .{ .rejected = .duplicate_resource_fault };
             if (spec.exclusion_group != null and active.spec.exclusion_group == spec.exclusion_group)
                 return .{ .rejected = .exclusion_group };
@@ -228,7 +230,7 @@ pub const Controller = struct {
                 return .{ .rejected = .delayed_message_budget },
             .storage => if (self.storage_faults_this_epoch >= self.budgets.max_storage_faults_per_durability_epoch)
                 return .{ .rejected = .storage_epoch_budget },
-            .resource, .custom => {},
+            .resource, .service_rate, .custom => {},
         }
         return .allowed;
     }
@@ -511,6 +513,23 @@ test "explicit fault algebra composes precedence and exclusions" {
     grouped_b.exclusion_group = 99;
     try controller.start(grouped_a, &sink, std.testing.allocator);
     try std.testing.expectEqual(Rejection.exclusion_group, (try controller.admission(grouped_b)).rejected);
+}
+
+test "service-rate effects overlap on one node and heal independently" {
+    var controller = try Controller.init(std.testing.allocator, 3, .{});
+    defer controller.deinit();
+    var sink: event.Sink = .{};
+    defer sink.deinit(std.testing.allocator);
+    var node_slow = Spec.named(.service_rate, .persistent, "node-a.slow");
+    node_slow.resource_id = 44;
+    var read_slow = Spec.named(.service_rate, .persistent, "node-a.read-slow");
+    read_slow.resource_id = 44;
+    try controller.start(node_slow, &sink, std.testing.allocator);
+    try controller.start(read_slow, &sink, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), controller.activeTotal());
+    try controller.stop(node_slow.id, &sink, std.testing.allocator);
+    try std.testing.expect(!controller.isActive(node_slow.id));
+    try std.testing.expect(controller.isActive(read_slow.id));
 }
 
 test "generic runner records controller lifecycle without synthetic pulses" {

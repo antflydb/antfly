@@ -63,6 +63,7 @@ pub const Operations = struct {
         job_id: u64,
     ) Error!JobState {
         try request.ensureActive();
+        if (self.join_context) |context| self.job_store.setContext(context);
         const encoded = (self.job_store.loadJoinJobStateSnapshot(alloc, job_id) catch return error.Internal) orelse
             return error.NotFound;
         defer alloc.free(encoded);

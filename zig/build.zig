@@ -6982,8 +6982,6 @@ pub fn build(b: *std.Build) void {
     vopr_engine_test_step.dependOn(&run_vopr_contract_tests.step);
     const vopr_contract_test_step = b.step("vopr-contract-test", "Run deterministic VOPR contract and replay-equivalence tests");
     vopr_contract_test_step.dependOn(&run_vopr_contract_tests.step);
-    const sim_contract_test_compat_step = b.step("sim-contract-test", "Compatibility alias for vopr-contract-test");
-    sim_contract_test_compat_step.dependOn(&run_vopr_contract_tests.step);
 
     const vopr_benchmark_mod = b.createModule(.{
         .root_source_file = b.path("lib/vopr/src/benchmark_main.zig"),
@@ -7017,12 +7015,11 @@ pub fn build(b: *std.Build) void {
     const vopr_cli_meta_tests = b.addTest(.{
         .root_module = vopr_cli_mod,
         .filters = &.{"Antfly injected bug is discovered replayed reduced and promoted"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_vopr_cli_meta_tests = b.addRunArtifact(vopr_cli_meta_tests);
     const vopr_meta_test_step = b.step("vopr-meta-test", "Prove Antfly VOPR discovery, replay, reduction, and promotion end to end");
     vopr_meta_test_step.dependOn(&run_vopr_cli_meta_tests.step);
-    const sim_meta_test_compat_step = b.step("sim-meta-test", "Compatibility alias for vopr-meta-test");
-    sim_meta_test_compat_step.dependOn(&run_vopr_cli_meta_tests.step);
     const vopr_cli_registry_tests = b.addTest(.{
         .root_module = vopr_cli_mod,
         .filters = &.{"VOPR scenario registry"},
@@ -7030,8 +7027,6 @@ pub fn build(b: *std.Build) void {
     const run_vopr_cli_registry_tests = b.addRunArtifact(vopr_cli_registry_tests);
     const vopr_registry_test_step = b.step("vopr-registry-test", "Record and exact-replay every context-free VOPR scenario through the CLI registry");
     vopr_registry_test_step.dependOn(&run_vopr_cli_registry_tests.step);
-    const sim_registry_test_compat_step = b.step("sim-registry-test", "Compatibility alias for vopr-registry-test");
-    sim_registry_test_compat_step.dependOn(&run_vopr_cli_registry_tests.step);
 
     const transaction_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -7300,6 +7295,12 @@ pub fn build(b: *std.Build) void {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
     });
     const run_production_cluster_join_split_vopr_tests = b.addRunArtifact(production_cluster_join_split_vopr_tests);
+    const production_cluster_durable_join_takeover_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production data plane durable shuffle join finalizer takeover exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_durable_join_takeover_vopr_tests = b.addRunArtifact(production_cluster_durable_join_takeover_vopr_tests);
     // Stackful VoprIo fibers do not use Zig's persistent std.zig.Server test
     // protocol: after a successful test body the server runner can report a
     // spurious subprocess failure, while the same binary and seed pass in
@@ -7318,6 +7319,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_graph_split_partial_write_vopr_tests,
         run_production_cluster_graph_split_resource_pressure_vopr_tests,
         run_production_cluster_join_split_vopr_tests,
+        run_production_cluster_durable_join_takeover_vopr_tests,
     }) |run_production_cluster_test| {
         // addRunArtifact appends cache-dir, seed, and --listen arguments after
         // the artifact; simple mode needs only the artifact itself.
@@ -7370,6 +7372,11 @@ pub fn build(b: *std.Build) void {
         "Exact-replay a public distributed join before, during, and after a production DataServer active split",
     );
     production_cluster_join_split_vopr_test_step.dependOn(&run_production_cluster_join_split_vopr_tests.step);
+    const production_cluster_durable_join_takeover_vopr_test_step = b.step(
+        "production-cluster-durable-join-takeover-vopr-test",
+        "Exact-replay durable shuffle finalizer takeover after an unacknowledged persisted result",
+    );
+    production_cluster_durable_join_takeover_vopr_test_step.dependOn(&run_production_cluster_durable_join_takeover_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
         "Run production DataServer smoke, active-reconfiguration, graph, and graph-during-split histories",
@@ -7383,6 +7390,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_partial_write_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_resource_pressure_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_join_split_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_takeover_vopr_test_step);
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
@@ -7594,72 +7602,54 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_vopr_cli.addArgs(args);
     const vopr_run_step = b.step("vopr-run", "Run one deterministic generated VOPR history");
     vopr_run_step.dependOn(&run_vopr_cli.step);
-    const sim_run_compat_step = b.step("sim-run", "Compatibility alias for vopr-run");
-    sim_run_compat_step.dependOn(&run_vopr_cli.step);
 
     const replay_vopr_cli = b.addRunArtifact(vopr_cli);
     replay_vopr_cli.addArg("replay");
     if (b.args) |args| replay_vopr_cli.addArgs(args);
     const vopr_replay_step = b.step("vopr-replay", "Replay one exact VOPR artifact");
     vopr_replay_step.dependOn(&replay_vopr_cli.step);
-    const sim_replay_compat_step = b.step("sim-replay", "Compatibility alias for vopr-replay");
-    sim_replay_compat_step.dependOn(&replay_vopr_cli.step);
 
     const campaign_vopr_cli = b.addRunArtifact(vopr_cli);
     campaign_vopr_cli.addArg("campaign");
     if (b.args) |args| campaign_vopr_cli.addArgs(args);
     const vopr_campaign_step = b.step("vopr-campaign", "Run a bounded parallel VOPR campaign");
     vopr_campaign_step.dependOn(&campaign_vopr_cli.step);
-    const sim_campaign_compat_step = b.step("sim-campaign", "Compatibility alias for vopr-campaign");
-    sim_campaign_compat_step.dependOn(&campaign_vopr_cli.step);
 
     const reduce_vopr_cli = b.addRunArtifact(vopr_cli);
     reduce_vopr_cli.addArg("reduce");
     if (b.args) |args| reduce_vopr_cli.addArgs(args);
     const vopr_reduce_step = b.step("vopr-reduce", "Reduce a VOPR failure while preserving its fingerprint");
     vopr_reduce_step.dependOn(&reduce_vopr_cli.step);
-    const sim_reduce_compat_step = b.step("sim-reduce", "Compatibility alias for vopr-reduce");
-    sim_reduce_compat_step.dependOn(&reduce_vopr_cli.step);
 
     const promote_vopr_cli = b.addRunArtifact(vopr_cli);
     promote_vopr_cli.addArg("promote");
     if (b.args) |args| promote_vopr_cli.addArgs(args);
     const vopr_promote_step = b.step("vopr-promote", "Promote a reviewed reduced VOPR failure fixture");
     vopr_promote_step.dependOn(&promote_vopr_cli.step);
-    const sim_promote_compat_step = b.step("sim-promote", "Compatibility alias for vopr-promote");
-    sim_promote_compat_step.dependOn(&promote_vopr_cli.step);
 
     const migrate_vopr_cli = b.addRunArtifact(vopr_cli);
     migrate_vopr_cli.addArg("migrate");
     if (b.args) |args| migrate_vopr_cli.addArgs(args);
     const vopr_migrate_step = b.step("vopr-migrate", "Migrate a VOPR artifact after proving equivalent replay outcomes");
     vopr_migrate_step.dependOn(&migrate_vopr_cli.step);
-    const sim_migrate_compat_step = b.step("sim-migrate", "Compatibility alias for vopr-migrate");
-    sim_migrate_compat_step.dependOn(&migrate_vopr_cli.step);
 
     const tla_vopr_cli = b.addRunArtifact(vopr_cli);
     tla_vopr_cli.addArg("tla");
     if (b.args) |args| tla_vopr_cli.addArgs(args);
     const vopr_tla_step = b.step("vopr-tla", "Exact-replay a VOPR artifact and export TLA+ Raft NDJSON");
     vopr_tla_step.dependOn(&tla_vopr_cli.step);
-    const sim_tla_compat_step = b.step("sim-tla", "Compatibility alias for vopr-tla");
-    sim_tla_compat_step.dependOn(&tla_vopr_cli.step);
 
     const explain_vopr_cli = b.addRunArtifact(vopr_cli);
     explain_vopr_cli.addArg("explain");
     if (b.args) |args| explain_vopr_cli.addArgs(args);
     const vopr_explain_step = b.step("vopr-explain", "Exact-replay a failing VOPR artifact and render its semantic causal slice");
     vopr_explain_step.dependOn(&explain_vopr_cli.step);
-    const sim_explain_compat_step = b.step("sim-explain", "Compatibility alias for vopr-explain");
-    sim_explain_compat_step.dependOn(&explain_vopr_cli.step);
 
     const debug_vopr_cli = b.addRunArtifact(vopr_cli);
     debug_vopr_cli.addArg("debug");
     if (b.args) |args| debug_vopr_cli.addArgs(args);
     const vopr_debug_step = b.step("vopr-debug", "Inspect a replay-validated VOPR artifact at a choice prefix");
     vopr_debug_step.dependOn(&debug_vopr_cli.step);
-    const sim_debug_compat_step = b.step("sim-debug", "Compatibility alias for vopr-debug");
-    sim_debug_compat_step.dependOn(&debug_vopr_cli.step);
 
     const results_vopr_cli = b.addRunArtifact(vopr_cli);
     results_vopr_cli.addArg("results");
@@ -7670,7 +7660,7 @@ pub fn build(b: *std.Build) void {
     const events_vopr_cli = b.addRunArtifact(vopr_cli);
     events_vopr_cli.addArg("events");
     if (b.args) |args| events_vopr_cli.addArgs(args);
-    const vopr_events_step = b.step("vopr-events", "Run a fielded temporal query over an exact-replayed VOPR event history");
+    const vopr_events_step = b.step("vopr-events", "Validate or run a saved event-set query over exact-replayed VOPR histories");
     vopr_events_step.dependOn(&events_vopr_cli.step);
 
     const recipe_vopr_cli = b.addRunArtifact(vopr_cli);
@@ -7735,8 +7725,6 @@ pub fn build(b: *std.Build) void {
     vopr_test_step.dependOn(&run_lib_raft_harness_tests.step);
     vopr_test_step.dependOn(&run_vopr_cli_meta_tests.step);
     vopr_test_step.dependOn(&run_vopr_cli_registry_tests.step);
-    const sim_test_compat_step = b.step("sim-test", "Compatibility alias for vopr-test");
-    sim_test_compat_step.dependOn(vopr_test_step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_public_integration_tests.step);
@@ -8146,8 +8134,6 @@ pub fn build(b: *std.Build) void {
     const run_storage_vopr_runtime_tests = b.addRunArtifact(storage_vopr_runtime_tests);
     const storage_vopr_runtime_test_step = b.step("storage-vopr-runtime-test", "Run storage VOPR runtime and modeled-device tests");
     storage_vopr_runtime_test_step.dependOn(&run_storage_vopr_runtime_tests.step);
-    const storage_sim_runtime_test_compat_step = b.step("storage-sim-runtime-test", "Compatibility alias for storage-vopr-runtime-test");
-    storage_sim_runtime_test_compat_step.dependOn(storage_vopr_runtime_test_step);
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);

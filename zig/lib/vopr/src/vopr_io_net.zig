@@ -114,15 +114,15 @@ const SocketState = struct {
     outbound_fault_match_len: usize = 0,
 
     fn readResource(self: *const SocketState) ids.StableId {
-        return ids.derive("sim-io.socket-read", self.id, 0);
+        return ids.derive("vopr-io.socket-read", self.id, 0);
     }
 
     fn writeResource(self: *const SocketState) ids.StableId {
-        return ids.derive("sim-io.socket-write", self.id, 0);
+        return ids.derive("vopr-io.socket-write", self.id, 0);
     }
 
     fn acceptResource(self: *const SocketState) ids.StableId {
-        return ids.derive("sim-io.socket-accept", self.id, 0);
+        return ids.derive("vopr-io.socket-accept", self.id, 0);
     }
 };
 
@@ -197,7 +197,7 @@ pub const Network = struct {
             address.setPort(self.allocateEphemeralPort() catch return error.AddressInUse);
         }
         if (self.findIpListener(address) != null) return error.AddressInUse;
-        const listener = self.createSocket(.listener, address, ipEndpointIdentity("sim-io.ip-listener", address)) catch |err| return mapListenResourceError(err);
+        const listener = self.createSocket(.listener, address, ipEndpointIdentity("vopr-io.ip-listener", address)) catch |err| return mapListenResourceError(err);
         listener.listener_address = .{ .ip = address };
         listener.backlog = options.kernel_backlog;
         return .{ .handle = listener.handle, .address = address };
@@ -206,7 +206,7 @@ pub const Network = struct {
     pub fn listenUnix(self: *Network, requested: *const std.Io.net.UnixAddress, options: std.Io.net.UnixAddress.ListenOptions) std.Io.net.UnixAddress.ListenError!std.Io.net.Socket.Handle {
         if (self.faults.network_down) return error.NetworkDown;
         if (self.findUnixListener(requested.path) != null) return error.AddressInUse;
-        const listener = self.createSocket(.listener, .{ .ip4 = .loopback(0) }, ids.stable("sim-io.unix-listener", requested.path)) catch |err|
+        const listener = self.createSocket(.listener, .{ .ip4 = .loopback(0) }, ids.stable("vopr-io.unix-listener", requested.path)) catch |err|
             return mapUnixListenResourceError(err);
         errdefer self.destroyLastSocket(listener);
         listener.listener_address = .{ .unix = self.allocator.dupe(u8, requested.path) catch return error.SystemResources };
@@ -230,7 +230,7 @@ pub const Network = struct {
         if (address.getPort() == 0)
             address.setPort(self.allocateEphemeralPort() catch return error.AddressInUse);
         if (self.findDatagram(address) != null) return error.AddressInUse;
-        const socket_state = self.createSocket(.datagram, address, ipEndpointIdentity("sim-io.datagram-endpoint", address)) catch |err| return mapBindResourceError(err);
+        const socket_state = self.createSocket(.datagram, address, ipEndpointIdentity("vopr-io.datagram-endpoint", address)) catch |err| return mapBindResourceError(err);
         return .{ .handle = socket_state.handle, .address = address };
     }
 
@@ -248,9 +248,9 @@ pub const Network = struct {
             .ip4 => .{ .ip4 = .loopback(0) },
             .ip6 => .{ .ip6 = .loopback(0) },
         };
-        const pair_owner = ids.derive("sim-io.socket-pair-owner", network_id, owner_id);
+        const pair_owner = ids.derive("vopr-io.socket-pair-owner", network_id, owner_id);
         const pair_sequence = self.allocateIdentitySequence(pair_owner) catch return error.SystemResources;
-        const pair_parent = ids.derive("sim-io.socket-pair", pair_owner, pair_sequence);
+        const pair_parent = ids.derive("vopr-io.socket-pair", pair_owner, pair_sequence);
         const left = self.createSocket(.stream, address, pair_parent) catch |err| return mapPairResourceError(err);
         errdefer self.destroyLastSocket(left);
         const right = self.createSocket(.stream, address, pair_parent) catch |err| return mapPairResourceError(err);
@@ -342,7 +342,7 @@ pub const Network = struct {
         };
         self.bindConnectionIdentity(source, destination, bytes) catch return error.SystemResources;
         const sequence = self.allocatePacketSequence(source) catch return error.SystemResources;
-        const packet_id = ids.derive("sim-io.packet", source.id, sequence);
+        const packet_id = ids.derive("vopr-io.packet", source.id, sequence);
         self.packets.append(self.allocator, .{
             .id = packet_id,
             .sequence = sequence,
@@ -369,7 +369,7 @@ pub const Network = struct {
             const sequence = self.allocatePacketSequence(source) catch
                 return .{ error.SystemResources, index };
             self.packets.append(self.allocator, .{
-                .id = ids.derive("sim-io.datagram", source.id, sequence),
+                .id = ids.derive("vopr-io.datagram", source.id, sequence),
                 .sequence = sequence,
                 .source = source.handle,
                 .destination = destination.handle,
@@ -537,7 +537,7 @@ pub const Network = struct {
                 // delay. The receiver must never observe a hole in the stream.
                 self.packets.items[index].drop = false;
                 try sink.emit(allocator, .{
-                    .id = ids.derive("sim-io.packet-event", packet.id, 1),
+                    .id = ids.derive("vopr-io.packet-event", packet.id, 1),
                     .kind = .injected_error,
                     .actor_id = if (source) |s| s.id else 0,
                     .resource_id = if (destination) |d| d.id else 0,
@@ -572,7 +572,7 @@ pub const Network = struct {
             if (packet.bytes.len != 0) self.allocator.free(packet.bytes);
             _ = self.packets.orderedRemove(index);
             try sink.emit(allocator, .{
-                .id = ids.derive("sim-io.packet-event", packet.id, @intFromBool(packet.drop)),
+                .id = ids.derive("vopr-io.packet-event", packet.id, @intFromBool(packet.drop)),
                 .kind = if (packet.drop and !packet.close_write) .injected_error else .domain,
                 .actor_id = if (source) |s| s.id else 0,
                 .resource_id = if (destination) |d| d.id else 0,
@@ -595,7 +595,7 @@ pub const Network = struct {
     pub fn setOutboundEndpointOutage(self: *Network, address: ?std.Io.net.IpAddress) void {
         self.clearOutboundEndpointPayloadFault();
         self.faults.outbound_endpoint_down = if (address) |value|
-            ids.derive("sim-io.socket", ipEndpointIdentity("sim-io.ip-listener", value), 1)
+            ids.derive("vopr-io.socket", ipEndpointIdentity("vopr-io.ip-listener", value), 1)
         else
             null;
         for (self.socket_order.items) |socket_state| socket_state.outbound_fault_match_len = 0;
@@ -651,9 +651,9 @@ pub const Network = struct {
 
     fn connectToListener(self: *Network, listener: *SocketState, address: std.Io.net.IpAddress, owner_id: ids.StableId) !*SocketState {
         if (listener.pending_accept.items.len >= listener.backlog) return error.ConnectionRefused;
-        const connection_owner = ids.derive("sim-io.connection-owner", listener.id, owner_id);
+        const connection_owner = ids.derive("vopr-io.connection-owner", listener.id, owner_id);
         const connection_sequence = try self.allocateIdentitySequence(connection_owner);
-        const connection_parent = ids.derive("sim-io.connection", connection_owner, connection_sequence);
+        const connection_parent = ids.derive("vopr-io.connection", connection_owner, connection_sequence);
         const client = try self.createSocket(.stream, address, connection_parent);
         const server = self.createSocket(.stream, address, connection_parent) catch |err| {
             self.destroyLastSocket(client);
@@ -688,18 +688,18 @@ pub const Network = struct {
         std.debug.assert(!destination.connection_identity_bound);
 
         const content_owner = ids.derive(
-            "sim-io.connection-content",
+            "vopr-io.connection-content",
             source.connection_owner_id.?,
             ids.digest(first_bytes),
         );
         const occurrence = try self.allocateIdentitySequence(content_owner);
-        const connection_parent = ids.derive("sim-io.semantic-connection", content_owner, occurrence);
+        const connection_parent = ids.derive("vopr-io.semantic-connection", content_owner, occurrence);
         const client = if (source.connection_client) source else destination;
         const server = if (source.connection_client) destination else source;
         const old_client_id = client.id;
         const old_server_id = server.id;
-        client.id = ids.derive("sim-io.socket", connection_parent, 1);
-        server.id = ids.derive("sim-io.socket", connection_parent, 2);
+        client.id = ids.derive("vopr-io.socket", connection_parent, 1);
+        server.id = ids.derive("vopr-io.socket", connection_parent, 2);
         client.connection_identity_bound = true;
         server.connection_identity_bound = true;
 
@@ -710,12 +710,12 @@ pub const Network = struct {
     fn rebindSocketResources(self: *Network, old_socket_id: ids.StableId, new_socket_id: ids.StableId) !void {
         const wait_port = self.wait_port orelse return;
         try wait_port.rebind(
-            ids.derive("sim-io.socket-read", old_socket_id, 0),
-            ids.derive("sim-io.socket-read", new_socket_id, 0),
+            ids.derive("vopr-io.socket-read", old_socket_id, 0),
+            ids.derive("vopr-io.socket-read", new_socket_id, 0),
         );
         try wait_port.rebind(
-            ids.derive("sim-io.socket-write", old_socket_id, 0),
-            ids.derive("sim-io.socket-write", new_socket_id, 0),
+            ids.derive("vopr-io.socket-write", old_socket_id, 0),
+            ids.derive("vopr-io.socket-write", new_socket_id, 0),
         );
     }
 
@@ -729,7 +729,7 @@ pub const Network = struct {
         const sequence = try self.allocateIdentitySequence(identity_parent);
         socket_state.* = .{
             .handle = handle,
-            .id = ids.derive("sim-io.socket", identity_parent, sequence),
+            .id = ids.derive("vopr-io.socket", identity_parent, sequence),
             .kind = kind,
             .address = address,
         };
@@ -761,7 +761,7 @@ pub const Network = struct {
             if (peer.closed) return;
             const sequence = try self.allocatePacketSequence(socket_state);
             try self.packets.append(self.allocator, .{
-                .id = ids.derive("sim-io.stream-fin", socket_state.id, sequence),
+                .id = ids.derive("vopr-io.stream-fin", socket_state.id, sequence),
                 .sequence = sequence,
                 .source = socket_state.handle,
                 .destination = peer.handle,
@@ -908,7 +908,7 @@ pub const Network = struct {
         return error.AddressInUse;
     }
 
-    const network_id = ids.stable("sim-io", "network-v1");
+    const network_id = ids.stable("vopr-io", "network-v1");
 };
 
 fn copyLimited(destination: []u8, source: []const u8, offset: usize) usize {
@@ -945,9 +945,9 @@ fn takeBool(value: *bool) bool {
 }
 
 fn packetName(packet: Packet) []const u8 {
-    if (packet.close_write) return "sim-io.stream_fin";
-    if (packet.datagram) return if (packet.drop) "sim-io.datagram_drop" else "sim-io.datagram_deliver";
-    return if (packet.drop) "sim-io.packet_drop" else "sim-io.packet_deliver";
+    if (packet.close_write) return "vopr-io.stream_fin";
+    if (packet.datagram) return if (packet.drop) "vopr-io.datagram_drop" else "vopr-io.datagram_deliver";
+    return if (packet.drop) "vopr-io.packet_drop" else "vopr-io.packet_deliver";
 }
 
 fn ipAddressMatches(listener: std.Io.net.IpAddress, requested: std.Io.net.IpAddress) bool {
@@ -966,14 +966,14 @@ fn ipAddressMatches(listener: std.Io.net.IpAddress, requested: std.Io.net.IpAddr
 
 fn ipEndpointIdentity(namespace: []const u8, address: std.Io.net.IpAddress) ids.StableId {
     const address_id = switch (address) {
-        .ip4 => |ip4| ids.derive("sim-io.ip4-address", ids.digest(&ip4.bytes), ip4.port),
+        .ip4 => |ip4| ids.derive("vopr-io.ip4-address", ids.digest(&ip4.bytes), ip4.port),
         .ip6 => |ip6| blk: {
             const scoped = ids.derive(
-                "sim-io.ip6-scope",
+                "vopr-io.ip6-scope",
                 ids.digest(&ip6.bytes),
                 (@as(u64, ip6.flow) << 32) | ip6.interface.index,
             );
-            break :blk ids.derive("sim-io.ip6-address", scoped, ip6.port);
+            break :blk ids.derive("vopr-io.ip6-address", scoped, ip6.port);
         },
     };
     return ids.derive(namespace, Network.network_id, address_id);
@@ -1266,13 +1266,13 @@ test "stream FIN never overtakes earlier payload when reordering is enabled" {
 
     try network.enumerateReady(&ready, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
-    try std.testing.expectEqualStrings("sim-io.packet_deliver", ready.items.items[0].name);
+    try std.testing.expectEqualStrings("vopr-io.packet_deliver", ready.items.items[0].name);
     try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
 
     ready.items.clearRetainingCapacity();
     try network.enumerateReady(&ready, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
-    try std.testing.expectEqualStrings("sim-io.stream_fin", ready.items.items[0].name);
+    try std.testing.expectEqualStrings("vopr-io.stream_fin", ready.items.items[0].name);
     try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
 
     var bytes: [16]u8 = undefined;

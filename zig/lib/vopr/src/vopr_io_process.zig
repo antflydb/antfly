@@ -65,7 +65,7 @@ const Process = struct {
     cpu_budget: u64,
 
     fn resumeResource(self: *const Process) ids.StableId {
-        return ids.derive("sim-io.process-resume", self.logical_id, 0);
+        return ids.derive("vopr-io.process-resume", self.logical_id, 0);
     }
 };
 
@@ -119,7 +119,7 @@ pub const Table = struct {
         self.next_sequence +|= 1;
         process.* = .{
             .pid = pid,
-            .logical_id = ids.derive("sim-io.process", process_table_id, sequence),
+            .logical_id = ids.derive("vopr-io.process", process_table_id, sequence),
             .registration = registration,
             .argv_storage = copied.storage,
             .argv = copied.argv,
@@ -232,7 +232,7 @@ pub const Table = struct {
         self.allocator.destroy(process);
     }
 
-    const process_table_id = ids.stable("sim-io", "process-table-v1");
+    const process_table_id = ids.stable("vopr-io", "process-table-v1");
 };
 
 fn copyArgv(allocator: std.mem.Allocator, argv: []const []const u8) !struct { storage: []u8, argv: [][]const u8 } {

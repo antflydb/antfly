@@ -124,7 +124,7 @@ const Task = struct {
     reap_after_switch: bool = false,
 
     fn transitionId(self: *const Task) ids.StableId {
-        return ids.derive("sim-io.task-resume", self.id, self.resume_generation);
+        return ids.derive("vopr-io.task-resume", self.id, self.resume_generation);
     }
 
     fn contextBytes(self: *Task) []u8 {
@@ -203,7 +203,7 @@ fn taskCallsite(start: *const fn (*const anyopaque, *anyopaque) void) u64 {
 }
 
 fn taskIdentityScope(parent: ids.StableId, start: *const fn (*const anyopaque, *anyopaque) void) ids.StableId {
-    return ids.derive("sim-io.task-callsite", parent, taskCallsite(start));
+    return ids.derive("vopr-io.task-callsite", parent, taskCallsite(start));
 }
 
 pub const Execution = struct {
@@ -620,7 +620,7 @@ pub const Kernel = struct {
             task.external_id = new_resource_id;
             if (task.identity_parent != old_resource_id) continue;
             const waiter_sequence = next_identity;
-            task.id = ids.derive("sim-io.external-task", new_resource_id, waiter_sequence);
+            task.id = ids.derive("vopr-io.external-task", new_resource_id, waiter_sequence);
             task.identity_parent = new_resource_id;
             task.identity_sequence = waiter_sequence;
             next_identity += 1;
@@ -632,7 +632,7 @@ pub const Kernel = struct {
             if (task.status != .runnable) continue;
             try list.append(allocator, .{
                 .id = task.transitionId(),
-                .name = "sim-io.task_resume",
+                .name = "vopr-io.task_resume",
                 .kind = .scheduler,
                 .actor_id = task.id,
                 .resource_id = task.id,
@@ -644,8 +644,8 @@ pub const Kernel = struct {
                 if (task.status != .waiting_futex or task.futex_ptr != wake.ptr or
                     task.futex_wait_sequence > wake.eligible_through) continue;
                 try list.append(allocator, .{
-                    .id = ids.derive("sim-io.futex-wake", task.id, wake.sequence),
-                    .name = "sim-io.futex_wake",
+                    .id = ids.derive("vopr-io.futex-wake", task.id, wake.sequence),
+                    .name = "vopr-io.futex_wake",
                     .kind = .scheduler,
                     .actor_id = task.id,
                     .resource_id = self.futexIdentity(wake.ptr).?,
@@ -658,8 +658,8 @@ pub const Kernel = struct {
                 if (task.status != .waiting_external or task.external_id != wake.resource_id or
                     task.external_wait_sequence > wake.eligible_through) continue;
                 try list.append(allocator, .{
-                    .id = ids.derive("sim-io.external-wake", task.id, wake.sequence),
-                    .name = "sim-io.external_wake",
+                    .id = ids.derive("vopr-io.external-wake", task.id, wake.sequence),
+                    .name = "vopr-io.external_wake",
                     .kind = .scheduler,
                     .actor_id = task.id,
                     .resource_id = wake.resource_id,
@@ -685,7 +685,7 @@ pub const Kernel = struct {
             for (self.tasks.items) |task| {
                 if (task.status != .waiting_futex or task.futex_ptr != wake.ptr or
                     task.futex_wait_sequence > wake.eligible_through or
-                    ids.derive("sim-io.futex-wake", task.id, wake.sequence) != transition_id) continue;
+                    ids.derive("vopr-io.futex-wake", task.id, wake.sequence) != transition_id) continue;
                 task.makeRunnable();
                 const task_id = task.id;
                 wake.remaining -= 1;
@@ -699,7 +699,7 @@ pub const Kernel = struct {
             for (self.tasks.items) |task| {
                 if (task.status != .waiting_external or task.external_id != wake.resource_id or
                     task.external_wait_sequence > wake.eligible_through or
-                    ids.derive("sim-io.external-wake", task.id, wake.sequence) != transition_id) continue;
+                    ids.derive("vopr-io.external-wake", task.id, wake.sequence) != transition_id) continue;
                 task.makeRunnable();
                 const task_id = task.id;
                 wake.remaining -= 1;
@@ -773,7 +773,7 @@ pub const Kernel = struct {
             stack_alignment,
         );
         const entry_context: *Entry = @ptrFromInt(entry_address);
-        const task_id = ids.derive("sim-io.task", identity.parent, identity.sequence);
+        const task_id = ids.derive("vopr-io.task", identity.parent, identity.sequence);
         task.* = .{
             .kernel = self,
             .id = task_id,
@@ -1009,7 +1009,7 @@ pub const Kernel = struct {
             break;
         }
         const identity = try self.allocateFutexIdentity();
-        const logical_id = ids.derive("sim-io.futex", identity.parent, identity.sequence);
+        const logical_id = ids.derive("vopr-io.futex", identity.parent, identity.sequence);
         try self.futex_identities.append(self.allocator, .{ .ptr = ptr, .id = logical_id });
         return logical_id;
     }
@@ -1037,7 +1037,7 @@ pub const Kernel = struct {
     fn bindExternalIdentity(self: *Kernel, task: *Task, resource_id: ids.StableId) !void {
         if (task.external_identity_bound) return;
         const waiter_sequence = try self.allocateExternalWaiterIdentity(resource_id);
-        task.id = ids.derive("sim-io.external-task", resource_id, waiter_sequence);
+        task.id = ids.derive("vopr-io.external-task", resource_id, waiter_sequence);
         task.identity_parent = resource_id;
         task.identity_sequence = waiter_sequence;
         task.external_identity_bound = true;
@@ -1066,7 +1066,7 @@ pub const Kernel = struct {
         return null;
     }
 
-    const capability_kernel_id = ids.stable("sim-io", "task-kernel-v1");
+    const capability_kernel_id = ids.stable("vopr-io", "task-kernel-v1");
 };
 
 test "inactive futex address reuse starts a new logical contention epoch" {
@@ -1202,7 +1202,7 @@ test "parked external task migrates to a semantic resource identity" {
     try kernel.rebindExternalResource(provisional, semantic);
     try std.testing.expectEqual(semantic, task.external_id.?);
     try std.testing.expectEqual(semantic, task.identity_parent);
-    try std.testing.expectEqual(ids.derive("sim-io.external-task", semantic, 1), task.id);
+    try std.testing.expectEqual(ids.derive("vopr-io.external-task", semantic, 1), task.id);
 }
 
 test "task kernel parks future await and exposes each resume" {
@@ -1322,20 +1322,20 @@ test "futex wake cannot be stolen by a waiter that parks later" {
     ready.items.clearRetainingCapacity();
     try kernel.enumerateReady(&ready, std.heap.page_allocator);
     const second_resume = for (ready.items.items) |candidate| {
-        if (std.mem.eql(u8, candidate.name, "sim-io.task_resume")) break candidate;
+        if (std.mem.eql(u8, candidate.name, "vopr-io.task_resume")) break candidate;
     } else return error.MissingSecondWaiterResume;
     _ = (try kernel.executeReady(second_resume.id)).?;
 
     ready.items.clearRetainingCapacity();
     try kernel.enumerateReady(&ready, std.heap.page_allocator);
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
-    try std.testing.expectEqualStrings("sim-io.futex_wake", ready.items.items[0].name);
+    try std.testing.expectEqualStrings("vopr-io.futex_wake", ready.items.items[0].name);
     _ = (try kernel.executeReady(ready.items.items[0].id)).?;
 
     ready.items.clearRetainingCapacity();
     try kernel.enumerateReady(&ready, std.heap.page_allocator);
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
-    try std.testing.expectEqualStrings("sim-io.task_resume", ready.items.items[0].name);
+    try std.testing.expectEqualStrings("vopr-io.task_resume", ready.items.items[0].name);
     _ = (try kernel.executeReady(ready.items.items[0].id)).?;
     try std.testing.expect(shared.first_done);
     try std.testing.expect(!shared.second_done);

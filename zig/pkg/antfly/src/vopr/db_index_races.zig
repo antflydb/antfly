@@ -400,7 +400,7 @@ pub const TextAdmissionScenario = struct {
             try enabled.canonicalize();
             if (enabled.items.items.len == 0) return error.DbIndexAdmissionDeadlock;
             const selected = for (enabled.items.items) |candidate| {
-                if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) break candidate;
+                if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) break candidate;
             } else enabled.items.items[0];
             try scheduler.executeReady(selected.id, &events, self.allocator);
         }

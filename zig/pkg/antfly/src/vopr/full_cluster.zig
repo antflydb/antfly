@@ -16,7 +16,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 19;
+    pub const version: u32 = 20;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -29,6 +29,7 @@ pub const Scenario = struct {
     const graph_split_partial_write_id = vopr.id.stable(name, "public-graph-active-split-partial-write-completes");
     const production_resource_split_id = vopr.id.stable(name, "production-owner-resource-denial-recovers-during-split");
     const production_join_split_id = vopr.id.stable(name, "public-distributed-join-survives-active-split");
+    const production_durable_join_takeover_id = vopr.id.stable(name, "public-durable-shuffle-finalizer-takeover");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
     const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
@@ -54,6 +55,7 @@ pub const Scenario = struct {
         .{ .id = graph_split_partial_write_id, .name = name ++ ".public-graph-active-split-partial-write-completes", .kind = .always },
         .{ .id = production_resource_split_id, .name = name ++ ".production-owner-resource-denial-recovers-during-split", .kind = .always },
         .{ .id = production_join_split_id, .name = name ++ ".public-distributed-join-survives-active-split", .kind = .always },
+        .{ .id = production_durable_join_takeover_id, .name = name ++ ".public-durable-shuffle-finalizer-takeover", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
         .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
@@ -88,6 +90,7 @@ pub const Scenario = struct {
         production_data_plane_graph_split_partial_write,
         production_data_plane_graph_split_resource_pressure,
         production_data_plane_join_split,
+        production_data_plane_durable_join_takeover,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
@@ -98,12 +101,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_graph_split_owner_restart or
                 self == .production_data_plane_graph_split_partial_write or
                 self == .production_data_plane_graph_split_resource_pressure or
-                self == .production_data_plane_join_split;
+                self == .production_data_plane_join_split or
+                self == .production_data_plane_durable_join_takeover;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -140,6 +144,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "production-data-plane-graph-split-partial-write"),
         vopr.id.stable(name, "production-data-plane-graph-split-resource-pressure"),
         vopr.id.stable(name, "production-data-plane-join-split"),
+        vopr.id.stable(name, "production-data-plane-durable-join-takeover"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -160,6 +165,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-graph-split-partial-write",
         name ++ ".production-data-plane-graph-split-resource-pressure",
         name ++ ".production-data-plane-join-split",
+        name ++ ".production-data-plane-durable-join-takeover",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -171,6 +177,7 @@ pub const Scenario = struct {
     const production_graph_split_partial_write_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_partial_write);
     const production_graph_split_resource_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_resource_pressure);
     const production_join_split_ordinal: usize = @intFromEnum(Mode.production_data_plane_join_split);
+    const production_durable_join_takeover_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_takeover);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -257,6 +264,9 @@ pub const Scenario = struct {
         join_query_ok: bool = false,
         split_join_query_ok: bool = false,
         post_split_join_query_ok: bool = false,
+        join_finalizer_ack_failure_injected: bool = false,
+        join_finalizer_persisted_group_id: u64 = 0,
+        durable_join_takeover_ok: bool = false,
         graph_query_ok: bool = false,
         split_graph_inflight_started: bool = false,
         split_graph_inflight_complete: bool = false,
@@ -394,6 +404,9 @@ pub const Scenario = struct {
                     .join_query_ok = snapshot.join_query_ok,
                     .split_join_query_ok = snapshot.split_join_query_ok,
                     .post_split_join_query_ok = snapshot.post_split_join_query_ok,
+                    .join_finalizer_ack_failure_injected = snapshot.join_finalizer_ack_failure_injected,
+                    .join_finalizer_persisted_group_id = snapshot.join_finalizer_persisted_group_id,
+                    .durable_join_takeover_ok = snapshot.durable_join_takeover_ok,
                     .graph_query_ok = snapshot.graph_query_ok,
                     .split_graph_inflight_started = snapshot.split_graph_inflight_started,
                     .split_graph_inflight_complete = snapshot.split_graph_inflight_complete,
@@ -494,12 +507,16 @@ pub const Scenario = struct {
                         mode == .production_data_plane_graph_split_partial_write or
                         mode == .production_data_plane_graph_split_resource_pressure,
                 );
-                self.production_cluster.?.setJoinEnabled(mode == .production_data_plane_join_split);
+                self.production_cluster.?.setJoinEnabled(
+                    mode == .production_data_plane_join_split or
+                        mode == .production_data_plane_durable_join_takeover,
+                );
                 self.production_cluster.?.setFaultMode(switch (mode) {
                     .production_data_plane_graph_split_transport_failure => .graph_transport_failure,
                     .production_data_plane_graph_split_owner_restart => .graph_owner_restart,
                     .production_data_plane_graph_split_partial_write => .graph_partial_write,
                     .production_data_plane_graph_split_resource_pressure => .resource_pressure,
+                    .production_data_plane_durable_join_takeover => .join_finalizer_ack_failure,
                     else => .clean,
                 });
                 self.production_cluster.?.bootstrap() catch |err| {
@@ -705,6 +722,11 @@ pub const Scenario = struct {
                     .resource,
                     domain_id,
                 ),
+                .production_data_plane_durable_join_takeover => for (process_domains[0..3], 0..) |domain_id, index| try deployment.activateFault(
+                    vopr.id.derive("full-cluster.production-durable-join-finalizer-ack-failure", domain_id, index),
+                    .custom,
+                    domain_id,
+                ),
                 .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split => {},
             }
         }
@@ -847,6 +869,9 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".public-distributed-join", @intFromBool(if (cluster) |snapshot| snapshot.join_query_ok else false));
         try builder.addNamed(allocator, name ++ ".public-split-distributed-join", @intFromBool(if (cluster) |snapshot| snapshot.split_join_query_ok else false));
         try builder.addNamed(allocator, name ++ ".public-post-split-distributed-join", @intFromBool(if (cluster) |snapshot| snapshot.post_split_join_query_ok else false));
+        try builder.addNamed(allocator, name ++ ".durable-join-finalizer-ack-failure", @intFromBool(if (cluster) |snapshot| snapshot.join_finalizer_ack_failure_injected else false));
+        try builder.addNamed(allocator, name ++ ".durable-join-persisted-owner", if (cluster) |snapshot| @intCast(snapshot.join_finalizer_persisted_group_id) else 0);
+        try builder.addNamed(allocator, name ++ ".durable-join-takeover", @intFromBool(if (cluster) |snapshot| snapshot.durable_join_takeover_ok else false));
         try builder.addNamed(allocator, name ++ ".public-cross-range-graph-query", @intFromBool(if (cluster) |snapshot| snapshot.graph_query_ok else false));
         try builder.addNamed(allocator, name ++ ".public-split-graph-inflight-started", @intFromBool(if (cluster) |snapshot| snapshot.split_graph_inflight_started else false));
         try builder.addNamed(allocator, name ++ ".public-split-graph-inflight-complete", @intFromBool(if (cluster) |snapshot| snapshot.split_graph_inflight_complete else false));
@@ -968,6 +993,11 @@ pub const Scenario = struct {
         try sink.check(allocator, production_join_split_id, !state.complete or state.mode.? != .production_data_plane_join_split or
             (cluster != null and cluster.?.join_query_ok and cluster.?.split_join_query_ok and
                 cluster.?.post_split_join_query_ok));
+        try sink.check(allocator, production_durable_join_takeover_id, !state.complete or state.mode.? != .production_data_plane_durable_join_takeover or
+            (cluster != null and cluster.?.join_query_ok and
+                cluster.?.join_finalizer_ack_failure_injected and
+                cluster.?.join_finalizer_persisted_group_id != 0 and
+                cluster.?.durable_join_takeover_ok));
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
                 cluster.?.graph_query_ok));
@@ -1044,11 +1074,12 @@ fn runExactMode(
     const production_graph_split_partial_write_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_partial_write_ordinal];
     const production_graph_split_resource_pressure_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_resource_pressure_ordinal];
     const production_join_split_mode = mode_id == Scenario.mode_ids[Scenario.production_join_split_ordinal];
+    const production_durable_join_takeover_mode = mode_id == Scenario.mode_ids[Scenario.production_durable_join_takeover_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
         production_graph_split_transport_mode or production_graph_split_owner_restart_mode or
         production_graph_split_partial_write_mode or production_graph_split_resource_pressure_mode or
-        production_join_split_mode;
+        production_join_split_mode or production_durable_join_takeover_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
     // truth, while comparable scheduling ensures the experiment changes the
@@ -1056,6 +1087,8 @@ fn runExactMode(
     // unrelated schedule solely because a new enum ordinal was appended.
     const schedule_ordinal = if (production_join_split_mode)
         Scenario.production_split_ordinal
+    else if (production_durable_join_takeover_mode)
+        Scenario.production_graph_ordinal
     else if (production_graph_split_owner_restart_mode or
         production_graph_split_partial_write_mode or production_graph_split_resource_pressure_mode)
         Scenario.production_graph_split_transport_ordinal
@@ -1073,7 +1106,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_join_split_mode)
+            (if (production_durable_join_takeover_mode)
+                "full-cluster-vopr-v20-durable-join-takeover"
+            else if (production_join_split_mode)
                 "full-cluster-vopr-v19-join-split"
             else if (production_graph_split_resource_pressure_mode)
                 "full-cluster-vopr-v18-graph-split-resource-pressure"
@@ -1272,6 +1307,19 @@ test "full cluster production data plane distributed join active split exact rep
         Scenario.mode_ids[ordinal],
         ordinal,
         420_000,
+        .complete,
+    );
+}
+
+test "full cluster production data plane durable shuffle join finalizer takeover exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_durable_join_takeover_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        300_000,
         .complete,
     );
 }

@@ -229,7 +229,7 @@ pub const PrefixedFairSeeded = struct {
         var weighted = false;
         var total_weight: u64 = 0;
         for (request.enabled) |candidate| {
-            if (std.mem.eql(u8, candidate.name, "sim-io.time_advance") or
+            if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance") or
                 std.mem.eql(u8, candidate.name, "runtime.time_advance")) continue;
             runnable_count += 1;
             if (candidate.weight == 0) return error.InvalidTransitionWeight;
@@ -243,7 +243,7 @@ pub const PrefixedFairSeeded = struct {
         else
             self.fallback.prng.random().intRangeLessThan(u64, 0, runnable_count);
         for (request.enabled) |candidate| {
-            if (std.mem.eql(u8, candidate.name, "sim-io.time_advance") or
+            if (std.mem.eql(u8, candidate.name, "vopr-io.time_advance") or
                 std.mem.eql(u8, candidate.name, "runtime.time_advance")) continue;
             const width: u64 = if (weighted) candidate.weight else 1;
             if (ordinal < width) return candidate.id;
@@ -298,7 +298,7 @@ pub const PrefixedCooperativeSeeded = struct {
         if (self.preferred_actor) |actor_id| {
             for (request.enabled) |candidate| {
                 if (candidate.actor_id == actor_id and
-                    std.mem.eql(u8, candidate.name, "sim-io.task_resume"))
+                    std.mem.eql(u8, candidate.name, "vopr-io.task_resume"))
                     return self.noteSelection(request, candidate.id);
             }
             self.preferred_actor = null;
@@ -342,9 +342,9 @@ pub const PrefixedCooperativeSeeded = struct {
                 return selected_id;
             }
             self.non_time_choices +|= 1;
-            if (std.mem.eql(u8, candidate.name, "sim-io.task_resume") or
-                std.mem.eql(u8, candidate.name, "sim-io.futex_wake") or
-                std.mem.eql(u8, candidate.name, "sim-io.external_wake"))
+            if (std.mem.eql(u8, candidate.name, "vopr-io.task_resume") or
+                std.mem.eql(u8, candidate.name, "vopr-io.futex_wake") or
+                std.mem.eql(u8, candidate.name, "vopr-io.external_wake"))
                 self.preferred_actor = candidate.actor_id;
             break;
         }
@@ -352,7 +352,7 @@ pub const PrefixedCooperativeSeeded = struct {
     }
 
     fn isTimeAdvance(name: []const u8) bool {
-        return std.mem.eql(u8, name, "sim-io.time_advance") or
+        return std.mem.eql(u8, name, "vopr-io.time_advance") or
             std.mem.eql(u8, name, "runtime.time_advance");
     }
 
@@ -877,7 +877,7 @@ test "prefixed seeded source forces reviewed setup then explores its suffix" {
 
 test "prefixed fair seeded source postpones time while application work is runnable" {
     const enabled = [_]transition.Transition{
-        .{ .id = 1, .name = "sim-io.time_advance", .kind = .scheduler },
+        .{ .id = 1, .name = "vopr-io.time_advance", .kind = .scheduler },
         .{ .id = 2, .name = "request.ready", .kind = .workload },
     };
     var prefixed = PrefixedFairSeeded.init(&.{1}, 19);
@@ -899,9 +899,9 @@ test "prefixed fair seeded source postpones time while application work is runna
 
 test "prefixed cooperative source runs one fiber until it parks" {
     const both = [_]transition.Transition{
-        .{ .id = 1, .name = "sim-io.time_advance", .kind = .scheduler },
-        .{ .id = 2, .name = "sim-io.task_resume", .kind = .scheduler, .actor_id = 20 },
-        .{ .id = 3, .name = "sim-io.task_resume", .kind = .scheduler, .actor_id = 30 },
+        .{ .id = 1, .name = "vopr-io.time_advance", .kind = .scheduler },
+        .{ .id = 2, .name = "vopr-io.task_resume", .kind = .scheduler, .actor_id = 20 },
+        .{ .id = 3, .name = "vopr-io.task_resume", .kind = .scheduler, .actor_id = 30 },
     };
     var cooperative = PrefixedCooperativeSeeded.init(&.{1}, 23);
     const source = cooperative.source();
@@ -944,19 +944,19 @@ test "prefixed cooperative source runs one fiber until it parks" {
 test "prefixed cooperative source hands a selected wake to its waiter" {
     const wake = transition.Transition{
         .id = 2,
-        .name = "sim-io.external_wake",
+        .name = "vopr-io.external_wake",
         .kind = .scheduler,
         .actor_id = 20,
     };
     const unrelated = transition.Transition{
         .id = 3,
-        .name = "sim-io.task_resume",
+        .name = "vopr-io.task_resume",
         .kind = .scheduler,
         .actor_id = 30,
     };
     const waiter = transition.Transition{
         .id = 4,
-        .name = "sim-io.task_resume",
+        .name = "vopr-io.task_resume",
         .kind = .scheduler,
         .actor_id = 20,
     };
@@ -978,7 +978,7 @@ test "prefixed cooperative source hands a selected wake to its waiter" {
 }
 
 test "prefixed cooperative source eventually advances time around runnable service work" {
-    const time = transition.Transition{ .id = 1, .name = "sim-io.time_advance", .kind = .scheduler };
+    const time = transition.Transition{ .id = 1, .name = "vopr-io.time_advance", .kind = .scheduler };
     const service = transition.Transition{ .id = 2, .name = "service.poll", .kind = .scheduler };
     var cooperative = PrefixedCooperativeSeeded.init(&.{ service.id, service.id }, 23);
     cooperative.max_non_time_choices = 2;

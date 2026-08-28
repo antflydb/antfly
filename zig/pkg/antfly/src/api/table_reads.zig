@@ -2832,10 +2832,16 @@ pub const ProvisionedTableReadSource = struct {
                 .search_result_group_local = searchResultGroupLocal,
                 .text_stats_group_local = textStatsGroupLocal,
                 .algebraic_partials_group_local = algebraicPartialsGroupLocal,
-                .join_partition_group_local = null,
-                .join_rows_group_local = null,
-                .join_unmatched_group_local = null,
-                .join_finalize_group_local = null,
+                // Route only the remote half of exact-group join work. Local
+                // routes return a typed sentinel so distributed_join executes
+                // against this source's resident DB and admission owner
+                // exactly once; a failed remote request must never be mistaken
+                // for permission to execute a foreign group locally.
+                .join_partition_group_local_with_timeout = joinPartitionGroupRemote,
+                .join_rows_group_local_with_timeout = joinRowsGroupRemote,
+                .join_unmatched_group_local_with_timeout = joinUnmatchedGroupRemote,
+                .join_finalize_group_local_with_timeout = joinFinalizeGroupRemote,
+                .join_job_state_group_local = joinJobStateGroupRemote,
                 .graph_expand_group_local = graphExpandGroupLocal,
                 .graph_hydrate_group_local = graphHydrateGroupLocal,
                 .graph_edges_group_local = graphEdgesGroupLocal,
@@ -3891,6 +3897,112 @@ pub const ProvisionedTableReadSource = struct {
             };
         }
         unreachable;
+    }
+
+    fn joinPartitionGroupRemote(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const router = self.distributed_router orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => error.JoinWorkerOwnedLocally,
+            .remote => |remote| joinPartitionRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
+    }
+
+    fn joinRowsGroupRemote(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const router = self.distributed_router orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => error.JoinWorkerOwnedLocally,
+            .remote => |remote| joinRowsRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
+    }
+
+    fn joinUnmatchedGroupRemote(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const router = self.distributed_router orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => error.JoinWorkerOwnedLocally,
+            .remote => |remote| joinUnmatchedRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
+    }
+
+    fn joinFinalizeGroupRemote(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+        timeout_ms: ?u32,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const router = self.distributed_router orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            .local => error.JoinWorkerOwnedLocally,
+            .remote => |remote| joinFinalizeRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body, timeout_ms) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
+    }
+
+    fn joinJobStateGroupRemote(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        table_name: []const u8,
+        body: []const u8,
+    ) !?query_api.QueryResponse {
+        const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        const router = self.distributed_router orelse return null;
+        var route = (try table_router.resolveGroupRoute(alloc, self.catalog, router, group_id, routePolicyForConsistency(.read_index))) orelse return null;
+        defer route.deinit(alloc);
+        return switch (route) {
+            // The caller already checked its node-local durable store before
+            // requesting a handoff import.
+            .local => null,
+            .remote => |remote| joinJobStateRemote(self.distributedInternalExecutor(), alloc, remote.base_uri, group_id, table_name, body) catch |err| switch (err) {
+                error.UnexpectedHttpStatus => null,
+                else => err,
+            },
+        };
     }
 
     fn graphExpandGroupLocal(

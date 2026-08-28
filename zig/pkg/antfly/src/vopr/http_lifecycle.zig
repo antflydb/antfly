@@ -57,7 +57,7 @@ fn driveUntilQuiescent(
             // Prefer concrete work over a timeout while a request can still
             // advance; time remains enabled and is selected when it is the
             // only progress transition.
-            if (!std.mem.eql(u8, candidate.name, "sim-io.time_advance")) {
+            if (!std.mem.eql(u8, candidate.name, "vopr-io.time_advance")) {
                 selected = candidate;
                 break;
             }
