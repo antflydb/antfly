@@ -418,7 +418,7 @@ runs registered production entrypoints in one virtual `std.Io` world.
 | --- | --- | --- |
 | Multiple logical nodes and clients | Multiple containers or pods | Integrated in metadata, distributed-data, distributed-transaction, Raft, HA, and data-plane suites |
 | Link and packet faults | Asymmetric latency, loss, clogs, partitions, and recovery | Integrated drop, duplicate, reorder, delay, jam, outage, directional partition, and healing |
-| Node lifecycle and pressure | Pause, stop/kill, restart, and throttling | Integrated pause, crash/restart, CPU work, descriptor, socket, allocator, and storage limits |
+| Node lifecycle and pressure | Pause, stop/kill, restart, and throttling | Integrated at registered process/resource seams: pause, crash/restart, CPU-work exhaustion, descriptor, socket, allocator, and storage limits. Reversible per-node CPU throttling/modulation and arbitrary native-thread pause are not implemented |
 | Deterministic replay and branching | Deterministic hypervisor execution | Exact choice/transition/observation replay plus reduction and multiverse branching |
 | Whole unmodified deployment | Arbitrary containerized binaries and sidecars | Deliberate non-goal; only registered in-process entrypoints are deterministic |
 | One full Antfly deployment history | Runs a supplied Docker Compose or Kubernetes topology | Integrated in-process at named complementary seams: v17 runs the real metadata quorum, three production DataServer/data-Raft owners, public two-table I/O, serverless catalog, a metadata-driven active split, and public graph work before/during/after that split with a fail-closed next-owner transport cut, a stable-endpoint next-owner process restart, and an exactly observed recoverable short write; v9 supplies the hosted public graph and broader nine-fault vocabulary. Both exact-replay, but v9's topology/resource breadth, broader short-write surfaces, and broader restart overlaps are not yet on the production owners. Co-resident HA and richer cross-domain overlap remain ongoing. Native sidecars, DNS, kernels, and mixed binaries remain differential concerns |
@@ -1989,6 +1989,30 @@ scenarios and operational tooling rather than missing foundational
 infrastructure. They are not a second numbered phase plan and are not
 dependencies of the already implemented domain suites.
 
+### Current Answer: Coverage, Parity, and Completeness
+
+The short answer is **yes, there are still valuable VOPR tests and
+Antithesis-class features to add; no, the complete roadmap is not
+implemented**. The reusable deterministic runtime is no longer the main gap.
+The highest-value work is composing more production owners, workflows, and
+fault domains in the same replayable history.
+
+| Question | Current answer | Highest-value next work |
+| --- | --- | --- |
+| Where should Antfly add VOPR testing? | At production orchestration boundaries that combine durable state, ownership, public visibility, and recovery | Deepen the v17 production-owner cluster with topology/resource faults and broader restart/short-write overlap; finish the repository-wide strong-read contract and managed-index publication/readiness; add public distributed joins/global queries; then compose metadata administration, MCP/A2A, cloud authentication, extension invocation, and live credential/provider replacement |
+| Which Antithesis ideas remain worth porting locally? | The large engine features are implemented at the registered in-process boundary, but several useful layers remain | Rich event-set algebra and live/count/validation queries; reversible per-node service-rate/CPU throttling distinct from CPU-budget termination; transitive determinism auditing; nightly sharding, retention, quarantine review, notifications, and dashboards; compiler coverage as guidance when Zig instrumentation is stable |
+| Is distributed VOPR missing? | No at the application/runtime foundation: logical nodes, directional links, process/storage/resource domains, independent faults, quiet suffixes, and exact replay exist | Whole-deployment breadth is incomplete. Co-resident HA/data-plane/serverless ownership, disk/socket pressure, richer fault overlap, separate-address-space agents, and live mixed binaries are not all implemented |
+| Are the features called finished actually finished? | Only within each narrowly stated **integrated** seam and its named green replay gate | Do not infer current aggregate health, transitive call-graph determinism, every cross-domain combination, arbitrary native/container determinism, or Antithesis product parity. Partial, ongoing, conditional, and explicitly excluded work remains unfinished |
+
+The distinction between a green focused seam and a finished platform is
+material. At this checkpoint the reusable engine and registered-source audit
+are green, and the cited v13-v17 production-owner gates passed their complete
+record/fresh-world replay oracles. The repository-wide `vopr-test` aggregate is
+not currently cited as green, the dedicated v12 deep result is from its named
+earlier checkpoint, and a source-manifest audit is not a proof over every
+transitive production callee. These limitations are part of the completion
+claim, not footnotes to it.
+
 ### Verification Audit and Meaning of "Finished"
 
 The 2026-08-26 design audit forced every exported scenario module into test
@@ -2653,6 +2677,14 @@ work already completed:
   an active run. These are useful self-contained equivalents of the current
   [Antithesis event-search API](https://antithesis.com/docs/reference/rest_api/),
   without requiring its hosted Logs Explorer;
+- add reversible, node-scoped service-rate throttling and CPU-cost modulation
+  as explicit fault effects. Current virtual processes can pause/resume and
+  terminate on a deterministic CPU-work budget, while scheduler starvation and
+  optional safepoints explore cooperative task interleavings; those mechanisms
+  do not yet model a node becoming temporarily slower or the relative cost of
+  operation classes. Arbitrary instruction-level native-thread pausing remains
+  a federated/native instrumentation concern rather than an in-process
+  completion claim;
 - make nightly campaign sharding, corpus merge, retention, quarantine review,
   usage indexing, and notifications a repository-owned operational workflow;
 - extend the registered-source determinism audit through transitive production
@@ -2903,10 +2935,13 @@ The detailed backlog behind that summary is:
 3. Co-locate production HA and data-plane owners, extend the integrated
    node-memory denial/recovery mode to disk and socket pressure, and combine
    directional link, storage-crash, restart, serverless lease/object-store,
-   and pressure faults. The real metadata/placement Raft wire hop, serverless
-   public catalog path, memory-pressure recovery, and quiet cluster-wide suffix
-   are complete at their named seams; broaden their fault combinations after
-   item 1 instead of rebuilding them.
+   and pressure faults. Add reversible per-node service-rate/CPU throttling as
+   a distinct fault from the current CPU-work exhaustion budget, and overlap
+   it with elections, fanout, maintenance, and quiet-suffix recovery. The real
+   metadata/placement Raft wire hop, serverless public catalog path, memory-
+   pressure recovery, and quiet cluster-wide suffix are complete at their
+   named seams; broaden their fault combinations after item 1 instead of
+   rebuilding them.
 4. Extend full-cluster workload dimensions instead of multiplying suites:
    authenticated multi-tenant identities in addition to current two-table
    isolation, concurrent range split and replicated merge routing changes,
