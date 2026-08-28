@@ -3854,14 +3854,15 @@ pub const Reader = struct {
             const input_live_bytes = std.math.add(usize, encoded.len, if (globals) |bytes| bytes.len else 0) catch return error.PdfDecodeWorkingSetTooLarge;
             if (input_live_bytes >= local_decode_limits.max_working_set_bytes) return error.PdfDecodeWorkingSetTooLarge;
             try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ input_live_bytes, expected_bitmap_bytes, coverage_bytes, render_rgba_len });
-            const decoder_working_set = local_decode_limits.max_working_set_bytes - input_live_bytes;
-
             var decoded = jbig2.decodeAlloc(
                 self.alloc,
                 if (globals) |bytes| bytes else null,
                 encoded,
                 local_decode_limits.max_decoded_stream_bytes,
-                decoder_working_set,
+                // decodeAlloc includes `encoded` and globals in its own live
+                // working-set ledger. Pass the complete local envelope so the
+                // same borrowed inputs are not subtracted a second time.
+                local_decode_limits.max_working_set_bytes,
                 jbig2DecodeWorkLimit(pixel_count),
                 .{ .width = width, .height = height },
             ) catch |err| switch (err) {
@@ -15684,6 +15685,50 @@ test "image decode preflights RGBA working set before JBIG2 codec work" {
     var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
     defer image.deinit(alloc);
     try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, reader.decodeImageToRgbaAlloc(&image));
+}
+
+test "JBIG2 input is charged once across the reader and codec budgets" {
+    const alloc = std.testing.allocator;
+    const page = [_]u8{
+        0, 0, 0, 0, 48, 0, 1, 0, 0, 0, 19,
+        0, 0, 0, 1, 0,  0, 0, 1, 0, 0, 0,
+        0, 0, 0, 0, 0,  0, 0, 0,
+    };
+    const extension_header = [_]u8{
+        0, 0, 0, 1, 62, 0, 0, 0, 0, 2, 188, // 700-byte payload.
+    };
+    var stream: [page.len + extension_header.len + 700]u8 = @splat(0);
+    @memcpy(stream[0..page.len], &page);
+    @memcpy(stream[page.len .. page.len + extension_header.len], &extension_header);
+    // A valid, non-necessary comment extension keeps the encoded input above
+    // half the configured envelope without requiring decoder scratch space.
+    stream[page.len + extension_header.len] = 0x20;
+
+    const image_object = try std.fmt.allocPrint(
+        alloc,
+        "5 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /JBIG2Decode /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        .{ stream.len, &stream },
+    );
+    defer alloc.free(image_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        "2 0 obj\nnull\nendobj\n",
+        "3 0 obj\nnull\nendobj\n",
+        "4 0 obj\nnull\nendobj\n",
+        image_object,
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var reader = try Reader.initWithDecodeLimits(alloc, sample, .{
+        .max_decoded_stream_bytes = 1024,
+        .max_working_set_bytes = 1024,
+    });
+    defer reader.deinit();
+    var image = try reader.readIndirectObject(.{ .id = 5, .gen = 0 });
+    defer image.deinit(alloc);
+    const decoded = try reader.decodeImageToRgbaAlloc(&image);
+    defer alloc.free(decoded.rgba);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, decoded.rgba);
 }
 
 test "unsupported JBIG2 profiles normalize to renderer fallback" {

@@ -28750,6 +28750,13 @@ fn computeDocumentExtractionAssetRequestDerived(
     var downloaded_mut = downloaded;
     defer downloaded_mut.deinit(alloc);
 
+    // This direct precompute path allocates the downloaded source, decoded
+    // extraction result, and retained materialization state from `alloc`
+    // rather than an independently observed BudgetedAllocator. Keep its
+    // conservative operation reservation until those owners are destroyed at
+    // function exit. The streaming runtime can stage-release decoder credit
+    // because it accounts retained owners separately; this path cannot safely
+    // report that capacity free while its allocations remain live.
     var pdf_decode_reservation: ?resource_manager_mod.Reservation = null;
     defer if (pdf_decode_reservation) |*reservation| reservation.release();
     if (document_extraction_mod.resolvesToPdf(config, source_url, if (config.content_type.len > 0) config.content_type else downloaded_mut.content_type, downloaded_mut.data)) {
@@ -28789,12 +28796,6 @@ fn computeDocumentExtractionAssetRequestDerived(
         );
     } else if (document_extraction_mod.ocrEnabledForRoute(config, extraction.route_type) or config.transcription_enabled) {
         return error.MissingAssetProducer;
-    }
-    // Decoder capacity is a transient peak reservation. OCR has consumed all
-    // page renders, so release it before building retained extraction state.
-    if (pdf_decode_reservation) |*reservation| {
-        reservation.release();
-        pdf_decode_reservation = null;
     }
     document_extraction_mod.rebaseUnitCharOffsets(extraction.units);
 
