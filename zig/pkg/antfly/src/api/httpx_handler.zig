@@ -1250,6 +1250,7 @@ pub const AntflyApiHandler = struct {
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),
             error.TopologyChanged => textResponse(ctx, 409, "topology changed"),
             error.IdentityReadGenerationChanged => textResponse(ctx, 409, "identity read generation changed"),
+            error.GroupLeaderUnavailable => textResponse(ctx, 503, "group leader unavailable"),
             error.StorageReadTemporarilyUnavailable => textResponse(ctx, 503, "storage read temporarily unavailable"),
             error.Canceled => textResponse(ctx, 408, "request canceled"),
             error.DeadlineExceeded => textResponse(ctx, 504, "request deadline exceeded"),
@@ -4679,11 +4680,38 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("standby read unavailable");
             },
+            error.NotLeader,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.UnknownGroup,
+            => {
+                _ = ctx.status(503);
+                return ctx.text("group leader unavailable");
+            },
             error.PersistentDescriptorAdmissionExhausted,
+            error.ResourceBudgetExceeded,
+            error.WriterLocked,
+            error.LsmRootWriterAlreadyOpen,
+            error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
+            },
+            error.TopologyChanged,
+            error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch,
+            => {
+                _ = ctx.status(409);
+                return ctx.text("read topology changed");
+            },
+            error.Timeout, error.DeadlineExceeded => {
+                _ = ctx.status(504);
+                return ctx.text("request deadline exceeded");
+            },
+            error.Cancelled, error.Canceled => {
+                _ = ctx.status(408);
+                return ctx.text("request canceled");
             },
             else => return err,
         }) orelse {
@@ -4740,11 +4768,38 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("standby read unavailable");
             },
+            error.NotLeader,
+            error.LeaderUnavailable,
+            error.GroupLeaderUnavailable,
+            error.UnknownGroup,
+            => {
+                _ = ctx.status(503);
+                return ctx.text("group leader unavailable");
+            },
             error.PersistentDescriptorAdmissionExhausted,
+            error.ResourceBudgetExceeded,
+            error.WriterLocked,
+            error.LsmRootWriterAlreadyOpen,
+            error.ResidentDbRetryRequired,
             error.StorageReadTemporarilyUnavailable,
             => {
                 var response = try public_table_http.storageReadTemporarilyUnavailableOwnedResponse(alloc);
                 return respondOwnedApiResponse(ctx, &response);
+            },
+            error.TopologyChanged,
+            error.IdentityReadGenerationChanged,
+            error.DocIdentityNamespaceMismatch,
+            => {
+                _ = ctx.status(409);
+                return ctx.text("read topology changed");
+            },
+            error.Timeout, error.DeadlineExceeded => {
+                _ = ctx.status(504);
+                return ctx.text("request deadline exceeded");
+            },
+            error.Cancelled, error.Canceled => {
+                _ = ctx.status(408);
+                return ctx.text("request canceled");
             },
             else => return err,
         }) orelse {

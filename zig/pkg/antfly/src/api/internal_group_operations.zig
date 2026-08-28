@@ -610,15 +610,7 @@ pub const Operations = struct {
             input.key,
             options,
             input.consistency,
-        ) catch |err| switch (err) {
-            error.Timeout => return error.DeadlineExceeded,
-            error.Cancelled, error.Canceled => return error.Canceled,
-            error.TopologyChanged => return error.TopologyChanged,
-            error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
-            error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
-            error.StorageReadTemporarilyUnavailable => return error.StorageReadTemporarilyUnavailable,
-            else => return error.Internal,
-        };
+        ) catch |err| return mapLookupError(err);
         return result orelse error.NotFound;
     }
 
@@ -823,6 +815,31 @@ pub const Operations = struct {
         };
     }
 };
+
+fn mapLookupError(err: anyerror) Error {
+    return switch (err) {
+        error.Timeout => error.DeadlineExceeded,
+        error.Cancelled, error.Canceled => error.Canceled,
+        error.TopologyChanged => error.TopologyChanged,
+        error.IdentityReadGenerationChanged => error.IdentityReadGenerationChanged,
+        error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
+        error.NotLeader,
+        error.LeaderUnavailable,
+        error.GroupLeaderUnavailable,
+        error.UnknownGroup,
+        error.ReadUnavailable,
+        => error.GroupLeaderUnavailable,
+        error.PersistentDescriptorAdmissionExhausted,
+        error.ResourceBudgetExceeded,
+        error.WriterLocked,
+        error.LsmRootWriterAlreadyOpen,
+        error.ResidentDbRetryRequired,
+        error.StorageReadTemporarilyUnavailable,
+        => error.StorageReadTemporarilyUnavailable,
+        error.TableNotFound, error.NotFound => error.NotFound,
+        else => error.Internal,
+    };
+}
 
 fn ensurePreDecisionRequestActive(request: operation.RequestContext) Error!void {
     request.ensureActive() catch |err| switch (err) {
@@ -1412,6 +1429,13 @@ test "typed internal group reads preserve retryable resident storage failures" {
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.algebraicPartials(alloc, .{}, 7, "docs", "{}"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifest(alloc, .{}, 7, "docs", "doc:a", "chunks"));
     try std.testing.expectError(error.StorageReadTemporarilyUnavailable, operations.documentArtifactManifests(alloc, .{}, 7, "docs", "doc:a"));
+    try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.NotLeader));
+    try std.testing.expectEqual(error.GroupLeaderUnavailable, mapLookupError(error.UnknownGroup));
+    try std.testing.expectEqual(
+        error.StorageReadTemporarilyUnavailable,
+        mapLookupError(error.ResourceBudgetExceeded),
+    );
+    try std.testing.expectEqual(error.Internal, mapLookupError(error.CorruptInput));
 }
 
 test "internal group reads are callable without an HTTP request" {

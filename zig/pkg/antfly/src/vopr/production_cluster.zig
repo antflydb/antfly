@@ -12,6 +12,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_http_server = @import("../metadata/http_server.zig");
 const metadata_http_test_runtime = @import("../metadata/http_test_runtime.zig");
 const metadata_sim = @import("../metadata/sim_harness.zig");
+const raft_runtime_loop = @import("../raft/runtime_loop.zig");
 const raft_transport = @import("../raft/transport/mod.zig");
 const background_runtime = @import("../storage/background_runtime.zig");
 const api_http_client = @import("../api/http_client.zig");
@@ -83,6 +84,7 @@ pub const Fixture = struct {
         graph_transport_failure,
         graph_owner_restart,
         graph_partial_write,
+        resource_pressure,
     };
 
     pub const Phase = enum(u8) {
@@ -138,6 +140,8 @@ pub const Fixture = struct {
         "{\"inserts\":{\"doc:c\":{\"title\":\"production-left\"},\"doc:k\":{\"title\":\"production-split\"}},\"sync_level\":\"write\"}";
     const ordinary_right_batch_body =
         "{\"inserts\":{\"doc:x\":{\"title\":\"production-right\"}},\"sync_level\":\"write\"}";
+    const resource_probe_body =
+        "{\"inserts\":{\"pressure:probe\":{\"title\":\"pressure\",\"body\":\"production-owner-resource-recovery\"}},\"sync_level\":\"write\"}";
     const DataServer = data_runtime.DataServer;
 
     alloc: std.mem.Allocator,
@@ -235,6 +239,20 @@ pub const Fixture = struct {
     graph_partial_write_count_before: u64 = 0,
     graph_partial_write_target_index: usize = 0,
     graph_partial_write_target_configured: bool = false,
+    resource_reservations: [node_count]?resource_manager.BatchReservation = .{null} ** node_count,
+    resource_pressure_observed: bool = false,
+    resource_denial_sound: bool = false,
+    resource_denial_status: u16 = 0,
+    resource_denial_body_digest: u64 = 0,
+    resource_preproposal_denial: bool = false,
+    resource_outcome_unknown: bool = false,
+    resource_read_before_retry: bool = false,
+    resource_retry_attempted: bool = false,
+    resource_proposals_before: u64 = 0,
+    resource_proposals_after: u64 = 0,
+    resource_absent_before_retry: bool = false,
+    resource_recovery_sound: bool = false,
+    resource_post_split_sound: bool = false,
     graph_restart_requested: std.Io.Semaphore = .{},
     graph_restart_down: std.Io.Semaphore = .{},
     graph_restart_recover: std.Io.Semaphore = .{},
@@ -599,7 +617,7 @@ pub const Fixture = struct {
         event: api_distributed_graph.LifecycleEvent,
     ) void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
-        if (self.fault_mode == .clean) return;
+        if (self.fault_mode == .clean or self.fault_mode == .resource_pressure) return;
         switch (event.phase) {
             .expand_round_completed => {
                 if (!self.graph_transport_fault_armed or event.depth != 1) return;
@@ -627,6 +645,7 @@ pub const Fixture = struct {
                         self.sim.setOutboundEndpointPayloadPartialWrite(endpoint, "/graph-expand", 1) catch unreachable;
                         self.graph_partial_write_injected = true;
                     },
+                    .resource_pressure => unreachable,
                 }
             },
             .attempt_failed => {
@@ -650,6 +669,7 @@ pub const Fixture = struct {
                         self.graph_restart_recovered.wait(self.sim.io()) catch return;
                     },
                     .graph_partial_write => {},
+                    .resource_pressure => unreachable,
                 }
             },
             else => {},
@@ -891,14 +911,30 @@ pub const Fixture = struct {
         self.control_requests.post(self.sim.io());
         try self.control_completions.wait(self.sim.io());
         if (self.driver_failure) |err| return err;
-        // Preserve the production loop's one-millisecond control cadence and
-        // give the independently owned Raft and HTTP tasks a deterministic
-        // scheduling boundary before the next status observation.
-        try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        // Give independently owned Raft and HTTP tasks a deterministic
+        // scheduling boundary before the next status observation. Promoted
+        // histories retain their accelerated cadence; the resource campaign
+        // uses the managed production cadence because capacity can keep a
+        // committed apply pending for the full request deadline.
+        try self.sim.io().sleep(.fromMilliseconds(self.driverCadenceMs()), .awake);
+    }
+
+    fn driverCadenceMs(self: *const Fixture) i64 {
+        return if (self.fault_mode == .resource_pressure)
+            @intCast(raft_runtime_loop.RuntimeCadence.default_raft_tick_ms)
+        else
+            1;
     }
 
     fn driveRaft(self: *Fixture, index: usize) void {
         defer self.raft_driver_done[index] = true;
+        // Existing promoted histories intentionally use an accelerated 1 ms
+        // scheduling quantum. Resource admission can keep a committed apply
+        // pending for the full public request deadline; run that campaign at
+        // the managed production driver's real default cadence so it tests
+        // bounded retries rather than manufacturing thousands of hot-loop
+        // attempts that production would never schedule.
+        const cadence_ms = self.driverCadenceMs();
         while (!self.driver_stop) {
             if (self.data_server_paused[index] or !self.data_server_live[index]) {
                 self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err| {
@@ -910,7 +946,7 @@ pub const Fixture = struct {
                 continue;
             }
             self.raft_driver_active[index] = true;
-            self.data_servers[index].runRaftRoundOnly() catch |err| {
+            self.data_servers[index].runRaftProgressRoundOnly() catch |err| {
                 self.raft_driver_active[index] = false;
                 self.driver_failure = err;
                 self.driver_stop = true;
@@ -918,7 +954,7 @@ pub const Fixture = struct {
             };
             self.raft_driver_active[index] = false;
             self.raft_driver_rounds[index] +|= 1;
-            self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err| {
+            self.sim.io().sleep(.fromMilliseconds(cadence_ms), .awake) catch |err| {
                 if (err == error.Canceled and self.driver_stop) return;
                 self.driver_failure = err;
                 self.driver_stop = true;
@@ -1217,9 +1253,11 @@ pub const Fixture = struct {
         self.phase = .split_requested;
         if (self.graph_enabled) {
             try self.waitForSplitInProgress();
+            if (self.fault_mode == .resource_pressure)
+                try self.runResourcePressureDuringSplit();
             const ingress_before = self.public_request_ingress_count;
             self.split_graph_inflight_sound = probe: {
-                if (self.fault_mode != .clean) {
+                if (self.fault_mode != .clean and self.fault_mode != .resource_pressure) {
                     const start_leader_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.data_group_id) orelse
                         return error.ProductionDataGraphLeaderMissing;
                     const target_index = self.currentDataLeaderIndex(metadata_sim.VoprPublicClusterFixture.graph_data_group_id) orelse
@@ -1244,6 +1282,7 @@ pub const Fixture = struct {
                                     return error.ProductionGraphPartialWriteTargetLeadershipChanged;
                                 break :blk try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
                             },
+                        .resource_pressure => unreachable,
                     }
                     self.graph_transport_fault_armed = true;
                 }
@@ -1284,6 +1323,16 @@ pub const Fixture = struct {
         self.topology_sound = self.topology_sound and self.split_sound;
         self.phase = .post_split_read_complete;
         if (!self.split_sound) return error.ProductionDataSplitRoundTripFailed;
+
+        if (self.fault_mode == .resource_pressure) {
+            self.resource_post_split_sound = try self.lookupContains(
+                "docs",
+                "pressure:probe",
+                "production-owner-resource-recovery",
+            );
+            if (!self.resource_post_split_sound)
+                return error.ProductionDataResourceRecoveryLostAtSplitCutover;
+        }
 
         if (self.graph_enabled) {
             // The split key moves doc:k to the newly published destination
@@ -1370,7 +1419,7 @@ pub const Fixture = struct {
                             self.graph_partial_write_count_before + 1;
                     return self.split_graph_inflight_complete and self.graph_partial_write_observed;
                 }
-                if (self.fault_mode != .clean) return false;
+                if (self.fault_mode != .clean and self.fault_mode != .resource_pressure) return false;
                 return self.split_graph_inflight_complete;
             },
             409, 503 => {
@@ -1403,6 +1452,7 @@ pub const Fixture = struct {
                     return self.graph_partial_rejected_sound;
                 }
                 if (self.fault_mode == .graph_partial_write) return false;
+                if (self.fault_mode == .resource_pressure) return false;
                 return self.split_graph_inflight_rejected;
             },
             else => return error.UnexpectedHttpStatus,
@@ -1416,6 +1466,162 @@ pub const Fixture = struct {
             std.mem.indexOf(u8, body, "graph_results") == null and
             std.mem.indexOf(u8, body, "doc:x") == null and
             std.mem.indexOf(u8, body, "doc:k") == null;
+    }
+
+    /// Consume every remaining byte in each real DataServer process envelope,
+    /// then drive the ordinary public write path while the metadata-owned
+    /// split is durably nonterminal. Pressure may reject before proposal with
+    /// a retryable 503 or cross the proposal boundary and return an explicit
+    /// 409 outcome-unknown. The latter is always resolved by a read before the
+    /// known-idempotent fixed-ID upsert may be retried. Recovery is not
+    /// complete until the value is publicly visible; the caller separately
+    /// verifies it again after split publication.
+    fn runResourcePressureDuringSplit(self: *Fixture) !void {
+        try self.saturateNodeMemory();
+        defer self.releaseNodeMemory();
+        self.resource_pressure_observed = self.allNodeMemorySaturated();
+        if (!self.resource_pressure_observed)
+            return error.ProductionDataResourceEnvelopeNotSaturated;
+
+        const proposal_phase = @intFromEnum(data_runtime.DataRequestLifecyclePhase.proposal_accepted);
+        self.resource_proposals_before = self.request_lifecycle_counts[proposal_phase];
+
+        var denied = try self.client.fetchBatchResponse(
+            self.data_api_uris[0],
+            "docs",
+            resource_probe_body,
+        );
+        defer denied.deinit(self.alloc);
+        self.resource_denial_status = denied.status;
+        self.resource_denial_body_digest = std.hash.Wyhash.hash(0, denied.body);
+        self.resource_proposals_after = self.request_lifecycle_counts[proposal_phase];
+        const body = std.mem.trim(u8, denied.body, " \t\r\n");
+        self.resource_preproposal_denial = denied.status == 503 and
+            std.mem.eql(u8, body, "write unavailable") and
+            self.resource_proposals_after == self.resource_proposals_before;
+        self.resource_outcome_unknown = denied.status == 409 and
+            std.mem.eql(u8, body, "write outcome unknown") and
+            self.resource_proposals_after > self.resource_proposals_before;
+        self.resource_denial_sound = self.resource_preproposal_denial or self.resource_outcome_unknown;
+        if (!self.resource_denial_sound)
+            return error.ProductionDataResourcePressureDidNotFailSafe;
+
+        self.releaseNodeMemory();
+        self.resource_read_before_retry = true;
+        if (self.resource_outcome_unknown) {
+            // The proposal can finish after the HTTP request loses certainty.
+            // Resolve that ambiguity through the ordinary public read path;
+            // a visible fixed-ID value is already a successful recovery and
+            // must not be blindly submitted again.
+            self.resource_recovery_sound = try self.lookupContains(
+                "docs",
+                "pressure:probe",
+                "production-owner-resource-recovery",
+            );
+            if (self.resource_recovery_sound) return;
+        }
+
+        self.resource_absent_before_retry = try self.lookupAbsentEverywhere("docs", "pressure:probe");
+        if (!self.resource_absent_before_retry)
+            return error.ProductionDataResourceAmbiguityUnresolved;
+
+        self.resource_retry_attempted = true;
+        var recovered = try self.client.fetchBatch(
+            self.data_api_uris[0],
+            "docs",
+            resource_probe_body,
+        );
+        recovered.deinit(self.alloc);
+        self.resource_recovery_sound = try self.lookupContains(
+            "docs",
+            "pressure:probe",
+            "production-owner-resource-recovery",
+        );
+        if (!self.resource_recovery_sound)
+            return error.ProductionDataResourceRecoveryFailed;
+    }
+
+    fn saturateNodeMemory(self: *Fixture) !void {
+        errdefer self.releaseNodeMemory();
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            if (!self.data_server_live[index])
+                return error.ProductionDataResourceOwnerUnavailable;
+            const manager = &server.provisioned_storage.resource_manager;
+            const memory = manager.snapshot().memory;
+            if (memory.hard_limit_bytes == 0 or memory.used_bytes >= memory.hard_limit_bytes)
+                return error.InvalidProductionDataResourceEnvelope;
+            self.resource_reservations[index] = try manager.reserveBatchClassified(&.{.{
+                .slice = .inference_model_residency,
+                .bytes = memory.hard_limit_bytes - memory.used_bytes,
+            }});
+        }
+    }
+
+    fn releaseNodeMemory(self: *Fixture) void {
+        for (&self.resource_reservations) |*slot| if (slot.*) |*reservation| {
+            reservation.release();
+            slot.* = null;
+        };
+    }
+
+    fn allNodeMemorySaturated(self: *Fixture) bool {
+        if (self.data_server_count != node_count) return false;
+        for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            if (!self.data_server_live[index]) return false;
+            const memory = server.provisioned_storage.resource_manager.snapshot().memory;
+            if (memory.hard_limit_bytes == 0 or memory.used_bytes != memory.hard_limit_bytes)
+                return false;
+        }
+        return true;
+    }
+
+    fn lookupAbsentEverywhere(
+        self: *Fixture,
+        table_name: []const u8,
+        key: []const u8,
+    ) !bool {
+        for (0..4) |_| {
+            var absent: usize = 0;
+            for (self.data_api_uris[0..self.data_api_uri_count]) |uri| {
+                var response = self.client.fetchLookupResponse(uri, table_name, key, null) catch break;
+                defer response.deinit(self.alloc);
+                if (response.status == 200) return false;
+                if (response.status == 404) absent += 1;
+            }
+            if (absent == self.data_api_uri_count) return true;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return false;
+    }
+
+    fn lookupContains(
+        self: *Fixture,
+        table_name: []const u8,
+        key: []const u8,
+        expected: []const u8,
+    ) !bool {
+        // Span several production Raft ticks so a committed outcome-unknown
+        // write can resume after capacity returns before the fixed-ID retry is
+        // considered. This helper is resource-campaign-only.
+        for (0..node_count * 32) |attempt| {
+            const uri = self.data_api_uris[attempt % self.data_api_uri_count];
+            var response = self.client.fetchLookupResponse(uri, table_name, key, null) catch {
+                try self.sim.io().sleep(.fromMilliseconds(10), .awake);
+                continue;
+            };
+            defer response.deinit(self.alloc);
+            if (response.status == 200 and std.mem.indexOf(u8, response.body, expected) != null)
+                return true;
+            if (response.status != 200 and response.status != 404 and response.status != 503) {
+                std.debug.print("production resource resolution read status={} body={s}\n", .{
+                    response.status,
+                    response.body,
+                });
+                return error.UnexpectedHttpStatus;
+            }
+            try self.sim.io().sleep(.fromMilliseconds(10), .awake);
+        }
+        return false;
     }
 
     fn waitForPublicIngressAfter(self: *Fixture, baseline: u64) !void {
@@ -1667,10 +1873,10 @@ pub const Fixture = struct {
             }
             response.deinit(self.alloc);
             if (visible) return .{ .success = true };
-            if (status != 200 and status != 404) {
+            if (status != 200 and status != 404 and status != 409 and status != 503 and status != 504) {
                 return .{ .failure = error.UnexpectedHttpStatus };
             }
-            self.sim.io().sleep(.fromMilliseconds(1), .awake) catch |err|
+            self.sim.io().sleep(.fromMilliseconds(self.driverCadenceMs()), .awake) catch |err|
                 return .{ .failure = err };
         }
         return .{ .success = false };
@@ -1703,6 +1909,7 @@ pub const Fixture = struct {
     fn cleanupRuntime(self: *Fixture) void {
         if (self.cleanup_sound) return;
         self.cleanup_started = true;
+        self.releaseNodeMemory();
         self.graph_transport_fault_armed = false;
         self.graph_transport_fault_endpoint = null;
         self.sim.setOutboundEndpointOutage(null);
@@ -1928,6 +2135,7 @@ pub const Fixture = struct {
             },
         );
         self.teardown_started = true;
+        self.releaseNodeMemory();
         self.graph_transport_fault_armed = false;
         self.graph_transport_fault_endpoint = null;
         self.sim.setOutboundEndpointOutage(null);
@@ -1968,6 +2176,18 @@ pub const Fixture = struct {
         graph_owner_restart_error_code: u16,
         graph_partial_write_injected: bool,
         graph_partial_write_observed: bool,
+        resource_pressure_observed: bool,
+        resource_denial_ok: bool,
+        resource_denial_status: u16,
+        resource_preproposal_denial: bool,
+        resource_outcome_unknown: bool,
+        resource_read_before_retry: bool,
+        resource_retry_attempted: bool,
+        resource_proposals_before: u64,
+        resource_proposals_after: u64,
+        resource_absent_before_retry: bool,
+        resource_recovery_ok: bool,
+        resource_post_split_ok: bool,
         graph_partial_rejected_sound: bool,
         cleanup_ok: bool,
         node_resource_managers: usize,
@@ -1998,6 +2218,18 @@ pub const Fixture = struct {
             .graph_owner_restart_error_code = self.graph_owner_restart_error_code,
             .graph_partial_write_injected = self.graph_partial_write_injected,
             .graph_partial_write_observed = self.graph_partial_write_observed,
+            .resource_pressure_observed = self.resource_pressure_observed,
+            .resource_denial_ok = self.resource_denial_sound,
+            .resource_denial_status = self.resource_denial_status,
+            .resource_preproposal_denial = self.resource_preproposal_denial,
+            .resource_outcome_unknown = self.resource_outcome_unknown,
+            .resource_read_before_retry = self.resource_read_before_retry,
+            .resource_retry_attempted = self.resource_retry_attempted,
+            .resource_proposals_before = self.resource_proposals_before,
+            .resource_proposals_after = self.resource_proposals_after,
+            .resource_absent_before_retry = self.resource_absent_before_retry,
+            .resource_recovery_ok = self.resource_recovery_sound,
+            .resource_post_split_ok = self.resource_post_split_sound,
             .graph_partial_rejected_sound = self.graph_partial_rejected_sound,
             .cleanup_ok = self.cleanup_sound,
             // `backend_runtime_count` is live ownership and intentionally

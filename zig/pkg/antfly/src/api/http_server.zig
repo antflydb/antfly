@@ -8604,6 +8604,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExclusionQueryRequest => return error.UnsupportedExclusionQueryRequest,
             error.Timeout => return error.ReadUnavailable,
             error.IdentityReadGenerationChanged => return error.ReadUnavailable,
+            error.TopologyChanged => return error.ReadUnavailable,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityUnavailable,
             error.IndexRebuilding => return error.IndexRebuilding,
@@ -8672,11 +8673,12 @@ pub const ApiHttpServer = struct {
     ) ![]u8 {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
+        const retry_io = self.sharedApiIo();
+        const start_ns = retryMonotonicNs(retry_io);
         const request_deadline_ns = query_contract.queryExecutionDeadlineNsFromBody(alloc, body) catch return error.InvalidQueryRequest;
         while (true) {
             try ensureRequestActive(cancellation);
-            if (retryDeadlineExpired(request_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
+            if (retryDeadlineExpired(request_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return self.executePublicTableQueryDispatchWithIdentity(
                 alloc,
                 source,
@@ -8690,13 +8692,14 @@ pub const ApiHttpServer = struct {
                 error.DocIdentityNamespaceMismatch,
                 error.IdentityReadGenerationChanged,
                 error.StorageReadTemporarilyUnavailable,
+                error.TopologyChanged,
                 => {
-                    const now_ns = platform_time.monotonicNs();
+                    const now_ns = retryMonotonicNs(retry_io);
                     if (retryDeadlineExpired(request_deadline_ns, now_ns)) return error.Timeout;
                     if (retry_timeout_ns == 0) return err;
                     const sleep_ns = boundedRetrySleepNs(request_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
-                    try sleepNsCancellable(sleep_ns, cancellation);
+                    try sleepNsCancellable(retry_io, sleep_ns, cancellation);
                     continue;
                 },
                 error.Timeout => {
@@ -8726,12 +8729,13 @@ pub const ApiHttpServer = struct {
     ) !?table_reads.LookupResponse {
         const retry_timeout_ns: u64 = if (self.table_writes != null) 5 * std.time.ns_per_s else 0;
         const retry_poll_ns = 50 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
+        const retry_io = self.sharedApiIo();
+        const start_ns = retryMonotonicNs(retry_io);
         while (true) {
             try ensureTableOperationActive(request);
             return source.lookup(alloc, table_name, key, opts, consistency) catch |err| switch (err) {
                 error.StorageReadTemporarilyUnavailable => {
-                    const now_ns = platform_time.monotonicNs();
+                    const now_ns = retryMonotonicNs(retry_io);
                     if (retry_timeout_ns == 0) return err;
                     const sleep_ns = boundedRetrySleepNs(
                         request.deadline_ns,
@@ -8741,7 +8745,7 @@ pub const ApiHttpServer = struct {
                         retry_poll_ns,
                     ) orelse return err;
                     if (sleep_ns == 0) return error.DeadlineExceeded;
-                    try sleepNsCancellable(sleep_ns, request.cancellation);
+                    try sleepNsCancellable(retry_io, sleep_ns, request.cancellation);
                     continue;
                 },
                 else => return err,
@@ -8784,6 +8788,7 @@ pub const ApiHttpServer = struct {
                 error.UnsupportedExactSort => return error.UnsupportedExactSort,
                 error.TableNotFound, error.NotFound => return error.NotFound,
                 error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+                error.TopologyChanged => return error.TopologyChanged,
                 error.HierarchyCursorStale => return error.HierarchyCursorStale,
                 error.ModelNotFound => return error.ModelNotFound,
                 error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -8841,6 +8846,7 @@ pub const ApiHttpServer = struct {
             error.EmbedUpstreamFailure,
             => return err,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.TopologyChanged => return error.TopologyChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.IndexRebuilding => return error.IndexRebuilding,
@@ -8912,6 +8918,7 @@ pub const ApiHttpServer = struct {
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.TableNotFound => return error.NotFound,
             error.IdentityReadGenerationChanged => return error.IdentityReadGenerationChanged,
+            error.TopologyChanged => return error.TopologyChanged,
             error.HierarchyCursorStale => return error.HierarchyCursorStale,
             error.ModelNotFound => return error.ModelNotFound,
             error.QueryCandidateBudgetExceeded => return error.QueryCandidateBudgetExceeded,
@@ -9383,7 +9390,7 @@ pub const ApiHttpServer = struct {
         defer query_req.deinit(alloc);
         if (request_deadline_ns) |deadline| {
             query_req.req.execution_deadline_ns = deadline;
-            if (retryDeadlineExpired(deadline, platform_time.monotonicNs())) return error.Timeout;
+            if (retryDeadlineExpired(deadline, retryMonotonicNs(self.sharedApiIo()))) return error.Timeout;
         }
         query_req.req.cancellation = cancellation;
         self.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
@@ -9404,6 +9411,7 @@ pub const ApiHttpServer = struct {
         }
         return (queryWithTransientReadRetry(
             alloc,
+            self.sharedApiIo(),
             source,
             table_name,
             query_req.req,
@@ -9605,6 +9613,7 @@ pub const ApiHttpServer = struct {
 
     fn queryWithTransientReadRetry(
         alloc: std.mem.Allocator,
+        retry_io: ?std.Io,
         source: table_reads.TableReadSource,
         table_name: []const u8,
         req: db_mod.types.SearchRequest,
@@ -9613,11 +9622,11 @@ pub const ApiHttpServer = struct {
     ) !?query_api.QueryResponse {
         const retry_timeout_ns = 5 * std.time.ns_per_s;
         const retry_poll_ns = 25 * std.time.ns_per_ms;
-        const start_ns = platform_time.monotonicNs();
+        const start_ns = retryMonotonicNs(retry_io);
         var attempts: u32 = 0;
         while (true) : (attempts += 1) {
             try ensureRequestActive(req.cancellation);
-            if (retryDeadlineExpired(req.execution_deadline_ns, platform_time.monotonicNs())) return error.Timeout;
+            if (retryDeadlineExpired(req.execution_deadline_ns, retryMonotonicNs(retry_io))) return error.Timeout;
             return source.query(alloc, table_name, req, consistency) catch |err| switch (err) {
                 // FileNotFound surfaces when a read-only replica open races
                 // with the writer reclaiming obsolete LSM runs; reopening
@@ -9628,14 +9637,15 @@ pub const ApiHttpServer = struct {
                 error.FileNotFound,
                 error.TableReadChurn,
                 error.IdentityReadGenerationChanged,
+                error.TopologyChanged,
                 => {
                     if (err == error.IdentityReadGenerationChanged and req.identity_read_generation != null) return err;
                     std.log.warn("public table query read failed table={s} err={} attempt={d}", .{ table_name, err, attempts + 1 });
-                    const now_ns = platform_time.monotonicNs();
+                    const now_ns = retryMonotonicNs(retry_io);
                     if (retryDeadlineExpired(req.execution_deadline_ns, now_ns)) return error.Timeout;
                     const sleep_ns = boundedRetrySleepNs(req.execution_deadline_ns, now_ns, start_ns, retry_timeout_ns, retry_poll_ns) orelse return err;
                     if (sleep_ns == 0) return error.Timeout;
-                    try sleepNsCancellable(sleep_ns, req.cancellation);
+                    try sleepNsCancellable(retry_io, sleep_ns, req.cancellation);
                     continue;
                 },
                 // Only translate a missing physical index when catalog and
@@ -14430,6 +14440,11 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
+fn retryMonotonicNs(io: ?std.Io) u64 {
+    if (io) |borrowed| return @intCast(@max(0, std.Io.Clock.now(.awake, borrowed).nanoseconds));
+    return platform_time.monotonicNs();
+}
+
 fn retryDeadlineExpired(deadline_ns: ?u64, now_ns: u64) bool {
     const deadline = deadline_ns orelse return false;
     return now_ns >= deadline;
@@ -14453,14 +14468,17 @@ fn ensureTableOperationActive(request: api_operation.RequestContext) error{ Canc
     };
 }
 
-fn sleepNsCancellable(duration_ns: u64, cancellation: ?CancellationToken) !void {
+fn sleepNsCancellable(io: ?std.Io, duration_ns: u64, cancellation: ?CancellationToken) !void {
     // Retry sleeps are deliberately broken into short slices so a vanished
     // peer does not occupy an expensive query slot for the full backoff.
     var remaining = duration_ns;
     while (remaining > 0) {
         try ensureRequestActive(cancellation);
         const slice = @min(remaining, 5 * std.time.ns_per_ms);
-        sleepNs(slice);
+        if (io) |borrowed|
+            try borrowed.sleep(.fromNanoseconds(slice), .awake)
+        else
+            sleepNs(slice);
         remaining -= slice;
     }
     try ensureRequestActive(cancellation);
@@ -19580,6 +19598,7 @@ test "api http transient read retry honors expired request deadline before sourc
     var reads = FakeReads{};
     try std.testing.expectError(error.Timeout, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         reads.source(),
         "docs",
         .{ .execution_deadline_ns = 0 },
@@ -19613,6 +19632,7 @@ test "api http transient read retry stops before source query when client cancel
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Cancelled, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         reads.source(),
         "docs",
         .{ .cancellation = &cancelled },
@@ -19622,9 +19642,10 @@ test "api http transient read retry stops before source query when client cancel
     try std.testing.expectEqual(@as(u32, 0), reads.attempts);
 }
 
-test "api http retries identity generation churn from a fresh query snapshot" {
+test "api http retries identity generation and topology churn from a fresh query snapshot" {
     const FakeReads = struct {
         attempts: u32 = 0,
+        transient: anyerror = error.IdentityReadGenerationChanged,
 
         fn source(self: *@This()) table_reads.TableReadSource {
             return .{
@@ -19669,7 +19690,7 @@ test "api http retries identity generation churn from a fresh query snapshot" {
         ) anyerror!?query_api.QueryResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.attempts += 1;
-            if (self.attempts == 1) return error.IdentityReadGenerationChanged;
+            if (self.attempts == 1) return self.transient;
             return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
         }
     };
@@ -19677,6 +19698,7 @@ test "api http retries identity generation churn from a fresh query snapshot" {
     var reads = FakeReads{};
     var response = (try ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         reads.source(),
         "docs",
         .{},
@@ -19686,6 +19708,21 @@ test "api http retries identity generation churn from a fresh query snapshot" {
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 2), reads.attempts);
     try std.testing.expectEqualStrings("{\"responses\":[]}", response.json);
+
+    reads.attempts = 0;
+    reads.transient = error.TopologyChanged;
+    var topology_response = (try ApiHttpServer.queryWithTransientReadRetry(
+        std.testing.allocator,
+        null,
+        reads.source(),
+        "docs",
+        .{},
+        .read_index,
+        .none,
+    )).?;
+    defer topology_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), reads.attempts);
+    try std.testing.expectEqualStrings("{\"responses\":[]}", topology_response.json);
 }
 
 test "api http maps missing physical index only for rebuilding lifecycle" {
@@ -19713,6 +19750,7 @@ test "api http maps missing physical index only for rebuilding lifecycle" {
 
     try std.testing.expectError(error.IndexRebuilding, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         FakeReads.source(),
         "docs",
         .{},
@@ -19721,6 +19759,7 @@ test "api http maps missing physical index only for rebuilding lifecycle" {
     ));
     try std.testing.expectError(error.IndexNotFound, ApiHttpServer.queryWithTransientReadRetry(
         std.testing.allocator,
+        null,
         FakeReads.source(),
         "docs",
         .{},

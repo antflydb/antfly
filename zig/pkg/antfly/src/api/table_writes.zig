@@ -16018,7 +16018,14 @@ pub const ProvisionedTableWriteSource = struct {
         metadata_source: ReplicatedApplyMetadataSource,
         err: anyerror,
     ) anyerror {
-        if (metadata_source == .local_persisted and isTransientWriterOpenConflict(err)) {
+        // A committed Raft entry cannot be discarded because its local writer
+        // owner is temporarily unavailable. Process-envelope admission is the
+        // same pre-mutation retry boundary as a writer lock or descriptor
+        // permit: preserve the apply checkpoint and let Raft progress retry
+        // after capacity is released.
+        if (metadata_source == .local_persisted and
+            (isTransientWriterOpenConflict(err) or err == error.ResourceBudgetExceeded))
+        {
             return error.RaftApplyWriterUnavailable;
         }
         return err;
@@ -19535,7 +19542,9 @@ test "prepared raft apply reclassifies every transient pre-mutation writer confl
     try std.testing.expect(map(.local_persisted, error.LsmRootWriterAlreadyOpen) == error.RaftApplyWriterUnavailable);
     try std.testing.expect(map(.local_persisted, error.WriterLocked) == error.RaftApplyWriterUnavailable);
     try std.testing.expect(map(.local_persisted, error.PersistentDescriptorAdmissionExhausted) == error.RaftApplyWriterUnavailable);
+    try std.testing.expect(map(.local_persisted, error.ResourceBudgetExceeded) == error.RaftApplyWriterUnavailable);
     try std.testing.expect(map(.catalog, error.LsmRootWriterAlreadyOpen) == error.LsmRootWriterAlreadyOpen);
+    try std.testing.expect(map(.catalog, error.ResourceBudgetExceeded) == error.ResourceBudgetExceeded);
     try std.testing.expect(map(.local_persisted, error.OutOfMemory) == error.OutOfMemory);
 }
 

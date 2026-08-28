@@ -61,7 +61,13 @@ pub const DataStateMachine = struct {
         const self: *DataStateMachine = @ptrCast(@alignCast(ptr));
         if (snapshot) |value| {
             if (self.snapshot_builder) |snapshot_builder| {
-                if (!try snapshot_builder.installSnapshot(self.alloc, group_id, value.metadata.index, value.data)) {
+                const installed = snapshot_builder.installSnapshot(
+                    self.alloc,
+                    group_id,
+                    value.metadata.index,
+                    value.data,
+                ) catch |err| return normalizeDurableProjectionApplyError(err);
+                if (!installed) {
                     return error.SnapshotInstallUnsupported;
                 }
             }
@@ -70,11 +76,11 @@ pub const DataStateMachine = struct {
             if (self.snapshot_builder) |snapshot_builder| {
                 const payload = try mod.encodeCommittedEntries(self.alloc, committed_entries);
                 defer self.alloc.free(payload);
-                try snapshot_builder.applyBatch(.{
+                snapshot_builder.applyBatch(.{
                     .group_id = group_id,
                     .commit_index = committed_entries[committed_entries.len - 1].index,
                     .entries_bytes = payload,
-                });
+                }) catch |err| return normalizeDurableProjectionApplyError(err);
             }
         }
         if (self.delegate) |delegate| {
@@ -94,3 +100,61 @@ pub const DataStateMachine = struct {
         if (self.delegate) |delegate| delegate.retireGroup(group_id);
     }
 };
+
+/// The durable data projection can reject owner creation or an atomic batch
+/// while the process memory envelope is saturated. The Raft entry is already
+/// committed, and both snapshot installation and batch publication are
+/// retry-safe, so keep the Ready pending and let the production progress loop
+/// retry after capacity returns. Other storage errors remain fatal with their
+/// original identity.
+fn normalizeDurableProjectionApplyError(err: anyerror) anyerror {
+    return if (err == error.ResourceBudgetExceeded)
+        error.RaftApplyWriterUnavailable
+    else
+        err;
+}
+
+test "data state machine defers durable projection resource exhaustion" {
+    const FaultingBuilder = struct {
+        apply_calls: usize = 0,
+
+        fn builder(self: *@This()) mod.SnapshotBuilder {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .build_snapshot = buildSnapshot,
+                    .apply_batch = applyBatch,
+                },
+            };
+        }
+
+        fn buildSnapshot(_: *anyopaque, alloc: std.mem.Allocator, _: u64) ![]u8 {
+            return try alloc.dupe(u8, &.{});
+        }
+
+        fn applyBatch(ptr: *anyopaque, _: mod.ApplyBatch) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.apply_calls += 1;
+            return error.ResourceBudgetExceeded;
+        }
+    };
+
+    var builder = FaultingBuilder{};
+    var state_machine = DataStateMachine{
+        .alloc = std.testing.allocator,
+        .applied_sink = applied_sink_mod.noopAppliedIndexSink(),
+        .snapshot_builder = builder.builder(),
+    };
+    try std.testing.expectError(
+        error.RaftApplyWriterUnavailable,
+        state_machine.stateMachine().applyReady(17, null, &.{.{
+            .term = 3,
+            .index = 9,
+            .data = @constCast("entry"),
+        }}, &.{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), builder.apply_calls);
+    try std.testing.expect(
+        normalizeDurableProjectionApplyError(error.OutOfMemory) == error.OutOfMemory,
+    );
+}

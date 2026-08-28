@@ -1202,6 +1202,7 @@ const RaftTableApplyStateMachine = struct {
 
     const TestFaults = if (@import("builtin").is_test) struct {
         writer_unavailable_once_at_index: ?u64 = null,
+        resource_budget_exceeded_once_at_index: ?u64 = null,
         applied_index_publication_failure_once: bool = false,
         document_apply_attempts: usize = 0,
         document_apply_successes: usize = 0,
@@ -1450,6 +1451,10 @@ const RaftTableApplyStateMachine = struct {
                 self.test_faults.writer_unavailable_once_at_index = null;
                 return error.RaftApplyWriterUnavailable;
             }
+            if (self.test_faults.resource_budget_exceeded_once_at_index == entry_index) {
+                self.test_faults.resource_budget_exceeded_once_at_index = null;
+                return error.ResourceBudgetExceeded;
+            }
         }
         _ = try self.write_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
             self.alloc,
@@ -1694,7 +1699,16 @@ const RaftTableApplyStateMachine = struct {
                                 decoded.table_name,
                                 @errorName(err),
                             });
-                        } else if (err == error.RaftApplyWriterUnavailable) {
+                        } else if (err == error.RaftApplyWriterUnavailable or
+                            err == error.ResourceBudgetExceeded)
+                        {
+                            // Resource admission can fail before or during an
+                            // atomic local DB batch. The Raft entry remains
+                            // committed and its entry identity makes replay
+                            // idempotent, so preserve the apply checkpoint and
+                            // retry after capacity returns. Treating this as a
+                            // fatal progress-driver error wedges the process
+                            // precisely when its envelope is doing its job.
                             const observation = self.noteWriterUnavailable(
                                 group_id,
                                 platform_time.monotonicNs(),
@@ -1709,7 +1723,7 @@ const RaftTableApplyStateMachine = struct {
                                     @errorName(err),
                                 });
                             }
-                            return err;
+                            return error.RaftApplyWriterUnavailable;
                         } else {
                             std.log.err("data raft document apply failed group_id={} index={} table={s} err={}", .{
                                 group_id,
@@ -6885,6 +6899,15 @@ pub const DataServer = struct {
         }
     }
 
+    /// Advances one production Raft progress turn, applying the same
+    /// transient-error classification as the managed production ticker.
+    /// Deterministic runtimes use this seam instead of duplicating policy or
+    /// treating a temporarily unavailable apply writer as a fatal driver
+    /// failure.
+    pub fn runRaftProgressRoundOnly(self: *DataServer) !void {
+        self.runRaftRoundOnly() catch |err| return handleRaftProgressError(err);
+    }
+
     fn raftProgressSource(self: *DataServer) antfly.raft.ProgressSource {
         return .{
             .ptr = self,
@@ -6894,7 +6917,7 @@ pub const DataServer = struct {
 
     fn runRaftProgressOnce(ptr: *anyopaque) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        self.runRaftRoundOnly() catch |err| return handleRaftProgressError(err);
+        try self.runRaftProgressRoundOnly();
     }
 
     fn handleRaftProgressError(err: anyerror) !void {
@@ -21422,13 +21445,23 @@ test "data raft retry checkpoints survive changed ready windows and publication 
     );
     try std.testing.expectEqual(@as(u64, 2), apply_sm.writer_unavailable_retries_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
+
+    // Process-envelope exhaustion is the same resumable committed-entry
+    // boundary even when it arises after writer acquisition.
+    apply_sm.test_faults.resource_budget_exceeded_once_at_index = 2;
+    try std.testing.expectError(
+        error.RaftApplyWriterUnavailable,
+        RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &entries, &.{}),
+    );
+    try std.testing.expectEqual(@as(u64, 3), apply_sm.writer_unavailable_retries_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 2), apply_sm.writer_unavailable_logs_suppressed_total.load(.monotonic));
     try DataServer.handleRaftProgressError(error.RaftApplyWriterUnavailable);
     try std.testing.expectError(error.OutOfMemory, DataServer.handleRaftProgressError(error.OutOfMemory));
 
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &extended_entries, &.{});
     try std.testing.expectEqual(@as(u64, 3), apply_sm.appliedIndex(group_id));
     try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-    try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_attempts);
+    try std.testing.expectEqual(@as(usize, 6), apply_sm.test_faults.document_apply_attempts);
     try std.testing.expectEqual(@as(usize, 3), apply_sm.test_faults.document_apply_successes);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 1).?);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 2).?);
@@ -21464,7 +21497,7 @@ test "data raft retry checkpoints survive changed ready windows and publication 
     try RaftTableApplyStateMachine.applyReady(&apply_sm, group_id, null, &shifted_entries, &.{});
     try std.testing.expectEqual(@as(u64, 5), apply_sm.appliedIndex(group_id));
     try std.testing.expectEqual(@as(usize, 0), apply_sm.retry_apply_checkpoints.count());
-    try std.testing.expectEqual(@as(usize, 7), apply_sm.test_faults.document_apply_attempts);
+    try std.testing.expectEqual(@as(usize, 8), apply_sm.test_faults.document_apply_attempts);
     try std.testing.expectEqual(@as(usize, 5), apply_sm.test_faults.document_apply_successes);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 4).?);
     try std.testing.expectEqual(.succeeded, apply_sm.takeApplyOutcome(group_id, 5).?);
