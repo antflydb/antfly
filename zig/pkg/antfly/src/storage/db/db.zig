@@ -15641,6 +15641,7 @@ pub const DB = struct {
 
         try self.core.syncStore(true);
         try self.core.index_manager.syncAll(true);
+        try self.core.index_manager.checkpointAllLsmWalsAfterDurableBoundary();
         if (self.loadIndexRepairState(self.alloc)) |repair_state_value| {
             var repair_state = repair_state_value;
             defer repair_state.deinit(self.alloc);
@@ -15687,6 +15688,8 @@ pub const DB = struct {
             {
                 return error.NativeBackupProjectionNotQuiescent;
             }
+            const backend_id = self.core.index_manager.nativeBackupBackendId(cfg.kind);
+            const has_immutable_checkpoint = cfg.kind == .algebraic or std.mem.eql(u8, backend_id, "lsm");
             projections[i] = .{
                 .name = cfg.name,
                 .kind = @tagName(cfg.kind),
@@ -15697,6 +15700,10 @@ pub const DB = struct {
                 .target_sequence = capture_target_sequence,
                 .artifact_format = "antfly-managed-index-tree",
                 .artifact_version = 1,
+                .backend_id = backend_id,
+                .codec_version = 1,
+                .artifact_state = if (has_immutable_checkpoint) .complete else .repair_required,
+                .repair_reason = if (has_immutable_checkpoint) "" else "backend_has_no_immutable_native_checkpoint",
             };
         }
         std.mem.sort(native_backup.Projection, projections, {}, struct {
@@ -15710,11 +15717,12 @@ pub const DB = struct {
         // after every capture fence has been released.
         const generated_pin_root = try std.fmt.allocPrint(self.alloc, "{s}/.generated-pin", .{staging_root});
         defer self.alloc.free(generated_pin_root);
-        var generated_snapshot = try native_backup.pinGeneratedArtifacts(
+        var generated_snapshot = try native_backup.pinGeneratedArtifactsForProjections(
             self.alloc,
             io,
             self.core.path,
             generated_pin_root,
+            projections,
             cancellation,
         );
         defer generated_snapshot.deinit();
@@ -15928,6 +15936,8 @@ pub const DB = struct {
             .none,
         );
         defer if (native_generation) |*generation| generation.deinit();
+        if (native_generation) |*generation|
+            try classifyAndDiscardIncompatibleNativeProjections(generation, io, path, opts);
         try restoreSnapshotStoreTo(
             alloc,
             snapshot_root,
@@ -15982,6 +15992,8 @@ pub const DB = struct {
             cancellation,
         );
         defer if (native_generation) |*generation| generation.deinit();
+        if (native_generation) |*generation|
+            try classifyAndDiscardIncompatibleNativeProjections(generation, io, path, opts);
         try restoreSnapshotStoreTo(
             alloc,
             snapshot_root,
@@ -16036,6 +16048,8 @@ pub const DB = struct {
             cancellation,
         );
         defer if (native_generation) |*generation| generation.deinit();
+        if (native_generation) |*generation|
+            try classifyAndDiscardIncompatibleNativeProjections(generation, io, path, opts);
         try restoreSnapshotStoreTo(
             alloc,
             snapshot_root,
@@ -16087,25 +16101,59 @@ pub const DB = struct {
         }
 
         var validation_opts = opts;
-        validation_opts.open_mode = .query_readonly;
+        validation_opts.open_mode = if (native_generation.invalid_projections.items.len == 0)
+            .query_readonly
+        else
+            .writer_no_replay;
         validation_opts.staged_generation = staged_generation;
         validation_opts.start_index_workers = false;
         validation_opts.start_optional_runtimes = false;
         validation_opts.start_optional_runtime_workers = false;
-        var restored = try DB.open(alloc, path, validation_opts);
-        defer restored.close();
-        try restored.validateNativeBackupGeneration(alloc, native_generation.value());
-        if (complete_runtime_repair)
+        {
+            var validation = try DB.open(alloc, path, validation_opts);
+            defer validation.close();
+            try validation.validateNativeBackupGeneration(alloc, native_generation);
+        }
+        if (native_generation.invalid_projections.items.len != 0) {
+            try native_generation.discardInvalidProjectionArtifacts(io, path);
+            validation_opts.open_mode = .writer_no_replay;
+            var restored = try DB.open(alloc, path, validation_opts);
+            defer restored.close();
+            for (native_generation.invalid_projections.items) |invalid| {
+                const cfg = restored.core.index_manager.get(invalid.name) orelse
+                    return error.NativeBackupProjectionMismatch;
+                const previous = try restored.core.loadProjectionCheckpoint(alloc, invalid.name);
+                try restored.core.saveProjectionCheckpoint(invalid.name, .{
+                    .applied_sequence = 0,
+                    .status = .repair_required,
+                    .generation = previous.generation +| 1,
+                    .config_hash = types.indexConfigHash(cfg.*),
+                });
+                _ = try restored.createGenerationRepairIntentAtTarget(
+                    alloc,
+                    cfg.*,
+                    .projection_generation_invalid,
+                    0,
+                    0,
+                    @tagName(invalid.reason),
+                    native_generation.value().capture_target_sequence,
+                );
+            }
+            try restored.core.index_manager.syncAll(true);
+        } else if (complete_runtime_repair) {
             try markRestoreRuntimeRepairCompleteWithIo(alloc, io, path);
+        }
     }
 
-    fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, manifest: *const native_backup.Manifest) !void {
+    fn validateNativeBackupGeneration(self: *DB, alloc: Allocator, native_generation: *native_backup.LoadedManifest) !void {
+        const manifest = native_generation.value();
         const configs = try self.core.listIndexes(alloc);
         defer types.freeIndexConfigs(alloc, configs);
         if (configs.len != manifest.projections.len)
             return error.NativeBackupProjectionMismatch;
 
         for (manifest.projections) |projection| {
+            if (native_generation.projectionInvalid(projection.name)) continue;
             const cfg = self.core.index_manager.get(projection.name) orelse
                 return error.NativeBackupProjectionMismatch;
             if (!std.mem.eql(u8, projection.kind, @tagName(cfg.kind)) or
@@ -16136,15 +16184,48 @@ pub const DB = struct {
                 });
                 return error.NativeBackupProjectionCheckpointMismatch;
             }
-            if (self.core.index_manager.loadFailure(projection.name) != null)
-                return error.NativeBackupProjectionUnreadable;
+            if (self.core.index_manager.loadFailure(projection.name) != null) {
+                try native_generation.invalidateProjection(projection.name, .unreadable);
+                continue;
+            }
             if (cfg.kind == .dense_vector) {
-                const dense = self.core.index_manager.denseIndex(projection.name) orelse
-                    return error.NativeBackupProjectionUnreadable;
-                if (@hasDecl(@TypeOf(dense.index), "validateStoredStructure"))
-                    try dense.index.validateStoredStructure(alloc);
+                const dense = self.core.index_manager.denseIndex(projection.name) orelse {
+                    try native_generation.invalidateProjection(projection.name, .unreadable);
+                    continue;
+                };
+                if (@hasDecl(@TypeOf(dense.index), "validateStoredStructure")) {
+                    dense.index.validateStoredStructure(alloc) catch {
+                        try native_generation.invalidateProjection(projection.name, .unreadable);
+                    };
+                }
             }
         }
+    }
+
+    fn classifyAndDiscardIncompatibleNativeProjections(
+        generation: *native_backup.LoadedManifest,
+        io: Io,
+        path: []const u8,
+        opts: OpenOptions,
+    ) !void {
+        if (generation.value().format_version < 3) return;
+        for (generation.value().projections) |projection| {
+            const kind = std.meta.stringToEnum(types.IndexKind, projection.kind) orelse
+                return error.InvalidNativeBackupManifest;
+            const target_backend = switch (kind) {
+                .full_text => @tagName(opts.index_backends.text_main_backend),
+                .dense_vector => @tagName(opts.index_backends.dense_storage_backend),
+                .sparse_vector => @tagName(opts.index_backends.sparse_backend),
+                .graph => @tagName(opts.index_backends.graph_reverse_backend),
+                .algebraic => "primary",
+            };
+            if (!std.mem.eql(u8, projection.backend_id, target_backend) or
+                projection.codec_version != 1)
+            {
+                try generation.invalidateProjection(projection.name, .backend_mismatch);
+            }
+        }
+        try generation.discardInvalidProjectionArtifacts(io, path);
     }
 
     fn beginRestoreImport(alloc: Allocator, path: []const u8, snapshot_root: []const u8, identity: RestoreIdentity) !void {
@@ -92407,7 +92488,7 @@ test "db native snapshot exports self-contained generation" {
     defer alloc.free(manifest_raw);
     var parsed_manifest = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
     defer parsed_manifest.deinit();
-    try std.testing.expectEqual(@as(u32, 2), parsed_manifest.value.format_version);
+    try std.testing.expectEqual(native_backup.format_version, parsed_manifest.value.format_version);
     try std.testing.expectEqualStrings("antfly-lsm-checkpoint", parsed_manifest.value.primary.artifact_format);
     try std.testing.expectEqual(@as(u32, 1), parsed_manifest.value.primary.artifact_version);
 }
@@ -92493,7 +92574,9 @@ test "db native snapshot admission bounds capture under concurrent writes" {
             self.started.store(true, .release);
             self.db.batch(.{
                 .writes = &.{.{ .key = "doc:during", .value = "{\"embedding\":[0,1,0]}" }},
-                .sync_level = .write,
+                // Exercise the post-fence generated-index write path. Native
+                // capture must never pin an appendable LSM WAL payload inode.
+                .sync_level = .full_index,
             }) catch |err| {
                 self.err = err;
             };
@@ -92558,7 +92641,8 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // Every corpus-sized generated and primary read is outside both mutation
     // fences. Foreground writes and index maintenance must finish even while
     // artifact materialization is deliberately held.
-    for (0..100_000) |_| {
+    const outside_fence_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
+    while (monotonicTimeNs() < outside_fence_deadline) {
         if (writer.done.load(.acquire) and maintenance.done.load(.acquire)) break;
         std.Thread.yield() catch {};
     }
@@ -92738,6 +92822,112 @@ test "db native deferred restore preserves generated dense generation without em
     defer result.deinit();
     try std.testing.expect(result.hits.len > 0);
     try std.testing.expectEqualStrings("doc:native", result.hits[0].id);
+}
+
+test "db native restore preserves primary generation and repairs only a missing projection" {
+    const alloc = std.testing.allocator;
+    var source_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_buf);
+    defer cleanupTempDir(source_path);
+    var restore_buf: [256]u8 = undefined;
+    const restore_path = tempPath(&restore_buf);
+    defer cleanupTempDir(restore_path);
+    const primary_backend: PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    {
+        var source = try DB.open(alloc, std.mem.span(source_path), .{ .primary_backend = primary_backend });
+        defer source.close();
+        try source.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":3}",
+        });
+        try source.addIndex(.{
+            .name = "text_idx",
+            .kind = .full_text,
+            .config_json = "{\"field\":\"title\"}",
+        });
+        try source.batch(.{
+            .writes = &.{.{ .key = "doc:native", .value = "{\"embedding\":[1,0,0],\"title\":\"healthy projection\"}" }},
+            .sync_level = .full_index,
+        });
+        _ = try source.snapshotNative("missing-projection");
+    }
+
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/missing-projection", .{std.mem.span(source_path)});
+    defer alloc.free(snapshot_root);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(source_path)})) |snapshots| {
+            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+        } else |_| {}
+    }
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
+    defer alloc.free(manifest_path);
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
+    defer alloc.free(manifest_raw);
+    var parsed = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
+    defer parsed.deinit();
+    var compatibility_tmp = std.testing.tmpDir(.{});
+    defer compatibility_tmp.cleanup();
+    const compatibility_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{compatibility_tmp.sub_path});
+    defer alloc.free(compatibility_path);
+    var compatibility = (try native_backup.validateAndMaterialize(
+        alloc,
+        std.testing.io,
+        snapshot_root,
+        compatibility_path,
+    )).?;
+    defer compatibility.deinit();
+    var mismatch_options = OpenOptions{ .primary_backend = primary_backend };
+    mismatch_options.index_backends.dense_storage_backend = .lmdb;
+    try DB.classifyAndDiscardIncompatibleNativeProjections(
+        &compatibility,
+        std.testing.io,
+        compatibility_path,
+        mismatch_options,
+    );
+    try std.testing.expect(compatibility.projectionInvalid("dense_idx"));
+    try std.testing.expect(!compatibility.projectionInvalid("text_idx"));
+
+    const damaged = for (parsed.value.artifacts) |artifact| {
+        if (artifact.role == .projection and std.mem.eql(u8, artifact.projection_name, "dense_idx"))
+            break artifact.path;
+    } else return error.TestUnexpectedResult;
+    const damaged_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, damaged });
+    defer alloc.free(damaged_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, damaged_path);
+
+    var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+    try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
+        &staged,
+        alloc,
+        std.testing.io,
+        snapshot_root,
+        staged.path(),
+        .{ .primary_backend = primary_backend },
+        .{
+            .backup_id = "missing-projection",
+            .location = "local",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .snapshot_path = "missing-projection",
+            .group_id = 7002,
+        },
+    );
+    try std.testing.expect(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, std.testing.io, staged.path()));
+    const repair_path = try index_repair_state.checkpointPathAlloc(alloc, staged.path());
+    defer alloc.free(repair_path);
+    var repair_state = try index_repair_state.load(alloc, repair_path);
+    defer repair_state.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), repair_state.entries.items.len);
+    try std.testing.expectEqualStrings("dense_idx", repair_state.entries.items[0].intent.index_name);
+    try std.testing.expectEqual(
+        index_repair_state.Trigger.projection_generation_invalid,
+        repair_state.entries.items[0].intent.trigger,
+    );
 }
 
 test "db restore snapshot recreates logical store for durable lsm primary backend" {

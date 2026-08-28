@@ -73,6 +73,159 @@ fn nativeSnapshotAttemptTokenAlloc(
     return try std.fmt.allocPrint(alloc, "{s}-{s}-attempt-{s}", .{ backup_id, shard_label, &nonce });
 }
 
+const native_snapshot_attempt_marker_suffix = ".native-backup-attempt.json";
+const native_snapshot_attempt_marker_directory = ".native-backup-attempts";
+const native_snapshot_attempt_stale_ns: i128 = 24 * std.time.ns_per_hour;
+const native_snapshot_attempt_reclaim_limit: usize = 8;
+
+const NativeSnapshotAttemptMarker = struct {
+    snapshot_token: []const u8,
+    created_at_unix_ns: i128,
+};
+
+fn nativeSnapshotAttemptMarkerPathAlloc(
+    alloc: std.mem.Allocator,
+    db_path: []const u8,
+    snapshot_token: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}/{s}{s}", .{
+        db_path,
+        native_snapshot_attempt_marker_directory,
+        snapshot_token,
+        native_snapshot_attempt_marker_suffix,
+    });
+}
+
+fn createNativeSnapshotAttemptMarker(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    db_path: []const u8,
+    snapshot_token: []const u8,
+    created_at_unix_ns: i128,
+) ![]u8 {
+    const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{db_path});
+    defer alloc.free(snapshot_parent);
+    try fs_paths.createDirPathPortable(io, snapshot_parent);
+    const marker_directory = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, native_snapshot_attempt_marker_directory });
+    defer alloc.free(marker_directory);
+    try fs_paths.createDirPathPortable(io, marker_directory);
+    const marker_path = try nativeSnapshotAttemptMarkerPathAlloc(alloc, db_path, snapshot_token);
+    errdefer alloc.free(marker_path);
+    errdefer deleteNativeSnapshotAttemptMarker(io, marker_path);
+    const body = try std.json.Stringify.valueAlloc(alloc, NativeSnapshotAttemptMarker{
+        .snapshot_token = snapshot_token,
+        .created_at_unix_ns = created_at_unix_ns,
+    }, .{});
+    defer alloc.free(body);
+    var file = try fs_paths.createFilePortable(io, marker_path, .{ .truncate = true, .exclusive = true });
+    defer file.close(io);
+    var buffer: [4096]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.writeAll(body);
+    try writer.end();
+    try file.sync(io);
+    try fs_paths.syncDirPortable(io, marker_directory);
+    try fs_paths.syncDirPortable(io, snapshot_parent);
+    return marker_path;
+}
+
+fn deleteNativeSnapshotAttemptMarker(io: std.Io, marker_path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => {
+            std.log.warn("failed to remove native snapshot attempt marker path={s} err={s}", .{ marker_path, @errorName(err) });
+            return;
+        },
+    };
+    const parent = std.fs.path.dirname(marker_path) orelse return;
+    fs_paths.syncDirPortable(io, parent) catch |err| {
+        std.log.warn("failed to sync native snapshot attempt marker deletion path={s} err={s}", .{ marker_path, @errorName(err) });
+    };
+}
+
+fn reclaimStaleNativeSnapshotAttempts(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    db_path: []const u8,
+) !void {
+    const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{db_path});
+    defer alloc.free(snapshot_parent);
+    const marker_directory = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, native_snapshot_attempt_marker_directory });
+    defer alloc.free(marker_directory);
+    var stale_tokens = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (stale_tokens.items) |token| alloc.free(token);
+        stale_tokens.deinit(alloc);
+    }
+    const now = platform_time.realtimeNs();
+    {
+        var dir = std.Io.Dir.cwd().openDir(io, marker_directory, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer dir.close(io);
+        var iterator = dir.iterate();
+        var examined: usize = 0;
+        while (examined < 64 and stale_tokens.items.len < native_snapshot_attempt_reclaim_limit) : (examined += 1) {
+            const entry = try iterator.next(io) orelse break;
+            if (entry.kind != .file or entry.name.len <= native_snapshot_attempt_marker_suffix.len or
+                !std.mem.endsWith(u8, entry.name, native_snapshot_attempt_marker_suffix))
+            {
+                continue;
+            }
+            const token = entry.name[0 .. entry.name.len - native_snapshot_attempt_marker_suffix.len];
+            if (std.mem.indexOfAny(u8, token, "/\\\x00") != null or
+                std.mem.indexOf(u8, token, "-attempt-") == null)
+            {
+                continue;
+            }
+            var created_at_unix_ns: i128 = @intCast((try dir.statFile(io, entry.name, .{ .follow_symlinks = false })).mtime.toNanoseconds());
+            const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ marker_directory, entry.name });
+            defer alloc.free(marker_path);
+            if (std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(4096)) catch null) |raw| {
+                defer alloc.free(raw);
+                if (std.json.parseFromSlice(NativeSnapshotAttemptMarker, alloc, raw, .{})) |parsed_value| {
+                    var parsed = parsed_value;
+                    defer parsed.deinit();
+                    if (std.mem.eql(u8, parsed.value.snapshot_token, token))
+                        created_at_unix_ns = parsed.value.created_at_unix_ns;
+                } else |_| {}
+            }
+            if (created_at_unix_ns > now or
+                now - created_at_unix_ns < native_snapshot_attempt_stale_ns)
+            {
+                continue;
+            }
+            try stale_tokens.append(alloc, try alloc.dupe(u8, token));
+        }
+    }
+
+    for (stale_tokens.items) |token| {
+        const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, token });
+        defer alloc.free(snapshot_root);
+        try std.Io.Dir.cwd().deleteTree(io, snapshot_root);
+
+        var cleanup_dir = std.Io.Dir.cwd().openDir(io, snapshot_parent, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer cleanup_dir.close(io);
+        const staging_prefix = try std.fmt.allocPrint(alloc, ".{s}.staging-", .{token});
+        defer alloc.free(staging_prefix);
+        var cleanup_iterator = cleanup_dir.iterate();
+        while (try cleanup_iterator.next(io)) |entry| {
+            if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, staging_prefix)) continue;
+            const staging_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, entry.name });
+            defer alloc.free(staging_path);
+            try std.Io.Dir.cwd().deleteTree(io, staging_path);
+        }
+        const marker_path = try nativeSnapshotAttemptMarkerPathAlloc(alloc, db_path, token);
+        defer alloc.free(marker_path);
+        deleteNativeSnapshotAttemptMarker(io, marker_path);
+    }
+    try fs_paths.syncDirPortable(io, snapshot_parent);
+}
+
 test "native backup local attempt tokens are retry unique" {
     const first = try nativeSnapshotAttemptTokenAlloc(std.testing.allocator, std.testing.io, "backup", "g7");
     defer std.testing.allocator.free(first);
@@ -80,6 +233,81 @@ test "native backup local attempt tokens are retry unique" {
     defer std.testing.allocator.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expect(std.mem.startsWith(u8, first, "backup-g7-attempt-"));
+}
+
+test "native backup reclaims crash-left snapshot attempts from durable markers" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-00000000000000000000000000000000";
+    const marker_path = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    defer alloc.free(marker_path);
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, token });
+    defer alloc.free(snapshot_root);
+    try fs_paths.createDirPathPortable(std.testing.io, snapshot_root);
+    const staging_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/.{s}.staging-deadbeef", .{ db_path, token });
+    defer alloc.free(staging_root);
+    try fs_paths.createDirPathPortable(std.testing.io, staging_root);
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, staging_root, .{}));
+}
+
+test "native restore admits selective repair only with authenticated generation manifest" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-selective", .{tmp.sub_path});
+    defer alloc.free(root);
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/native-generation.json", .{root});
+    defer alloc.free(manifest_path);
+    const projection_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{root});
+    defer alloc.free(projection_path);
+    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(projection_path).?);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "authenticated-generation" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = projection_path, .data = "projection" });
+
+    var tree_integrity = try backups_api.artifactIntegrityAlloc(alloc, std.testing.io, .native, root);
+    defer tree_integrity.deinit(alloc);
+    var manifest_integrity = try backups_api.nativeGenerationManifestIntegrityAllocWithCancellation(
+        alloc,
+        std.testing.io,
+        root,
+        .none,
+    );
+    defer manifest_integrity.deinit(alloc);
+    const shard = backups_api.ShardSnapshot{
+        .group_id = 1,
+        .start_key = "",
+        .snapshot_path = "native-selective",
+        .artifact_size_bytes = tree_integrity.size_bytes,
+        .artifact_sha256 = tree_integrity.sha256,
+        .native_manifest_size_bytes = manifest_integrity.size_bytes,
+        .native_manifest_sha256 = manifest_integrity.sha256,
+    };
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, projection_path);
+    try std.testing.expectError(
+        error.BackupArtifactIntegrityMismatch,
+        backups_api.verifyShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none),
+    );
+    try backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none);
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "tampered-generation!!!!" });
+    try std.testing.expectError(
+        error.BackupArtifactIntegrityMismatch,
+        backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none),
+    );
 }
 
 pub const LsmOwnerMetricStats = struct {
@@ -5120,8 +5348,18 @@ pub const BoundTableWriteSource = struct {
 
         const snapshot_io = plan.io orelse db.backend_runtime.io() orelse
             return error.BackendRuntimeIoUnavailable;
+        try reclaimStaleNativeSnapshotAttempts(alloc, snapshot_io, db.core.path);
         const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, "local");
         defer alloc.free(snapshot_token);
+        const attempt_marker_path = try createNativeSnapshotAttemptMarker(
+            alloc,
+            snapshot_io,
+            db.core.path,
+            snapshot_token,
+            platform_time.realtimeNs(),
+        );
+        defer alloc.free(attempt_marker_path);
+        defer deleteNativeSnapshotAttemptMarker(snapshot_io, attempt_marker_path);
         _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
@@ -5150,6 +5388,15 @@ pub const BoundTableWriteSource = struct {
         shards[0].artifact_size_bytes = integrity.size_bytes;
         shards[0].artifact_sha256 = integrity.sha256;
         integrity = undefined;
+        var native_manifest_integrity = try backups_api.nativeGenerationManifestIntegrityAllocWithCancellation(
+            alloc,
+            snapshot_io,
+            dest_root,
+            plan.cancellation,
+        );
+        shards[0].native_manifest_size_bytes = native_manifest_integrity.size_bytes;
+        shards[0].native_manifest_sha256 = native_manifest_integrity.sha256;
+        native_manifest_integrity = undefined;
         return shards;
     }
 
@@ -5169,7 +5416,7 @@ pub const BoundTableWriteSource = struct {
         const shard = &plan.manifest.shards[0];
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, shard.snapshot_path });
         defer alloc.free(snapshot_root);
-        try backups_api.verifyShardArtifactIntegrityWithCancellation(
+        try backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(
             alloc,
             plan.io,
             plan.manifest.format,
@@ -15401,6 +15648,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     const NativeBackupShardSnapshot = struct {
         snapshot_root: []const u8,
+        attempt_marker_path: []const u8,
         dest_root: []const u8,
         io: std.Io,
         cancellation: db_mod.types.CancellationToken,
@@ -15409,7 +15657,9 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             deleteLocalNativeSnapshot(self.io, self.snapshot_root);
+            deleteNativeSnapshotAttemptMarker(self.io, self.attempt_marker_path);
             alloc.free(@constCast(self.snapshot_root));
+            alloc.free(@constCast(self.attempt_marker_path));
             alloc.free(@constCast(self.dest_root));
             if (self.owns_shard) self.shard.deinit(alloc);
             self.* = undefined;
@@ -15423,18 +15673,15 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
-    fn deleteLocalNativeSnapshot(maybe_io: ?std.Io, snapshot_root: []const u8) void {
-        if (maybe_io) |io| {
-            std.Io.Dir.cwd().deleteTree(io, snapshot_root) catch |err| {
-                std.log.warn("failed to remove exported native snapshot staging root={s} err={s}", .{ snapshot_root, @errorName(err) });
-            };
-            return;
-        }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch |err| {
+    fn deleteLocalNativeSnapshot(io: std.Io, snapshot_root: []const u8) void {
+        std.Io.Dir.cwd().deleteTree(io, snapshot_root) catch |err| {
             std.log.warn("failed to remove exported native snapshot staging root={s} err={s}", .{ snapshot_root, @errorName(err) });
         };
+        if (std.fs.path.dirname(snapshot_root)) |parent| {
+            fs_paths.syncDirPortable(io, parent) catch |err| {
+                std.log.warn("failed to sync exported native snapshot deletion root={s} err={s}", .{ snapshot_root, @errorName(err) });
+            };
+        }
     }
 
     fn prepareNativeBackupShardSnapshot(
@@ -15448,10 +15695,22 @@ pub const ProvisionedTableWriteSource = struct {
 
         const snapshot_io = plan.io orelse db.backend_runtime.io() orelse
             return error.BackendRuntimeIoUnavailable;
+        try reclaimStaleNativeSnapshotAttempts(alloc, snapshot_io, db_path);
         const group_label = try std.fmt.allocPrint(alloc, "g{d}", .{group_id});
         defer alloc.free(group_label);
         const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, group_label);
         defer alloc.free(snapshot_token);
+        const attempt_marker_path = try createNativeSnapshotAttemptMarker(
+            alloc,
+            snapshot_io,
+            db_path,
+            snapshot_token,
+            platform_time.realtimeNs(),
+        );
+        errdefer {
+            deleteNativeSnapshotAttemptMarker(snapshot_io, attempt_marker_path);
+            alloc.free(attempt_marker_path);
+        }
         _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
@@ -15469,6 +15728,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         return .{
             .snapshot_root = snapshot_root,
+            .attempt_marker_path = attempt_marker_path,
             .dest_root = dest_root,
             .io = snapshot_io,
             .cancellation = plan.cancellation,
@@ -15496,6 +15756,15 @@ pub const ProvisionedTableWriteSource = struct {
         native_snapshot.shard.artifact_size_bytes = integrity.size_bytes;
         native_snapshot.shard.artifact_sha256 = integrity.sha256;
         integrity = undefined;
+        var native_manifest_integrity = try backups_api.nativeGenerationManifestIntegrityAllocWithCancellation(
+            alloc,
+            native_snapshot.io,
+            native_snapshot.dest_root,
+            native_snapshot.cancellation,
+        );
+        native_snapshot.shard.native_manifest_size_bytes = native_manifest_integrity.size_bytes;
+        native_snapshot.shard.native_manifest_sha256 = native_manifest_integrity.sha256;
+        native_manifest_integrity = undefined;
         return try native_snapshot.toShardsAlloc(alloc);
     }
 
@@ -25009,6 +25278,11 @@ fn cloneShardSnapshots(
             .artifact_size_bytes = shard.artifact_size_bytes,
             .artifact_sha256 = if (shard.artifact_sha256.len > 0)
                 try alloc.dupe(u8, shard.artifact_sha256)
+            else
+                "",
+            .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+            .native_manifest_sha256 = if (shard.native_manifest_sha256.len > 0)
+                try alloc.dupe(u8, shard.native_manifest_sha256)
             else
                 "",
         };

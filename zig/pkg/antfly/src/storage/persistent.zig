@@ -1809,6 +1809,7 @@ pub const PersistentIndex = struct {
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *PersistentIndex) !void {
         try self.main_store_owner.checkpointLsmWalAfterDurableBoundary();
+        try self.wal.checkpointLsmWalAfterDurableBoundary();
     }
 
     pub fn snapshotLsmNativeStorageStats(self: *const PersistentIndex) ?lsm_backend.NativeStorageStats {

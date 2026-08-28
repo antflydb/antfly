@@ -106,12 +106,18 @@ pub const ShardSnapshot = struct {
     snapshot_path: []const u8,
     artifact_size_bytes: u64 = 0,
     artifact_sha256: []const u8 = "",
+    /// Authenticates the per-file native generation inventory independently
+    /// from the whole-tree transport identity. This permits selective repair
+    /// only when the authoritative inventory itself is unchanged.
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
 
     pub fn deinit(self: ShardSnapshot, alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.start_key));
         if (self.end_key) |value| alloc.free(@constCast(value));
         alloc.free(@constCast(self.snapshot_path));
         if (self.artifact_sha256.len > 0) alloc.free(@constCast(self.artifact_sha256));
+        if (self.native_manifest_sha256.len > 0) alloc.free(@constCast(self.native_manifest_sha256));
     }
 };
 

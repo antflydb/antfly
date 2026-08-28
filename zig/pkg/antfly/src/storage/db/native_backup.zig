@@ -28,7 +28,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const format_version: u32 = 2;
+pub const format_version: u32 = 3;
 const minimum_supported_format_version: u32 = 1;
 pub const manifest_file_name = "native-generation.json";
 const indexes_directory_name = "indexes";
@@ -48,6 +48,18 @@ pub const Projection = struct {
     target_sequence: u64,
     artifact_format: []const u8 = "legacy-managed-index-tree",
     artifact_version: u32 = 0,
+    /// Physical backend and codec are part of the native compatibility
+    /// contract. Native is deliberately not source-portable; a mismatch is a
+    /// per-projection repair condition, never permission to trust watermarks.
+    backend_id: []const u8 = "unknown",
+    codec_version: u32 = 0,
+    artifact_state: ProjectionArtifactState = .complete,
+    repair_reason: []const u8 = "",
+};
+
+pub const ProjectionArtifactState = enum {
+    complete,
+    repair_required,
 };
 
 pub const Primary = struct {
@@ -59,10 +71,19 @@ pub const Primary = struct {
     source_backend: []const u8 = "unknown",
 };
 
+pub const ArtifactRole = enum {
+    legacy,
+    primary,
+    projection,
+    metadata,
+};
+
 pub const Artifact = struct {
     path: []const u8,
     size_bytes: u64,
     sha256: []const u8,
+    role: ArtifactRole = .legacy,
+    projection_name: []const u8 = "",
 };
 
 pub const Manifest = struct {
@@ -73,22 +94,95 @@ pub const Manifest = struct {
     primary: Primary = .{},
 };
 
+pub const InvalidProjectionReason = enum {
+    missing_artifact,
+    integrity_mismatch,
+    backend_mismatch,
+    capture_repair_required,
+    unreadable,
+};
+
+pub const InvalidProjection = struct {
+    name: []u8,
+    reason: InvalidProjectionReason,
+};
+
 pub const LoadedManifest = struct {
+    alloc: Allocator,
     parsed: std.json.Parsed(Manifest),
+    invalid_projections: std.ArrayListUnmanaged(InvalidProjection) = .empty,
 
     pub fn deinit(self: *LoadedManifest) void {
+        for (self.invalid_projections.items) |invalid| self.alloc.free(invalid.name);
+        self.invalid_projections.deinit(self.alloc);
         self.parsed.deinit();
+        self.* = undefined;
     }
 
     pub fn value(self: *const LoadedManifest) *const Manifest {
         return &self.parsed.value;
     }
+
+    pub fn projectionInvalid(self: *const LoadedManifest, name: []const u8) bool {
+        for (self.invalid_projections.items) |invalid| {
+            if (std.mem.eql(u8, invalid.name, name)) return true;
+        }
+        return false;
+    }
+
+    pub fn invalidateProjection(
+        self: *LoadedManifest,
+        name: []const u8,
+        reason: InvalidProjectionReason,
+    ) !void {
+        for (self.invalid_projections.items) |*invalid| {
+            if (!std.mem.eql(u8, invalid.name, name)) continue;
+            // Integrity/missing evidence is more actionable than a later
+            // compatibility observation over the same projection.
+            if (@intFromEnum(reason) < @intFromEnum(invalid.reason)) invalid.reason = reason;
+            return;
+        }
+        try self.invalid_projections.append(self.alloc, .{
+            .name = try self.alloc.dupe(u8, name),
+            .reason = reason,
+        });
+    }
+
+    pub fn discardInvalidProjectionArtifacts(self: *const LoadedManifest, io: Io, destination_root: []const u8) !void {
+        for (self.invalid_projections.items) |invalid| {
+            try validateProjectionName(invalid.name);
+            const path = try std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}", .{
+                destination_root,
+                indexes_directory_name,
+                invalid.name,
+            });
+            defer self.alloc.free(path);
+            try std.Io.Dir.cwd().deleteTree(io, path);
+        }
+        const indexes_path = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ destination_root, indexes_directory_name });
+        defer self.alloc.free(indexes_path);
+        fs_paths.syncDirPortable(io, indexes_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 };
+
+fn validateProjectionName(name: []const u8) !void {
+    if (name.len == 0 or name.len > 255 or std.fs.path.isAbsolute(name) or
+        std.mem.indexOfAny(u8, name, "/\\\x00") != null or
+        std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, ".."))
+    {
+        return error.InvalidNativeBackupManifest;
+    }
+}
 
 const OwnedArtifact = struct {
     path: []u8,
     size_bytes: u64,
     sha256: []u8,
+    role: ArtifactRole,
+    projection_name: []const u8,
 
     fn deinit(self: *OwnedArtifact, alloc: Allocator) void {
         alloc.free(self.path);
@@ -158,6 +252,27 @@ pub fn pinGeneratedArtifacts(
     pin_root: []const u8,
     cancellation: CancellationToken,
 ) !PinnedGeneratedArtifacts {
+    return try pinGeneratedArtifactsForProjections(
+        alloc,
+        io,
+        source_root,
+        pin_root,
+        null,
+        cancellation,
+    );
+}
+
+/// Pins only projection generations whose physical backend has an immutable
+/// native checkpoint. Omitted projections remain represented in the manifest
+/// as durable repair work; their live mutable files are never hardlinked.
+pub fn pinGeneratedArtifactsForProjections(
+    alloc: Allocator,
+    io: Io,
+    source_root: []const u8,
+    pin_root: []const u8,
+    projections: ?[]const Projection,
+    cancellation: CancellationToken,
+) !PinnedGeneratedArtifacts {
     try ensureActive(cancellation);
     try fs_paths.createDirPathPortable(io, pin_root);
     errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
@@ -182,6 +297,25 @@ pub fn pinGeneratedArtifacts(
             switch (entry.kind) {
                 .directory => {},
                 .file => {
+                    // A forced LSM checkpoint has already manifested all
+                    // captured state into immutable runs. Segment payloads
+                    // remain appendable after admission reopens and therefore
+                    // must not be hardlinked into the generation. LSM recovery
+                    // creates fresh WAL control/payload files from the pinned
+                    // manifest and runs.
+                    if (std.mem.endsWith(u8, entry.path, ".log")) continue;
+                    if (projections) |inventory| {
+                        const separator = std.mem.indexOfAny(u8, entry.path, "/\\");
+                        const index_name = if (separator) |offset| entry.path[0..offset] else entry.path;
+                        var include = false;
+                        for (inventory) |projection| {
+                            if (std.mem.eql(u8, projection.name, index_name)) {
+                                include = projection.artifact_state == .complete;
+                                break;
+                            }
+                        }
+                        if (!include) continue;
+                    }
                     const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ source_indexes, entry.path });
                     defer alloc.free(source);
                     const relative = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ indexes_directory_name, entry.path });
@@ -326,7 +460,7 @@ pub fn finalizeCaptureGenerationWithCancellation(
     try ensureActive(cancellation);
     try validateProjectionInventory(format_version, capture_target_sequence, projections);
     try validatePrimary(format_version, primary);
-    var artifacts = try collectArtifacts(alloc, io, snapshot_root, cancellation);
+    var artifacts = try collectArtifacts(alloc, io, snapshot_root, projections, cancellation);
     defer {
         for (artifacts.items) |*artifact| artifact.deinit(alloc);
         artifacts.deinit(alloc);
@@ -340,6 +474,8 @@ pub fn finalizeCaptureGenerationWithCancellation(
             .path = artifact.path,
             .size_bytes = artifact.size_bytes,
             .sha256 = artifact.sha256,
+            .role = artifact.role,
+            .projection_name = artifact.projection_name,
         };
     }
     const encoded = try std.json.Stringify.valueAlloc(alloc, Manifest{
@@ -393,10 +529,11 @@ pub fn validateAndMaterializeWithCancellation(
     };
     defer alloc.free(raw);
 
-    var parsed = std.json.parseFromSlice(Manifest, alloc, raw, .{ .allocate = .alloc_always }) catch
+    const parsed = std.json.parseFromSlice(Manifest, alloc, raw, .{ .allocate = .alloc_always }) catch
         return error.InvalidNativeBackupManifest;
-    errdefer parsed.deinit();
-    const manifest = &parsed.value;
+    var loaded = LoadedManifest{ .alloc = alloc, .parsed = parsed };
+    errdefer loaded.deinit();
+    const manifest = loaded.value();
     if (manifest.format_version < minimum_supported_format_version or
         manifest.format_version > format_version or
         manifest.artifacts.len == 0 or
@@ -406,6 +543,12 @@ pub fn validateAndMaterializeWithCancellation(
     }
     try validateProjectionInventory(manifest.format_version, manifest.capture_target_sequence, manifest.projections);
     try validatePrimary(manifest.format_version, manifest.primary);
+    if (manifest.format_version >= 3) {
+        for (manifest.projections) |projection| {
+            if (projection.artifact_state == .repair_required)
+                try loaded.invalidateProjection(projection.name, .capture_repair_required);
+        }
+    }
 
     var previous_path: ?[]const u8 = null;
     for (manifest.artifacts) |artifact| {
@@ -421,26 +564,45 @@ pub fn validateAndMaterializeWithCancellation(
                 return error.InvalidNativeBackupManifest;
         }
         previous_path = artifact.path;
+        if (manifest.format_version >= 3)
+            try validateArtifactOwnership(artifact, manifest.projections);
 
         const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, artifact.path });
         defer alloc.free(source);
         const stat = statRegularFile(io, source) catch |err| switch (err) {
-            error.FileNotFound => return error.NativeBackupArtifactMissing,
+            error.FileNotFound => {
+                if (try downgradeProjectionArtifactFailure(&loaded, artifact, .missing_artifact)) continue;
+                return error.NativeBackupArtifactMissing;
+            },
             else => return err,
         };
-        if (stat.size != artifact.size_bytes) return error.NativeBackupArtifactIntegrityMismatch;
-        var digest: [Sha256.digest_length]u8 = undefined;
-        try hashFile(io, source, stat, &digest, cancellation);
-        const actual = std.fmt.bytesToHex(digest, .lower);
-        if (!std.mem.eql(u8, &actual, artifact.sha256))
+        if (stat.size != artifact.size_bytes) {
+            if (try downgradeProjectionArtifactFailure(&loaded, artifact, .integrity_mismatch)) continue;
             return error.NativeBackupArtifactIntegrityMismatch;
+        }
+        var digest: [Sha256.digest_length]u8 = undefined;
+        hashFile(io, source, stat, &digest, cancellation) catch |err| switch (err) {
+            error.SourceFileChanged => {
+                if (try downgradeProjectionArtifactFailure(&loaded, artifact, .integrity_mismatch)) continue;
+                return err;
+            },
+            else => return err,
+        };
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &actual, artifact.sha256)) {
+            if (try downgradeProjectionArtifactFailure(&loaded, artifact, .integrity_mismatch)) continue;
+            return error.NativeBackupArtifactIntegrityMismatch;
+        }
     }
 
+    if (manifest.format_version >= 3)
+        try validateProjectionArtifactInventory(manifest);
     try validateCompleteInventory(alloc, io, snapshot_root, manifest, cancellation);
     try validatePrimaryInventory(manifest);
     for (manifest.artifacts) |artifact| {
         try ensureActive(cancellation);
         if (!isGeneratedArtifact(artifact.path)) continue;
+        if (artifact.role == .projection and loaded.projectionInvalid(artifact.projection_name)) continue;
         const source = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, artifact.path });
         defer alloc.free(source);
         const materialized_path = if (std.mem.startsWith(u8, artifact.path, primary_lsm_directory_name ++ "/"))
@@ -452,18 +614,75 @@ pub fn validateAndMaterializeWithCancellation(
         defer alloc.free(destination);
         _ = try copyFileDurableCancellable(io, source, destination, cancellation);
     }
-    return .{ .parsed = parsed };
+    return loaded;
+}
+
+fn downgradeProjectionArtifactFailure(
+    loaded: *LoadedManifest,
+    artifact: Artifact,
+    reason: InvalidProjectionReason,
+) !bool {
+    if (loaded.value().format_version < 3 or artifact.role != .projection or
+        artifact.projection_name.len == 0)
+    {
+        return false;
+    }
+    try loaded.invalidateProjection(artifact.projection_name, reason);
+    return true;
+}
+
+fn validateArtifactOwnership(artifact: Artifact, projections: []const Projection) !void {
+    const expected = try artifactOwnership(artifact.path, projections);
+    if (artifact.role != expected.role) return error.InvalidNativeBackupManifest;
+    switch (artifact.role) {
+        .projection => {
+            if (artifact.projection_name.len == 0 or
+                !std.mem.eql(u8, artifact.projection_name, expected.projection_name))
+            {
+                return error.InvalidNativeBackupManifest;
+            }
+        },
+        .primary, .metadata => if (artifact.projection_name.len != 0)
+            return error.InvalidNativeBackupManifest,
+        .legacy => return error.InvalidNativeBackupManifest,
+    }
+}
+
+fn validateProjectionArtifactInventory(manifest: *const Manifest) !void {
+    for (manifest.projections) |projection| {
+        var artifact_count: usize = 0;
+        for (manifest.artifacts) |artifact| {
+            if (artifact.role == .projection and
+                std.mem.eql(u8, artifact.projection_name, projection.name))
+            {
+                artifact_count += 1;
+            }
+        }
+        switch (projection.artifact_state) {
+            .complete => if (!std.mem.eql(u8, projection.kind, "algebraic") and artifact_count == 0)
+                return error.InvalidNativeBackupManifest,
+            .repair_required => if (artifact_count != 0 or projection.repair_reason.len == 0)
+                return error.InvalidNativeBackupManifest,
+        }
+    }
 }
 
 fn validateProjectionInventory(manifest_version: u32, capture_target_sequence: u64, projections: []const Projection) !void {
     if (projections.len > max_artifacts) return error.InvalidNativeBackupManifest;
     var previous_name: ?[]const u8 = null;
     for (projections) |projection| {
+        if (manifest_version >= 3) try validateProjectionName(projection.name);
         if (projection.name.len == 0 or
             projection.kind.len == 0 or
             (manifest_version >= 2 and
                 (!std.mem.eql(u8, projection.artifact_format, "antfly-managed-index-tree") or
                     projection.artifact_version != 1)) or
+            (manifest_version >= 3 and
+                (projection.backend_id.len == 0 or
+                    std.mem.eql(u8, projection.backend_id, "unknown") or
+                    projection.codec_version == 0 or
+                    (projection.artifact_state == .complete and projection.repair_reason.len != 0) or
+                    (projection.artifact_state == .repair_required and projection.repair_reason.len == 0))) or
             projection.target_sequence != capture_target_sequence or
             projection.applied_sequence != projection.target_sequence)
         {
@@ -532,7 +751,13 @@ fn isGeneratedArtifact(path: []const u8) bool {
         std.mem.eql(u8, path, repair_checkpoint_file_name);
 }
 
-fn collectArtifacts(alloc: Allocator, io: Io, root: []const u8, cancellation: CancellationToken) !std.ArrayListUnmanaged(OwnedArtifact) {
+fn collectArtifacts(
+    alloc: Allocator,
+    io: Io,
+    root: []const u8,
+    projections: []const Projection,
+    cancellation: CancellationToken,
+) !std.ArrayListUnmanaged(OwnedArtifact) {
     var result = std.ArrayListUnmanaged(OwnedArtifact).empty;
     errdefer {
         for (result.items) |*artifact| artifact.deinit(alloc);
@@ -563,10 +788,13 @@ fn collectArtifacts(alloc: Allocator, io: Io, root: []const u8, cancellation: Ca
                 const hex = std.fmt.bytesToHex(digest, .lower);
                 const sha256 = try alloc.dupe(u8, &hex);
                 errdefer alloc.free(sha256);
+                const ownership = try artifactOwnership(entry.path, projections);
                 try result.append(alloc, .{
                     .path = path,
                     .size_bytes = stat.size,
                     .sha256 = sha256,
+                    .role = ownership.role,
+                    .projection_name = ownership.projection_name,
                 });
             },
             else => return error.UnsupportedFileType,
@@ -578,6 +806,37 @@ fn collectArtifacts(alloc: Allocator, io: Io, root: []const u8, cancellation: Ca
         }
     }.lessThan);
     return result;
+}
+
+const ArtifactOwnership = struct {
+    role: ArtifactRole,
+    projection_name: []const u8 = "",
+};
+
+fn artifactOwnership(path: []const u8, projections: []const Projection) !ArtifactOwnership {
+    if (std.mem.eql(u8, path, "store.bin") or
+        std.mem.eql(u8, path, "change-journal.bin") or
+        std.mem.startsWith(u8, path, primary_lsm_directory_name ++ "/"))
+    {
+        return .{ .role = .primary };
+    }
+    if (std.mem.eql(u8, path, applied_checkpoint_file_name) or
+        std.mem.eql(u8, path, repair_checkpoint_file_name))
+    {
+        return .{ .role = .metadata };
+    }
+    if (std.mem.startsWith(u8, path, indexes_directory_name ++ "/")) {
+        const suffix = path[(indexes_directory_name ++ "/").len..];
+        const separator = std.mem.indexOfScalar(u8, suffix, '/') orelse
+            return error.InvalidNativeBackupArtifactPath;
+        const index_name = suffix[0..separator];
+        for (projections) |projection| {
+            if (std.mem.eql(u8, projection.name, index_name))
+                return .{ .role = .projection, .projection_name = projection.name };
+        }
+        return error.NativeBackupProjectionMismatch;
+    }
+    return error.InvalidNativeBackupManifest;
 }
 
 fn validateCompleteInventory(
@@ -608,7 +867,8 @@ fn validateCompleteInventory(
             else => return error.UnsupportedFileType,
         }
     }
-    if (files != manifest.artifacts.len) return error.InvalidNativeBackupManifest;
+    if (manifest.format_version < 3 and files != manifest.artifacts.len)
+        return error.InvalidNativeBackupManifest;
 }
 
 fn manifestContainsArtifact(manifest: *const Manifest, path: []const u8) bool {
@@ -694,9 +954,14 @@ fn copyPinnedFileDurable(
         current.size != pinned.stat.size or
         !std.meta.eql(current.mtime, pinned.stat.mtime))
     {
+        std.log.err("native backup pinned artifact changed before copy path={s}", .{pinned.relative_path});
         return error.SourceFileChanged;
     }
-    return try copyFileDurableCancellable(io, pinned.pinned_path, destination_path, cancellation);
+    return copyFileDurableCancellable(io, pinned.pinned_path, destination_path, cancellation) catch |err| {
+        if (err == error.SourceFileChanged)
+            std.log.err("native backup pinned artifact changed during copy path={s}", .{pinned.relative_path});
+        return err;
+    };
 }
 
 fn pinArtifactFile(io: Io, source_path: []const u8, pinned_path: []const u8) !std.Io.File.Stat {
@@ -822,6 +1087,8 @@ test "native generation manifest captures validates and materializes generated a
         .target_sequence = 12,
         .artifact_format = "antfly-managed-index-tree",
         .artifact_version = 1,
+        .backend_id = "lsm",
+        .codec_version = 1,
     }});
     var loaded = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
     defer loaded.deinit();
@@ -836,10 +1103,11 @@ test "native generation manifest captures validates and materializes generated a
     const snapshot_index = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{snapshot});
     defer alloc.free(snapshot_index);
     _ = try writeFileDurable(std.testing.io, snapshot_index, "corrupt");
-    try std.testing.expectError(
-        error.NativeBackupArtifactIntegrityMismatch,
-        validateAndMaterialize(alloc, std.testing.io, snapshot, destination),
-    );
+    var corrupted = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
+    defer corrupted.deinit();
+    try std.testing.expect(corrupted.projectionInvalid("dense"));
+    try corrupted.discardInvalidProjectionArtifacts(std.testing.io, destination);
+    try std.testing.expect(!try pathExists(std.testing.io, restored));
 }
 
 test "native generation projection inventory is complete and revision exact" {
@@ -853,6 +1121,8 @@ test "native generation projection inventory is complete and revision exact" {
         .target_sequence = 12,
         .artifact_format = "antfly-managed-index-tree",
         .artifact_version = 1,
+        .backend_id = "lsm",
+        .codec_version = 1,
     };
     const second = Projection{
         .name = "dense_b",
@@ -864,11 +1134,13 @@ test "native generation projection inventory is complete and revision exact" {
         .target_sequence = 12,
         .artifact_format = "antfly-managed-index-tree",
         .artifact_version = 1,
+        .backend_id = "lsm",
+        .codec_version = 1,
     };
-    try validateProjectionInventory(2, 12, &.{ first, second });
+    try validateProjectionInventory(format_version, 12, &.{ first, second });
     try std.testing.expectError(
         error.InvalidNativeBackupManifest,
-        validateProjectionInventory(2, 12, &.{ first, first }),
+        validateProjectionInventory(format_version, 12, &.{ first, first }),
     );
 
     var stale = second;
@@ -876,7 +1148,7 @@ test "native generation projection inventory is complete and revision exact" {
     stale.target_sequence = 11;
     try std.testing.expectError(
         error.InvalidNativeBackupManifest,
-        validateProjectionInventory(2, 12, &.{ first, stale }),
+        validateProjectionInventory(format_version, 12, &.{ first, stale }),
     );
 }
 

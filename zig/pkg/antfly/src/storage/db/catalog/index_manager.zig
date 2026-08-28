@@ -3529,6 +3529,35 @@ pub const IndexManager = struct {
         for (self.algebraic_indexes.items) |*entry| try entry.index.sync(force);
     }
 
+    pub fn nativeBackupBackendId(self: *const IndexManager, kind: types.IndexKind) []const u8 {
+        return switch (kind) {
+            .full_text => @tagName(self.text_main_backend),
+            .dense_vector => @tagName(self.dense_storage_backend),
+            .sparse_vector => @tagName(self.sparse_backend),
+            .graph => @tagName(self.graph_reverse_backend),
+            // Algebraic indexes are materialized in the primary namespace and
+            // have no independently selectable physical backend.
+            .algebraic => "primary",
+        };
+    }
+
+    /// Publish every mutable LSM generation before native snapshot pinning.
+    /// This is intentionally separate from `syncAll`: sync is a durability
+    /// operation, while this establishes manifested immutable runs. Native
+    /// capture omits the appendable WAL payloads after this boundary.
+    pub fn checkpointAllLsmWalsAfterDurableBoundary(self: *IndexManager) !void {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.text_indexes.items) |*entry|
+            try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+        for (self.dense_indexes.items) |*entry|
+            try entry.index.checkpointLsmWalAfterDurableBoundary();
+        for (self.sparse_indexes.items) |*entry|
+            try entry.index.checkpointLsmWalAfterDurableBoundary();
+        for (self.graph_indexes.items) |*entry|
+            try entry.index.checkpointLsmWalAfterDurableBoundary();
+    }
+
     pub fn syncIndexByName(self: *IndexManager, name: []const u8, force: bool) !void {
         for (self.text_indexes.items) |*entry| {
             if (std.mem.eql(u8, entry.config.name, name)) {

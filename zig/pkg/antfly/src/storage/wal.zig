@@ -256,6 +256,13 @@ const StoreOwner = union(enum) {
         }
     }
 
+    fn checkpointLsmWalAfterDurableBoundary(self: *StoreOwner) !void {
+        switch (self.*) {
+            .lmdb => {},
+            .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
+        }
+    }
+
     fn syncCommitDurability(self: *StoreOwner) !DurabilitySyncStats {
         return switch (self.*) {
             .lmdb => |backend| blk: {
@@ -665,6 +672,20 @@ pub const WAL = struct {
 
     pub fn sync(self: *WAL, force: bool) !void {
         try self.store_owner.sync(force);
+    }
+
+    /// Manifest the physical LSM generation which backs this logical WAL.
+    /// Native capture uses the resulting immutable runs and deliberately omits
+    /// the appendable physical WAL payloads.
+    pub fn checkpointLsmWalAfterDurableBoundary(self: *WAL) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        while (self.coordinator_active or self.pending_head != null) {
+            self.mutex.unlock();
+            std.Thread.yield() catch {};
+            lockAtomic(&self.mutex);
+        }
+        try self.store_owner.checkpointLsmWalAfterDurableBoundary();
     }
 
     /// Truncate all entries with LSN <= the given value.

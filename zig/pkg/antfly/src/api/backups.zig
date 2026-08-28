@@ -2321,6 +2321,11 @@ pub fn createManifest(
                 try alloc.dupe(u8, shard.artifact_sha256)
             else
                 "",
+            .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+            .native_manifest_sha256 = if (shard.native_manifest_sha256.len > 0)
+                try alloc.dupe(u8, shard.native_manifest_sha256)
+            else
+                "",
         };
         initialized += 1;
     }
@@ -2564,6 +2569,14 @@ fn validateManifestShards(
             !isLowerSha256Hex(shard.artifact_sha256))
         {
             return error.BackupIntegrityMissing;
+        }
+        const has_native_manifest_identity = shard.native_manifest_size_bytes != 0 or
+            shard.native_manifest_sha256.len != 0;
+        if (has_native_manifest_identity and
+            (manifest.format != .native or shard.native_manifest_size_bytes == 0 or
+                !isLowerSha256Hex(shard.native_manifest_sha256)))
+        {
+            return error.InvalidBackupRequest;
         }
         if (manifest.artifact_integrity_mode == .derive_after_materialization and
             (manifest.format != .portable or
@@ -9735,6 +9748,8 @@ fn artifactVerificationCacheKeyHasher(
     hashArtifactBytes(&hasher, shard.snapshot_path);
     hashArtifactU64(&hasher, shard.artifact_size_bytes);
     hashArtifactBytes(&hasher, shard.artifact_sha256);
+    hashArtifactU64(&hasher, shard.native_manifest_size_bytes);
+    hashArtifactBytes(&hasher, shard.native_manifest_sha256);
 
     switch (location.*) {
         .file => |backup_root| {
@@ -11142,6 +11157,66 @@ pub fn verifyShardArtifactIntegrityWithCancellation(
     }
 }
 
+/// Restore-only verification for native generations. A whole-tree mismatch
+/// may represent a missing/corrupt generated projection. It is safe to defer
+/// that classification to the native validator only when the separately
+/// authenticated per-file generation manifest is still exact.
+pub fn verifyRestorableShardArtifactIntegrityWithCancellation(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    format: BackupFormat,
+    artifact_path: []const u8,
+    shard: *const ShardSnapshot,
+    cancellation: CancellationToken,
+) !void {
+    verifyShardArtifactIntegrityWithCancellation(
+        alloc,
+        shared_io,
+        format,
+        artifact_path,
+        shard,
+        cancellation,
+    ) catch |err| switch (err) {
+        error.BackupArtifactIntegrityMismatch => {
+            if (format != .native or shard.native_manifest_size_bytes == 0 or
+                !isLowerSha256Hex(shard.native_manifest_sha256))
+            {
+                return err;
+            }
+            var manifest_integrity = try nativeGenerationManifestIntegrityAllocWithCancellation(
+                alloc,
+                shared_io,
+                artifact_path,
+                cancellation,
+            );
+            defer manifest_integrity.deinit(alloc);
+            if (manifest_integrity.size_bytes != shard.native_manifest_size_bytes or
+                !std.mem.eql(u8, manifest_integrity.sha256, shard.native_manifest_sha256))
+            {
+                return error.BackupArtifactIntegrityMismatch;
+            }
+            std.log.warn("native backup tree integrity differs; authenticated generation manifest will classify projection repair", .{});
+        },
+        else => return err,
+    };
+}
+
+pub fn nativeGenerationManifestIntegrityAllocWithCancellation(
+    alloc: std.mem.Allocator,
+    shared_io: ?std.Io,
+    artifact_path: []const u8,
+    cancellation: CancellationToken,
+) !ArtifactIntegrity {
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}/native-generation.json", .{artifact_path});
+    defer alloc.free(manifest_path);
+    try cancellation.check();
+    if (shared_io) |io|
+        return try fileArtifactIntegrityAllocCancellable(alloc, io, manifest_path, cancellation);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    return try fileArtifactIntegrityAllocCancellable(alloc, io_impl.io(), manifest_path, cancellation);
+}
+
 pub fn artifactIntegrityAlloc(
     alloc: std.mem.Allocator,
     shared_io: ?std.Io,
@@ -11525,6 +11600,11 @@ fn cloneTableBackupManifest(alloc: std.mem.Allocator, manifest: TableBackupManif
             .artifact_size_bytes = shard.artifact_size_bytes,
             .artifact_sha256 = if (shard.artifact_sha256.len > 0)
                 try alloc.dupe(u8, shard.artifact_sha256)
+            else
+                "",
+            .native_manifest_size_bytes = shard.native_manifest_size_bytes,
+            .native_manifest_sha256 = if (shard.native_manifest_sha256.len > 0)
+                try alloc.dupe(u8, shard.native_manifest_sha256)
             else
                 "",
         };

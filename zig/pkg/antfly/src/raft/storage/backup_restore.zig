@@ -468,7 +468,7 @@ fn prepareRestoreSnapshot(
         destroyPathIfExistsWithIo(io, snapshot_root);
         alloc.free(snapshot_root);
     }
-    try backups_api.verifyShardArtifactIntegrityWithCancellation(
+    try backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(
         alloc,
         io,
         .native,
