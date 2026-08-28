@@ -6861,6 +6861,10 @@ pub const DataServer = struct {
         // still available. Cached DB callbacks are detached only after every
         // possible writer has reached this quiescent boundary.
         self.write_source.quiesce();
+        // Recovery jobs borrow the Raft host through their ownership proof.
+        // Drain them before destroying Raft, not merely before destroying the
+        // apply state that owns the write source.
+        if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
         if (self.data_raft) |raft| {
             raft.deinit();
             self.alloc.destroy(raft);
@@ -6869,7 +6873,6 @@ pub const DataServer = struct {
             factory.deinit();
             self.alloc.destroy(factory);
         }
-        if (self.data_raft_apply) |apply_sm| apply_sm.write_source.quiesce();
         self.provisioned_storage.detachWriteSourceRuntimeHooks();
         if (self.data_raft_apply) |apply_sm| {
             apply_sm.deinit();
@@ -11774,7 +11777,16 @@ pub const DataServer = struct {
             if (prepared_retirements) |*prepared| {
                 const source = retirement_source.?;
                 if (reconcile.catalog_commit_complete) {
-                    source.requestReplicaRetirementRecovery();
+                    source.completePreparedReplicaRetirements(
+                        reconcile.removals,
+                        prepared,
+                    ) catch |retirement_err| {
+                        std.log.warn("committed local replica retirement deferred groups={d} err={s}", .{
+                            reconcile.removals.len,
+                            @errorName(retirement_err),
+                        });
+                        source.requestReplicaRetirementRecovery();
+                    };
                 } else {
                     source.cancelPreparedReplicaRetirements(prepared);
                 }
@@ -12052,18 +12064,24 @@ pub const DataServer = struct {
         return &self.write_source;
     }
 
-    fn localDataRaftOwnsReplica(ptr: *anyopaque, group_id: u64) bool {
+    fn classifyLocalDataRaftReplicaRetirement(
+        ptr: *anyopaque,
+        group_id: u64,
+    ) !antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.data_raft_mutex);
         defer self.data_raft_mutex.unlock();
-        const raft = self.data_raft orelse return false;
-        return raft.host.http_host.host.hasReplica(group_id);
+        const raft = self.data_raft orelse return error.ReplicaRetirementOwnershipUnavailable;
+        const catalog_contains = raft.host.http_host.host.replicaCatalogContains(group_id) orelse
+            return error.ReplicaRetirementCatalogUnavailable;
+        if (catalog_contains) return .retained;
+        return if (raft.host.http_host.host.hasReplica(group_id)) .retiring else .retired;
     }
 
     fn replicaRetirementOwnership(self: *DataServer) antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership {
         return .{
             .ptr = self,
-            .is_owned = localDataRaftOwnsReplica,
+            .classify = classifyLocalDataRaftReplicaRetirement,
         };
     }
 

@@ -433,6 +433,13 @@ pub const Host = struct {
         return replica_catalog.revision();
     }
 
+    /// Returns the durable admission decision, independently of whether the
+    /// live runtime has finished installing or removing the replica.
+    pub fn replicaCatalogContains(self: *Host, group_id: u64) ?bool {
+        const replica_catalog = self.deps.replica_catalog orelse return null;
+        return replica_catalog.containsReplica(group_id);
+    }
+
     pub fn commitReplicaCatalog(
         self: *Host,
         expected_revision: ?u64,
@@ -1285,6 +1292,7 @@ test "host can ensure and remove a replica" {
                 .vtable = &.{
                     .upsert_replica = upsertReplica,
                     .remove_replica = removeReplica,
+                    .contains_replica = containsReplica,
                     .list_replicas = listReplicas,
                     .revision = revision,
                     .apply_batch = applyBatch,
@@ -1298,6 +1306,10 @@ test "host can ensure and remove a replica" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.remove_calls += 1;
             if (self.fail_remove) return error.InjectedCatalogRemovalFailure;
+            return true;
+        }
+
+        fn containsReplica(_: *anyopaque, _: u64) bool {
             return true;
         }
 

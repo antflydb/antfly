@@ -2024,12 +2024,6 @@ pub const MetadataHttpServer = struct {
             routes.Routes.raft_mutation_outcome_header,
             routes.Routes.raft_mutation_outcome_not_proposed,
         );
-        self.source.preflightTableMutationAuthority() catch |err| {
-            if (err != error.NotLeader or !forwarding.campaign_allowed)
-                return metadataMutationError(ctx, err);
-            self.source.recoverTableMutationAuthority(forwarding.remaining_ms) catch |recover_err|
-                return metadataMutationError(ctx, recover_err);
-        };
         const body = (try ctx.body()) orelse "";
         validateForwardedCreateTableBodySize(body.len) catch
             return ctx.status(413).text("table mutation request too large");
@@ -2044,23 +2038,42 @@ pub const MetadataHttpServer = struct {
             return ctx.status(426).text("unsupported table mutation protocol");
         tables_api.validateTableMutationName(forwarded.value.table_name) catch
             return ctx.status(400).text("invalid table name");
+        var create_request: ?tables_api.CreateTableRequest = null;
+        defer if (create_request) |*request| request.deinit(ctx.allocator);
+        switch (forwarded.value.kind) {
+            .create_table => {
+                const definition_json = forwarded.value.definition_json orelse
+                    return ctx.status(400).text("missing create table definition");
+                tables_api.validateTableCreateBodySize(definition_json.len) catch
+                    return ctx.status(413).text("create table request too large");
+                create_request = parseCreateTableRequest(ctx.allocator, definition_json) catch |err| switch (err) {
+                    error.CreateTableShardCountOutOfRange => return ctx.status(400).text(tables_api.table_initial_ranges_error_message),
+                    else => return ctx.status(400).text("invalid create table request"),
+                };
+            },
+            .drop_table => if (forwarded.value.definition_json != null)
+                return ctx.status(400).text("drop table definition must be absent"),
+        }
+        // Campaigning can disturb a healthy leader. Do it only after every
+        // bounded, deterministic request validation has succeeded.
+        self.source.preflightTableMutationAuthority() catch |err| {
+            if (err != error.NotLeader or !forwarding.campaign_allowed)
+                return metadataMutationError(ctx, err);
+            self.source.recoverTableMutationAuthority(forwarding.remaining_ms) catch |recover_err|
+                return metadataMutationError(ctx, recover_err);
+        };
         try ctx.setHeader(
             routes.Routes.raft_mutation_outcome_header,
             routes.Routes.raft_mutation_outcome_unknown,
         );
         var response = switch (forwarded.value.kind) {
-            .create_table => try self.executeMetadataCreateTable(
+            .create_table => try self.executeMetadataCreateTableParsed(
                 ctx,
                 forwarded_request,
                 forwarded.value.table_name,
-                forwarded.value.definition_json orelse
-                    return ctx.status(400).text("missing create table definition"),
+                create_request.?,
             ),
-            .drop_table => blk: {
-                if (forwarded.value.definition_json != null)
-                    return ctx.status(400).text("drop table definition must be absent");
-                break :blk try self.executeMetadataDropTableForwarded(ctx, forwarded_request, forwarded.value.table_name);
-            },
+            .drop_table => try self.executeMetadataDropTableForwarded(ctx, forwarded_request, forwarded.value.table_name),
         };
         if (response.status.code >= 200 and response.status.code < 300) {
             try response.headers.set(
@@ -2085,6 +2098,16 @@ pub const MetadataHttpServer = struct {
             else => return ctx.status(400).text("invalid create table request"),
         };
         defer request.deinit(ctx.allocator);
+        return self.executeMetadataCreateTableParsed(ctx, request_context, table_name, request);
+    }
+
+    fn executeMetadataCreateTableParsed(
+        self: *MetadataHttpServer,
+        ctx: *httpx.Context,
+        request_context: operation.RequestContext,
+        table_name: []const u8,
+        request: tables_api.CreateTableRequest,
+    ) !httpx.Response {
         self.tableOperations().create(ctx.allocator, request_context, table_name, request) catch |err| switch (err) {
             error.TableAlreadyExists => return ctx.status(409).text("table already exists"),
             error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.InvalidArgument => return ctx.status(400).text("invalid create table request"),
@@ -5602,6 +5625,71 @@ test "forwarded table mutation uses its single campaign allowance" {
     try std.testing.expectEqual(@as(usize, 1), source.create_calls);
     try std.testing.expectEqualStrings(
         routes.Routes.raft_mutation_outcome_committed,
+        response.headers.get(routes.Routes.raft_mutation_outcome_header).?,
+    );
+}
+
+test "invalid forwarded table mutation never preflights or campaigns" {
+    const FakeSource = struct {
+        preflight_calls: usize = 0,
+        recover_calls: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{ .ptr = self, .vtable = &.{
+                .status = status,
+                .admin_snapshot = adminSnapshot,
+                .free_admin_snapshot = freeAdminSnapshot,
+                .preflight_table_mutation_authority = preflight,
+                .recover_table_mutation_authority = recover,
+            } };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return error.UnexpectedAdminSnapshotCall;
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn preflight(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.preflight_calls += 1;
+            return error.NotLeader;
+        }
+
+        fn recover(ptr: *anyopaque, _: u32) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.recover_calls += 1;
+        }
+    };
+
+    const body = try std.json.Stringify.valueAlloc(std.testing.allocator, routes.ForwardedTableMutation{
+        .kind = .create_table,
+        .table_name = "docs",
+        .definition_json = "{",
+    }, .{ .emit_null_optional_fields = false });
+    defer std.testing.allocator.free(body);
+    var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_forwarded_table_mutation);
+    defer request.deinit();
+    try request.setHeader(routes.Routes.raft_mutation_remaining_ms_header, "500");
+    try request.setHeader(routes.Routes.raft_mutation_forwards_remaining_header, "1");
+    try request.setHeader(routes.Routes.raft_mutation_campaign_allowed_header, "true");
+    try request.setBody(body);
+    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    defer ctx.deinit();
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var response = try server.metadataTableMutationForwarded(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    try std.testing.expectEqual(@as(usize, 0), source.preflight_calls);
+    try std.testing.expectEqual(@as(usize, 0), source.recover_calls);
+    try std.testing.expectEqualStrings(
+        routes.Routes.raft_mutation_outcome_not_proposed,
         response.headers.get(routes.Routes.raft_mutation_outcome_header).?,
     );
 }

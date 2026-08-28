@@ -327,6 +327,7 @@ pub const ReplicaCatalog = struct {
     pub const VTable = struct {
         upsert_replica: *const fn (ptr: *anyopaque, record: ReplicaRecord) anyerror!void,
         remove_replica: *const fn (ptr: *anyopaque, group_id: u64) anyerror!bool,
+        contains_replica: *const fn (ptr: *anyopaque, group_id: u64) bool,
         list_replicas: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror![]ReplicaRecord,
         revision: *const fn (ptr: *anyopaque) u64,
         apply_batch: *const fn (
@@ -344,6 +345,10 @@ pub const ReplicaCatalog = struct {
 
     pub fn removeReplica(self: ReplicaCatalog, group_id: u64) !bool {
         return try self.vtable.remove_replica(self.ptr, group_id);
+    }
+
+    pub fn containsReplica(self: ReplicaCatalog, group_id: u64) bool {
+        return self.vtable.contains_replica(self.ptr, group_id);
     }
 
     pub fn listReplicas(self: ReplicaCatalog, alloc: std.mem.Allocator) ![]ReplicaRecord {
@@ -388,6 +393,7 @@ pub const MemoryReplicaCatalog = struct {
             .vtable = &.{
                 .upsert_replica = upsertReplica,
                 .remove_replica = removeReplica,
+                .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
                 .revision = revision,
                 .apply_batch = applyBatch,
@@ -429,6 +435,13 @@ pub const MemoryReplicaCatalog = struct {
         record.deinit(self.alloc);
         self.current_revision = next_revision;
         return true;
+    }
+
+    fn containsReplica(ptr: *anyopaque, group_id: u64) bool {
+        const self: *MemoryReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.records.contains(group_id);
     }
 
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicaRecord {
@@ -506,6 +519,7 @@ pub const FileReplicaCatalog = struct {
             .vtable = &.{
                 .upsert_replica = upsertReplica,
                 .remove_replica = removeReplica,
+                .contains_replica = containsReplica,
                 .list_replicas = listReplicas,
                 .revision = revision,
                 .apply_batch = applyBatch,
@@ -564,6 +578,13 @@ pub const FileReplicaCatalog = struct {
         record.deinit(self.alloc);
         self.current_revision = next_revision;
         return true;
+    }
+
+    fn containsReplica(ptr: *anyopaque, group_id: u64) bool {
+        const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return self.records.contains(group_id);
     }
 
     fn listReplicas(ptr: *anyopaque, alloc: std.mem.Allocator) ![]ReplicaRecord {

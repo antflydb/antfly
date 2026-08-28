@@ -471,7 +471,8 @@ const dropped_table_repair_dir_name = ".antfly-drop-repair";
 const replica_retirement_dir_name = ".antfly-replica-retirement";
 const dropped_table_repair_magic_v1 = "AFDROP1\x00";
 const dropped_table_repair_magic = "AFDROP2\x00";
-const replica_retirement_magic = "AFRTRM1\x00";
+const replica_retirement_magic_v1 = "AFRTRM1\x00";
+const replica_retirement_magic = "AFRTRM2\x00";
 const max_dropped_table_repair_bytes: usize = 256 * 1024 * 1024;
 const max_dropped_table_repair_name_bytes: usize = 16 * 1024;
 
@@ -991,9 +992,57 @@ fn replicaRetirementIntentPath(
 }
 
 const PersistedReplicaRetirementIntent = struct {
+    group_id: u64,
     path: []u8,
     created: bool,
 };
+
+const ReplicaRetirementIntentPhase = enum(u8) {
+    prepared = 1,
+    committed = 2,
+};
+
+const LoadedReplicaRetirementIntent = struct {
+    group_id: u64,
+    phase: ReplicaRetirementIntentPhase,
+    legacy: bool = false,
+};
+
+fn writeReplicaRetirementIntent(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
+    path: []const u8,
+    group_id: u64,
+    phase: ReplicaRetirementIntentPhase,
+) !void {
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
+    defer alloc.free(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    {
+        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
+        defer file.close(io);
+        var buffer: [128]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        var encoded_group_id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_group_id, group_id, .little);
+        const encoded_phase = [_]u8{@intFromEnum(phase)};
+        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+        checksum.update(replica_retirement_magic);
+        checksum.update(&encoded_group_id);
+        checksum.update(&encoded_phase);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        checksum.final(&digest);
+        try writer.interface.writeAll(replica_retirement_magic);
+        try writer.interface.writeAll(&encoded_group_id);
+        try writer.interface.writeAll(&encoded_phase);
+        try writer.interface.writeAll(&digest);
+        try writer.end();
+        try file.sync(io);
+    }
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
+    try fs_paths.syncDirPortable(io, dir_path);
+}
 
 fn persistReplicaRetirementIntent(
     alloc: std.mem.Allocator,
@@ -1010,55 +1059,52 @@ fn persistReplicaRetirementIntent(
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, dir_path);
     if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
-        const persisted_group_id = try loadReplicaRetirementIntent(alloc, io, path);
-        if (persisted_group_id != group_id) return error.InvalidReplicaRetirementIntent;
-        return .{ .path = path, .created = false };
+        const persisted = try loadReplicaRetirementIntent(alloc, io, path);
+        if (persisted.group_id != group_id) return error.InvalidReplicaRetirementIntent;
+        return .{ .group_id = group_id, .path = path, .created = false };
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
 
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
-    defer alloc.free(tmp_path);
-    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-    {
-        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
-        defer file.close(io);
-        var buffer: [128]u8 = undefined;
-        var writer = file.writer(io, &buffer);
-        var encoded_group_id: [8]u8 = undefined;
-        std.mem.writeInt(u64, &encoded_group_id, group_id, .little);
-        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
-        checksum.update(replica_retirement_magic);
-        checksum.update(&encoded_group_id);
-        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-        checksum.final(&digest);
-        try writer.interface.writeAll(replica_retirement_magic);
-        try writer.interface.writeAll(&encoded_group_id);
-        try writer.interface.writeAll(&digest);
-        try writer.end();
-        try file.sync(io);
-    }
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
-    try fs_paths.syncDirPortable(io, dir_path);
-    return .{ .path = path, .created = true };
+    try writeReplicaRetirementIntent(alloc, io, dir_path, path, group_id, .prepared);
+    return .{ .group_id = group_id, .path = path, .created = true };
 }
 
-fn loadReplicaRetirementIntent(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !u64 {
-    const encoded_len = replica_retirement_magic.len + @sizeOf(u64) + std.crypto.hash.sha2.Sha256.digest_length;
+fn loadReplicaRetirementIntent(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedReplicaRetirementIntent {
+    const encoded_len_v1 = replica_retirement_magic_v1.len + @sizeOf(u64) + std.crypto.hash.sha2.Sha256.digest_length;
+    const encoded_len = replica_retirement_magic.len + @sizeOf(u64) + @sizeOf(u8) + std.crypto.hash.sha2.Sha256.digest_length;
     // readFileAlloc's limit is an EOF-detection ceiling, so leave one byte of
     // headroom and reject both truncated and oversized records below.
     const encoded = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(encoded_len + 1));
     defer alloc.free(encoded);
-    if (encoded.len != encoded_len) return error.InvalidReplicaRetirementIntent;
-    if (!std.mem.eql(u8, encoded[0..replica_retirement_magic.len], replica_retirement_magic))
+    const legacy = encoded.len == encoded_len_v1 and
+        std.mem.eql(u8, encoded[0..replica_retirement_magic_v1.len], replica_retirement_magic_v1);
+    if (!legacy and (encoded.len != encoded_len or
+        !std.mem.eql(u8, encoded[0..replica_retirement_magic.len], replica_retirement_magic)))
         return error.InvalidReplicaRetirementIntent;
-    const payload_end = replica_retirement_magic.len + @sizeOf(u64);
+    const magic_len = if (legacy) replica_retirement_magic_v1.len else replica_retirement_magic.len;
+    const phase_len: usize = if (legacy) 0 else @sizeOf(u8);
+    const payload_end = magic_len + @sizeOf(u64) + phase_len;
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(encoded[0..payload_end], &digest, .{});
     if (!std.mem.eql(u8, &digest, encoded[payload_end..]))
         return error.InvalidReplicaRetirementIntent;
-    return std.mem.readInt(u64, encoded[replica_retirement_magic.len..payload_end], .little);
+    const group_id_end = magic_len + @sizeOf(u64);
+    const phase: ReplicaRetirementIntentPhase = if (legacy)
+        .prepared
+    else switch (encoded[group_id_end]) {
+        @intFromEnum(ReplicaRetirementIntentPhase.prepared) => .prepared,
+        @intFromEnum(ReplicaRetirementIntentPhase.committed) => .committed,
+        else => return error.InvalidReplicaRetirementIntent,
+    };
+    var encoded_group_id: [@sizeOf(u64)]u8 = undefined;
+    @memcpy(&encoded_group_id, encoded[magic_len..group_id_end]);
+    return .{
+        .group_id = std.mem.readInt(u64, &encoded_group_id, .little),
+        .phase = phase,
+        .legacy = legacy,
+    };
 }
 
 fn droppedTableRepairIntentPath(
@@ -6093,16 +6139,21 @@ pub const ProvisionedTableWriteSource = struct {
         ) void,
     };
 
-    /// Fail-closed recovery proof for a staged local replica retirement. The
-    /// intent may outlive a failed replica-catalog transaction or a process
-    /// crash, so filesystem deletion is allowed only after the live host no
-    /// longer owns the group.
+    /// Durable and live recovery proof for a staged local replica retirement.
+    /// The catalog distinguishes an aborted removal from a committed one;
+    /// live ownership then fences filesystem deletion until runtime teardown.
     pub const ReplicaRetirementOwnership = struct {
-        ptr: *anyopaque,
-        is_owned: *const fn (ptr: *anyopaque, group_id: u64) bool,
+        pub const State = enum {
+            retained,
+            retiring,
+            retired,
+        };
 
-        fn owns(self: @This(), group_id: u64) bool {
-            return self.is_owned(self.ptr, group_id);
+        ptr: *anyopaque,
+        classify: *const fn (ptr: *anyopaque, group_id: u64) anyerror!State,
+
+        fn state(self: @This(), group_id: u64) !State {
+            return try self.classify(self.ptr, group_id);
         }
     };
 
@@ -6310,6 +6361,10 @@ pub const ProvisionedTableWriteSource = struct {
     dropped_table_recovery_retry_failures: std.atomic.Value(u32) = .init(0),
     replica_retirement_ownership_mutex: std.atomic.Mutex = .unlocked,
     replica_retirement_ownership: ?ReplicaRetirementOwnership = null,
+    // Serializes journal publication/recovery and tracks in-flight plans so a
+    // scanner cannot classify a just-prepared record before its catalog CAS.
+    replica_retirement_intent_mutex: std.atomic.Mutex = .unlocked,
+    active_replica_retirement_intents: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     // Protected by table_activity_mutex. A retirement is rare topology work;
     // this set fences new group activity while current leases drain.
     retiring_replica_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
@@ -7076,6 +7131,10 @@ pub const ProvisionedTableWriteSource = struct {
         self.retiring_replica_groups.deinit(std.heap.page_allocator);
         self.retiring_replica_groups = .empty;
         self.table_activity_mutex.unlock(io);
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        self.active_replica_retirement_intents.deinit(std.heap.page_allocator);
+        self.active_replica_retirement_intents = .empty;
+        self.replica_retirement_intent_mutex.unlock();
         self.quiesced = true;
     }
 
@@ -7330,6 +7389,8 @@ pub const ProvisionedTableWriteSource = struct {
     fn recoverReplicaRetirementIntents(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator) !bool {
         var retry_required = false;
         const ownership = self.replicaRetirementOwnershipSnapshot() orelse return false;
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        defer self.replica_retirement_intent_mutex.unlock();
         const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
         defer alloc.free(dir_path);
         var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -7345,13 +7406,36 @@ pub const ProvisionedTableWriteSource = struct {
             if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".bin")) continue;
             const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir_path, entry.name });
             defer alloc.free(path);
-            const group_id = loadReplicaRetirementIntent(alloc, io, path) catch |err| {
+            const intent = loadReplicaRetirementIntent(alloc, io, path) catch |err| {
                 std.log.err("invalid replica-retirement intent retained path={s} err={s}", .{ path, @errorName(err) });
                 continue;
             };
-            // A crash can leave an intent whose replica-catalog transaction
-            // never committed. Ownership is the fail-closed deletion fence.
-            if (ownership.owns(group_id)) {
+            const group_id = intent.group_id;
+            if (self.active_replica_retirement_intents.contains(group_id)) continue;
+            const state = ownership.state(group_id) catch |err| {
+                std.log.warn("replica-retirement ownership classification deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                retry_required = true;
+                continue;
+            };
+            // A retained catalog record proves that the removal CAS never
+            // committed. Retire only the orphaned journal, never the replica.
+            if (state == .retained) {
+                removeDroppedTableRepairIntent(path) catch |err| {
+                    std.log.warn("aborted replica-retirement intent retained group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                    retry_required = true;
+                };
+                continue;
+            }
+            // Promotion repairs the crash window between the atomic catalog
+            // commit and journal phase update. V1 records are upgraded here.
+            if (intent.phase != .committed or intent.legacy) {
+                writeReplicaRetirementIntent(alloc, io, dir_path, path, group_id, .committed) catch |err| {
+                    std.log.warn("replica-retirement commit marker deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
+                    retry_required = true;
+                    continue;
+                };
+            }
+            if (state == .retiring) {
                 retry_required = true;
                 continue;
             }
@@ -7373,17 +7457,32 @@ pub const ProvisionedTableWriteSource = struct {
         alloc: std.mem.Allocator,
         group_ids: []const u64,
     ) !PreparedReplicaRetirements {
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        defer self.replica_retirement_intent_mutex.unlock();
+        try self.active_replica_retirement_intents.ensureUnusedCapacity(
+            std.heap.page_allocator,
+            std.math.cast(u32, group_ids.len) orelse return error.ReplicaRetirementBatchTooLarge,
+        );
         const intents = try alloc.alloc(PersistedReplicaRetirementIntent, group_ids.len);
         var initialized: usize = 0;
         errdefer {
             for (intents[0..initialized]) |intent| {
-                if (intent.created) removeDroppedTableRepairIntent(intent.path) catch {};
+                const active = self.active_replica_retirement_intents.getPtr(intent.group_id) orelse unreachable;
+                std.debug.assert(active.* > 0);
+                active.* -= 1;
+                if (active.* == 0) {
+                    _ = self.active_replica_retirement_intents.remove(intent.group_id);
+                    if (intent.created) removeDroppedTableRepairIntent(intent.path) catch {};
+                }
                 alloc.free(intent.path);
             }
             alloc.free(intents);
         }
         for (group_ids, intents) |group_id, *intent| {
             intent.* = try persistReplicaRetirementIntent(alloc, self.replica_root_dir, group_id);
+            const active = self.active_replica_retirement_intents.getOrPutAssumeCapacity(group_id);
+            if (!active.found_existing) active.value_ptr.* = 0;
+            active.value_ptr.* += 1;
             initialized += 1;
         }
         return .{ .alloc = alloc, .intents = intents };
@@ -7393,13 +7492,28 @@ pub const ProvisionedTableWriteSource = struct {
         self: *ProvisionedTableWriteSource,
         prepared: *const PreparedReplicaRetirements,
     ) void {
-        _ = self;
+        var recovery_required = false;
+        lockAtomic(&self.replica_retirement_intent_mutex);
         for (prepared.intents) |intent| {
-            if (!intent.created) continue;
+            const active = self.active_replica_retirement_intents.getPtr(intent.group_id) orelse continue;
+            std.debug.assert(active.* > 0);
+            active.* -= 1;
+            if (active.* != 0) continue;
+            _ = self.active_replica_retirement_intents.remove(intent.group_id);
+            // A pre-existing record may belong to an earlier committed
+            // retirement. This failed preparation did not create it and must
+            // not cancel its recovery ownership.
+            if (!intent.created) {
+                recovery_required = true;
+                continue;
+            }
             removeDroppedTableRepairIntent(intent.path) catch |err| {
                 std.log.warn("uncommitted replica-retirement intent retained path={s} err={s}", .{ intent.path, @errorName(err) });
+                recovery_required = true;
             };
         }
+        self.replica_retirement_intent_mutex.unlock();
+        if (recovery_required and self.backend_runtime != null) self.scheduleDroppedTableRecovery();
     }
 
     pub fn completePreparedReplicaRetirements(
@@ -7408,11 +7522,54 @@ pub const ProvisionedTableWriteSource = struct {
         prepared: *const PreparedReplicaRetirements,
     ) !void {
         if (group_ids.len != prepared.intents.len) return error.InvalidReplicaRetirementBatch;
-        const ownership = self.replicaRetirementOwnershipSnapshot() orelse
-            return error.ReplicaRetirementOwnershipUnavailable;
         var first_error: ?anyerror = null;
+
+        // Publish the committed phase before releasing the in-process fence.
+        // If a phase write fails, catalog classification still repairs it on
+        // the next scan without ever guessing whether the CAS committed.
+        lockAtomic(&self.replica_retirement_intent_mutex);
+        const dir_path = replicaRetirementDirPath(prepared.alloc, self.replica_root_dir) catch |err| blk: {
+            first_error = err;
+            break :blk null;
+        };
+        defer if (dir_path) |path| prepared.alloc.free(path);
+        var io_impl = std.Io.Threaded.init(prepared.alloc, .{});
+        defer io_impl.deinit();
         for (group_ids, prepared.intents) |group_id, intent| {
-            if (ownership.owns(group_id)) {
+            if (dir_path) |path| writeReplicaRetirementIntent(
+                prepared.alloc,
+                io_impl.io(),
+                path,
+                intent.path,
+                group_id,
+                .committed,
+            ) catch |err| {
+                first_error = first_error orelse err;
+            };
+            if (self.active_replica_retirement_intents.getPtr(group_id)) |active| {
+                std.debug.assert(active.* > 0);
+                active.* -= 1;
+                if (active.* == 0) _ = self.active_replica_retirement_intents.remove(group_id);
+            }
+        }
+        self.replica_retirement_intent_mutex.unlock();
+
+        const ownership = self.replicaRetirementOwnershipSnapshot() orelse {
+            if (self.backend_runtime != null) self.scheduleDroppedTableRecovery();
+            return first_error orelse error.ReplicaRetirementOwnershipUnavailable;
+        };
+        for (group_ids, prepared.intents) |group_id, intent| {
+            const state = ownership.state(group_id) catch |err| {
+                first_error = first_error orelse err;
+                continue;
+            };
+            if (state == .retained) {
+                // The caller promises this method only after a durable catalog
+                // commit. Treat a retained record as an inconclusive proof.
+                first_error = first_error orelse error.ReplicaRetirementOwnershipInconclusive;
+                continue;
+            }
+            if (state == .retiring) {
                 first_error = first_error orelse error.ReplicaRetirementOwnershipInconclusive;
                 continue;
             }
@@ -43838,7 +43995,7 @@ test "provisioned table drop retains repair intent until catalog ownership clear
     try std.testing.expect((try iterator.next(io_impl.io())) == null);
 }
 
-test "replica retirement recovery waits for durable ownership removal" {
+test "replica retirement journal distinguishes active retained and committed removal" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -43858,41 +44015,106 @@ test "replica retirement recovery waits for durable ownership removal" {
     try std.Io.Dir.cwd().createDirPath(io_impl.io(), raft_path);
 
     const Ownership = struct {
-        owned: bool = true,
+        state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retained,
 
-        fn isOwned(ptr: *anyopaque, group_id: u64) bool {
+        fn classify(ptr: *anyopaque, group_id: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.debug.assert(group_id == 7001);
-            return self.owned;
+            return self.state;
         }
     };
 
     var ownership = Ownership{};
     var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
     defer source.deinit();
-    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .is_owned = Ownership.isOwned });
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
     var prepared = try source.prepareReplicaRetirements(alloc, &.{7001});
     defer prepared.deinit();
     try std.testing.expect(prepared.intents[0].created);
-    try std.testing.expectEqual(@as(u64, 7001), try loadReplicaRetirementIntent(alloc, io_impl.io(), prepared.intents[0].path));
+    try std.testing.expectEqual(@as(u64, 7001), (try loadReplicaRetirementIntent(alloc, io_impl.io(), prepared.intents[0].path)).group_id);
     var duplicate = try source.prepareReplicaRetirements(alloc, &.{7001});
     defer duplicate.deinit();
     try std.testing.expect(!duplicate.intents[0].created);
     source.cancelPreparedReplicaRetirements(&duplicate);
     try std.Io.Dir.cwd().access(io_impl.io(), prepared.intents[0].path, .{});
 
-    try std.testing.expect(try source.recoverReplicaRetirementIntents(alloc));
+    // The in-process preparation fence suppresses premature classification
+    // without scheduling a retry loop; its owner will complete or cancel it.
+    try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
     try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
     try std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{});
     try std.Io.Dir.cwd().access(io_impl.io(), prepared.intents[0].path, .{});
 
-    ownership.owned = false;
+    ownership.state = .retiring;
+    try std.testing.expectError(
+        error.ReplicaRetirementOwnershipInconclusive,
+        source.completePreparedReplicaRetirements(&.{7001}, &prepared),
+    );
+    const committed_intent = try loadReplicaRetirementIntent(alloc, io_impl.io(), prepared.intents[0].path);
+    try std.testing.expectEqual(ReplicaRetirementIntentPhase.committed, committed_intent.phase);
+    try std.testing.expect(!committed_intent.legacy);
+    try std.testing.expect(try source.recoverReplicaRetirementIntents(alloc));
+
+    ownership.state = .retired;
     // Reattaching a now-authoritative host proof must rescan synchronously;
     // an earlier generic startup scan may have run before that proof existed.
-    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .is_owned = Ownership.isOwned });
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.intents[0].path, .{}));
+}
+
+test "replica retirement recovery discards a legacy orphan whose catalog removal aborted" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/replica-retirement-aborted",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+    const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(db_path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
+    const persisted = try persistReplicaRetirementIntent(alloc, replica_root_dir, 7001);
+    defer alloc.free(persisted.path);
+    // Simulate a sidecar left by a rolling-upgrade predecessor.
+    {
+        var file = try fs_paths.createFilePortable(io_impl.io(), persisted.path, .{ .truncate = true });
+        defer file.close(io_impl.io());
+        var buffer: [128]u8 = undefined;
+        var writer = file.writer(io_impl.io(), &buffer);
+        var encoded_group_id: [@sizeOf(u64)]u8 = undefined;
+        std.mem.writeInt(u64, &encoded_group_id, 7001, .little);
+        var checksum = std.crypto.hash.sha2.Sha256.init(.{});
+        checksum.update(replica_retirement_magic_v1);
+        checksum.update(&encoded_group_id);
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        checksum.final(&digest);
+        try writer.interface.writeAll(replica_retirement_magic_v1);
+        try writer.interface.writeAll(&encoded_group_id);
+        try writer.interface.writeAll(&digest);
+        try writer.end();
+        try file.sync(io_impl.io());
+    }
+    try std.testing.expect((try loadReplicaRetirementIntent(alloc, io_impl.io(), persisted.path)).legacy);
+
+    const Ownership = struct {
+        fn classify(_: *anyopaque, group_id: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
+            std.debug.assert(group_id == 7001);
+            return .retained;
+        }
+    };
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &source, .classify = Ownership.classify });
+
+    try std.Io.Dir.cwd().access(io_impl.io(), db_path, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), persisted.path, .{}));
+    try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
 }
 
 test "hosted source publication recovers durable dropped-table intent" {
