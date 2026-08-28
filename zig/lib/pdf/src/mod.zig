@@ -134,12 +134,14 @@ fn renderParsedPagePngNativeAlloc(
     // Reject oversized pages before decoding page images and font resources.
     const unscaled_box = try parsed.extractPageBox(page_number);
     const scale = @as(f64, @floatFromInt(dpi)) / 72.0;
-    const preflight_width = @max(1.0, unscaled_box.max_x - unscaled_box.min_x) * scale;
-    const preflight_height = @max(1.0, unscaled_box.max_y - unscaled_box.min_y) * scale;
+    const preflight_width = rasterAxisExtent(unscaled_box.min_x, unscaled_box.max_x, scale);
+    const preflight_height = rasterAxisExtent(unscaled_box.min_y, unscaled_box.max_y, scale);
     if (preflight_width * preflight_height > @as(f64, @floatFromInt(max_pixels))) return error.RenderedPageTooLarge;
-    var render_runs = try parsed.extractPageRenderRunsAlloc(page_number);
+    if (preflight_width > std.math.maxInt(u32) or preflight_height > std.math.maxInt(u32)) return error.RenderedPageTooLarge;
+    var render_runs = try parsed.extractPageRenderRunsForRasterAlloc(page_number, @intFromFloat(preflight_width), @intFromFloat(preflight_height));
     defer render_runs.deinit(reader_alloc);
     scalePageRenderRuns(&render_runs, scale);
+    alignPageBoxToPixelGrid(&render_runs.page_box);
     const page_box = render_runs.page_box;
     const page_width = @max(1.0, page_box.max_x - page_box.min_x);
     const page_height = @max(1.0, page_box.max_y - page_box.min_y);
@@ -258,19 +260,17 @@ pub fn renderParsedPagePngAdaptiveAlloc(
     if (page_number > page_count) return error.InvalidPageNumber;
     const box = try parsed.extractPageBox(page_number);
     const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
-    const unrotated_width = @max(1.0, box.max_x - box.min_x);
-    const unrotated_height = @max(1.0, box.max_y - box.min_y);
     const swaps_dimensions = rotation == .clockwise_90 or rotation == .clockwise_270;
-    const page_width = if (swaps_dimensions) unrotated_height else unrotated_width;
-    const page_height = if (swaps_dimensions) unrotated_width else unrotated_height;
 
     var effective_dpi = requested_dpi;
     var width: u32 = 0;
     var height: u32 = 0;
     while (true) {
         const scale = @as(f64, @floatFromInt(effective_dpi)) / 72.0;
-        const width_f = @ceil(page_width * scale);
-        const height_f = @ceil(page_height * scale);
+        const unrotated_width = rasterAxisExtent(box.min_x, box.max_x, scale);
+        const unrotated_height = rasterAxisExtent(box.min_y, box.max_y, scale);
+        const width_f = if (swaps_dimensions) unrotated_height else unrotated_width;
+        const height_f = if (swaps_dimensions) unrotated_width else unrotated_height;
         const fits_integer = width_f <= @as(f64, @floatFromInt(std.math.maxInt(u32))) and
             height_f <= @as(f64, @floatFromInt(std.math.maxInt(u32)));
         if (fits_integer) {
@@ -401,6 +401,37 @@ fn scalePageRenderRuns(runs: *reader.PageRenderRuns, scale: f64) void {
     scaleShadingRuns(runs.shading_runs, scale);
     scalePatternRuns(runs.pattern_runs, scale);
     scaleShapeRuns(runs.shape_runs, scale);
+}
+
+fn rasterAxisExtent(min_value: f64, max_value: f64, scale: f64) f64 {
+    return @max(1.0, @ceil(max_value * scale) - @floor(min_value * scale));
+}
+
+fn alignPageBoxToPixelGrid(box: *reader.PageBox) void {
+    box.min_x = @floor(box.min_x);
+    box.min_y = @floor(box.min_y);
+    box.max_x = @max(box.min_x + 1.0, @ceil(box.max_x));
+    box.max_y = @max(box.min_y + 1.0, @ceil(box.max_y));
+}
+
+test "raster extents include fractional crop-box edges" {
+    const box: reader.PageBox = .{
+        .min_x = 0.720001,
+        .min_y = 0.479996,
+        .max_x = 595.92,
+        .max_y = 842.16,
+    };
+    const scale = 150.0 / 72.0;
+    try std.testing.expectEqual(@as(f64, 1241), rasterAxisExtent(box.min_x, box.max_x, scale));
+    try std.testing.expectEqual(@as(f64, 1755), rasterAxisExtent(box.min_y, box.max_y, scale));
+
+    var scaled = box;
+    scaleBox(&scaled, scale);
+    alignPageBoxToPixelGrid(&scaled);
+    try std.testing.expectEqual(@as(f64, 1), scaled.min_x);
+    try std.testing.expectEqual(@as(f64, 0), scaled.min_y);
+    try std.testing.expectEqual(@as(f64, 1242), scaled.max_x);
+    try std.testing.expectEqual(@as(f64, 1755), scaled.max_y);
 }
 
 fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
