@@ -699,15 +699,31 @@ pub const QueryVisibilityChange = enum {
     index_repair_cleared,
 };
 
+/// Incarnation-scoped identity for a durable repair visibility edge. The
+/// slices are borrowed for the synchronous notification only; consumers that
+/// retain an event must clone them.
+pub const IndexRepairVisibility = struct {
+    index_name: []const u8,
+    repair_id: u128 = 0,
+    revision: u64 = 0,
+    config_hash: u64 = 0,
+    root_generation: u64 = 0,
+};
+
+pub const QueryVisibilityEvent = struct {
+    change: QueryVisibilityChange,
+    repair: ?IndexRepairVisibility = null,
+};
+
 pub const QueryVisibilityHook = struct {
     ptr: *anyopaque,
     table_name: []const u8,
     group_id: u64 = 0,
     db: ?*DB = null,
-    on_change: *const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64, db: ?*DB, change: QueryVisibilityChange) void,
+    on_change: *const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64, db: ?*DB, event: QueryVisibilityEvent) void,
 
-    pub fn notify(self: @This(), change: QueryVisibilityChange) void {
-        self.on_change(self.ptr, self.table_name, self.group_id, self.db, change);
+    pub fn notify(self: @This(), event: QueryVisibilityEvent) void {
+        self.on_change(self.ptr, self.table_name, self.group_id, self.db, event);
     }
 };
 
@@ -755,6 +771,7 @@ const AsyncContext = struct {
     query_visibility_hook: ?QueryVisibilityHook = null,
     query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     index_repair_notification_pending: bool = false,
+    index_repair_scan_cursor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
@@ -3831,7 +3848,10 @@ pub const DB = struct {
         }
         self.async_context.query_visibility_hook_mutex.unlock();
         if (pending_hook) |attached| {
-            attached.notify(.index_repair_pending);
+            // A repair edge raised before hook attachment cannot safely retain
+            // a borrowed index identity. Deliver it as unknown scope so the
+            // owner conservatively invalidates group-wide visibility.
+            attached.notify(.{ .change = .index_repair_pending });
             _ = self.async_context.query_visibility_hook_in_flight.fetchSub(1, .release);
         }
         if (hook == null) {
@@ -3900,22 +3920,45 @@ pub const DB = struct {
     }
 
     fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
+        notifyQueryVisibilityEvent(ctx, .{ .change = change });
+    }
+
+    fn notifyIndexRepairVisibilityHook(
+        ctx: *AsyncContext,
+        change: QueryVisibilityChange,
+        intent: index_repair_state.IndexRepairIntent,
+        persisted_revision: u64,
+    ) void {
+        std.debug.assert(change == .index_repair_pending or change == .index_repair_cleared);
+        notifyQueryVisibilityEvent(ctx, .{
+            .change = change,
+            .repair = .{
+                .index_name = intent.index_name,
+                .repair_id = intent.repair_id,
+                .revision = persisted_revision,
+                .config_hash = intent.config_hash,
+                .root_generation = intent.root_generation,
+            },
+        });
+    }
+
+    fn notifyQueryVisibilityEvent(ctx: *AsyncContext, event: QueryVisibilityEvent) void {
         lockAtomic(&ctx.query_visibility_hook_mutex);
         const hook = ctx.query_visibility_hook orelse {
-            switch (change) {
+            switch (event.change) {
                 .index_repair_pending => ctx.index_repair_notification_pending = true,
                 else => {},
             }
             ctx.query_visibility_hook_mutex.unlock();
             return;
         };
-        if (change == .index_repair_pending or change == .index_repair_cleared) {
+        if (event.change == .index_repair_pending or event.change == .index_repair_cleared) {
             ctx.index_repair_notification_pending = false;
         }
         _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
         ctx.query_visibility_hook_mutex.unlock();
         defer _ = ctx.query_visibility_hook_in_flight.fetchSub(1, .release);
-        hook.notify(change);
+        hook.notify(event);
     }
 
     const DetachedEnrichmentRuntime = struct {
@@ -11182,9 +11225,11 @@ pub const DB = struct {
             self.core.index_manager.clearRepairUnavailable(entry.intent.index_name);
         }
         if (update.automation) |automation| {
-            notifyQueryVisibilityHook(
+            notifyIndexRepairVisibilityHook(
                 self.async_context,
                 if (automation == .enabled) .index_repair_pending else .index_repair_cleared,
+                entry.intent,
+                entry.intent.revision +| 1,
             );
         }
         if (update.phase) |phase| {
@@ -11519,7 +11564,7 @@ pub const DB = struct {
         if (indexRepairIntentBlocksService(intent)) {
             try self.core.index_manager.markRepairUnavailable(intent.index_name);
         }
-        notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
+        notifyIndexRepairVisibilityHook(self.async_context, .index_repair_pending, intent, intent.revision +| 1);
         return repair_id;
     }
 
@@ -12192,10 +12237,20 @@ pub const DB = struct {
         });
         ctx.index_repair_replay_pinned.store(remaining_replay_pin, .release);
         ctx.index_manager.clearRepairUnavailable(entry.intent.index_name);
-        notifyQueryVisibilityHook(
+        notifyIndexRepairVisibilityHook(
             ctx,
-            if (remaining_replay_pin) .index_repair_pending else .index_repair_cleared,
+            .index_repair_cleared,
+            entry.intent,
+            entry.intent.revision,
         );
+        if (remaining_replay_pin) {
+            // The removed intent identifies only the cleared index; replay is
+            // still pinned by one or more different durable intents. Never
+            // mislabel that group debt as belonging to the removed target.
+            // Unknown scope deliberately forces conservative group-wide
+            // invalidation in the coordination layer.
+            notifyQueryVisibilityHook(ctx, .index_repair_pending);
+        }
     }
 
     pub fn denseRepairWriteBackpressured(self: *const DB) bool {
@@ -12398,7 +12453,7 @@ pub const DB = struct {
             defer intent.deinit(alloc);
             try index_repair_state.putEntryAt(alloc, location, state.identity, null, .{ .intent = intent });
             try self.core.index_manager.markRepairUnavailable(cfg.name);
-            notifyQueryVisibilityHook(self.async_context, .index_repair_pending);
+            notifyIndexRepairVisibilityHook(self.async_context, .index_repair_pending, intent, intent.revision +| 1);
             result.discovered += 1;
 
             // Intent durability precedes the serviceability marker. If this
@@ -13128,7 +13183,34 @@ pub const DB = struct {
         disk_waits: usize = 0,
         documents_reprocessed: u64 = 0,
         next_retry_at_ms: u64 = 0,
+        inspected: usize = 0,
     };
+
+    const index_repair_inspections_per_execution_slot: usize = 8;
+
+    const IndexRepairInspectionWindow = struct {
+        start: usize,
+        budget: usize,
+    };
+
+    fn indexRepairInspectionWindow(
+        candidate_count: usize,
+        execution_limit: usize,
+        cursor: u64,
+    ) IndexRepairInspectionWindow {
+        if (candidate_count == 0 or execution_limit == 0) return .{ .start = 0, .budget = 0 };
+        return .{
+            .start = @intCast(cursor % candidate_count),
+            .budget = @min(
+                candidate_count,
+                std.math.mul(
+                    usize,
+                    execution_limit,
+                    index_repair_inspections_per_execution_slot,
+                ) catch std.math.maxInt(usize),
+            ),
+        };
+    }
 
     /// Bounded owner-side pass used by managed startup workers and periodic
     /// repair scans. Discovery itself is cheap; callers choose when execution
@@ -13151,7 +13233,6 @@ pub const DB = struct {
         defer state.deinit(alloc);
         const Candidate = struct {
             repair_id: u128,
-            started_at_ms: u64,
         };
         var candidates = std.ArrayListUnmanaged(Candidate).empty;
         defer candidates.deinit(alloc);
@@ -13175,18 +13256,24 @@ pub const DB = struct {
             }
             try candidates.append(alloc, .{
                 .repair_id = entry.intent.repair_id,
-                .started_at_ms = entry.intent.started_at_ms,
             });
         }
-        std.mem.sort(Candidate, candidates.items, {}, struct {
-            fn lessThan(_: void, a: Candidate, b: Candidate) bool {
-                if (a.started_at_ms != b.started_at_ms) return a.started_at_ms < b.started_at_ms;
-                return a.repair_id < b.repair_id;
-            }
-        }.lessThan);
         var consumed_slots: usize = 0;
-        for (candidates.items) |candidate| {
-            if (consumed_slots >= limit) break;
+        const inspection = indexRepairInspectionWindow(
+            candidates.items.len,
+            limit,
+            self.async_context.index_repair_scan_cursor.load(.monotonic),
+        );
+        while (result.inspected < inspection.budget and consumed_slots < limit) {
+            const candidate_index = (inspection.start + result.inspected) % candidates.items.len;
+            const candidate = candidates.items[candidate_index];
+            result.inspected += 1;
+            // Advance before performing any durable work so an error or busy
+            // candidate cannot pin the next quantum to the same prefix.
+            self.async_context.index_repair_scan_cursor.store(
+                @intCast((candidate_index + 1) % candidates.items.len),
+                .monotonic,
+            );
             const advanced = try self.advanceIndexRepairIntent(alloc, candidate.repair_id, options);
             result.attempted += @intFromBool(advanced.attempted);
             result.repaired += @intFromBool(advanced.repaired);
@@ -13200,11 +13287,10 @@ pub const DB = struct {
             {
                 result.next_retry_at_ms = advanced.next_retry_at_ms;
             }
-            // `limit` bounds material repair work, not the number of durable
-            // intents inspected. A progressive managed generation can remain
-            // intentionally deferred while its canonical worker converges.
-            // Counting that O(1) observation as the only slot starves every
-            // later damaged index forever when the executor limit is one.
+            // Material execution and inspection are independently bounded.
+            // Deferred progressive generations do not consume a repair slot,
+            // while the rotating cursor prevents them from pinning every
+            // future quantum ahead of later damaged indexes.
             if (advanced.attempted or advanced.busy or advanced.terminal) {
                 consumed_slots += 1;
             }
@@ -17143,7 +17229,10 @@ pub const DB = struct {
         };
         self.core.index_manager.clearManagedAdmissionSnapshotForIndex(index_name);
         self.core.index_manager.clearRepairUnavailable(index_name);
-        notifyQueryVisibilityHook(self.async_context, .index_repair_cleared);
+        notifyQueryVisibilityEvent(self.async_context, .{
+            .change = .index_repair_cleared,
+            .repair = .{ .index_name = index_name },
+        });
     }
 
     fn recoverCommittedIndexAdmission(self: *DB, cfg: types.IndexConfig, activation_err: anyerror) !?u128 {
@@ -51402,13 +51491,13 @@ test "db enrichment status changes notify query visibility hook" {
         saw_db: bool = false,
         change: ?QueryVisibilityChange = null,
 
-        fn onChange(ptr: *anyopaque, table_name: []const u8, group_id: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
+        fn onChange(ptr: *anyopaque, table_name: []const u8, group_id: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             self.table_name = table_name;
             self.group_id = group_id;
             self.saw_db = changed_db != null;
-            self.change = change;
+            self.change = event.change;
         }
     };
     var hook_ctx = HookCtx{};
@@ -74819,6 +74908,23 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
     try std.testing.expect(!db.core.index_manager.repairUnavailable(cfg.name));
 }
 
+test "index repair inspection window is bounded and rotates fairly" {
+    const candidate_count = 257;
+    var seen = [_]bool{false} ** candidate_count;
+    var cursor: u64 = 0;
+    var pass: usize = 0;
+    while (pass < 33) : (pass += 1) {
+        const window = DB.indexRepairInspectionWindow(candidate_count, 1, cursor);
+        try std.testing.expectEqual(@as(usize, 8), window.budget);
+        var offset: usize = 0;
+        while (offset < window.budget) : (offset += 1) {
+            seen[(window.start + offset) % candidate_count] = true;
+        }
+        cursor = @intCast((window.start + window.budget) % candidate_count);
+    }
+    for (seen) |inspected| try std.testing.expect(inspected);
+}
+
 test "db progressive managed admission serves a checkpointed partial generation" {
     const alloc = std.testing.allocator;
     var path_buf: [256]u8 = undefined;
@@ -74929,6 +75035,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
     const damaged_repair_id = try db.createOperatorGenerationRepairIntent(alloc, damaged_cfg.*, 0, 0);
     const scheduler_pass = try db.repairRecoverableStartupIndexFailures(alloc, 1, repair_completion_test_options);
     try std.testing.expectEqual(@as(usize, 1), scheduler_pass.attempted);
+    try std.testing.expectEqual(@as(usize, 2), scheduler_pass.inspected);
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, cfg.name)) != null);
     if (try db.indexRepairIdForIndex(alloc, "damaged_idx")) |remaining_repair_id| {
         try std.testing.expectEqual(damaged_repair_id, remaining_repair_id);
@@ -76246,10 +76353,10 @@ test "db managed visibility hook rehydrates durable repair debt once" {
             _: []const u8,
             _: u64,
             _: ?*DB,
-            change: QueryVisibilityChange,
+            event: QueryVisibilityEvent,
         ) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (change == .index_repair_pending) self.pending += 1;
+            if (event.change == .index_repair_pending) self.pending += 1;
         }
     };
     var hook = Hook{};
@@ -76872,6 +76979,35 @@ test "db removing one repair pin preserves pressure gate for another index" {
             .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
         });
     }
+    const Hook = struct {
+        cleared_a: usize = 0,
+        pending_unknown: usize = 0,
+        pending_exact: usize = 0,
+
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (event.change) {
+                .index_repair_cleared => if (event.repair) |repair| {
+                    self.cleared_a += @intFromBool(std.mem.eql(u8, repair.index_name, "dense_a"));
+                },
+                .index_repair_pending => if (event.repair == null) {
+                    self.pending_unknown += 1;
+                } else {
+                    self.pending_exact += 1;
+                },
+                else => {},
+            }
+        }
+    };
+    var hook = Hook{};
+    db.setQueryVisibilityHook(.{
+        .ptr = &hook,
+        .table_name = "docs",
+        .group_id = 7001,
+        .db = &db,
+        .on_change = Hook.onChange,
+    });
+    defer db.setQueryVisibilityHook(null);
     const cfg_a = db.core.index_manager.get("dense_a") orelse return error.TestUnexpectedResult;
     const cfg_b = db.core.index_manager.get("dense_b") orelse return error.TestUnexpectedResult;
     const repair_a = try db.createOperatorGenerationRepairIntent(alloc, cfg_a.*, 0, 0);
@@ -76881,8 +77017,12 @@ test "db removing one repair pin preserves pressure gate for another index" {
     var snapshot_b = try db.beginPinnedIndexRepairSnapshot(alloc, repair_b);
     snapshot_b.deinit();
 
+    hook = .{};
     try db.removeIndexRepairIntentAndPin(alloc, repair_a);
     try std.testing.expect(db.async_context.index_repair_replay_pinned.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), hook.cleared_a);
+    try std.testing.expectEqual(@as(usize, 1), hook.pending_unknown);
+    try std.testing.expectEqual(@as(usize, 0), hook.pending_exact);
     var remaining = try db.loadIndexRepairState(alloc);
     try std.testing.expect(remaining.minimumRetainAfterSequence() != null);
     remaining.deinit(alloc);
@@ -86698,7 +86838,7 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
             _: []const u8,
             _: u64,
             _: ?*DB,
-            _: QueryVisibilityChange,
+            _: QueryVisibilityEvent,
         ) void {}
     };
     db.setQueryVisibilityHook(.{
@@ -88219,9 +88359,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         publish_blocking_checkpoint_clean: bool = false,
         invalidate_calls: u64 = 0,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, change: QueryVisibilityChange) void {
+        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            switch (change) {
+            switch (event.change) {
                 .status => {
                     self.publish_calls += 1;
                     self.status_calls += 1;

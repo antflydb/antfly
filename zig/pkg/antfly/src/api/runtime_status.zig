@@ -351,6 +351,45 @@ pub const TableRuntimeSnapshotCache = struct {
         state.epoch.invalidation_epoch = self.next_invalidation_epoch;
     }
 
+    /// Applies a durable repair visibility edge without consulting external
+    /// activity state. If the exact index is already protected by a targeted
+    /// mutation fence, preserve sibling authority and stale only that target.
+    /// Unknown or unrelated repair scope invalidates the table conservatively.
+    /// The match and epoch transition occur under one cache lock, so mutation
+    /// lease release cannot race between classification and publication.
+    pub fn fenceIndexRepairPublications(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: ?[]const u8,
+    ) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        self.advanceInvalidationEpochLocked();
+        self.advanceTopologyRevisionLocked();
+
+        const state = self.ensureTableLocked(table_name) catch {
+            self.clearTablesLocked();
+            self.advanceInvalidationEpochLocked();
+            return false;
+        };
+        const target = index_name orelse {
+            self.invalidateTableStateLocked(state);
+            return false;
+        };
+        if (state.targeted_index_fences.getPtr(target) == null) {
+            self.invalidateTableStateLocked(state);
+            return false;
+        }
+        var status_it = state.groups.valueIterator();
+        while (status_it.next()) |status| {
+            for (status.stats.indexes) |*item| {
+                if (std.mem.eql(u8, item.name, target)) item.runtime_observation_stale = true;
+            }
+        }
+        state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+        return true;
+    }
+
     /// Starts an index-local publication fence for an in-place catalog
     /// mutation. The target's cached observation is persistently stale from
     /// this point forward; untouched sibling observations may remain
@@ -928,6 +967,14 @@ pub const TableRuntimeSnapshotCache = struct {
         var it = state.groups.valueIterator();
         while (it.next()) |status| status.deinit(self.alloc);
         state.groups.clearRetainingCapacity();
+    }
+
+    fn invalidateTableStateLocked(self: *@This(), state: *TableState) void {
+        self.clearGroupsLocked(state);
+        self.clearTargetedIndexFencesLocked(state);
+        state.epoch.invalidation_epoch = self.next_invalidation_epoch;
+        state.epoch.root_generation +%= 1;
+        if (state.epoch.root_generation == 0) state.epoch.root_generation = 1;
     }
 
     fn clearTargetedIndexFencesLocked(self: *@This(), state: *TableState) void {

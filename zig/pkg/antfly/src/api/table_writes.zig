@@ -9456,26 +9456,17 @@ pub const ProvisionedTableWriteSource = struct {
     fn fenceRuntimeStatusForRepairEdgeBestEffort(
         self: *ProvisionedTableWriteSource,
         table_name: []const u8,
+        repair: ?db_mod.IndexRepairVisibility,
     ) bool {
         const snapshot_cache = self.runtime_status_cache orelse return false;
-        const io = self.table_activity_threaded.io();
-        self.table_activity_mutex.lockUncancelable(io);
-        const targeted = if (self.findTableActivityLocked(table_name, null)) |index| blk: {
-            const entry = self.active_table_activities.items[index];
-            break :blk entry.targeted_structural_reconcile_status_pending > 0 and
-                entry.structural_reconcile_status_pending == entry.targeted_structural_reconcile_status_pending and
-                entry.targeted_structural_reconcile_indexes.items.len > 0;
-        } else false;
-        self.table_activity_mutex.unlock(io);
-        if (targeted) {
-            // The exact target fence already fail-closes the mutating index.
-            // Advance the epoch to reject pre-edge publishers while retaining
-            // immutable sibling authority and the target identity itself.
-            snapshot_cache.fenceTablePublications(table_name);
-        } else {
-            snapshot_cache.invalidateTable(table_name);
-        }
-        return targeted;
+        // Repair scope comes from the durable intent, never from concurrent
+        // table activity. The cache matches and fences the exact target under
+        // one lock; an unknown, unrelated, or already-released target fails
+        // closed through whole-table invalidation.
+        return snapshot_cache.fenceIndexRepairPublications(
+            table_name,
+            if (repair) |identity| identity.index_name else null,
+        );
     }
 
     fn invalidateSharedPathCaches(self: *ProvisionedTableWriteSource, path: []const u8) void {
@@ -9535,7 +9526,7 @@ pub const ProvisionedTableWriteSource = struct {
             .table_name = table_name,
             .group_id = group_id,
             .db = db,
-            .on_change = onManagedDerivedVisibilityChanged,
+            .on_change = onManagedDerivedVisibilityEvent,
         };
     }
 
@@ -9602,31 +9593,31 @@ pub const ProvisionedTableWriteSource = struct {
         return true;
     }
 
-    fn onManagedDerivedVisibilityChanged(
+    fn onManagedDerivedVisibilityEvent(
         ptr: *anyopaque,
         table_name: []const u8,
         group_id: u64,
         db: ?*db_mod.DB,
-        change: db_mod.QueryVisibilityChange,
+        event: db_mod.QueryVisibilityEvent,
     ) void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         // Cached owners release repair handoff authority only after a fresh
         // post-clear observation is successfully published. Sources without a
         // status cache have no publication plane to wait for: their next live
         // status request is itself authoritative.
-        defer if (self.runtime_status_cache == null) switch (change) {
+        defer if (self.runtime_status_cache == null) switch (event.change) {
             .status, .publish, .publish_consistent, .publish_blocking => if (self.captureRepairHandoffPublicationTokenBestEffort(table_name, group_id, true)) |token| {
                 _ = self.settleRepairHandoffStatusIfUnchangedBestEffort(table_name, group_id, token);
             },
             else => {},
         };
-        switch (change) {
+        switch (event.change) {
             .index_repair_pending => {
                 // Query DBs snapshot repair admission at open. Retire readers
                 // on both edges so a newly detected repair fails closed and a
                 // completed repair cannot leave an old reader quarantined.
                 self.invalidateReadCache(table_name);
-                const targeted_repair = self.fenceRuntimeStatusForRepairEdgeBestEffort(table_name);
+                const targeted_repair = self.fenceRuntimeStatusForRepairEdgeBestEffort(table_name, event.repair);
                 if (!targeted_repair) self.markRepairHandoffPendingBestEffort(table_name, group_id);
                 // Preserve every exact debt edge even while structural
                 // reconciliation owns the table status fence. Plain enqueue
@@ -9639,7 +9630,7 @@ pub const ProvisionedTableWriteSource = struct {
             },
             .index_repair_cleared => {
                 self.invalidateReadCache(table_name);
-                _ = self.fenceRuntimeStatusForRepairEdgeBestEffort(table_name);
+                _ = self.fenceRuntimeStatusForRepairEdgeBestEffort(table_name, event.repair);
                 // Visibility callbacks can overlap after copying their hook.
                 // A clear edge is therefore an audit trigger, never settlement
                 // evidence: an older clear can finish after a newer durable
@@ -9729,6 +9720,16 @@ pub const ProvisionedTableWriteSource = struct {
         }
         self.invalidateReadCache(table_name);
         self.notifyLocalChange(table_name, .data);
+    }
+
+    fn onManagedDerivedVisibilityChanged(
+        ptr: *anyopaque,
+        table_name: []const u8,
+        group_id: u64,
+        db: ?*db_mod.DB,
+        change: db_mod.QueryVisibilityChange,
+    ) void {
+        onManagedDerivedVisibilityEvent(ptr, table_name, group_id, db, .{ .change = change });
     }
 
     fn deferManagedRuntimeStatusPublication(
@@ -29302,7 +29303,7 @@ test "managed visibility publish hook updates runtime status cache from live wri
     });
 
     const hook = source.managedDerivedVisibilityHook("docs", 7001, &db);
-    hook.notify(.publish);
+    hook.notify(.{ .change = .publish });
 
     var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer statuses.deinit(alloc);
@@ -35830,12 +35831,21 @@ test "targeted repair visibility edge preserves exact sibling cache authority" {
     source.reserveTargetedStructuralReconcileStatus("docs", "thumbnail");
     defer source.releaseTargetedStructuralReconcileStatus("docs", "thumbnail");
 
-    ProvisionedTableWriteSource.onManagedDerivedVisibilityChanged(
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityEvent(
         &source,
         "docs",
         7001,
         null,
-        .index_repair_pending,
+        db_mod.QueryVisibilityEvent{
+            .change = .index_repair_pending,
+            .repair = .{
+                .index_name = "thumbnail",
+                .repair_id = 91,
+                .revision = 1,
+                .config_hash = 77,
+                .root_generation = 9,
+            },
+        },
     );
 
     var statuses = (try cache.snapshot(alloc, "docs")).?;
@@ -35846,6 +35856,120 @@ test "targeted repair visibility edge preserves exact sibling cache authority" {
     // No group-wide repair handoff was manufactured; the table's exact
     // target reservation is the sole status authority.
     try std.testing.expectEqual(@as(usize, 1), source.active_table_activities.items.len);
+}
+
+test "unrelated repair visibility edge invalidates during targeted reconciliation" {
+    const alloc = std.testing.allocator;
+    var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-unrelated-repair-visibility-edge",
+        catalog.iface(),
+    );
+    defer source.deinit();
+    source.runtime_status_cache = &cache;
+
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{ .name = "search_idx", .kind = .full_text, .doc_count = 4, .term_count = 8 },
+        .{ .name = "thumbnail", .kind = .dense_vector, .backfill_active = true },
+    };
+    const token = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(token, "docs", .{
+            .group_id = 7001,
+            .metadata = .{ .freshness = .fresh },
+            .stats = .{ .index_count = indexes.len, .indexes = &indexes },
+        }),
+    );
+    source.reserveTargetedStructuralReconcileStatus("docs", "thumbnail");
+    defer source.releaseTargetedStructuralReconcileStatus("docs", "thumbnail");
+
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityEvent(
+        &source,
+        "docs",
+        7001,
+        null,
+        .{
+            .change = .index_repair_pending,
+            .repair = .{
+                .index_name = "search_idx",
+                .repair_id = 92,
+                .revision = 1,
+                .config_hash = 88,
+                .root_generation = 9,
+            },
+        },
+    );
+
+    try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
+    const io = source.table_activity_threaded.io();
+    source.table_activity_mutex.lockUncancelable(io);
+    const group_index = source.findTableActivityLocked("docs", 7001) orelse {
+        source.table_activity_mutex.unlock(io);
+        return error.TestUnexpectedResult;
+    };
+    const handoff_pending = source.active_table_activities.items[group_index].repair_handoff_status_pending;
+    source.table_activity_mutex.unlock(io);
+    try std.testing.expectEqual(@as(usize, 1), handoff_pending);
+}
+
+test "repair edge after target authority release fails closed" {
+    const alloc = std.testing.allocator;
+    var cache = runtime_status.TableRuntimeSnapshotCache.init(alloc);
+    defer cache.deinit();
+    var catalog = StructuralReconcileTestCatalog{ .mode = .vanish };
+    var source = ProvisionedTableWriteSource.init(
+        "/tmp/unused-antfly-released-target-repair-visibility-edge",
+        catalog.iface(),
+    );
+    defer source.deinit();
+    source.runtime_status_cache = &cache;
+
+    var indexes = [_]db_mod.types.DBIndexStats{
+        .{ .name = "search_idx", .kind = .full_text, .doc_count = 4, .term_count = 8 },
+        .{ .name = "thumbnail", .kind = .dense_vector, .doc_count = 4, .node_count = 1 },
+    };
+    const initial = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(initial, "docs", .{
+            .group_id = 7001,
+            .metadata = .{ .freshness = .fresh },
+            .stats = .{ .index_count = indexes.len, .indexes = &indexes },
+        }),
+    );
+    source.reserveTargetedStructuralReconcileStatus("docs", "thumbnail");
+    source.releaseTargetedStructuralReconcileStatus("docs", "thumbnail");
+    const settled = try cache.capturePublicationToken("docs");
+    try std.testing.expectEqual(
+        runtime_status.TableRuntimeSnapshotCache.PublishResult.published,
+        try cache.publishGroup(settled, "docs", .{
+            .group_id = 7001,
+            .metadata = .{ .freshness = .fresh },
+            .stats = .{ .index_count = indexes.len, .indexes = &indexes },
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), cache.tables.getPtr("docs").?.targeted_index_fences.count());
+
+    ProvisionedTableWriteSource.onManagedDerivedVisibilityEvent(
+        &source,
+        "docs",
+        7001,
+        null,
+        .{
+            .change = .index_repair_pending,
+            .repair = .{
+                .index_name = "thumbnail",
+                .repair_id = 93,
+                .revision = 2,
+                .config_hash = 77,
+                .root_generation = 9,
+            },
+        },
+    );
+    try std.testing.expect((try cache.snapshot(alloc, "docs")) == null);
 }
 
 test "targeted index cache update retains the published sibling snapshot through handoff" {
@@ -38799,13 +38923,13 @@ test "provisioned table write source consistent visibility refreshes stale dense
         .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},
         .sync_level = .full_index,
     });
-    hook.notify(.publish);
+    hook.notify(.{ .change = .publish });
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:b", .value = "{\"_embeddings\":{\"dense_idx\":[0,1]}}" }},
         .sync_level = .full_index,
     });
-    hook.notify(.publish_blocking);
+    hook.notify(.{ .change = .publish_blocking });
 
     var published = (try snapshot_cache.snapshot(alloc, "docs")).?;
     defer published.deinit(alloc);
