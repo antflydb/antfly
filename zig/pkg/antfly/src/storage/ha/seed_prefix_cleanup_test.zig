@@ -9,8 +9,8 @@ const cleanup = @import("seed_prefix_cleanup.zig");
 const namespace_control = @import("seed_namespace_control.zig");
 const object_storage = @import("../object_storage.zig");
 
-const location = "s3://ha-bucket/instances/instance-a/ha-seeds/";
-const object_prefix = "instances/instance-a/ha-seeds/";
+const location = "s3://ha-bucket/orgs/org-a/instances/instance-a/ha-seeds/";
+const object_prefix = "orgs/org-a/instances/instance-a/ha-seeds/";
 
 fn requestAlloc(alloc: std.mem.Allocator) !cleanup.Request {
     const prefix_sha256 = try cleanup.sha256HexAlloc(alloc, location);
@@ -54,7 +54,7 @@ test "storage.ha seed prefix cleanup deletes the exact instance prefix and emits
     try put(&client, "ha-bucket", object_prefix ++ "generations/gen-a/files/catalog");
     try put(&client, "ha-bucket", object_prefix ++ "generations/gen-b/COMPLETE.json");
     try put(&client, "ha-bucket", object_prefix ++ "uploads/orphan.part");
-    try put(&client, "ha-bucket", "instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json");
+    try put(&client, "ha-bucket", "orgs/org-a/instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json");
 
     const request = try requestAlloc(alloc);
     defer freeRequest(alloc, request);
@@ -83,7 +83,7 @@ test "storage.ha seed prefix cleanup deletes the exact instance prefix and emits
     var exact = try client.listObjects("ha-bucket", .{ .prefix = object_prefix, .recursive = true });
     defer exact.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), exact.entries.len);
-    var sibling = try client.getObject("ha-bucket", "instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json", .{});
+    var sibling = try client.getObject("ha-bucket", "orgs/org-a/instances/instance-a-other/ha-seeds/generations/keep/COMPLETE.json", .{});
     defer sibling.deinit(alloc);
     try std.testing.expectEqualStrings("x", sibling.body);
 }
@@ -106,12 +106,20 @@ test "storage.ha seed prefix cleanup fails closed on mutated authority and is id
     }, wrong_digest, .{}));
 
     var wrong_prefix = request;
-    wrong_prefix.location = "s3://ha-bucket/instances/instance-a/ha-seeds-extra/";
+    wrong_prefix.location = "s3://ha-bucket/orgs/org-a/instances/instance-a/ha-seeds-extra/";
     try std.testing.expectError(error.InvalidSeedPrefixCleanupPrefix, cleanup.deleteAll(alloc, .{
         .client = &client,
         .bucket = "ha-bucket",
-        .prefix = "instances/instance-a/ha-seeds-extra/",
+        .prefix = "orgs/org-a/instances/instance-a/ha-seeds-extra/",
     }, wrong_prefix, .{}));
+
+    var nested_scope = request;
+    nested_scope.location = "s3://ha-bucket/tenants/tenant-a/orgs/org-a/instances/instance-a/ha-seeds/";
+    try std.testing.expectError(error.InvalidSeedPrefixCleanupPrefix, cleanup.validateRequestAuthority(alloc, nested_scope));
+
+    var missing_separator = request;
+    missing_separator.location = "s3://ha-bucket/orgs/org-a/instances/instance-a/ha-seeds";
+    try std.testing.expectError(error.InvalidSeedPrefixCleanupPrefix, cleanup.validateRequestAuthority(alloc, missing_separator));
 
     var not_delete_all = request;
     not_delete_all.delete_all = false;

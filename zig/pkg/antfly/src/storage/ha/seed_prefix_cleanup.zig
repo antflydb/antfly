@@ -7,10 +7,11 @@
 //! Fail-closed deletion of one instance's complete portable HA seed namespace.
 //!
 //! The operation is deliberately bound to a canonical controller request. The
-//! runtime accepts only the exact `s3://<bucket>/instances/<id>/ha-seeds/`
-//! boundary, relists until that boundary is empty, and never broadens or trims
-//! the supplied object prefix. A concurrent writer therefore makes cleanup
-//! retry or fail rather than leaving a false-success receipt.
+//! runtime accepts only the exact instance boundary, either directly below the
+//! bucket or below Colony's `orgs/<org-id>/` tenant scope. It relists until that
+//! exact trailing-slash prefix is empty and never broadens or trims it. A
+//! concurrent writer therefore makes cleanup retry or fail rather than leaving
+//! a false-success receipt.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -113,7 +114,7 @@ pub fn receiptSha256Alloc(alloc: Allocator, receipt: Receipt) ![]u8 {
 
 pub fn deleteAll(alloc: Allocator, store: Store, request: Request, options: Options) !Result {
     try validateRequestAuthority(alloc, request);
-    try validateStoreBinding(alloc, store, request);
+    try validateStoreBinding(store, request);
     if (options.max_keys == 0 or options.max_quiescence_rounds == 0)
         return error.InvalidSeedPrefixCleanupLimits;
 
@@ -266,11 +267,10 @@ pub fn validateRequestAuthority(alloc: Allocator, request: Request) !void {
         return error.InvalidSeedPrefixCleanupPrefix;
     const bucket = rest[0..slash];
     if (!isS3Bucket(bucket)) return error.InvalidSeedPrefixCleanupPrefix;
-    const expected_prefix = try std.fmt.allocPrint(alloc, "instances/{s}/ha-seeds/", .{request.instance_id});
-    defer alloc.free(expected_prefix);
-    const expected_location = try std.fmt.allocPrint(alloc, "s3://{s}/{s}", .{ bucket, expected_prefix });
-    defer alloc.free(expected_location);
-    if (!std.mem.eql(u8, request.location, expected_location)) {
+    const prefix = rest[slash + 1 ..];
+    const instance_prefix = try std.fmt.allocPrint(alloc, "instances/{s}/ha-seeds/", .{request.instance_id});
+    defer alloc.free(instance_prefix);
+    if (!validInstanceScopedPrefix(prefix, instance_prefix)) {
         return error.InvalidSeedPrefixCleanupPrefix;
     }
 
@@ -286,14 +286,32 @@ pub fn validateRequestAuthority(alloc: Allocator, request: Request) !void {
         return error.SeedPrefixCleanupRequestDigestMismatch;
 }
 
-fn validateStoreBinding(alloc: Allocator, store: Store, request: Request) !void {
+fn validateStoreBinding(store: Store, request: Request) !void {
     const rest = request.location["s3://".len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse unreachable;
     const bucket = rest[0..slash];
-    const expected_prefix = try std.fmt.allocPrint(alloc, "instances/{s}/ha-seeds/", .{request.instance_id});
-    defer alloc.free(expected_prefix);
-    if (!std.mem.eql(u8, store.bucket, bucket) or !std.mem.eql(u8, store.prefix, expected_prefix))
+    if (!std.mem.eql(u8, store.bucket, bucket) or !std.mem.eql(u8, store.prefix, rest[slash + 1 ..]))
         return error.InvalidSeedPrefixCleanupPrefix;
+}
+
+/// Returns the already-validated, exact trailing-slash object prefix. The
+/// destructive CLI uses this instead of a generic URI parser that deliberately
+/// canonicalizes away trailing slashes for non-destructive callers.
+pub fn exactObjectPrefix(request: Request) []const u8 {
+    const rest = request.location["s3://".len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse unreachable;
+    return rest[slash + 1 ..];
+}
+
+fn validInstanceScopedPrefix(prefix: []const u8, instance_prefix: []const u8) bool {
+    if (std.mem.eql(u8, prefix, instance_prefix)) return true;
+    const orgs = "orgs/";
+    if (!std.mem.startsWith(u8, prefix, orgs) or !std.mem.endsWith(u8, prefix, instance_prefix))
+        return false;
+    const org_end = prefix.len - instance_prefix.len;
+    if (org_end <= orgs.len or prefix[org_end - 1] != '/') return false;
+    const org_id = prefix[orgs.len .. org_end - 1];
+    return std.mem.indexOfScalar(u8, org_id, '/') == null and validation.isIdentifier(org_id);
 }
 
 fn listAllKeysAlloc(alloc: Allocator, store: Store, max_keys: u32) ![][]u8 {

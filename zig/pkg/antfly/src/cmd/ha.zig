@@ -513,7 +513,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
             var result = try ha.seed_prefix_cleanup.deleteAll(alloc, .{
                 .client = &opened.client,
                 .bucket = opened.bucket,
-                .prefix = opened.prefix,
+                .prefix = ha.seed_prefix_cleanup.exactObjectPrefix(request),
             }, request, .{});
             defer result.deinit(alloc);
             try writeArtifactResult(io, result.receipt_json);
