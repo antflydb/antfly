@@ -472,7 +472,7 @@ const TrueTypeFont = struct {
     font: font_lib.sfnt.Font,
     units_per_em: u16,
     raw_code_bytes: usize = 0,
-    cid_to_gid: ?[]u16 = null,
+    cid_to_gid: ?CidToGidMap = null,
     simple_code_to_gid: ?[]u16 = null,
     pdf_widths: ?[]f64 = null,
     pdf_missing_width: ?f64 = null,
@@ -480,12 +480,36 @@ const TrueTypeFont = struct {
 
     fn deinit(self: *TrueTypeFont, alloc: Allocator) void {
         self.font.deinit(alloc);
-        if (self.cid_to_gid) |map| if (map.len > 0) alloc.free(map);
+        if (self.cid_to_gid) |*map| map.deinit(alloc);
         if (self.simple_code_to_gid) |map| alloc.free(map);
         if (self.pdf_widths) |widths| alloc.free(widths);
         if (self.cid_widths) |*widths| widths.deinit(alloc);
         alloc.free(self.bytes);
         self.* = undefined;
+    }
+};
+
+const CidToGidMap = union(enum) {
+    identity,
+    table: []u16,
+
+    fn deinit(self: *CidToGidMap, alloc: Allocator) void {
+        switch (self.*) {
+            .identity => {},
+            .table => |map| if (map.len > 0) alloc.free(map),
+        }
+        self.* = undefined;
+    }
+
+    fn glyphIndex(self: CidToGidMap, cid: u16) u16 {
+        return switch (self) {
+            .identity => cid,
+            // PDF CIDToGIDMap streams use glyph 0 for CIDs beyond the
+            // explicitly supplied table. This also gives an empty stream its
+            // correct .notdef behavior instead of silently treating it as
+            // the distinct /Identity name.
+            .table => |map| if (cid < map.len) map[cid] else 0,
+        };
     }
 };
 
@@ -610,6 +634,11 @@ const CffOpenTypeFont = struct {
     fn textSpacing(self: CffOpenTypeFont, code: u32, char_spacing: f64, word_spacing: f64) f64 {
         return embeddedCffTextSpacing(self.code_bytes, code, char_spacing, word_spacing);
     }
+};
+
+const BuiltSfntFont = union(enum) {
+    truetype: TrueTypeFont,
+    cff_otf: CffOpenTypeFont,
 };
 
 const EmbeddedCffGlyph = struct {
@@ -4170,9 +4199,7 @@ pub const Reader = struct {
                 if (cid > std.math.maxInt(u16)) break :blk null;
                 cid_code = @intCast(cid);
                 if (truetype.cid_to_gid) |map| {
-                    if (map.len == 0) break :blk @as(?u16, @intCast(cid));
-                    if (cid >= map.len) break :blk null;
-                    break :blk @as(?u16, map[cid]);
+                    break :blk @as(?u16, map.glyphIndex(@intCast(cid)));
                 }
                 break :blk null;
             } else blk: {
@@ -6680,14 +6707,17 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
-        font.truetype = self.buildTrueTypeFont(font_obj, &font.decoder, &font.outline_fallback) catch |err| switch (err) {
+        const built_sfnt = self.buildSfntFont(font_obj, &font.decoder) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => blk: {
                 font.outline_fallback = true;
                 break :blk null;
             },
         };
-        font.cff_otf = try self.buildCffOpenTypeFont(font_obj, &font.outline_fallback);
+        if (built_sfnt) |built| switch (built) {
+            .truetype => |truetype| font.truetype = truetype,
+            .cff_otf => |cff_otf| font.cff_otf = cff_otf,
+        };
         font.cff = self.buildEmbeddedCffFont(font_obj) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => blk: {
@@ -6860,51 +6890,68 @@ pub const Reader = struct {
         return font;
     }
 
-    fn buildTrueTypeFont(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder, outline_fallback: *bool) !?TrueTypeFont {
-        // Keep the embedded SFNT, table directory, decoded CID mapping, and
-        // compact paint maps under one live-allocation ceiling. Returned
+    fn buildSfntFont(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder) !?BuiltSfntFont {
+        // Decode and classify an embedded SFNT exactly once. The retained font
+        // bytes, table directory, outline parser, PDF mapping, and compact
+        // paint metadata all share one live-allocation ceiling. Returned
         // allocations remain owned by the Reader's backing allocator.
         var budget = DecodeBudgetAllocator.init(self.alloc, 0, self.decode_limits.max_working_set_bytes);
         var scoped_reader = self.*;
         scoped_reader.alloc = budget.allocator();
-        return scoped_reader.buildTrueTypeFontBudgeted(font_obj, decoder, outline_fallback) catch |err| {
+        return scoped_reader.buildSfntFontBudgeted(font_obj, decoder) catch |err| {
             if (err == error.OutOfMemory and budget.limit_exceeded) return error.PdfDecodeWorkingSetTooLarge;
             return err;
         };
     }
 
-    fn buildTrueTypeFontBudgeted(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder, outline_fallback: *bool) !?TrueTypeFont {
+    fn buildSfntFontBudgeted(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder) !?BuiltSfntFont {
         const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
         errdefer self.alloc.free(bytes);
-        var font = font_lib.sfnt.Font.init(self.alloc, bytes) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                outline_fallback.* = true;
-                self.alloc.free(bytes);
-                return null;
-            },
-        };
-        errdefer font.deinit(self.alloc);
-        _ = font.tableData(.{ 'g', 'l', 'y', 'f' }) catch {
-            outline_fallback.* = true;
-            font.deinit(self.alloc);
-            self.alloc.free(bytes);
-            return null;
-        };
-        const head = font.head() catch {
-            outline_fallback.* = true;
-            font.deinit(self.alloc);
-            self.alloc.free(bytes);
-            return null;
-        };
+        var sfnt = try font_lib.sfnt.Font.init(self.alloc, bytes);
+        errdefer sfnt.deinit(self.alloc);
+        const head = try sfnt.head();
 
+        if (sfnt.findTable(.{ 'g', 'l', 'y', 'f' }) != null) {
+            // Validate the complete table range before transferring ownership
+            // to the TrueType renderer.
+            _ = try sfnt.tableData(.{ 'g', 'l', 'y', 'f' });
+            return .{ .truetype = try self.buildTrueTypeFontFromSfnt(font_obj, decoder, bytes, sfnt, head.units_per_em) };
+        }
+
+        if (sfnt.findTable(.{ 'C', 'F', 'F', ' ' }) != null) {
+            const cff_bytes = try sfnt.tableData(.{ 'C', 'F', 'F', ' ' });
+            var cff = try font_lib.cff.Font.init(self.alloc, cff_bytes);
+            errdefer cff.deinit(self.alloc);
+            const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff)) orelse return error.UnsupportedPdfRendering;
+            errdefer if (mapping.glyphs.len > 0) self.alloc.free(mapping.glyphs);
+            return .{ .cff_otf = .{
+                .bytes = bytes,
+                .sfnt = sfnt,
+                .cff = cff,
+                .units_per_em = head.units_per_em,
+                .glyphs = mapping.glyphs,
+                .code_bytes = mapping.code_bytes,
+            } };
+        }
+
+        return error.UnsupportedPdfRendering;
+    }
+
+    fn buildTrueTypeFontFromSfnt(
+        self: *const Reader,
+        font_obj: *const syntax.Object,
+        decoder: *const FontDecoder,
+        bytes: []u8,
+        font: font_lib.sfnt.Font,
+        units_per_em: u16,
+    ) !TrueTypeFont {
         var raw_code_bytes: usize = 0;
-        var cid_to_gid: ?[]u16 = null;
+        var cid_to_gid: ?CidToGidMap = null;
         var simple_code_to_gid: ?[]u16 = null;
         var pdf_widths: ?[]f64 = null;
         var pdf_missing_width: ?f64 = null;
         var cid_widths: ?CidWidths = null;
-        errdefer if (cid_to_gid) |map| if (map.len > 0) self.alloc.free(map);
+        errdefer if (cid_to_gid) |*map| map.deinit(self.alloc);
         errdefer if (simple_code_to_gid) |map| self.alloc.free(map);
         errdefer if (pdf_widths) |widths| self.alloc.free(widths);
         errdefer if (cid_widths) |*widths| widths.deinit(self.alloc);
@@ -6915,51 +6962,21 @@ pub const Reader = struct {
             if (font_obj.get("Encoding")) |encoding| resolved_encoding = try self.resolveValue(encoding);
             const encoding_name = if (resolved_encoding) |*encoding| encoding.asName() orelse "" else "";
             const identity_encoding = std.mem.eql(u8, encoding_name, "Identity-H");
-            if (!identity_encoding) {
-                outline_fallback.* = true;
-                font.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            }
-            const descendants_obj = font_obj.get("DescendantFonts") orelse {
-                outline_fallback.* = true;
-                font.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            };
+            if (!identity_encoding) return error.UnsupportedPdfRendering;
+            const descendants_obj = font_obj.get("DescendantFonts") orelse return error.UnsupportedPdfRendering;
             var resolved_descendants = try self.resolveValue(descendants_obj);
             defer resolved_descendants.deinit(self.alloc);
-            if (resolved_descendants != .array or resolved_descendants.array.len == 0) {
-                outline_fallback.* = true;
-                font.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            }
+            if (resolved_descendants != .array or resolved_descendants.array.len == 0) return error.UnsupportedPdfRendering;
             var descendant = try self.resolveValue(&resolved_descendants.array[0]);
             defer descendant.deinit(self.alloc);
-            if (descendant != .dict) {
-                outline_fallback.* = true;
-                font.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            }
-            const descendant_subtype = descendant.get("Subtype") orelse {
-                outline_fallback.* = true;
-                font.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            };
-            if (!std.mem.eql(u8, descendant_subtype.asName() orelse "", "CIDFontType2")) {
-                outline_fallback.* = true;
-                font.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            }
+            if (descendant != .dict) return error.UnsupportedPdfRendering;
+            const descendant_subtype = descendant.get("Subtype") orelse return error.UnsupportedPdfRendering;
+            if (!std.mem.eql(u8, descendant_subtype.asName() orelse "", "CIDFontType2")) return error.UnsupportedPdfRendering;
             if (descendant.get("CIDToGIDMap")) |mapping_obj| {
                 var mapping = try self.resolveValue(mapping_obj);
                 defer mapping.deinit(self.alloc);
                 if (mapping == .name and std.mem.eql(u8, mapping.name, "Identity")) {
-                    cid_to_gid = try self.alloc.alloc(u16, 0);
+                    cid_to_gid = .identity;
                     raw_code_bytes = 2;
                 } else if (mapping == .stream) {
                     const mapping_bytes = try self.readDecodedStreamDataWithLimits(&mapping, .{
@@ -6967,17 +6984,14 @@ pub const Reader = struct {
                         .max_working_set_bytes = self.decode_limits.max_working_set_bytes,
                     });
                     defer self.alloc.free(mapping_bytes);
-                    cid_to_gid = try parseCidToGidMapAlloc(self.alloc, mapping_bytes);
+                    cid_to_gid = .{ .table = try parseCidToGidMapAlloc(self.alloc, mapping_bytes) };
                     raw_code_bytes = 2;
                 } else {
-                    outline_fallback.* = true;
-                    font.deinit(self.alloc);
-                    self.alloc.free(bytes);
-                    return null;
+                    return error.UnsupportedPdfRendering;
                 }
             } else {
                 // CIDFontType2 defaults to an identity CID-to-GID mapping.
-                cid_to_gid = try self.alloc.alloc(u16, 0);
+                cid_to_gid = .identity;
                 raw_code_bytes = 2;
             }
             cid_widths = self.parseCidWidthsAlloc(&descendant) catch |err| switch (err) {
@@ -7017,7 +7031,7 @@ pub const Reader = struct {
         return .{
             .bytes = bytes,
             .font = font,
-            .units_per_em = head.units_per_em,
+            .units_per_em = units_per_em,
             .raw_code_bytes = raw_code_bytes,
             .cid_to_gid = cid_to_gid,
             .simple_code_to_gid = simple_code_to_gid,
@@ -7122,60 +7136,6 @@ pub const Reader = struct {
             // Identity-H character codes are exactly two bytes. ToUnicode
             // codespaces describe extraction and must never change painting.
             .code_bytes = if (composite) 2 else 1,
-        };
-    }
-
-    fn buildCffOpenTypeFont(self: *const Reader, font_obj: *const syntax.Object, outline_fallback: *bool) !?CffOpenTypeFont {
-        const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
-        errdefer self.alloc.free(bytes);
-        var sfnt = font_lib.sfnt.Font.init(self.alloc, bytes) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                outline_fallback.* = true;
-                self.alloc.free(bytes);
-                return null;
-            },
-        };
-        errdefer sfnt.deinit(self.alloc);
-        const cff_bytes = sfnt.tableData(.{ 'C', 'F', 'F', ' ' }) catch {
-            outline_fallback.* = true;
-            sfnt.deinit(self.alloc);
-            self.alloc.free(bytes);
-            return null;
-        };
-        var cff = font_lib.cff.Font.init(self.alloc, cff_bytes) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => {
-                outline_fallback.* = true;
-                sfnt.deinit(self.alloc);
-                self.alloc.free(bytes);
-                return null;
-            },
-        };
-        errdefer cff.deinit(self.alloc);
-        const head = sfnt.head() catch {
-            outline_fallback.* = true;
-            cff.deinit(self.alloc);
-            sfnt.deinit(self.alloc);
-            self.alloc.free(bytes);
-            return null;
-        };
-        const mapping = (try self.buildCffPdfGlyphMapAlloc(font_obj, cff)) orelse {
-            outline_fallback.* = true;
-            cff.deinit(self.alloc);
-            sfnt.deinit(self.alloc);
-            self.alloc.free(bytes);
-            return null;
-        };
-        errdefer if (mapping.glyphs.len > 0) self.alloc.free(mapping.glyphs);
-
-        return .{
-            .bytes = bytes,
-            .sfnt = sfnt,
-            .cff = cff,
-            .units_per_em = head.units_per_em,
-            .glyphs = mapping.glyphs,
-            .code_bytes = mapping.code_bytes,
         };
     }
 
@@ -15495,8 +15455,19 @@ test "simple TrueType PDF widths fall back to MissingWidth" {
 test "CIDToGIDMap is limited to the addressable CID domain" {
     const alloc = std.testing.allocator;
     const valid = try parseCidToGidMapAlloc(alloc, &.{ 0x00, 0x01, 0xab, 0xcd });
-    defer alloc.free(valid);
+    var explicit = CidToGidMap{ .table = valid };
+    defer explicit.deinit(alloc);
     try std.testing.expectEqualSlices(u16, &.{ 1, 0xabcd }, valid);
+    try std.testing.expectEqual(@as(u16, 1), explicit.glyphIndex(0));
+    try std.testing.expectEqual(@as(u16, 0xabcd), explicit.glyphIndex(1));
+    try std.testing.expectEqual(@as(u16, 0), explicit.glyphIndex(2));
+
+    const empty = try parseCidToGidMapAlloc(alloc, &.{});
+    var empty_explicit = CidToGidMap{ .table = empty };
+    defer empty_explicit.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 0), empty_explicit.glyphIndex(42));
+    try std.testing.expectEqual(@as(u16, 42), (CidToGidMap{ .identity = {} }).glyphIndex(42));
+
     try std.testing.expectError(error.InvalidCidToGidMap, parseCidToGidMapAlloc(alloc, &.{0}));
 
     const oversized = try alloc.alloc(u8, max_cid_to_gid_bytes + 2);

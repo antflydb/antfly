@@ -301,12 +301,13 @@ pub const Font = struct {
             if (sub_offset >= data.len) return error.TruncatedSfnt;
             const sub = data[sub_offset..];
             if (sub.len < 2) return error.TruncatedSfnt;
-            return switch (readU16(sub, 0)) {
+            const glyph = switch (readU16(sub, 0)) {
                 0 => try cmapFormat0Glyph(sub, codepoint),
                 4 => try cmapFormat4Glyph(sub, codepoint),
                 12 => try cmapFormat12Glyph(sub, codepoint),
                 else => null,
             };
+            if (glyph != null) return glyph;
         }
         return null;
     }
@@ -931,6 +932,51 @@ test "sfnt reader maps cmap and extracts simple glyph outline" {
     try std.testing.expectApproxEqAbs(@as(f64, 1000), outline.contours[0].points[1].x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 1000), outline.contours[0].points[2].y, 0.001);
     try std.testing.expect(outline.contours[0].points[0].on_curve);
+}
+
+test "exact cmap lookup continues across matching encoding records" {
+    const alloc = std.testing.allocator;
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(alloc);
+
+    // One cmap table with two Windows symbol encoding records. The first
+    // valid subtable has no mapping for A; the second maps A to GID 7.
+    const cmap_offset: u32 = 28;
+    const cmap_header_len: usize = 4 + 2 * 8;
+    const format0_len: usize = 262;
+    const cmap_len: u32 = @intCast(cmap_header_len + 2 * format0_len);
+    try appendU32(alloc, &bytes, 0x00010000);
+    try appendU16(alloc, &bytes, 1);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, 0);
+    try appendTag(alloc, &bytes, .{ 'c', 'm', 'a', 'p' });
+    try appendU32(alloc, &bytes, 0);
+    try appendU32(alloc, &bytes, cmap_offset);
+    try appendU32(alloc, &bytes, cmap_len);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, 2);
+    try appendU16(alloc, &bytes, 3);
+    try appendU16(alloc, &bytes, 0);
+    try appendU32(alloc, &bytes, cmap_header_len);
+    try appendU16(alloc, &bytes, 3);
+    try appendU16(alloc, &bytes, 0);
+    try appendU32(alloc, &bytes, cmap_header_len + format0_len);
+
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, format0_len);
+    try appendU16(alloc, &bytes, 0);
+    try bytes.appendNTimes(alloc, 0, 256);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, format0_len);
+    try appendU16(alloc, &bytes, 0);
+    var glyphs = [_]u8{0} ** 256;
+    glyphs['A'] = 7;
+    try bytes.appendSlice(alloc, &glyphs);
+
+    var font = try Font.init(alloc, bytes.items);
+    defer font.deinit(alloc);
+    try std.testing.expectEqual(@as(?u16, 7), try font.cmapGlyphIndexForPlatform(3, 0, 'A'));
 }
 
 test "sfnt reader rejects an outline before exceeding its point limit" {
