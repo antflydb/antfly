@@ -1105,6 +1105,12 @@ pub const HttpHost = struct {
         return try self.listener.baseUri(alloc);
     }
 
+    /// Shared bounded outbound I/O used for small control-plane fan-outs.
+    /// Callers must still provide request-level deadlines.
+    pub fn outboundIo(self: *const HttpHost) std.Io {
+        return self.transport_stack.driver.io;
+    }
+
     pub fn metricsSnapshot(self: *const HttpHost) HostMetrics {
         var snapshot = self.host.metricsSnapshot();
         const async_send = self.transport_stack.asyncSendMetricsSnapshot();

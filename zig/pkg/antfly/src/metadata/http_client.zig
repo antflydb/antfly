@@ -122,6 +122,19 @@ pub const MetadataHttpClient = struct {
         return try self.getJsonValueWithBudget(metadata_api.MetadataStatus, base_uri, routes.Routes.status, budget);
     }
 
+    pub fn fetchTableTopologyProtocolStatusWithBudget(
+        self: *MetadataHttpClient,
+        base_uri: []const u8,
+        budget: RequestBudget,
+    ) !metadata_api.TableTopologyProtocolStatus {
+        return try self.getJsonValueWithBudget(
+            metadata_api.TableTopologyProtocolStatus,
+            base_uri,
+            routes.Routes.status,
+            budget,
+        );
+    }
+
     pub fn fetchHead(self: *MetadataHttpClient, base_uri: []const u8) !metadata_api.MetadataHead {
         return try self.fetchHeadWithBudget(base_uri, null);
     }

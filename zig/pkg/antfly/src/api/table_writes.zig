@@ -1015,6 +1015,7 @@ fn writeReplicaRetirementIntent(
     path: []const u8,
     group_id: u64,
     phase: ReplicaRetirementIntentPhase,
+    sync_directory: bool,
 ) !void {
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
@@ -1041,23 +1042,19 @@ fn writeReplicaRetirementIntent(
         try file.sync(io);
     }
     try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
-    try fs_paths.syncDirPortable(io, dir_path);
+    if (sync_directory) try fs_paths.syncDirPortable(io, dir_path);
 }
 
-fn persistReplicaRetirementIntent(
+fn persistReplicaRetirementIntentWithIo(
     alloc: std.mem.Allocator,
+    io: std.Io,
+    dir_path: []const u8,
     replica_root_dir: []const u8,
     group_id: u64,
+    sync_directory: bool,
 ) !PersistedReplicaRetirementIntent {
-    const dir_path = try replicaRetirementDirPath(alloc, replica_root_dir);
-    defer alloc.free(dir_path);
     const path = try replicaRetirementIntentPath(alloc, replica_root_dir, group_id);
     errdefer alloc.free(path);
-
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const io = io_impl.io();
-    try fs_paths.createDirPathPortable(io, dir_path);
     if (std.Io.Dir.cwd().access(io, path, .{})) |_| {
         const persisted = try loadReplicaRetirementIntent(alloc, io, path);
         if (persisted.group_id != group_id) return error.InvalidReplicaRetirementIntent;
@@ -1067,8 +1064,38 @@ fn persistReplicaRetirementIntent(
         else => return err,
     }
 
-    try writeReplicaRetirementIntent(alloc, io, dir_path, path, group_id, .prepared);
+    try writeReplicaRetirementIntent(
+        alloc,
+        io,
+        dir_path,
+        path,
+        group_id,
+        .prepared,
+        sync_directory,
+    );
     return .{ .group_id = group_id, .path = path, .created = true };
+}
+
+fn persistReplicaRetirementIntent(
+    alloc: std.mem.Allocator,
+    replica_root_dir: []const u8,
+    group_id: u64,
+) !PersistedReplicaRetirementIntent {
+    const dir_path = try replicaRetirementDirPath(alloc, replica_root_dir);
+    defer alloc.free(dir_path);
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    try fs_paths.createDirPathPortable(io, dir_path);
+    return try persistReplicaRetirementIntentWithIo(
+        alloc,
+        io,
+        dir_path,
+        replica_root_dir,
+        group_id,
+        true,
+    );
 }
 
 fn loadReplicaRetirementIntent(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedReplicaRetirementIntent {
@@ -7429,7 +7456,7 @@ pub const ProvisionedTableWriteSource = struct {
             // Promotion repairs the crash window between the atomic catalog
             // commit and journal phase update. V1 records are upgraded here.
             if (intent.phase != .committed or intent.legacy) {
-                writeReplicaRetirementIntent(alloc, io, dir_path, path, group_id, .committed) catch |err| {
+                writeReplicaRetirementIntent(alloc, io, dir_path, path, group_id, .committed, true) catch |err| {
                     std.log.warn("replica-retirement commit marker deferred group_id={d} path={s} err={s}", .{ group_id, path, @errorName(err) });
                     retry_required = true;
                     continue;
@@ -7478,13 +7505,31 @@ pub const ProvisionedTableWriteSource = struct {
             }
             alloc.free(intents);
         }
+        const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
+        defer alloc.free(dir_path);
+        var io_impl = std.Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        const io = io_impl.io();
+        try fs_paths.createDirPathPortable(io, dir_path);
+        var directory_dirty = false;
         for (group_ids, intents) |group_id, *intent| {
-            intent.* = try persistReplicaRetirementIntent(alloc, self.replica_root_dir, group_id);
+            intent.* = try persistReplicaRetirementIntentWithIo(
+                alloc,
+                io,
+                dir_path,
+                self.replica_root_dir,
+                group_id,
+                false,
+            );
+            directory_dirty = directory_dirty or intent.created;
             const active = self.active_replica_retirement_intents.getOrPutAssumeCapacity(group_id);
             if (!active.found_existing) active.value_ptr.* = 0;
             active.value_ptr.* += 1;
             initialized += 1;
         }
+        // Every file was synced before rename. One directory barrier makes the
+        // complete removal batch durable without paying one fsync per entry.
+        if (directory_dirty) try fs_paths.syncDirPortable(io, dir_path);
         return .{ .alloc = alloc, .intents = intents };
     }
 
@@ -7535,22 +7580,36 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (dir_path) |path| prepared.alloc.free(path);
         var io_impl = std.Io.Threaded.init(prepared.alloc, .{});
         defer io_impl.deinit();
+        var directory_dirty = false;
         for (group_ids, prepared.intents) |group_id, intent| {
-            if (dir_path) |path| writeReplicaRetirementIntent(
-                prepared.alloc,
-                io_impl.io(),
-                path,
-                intent.path,
-                group_id,
-                .committed,
-            ) catch |err| {
-                first_error = first_error orelse err;
-            };
+            if (dir_path) |path| {
+                const wrote = wrote: {
+                    writeReplicaRetirementIntent(
+                        prepared.alloc,
+                        io_impl.io(),
+                        path,
+                        intent.path,
+                        group_id,
+                        .committed,
+                        false,
+                    ) catch |err| {
+                        first_error = first_error orelse err;
+                        break :wrote false;
+                    };
+                    break :wrote true;
+                };
+                directory_dirty = directory_dirty or wrote;
+            }
             if (self.active_replica_retirement_intents.getPtr(group_id)) |active| {
                 std.debug.assert(active.* > 0);
                 active.* -= 1;
                 if (active.* == 0) _ = self.active_replica_retirement_intents.remove(group_id);
             }
+        }
+        if (directory_dirty) {
+            if (dir_path) |path| fs_paths.syncDirPortable(io_impl.io(), path) catch |err| {
+                first_error = first_error orelse err;
+            };
         }
         self.replica_retirement_intent_mutex.unlock();
 
@@ -44062,6 +44121,60 @@ test "replica retirement journal distinguishes active retained and committed rem
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), db_path, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), raft_path, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), prepared.intents[0].path, .{}));
+}
+
+test "replica retirement journal batches preserve every group phase" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/replica-retirement-batch",
+        .{tmp.sub_path},
+    );
+    defer alloc.free(replica_root_dir);
+
+    const Ownership = struct {
+        state: ProvisionedTableWriteSource.ReplicaRetirementOwnership.State = .retiring,
+
+        fn classify(ptr: *anyopaque, _: u64) !ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.state;
+        }
+    };
+
+    const group_ids = [_]u64{ 7001, 7002, 7003 };
+    var ownership = Ownership{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    _ = source.withReplicaRetirementOwnership(.{ .ptr = &ownership, .classify = Ownership.classify });
+    var prepared = try source.prepareReplicaRetirements(alloc, &group_ids);
+    defer prepared.deinit();
+
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    for (prepared.intents, group_ids) |intent, group_id| {
+        try std.testing.expect(intent.created);
+        const persisted = try loadReplicaRetirementIntent(alloc, io_impl.io(), intent.path);
+        try std.testing.expectEqual(group_id, persisted.group_id);
+        try std.testing.expectEqual(ReplicaRetirementIntentPhase.prepared, persisted.phase);
+    }
+
+    try std.testing.expectError(
+        error.ReplicaRetirementOwnershipInconclusive,
+        source.completePreparedReplicaRetirements(&group_ids, &prepared),
+    );
+    for (prepared.intents, group_ids) |intent, group_id| {
+        const persisted = try loadReplicaRetirementIntent(alloc, io_impl.io(), intent.path);
+        try std.testing.expectEqual(group_id, persisted.group_id);
+        try std.testing.expectEqual(ReplicaRetirementIntentPhase.committed, persisted.phase);
+    }
+
+    ownership.state = .retired;
+    try std.testing.expect(!try source.recoverReplicaRetirementIntents(alloc));
+    for (prepared.intents) |intent| {
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), intent.path, .{}));
+    }
 }
 
 test "replica retirement recovery discards a legacy orphan whose catalog removal aborted" {

@@ -28,6 +28,26 @@ fn afterAdmission(err: anyerror) anyerror {
     return error.MetadataMutationOutcomeUnknown;
 }
 
+fn lockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+    const Service = @TypeOf(svc.*);
+    if (comptime @hasDecl(Service, "lockTableCatalogMutation")) {
+        svc.lockTableCatalogMutation(table_name);
+    } else {
+        // Keep transport test doubles and embedders source compatible. Real
+        // metadata services provide the narrower per-table shared lane.
+        svc.lockCatalogMutation();
+    }
+}
+
+fn unlockTableCatalogMutation(svc: anytype, table_name: []const u8) void {
+    const Service = @TypeOf(svc.*);
+    if (comptime @hasDecl(Service, "unlockTableCatalogMutation")) {
+        svc.unlockTableCatalogMutation(table_name);
+    } else {
+        svc.unlockCatalogMutation();
+    }
+}
+
 pub const DropResult = topology_protocol.DropResult;
 
 pub fn create(
@@ -55,9 +75,9 @@ pub fn create(
     // entering the catalog lane, then revalidate their term/membership token
     // under the lane immediately before deriving the admission snapshot.
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(request);
-    svc.lockCatalogMutation();
+    lockTableCatalogMutation(svc, table_name);
     var catalog_locked = true;
-    defer if (catalog_locked) svc.unlockCatalogMutation();
+    defer if (catalog_locked) unlockTableCatalogMutation(svc, table_name);
     try request.ensureActive();
     const table = tables_api.deriveTableRecord(table_name, normalized_req);
     // Read the durable fence on the leader while holding the catalog mutation
@@ -98,7 +118,7 @@ pub fn create(
         error.TableAlreadyExists => return err,
         else => return afterAdmission(err),
     };
-    svc.unlockCatalogMutation();
+    unlockTableCatalogMutation(svc, table_name);
     catalog_locked = false;
 }
 
@@ -109,9 +129,9 @@ pub fn drop(
     table_name: []const u8,
 ) !DropResult {
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(request);
-    svc.lockCatalogMutation();
+    lockTableCatalogMutation(svc, table_name);
     var catalog_locked = true;
-    defer if (catalog_locked) svc.unlockCatalogMutation();
+    defer if (catalog_locked) unlockTableCatalogMutation(svc, table_name);
     try request.ensureActive();
     try svc.ensureLinearizableReadWithContext(request);
     try svc.validateTableTopologyProtocolReadinessWithContext(request, protocol_readiness);
@@ -137,7 +157,7 @@ pub fn drop(
         error.TableTransitionActive => return err,
         else => return afterAdmission(err),
     };
-    svc.unlockCatalogMutation();
+    unlockTableCatalogMutation(svc, table_name);
     catalog_locked = false;
     const result = DropResult{
         .table_id = admission.table_id,

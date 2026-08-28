@@ -4349,6 +4349,12 @@ pub const RaftApplyStore = struct {
                     try self.putTableRecordTxn(txn, group_id, table_key, create.table);
                     changed = true;
                 }
+                // Atomic topology commands publish one table-scoped catalog
+                // invalidation through putTableRecordTxn below. Per-range
+                // lifecycle signals would clone the same table name and key
+                // once per shard while every production consumer only treats
+                // them as an epoch invalidation. Ordinary split/merge commands
+                // retain their precise range signals.
                 for (create.ranges) |record| {
                     var range_key_buf: [160]u8 = undefined;
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, record.group_id);
@@ -4363,17 +4369,6 @@ pub const RaftApplyStore = struct {
                     try txn.put(range_key, encoded_range);
                     try self.putTableRangeIndexTxn(txn, group_id, record.table_id, record.group_id);
                     try added_range_group_ids.append(self.alloc, record.group_id);
-                    self.notifyCommittedKeyListeners(.{
-                        .metadata_group_id = group_id,
-                        .key = range_key,
-                    });
-                    self.notifyProjectionListeners(.{
-                        .kind = .range,
-                        .metadata_group_id = group_id,
-                        .table_name = create.table.name,
-                        .table_id = create.table.table_id,
-                        .group_id = record.group_id,
-                    });
                 }
                 if (changed) {
                     if (added_range_group_ids.items.len > 0) {
@@ -4387,6 +4382,16 @@ pub const RaftApplyStore = struct {
                     } else {
                         try self.advanceTableTransitionGenerationTxn(txn, group_id, create.table.table_id);
                     }
+                    // A matching legacy table row may exist without the full
+                    // atomic range set. New tables already emitted this signal
+                    // through putTableRecordTxn; legacy completion needs the
+                    // same single table-scoped invalidation here.
+                    if (encoded_table != null) self.notifyProjectionListeners(.{
+                        .kind = .table,
+                        .metadata_group_id = group_id,
+                        .table_name = create.table.name,
+                        .table_id = create.table.table_id,
+                    });
                 }
             },
             .drop => |drop| {
@@ -4451,22 +4456,15 @@ pub const RaftApplyStore = struct {
                         if (record.table_id != drop.table_id) return;
                     }
                 }
+                // The table deletion below is the single catalog/lifecycle
+                // invalidation for this atomic topology change. Avoid queuing
+                // O(range_count) duplicate owned notifications while the
+                // metadata apply mutex is held.
                 for (range_group_ids) |range_group_id| {
                     var range_key_buf: [160]u8 = undefined;
                     const range_key = try rangeKeyForGroup(&range_key_buf, group_id, range_group_id);
                     try txn.delete(range_key);
                     try self.deleteTableRangeIndexTxn(txn, group_id, drop.table_id, range_group_id);
-                    self.notifyCommittedKeyListeners(.{
-                        .metadata_group_id = group_id,
-                        .key = range_key,
-                    });
-                    self.notifyProjectionListeners(.{
-                        .kind = .range,
-                        .metadata_group_id = group_id,
-                        .table_name = existing.name,
-                        .table_id = drop.table_id,
-                        .group_id = range_group_id,
-                    });
                 }
                 try txn.delete(table_key);
                 try self.deleteTableNameIndexTxn(txn, group_id, existing.name);
@@ -11411,6 +11409,118 @@ test "metadata raft apply store notifies projection listeners for committed tabl
     try std.testing.expectEqual(@as(usize, 1), capture.range_signals);
     try std.testing.expectEqual(@as(u64, 77), capture.last_table_id);
     try std.testing.expectEqual(@as(u64, 1001), capture.last_range_group_id);
+}
+
+test "atomic table topology lifecycle notifications stay constant at the initial range limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/metadata-topology-notification-scale-store",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(root);
+
+    const Capture = struct {
+        table_signals: usize = 0,
+        range_signals: usize = 0,
+        committed_keys: usize = 0,
+
+        fn onProjection(ptr: *anyopaque, signal: ProjectionSignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (signal.kind) {
+                .table => self.table_signals += 1,
+                .range => self.range_signals += 1,
+                else => {},
+            }
+        }
+
+        fn matchesCommittedKey(_: *anyopaque, _: CommittedKeySignal) bool {
+            return true;
+        }
+
+        fn onCommittedKey(ptr: *anyopaque, _: CommittedKeySignal) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.committed_keys += 1;
+        }
+    };
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    var capture = Capture{};
+    try store.addLifecycleListeners(
+        .{ .ptr = &capture, .vtable = &.{ .on_projection_signal = Capture.onProjection } },
+        .{ .ptr = &capture, .vtable = &.{
+            .matches_key = Capture.matchesCommittedKey,
+            .on_committed_key = Capture.onCommittedKey,
+        } },
+    );
+
+    const range_count: usize = topology_protocol.max_initial_ranges;
+    const ranges = try std.testing.allocator.alloc(metadata.RangeRecord, range_count);
+    defer std.testing.allocator.free(ranges);
+    for (ranges, 0..) |*record, offset| {
+        const range_group_id = 10_000 + @as(u64, @intCast(offset));
+        record.* = .{
+            .group_id = range_group_id,
+            .range_id = range_group_id,
+            .table_id = 77,
+            .start_key = "",
+        };
+    }
+    const table: metadata.TableRecord = .{
+        .table_id = 77,
+        .name = "docs",
+        .min_ranges = @intCast(range_count),
+    };
+    const create = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .create = .{
+            .expected_transition_generation = 0,
+            .table = table,
+            .ranges = ranges,
+        } },
+    });
+    defer std.testing.allocator.free(create);
+    const create_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = create },
+    });
+    defer std.testing.allocator.free(create_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 1,
+        .entries_bytes = create_entries,
+    });
+
+    const fence = try store.getTableTransitionFence(41, table.table_id);
+    const drop = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_table_topology = .{ .drop = .{
+            .table_id = table.table_id,
+            .expected_name = table.name,
+            .expected_transition_generation = fence.generation,
+            .range_contract = .{ .membership = fence.membership(table.table_id) },
+        } },
+    });
+    defer std.testing.allocator.free(drop);
+    const drop_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = drop },
+    });
+    defer std.testing.allocator.free(drop_entries);
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 2,
+        .entries_bytes = drop_entries,
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), capture.table_signals);
+    try std.testing.expectEqual(@as(usize, 0), capture.range_signals);
+    try std.testing.expectEqual(@as(usize, 4), capture.committed_keys);
+    const remaining_tables = try store.listTables(std.testing.allocator, 41);
+    defer store.freeTables(std.testing.allocator, remaining_tables);
+    const remaining_ranges = try store.listRanges(std.testing.allocator, 41);
+    defer store.freeRanges(std.testing.allocator, remaining_ranges);
+    try std.testing.expectEqual(@as(usize, 0), remaining_tables.len);
+    try std.testing.expectEqual(@as(usize, 0), remaining_ranges.len);
 }
 
 test "metadata raft apply store notifies projection listeners for shuffle join lease changes" {

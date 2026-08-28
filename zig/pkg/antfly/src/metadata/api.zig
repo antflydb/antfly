@@ -27,6 +27,16 @@ const reallocation_request = @import("reallocation_request.zig");
 pub const MetadataClusterIncarnation = metadata_incarnation.MetadataClusterIncarnation;
 pub const MetadataRaftVoterSetFingerprint = [table_manager.voter_set_fingerprint_len * 2]u8;
 
+/// Allocation-free subset of `/status` used by rolling-upgrade admission
+/// probes. Keeping this separate from MetadataStatus avoids parsing and
+/// retaining unrelated status strings on every table DDL operation.
+pub const TableTopologyProtocolStatus = struct {
+    metadata_group_id: u64,
+    table_topology_protocol_version: u16 = 0,
+    metadata_incarnation: ?MetadataClusterIncarnation = null,
+    metadata_raft_local_node_id: u64 = 0,
+};
+
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
     /// Zero means the peer predates the causal reallocation barrier.

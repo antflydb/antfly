@@ -71,8 +71,10 @@ const table_mutation_campaign_max_wait_ms: u32 = 500;
 const table_mutation_campaign_poll_ms: u64 = 5;
 const table_mutation_campaign_response_reserve_ms: u32 = 50;
 const reallocation_protocol_probe_timeout_ns: u64 = 5 * std.time.ns_per_s;
+const table_topology_protocol_probe_concurrency: usize = 8;
 const runtime_status_protocol_probe_min_backoff_ns: u64 = 5 * std.time.ns_per_s;
 const runtime_status_protocol_probe_max_backoff_ns: u64 = 60 * std.time.ns_per_s;
+const table_catalog_mutation_lane_count: usize = 64;
 
 pub const AdminSnapshotFence = struct {
     metadata_group_id: u64,
@@ -905,7 +907,7 @@ fn reallocationBarrierStatusCompatible(
 }
 
 fn tableTopologyProtocolCompatible(
-    peer_status: MetadataStatus,
+    peer_status: anytype,
     metadata_group_id: u64,
     node_id: u64,
     incarnation: metadata_mod.MetadataClusterIncarnation,
@@ -2096,6 +2098,10 @@ pub const MetadataService = struct {
     cdc_permit_check_after_ns: std.atomic.Value(u64) = .init(0),
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
+    // Coordinate proposal progress across in-process callers just as the HTTP
+    // service does: one waiter drives Raft while the others sleep on a
+    // generation signal instead of polling independently.
+    proposal_progress_driver: MetadataProposalProgressDriver = .{},
     lifecycle_signal: LifecycleSignal,
     lifecycle_reconcile_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lifecycle_reconcile_hook: ?LifecycleReconcileHook = null,
@@ -2103,7 +2109,8 @@ pub const MetadataService = struct {
     local_replica_root_reconcile_permit_hook: ?LocalReplicaRootReconcilePermitHook = null,
     lifecycle_listener_mutex: std.Io.Mutex = .init,
     lifecycle_listener_registered: bool = false,
-    catalog_mutation_mutex: std.Io.Mutex = .init,
+    catalog_mutation_mutex: std.Io.RwLock = .init,
+    table_catalog_mutation_lanes: [table_catalog_mutation_lane_count]std.Io.Mutex = @splat(.init),
     catalog_validation_mutex: std.Io.Mutex = .init,
     catalog_validation_cache: CatalogValidationSnapshotCache = .{},
     local_group_status_provider: ?LocalGroupStatusProvider = null,
@@ -2373,6 +2380,7 @@ pub const MetadataService = struct {
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
             else => {},
         }
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(signal.table_name);
     }
 
@@ -2384,6 +2392,7 @@ pub const MetadataService = struct {
     fn metadataServiceCommittedKeySignal(ptr: *anyopaque, _: metadata_storage.raft_apply_store.CommittedKeySignal) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         self.lifecycle_reconcile_requested.store(true, .release);
+        self.proposal_progress_driver.notifyWaiters();
         self.lifecycle_signal.notify(null);
     }
 
@@ -2580,6 +2589,8 @@ pub const MetadataService = struct {
         // removes the zero-waiter receipt from the bounded tracker.
         try request.ensureActive();
 
+        var progress_driver_lease: ?MetadataProposalProgressDriver.Lease = null;
+        defer if (progress_driver_lease) |*lease| lease.deinit();
         const local_deadline_ns = platform_time.monotonicNs() +| linearizable_metadata_read_timeout_ns;
         const deadline_ns = if (request.deadline_ns) |caller_deadline_ns|
             @min(local_deadline_ns, caller_deadline_ns)
@@ -2587,6 +2598,11 @@ pub const MetadataService = struct {
             local_deadline_ns;
         while (platform_time.monotonicNs() < deadline_ns) {
             try request.ensureActive();
+            // Capture both generations before observing Raft so neither an
+            // apply notification nor a driver handoff can be lost between the
+            // observation and the corresponding wait.
+            const lifecycle_observation = self.lifecycle_signal.snapshot(null);
+            const progress_driver_epoch = self.proposal_progress_driver.currentEpoch();
             self.lockRuntime();
             const maybe_raft_status = self.raft.host.host.raftStatus(self.metadata_group_id);
             const applied_entry_term = if (maybe_raft_status) |raft_status|
@@ -2621,8 +2637,24 @@ pub const MetadataService = struct {
                 },
                 .pending => {},
             }
-            try self.runRaftProgressOnly();
-            platform_clock.Clock.real().sleepMs(1);
+            if (progress_driver_lease == null) {
+                progress_driver_lease = self.proposal_progress_driver.tryAcquire();
+            }
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= deadline_ns) break;
+            const remaining_ns = deadline_ns - now_ns;
+            if (progress_driver_lease != null) {
+                try self.runRaftProgressOnly();
+                self.lifecycle_signal.wait(
+                    lifecycle_observation,
+                    @min(remaining_ns, metadata_proposal_driver_wait_ns),
+                );
+            } else {
+                self.proposal_progress_driver.waitForHandoff(
+                    progress_driver_epoch,
+                    @min(remaining_ns, metadata_proposal_passive_wait_ns),
+                );
+            }
         }
         try request.ensureActive();
         return error.MetadataProposalApplyTimeout;
@@ -2728,6 +2760,23 @@ pub const MetadataService = struct {
 
     pub fn unlockCatalogMutation(self: *MetadataService) void {
         self.catalog_mutation_mutex.unlock(std.Options.debug_io);
+    }
+
+    pub fn lockTableCatalogMutation(self: *MetadataService, table_name: []const u8) void {
+        // Serialize the table first so same-table queueing does not occupy a
+        // shared slot and delay a pending exclusive catalog mutation.
+        self.tableCatalogMutationLane(table_name).lockUncancelable(std.Options.debug_io);
+        self.catalog_mutation_mutex.lockSharedUncancelable(std.Options.debug_io);
+    }
+
+    pub fn unlockTableCatalogMutation(self: *MetadataService, table_name: []const u8) void {
+        self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
+        self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
+    }
+
+    fn tableCatalogMutationLane(self: *MetadataService, table_name: []const u8) *std.Io.Mutex {
+        const hash = std.hash.Wyhash.hash(0, table_name);
+        return &self.table_catalog_mutation_lanes[hash % self.table_catalog_mutation_lanes.len];
     }
 
     pub fn upsertNode(self: *MetadataService, record: metadata_table_manager.NodeRecord) !void {
@@ -4256,7 +4305,8 @@ pub const MetadataHttpService = struct {
     cdc_job_owner_id: u64 = 0,
     reconcile_lease: metadata_reconcile_lease.State,
     runtime_mutex: std.Io.Mutex = .init,
-    catalog_mutation_mutex: std.Io.Mutex = .init,
+    catalog_mutation_mutex: std.Io.RwLock = .init,
+    table_catalog_mutation_lanes: [table_catalog_mutation_lane_count]std.Io.Mutex = @splat(.init),
     placement_reconcile_mutex: std.Io.Mutex = .init,
     transition_mutex: std.Io.Mutex = .init,
     transition_metrics_mutex: std.Io.Mutex = .init,
@@ -5526,18 +5576,50 @@ pub const MetadataHttpService = struct {
         const incarnation = (try self.metadataIncarnation()) orelse
             return error.TableTopologyProtocolUpgradeRequired;
 
-        var client = metadata_http_client.MetadataHttpClient.init(
-            self.alloc,
-            self.raft.host.http_host.request_executor,
-        );
         const now_ns = platform_time.monotonicNs();
         const request_deadline = request.deadline_ns orelse std.math.maxInt(u64);
         const probe_budget = metadata_http_client.RequestBudget{
             .deadline_ns = @min(now_ns +| reallocation_protocol_probe_timeout_ns, request_deadline),
         };
-        for (required_node_ids) |node_id| {
+        const ProbeSlot = struct {
+            node_id: u64 = 0,
+            base_uri: ?[]const u8 = null,
+            status: metadata_api.TableTopologyProtocolStatus = .{ .metadata_group_id = 0 },
+            err: ?anyerror = null,
+        };
+        const Probe = struct {
+            fn run(
+                alloc: std.mem.Allocator,
+                executor: http_common.RequestExecutor,
+                base_uri: []const u8,
+                budget: metadata_http_client.RequestBudget,
+                slot: *ProbeSlot,
+            ) void {
+                var client = metadata_http_client.MetadataHttpClient.init(alloc, executor);
+                slot.status = client.fetchTableTopologyProtocolStatusWithBudget(
+                    base_uri,
+                    budget,
+                ) catch |err| {
+                    slot.err = err;
+                    return;
+                };
+            }
+        };
+        const slots = try self.alloc.alloc(ProbeSlot, required_node_ids.len);
+        defer self.alloc.free(slots);
+        for (slots) |*slot| slot.* = .{};
+        for (required_node_ids, slots) |node_id, *slot| {
             try request.ensureActive();
-            if (node_id == local_node_id) continue;
+            slot.node_id = node_id;
+            if (node_id == local_node_id) {
+                slot.status = .{
+                    .metadata_group_id = self.metadata_group_id,
+                    .table_topology_protocol_version = metadata_topology_protocol.current_version,
+                    .metadata_incarnation = incarnation,
+                    .metadata_raft_local_node_id = local_node_id,
+                };
+                continue;
+            }
             const peer = findReallocationProtocolPeer(self.reallocation_protocol_peers, node_id) orelse {
                 std.log.warn("table topology protocol blocked: metadata member {d} is not configured", .{node_id});
                 return error.TableTopologyProtocolUpgradeRequired;
@@ -5545,14 +5627,41 @@ pub const MetadataHttpService = struct {
             const orchestration_url = peer.orchestration_url orelse
                 return error.TableTopologyProtocolUpgradeRequired;
             if (orchestration_url.len == 0) return error.TableTopologyProtocolUpgradeRequired;
-            const peer_status = client.fetchStatusWithBudget(orchestration_url, probe_budget) catch |err| {
-                std.log.warn("table topology protocol probe failed member={d} err={s}", .{ node_id, @errorName(err) });
+            slot.base_uri = orchestration_url;
+        }
+        // Validate the complete route set before scheduling any fibers so an
+        // early configuration error can never leave work borrowing `slots`.
+        const probe_io = self.raft.host.http_host.outboundIo();
+        var batch_start: usize = 0;
+        while (batch_start < slots.len) : (batch_start += table_topology_protocol_probe_concurrency) {
+            try request.ensureActive();
+            const batch_end = @min(batch_start + table_topology_protocol_probe_concurrency, slots.len);
+            var probe_group: std.Io.Group = .init;
+            for (slots[batch_start..batch_end]) |*slot| {
+                const orchestration_url = slot.base_uri orelse continue;
+                probe_group.async(probe_io, Probe.run, .{
+                    self.alloc,
+                    self.raft.host.http_host.request_executor,
+                    orchestration_url,
+                    probe_budget,
+                    slot,
+                });
+            }
+            probe_group.await(probe_io) catch |err| {
+                std.log.warn("table topology protocol fanout failed err={s}", .{@errorName(err)});
                 return error.TableTopologyProtocolUpgradeRequired;
             };
-            if (!tableTopologyProtocolCompatible(peer_status, self.metadata_group_id, node_id, incarnation)) {
+        }
+        try request.ensureActive();
+        for (slots) |slot| {
+            if (slot.err) |err| {
+                std.log.warn("table topology protocol probe failed member={d} err={s}", .{ slot.node_id, @errorName(err) });
+                return error.TableTopologyProtocolUpgradeRequired;
+            }
+            if (!tableTopologyProtocolCompatible(slot.status, self.metadata_group_id, slot.node_id, incarnation)) {
                 std.log.warn(
                     "table topology protocol blocked member={d} reports node={d} group={d} protocol={d}",
-                    .{ node_id, peer_status.metadata_raft_local_node_id, peer_status.metadata_group_id, peer_status.table_topology_protocol_version },
+                    .{ slot.node_id, slot.status.metadata_raft_local_node_id, slot.status.metadata_group_id, slot.status.table_topology_protocol_version },
                 );
                 return error.TableTopologyProtocolUpgradeRequired;
             }
@@ -7080,6 +7189,27 @@ pub const MetadataHttpService = struct {
 
     pub fn unlockCatalogMutation(self: *MetadataHttpService) void {
         self.catalog_mutation_mutex.unlock(std.Options.debug_io);
+    }
+
+    /// DDL holds a shared catalog gate plus a stable per-table lane through
+    /// admission and apply. Unrelated tables can make progress concurrently,
+    /// while reconcile, membership, and extension changes retain exclusive
+    /// snapshot/log ordering through `lockCatalogMutation`.
+    pub fn lockTableCatalogMutation(self: *MetadataHttpService, table_name: []const u8) void {
+        // Serialize the table first so same-table queueing does not occupy a
+        // shared slot and delay a pending exclusive catalog mutation.
+        self.tableCatalogMutationLane(table_name).lockUncancelable(std.Options.debug_io);
+        self.catalog_mutation_mutex.lockSharedUncancelable(std.Options.debug_io);
+    }
+
+    pub fn unlockTableCatalogMutation(self: *MetadataHttpService, table_name: []const u8) void {
+        self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
+        self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
+    }
+
+    fn tableCatalogMutationLane(self: *MetadataHttpService, table_name: []const u8) *std.Io.Mutex {
+        const hash = std.hash.Wyhash.hash(0, table_name);
+        return &self.table_catalog_mutation_lanes[hash % self.table_catalog_mutation_lanes.len];
     }
 
     fn raftDiagnosticsSnapshotLocked(self: *MetadataHttpService) MetadataRaftDiagnosticsSnapshot {

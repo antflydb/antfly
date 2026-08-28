@@ -6290,6 +6290,7 @@ pub fn build(b: *std.Build) void {
             "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
             "provisioned table drop retains repair intent until catalog ownership clears",
             "replica retirement journal distinguishes active retained and committed removal",
+            "replica retirement journal batches preserve every group phase",
             "replica retirement recovery discards a legacy orphan whose catalog removal aborted",
             "hosted source publication recovers durable dropped-table intent",
             "provisioned table write source drop table retires old publication authority",
