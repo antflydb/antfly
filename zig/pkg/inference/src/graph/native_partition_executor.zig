@@ -140,6 +140,7 @@ pub const NativePartitionExecutor = struct {
             .options = options,
             .last_use = last_use,
             .pair_second = if (exec_ctx.pair_second) |pair| pair.* else null,
+            .runtime_shapes = if (exec_ctx.runtime_shape_tracker) |tracker| tracker.runtimeShapes() else null,
         };
         defer exec_state.freeMoeState();
 
@@ -162,6 +163,9 @@ pub const NativePartitionExecutor = struct {
                     values[i] = rt_val;
                 }
                 value_device[i] = device_id;
+                if (exec_ctx.runtime_shape_tracker) |tracker| {
+                    try tracker.record(cb, node_id, values[i].?);
+                }
                 continue;
             }
 
@@ -184,6 +188,9 @@ pub const NativePartitionExecutor = struct {
                 if (exec_ctx.stats) |stats| stats.interpreter_fallbacks += 1;
             }
             value_device[i] = device_id;
+            if (exec_ctx.runtime_shape_tracker) |tracker| {
+                try tracker.record(cb, node_id, values[i].?);
+            }
 
             try interpreter.cloneOutputIfAliasedInputWouldBeFreed(
                 allocator,
@@ -243,6 +250,11 @@ fn executeNativePlannedNode(
     if (cb.kind() != .native) return null;
     const n = graph.node(node_id);
     const inputs = n.getInputs();
+    // Planned native kernels currently derive several operand layouts from
+    // graph declarations. When any participating shape is symbolic, route the
+    // node through executeNode, which resolves those layouts from the shared
+    // request shape tracker. Static graphs keep the planned fast path.
+    if (exec_state.runtime_shapes != null and nodeTouchesSymbolicShape(graph, node_id)) return null;
     return switch (n.op) {
         .parameter => blk: {
             const name = graph.parameterName(n);
@@ -480,7 +492,10 @@ fn executeNativePlannedNode(
             );
         },
         .reshape => |attrs| blk: {
-            if (attrs.runtime_shape) return null;
+            // Imported dynamic graphs may encode a request-dependent reshape
+            // with static-looking symbolic attributes. Let executeNode resolve
+            // those dimensions from the shared request shape provenance.
+            if (attrs.runtime_shape or exec_state.runtime_shapes != null) return null;
             const rank = attrs.new_shape.rank();
             var dims: [8]i64 = undefined;
             for (0..rank) |d| dims[d] = attrs.new_shape.dim(@intCast(d));
@@ -494,6 +509,9 @@ fn executeNativePlannedNode(
             break :blk try cb.primTranspose(valueAt(values, inputs[0]), perm, input_shape);
         },
         .broadcast_in_dim => |attrs| blk: {
+            // ONNX Expand carries its target as a second runtime input. The
+            // planned path only understands the declared target attributes.
+            if (n.num_inputs > 1) return null;
             var input_shape_buf: [8]i64 = undefined;
             const input_shape = fillShapeDims(graph, inputs[0], &input_shape_buf);
             const rank = attrs.target_shape.rank();
@@ -614,6 +632,23 @@ fn executeNativePlannedNode(
         },
         else => null,
     };
+}
+
+fn nodeTouchesSymbolicShape(graph: *const Graph, node_id: NodeId) bool {
+    const node = graph.node(node_id);
+    if (shapeHasSymbolicDim(node.output_shape)) return true;
+    for (node.getInputs()) |input_id| {
+        if (input_id == null_node or input_id >= graph.nodeCount()) continue;
+        if (shapeHasSymbolicDim(graph.node(input_id).output_shape)) return true;
+    }
+    return false;
+}
+
+fn shapeHasSymbolicDim(shape: ml.graph.Shape) bool {
+    for (0..shape.rank()) |axis| {
+        if (shape.dim(@intCast(axis)) < 0) return true;
+    }
+    return false;
 }
 
 fn fillShapeDims(graph: *const Graph, node_id: NodeId, buf: *[8]i64) []const i64 {
