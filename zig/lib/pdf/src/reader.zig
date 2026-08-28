@@ -3531,9 +3531,6 @@ pub const Reader = struct {
         for (raw) |code| {
             const glyph = type3.glyphForCode(code) orelse return false;
             if (!glyph.vectorizable or !try type3ResourcesAvailableAlloc(alloc, glyph.*, type3)) return false;
-            // Uncolored Type3 glyphs may contain paths only; images and
-            // shadings carry their own color and would violate PaintType 2.
-            if (type3.paint_type == 2 and (contentMayContainOperator(glyph.content, "Do") or contentMayContainOperator(glyph.content, "sh"))) return false;
 
             const initial_state = type3InitialGraphicsState(run, type3, cursor_x, cursor_y);
             const initial_clip = run.clip_points orelse &.{};
@@ -3603,6 +3600,10 @@ pub const Reader = struct {
                 if (!text.vectorizable or text.fill_pattern_name != null or text.stroke_pattern_name != null) return false;
                 if (!try appendVectorTextRunShapesAlloc(alloc, &glyph_shapes, type3.fonts, text, &nested_type3_phase)) return false;
             }
+            // PaintType 2 may use resource-backed forms when they ultimately
+            // emit recolorable paths or text. Intrinsically colored paint
+            // cannot inherit the caller's color and must remain conservative.
+            if (type3.paint_type == 2 and (glyph_images.items.len > 0 or glyph_shadings.items.len > 0 or glyph_patterns.items.len > 0)) return false;
 
             for (glyph_images.items) |*image| {
                 const local_order = image.paint_order;
@@ -19929,6 +19930,30 @@ test "vector text admission is raster relative and transactional" {
     const expensive = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = &expensive_points, .antialias = true };
     try std.testing.expect(!budget.admit((&expensive)[0..1], &.{}, &.{}, &.{}));
     try std.testing.expectEqual(remaining, budget.remaining_edge_tests);
+}
+
+test "uncolored Type3 accepts path-only forms and inherits caller color" {
+    const alloc = std.testing.allocator;
+    var form = PageForm{ .name = @constCast("Fm"), .content = @constCast("0 0 4 5 re f") };
+    var glyph = Type3Glyph{ .code = 'A', .name = @constCast("A"), .content = @constCast("/Fm Do"), .advance_x = 1, .advance_y = 0, .outline_only = false };
+    const type3 = Type3Font{ .paint_type = 2, .font_matrix = .{ 1, 0, 0, 1, 0, 0 }, .glyphs = (&glyph)[0..1], .forms = (&form)[0..1] };
+    const text_run = TextRun{ .text = @constCast("A"), .raw_text = @constCast("A"), .x = 2, .y = 3, .font_size = 1, .fill_color = .{ 200, 10, 20, 255 } };
+    var images = std.ArrayList(ImageRun).empty;
+    defer images.deinit(alloc);
+    var shadings = std.ArrayList(ShadingRun).empty;
+    defer shadings.deinit(alloc);
+    var patterns = std.ArrayList(PatternRun).empty;
+    defer patterns.deinit(alloc);
+    var shapes = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (shapes.items) |*shape| shape.deinit(alloc);
+        shapes.deinit(alloc);
+    }
+    var phase: usize = 0;
+    var next_group_id: u32 = 1;
+    try std.testing.expect(try Reader.appendType3RunResourceRunsAlloc(alloc, &images, &shadings, &patterns, &shapes, text_run, type3, "A", &phase, &next_group_id));
+    try std.testing.expectEqual(@as(usize, 1), shapes.items.len);
+    try std.testing.expectEqual([4]u8{ 200, 10, 20, 255 }, shapes.items[0].color);
 }
 
 test "content resource discovery requires the name as the immediate operand" {
