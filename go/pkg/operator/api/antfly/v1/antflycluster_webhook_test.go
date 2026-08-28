@@ -2373,12 +2373,37 @@ func TestValidateCreate_HighAvailabilityAllowsExactActivatedSeedStartupGate(t *t
 	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
 	cluster.Spec.HighAvailability.Runtime.Role = HARuntimeRolePrimary
 	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Runtime.Primary = &HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/ha/standby.wal",
+		SlotsPath: "/antflydb/ha/standby-progress.wal.promoted-primary-slots",
+	}
 	cluster.Spec.HighAvailability.Standbys = nil
 	if err := cluster.ValidateCreate(); err != nil {
 		t.Fatalf("expected promoted primary to retain exact activated-volume provenance: %v", err)
 	}
 	if err := cluster.ValidateUpdate(standby); err != nil {
 		t.Fatalf("expected promotion to retain the unchanged activated-volume binding: %v", err)
+	}
+
+	wrongStorage := cluster.DeepCopy()
+	wrongStorage.Spec.HighAvailability.Runtime.Primary = &HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/ha/primary.wal",
+		SlotsPath: "/antflydb/ha/slots",
+	}
+	if err := wrongStorage.ValidateUpdate(standby); err == nil || !strings.Contains(err.Error(), "must reopen the promoted standby storage") {
+		t.Fatalf("expected promotion to reject a fresh primary WAL and slot store, got: %v", err)
+	}
+
+	customStandby := standby.DeepCopy()
+	customStandby.Spec.HighAvailability.Runtime.Standby.LogPath = "/antflydb/custom/receive.wal"
+	customStandby.Spec.HighAvailability.Runtime.Standby.ProgressPath = "/antflydb/custom/progress.wal"
+	customPromotion := cluster.DeepCopy()
+	customPromotion.Spec.HighAvailability.Runtime.Primary = &HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/custom/receive.wal",
+		SlotsPath: "/antflydb/custom/progress.wal.promoted-primary-slots",
+	}
+	if err := customPromotion.ValidateUpdate(customStandby); err != nil {
+		t.Fatalf("expected promotion to preserve custom standby WAL paths: %v", err)
 	}
 
 	cluster.Spec.HighAvailability.Runtime.StartupGate.RequiredReceipt.TargetPVCUID = ""

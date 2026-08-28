@@ -19,6 +19,14 @@ import (
 
 const haTopologyIDAnnotation = "antfly.io/ha-topology-id"
 
+const (
+	defaultHAPrimaryLogPath      = "/antflydb/ha/primary.wal"
+	defaultHAPrimarySlotsPath    = "/antflydb/ha/slots"
+	defaultHAStandbyLogPath      = "/antflydb/ha/standby.wal"
+	defaultHAStandbyProgressPath = "/antflydb/ha/standby-progress.wal"
+	promotedPrimarySlotsSuffix   = ".promoted-primary-slots"
+)
+
 var (
 	// irsaARNPattern matches AWS IAM Role ARNs including China and GovCloud partitions.
 	irsaARNPattern = regexp.MustCompile(`^arn:aws(-cn|-us-gov)?:iam::\d{12}:role/.+$`)
@@ -58,10 +66,9 @@ func (r *AntflyCluster) ValidateUpdate(old runtime.Object) error {
 	return r.validateHAPromotedPrimaryStorageBinding(oldCluster)
 }
 
-// validateHAPromotedPrimaryStorageBinding makes the activated PVC binding
-// immutable across and after promotion. Changing or dropping it would either
-// close the new writer after authority moved or remount a different volume
-// under an already-promoted identity.
+// validateHAPromotedPrimaryStorageBinding preserves both pieces of durable
+// storage authority across an in-place standby promotion: the activated PVC
+// binding and the exact WAL/slot paths adopted by the running process.
 func (r *AntflyCluster) validateHAPromotedPrimaryStorageBinding(old *AntflyCluster) error {
 	if old == nil || old.Spec.HighAvailability == nil || old.Spec.HighAvailability.Runtime == nil ||
 		r.Spec.HighAvailability == nil || r.Spec.HighAvailability.Runtime == nil {
@@ -69,6 +76,18 @@ func (r *AntflyCluster) validateHAPromotedPrimaryStorageBinding(old *AntflyClust
 	}
 	oldRuntime := old.Spec.HighAvailability.Runtime
 	newRuntime := r.Spec.HighAvailability.Runtime
+	if oldRuntime.Role == HARuntimeRoleStandby && newRuntime.Role == HARuntimeRolePrimary {
+		oldLogPath, oldProgressPath := effectiveHAStandbyPaths(oldRuntime.Standby)
+		newLogPath, newSlotsPath := effectiveHAPrimaryPaths(newRuntime.Primary)
+		expectedSlotsPath := oldProgressPath + promotedPrimarySlotsSuffix
+		if newLogPath != oldLogPath || newSlotsPath != expectedSlotsPath {
+			return fmt.Errorf(
+				"spec.highAvailability.runtime.primary must reopen the promoted standby storage: logPath=%q and slotsPath=%q",
+				oldLogPath,
+				expectedSlotsPath,
+			)
+		}
+	}
 	oldGate := oldRuntime.StartupGate
 	newGate := newRuntime.StartupGate
 	oldBoundPrimary := oldRuntime.Role == HARuntimeRolePrimary && oldGate != nil && oldGate.Policy == HAStartupGatePolicyRequireActivatedSeed
@@ -83,6 +102,34 @@ func (r *AntflyCluster) validateHAPromotedPrimaryStorageBinding(old *AntflyClust
 		return fmt.Errorf("spec.highAvailability.runtime.startupGate activated-volume binding is immutable across and after promotion")
 	}
 	return nil
+}
+
+func effectiveHAStandbyPaths(standby *HAStandbyRuntimeSpec) (string, string) {
+	logPath := defaultHAStandbyLogPath
+	progressPath := defaultHAStandbyProgressPath
+	if standby != nil {
+		if value := strings.TrimSpace(standby.LogPath); value != "" {
+			logPath = value
+		}
+		if value := strings.TrimSpace(standby.ProgressPath); value != "" {
+			progressPath = value
+		}
+	}
+	return logPath, progressPath
+}
+
+func effectiveHAPrimaryPaths(primary *HAPrimaryRuntimeSpec) (string, string) {
+	logPath := defaultHAPrimaryLogPath
+	slotsPath := defaultHAPrimarySlotsPath
+	if primary != nil {
+		if value := strings.TrimSpace(primary.LogPath); value != "" {
+			logPath = value
+		}
+		if value := strings.TrimSpace(primary.SlotsPath); value != "" {
+			slotsPath = value
+		}
+	}
+	return logPath, slotsPath
 }
 
 // Default applies admission defaults to AntflyCluster.

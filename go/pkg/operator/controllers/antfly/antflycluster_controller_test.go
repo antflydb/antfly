@@ -15509,6 +15509,10 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	cluster.Spec.HighAvailability.Runtime.Role = antflyv1.HARuntimeRolePrimary
 	cluster.Spec.HighAvailability.Runtime.NodeID = "standby-a"
 	cluster.Spec.HighAvailability.Runtime.Standby = nil
+	cluster.Spec.HighAvailability.Runtime.Primary = &antflyv1.HAPrimaryRuntimeSpec{
+		LogPath:   "/antflydb/ha/standby-generations/prod-standby-a-10/receive.wal",
+		SlotsPath: "/antflydb/ha/standby-generations/prod-standby-a-10/progress.wal.promoted-primary-slots",
+	}
 	cluster.Spec.HighAvailability.Identity.CurrentPrimaryID = "standby-a"
 	cluster.Spec.HighAvailability.Identity.TimelineID = 2
 	cluster.Spec.HighAvailability.Identity.Epoch = 2
@@ -15516,6 +15520,9 @@ func TestReconcileStandaloneStatefulSetStartupGateRequiresExactObservedReceipt(t
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
 	g.Expect(client.Get(context.Background(), types.NamespacedName{Name: "test-standalone-standalone", Namespace: "default"}, sts)).To(Succeed())
 	g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)), "a promoted primary must retain access to its activated volume")
+	runtimeArgs = sts.Spec.Template.Spec.Containers[0].Args[0]
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-primary-log '/antflydb/ha/standby-generations/prod-standby-a-10/receive.wal'`))
+	g.Expect(runtimeArgs).To(ContainSubstring(`--ha-primary-slots '/antflydb/ha/standby-generations/prod-standby-a-10/progress.wal.promoted-primary-slots'`))
 
 	cluster.Status.HAStatus.StartupGate.ActivationReceipt.TimelineID = 3
 	g.Expect(reconciler.reconcileStandaloneStatefulSet(context.Background(), &envFromCache{}, cluster)).To(Succeed())
