@@ -74,7 +74,7 @@ pub const MetadataControlLoop = struct {
         const catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
         try self.state.syncProjected(service);
-        return try self.reconcilePreparedLocked(service);
+        return try self.reconcilePreparedCatalogLocked(service);
     }
 
     /// Refresh projection, derive the legacy desired topology, and apply the
@@ -86,7 +86,7 @@ pub const MetadataControlLoop = struct {
         defer unlockCatalogMutation(service, catalog_locked);
         try self.state.syncProjected(service);
         try self.state.seedDesiredFromProjected();
-        return try self.reconcilePreparedLocked(service);
+        return try self.reconcilePreparedCatalogLocked(service);
     }
 
     /// Reconcile using the caller's prepared projected/desired state.
@@ -97,10 +97,15 @@ pub const MetadataControlLoop = struct {
     pub fn reconcilePrepared(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
         const catalog_locked = lockCatalogMutation(service);
         defer unlockCatalogMutation(service, catalog_locked);
-        return try self.reconcilePreparedLocked(service);
+        return try self.reconcilePreparedCatalogLocked(service);
     }
 
-    fn reconcilePreparedLocked(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+    /// Reconcile a projected/desired state prepared while the caller owns the
+    /// service catalog-mutation lock. This is the only lock-free reconciliation
+    /// entry point: synchronous catalog workflows use it to keep projection
+    /// refresh, desired mutation, plan construction, and proposal admission in
+    /// one critical section without recursively acquiring the lock.
+    pub fn reconcilePreparedCatalogLocked(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
         self.installMedianKeyLookup(service);
         var current = try self.state.captureCurrent(service);
         defer current.deinit(self.alloc);

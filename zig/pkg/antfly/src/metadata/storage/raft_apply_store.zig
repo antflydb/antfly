@@ -64,6 +64,19 @@ pub const ExtensionLifecycleDelta = struct {
     remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
 };
 
+/// Exact predecessor wire shape for transition tag 40. Semantic preconditions
+/// must never be smuggled into this JSON object: predecessor binaries ignore
+/// unknown fields, which would let replicas make different apply decisions.
+const ExtensionLifecycleDeltaV1 = struct {
+    upsert_tables: []const metadata.TableRecord = &.{},
+    upsert_installed_extensions: []const extension_domain.InstalledExtension = &.{},
+    remove_installed_extensions: []const []const u8 = &.{},
+    upsert_extension_members: []const extension_domain.ExtensionMember = &.{},
+    remove_extension_members: []const ExtensionMemberKey = &.{},
+    upsert_extension_dependencies: []const extension_domain.ExtensionDependency = &.{},
+    remove_extension_dependencies: []const ExtensionDependencyKey = &.{},
+};
+
 pub const ExtensionLifecycleTablePrecondition = struct {
     table_id: u64,
     definition_fingerprint: metadata_table_manager.TableDefinitionFingerprint,
@@ -245,6 +258,7 @@ pub const TransitionCommand = union(enum) {
         package_name: []const u8,
     },
     apply_extension_lifecycle: ExtensionLifecycleDelta,
+    apply_extension_lifecycle_v2: ExtensionLifecycleDelta,
 
     pub fn deinit(self: *TransitionCommand, alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -346,7 +360,7 @@ pub const TransitionCommand = union(enum) {
                 for (record.keys) |key| alloc.free(key);
                 alloc.free(record.keys);
             },
-            .apply_extension_lifecycle => |*delta| freeExtensionLifecycleDelta(alloc, delta.*),
+            .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |*delta| freeExtensionLifecycleDelta(alloc, delta.*),
             else => {},
         }
         self.* = undefined;
@@ -402,6 +416,36 @@ pub fn validateTransitionCommandDataGroupIds(command: TransitionCommand) !void {
                     },
                 }
             },
+        },
+        .apply_extension_lifecycle => |delta| {
+            if (delta.expected_tables.len != 0)
+                return error.ExtensionLifecycleV2Required;
+        },
+        .apply_extension_lifecycle_v2 => |delta| {
+            if (delta.expected_tables.len == 0 or
+                delta.expected_tables.len != delta.upsert_tables.len)
+                return error.InvalidExtensionLifecyclePreconditions;
+            for (delta.upsert_tables) |replacement| {
+                if (replacement.table_id == 0)
+                    return error.InvalidExtensionLifecyclePreconditions;
+                var matches: usize = 0;
+                for (delta.expected_tables) |expected| {
+                    if (expected.table_id == replacement.table_id) matches += 1;
+                }
+                if (matches != 1) return error.InvalidExtensionLifecyclePreconditions;
+            }
+            // The equal-length check plus both uniqueness directions makes the
+            // relation a bijection. Without this reverse check, duplicate
+            // replacement IDs could leave an unrelated precondition unused.
+            for (delta.expected_tables) |expected| {
+                if (expected.table_id == 0)
+                    return error.InvalidExtensionLifecyclePreconditions;
+                var matches: usize = 0;
+                for (delta.upsert_tables) |replacement| {
+                    if (replacement.table_id == expected.table_id) matches += 1;
+                }
+                if (matches != 1) return error.InvalidExtensionLifecyclePreconditions;
+            }
         },
         .claim_replication_source_cutover => |claim| {
             if (claim.expected_replication_sources_json.len == 0 or
@@ -3287,7 +3331,7 @@ pub const RaftApplyStore = struct {
             .upsert_installed_extension, .remove_installed_extension => metadataSnapshotProjectionBit(.installed_extension),
             .upsert_extension_member, .remove_extension_member => metadataSnapshotProjectionBit(.extension_member),
             .upsert_extension_dependency, .remove_extension_dependency => metadataSnapshotProjectionBit(.extension_dependency),
-            .apply_extension_lifecycle => metadataSnapshotProjectionBit(.table) |
+            .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => metadataSnapshotProjectionBit(.table) |
                 metadataSnapshotProjectionBit(.table_transition_fence) |
                 metadataSnapshotProjectionBit(.installed_extension) |
                 metadataSnapshotProjectionBit(.extension_member) |
@@ -4291,7 +4335,7 @@ pub const RaftApplyStore = struct {
                 };
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
             },
-            .apply_extension_lifecycle => |delta| {
+            .apply_extension_lifecycle, .apply_extension_lifecycle_v2 => |delta| {
                 try self.applyExtensionLifecycleDeltaTxn(txn, group_id, delta);
             },
         }
@@ -6133,6 +6177,7 @@ const TransitionTag = enum(u8) {
     claim_replication_source_cutover = 48,
     complete_replication_source_retirement = 49,
     apply_table_topology = 50,
+    apply_extension_lifecycle_v2 = 51,
 };
 
 pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionCommand) ![]u8 {
@@ -6396,7 +6441,13 @@ pub fn encodeTransitionCommand(alloc: std.mem.Allocator, command: TransitionComm
             try appendRequiredString(alloc, &out, record.package_name);
         },
         .apply_extension_lifecycle => |delta| {
+            if (delta.expected_tables.len != 0)
+                return error.ExtensionLifecycleV2Required;
             try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle));
+            try appendJsonRecord(alloc, &out, extensionLifecycleDeltaV1(delta));
+        },
+        .apply_extension_lifecycle_v2 => |delta| {
+            try out.append(alloc, @intFromEnum(TransitionTag.apply_extension_lifecycle_v2));
             try appendJsonRecord(alloc, &out, delta);
         },
         .upsert_restore_job => |record| {
@@ -6739,7 +6790,12 @@ pub fn decodeTransitionCommand(alloc: std.mem.Allocator, encoded: []const u8) !?
             },
         },
         .apply_extension_lifecycle => .{
-            .apply_extension_lifecycle = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
+            .apply_extension_lifecycle = extensionLifecycleDeltaFromV1(
+                try readJsonRecord(ExtensionLifecycleDeltaV1, alloc, encoded, &pos),
+            ),
+        },
+        .apply_extension_lifecycle_v2 => .{
+            .apply_extension_lifecycle_v2 = try readJsonRecord(ExtensionLifecycleDelta, alloc, encoded, &pos),
         },
         .upsert_restore_job => .{
             .upsert_restore_job = .{
@@ -8508,6 +8564,31 @@ fn appendJsonRecord(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), 
     const json = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(record, .{})});
     defer alloc.free(json);
     try appendRequiredString(alloc, out, json);
+}
+
+fn extensionLifecycleDeltaV1(delta: ExtensionLifecycleDelta) ExtensionLifecycleDeltaV1 {
+    return .{
+        .upsert_tables = delta.upsert_tables,
+        .upsert_installed_extensions = delta.upsert_installed_extensions,
+        .remove_installed_extensions = delta.remove_installed_extensions,
+        .upsert_extension_members = delta.upsert_extension_members,
+        .remove_extension_members = delta.remove_extension_members,
+        .upsert_extension_dependencies = delta.upsert_extension_dependencies,
+        .remove_extension_dependencies = delta.remove_extension_dependencies,
+    };
+}
+
+fn extensionLifecycleDeltaFromV1(delta: ExtensionLifecycleDeltaV1) ExtensionLifecycleDelta {
+    return .{
+        .expected_tables = &.{},
+        .upsert_tables = delta.upsert_tables,
+        .upsert_installed_extensions = delta.upsert_installed_extensions,
+        .remove_installed_extensions = delta.remove_installed_extensions,
+        .upsert_extension_members = delta.upsert_extension_members,
+        .remove_extension_members = delta.remove_extension_members,
+        .upsert_extension_dependencies = delta.upsert_extension_dependencies,
+        .remove_extension_dependencies = delta.remove_extension_dependencies,
+    };
 }
 
 fn deinitExtensionJsonRecord(comptime T: type, alloc: std.mem.Allocator, value: *T) void {
@@ -12033,14 +12114,14 @@ test "metadata reallocation request decoder accepts the legacy unfenced record" 
     try std.testing.expect(record.metadata_incarnation == null);
 }
 
-test "metadata extension lifecycle transition command round-trips" {
+test "metadata extension lifecycle v2 transition command round-trips table CAS" {
     const original_table = metadata.TableRecord{
         .table_id = 7,
         .name = "memories",
         .indexes_json = "{}",
     };
     const command: TransitionCommand = .{
-        .apply_extension_lifecycle = .{
+        .apply_extension_lifecycle_v2 = .{
             .expected_tables = &.{.{
                 .table_id = original_table.table_id,
                 .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(original_table),
@@ -12092,8 +12173,8 @@ test "metadata extension lifecycle transition command round-trips" {
     defer if (decoded) |*d| d.deinit(std.testing.allocator);
 
     try std.testing.expect(decoded != null);
-    try std.testing.expect(decoded.? == .apply_extension_lifecycle);
-    const delta = decoded.?.apply_extension_lifecycle;
+    try std.testing.expect(decoded.? == .apply_extension_lifecycle_v2);
+    const delta = decoded.?.apply_extension_lifecycle_v2;
     try std.testing.expectEqual(@as(usize, 1), delta.expected_tables.len);
     try std.testing.expectEqual(original_table.table_id, delta.expected_tables[0].table_id);
     try std.testing.expectEqualSlices(
@@ -12114,6 +12195,48 @@ test "metadata extension lifecycle transition command round-trips" {
     try std.testing.expectEqual(@as(usize, 1), delta.upsert_extension_dependencies.len);
     try std.testing.expectEqualStrings("antfly_core", delta.upsert_extension_dependencies[0].package_name);
     try std.testing.expectEqual(@as(usize, 1), delta.remove_extension_dependencies.len);
+}
+
+test "metadata extension lifecycle v1 preserves predecessor wire shape" {
+    const table = metadata.TableRecord{ .table_id = 7, .name = "memories" };
+    const legacy = try encodeTransitionCommand(std.testing.allocator, .{
+        .apply_extension_lifecycle = .{ .upsert_tables = &.{table} },
+    });
+    defer std.testing.allocator.free(legacy);
+    try std.testing.expect(std.mem.indexOf(u8, legacy, "expected_tables") == null);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, legacy)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expect(decoded == .apply_extension_lifecycle);
+    try std.testing.expectEqual(@as(usize, 0), decoded.apply_extension_lifecycle.expected_tables.len);
+
+    try std.testing.expectError(error.ExtensionLifecycleV2Required, encodeTransitionCommand(
+        std.testing.allocator,
+        .{ .apply_extension_lifecycle = .{
+            .expected_tables = &.{.{
+                .table_id = table.table_id,
+                .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(table),
+            }},
+            .upsert_tables = &.{table},
+        } },
+    ));
+}
+
+test "metadata extension lifecycle v2 requires a one-to-one table CAS contract" {
+    const table_a = metadata.TableRecord{ .table_id = 7, .name = "memories" };
+    const duplicate_a = metadata.TableRecord{ .table_id = 7, .name = "memories_v2" };
+    const table_b = metadata.TableRecord{ .table_id = 8, .name = "events" };
+    try std.testing.expectError(
+        error.InvalidExtensionLifecyclePreconditions,
+        validateTransitionCommandDataGroupIds(.{ .apply_extension_lifecycle_v2 = .{
+            .expected_tables = &.{
+                .{ .table_id = 7, .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(table_a) },
+                .{ .table_id = 8, .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(table_b) },
+            },
+            .upsert_tables = &.{ table_a, duplicate_a },
+        } }),
+    );
 }
 
 test "metadata extension lifecycle table precondition prevents stale replacement and partial rows" {
@@ -12152,7 +12275,7 @@ test "metadata extension lifecycle table precondition prevents stale replacement
     defer std.testing.allocator.free(seed);
     const concurrent_update = try encodeTransitionCommand(std.testing.allocator, .{ .upsert_table = concurrent });
     defer std.testing.allocator.free(concurrent_update);
-    const lifecycle = try encodeTransitionCommand(std.testing.allocator, .{ .apply_extension_lifecycle = stale_delta });
+    const lifecycle = try encodeTransitionCommand(std.testing.allocator, .{ .apply_extension_lifecycle_v2 = stale_delta });
     defer std.testing.allocator.free(lifecycle);
     const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
         .{ .term = 1, .index = 1, .entry_type = .normal, .data = seed },

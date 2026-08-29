@@ -65,6 +65,14 @@ fn unlockTableWorkflowMutation(svc: anytype, table_name: []const u8, locked: boo
     svc.unlockTableWorkflowMutation(table_name);
 }
 
+fn lockCatalogMutation(svc: anytype) void {
+    svc.lockCatalogMutation();
+}
+
+fn unlockCatalogMutation(svc: anytype) void {
+    svc.unlockCatalogMutation();
+}
+
 fn verifyCompatibleTableDropProjection(
     svc: anytype,
     alloc: std.mem.Allocator,
@@ -116,8 +124,6 @@ fn createCompatible(
 
     const lane_locked = lockTableWorkflowMutation(svc, table_name);
     defer unlockTableWorkflowMutation(svc, table_name, lane_locked);
-    try request.ensureActive();
-    try svc.ensureLinearizableReadWithContext(request);
     const table = tables_api.deriveTableRecord(table_name, normalized_req);
     // Generation-salted identities require the atomic drop's durable fence.
     // Retain the predecessor identity derivation throughout decoder-only
@@ -130,7 +136,16 @@ fn createCompatible(
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
-    _ = workflow.createTableWithRanges(svc, table, ranges) catch |err| {
+    // Lease acquisition may drive Raft and perform disk/network work. Complete
+    // it before taking the exclusive catalog lane, then keep the exact
+    // projection refresh, desired mutation, reconcile plan, and verification
+    // in one critical section.
+    try workflow.ensureCatalogMutationReady(svc);
+    lockCatalogMutation(svc);
+    defer unlockCatalogMutation(svc);
+    try request.ensureActive();
+    try svc.ensureLinearizableReadWithContext(request);
+    _ = workflow.createTableWithRangesCatalogLocked(svc, table, ranges) catch |err| {
         svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
         svc.verifyTableCreateProjection(alloc, table, ranges) catch |verify_err| switch (verify_err) {
             error.TableAlreadyExists => return verify_err,
@@ -239,14 +254,18 @@ fn dropCompatible(
 ) !DropResult {
     const lane_locked = lockTableWorkflowMutation(svc, table_name);
     defer unlockTableWorkflowMutation(svc, table_name, lane_locked);
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    try workflow.ensureCatalogMutationReady(svc);
+    lockCatalogMutation(svc);
+    defer unlockCatalogMutation(svc);
     try request.ensureActive();
     try svc.ensureLinearizableReadWithContext(request);
     var admission = try svc.captureTableDropAdmission(alloc, table_name);
     defer admission.deinit(alloc);
 
-    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
-    defer workflow.deinit();
-    if (workflow.dropTable(svc, admission.table_id)) |_| {} else |err| {
+    if (workflow.dropTableCatalogLocked(svc, admission.table_id)) |_| {} else |err| {
         svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
         verifyCompatibleTableDropProjection(
             svc,

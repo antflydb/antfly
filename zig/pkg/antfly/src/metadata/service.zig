@@ -3494,6 +3494,20 @@ pub const MetadataService = struct {
         return error.ReconcileLeaseNotHeld;
     }
 
+    /// Establish the replicated reconciliation lease before a synchronous
+    /// catalog workflow takes the exclusive catalog lock. The workflow then
+    /// refreshes and mutates desired state under that lock and uses the
+    /// lock-free prepared reconciliation primitive, avoiding both stale
+    /// whole-catalog plans and recursive lock acquisition.
+    pub fn ensureCatalogWorkflowLease(self: *MetadataService) !void {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            if (try self.ensureReconcileLease()) return;
+            try self.runRound();
+        }
+        return error.ReconcileLeaseNotHeld;
+    }
+
     /// Acquire or renew the reconcile lease without refreshing the control
     /// loop's prepared desired state. This is required after a transition
     /// observation has already been folded into that state: retrying through
@@ -6295,6 +6309,15 @@ pub const MetadataHttpService = struct {
         return error.ReconcileLeaseNotHeld;
     }
 
+    pub fn ensureCatalogWorkflowLease(self: *MetadataHttpService) !void {
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            if (try self.ensureReconcileLease()) return;
+            try self.runRound();
+        }
+        return error.ReconcileLeaseNotHeld;
+    }
+
     /// HTTP-backed counterpart of MetadataService's prepared-state lease
     /// acquisition. The prepared state remains stable while Raft publishes a
     /// lease renewal.
@@ -6403,6 +6426,8 @@ pub const MetadataHttpService = struct {
             .metadata_group_id = self.metadata_group_id,
             .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
             .table_topology_protocol_version = metadata_topology_protocol.current_version,
+            .atomic_table_topology_writer_enabled = metadata_topology_protocol.atomic_table_topology_rollout == .enabled,
+            .extension_lifecycle_table_cas_writer_enabled = metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .enabled,
             .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version,
             .metadata_epoch = self.lifecycle_signal.currentEpoch(),
             .metrics = self.metrics(),
@@ -11527,6 +11552,8 @@ pub fn snapshotStatusWithOptions(
         .metadata_group_id = metadata_group_id,
         .reallocation_barrier_protocol_version = metadata_reallocation_request.barrier_protocol_version,
         .table_topology_protocol_version = metadata_topology_protocol.current_version,
+        .atomic_table_topology_writer_enabled = metadata_topology_protocol.atomic_table_topology_rollout == .enabled,
+        .extension_lifecycle_table_cas_writer_enabled = metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .enabled,
         .runtime_status_record_version = metadata_runtime_status_protocol.current_record_version,
         .metadata_incarnation = metadata_incarnation,
         .metadata_raft_local_node_id = metadata_raft.local_node_id,

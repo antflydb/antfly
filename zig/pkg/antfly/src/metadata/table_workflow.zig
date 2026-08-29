@@ -66,12 +66,32 @@ pub const TableWorkflow = struct {
         table: table_manager.TableRecord,
         initial_ranges: []const table_manager.RangeRecord,
     ) !control_loop.ReconcileSummary {
+        try self.ensureCatalogMutationReady(service);
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
+        return try self.createTableWithRangesCatalogLocked(service, table, initial_ranges);
+    }
+
+    /// Apply a table create while the caller owns the exclusive catalog lane.
+    /// The caller may include admission and exact postcondition verification in
+    /// the same critical section, which is required by decoder-only DDL.
+    pub fn createTableWithRangesCatalogLocked(
+        self: *TableWorkflow,
+        service: anytype,
+        table: table_manager.TableRecord,
+        initial_ranges: []const table_manager.RangeRecord,
+    ) !control_loop.ReconcileSummary {
         try self.bootstrapDesiredFromCommitted(service);
         try self.loop.stateRef().tableManager().upsertTable(table);
         for (initial_ranges) |initial_range| {
             try self.loop.stateRef().tableManager().upsertRange(initial_range);
         }
-        return try reconcileForService(&self.loop, service);
+        return try self.loop.reconcilePreparedCatalogLocked(service);
+    }
+
+    pub fn ensureCatalogMutationReady(self: *TableWorkflow, service: anytype) !void {
+        _ = self;
+        try ensureCatalogWorkflowLease(service);
     }
 
     pub fn requestSplit(
@@ -79,12 +99,15 @@ pub const TableWorkflow = struct {
         service: anytype,
         intent: table_manager.SplitIntent,
     ) !control_loop.ReconcileSummary {
+        try ensureCatalogWorkflowLease(service);
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
         try self.bootstrapDesiredFromCommitted(service);
         var current = try self.loop.stateRef().captureCurrent(service);
         defer current.deinit(self.loop.alloc);
         try validateSplitIntentDocIdentity(current.current, intent);
         try self.loop.stateRef().tableManager().requestSplit(intent);
-        return try reconcileForService(&self.loop, service);
+        return try self.loop.reconcilePreparedCatalogLocked(service);
     }
 
     pub fn requestMerge(
@@ -92,6 +115,9 @@ pub const TableWorkflow = struct {
         service: anytype,
         intent: table_manager.MergeIntent,
     ) !control_loop.ReconcileSummary {
+        try ensureCatalogWorkflowLease(service);
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
         try self.bootstrapDesiredFromCommitted(service);
         var current = try self.loop.stateRef().captureCurrent(service);
         defer current.deinit(self.loop.alloc);
@@ -105,7 +131,7 @@ pub const TableWorkflow = struct {
             requires_reassignment,
         );
         try self.loop.stateRef().tableManager().requestMerge(normalized_intent);
-        return try reconcileForService(&self.loop, service);
+        return try self.loop.reconcilePreparedCatalogLocked(service);
     }
 
     pub fn addRange(
@@ -113,9 +139,12 @@ pub const TableWorkflow = struct {
         service: anytype,
         record: table_manager.RangeRecord,
     ) !control_loop.ReconcileSummary {
+        try ensureCatalogWorkflowLease(service);
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
         try self.bootstrapDesiredFromCommitted(service);
         try self.loop.stateRef().tableManager().upsertRange(record);
-        return try reconcileForService(&self.loop, service);
+        return try self.loop.reconcilePreparedCatalogLocked(service);
     }
 
     pub fn dropTable(
@@ -123,9 +152,20 @@ pub const TableWorkflow = struct {
         service: anytype,
         table_id: u64,
     ) !control_loop.ReconcileSummary {
+        try self.ensureCatalogMutationReady(service);
+        const catalog_locked = lockCatalogMutation(service);
+        defer unlockCatalogMutation(service, catalog_locked);
+        return try self.dropTableCatalogLocked(service, table_id);
+    }
+
+    pub fn dropTableCatalogLocked(
+        self: *TableWorkflow,
+        service: anytype,
+        table_id: u64,
+    ) !control_loop.ReconcileSummary {
         try self.bootstrapDesiredFromCommitted(service);
         _ = self.loop.stateRef().tableManager().removeTableTopology(table_id);
-        return try reconcileForService(&self.loop, service);
+        return try self.loop.reconcilePreparedCatalogLocked(service);
     }
 
     pub fn planLocalPlacementIntents(
@@ -211,19 +251,36 @@ fn listProjectedPlacementVersionFences(
 
 const PlacementVersionFenceKey = struct { group_id: u64, local_node_id: u64 };
 
-fn reconcileForService(loop: *control_loop.MetadataControlLoop, service: anytype) !control_loop.ReconcileSummary {
+fn ensureCatalogWorkflowLease(service: anytype) !void {
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
         else => ServiceType,
     };
-    if (@hasDecl(ServiceDeclType, "reconcileOnceEnsuringLease")) {
-        return try service.reconcileOnceEnsuringLease(loop);
-    }
-    if (@hasDecl(ServiceDeclType, "reconcileOnceIfLeaseHeld")) {
-        return (try service.reconcileOnceIfLeaseHeld(loop)) orelse error.ReconcileLeaseNotHeld;
-    }
-    return try loop.reconcileOnce(service);
+    if (@hasDecl(ServiceDeclType, "ensureCatalogWorkflowLease"))
+        try service.ensureCatalogWorkflowLease();
+}
+
+fn lockCatalogMutation(service: anytype) bool {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (!@hasDecl(ServiceDeclType, "lockCatalogMutation")) return false;
+    service.lockCatalogMutation();
+    return true;
+}
+
+fn unlockCatalogMutation(service: anytype, locked: bool) void {
+    if (!locked) return;
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    if (@hasDecl(ServiceDeclType, "unlockCatalogMutation"))
+        service.unlockCatalogMutation();
 }
 
 fn validateSplitIntentDocIdentity(current: metadata_reconciler.CurrentMetadataState, intent: table_manager.SplitIntent) !void {
@@ -534,8 +591,26 @@ test "table workflow can build desired topology through the control loop seam" {
     const FakeService = struct {
         table_upserts: usize = 0,
         range_upserts: usize = 0,
+        lease_checks: usize = 0,
+        catalog_locked: bool = false,
 
-        pub fn listProjectedTables(_: *@This(), alloc: std.mem.Allocator) ![]table_manager.TableRecord {
+        pub fn ensureCatalogWorkflowLease(self: *@This()) !void {
+            std.debug.assert(!self.catalog_locked);
+            self.lease_checks += 1;
+        }
+
+        pub fn lockCatalogMutation(self: *@This()) void {
+            std.debug.assert(!self.catalog_locked);
+            self.catalog_locked = true;
+        }
+
+        pub fn unlockCatalogMutation(self: *@This()) void {
+            std.debug.assert(self.catalog_locked);
+            self.catalog_locked = false;
+        }
+
+        pub fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]table_manager.TableRecord {
+            std.debug.assert(self.catalog_locked);
             return try alloc.alloc(table_manager.TableRecord, 0);
         }
 
@@ -543,7 +618,8 @@ test "table workflow can build desired topology through the control loop seam" {
             alloc.free(records);
         }
 
-        pub fn listProjectedRanges(_: *@This(), alloc: std.mem.Allocator) ![]table_manager.RangeRecord {
+        pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]table_manager.RangeRecord {
+            std.debug.assert(self.catalog_locked);
             return try alloc.alloc(table_manager.RangeRecord, 0);
         }
 
@@ -584,6 +660,7 @@ test "table workflow can build desired topology through the control loop seam" {
         }
 
         pub fn applyReconciliationPlan(self: *@This(), plan: *const @import("reconciler.zig").ReconciliationPlan) !void {
+            std.debug.assert(self.catalog_locked);
             self.table_upserts += plan.table_upserts.len;
             self.range_upserts += plan.range_upserts.len;
         }
@@ -609,6 +686,8 @@ test "table workflow can build desired topology through the control loop seam" {
     try std.testing.expectEqual(@as(usize, 1), summary.range_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.table_upserts);
     try std.testing.expectEqual(@as(usize, 1), fake.range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.lease_checks);
+    try std.testing.expect(!fake.catalog_locked);
 }
 
 test "table workflow create preserves existing projected topology" {

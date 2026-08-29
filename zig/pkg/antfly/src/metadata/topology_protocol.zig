@@ -19,8 +19,9 @@ const std = @import("std");
 /// with a fixed-size membership contract. Version 3 fences create against the
 /// replicated transition generation so recreated tables receive fresh data
 /// group identities and stale drop cleanup cannot delete their storage.
-/// Version 4 adds compare-and-set table preconditions to extension lifecycle
-/// entries; leaders gate those entries on the same all-member capability.
+/// Version 4 decodes and enforces the distinct extension-lifecycle-v2 command
+/// carrying table compare-and-set preconditions. Writer activation remains a
+/// separate decoder-first release stage below.
 pub const current_version: u16 = 4;
 /// Minimum decoder capability required by the atomic create/drop wire format.
 /// Later, unrelated metadata features must not unnecessarily stop table DDL
@@ -36,11 +37,17 @@ pub const extension_lifecycle_table_cas_version: u16 = 4;
 /// Raft membership identity. Ship the decoder first, then change this
 /// compile-time release stage only after every supported predecessor can
 /// decode the command. There is deliberately no runtime override.
-pub const AtomicTableTopologyRollout = enum {
+pub const ReplicatedSemanticRollout = enum {
     decoder_only,
     enabled,
 };
-pub const atomic_table_topology_rollout: AtomicTableTopologyRollout = .decoder_only;
+pub const AtomicTableTopologyRollout = ReplicatedSemanticRollout;
+pub const atomic_table_topology_rollout: ReplicatedSemanticRollout = .decoder_only;
+
+/// Version 4 is decoded and enforced in this release, but its distinct v2
+/// lifecycle command is not emitted until the predecessor release understands
+/// it. A transient all-member probe cannot protect against binary rollback.
+pub const extension_lifecycle_table_cas_rollout: ReplicatedSemanticRollout = .decoder_only;
 
 /// Creating thousands of Raft groups is an operational workflow, not one
 /// catalog request. Keep one create bounded in CPU, memory, and log growth.

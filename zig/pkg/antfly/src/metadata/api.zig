@@ -43,6 +43,10 @@ pub const MetadataStatus = struct {
     reallocation_barrier_protocol_version: u16 = 0,
     /// Zero means the peer cannot decode atomic table-topology transitions.
     table_topology_protocol_version: u16 = 0,
+    /// Decoder support and writer activation are intentionally separate so
+    /// operators can verify a decoder-first rollout from `/status`.
+    atomic_table_topology_writer_enabled: bool = false,
+    extension_lifecycle_table_cas_writer_enabled: bool = false,
     /// Maximum embedded runtime-status record version this replica can apply;
     /// zero means the peer predates rolling-safe format negotiation.
     runtime_status_record_version: u16 = 0,

@@ -65,14 +65,17 @@ fn probeLifecycleProtocolReadiness(
     service: anytype,
     required: bool,
 ) !?metadata_service.TableTopologyProtocolReadiness {
+    if (metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .decoder_only)
+        return null;
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
         .pointer => |pointer| pointer.child,
         else => ServiceType,
     };
-    // Lifecycle table preconditions change replicated apply semantics. Reuse
-    // the metadata-member decoder capability barrier so a rolling upgrade can
-    // never let an older follower ignore the compare-and-set fence.
+    // Lifecycle table preconditions change replicated apply semantics. The
+    // compile-time decoder-first stage is the rollback-safety boundary; once
+    // v2 emission is enabled, this live probe additionally rejects incomplete
+    // or transitional memberships before admission.
     if (required and @hasDecl(ServiceDeclType, "ensureTableTopologyProtocolReadyWithContext"))
         return try service.ensureTableTopologyProtocolReadyWithContext(
             .{},
@@ -101,6 +104,8 @@ fn lifecycleMutationReadiness(
     readiness: ?metadata_service.TableTopologyProtocolReadiness,
 ) !?metadata_service.TableTopologyProtocolReadiness {
     if (table_precondition_count == 0) return null;
+    if (metadata_topology_protocol.extension_lifecycle_table_cas_rollout == .decoder_only)
+        return null;
     if (readiness) |ready| return ready;
     const ServiceType = @TypeOf(service);
     const ServiceDeclType = switch (@typeInfo(ServiceType)) {
@@ -112,7 +117,7 @@ fn lifecycleMutationReadiness(
     return null;
 }
 
-test "extension lifecycle protocol readiness is required only for table CAS" {
+test "extension lifecycle protocol readiness remains disabled during decoder-only rollout" {
     const LegacyService = struct {};
     const ProtocolService = struct {
         pub fn ensureTableTopologyProtocolReadyWithContext(
@@ -127,10 +132,7 @@ test "extension lifecycle protocol readiness is required only for table CAS" {
     var protocol = ProtocolService{};
     try std.testing.expect((try lifecycleMutationReadiness(&protocol, 0, null)) == null);
     try std.testing.expect((try lifecycleMutationReadiness(&legacy, 1, null)) == null);
-    try std.testing.expectError(
-        error.ExtensionLifecycleProtocolReadinessRequired,
-        lifecycleMutationReadiness(&protocol, 1, null),
-    );
+    try std.testing.expect((try lifecycleMutationReadiness(&protocol, 1, null)) == null);
 }
 
 fn captureLifecycleSnapshot(service: anytype) !metadata_api.AdminSnapshot {
@@ -252,8 +254,23 @@ fn proposeLifecycleMutation(
     // The remote probe intentionally runs outside the catalog lane. Fence its
     // term and exact membership under the lane immediately before admission.
     try validateLifecycleProtocolReadiness(service, readiness);
-    try proposeCatalogMutation(service, .{ .apply_extension_lifecycle = delta });
-    const applied = verifyLifecycleProjection(service, delta) catch
+    var emitted = delta;
+    const command: metadata_storage.TransitionCommand = switch (metadata_topology_protocol.extension_lifecycle_table_cas_rollout) {
+        .decoder_only => blk: {
+            // Tag 40 must retain its predecessor semantics and exact JSON
+            // shape. The global catalog lane supplies same-leader ordering
+            // during this release; CAS is activated only with the distinct v2
+            // tag after its decoder has shipped everywhere.
+            emitted.expected_tables = &.{};
+            break :blk .{ .apply_extension_lifecycle = emitted };
+        },
+        .enabled => if (emitted.expected_tables.len == 0)
+            .{ .apply_extension_lifecycle = emitted }
+        else
+            .{ .apply_extension_lifecycle_v2 = emitted },
+    };
+    try proposeCatalogMutation(service, command);
+    const applied = verifyLifecycleProjection(service, emitted) catch
         return error.MetadataMutationOutcomeUnknown;
     if (!applied) return error.ExtensionLifecycleConflict;
 }
@@ -364,6 +381,50 @@ test "extension lifecycle verification distinguishes conflicts from unknown outc
         error.MetadataMutationOutcomeUnknown,
         proposeLifecycleMutation(&unknown, null, .{}),
     );
+}
+
+test "extension lifecycle proposal decoder-only writer emits predecessor semantics" {
+    const FakeService = struct {
+        const Receipt = struct { term: u64, index: u64 };
+        proposed_v1: bool = false,
+        verified_without_cas: bool = false,
+
+        pub fn proposeTransitionCommandWithReceipt(
+            self: *@This(),
+            command: metadata_storage.TransitionCommand,
+        ) !Receipt {
+            try std.testing.expect(command == .apply_extension_lifecycle);
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                command.apply_extension_lifecycle.expected_tables.len,
+            );
+            self.proposed_v1 = true;
+            return .{ .term = 3, .index = 9 };
+        }
+
+        pub fn waitForTransitionApplied(_: *@This(), _: Receipt) !void {}
+
+        pub fn verifyExtensionLifecycleProjection(
+            self: *@This(),
+            delta: metadata_storage.ExtensionLifecycleDelta,
+        ) !bool {
+            try std.testing.expectEqual(@as(usize, 0), delta.expected_tables.len);
+            self.verified_without_cas = true;
+            return true;
+        }
+    };
+
+    const table = metadata_table_manager.TableRecord{ .table_id = 7, .name = "docs" };
+    var service = FakeService{};
+    try proposeLifecycleMutation(&service, null, .{
+        .expected_tables = &.{.{
+            .table_id = table.table_id,
+            .definition_fingerprint = metadata_table_manager.tableDefinitionFingerprint(table),
+        }},
+        .upsert_tables = &.{table},
+    });
+    try std.testing.expect(service.proposed_v1);
+    try std.testing.expect(service.verified_without_cas);
 }
 
 pub fn installOnService(
