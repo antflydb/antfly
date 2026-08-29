@@ -1286,11 +1286,27 @@ pub const IndexManager = struct {
     // and retry/backoff state for self-healing (retryFailedIndexLoads).
     // Keys are duped index names; err_name values are static @errorName memory.
     failed_index_loads: std.StringHashMapUnmanaged(FailedIndexLoad) = .empty,
+    /// Process-local identity allocator for quarantined catalog incarnations.
+    /// A fresh value is assigned on every insertion, including same-name,
+    /// same-config recreation, so detached work never derives identity from
+    /// mutable record contents. Zero remains reserved as "no incarnation".
+    next_failed_index_load_incarnation_id: std.atomic.Value(u64) = .init(1),
+    /// Stable resident retry ring. Every quarantined index is safe to reopen,
+    /// even when destructive reconstruction requires operator authorization.
+    /// Entries borrow the owned map keys and are updated under catalog_mutex.
+    failed_index_load_order: std.ArrayListUnmanaged([]const u8) = .empty,
+    failed_index_load_cursor: usize = 0,
+    /// Action-partitioned discovery rings. Automatic reconstruction never
+    /// spends its bounded inspection budget walking retry-only or manual debt,
+    /// while exact queue lengths make wake/terminal classification O(1).
+    failed_index_load_action_queues: [std.meta.fields(IndexLoadRecoveryAction).len]FailedIndexLoadActionQueue =
+        [_]FailedIndexLoadActionQueue{.{}} ** std.meta.fields(IndexLoadRecoveryAction).len,
     // Durable repair intents gate service independently of load failures. A
     // replacement may load successfully after pointer activation while its
     // intent is still in activating/validating; queries must remain closed
     // until DB validation publishes a clean checkpoint.
-    repair_unavailable_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    repair_unavailable_indexes: std.StringHashMapUnmanaged(RepairAdmissionSlot) = .empty,
+    next_repair_admission_epoch: u64 = 1,
     // Primary-store admission markers captured once before catalog open. The
     // immutable snapshot makes full-text backfill suppression O(1) per index
     // and lets every open mode install the same fail-closed service gate.
@@ -1299,17 +1315,124 @@ pub const IndexManager = struct {
     index_load_states: std.StringHashMapUnmanaged(IndexLoadState) = .empty,
 
     pub const FailedIndexLoad = struct {
+        incarnation_id: u64,
         err_name: []const u8,
+        config: types.IndexConfig,
+        /// Stable identity component cached at quarantine creation. Keeping
+        /// this in the resident record makes every catalog-locked identity
+        /// check O(1), independent of config JSON size.
+        config_hash: u64,
+        action: IndexLoadRecoveryAction,
+        retry_queue_position: usize,
+        action_queue_position: usize,
+        revision: u64 = 1,
+        /// The action-queue epoch in which this exact failure incarnation was
+        /// successfully classified by automatic recovery. Epoch changes make
+        /// this marker stale without an O(queue length) reset pass.
+        classified_discovery_epoch: u64 = 0,
+        /// Durable repair identity which exclusively owns this resident
+        /// incarnation. A repair may reacquire its own claim after restart;
+        /// another repair may neither adopt nor release it.
+        repair_claim_owner_id: u128 = 0,
         retry_attempts: u32 = 0,
         // Monotonic deadline before which retryFailedIndexLoads skips this
         // index. 0 = due immediately (first retry happens on the next tick).
         next_retry_ns: u64 = 0,
     };
 
+    const FailedIndexLoadActionQueue = struct {
+        order: std.ArrayListUnmanaged([]const u8) = .empty,
+        discovery_cursor: usize = 0,
+        discovery_epoch: u64 = 1,
+        unclassified_count: usize = 0,
+
+        fn invalidateDiscovery(self: *@This()) void {
+            self.discovery_epoch +%= 1;
+            if (self.discovery_epoch == 0) self.discovery_epoch = 1;
+            self.unclassified_count = self.order.items.len;
+            // Epoch invalidation revokes completeness, not fairness. Keeping
+            // the rotating cursor prevents a churning early entry from
+            // starving later failures. swapRemove/append remain safe because
+            // a full rotation from any normalized position visits every
+            // member of the new epoch exactly once.
+            if (self.order.items.len == 0) {
+                self.discovery_cursor = 0;
+            } else {
+                self.discovery_cursor %= self.order.items.len;
+            }
+        }
+    };
+
     const IndexLoadState = enum {
         loading,
         complete,
     };
+
+    /// Process-local projection of repair admission. Durable transitions use
+    /// `control_revision`; `provisional_fences` closes admission before the
+    /// checkpoint CAS so allocation or callback failure after commit cannot
+    /// expose an unsafe generation. Legacy structural admission remains an
+    /// independent bit because it is authorized by a primary-store marker,
+    /// not an index-repair revision.
+    const RepairAdmissionSlot = struct {
+        repair_id: u128 = 0,
+        config_hash: u64 = 0,
+        root_generation: u64 = 0,
+        control_revision: u64 = 0,
+        durable_revision: u64 = 0,
+        durable_blocked: bool = false,
+        legacy_blocked: bool = false,
+        runtime_serviceable: bool = false,
+        provisional_fences: u32 = 0,
+
+        fn blocked(self: @This()) bool {
+            return self.legacy_blocked or self.provisional_fences != 0 or
+                (self.durable_blocked and !self.runtime_serviceable);
+        }
+
+        fn retained(self: @This()) bool {
+            return self.durable_blocked or self.legacy_blocked or self.provisional_fences != 0;
+        }
+    };
+
+    pub const RepairAdmissionFence = struct {
+        epoch: u64,
+        active: bool = true,
+    };
+
+    pub const RepairAdmissionVersion = struct {
+        repair_id: u128,
+        /// Checkpoint-wide durable order. This is authoritative for committed
+        /// publication ordering; process-local fence epochs only reserve the
+        /// fail-closed interval before the commit exists.
+        control_revision: u64,
+        revision: u64,
+        config_hash: u64,
+        root_generation: u64,
+
+        fn matchesSlot(self: @This(), slot: RepairAdmissionSlot) bool {
+            return self.repair_id == slot.repair_id and
+                self.config_hash == slot.config_hash and
+                self.root_generation == slot.root_generation;
+        }
+
+        fn supersedesSlot(self: @This(), slot: RepairAdmissionSlot) bool {
+            if (self.root_generation != slot.root_generation) {
+                return self.root_generation > slot.root_generation;
+            }
+            if (self.control_revision != slot.control_revision) {
+                return self.control_revision > slot.control_revision;
+            }
+            return self.matchesSlot(slot) and self.revision >= slot.durable_revision;
+        }
+    };
+
+    fn allocateRepairAdmissionEpochUnlocked(self: *IndexManager) u64 {
+        const epoch = self.next_repair_admission_epoch;
+        self.next_repair_admission_epoch +%= 1;
+        if (self.next_repair_admission_epoch == 0) self.next_repair_admission_epoch = 1;
+        return epoch;
+    }
 
     const TextMergeDeletionDelta = struct {
         bitmap: roaring.RoaringBitmap,
@@ -2993,6 +3116,8 @@ pub const IndexManager = struct {
         self.clearStatusOnlyIndexConfigs();
         self.clearFailedIndexLoads();
         self.failed_index_loads.deinit(self.alloc);
+        self.failed_index_load_order.deinit(self.alloc);
+        for (&self.failed_index_load_action_queues) |*queue| queue.order.deinit(self.alloc);
         self.clearRepairUnavailableIndexes();
         self.repair_unavailable_indexes.deinit(self.alloc);
         self.clearManagedAdmissionSnapshot();
@@ -3022,17 +3147,101 @@ pub const IndexManager = struct {
         self.status_only_index_configs = &.{};
     }
 
-    /// Load error recorded for `name` during the last catalog load, or null
-    /// if the index loaded normally (or is not configured).
-    pub fn loadFailure(self: *const IndexManager, name: []const u8) ?[]const u8 {
-        return (self.failed_index_loads.get(name) orelse return null).err_name;
-    }
-
     pub const IndexLoadRecoveryAction = enum {
         retry_open,
         rebuild_from_artifacts,
         manual_intervention,
     };
+
+    /// Process-local identity for one exact quarantined incarnation. Durable
+    /// repair identity remains config/root/control based; incarnation plus
+    /// revision prevents resident retry and repair actors from acting on stale
+    /// state even when a same-name replacement has identical contents.
+    pub const FailedIndexLoadToken = struct {
+        incarnation_id: u64,
+        revision: u64,
+        action: IndexLoadRecoveryAction,
+        config_hash: u64,
+
+        pub fn eql(a: @This(), b: @This()) bool {
+            return a.incarnation_id == b.incarnation_id and
+                a.revision == b.revision and
+                a.action == b.action and
+                a.config_hash == b.config_hash;
+        }
+    };
+
+    /// Structured identity drift lets callers choose a stable, safety-first
+    /// user-visible reason without discarding simultaneous changes.
+    pub const FailedIndexLoadMismatch = packed struct {
+        incarnation_changed: bool = false,
+        config_changed: bool = false,
+        action_changed: bool = false,
+        revision_changed: bool = false,
+
+        pub fn any(self: @This()) bool {
+            return self.incarnation_changed or self.config_changed or
+                self.action_changed or self.revision_changed;
+        }
+    };
+
+    pub fn compareFailedIndexLoadTokens(
+        expected: FailedIndexLoadToken,
+        current: FailedIndexLoadToken,
+    ) FailedIndexLoadMismatch {
+        return .{
+            .incarnation_changed = expected.incarnation_id != current.incarnation_id,
+            .config_changed = expected.config_hash != current.config_hash,
+            .action_changed = expected.action != current.action,
+            .revision_changed = expected.revision != current.revision,
+        };
+    }
+
+    /// Value-only, catalog-consistent observation. `err_name` is static
+    /// @errorName storage; no map-owned key/config pointer escapes the lock.
+    pub const FailedIndexLoadSnapshot = struct {
+        token: FailedIndexLoadToken,
+        err_name: []const u8,
+        retry_attempts: u32,
+        next_retry_ns: u64,
+        claim_owner_repair_id: ?u128,
+    };
+
+    fn failedIndexLoadSnapshotNoLock(failure: FailedIndexLoad) FailedIndexLoadSnapshot {
+        return .{
+            .token = .{
+                .incarnation_id = failure.incarnation_id,
+                .revision = failure.revision,
+                .action = failure.action,
+                .config_hash = failure.config_hash,
+            },
+            .err_name = failure.err_name,
+            .retry_attempts = failure.retry_attempts,
+            .next_retry_ns = failure.next_retry_ns,
+            .claim_owner_repair_id = if (failure.repair_claim_owner_id == 0)
+                null
+            else
+                failure.repair_claim_owner_id,
+        };
+    }
+
+    fn failedIndexLoadMatchesToken(failure: FailedIndexLoad, token: FailedIndexLoadToken) bool {
+        return failedIndexLoadSnapshotNoLock(failure).token.eql(token);
+    }
+
+    /// Coherent public read of one quarantined incarnation.
+    pub fn failedIndexLoadSnapshot(self: *IndexManager, name: []const u8) ?FailedIndexLoadSnapshot {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return failedIndexLoadSnapshotNoLock(self.failed_index_loads.get(name) orelse return null);
+    }
+
+    /// Compatibility projection for status/error callers. New control-flow
+    /// code should use failedIndexLoadSnapshot so policy and identity cannot
+    /// be observed from different incarnations.
+    pub fn loadFailure(self: *IndexManager, name: []const u8) ?[]const u8 {
+        return (self.failedIndexLoadSnapshot(name) orelse return null).err_name;
+    }
 
     /// Classifies policy, not corruption severity. Keep the destructive
     /// automatic-rebuild allowlist deliberately narrow: an unknown load error
@@ -3047,13 +3256,338 @@ pub const IndexManager = struct {
         return .manual_intervention;
     }
 
-    pub fn recoveryActionForIndex(self: *const IndexManager, name: []const u8) ?IndexLoadRecoveryAction {
-        const err_name = self.loadFailure(name) orelse return null;
-        return loadFailureRecoveryAction(err_name);
+    fn loadFailureRecoveryActionForConfig(cfg: types.IndexConfig, err_name: []const u8) IndexLoadRecoveryAction {
+        const action = loadFailureRecoveryAction(err_name);
+        // IncompleteBulkPublish currently authorizes reconstruction only for
+        // the HBC dense implementation. Keep the queue classification as
+        // narrow as the execution allowlist so an unfamiliar future producer
+        // cannot create an endlessly runnable automatic-repair entry.
+        if (action == .rebuild_from_artifacts and cfg.kind != .dense_vector) {
+            return .manual_intervention;
+        }
+        return action;
     }
 
-    pub fn hasLoadFailures(self: *const IndexManager) bool {
+    fn failedIndexLoadActionQueue(self: *IndexManager, action: IndexLoadRecoveryAction) *FailedIndexLoadActionQueue {
+        return &self.failed_index_load_action_queues[@intFromEnum(action)];
+    }
+
+    fn failedIndexLoadActionQueueConst(self: *const IndexManager, action: IndexLoadRecoveryAction) *const FailedIndexLoadActionQueue {
+        return &self.failed_index_load_action_queues[@intFromEnum(action)];
+    }
+
+    pub fn hasLoadFailures(self: *IndexManager) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
         return self.failed_index_loads.count() > 0;
+    }
+
+    pub const FailedIndexLoadSummary = struct {
+        total: usize = 0,
+        retry_open: usize = 0,
+        rebuild_from_artifacts: usize = 0,
+        manual_intervention: usize = 0,
+
+        pub fn count(self: @This(), action: IndexLoadRecoveryAction) usize {
+            return switch (action) {
+                .retry_open => self.retry_open,
+                .rebuild_from_artifacts => self.rebuild_from_artifacts,
+                .manual_intervention => self.manual_intervention,
+            };
+        }
+    };
+
+    /// Exact O(1) quarantine aggregate used for owner wake and user-visible
+    /// terminal classification. Queue membership is updated atomically with
+    /// the failed-load map under catalog_mutex.
+    pub fn failedIndexLoadSummary(self: *IndexManager) FailedIndexLoadSummary {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return .{
+            .total = self.failed_index_loads.count(),
+            .retry_open = self.failedIndexLoadActionQueueConst(.retry_open).order.items.len,
+            .rebuild_from_artifacts = self.failedIndexLoadActionQueueConst(.rebuild_from_artifacts).order.items.len,
+            .manual_intervention = self.failedIndexLoadActionQueueConst(.manual_intervention).order.items.len,
+        };
+    }
+
+    pub const FailedIndexLoadRecoveryCandidate = struct {
+        config: types.IndexConfig,
+        token: FailedIndexLoadToken,
+        /// Set by the detached classifier only after this candidate has been
+        /// durably classified as pending or terminal for its exact identity.
+        classified: bool = false,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            self.config.deinit(alloc);
+            self.* = undefined;
+        }
+    };
+
+    pub const FailedIndexLoadRecoveryQuantum = struct {
+        candidates: []FailedIndexLoadRecoveryCandidate,
+        action_total: usize,
+        queue_epoch: u64,
+        sweep_complete: bool,
+
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
+            for (self.candidates) |*candidate| candidate.deinit(alloc);
+            alloc.free(self.candidates);
+            self.* = undefined;
+        }
+    };
+
+    /// Returns a rotating, bounded snapshot of unclassified incarnations for
+    /// one recovery policy. Separate action rings prevent manual/retry debt
+    /// from hiding automatic rebuilds. Selection never counts as completion:
+    /// detached callers must acknowledge exact candidates after classification.
+    pub fn failedIndexLoadRecoveryCandidates(
+        self: *IndexManager,
+        alloc: Allocator,
+        action: IndexLoadRecoveryAction,
+        limit: usize,
+    ) !FailedIndexLoadRecoveryQuantum {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const queue = self.failedIndexLoadActionQueue(action);
+        const action_total = queue.order.items.len;
+        if (limit == 0 or action_total == 0 or queue.unclassified_count == 0) return .{
+            .candidates = try alloc.alloc(FailedIndexLoadRecoveryCandidate, 0),
+            .action_total = action_total,
+            .queue_epoch = queue.discovery_epoch,
+            .sweep_complete = queue.unclassified_count == 0,
+        };
+        var out = std.ArrayListUnmanaged(FailedIndexLoadRecoveryCandidate).empty;
+        errdefer {
+            for (out.items) |*candidate| candidate.deinit(alloc);
+            out.deinit(alloc);
+        }
+        const inspection_budget = @min(limit, action_total);
+        try out.ensureTotalCapacity(alloc, inspection_budget);
+        var inspected: usize = 0;
+        while (inspected < inspection_budget) : (inspected += 1) {
+            const position = queue.discovery_cursor % queue.order.items.len;
+            const name = queue.order.items[position];
+            const failure = self.failed_index_loads.get(name) orelse unreachable;
+            queue.discovery_cursor = (position + 1) % queue.order.items.len;
+            if (failure.classified_discovery_epoch == queue.discovery_epoch) continue;
+            out.appendAssumeCapacity(.{
+                .config = try types.IndexConfig.clone(alloc, failure.config),
+                .token = failedIndexLoadSnapshotNoLock(failure).token,
+            });
+        }
+        return .{
+            .candidates = try out.toOwnedSlice(alloc),
+            .action_total = action_total,
+            .queue_epoch = queue.discovery_epoch,
+            .sweep_complete = false,
+        };
+    }
+
+    pub const FailedIndexLoadRecoveryQueueState = struct {
+        action_total: usize,
+        queue_epoch: u64,
+        sweep_complete: bool,
+    };
+
+    fn failedIndexLoadRecoveryQueueStateNoLock(
+        self: *const IndexManager,
+        action: IndexLoadRecoveryAction,
+    ) FailedIndexLoadRecoveryQueueState {
+        const queue = self.failedIndexLoadActionQueueConst(action);
+        return .{
+            .action_total = queue.order.items.len,
+            .queue_epoch = queue.discovery_epoch,
+            .sweep_complete = queue.unclassified_count == 0,
+        };
+    }
+
+    pub fn failedIndexLoadRecoveryQueueState(
+        self: *IndexManager,
+        action: IndexLoadRecoveryAction,
+    ) FailedIndexLoadRecoveryQueueState {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        return self.failedIndexLoadRecoveryQueueStateNoLock(action);
+    }
+
+    /// Acknowledge successfully classified exact incarnations from one
+    /// detached quantum. A queue mutation changes the epoch and rejects every
+    /// stale acknowledgement. Concurrent or out-of-order quanta are safe:
+    /// each current entry decrements the epoch ledger at most once.
+    pub fn finishFailedIndexLoadRecoveryQuantum(
+        self: *IndexManager,
+        action: IndexLoadRecoveryAction,
+        queue_epoch: u64,
+        candidates: []const FailedIndexLoadRecoveryCandidate,
+    ) FailedIndexLoadRecoveryQueueState {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const queue = self.failedIndexLoadActionQueue(action);
+        if (queue.discovery_epoch == queue_epoch) {
+            for (candidates) |candidate| {
+                if (!candidate.classified or candidate.token.action != action) continue;
+                const failure = self.failed_index_loads.getPtr(candidate.config.name) orelse continue;
+                if (!failedIndexLoadMatchesToken(failure.*, candidate.token) or
+                    failure.classified_discovery_epoch == queue_epoch)
+                {
+                    continue;
+                }
+                std.debug.assert(queue.unclassified_count != 0);
+                failure.classified_discovery_epoch = queue_epoch;
+                queue.unclassified_count -= 1;
+            }
+        }
+        return self.failedIndexLoadRecoveryQueueStateNoLock(action);
+    }
+
+    /// Revalidate a cloned candidate immediately before durable intent
+    /// creation. Retry, drop/recreate, and error reclassification all advance
+    /// or remove this incarnation token, preventing stale snapshots from
+    /// authorizing reconstruction of a different catalog generation.
+    pub fn failedIndexLoadRecoveryCandidateIsCurrent(
+        self: *IndexManager,
+        candidate: FailedIndexLoadRecoveryCandidate,
+    ) bool {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        const failure = self.failed_index_loads.get(candidate.config.name) orelse return false;
+        return failedIndexLoadMatchesToken(failure, candidate.token);
+    }
+
+    /// Claim one exact failure incarnation for durable repair materialization.
+    /// This is allocation-free and shares catalog_mutex with retry selection;
+    /// once claimed, a detached reopen cannot publish or reclassify underneath
+    /// the repair-control checkpoint commit.
+    pub const FailedIndexLoadRecoveryClaimResult = enum {
+        claimed,
+        already_claimed,
+        absent,
+        stale,
+        claimed_by_other,
+    };
+
+    pub fn claimFailedIndexLoadRecoveryCandidate(
+        self: *IndexManager,
+        candidate: FailedIndexLoadRecoveryCandidate,
+        owner_repair_id: u128,
+    ) FailedIndexLoadRecoveryClaimResult {
+        std.debug.assert(owner_repair_id != 0);
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const failure = self.failed_index_loads.getPtr(candidate.config.name) orelse return .absent;
+        if (!failedIndexLoadMatchesToken(failure.*, candidate.token)) return .stale;
+        if (failure.repair_claim_owner_id != 0) {
+            return if (failure.repair_claim_owner_id == owner_repair_id)
+                .already_claimed
+            else
+                .claimed_by_other;
+        }
+        failure.repair_claim_owner_id = owner_repair_id;
+        return .claimed;
+    }
+
+    pub fn releaseFailedIndexLoadRecoveryCandidate(
+        self: *IndexManager,
+        name: []const u8,
+        token: FailedIndexLoadToken,
+        owner_repair_id: u128,
+    ) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const failure = self.failed_index_loads.getPtr(name) orelse return;
+        if (failedIndexLoadMatchesToken(failure.*, token) and
+            failure.repair_claim_owner_id == owner_repair_id)
+        {
+            failure.repair_claim_owner_id = 0;
+        }
+    }
+
+    pub fn releaseFailedIndexLoadRepairClaim(
+        self: *IndexManager,
+        name: []const u8,
+        owner_repair_id: u128,
+    ) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const failure = self.failed_index_loads.getPtr(name) orelse return;
+        if (failure.repair_claim_owner_id == owner_repair_id) {
+            failure.repair_claim_owner_id = 0;
+        }
+    }
+
+    pub const FailedIndexLoadRepairClaimExpectation = union(enum) {
+        /// Durable repair state survives process-local incarnation IDs. Its
+        /// durable config and recovery provenance may atomically adopt the
+        /// current matching resident failure after restart.
+        current_policy: struct {
+            action: IndexLoadRecoveryAction,
+            config_hash: u64,
+        },
+        /// Detached resident work must validate the entire token; partial CAS
+        /// expectations are intentionally unrepresentable.
+        exact: FailedIndexLoadToken,
+    };
+
+    pub const FailedIndexLoadRepairClaim = struct {
+        token: FailedIndexLoadToken,
+        owner_repair_id: u128,
+    };
+
+    pub const FailedIndexLoadClaimMismatch = struct {
+        current: FailedIndexLoadSnapshot,
+        differences: FailedIndexLoadMismatch,
+    };
+
+    pub const FailedIndexLoadRepairClaimResult = union(enum) {
+        claimed: FailedIndexLoadRepairClaim,
+        absent,
+        mismatch: FailedIndexLoadClaimMismatch,
+        already_claimed: FailedIndexLoadRepairClaim,
+        claimed_by_other: FailedIndexLoadRepairClaim,
+    };
+
+    /// Atomically classify and claim resident quarantine ownership. The typed
+    /// result forces callers to distinguish absence from policy/config drift;
+    /// no destructive decision is authorized by a split unlocked read.
+    pub fn claimFailedIndexLoadRepair(
+        self: *IndexManager,
+        name: []const u8,
+        expected: FailedIndexLoadRepairClaimExpectation,
+        owner_repair_id: u128,
+    ) FailedIndexLoadRepairClaimResult {
+        std.debug.assert(owner_repair_id != 0);
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const failure = self.failed_index_loads.getPtr(name) orelse return .absent;
+        const snapshot = failedIndexLoadSnapshotNoLock(failure.*);
+        const differences: FailedIndexLoadMismatch = switch (expected) {
+            .current_policy => |policy| .{
+                .config_changed = policy.config_hash != failure.config_hash,
+                .action_changed = policy.action != failure.action,
+            },
+            .exact => |token| compareFailedIndexLoadTokens(token, snapshot.token),
+        };
+        if (differences.any()) return .{ .mismatch = .{
+            .current = snapshot,
+            .differences = differences,
+        } };
+        const claim = FailedIndexLoadRepairClaim{
+            .token = snapshot.token,
+            .owner_repair_id = owner_repair_id,
+        };
+        if (failure.repair_claim_owner_id != 0) {
+            const existing = FailedIndexLoadRepairClaim{
+                .token = snapshot.token,
+                .owner_repair_id = failure.repair_claim_owner_id,
+            };
+            if (failure.repair_claim_owner_id == owner_repair_id) {
+                return .{ .already_claimed = existing };
+            }
+            return .{ .claimed_by_other = existing };
+        }
+        failure.repair_claim_owner_id = owner_repair_id;
+        return .{ .claimed = claim };
     }
 
     /// Refresh schema-derived mapping state for text indexes that have not
@@ -3110,31 +3644,194 @@ pub const IndexManager = struct {
         }
     }
 
-    pub fn markRepairUnavailable(self: *IndexManager, name: []const u8) !void {
+    /// Install a fail-closed gate for a structural condition which does not
+    /// yet have a durable repair identity. Exact durable publication consumes
+    /// this gate; clearing it can never erase incarnation-scoped repair debt.
+    pub fn markUnscopedRepairUnavailable(self: *IndexManager, name: []const u8) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        if (self.repair_unavailable_indexes.contains(name)) return;
+        if (self.repair_unavailable_indexes.getPtr(name)) |slot| {
+            slot.legacy_blocked = true;
+            slot.runtime_serviceable = false;
+            return;
+        }
         const owned = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(owned);
-        try self.repair_unavailable_indexes.put(self.alloc, owned, {});
+        try self.repair_unavailable_indexes.put(self.alloc, owned, .{ .legacy_blocked = true });
     }
 
-    pub fn clearRepairUnavailable(self: *IndexManager, name: []const u8) void {
+    /// Preallocate a fail-closed slot while deliberately retiring the prior
+    /// repair incarnation. Root-generation replacement calls this before its
+    /// checkpoint commit, then binds the new identity without allocation.
+    pub fn prepareRepairAdmissionRebind(
+        self: *IndexManager,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+    ) !void {
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
+        const slot = if (self.repair_unavailable_indexes.getPtr(name)) |existing|
+            existing
+        else blk: {
+            const owned = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(owned);
+            try self.repair_unavailable_indexes.put(self.alloc, owned, .{});
+            break :blk self.repair_unavailable_indexes.getPtr(name).?;
+        };
+        slot.repair_id = version.repair_id;
+        slot.config_hash = version.config_hash;
+        slot.root_generation = version.root_generation;
+        slot.control_revision = version.control_revision;
+        slot.durable_revision = version.revision;
+        // The durable root/control version is also an incarnation barrier:
+        // any old-root fence reserved before replacement is stale afterward.
+        slot.durable_blocked = false;
+        slot.runtime_serviceable = false;
+        slot.legacy_blocked = true;
+    }
+
+    pub fn clearUnscopedRepairUnavailable(self: *IndexManager, name: []const u8) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse return;
+        slot.legacy_blocked = false;
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    /// Reserve a non-fallible fail-closed publication before committing a
+    /// durable blocking transition. The returned fence must be finished or
+    /// cancelled exactly once.
+    pub fn beginRepairAdmissionFence(self: *IndexManager, name: []const u8) !RepairAdmissionFence {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const epoch = self.allocateRepairAdmissionEpochUnlocked();
+        if (self.repair_unavailable_indexes.getPtr(name)) |slot| {
+            slot.provisional_fences = std.math.add(u32, slot.provisional_fences, 1) catch
+                return error.IndexRepairAdmissionOverflow;
+            return .{ .epoch = epoch };
+        }
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        try self.repair_unavailable_indexes.put(self.alloc, owned, .{ .provisional_fences = 1 });
+        return .{ .epoch = epoch };
+    }
+
+    /// Publish the committed checkpoint revision and release its provisional
+    /// fence without allocating. A delayed older publisher cannot overwrite a
+    /// newer admission decision.
+    pub fn finishRepairAdmissionFence(
+        self: *IndexManager,
+        fence: *RepairAdmissionFence,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+        blocked: bool,
+        preserve_serviceability: bool,
+    ) void {
+        std.debug.assert(fence.active);
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse unreachable;
+        std.debug.assert(slot.provisional_fences != 0);
+        if (version.supersedesSlot(slot.*)) {
+            slot.repair_id = version.repair_id;
+            slot.config_hash = version.config_hash;
+            slot.root_generation = version.root_generation;
+            slot.control_revision = version.control_revision;
+            slot.durable_revision = version.revision;
+            slot.durable_blocked = blocked;
+            slot.legacy_blocked = false;
+            if (!preserve_serviceability) slot.runtime_serviceable = false;
+        }
+        slot.provisional_fences -= 1;
+        fence.active = false;
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    pub fn cancelRepairAdmissionFence(
+        self: *IndexManager,
+        fence: *RepairAdmissionFence,
+        name: []const u8,
+    ) void {
+        if (!fence.active) return;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse unreachable;
+        std.debug.assert(slot.provisional_fences != 0);
+        slot.provisional_fences -= 1;
+        fence.active = false;
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    /// Apply a committed admission revision which did not require a new
+    /// fail-closed fence (normally a serviceability/opening transition).
+    pub fn publishRepairAdmission(
+        self: *IndexManager,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+        blocked: bool,
+        preserve_serviceability: bool,
+    ) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse {
+            // A blocking publication is required to reserve before commit.
+            std.debug.assert(!blocked);
+            return;
+        };
+        const bootstrap_preallocated_gate = slot.repair_id == 0 and slot.legacy_blocked;
+        if (version.supersedesSlot(slot.*) or
+            bootstrap_preallocated_gate)
+        {
+            slot.repair_id = version.repair_id;
+            slot.config_hash = version.config_hash;
+            slot.root_generation = version.root_generation;
+            slot.control_revision = version.control_revision;
+            slot.durable_revision = version.revision;
+            slot.durable_blocked = blocked;
+            slot.legacy_blocked = false;
+            if (!preserve_serviceability) slot.runtime_serviceable = false;
+        }
+        self.pruneRepairAdmissionSlotUnlocked(name);
+    }
+
+    /// Publish a generation-scoped live proof which permits a progressive
+    /// active generation to serve while its durable corpus-wide repair intent
+    /// remains pending. Any newer blocking revision revokes this proof.
+    pub fn publishRepairServiceabilityProof(
+        self: *IndexManager,
+        name: []const u8,
+        version: RepairAdmissionVersion,
+    ) void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        const slot = self.repair_unavailable_indexes.getPtr(name) orelse return;
+        if (!version.matchesSlot(slot.*) or
+            version.control_revision != slot.control_revision or
+            version.revision != slot.durable_revision) return;
+        slot.runtime_serviceable = true;
+    }
+
+    fn pruneRepairAdmissionSlotUnlocked(self: *IndexManager, name: []const u8) void {
+        const slot = self.repair_unavailable_indexes.get(name) orelse return;
+        if (slot.retained()) return;
         if (self.repair_unavailable_indexes.fetchRemove(name)) |entry| self.alloc.free(entry.key);
     }
 
     pub fn repairUnavailable(self: *IndexManager, name: []const u8) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return self.repair_unavailable_indexes.contains(name);
+        const slot = self.repair_unavailable_indexes.get(name) orelse return false;
+        return slot.blocked();
     }
 
     pub fn hasRepairUnavailableIndexes(self: *IndexManager) bool {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        return self.repair_unavailable_indexes.count() != 0;
+        var slots = self.repair_unavailable_indexes.valueIterator();
+        while (slots.next()) |slot| {
+            if (slot.blocked()) return true;
+        }
+        return false;
     }
 
     fn clearRepairUnavailableIndexes(self: *IndexManager) void {
@@ -3187,7 +3884,7 @@ pub const IndexManager = struct {
             var it = self.managed_admission_indexes.keyIterator();
             while (it.next()) |name| names.appendAssumeCapacity(try self.alloc.dupe(u8, name.*));
         }
-        for (names.items) |name| try self.markRepairUnavailable(name);
+        for (names.items) |name| try self.markUnscopedRepairUnavailable(name);
     }
 
     fn managedAdmissionPending(self: *IndexManager, name: []const u8) bool {
@@ -3197,13 +3894,60 @@ pub const IndexManager = struct {
     }
 
     fn clearFailedIndexLoads(self: *IndexManager) void {
-        var it = self.failed_index_loads.keyIterator();
-        while (it.next()) |key| self.alloc.free(key.*);
+        var it = self.failed_index_loads.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.config.deinit(self.alloc);
+            self.alloc.free(entry.key_ptr.*);
+        }
         self.failed_index_loads.clearRetainingCapacity();
+        self.failed_index_load_order.clearRetainingCapacity();
+        self.failed_index_load_cursor = 0;
+        for (&self.failed_index_load_action_queues) |*queue| {
+            queue.order.clearRetainingCapacity();
+            queue.invalidateDiscovery();
+        }
+    }
+
+    fn removeFailedIndexLoadActionQueueMember(
+        self: *IndexManager,
+        name: []const u8,
+        action: IndexLoadRecoveryAction,
+        position: usize,
+    ) void {
+        const queue = self.failedIndexLoadActionQueue(action);
+        std.debug.assert(position < queue.order.items.len);
+        std.debug.assert(std.mem.eql(u8, queue.order.items[position], name));
+        const moved_name = queue.order.items[queue.order.items.len - 1];
+        _ = queue.order.swapRemove(position);
+        if (position < queue.order.items.len) {
+            self.failed_index_loads.getPtr(moved_name).?.action_queue_position = position;
+        }
+        // Membership changes invalidate the meaning of a partial sweep. Reset
+        // instead of trying to repair progress arithmetically around swapRemove.
+        queue.invalidateDiscovery();
     }
 
     fn dropFailedIndexLoad(self: *IndexManager, name: []const u8) void {
-        if (self.failed_index_loads.fetchRemove(name)) |entry| self.alloc.free(entry.key);
+        const entry = self.failed_index_loads.fetchRemove(name) orelse return;
+        const position = entry.value.retry_queue_position;
+        const moved_name = self.failed_index_load_order.items[self.failed_index_load_order.items.len - 1];
+        _ = self.failed_index_load_order.swapRemove(position);
+        if (position < self.failed_index_load_order.items.len) {
+            self.failed_index_loads.getPtr(moved_name).?.retry_queue_position = position;
+        }
+        if (self.failed_index_load_order.items.len == 0) {
+            self.failed_index_load_cursor = 0;
+        } else {
+            self.failed_index_load_cursor %= self.failed_index_load_order.items.len;
+        }
+        self.removeFailedIndexLoadActionQueueMember(
+            name,
+            entry.value.action,
+            entry.value.action_queue_position,
+        );
+        var failure = entry.value;
+        failure.config.deinit(self.alloc);
+        self.alloc.free(entry.key);
     }
 
     fn clearIndexLoadStates(self: *IndexManager) void {
@@ -3238,13 +3982,120 @@ pub const IndexManager = struct {
         return (self.index_load_states.get(name) orelse .complete) == .complete;
     }
 
-    fn appendStatusOnlyConfig(self: *IndexManager, cfg: types.IndexConfig) !void {
-        const old = self.status_only_index_configs;
-        const replacement = try self.alloc.alloc(types.IndexConfig, old.len + 1);
-        @memcpy(replacement[0..old.len], old);
-        replacement[old.len] = cfg;
-        if (old.len > 0) self.alloc.free(old);
-        self.status_only_index_configs = replacement;
+    /// Fully allocated quarantine mutation. Preparing under catalog ownership
+    /// makes the later status/runtime/pointer publication infallible: a repair
+    /// rollback can therefore restore its predecessor without ever losing the
+    /// index config or exposing a live runtime with no resident failure
+    /// identity.
+    const PreparedFailedIndexLoad = struct {
+        name_key: ?[]u8,
+        status_config: ?types.IndexConfig,
+        failure_config: ?types.IndexConfig,
+        status_replacement: ?[]types.IndexConfig,
+        incarnation_id: u64,
+        action: IndexLoadRecoveryAction,
+        err_name: []const u8,
+        repair_claim_owner_id: u128,
+
+        fn deinit(self: *@This(), manager: *IndexManager) void {
+            if (self.name_key) |name| manager.alloc.free(name);
+            if (self.status_config) |*cfg| cfg.deinit(manager.alloc);
+            if (self.failure_config) |*cfg| cfg.deinit(manager.alloc);
+            if (self.status_replacement) |replacement| manager.alloc.free(replacement);
+            self.* = undefined;
+        }
+    };
+
+    /// Requires catalog-exclusive ownership. All fallible work happens here;
+    /// commitPreparedFailedIndexLoad is allocation-free and cannot fail.
+    fn prepareFailedIndexLoad(
+        self: *IndexManager,
+        cfg: types.IndexConfig,
+        err_name: []const u8,
+        repair_claim_owner_id: u128,
+    ) !PreparedFailedIndexLoad {
+        if (self.failed_index_loads.contains(cfg.name)) return error.FailedIndexLoadAlreadyRecorded;
+        const action = loadFailureRecoveryActionForConfig(cfg, err_name);
+        var status_config = try types.IndexConfig.clone(self.alloc, cfg);
+        var status_config_owned = true;
+        errdefer if (status_config_owned) status_config.deinit(self.alloc);
+        var failure_config = try types.IndexConfig.clone(self.alloc, cfg);
+        var failure_config_owned = true;
+        errdefer if (failure_config_owned) failure_config.deinit(self.alloc);
+        const name_key = try self.alloc.dupe(u8, cfg.name);
+        var name_key_owned = true;
+        errdefer if (name_key_owned) self.alloc.free(name_key);
+        const status_replacement = try self.alloc.alloc(
+            types.IndexConfig,
+            self.status_only_index_configs.len + 1,
+        );
+        errdefer self.alloc.free(status_replacement);
+        @memcpy(
+            status_replacement[0..self.status_only_index_configs.len],
+            self.status_only_index_configs,
+        );
+        try self.failed_index_loads.ensureUnusedCapacity(self.alloc, 1);
+        try self.failed_index_load_order.ensureUnusedCapacity(self.alloc, 1);
+        const next_failure_count = self.failed_index_loads.count() + 1;
+        // Reserve one slot per quarantined entry in every policy queue. Error
+        // reclassification then migrates membership without allocation after
+        // an open attempt has already observed a different failure class.
+        for (&self.failed_index_load_action_queues) |*queue| {
+            try queue.order.ensureTotalCapacity(self.alloc, next_failure_count);
+        }
+        const incarnation_id = try self.allocateFailedIndexLoadIncarnationId();
+        status_config_owned = false;
+        failure_config_owned = false;
+        name_key_owned = false;
+        return .{
+            .name_key = name_key,
+            .status_config = status_config,
+            .failure_config = failure_config,
+            .status_replacement = status_replacement,
+            .incarnation_id = incarnation_id,
+            .action = action,
+            .err_name = err_name,
+            .repair_claim_owner_id = repair_claim_owner_id,
+        };
+    }
+
+    /// Requires catalog-exclusive ownership and a preparation made against the
+    /// current status-only slice. Returns the exact resident identity now owned
+    /// by the durable repair, if any.
+    fn commitPreparedFailedIndexLoad(
+        self: *IndexManager,
+        prepared: *PreparedFailedIndexLoad,
+    ) FailedIndexLoadSnapshot {
+        const name_key = prepared.name_key.?;
+        const status_config = prepared.status_config.?;
+        const failure_config = prepared.failure_config.?;
+        const status_replacement = prepared.status_replacement.?;
+        status_replacement[self.status_only_index_configs.len] = status_config;
+        if (self.status_only_index_configs.len > 0) self.alloc.free(self.status_only_index_configs);
+        self.status_only_index_configs = status_replacement;
+        prepared.status_config = null;
+        prepared.status_replacement = null;
+
+        const action_queue = self.failedIndexLoadActionQueue(prepared.action);
+        const retry_position = self.failed_index_load_order.items.len;
+        const action_position = action_queue.order.items.len;
+        const failure = FailedIndexLoad{
+            .incarnation_id = prepared.incarnation_id,
+            .err_name = prepared.err_name,
+            .config = failure_config,
+            .config_hash = types.indexConfigHash(failure_config),
+            .action = prepared.action,
+            .retry_queue_position = retry_position,
+            .action_queue_position = action_position,
+            .repair_claim_owner_id = prepared.repair_claim_owner_id,
+        };
+        self.failed_index_loads.putAssumeCapacity(name_key, failure);
+        self.failed_index_load_order.appendAssumeCapacity(name_key);
+        action_queue.order.appendAssumeCapacity(name_key);
+        action_queue.invalidateDiscovery();
+        prepared.name_key = null;
+        prepared.failure_config = null;
+        return failedIndexLoadSnapshotNoLock(failure);
     }
 
     /// Quarantine an index whose persisted artifacts could not be opened:
@@ -3272,14 +4123,55 @@ pub const IndexManager = struct {
     }
 
     fn recordFailedIndexLoad(self: *IndexManager, cfg: types.IndexConfig, err: anyerror) !void {
-        if (self.loadFailure(cfg.name) != null) return;
-        var cloned = try types.IndexConfig.clone(self.alloc, cfg);
-        errdefer cloned.deinit(self.alloc);
-        try self.appendStatusOnlyConfig(cloned);
-        // The clone is owned by status_only_index_configs from here on.
-        const name_key = try self.alloc.dupe(u8, cfg.name);
-        errdefer self.alloc.free(name_key);
-        try self.failed_index_loads.put(self.alloc, name_key, .{ .err_name = @errorName(err) });
+        if (self.failed_index_loads.contains(cfg.name)) return;
+        var prepared = try self.prepareFailedIndexLoad(cfg, @errorName(err), 0);
+        defer prepared.deinit(self);
+        _ = self.commitPreparedFailedIndexLoad(&prepared);
+    }
+
+    fn allocateFailedIndexLoadIncarnationId(self: *IndexManager) !u64 {
+        var current = self.next_failed_index_load_incarnation_id.load(.monotonic);
+        while (true) {
+            if (current == std.math.maxInt(u64)) return error.FailedIndexLoadIncarnationExhausted;
+            current = self.next_failed_index_load_incarnation_id.cmpxchgWeak(
+                current,
+                current + 1,
+                .monotonic,
+                .monotonic,
+            ) orelse return current;
+        }
+    }
+
+    fn updateFailedIndexLoadError(
+        self: *IndexManager,
+        name: []const u8,
+        err: anyerror,
+        now_ns: u64,
+    ) void {
+        const record = self.failed_index_loads.getPtr(name) orelse return;
+        const next_action = loadFailureRecoveryActionForConfig(record.config, @errorName(err));
+        if (next_action != record.action) {
+            const next_queue = self.failedIndexLoadActionQueue(next_action);
+            self.removeFailedIndexLoadActionQueueMember(name, record.action, record.action_queue_position);
+            record.action = next_action;
+            record.action_queue_position = next_queue.order.items.len;
+            // Queue epochs are independent. A marker from the source queue
+            // may numerically equal the destination's next epoch, so clear it
+            // before publishing membership in the new classification ledger.
+            record.classified_discovery_epoch = 0;
+            next_queue.order.appendAssumeCapacity(name);
+            next_queue.invalidateDiscovery();
+        } else {
+            // A sweep covers failure incarnations, not merely stable names.
+            // Reclassifying the same queue member must make the new revision
+            // visible before discovery can report a complete rotation.
+            self.failedIndexLoadActionQueue(record.action).invalidateDiscovery();
+        }
+        record.err_name = @errorName(err);
+        record.revision +%= 1;
+        if (record.revision == 0) record.revision = 1;
+        record.retry_attempts +|= 1;
+        record.next_retry_ns = now_ns + quarantineRetryBackoffNs(record.retry_attempts);
     }
 
     const quarantine_retry_base_backoff_ns: u64 = 30 * std.time.ns_per_s;
@@ -3293,7 +4185,52 @@ pub const IndexManager = struct {
     pub const QuarantineRetryResult = struct {
         recovered: usize = 0,
         remaining: usize = 0,
+        target_outcome: QuarantineRetryTargetOutcome = .not_targeted,
+        /// Recovery policy after a targeted open failed. The detached open may
+        /// reclassify the same exact incarnation, so repair owners must branch
+        /// on this post-attempt value rather than the policy which authorized
+        /// the retry.
+        target_action: ?IndexLoadRecoveryAction = null,
     };
+
+    pub const QuarantineRetryTargetOutcome = enum {
+        not_targeted,
+        absent,
+        stale,
+        repair_claimed,
+        backoff,
+        attempted_failed,
+        recovered,
+    };
+
+    pub const FailedIndexLoadRetryTarget = struct {
+        name: []const u8,
+        token: FailedIndexLoadToken,
+        /// Detached retries normally require an unclaimed quarantine record.
+        /// Repair rollback instead retains its exact durable claim while it
+        /// reopens the previous generation. Revalidating that authority at
+        /// every catalog boundary prevents discovery or terminalization from
+        /// changing ownership underneath slow detached I/O.
+        authority: FailedIndexLoadRetryAuthority = .unclaimed,
+    };
+
+    pub const FailedIndexLoadRetryAuthority = union(enum) {
+        unclaimed,
+        repair_claim: u128,
+
+        fn matches(self: @This(), owner_repair_id: u128) bool {
+            return switch (self) {
+                .unclaimed => owner_repair_id == 0,
+                .repair_claim => |expected| expected != 0 and owner_repair_id == expected,
+            };
+        }
+    };
+
+    fn failedIndexLoadRetryAuthorityMismatchOutcome(
+        failure: FailedIndexLoad,
+    ) QuarantineRetryTargetOutcome {
+        return if (failure.repair_claim_owner_id == 0) .stale else .repair_claimed;
+    }
 
     /// DB-owned service fence for publishing a newly opened quarantined
     /// index. Opening and backfill happen outside this fence; only the final
@@ -3314,7 +4251,9 @@ pub const IndexManager = struct {
     };
 
     /// Re-attempts opening quarantined indexes whose backoff deadline has
-    /// passed (all of them when `force` is set). A successful open registers
+    /// passed (all of them when `force` is set). A targeted retry is an exact
+    /// incarnation CAS and becomes a no-op if revision, policy, or config has
+    /// changed. A successful open registers
     /// the runtime index, removes the quarantined config from the
     /// status-only list, and clears the recorded load error — the same end
     /// state as a clean open-time load. A failed attempt updates the
@@ -3326,11 +4265,15 @@ pub const IndexManager = struct {
         store: anytype,
         now_ns: u64,
         force: bool,
+        target: ?FailedIndexLoadRetryTarget,
+        execution_limit: usize,
         publication_fence: CatalogPublicationFence,
     ) !QuarantineRetryResult {
         const RetryTask = struct {
             name: []u8,
             cfg: types.IndexConfig,
+            token: FailedIndexLoadToken,
+            authority: FailedIndexLoadRetryAuthority,
 
             fn deinit(task: *@This(), alloc: Allocator) void {
                 alloc.free(task.name);
@@ -3340,48 +4283,99 @@ pub const IndexManager = struct {
         };
 
         var tasks = std.ArrayListUnmanaged(RetryTask).empty;
+        var target_outcome: QuarantineRetryTargetOutcome = if (target == null) .not_targeted else .absent;
+        var target_action: ?IndexLoadRecoveryAction = null;
         defer {
             for (tasks.items) |*task| task.deinit(self.alloc);
             tasks.deinit(self.alloc);
         }
-        var stale_failed_names = std.ArrayListUnmanaged([]const u8).empty;
-        defer stale_failed_names.deinit(self.alloc);
-
         {
             self.catalog_mutex.lockExclusive();
             defer self.catalog_mutex.unlockExclusive();
-            if (self.failed_index_loads.count() == 0) return .{};
-
-            var it = self.failed_index_loads.iterator();
-            while (it.next()) |entry| {
-                if (!force and now_ns < entry.value_ptr.next_retry_ns) continue;
-                const cfg = blk: {
-                    for (self.status_only_index_configs) |*candidate| {
-                        if (std.mem.eql(u8, candidate.name, entry.key_ptr.*)) break :blk candidate.*;
-                    }
-                    try stale_failed_names.append(self.alloc, entry.key_ptr.*);
-                    continue;
+            const failure_count = self.failed_index_load_order.items.len;
+            if (failure_count == 0 or execution_limit == 0) return .{
+                .remaining = failure_count,
+                .target_outcome = target_outcome,
+            };
+            if (target) |retry_target| {
+                const failure = self.failed_index_loads.get(retry_target.name) orelse
+                    return .{ .remaining = failure_count, .target_outcome = .absent };
+                if (!failedIndexLoadMatchesToken(failure, retry_target.token)) return .{
+                    .remaining = failure_count,
+                    .target_outcome = .stale,
                 };
+                if (!retry_target.authority.matches(failure.repair_claim_owner_id)) return .{
+                    .remaining = failure_count,
+                    .target_outcome = failedIndexLoadRetryAuthorityMismatchOutcome(failure),
+                };
+                if (!force and now_ns < failure.next_retry_ns) return .{
+                    .remaining = failure_count,
+                    .target_outcome = .backoff,
+                };
+                target_outcome = .stale;
+                try tasks.ensureTotalCapacity(self.alloc, 1);
                 var task = RetryTask{
-                    .name = try self.alloc.dupe(u8, entry.key_ptr.*),
+                    .name = try self.alloc.dupe(u8, retry_target.name),
                     .cfg = undefined,
+                    .token = retry_target.token,
+                    .authority = retry_target.authority,
                 };
                 var task_name_owned = true;
                 errdefer if (task_name_owned) self.alloc.free(task.name);
-                task.cfg = try types.IndexConfig.clone(self.alloc, cfg);
+                task.cfg = try types.IndexConfig.clone(self.alloc, failure.config);
                 var task_cfg_owned = true;
                 errdefer if (task_cfg_owned) task.cfg.deinit(self.alloc);
                 try tasks.append(self.alloc, task);
                 task_name_owned = false;
                 task_cfg_owned = false;
+            } else {
+                const inspection_budget = @min(
+                    failure_count,
+                    std.math.mul(usize, execution_limit, 8) catch std.math.maxInt(usize),
+                );
+                try tasks.ensureTotalCapacity(self.alloc, @min(execution_limit, failure_count));
+                var inspected: usize = 0;
+                while (inspected < inspection_budget and tasks.items.len < execution_limit) : (inspected += 1) {
+                    const position = self.failed_index_load_cursor % self.failed_index_load_order.items.len;
+                    const name = self.failed_index_load_order.items[position];
+                    self.failed_index_load_cursor = (position + 1) % self.failed_index_load_order.items.len;
+                    const failure = self.failed_index_loads.get(name) orelse unreachable;
+                    if (failure.repair_claim_owner_id != 0) continue;
+                    if (!force and now_ns < failure.next_retry_ns) continue;
+                    var task = RetryTask{
+                        .name = try self.alloc.dupe(u8, name),
+                        .cfg = undefined,
+                        .token = failedIndexLoadSnapshotNoLock(failure).token,
+                        .authority = .unclaimed,
+                    };
+                    var task_name_owned = true;
+                    errdefer if (task_name_owned) self.alloc.free(task.name);
+                    task.cfg = try types.IndexConfig.clone(self.alloc, failure.config);
+                    var task_cfg_owned = true;
+                    errdefer if (task_cfg_owned) task.cfg.deinit(self.alloc);
+                    try tasks.append(self.alloc, task);
+                    task_name_owned = false;
+                    task_cfg_owned = false;
+                }
             }
-            for (stale_failed_names.items) |name| self.dropFailedIndexLoad(name);
         }
 
         var recovered: usize = 0;
         for (tasks.items) |*task| {
             self.catalog_mutex.lockExclusive();
-            if (self.failed_index_loads.get(task.name) == null) {
+            const current = self.failed_index_loads.get(task.name);
+            if (current == null or
+                !failedIndexLoadMatchesToken(current.?, task.token) or
+                !task.authority.matches(current.?.repair_claim_owner_id))
+            {
+                if (target != null) {
+                    target_outcome = if (current == null)
+                        .absent
+                    else if (!failedIndexLoadMatchesToken(current.?, task.token))
+                        .stale
+                    else
+                        failedIndexLoadRetryAuthorityMismatchOutcome(current.?);
+                }
                 self.catalog_mutex.unlockExclusive();
                 continue;
             }
@@ -3396,12 +4390,24 @@ pub const IndexManager = struct {
                 defer self.catalog_mutex.unlockExclusive();
                 self.completeIndexLoadNoLock(task.name);
                 const record = self.failed_index_loads.getPtr(task.name) orelse continue;
-                record.err_name = @errorName(err);
-                record.retry_attempts +|= 1;
-                record.next_retry_ns = now_ns + quarantineRetryBackoffNs(record.retry_attempts);
+                if (!failedIndexLoadMatchesToken(record.*, task.token) or
+                    !task.authority.matches(record.repair_claim_owner_id))
+                {
+                    if (target != null) target_outcome = if (!failedIndexLoadMatchesToken(record.*, task.token))
+                        .stale
+                    else
+                        failedIndexLoadRetryAuthorityMismatchOutcome(record.*);
+                    continue;
+                }
+                self.updateFailedIndexLoadError(task.name, err, now_ns);
+                const updated = self.failed_index_loads.get(task.name) orelse continue;
+                if (target != null) {
+                    target_outcome = .attempted_failed;
+                    target_action = updated.action;
+                }
                 std.log.warn("quarantined index retry failed name={s} attempt={d} err={s}", .{
                     task.name,
-                    record.retry_attempts,
+                    updated.retry_attempts,
                     @errorName(err),
                 });
                 continue;
@@ -3416,7 +4422,17 @@ pub const IndexManager = struct {
                 defer publication_fence.unlock();
 
                 self.catalog_mutex.lockExclusive();
-                if (self.failed_index_loads.get(task.name) == null) {
+                const publication_current = self.failed_index_loads.get(task.name);
+                if (publication_current == null or
+                    !failedIndexLoadMatchesToken(publication_current.?, task.token) or
+                    !task.authority.matches(publication_current.?.repair_claim_owner_id))
+                {
+                    if (target != null) target_outcome = if (publication_current == null)
+                        .absent
+                    else if (!failedIndexLoadMatchesToken(publication_current.?, task.token))
+                        .stale
+                    else
+                        failedIndexLoadRetryAuthorityMismatchOutcome(publication_current.?);
                     self.completeIndexLoadNoLock(task.name);
                     self.catalog_mutex.unlockExclusive();
                     opened.deinit(self);
@@ -3473,12 +4489,18 @@ pub const IndexManager = struct {
                 self.dropFailedIndexLoad(task.name);
                 self.catalog_mutex.unlockExclusive();
                 recovered += 1;
+                if (target != null) target_outcome = .recovered;
             }
         }
 
         self.catalog_mutex.lockExclusive();
         defer self.catalog_mutex.unlockExclusive();
-        return .{ .recovered = recovered, .remaining = self.failed_index_loads.count() };
+        return .{
+            .recovered = recovered,
+            .remaining = self.failed_index_loads.count(),
+            .target_outcome = target_outcome,
+            .target_action = target_action,
+        };
     }
 
     fn accountFullTextPendingBytes(self: *IndexManager, pending_bytes: u64) !void {
@@ -6144,6 +7166,53 @@ pub const IndexManager = struct {
         }
     }
 
+    /// Converts a loaded but uncertified active repair candidate into the same
+    /// incarnation-scoped quarantine used by open failures while restoring the
+    /// exact predecessor pointer. The caller owns the DB structural/apply
+    /// fence and has already checkpointed `rolling_back`. Every allocation is
+    /// completed before the pointer mutation; after that durable write,
+    /// runtime detachment, status publication, quarantine identity, and repair
+    /// claim commit without another failure point.
+    pub fn rollbackUncertifiedActiveIndexRoot(
+        self: *IndexManager,
+        name: []const u8,
+        expected_candidate_relative_path: []const u8,
+        previous_pointer: ?[]const u8,
+        expected_config_hash: u64,
+        failure_reason: []const u8,
+        repair_id: u128,
+    ) !FailedIndexLoadRepairClaim {
+        if (repair_id == 0 or failure_reason.len == 0) return error.InvalidArgument;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        if (self.failed_index_loads.contains(name)) return error.RepairOwnershipLost;
+        const cfg = self.get(name) orelse return error.IndexNotFound;
+        if (types.indexConfigHash(cfg.*) != expected_config_hash) {
+            return error.IndexRepairConfigurationChanged;
+        }
+        const target_path = try self.indexPath(name);
+        defer self.alloc.free(target_path);
+        const current_pointer = try self.readActiveIndexRootPointer(target_path, name);
+        defer if (current_pointer) |value| self.alloc.free(value);
+        if (!optionalBytesEqual(current_pointer, expected_candidate_relative_path)) {
+            return error.IndexRootPointerChanged;
+        }
+
+        var prepared = try self.prepareFailedIndexLoad(cfg.*, failure_reason, repair_id);
+        defer prepared.deinit(self);
+        if (previous_pointer) |value| {
+            try self.writeActiveIndexRootPointer(target_path, value);
+        } else {
+            try self.clearActiveIndexRootPointer(target_path);
+        }
+        self.removeInMemory(name);
+        const snapshot = self.commitPreparedFailedIndexLoad(&prepared);
+        return .{
+            .token = snapshot.token,
+            .owner_repair_id = repair_id,
+        };
+    }
+
     /// Returns whether the durable active-root pointer for `name` selects the
     /// exact repair candidate recorded by a replica-local repair intent.  This
     /// is used during restart reconciliation to distinguish a crash before
@@ -6529,7 +7598,7 @@ pub const IndexManager = struct {
         return names;
     }
 
-    pub fn managedIndexes(self: *const IndexManager, alloc: Allocator) ![]ManagedIndexRef {
+    pub fn managedIndexes(self: *IndexManager, alloc: Allocator) ![]ManagedIndexRef {
         var status_only_count: usize = 0;
         for (self.status_only_index_configs) |cfg| {
             if (self.loadFailure(cfg.name) == null) status_only_count += 1;
@@ -25408,6 +26477,487 @@ test "remove status-only malformed dense config drops catalog entry" {
     try std.testing.expect(manager.loadFailure("bad_dense") == null);
     try std.testing.expectEqual(@as(usize, 0), manager.status_only_index_configs.len);
     try std.testing.expectEqual(@as(usize, 0), manager.index_load_states.count());
+}
+
+test "failed index recovery queues partition actions and retain exact aggregates" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-repair-ring");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    const configs = [_]types.IndexConfig{
+        .{ .name = "failed-a", .kind = .dense_vector, .config_json = "{}" },
+        .{ .name = "failed-b", .kind = .dense_vector, .config_json = "{}" },
+        .{ .name = "failed-c", .kind = .dense_vector, .config_json = "{}" },
+    };
+    try manager.recordFailedIndexLoad(configs[0], error.IncompleteBulkPublish);
+    try manager.recordFailedIndexLoad(configs[1], error.InvalidIndexConfig);
+    try manager.recordFailedIndexLoad(configs[2], error.TableReadChurn);
+
+    const summary = manager.failedIndexLoadSummary();
+    try std.testing.expectEqual(@as(usize, 3), summary.total);
+    try std.testing.expectEqual(@as(usize, 1), summary.rebuild_from_artifacts);
+    try std.testing.expectEqual(@as(usize, 1), summary.manual_intervention);
+    try std.testing.expectEqual(@as(usize, 1), summary.retry_open);
+
+    const expected_actions = [_]IndexManager.IndexLoadRecoveryAction{
+        .rebuild_from_artifacts,
+        .manual_intervention,
+        .retry_open,
+    };
+    for (configs, expected_actions) |cfg, action| {
+        var quantum = try manager.failedIndexLoadRecoveryCandidates(alloc, action, 1);
+        defer quantum.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), quantum.action_total);
+        try std.testing.expect(!quantum.sweep_complete);
+        try std.testing.expectEqual(@as(usize, 1), quantum.candidates.len);
+        try std.testing.expectEqualStrings(cfg.name, quantum.candidates[0].config.name);
+        try std.testing.expectEqual(action, quantum.candidates[0].token.action);
+        try std.testing.expect(manager.failedIndexLoadRecoveryCandidateIsCurrent(quantum.candidates[0]));
+    }
+
+    var claimed = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 1);
+    defer claimed.deinit(alloc);
+    const owner_a: u128 = 101;
+    const owner_b: u128 = 202;
+    try std.testing.expectEqual(.claimed, manager.claimFailedIndexLoadRecoveryCandidate(claimed.candidates[0], owner_a));
+    try std.testing.expectEqual(.already_claimed, manager.claimFailedIndexLoadRecoveryCandidate(claimed.candidates[0], owner_a));
+    try std.testing.expectEqual(.claimed_by_other, manager.claimFailedIndexLoadRecoveryCandidate(claimed.candidates[0], owner_b));
+    // A non-owner cannot release the resident reservation.
+    manager.releaseFailedIndexLoadRecoveryCandidate(
+        claimed.candidates[0].config.name,
+        claimed.candidates[0].token,
+        owner_b,
+    );
+    try std.testing.expectEqual(.claimed_by_other, manager.claimFailedIndexLoadRecoveryCandidate(claimed.candidates[0], owner_b));
+    manager.releaseFailedIndexLoadRecoveryCandidate(
+        claimed.candidates[0].config.name,
+        claimed.candidates[0].token,
+        owner_a,
+    );
+    try std.testing.expectEqual(.claimed, manager.claimFailedIndexLoadRecoveryCandidate(claimed.candidates[0], owner_b));
+    manager.releaseFailedIndexLoadRepairClaim(claimed.candidates[0].config.name, owner_b);
+
+    const combined_mismatch = manager.claimFailedIndexLoadRepair(
+        claimed.candidates[0].config.name,
+        .{ .current_policy = .{
+            .action = .retry_open,
+            .config_hash = claimed.candidates[0].token.config_hash +% 1,
+        } },
+        owner_a,
+    );
+    try std.testing.expectEqual(.mismatch, std.meta.activeTag(combined_mismatch));
+    try std.testing.expect(combined_mismatch.mismatch.differences.config_changed);
+    try std.testing.expect(combined_mismatch.mismatch.differences.action_changed);
+    try std.testing.expectEqual(.claimed, std.meta.activeTag(manager.claimFailedIndexLoadRepair(
+        claimed.candidates[0].config.name,
+        .{ .current_policy = .{
+            .action = .rebuild_from_artifacts,
+            .config_hash = claimed.candidates[0].token.config_hash,
+        } },
+        owner_a,
+    )));
+    try std.testing.expectEqual(.already_claimed, std.meta.activeTag(manager.claimFailedIndexLoadRepair(
+        claimed.candidates[0].config.name,
+        .{ .current_policy = .{
+            .action = .rebuild_from_artifacts,
+            .config_hash = claimed.candidates[0].token.config_hash,
+        } },
+        owner_a,
+    )));
+    try std.testing.expectEqual(.claimed_by_other, std.meta.activeTag(manager.claimFailedIndexLoadRepair(
+        claimed.candidates[0].config.name,
+        .{ .current_policy = .{
+            .action = .rebuild_from_artifacts,
+            .config_hash = claimed.candidates[0].token.config_hash,
+        } },
+        owner_b,
+    )));
+    manager.releaseFailedIndexLoadRepairClaim(claimed.candidates[0].config.name, owner_b);
+    try std.testing.expect(manager.failedIndexLoadSnapshot(claimed.candidates[0].config.name).?.claim_owner_repair_id != null);
+    manager.releaseFailedIndexLoadRepairClaim(claimed.candidates[0].config.name, owner_a);
+
+    const before_reclassification = manager.failedIndexLoadSnapshot(claimed.candidates[0].config.name).?;
+    manager.updateFailedIndexLoadError(claimed.candidates[0].config.name, error.IncompleteBulkPublish, 1);
+    const stale_claim = manager.claimFailedIndexLoadRepair(
+        claimed.candidates[0].config.name,
+        .{ .exact = before_reclassification.token },
+        owner_a,
+    );
+    try std.testing.expectEqual(.mismatch, std.meta.activeTag(stale_claim));
+    try std.testing.expect(stale_claim.mismatch.differences.revision_changed);
+
+    // Error reclassification migrates queue membership atomically and
+    // invalidates snapshots from the previous failure incarnation.
+    var stale = try manager.failedIndexLoadRecoveryCandidates(alloc, .manual_intervention, 1);
+    defer stale.deinit(alloc);
+    manager.updateFailedIndexLoadError("failed-b", error.TableReadChurn, 1);
+    try std.testing.expect(!manager.failedIndexLoadRecoveryCandidateIsCurrent(stale.candidates[0]));
+    const reclassified = manager.failedIndexLoadSummary();
+    try std.testing.expectEqual(@as(usize, 0), reclassified.manual_intervention);
+    try std.testing.expectEqual(@as(usize, 2), reclassified.retry_open);
+
+    manager.dropFailedIndexLoad("failed-b");
+    const remaining = manager.failedIndexLoadSummary();
+    try std.testing.expectEqual(@as(usize, 2), remaining.total);
+    try std.testing.expectEqual(@as(usize, 1), remaining.retry_open);
+}
+
+test "targeted quarantine retry rejects a stale incarnation before detached open" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-stale-target");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const cfg: types.IndexConfig = .{
+        .name = "stale-target",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":",
+    };
+    try manager.recordFailedIndexLoad(cfg, error.InvalidIndexConfig);
+    const stale = manager.failedIndexLoadSnapshot(cfg.name).?;
+    // Same name, config, error, action, and revision still denotes a distinct
+    // catalog incarnation after drop/recreate.
+    manager.dropFailedIndexLoad(cfg.name);
+    try manager.recordFailedIndexLoad(cfg, error.InvalidIndexConfig);
+    const current = manager.failedIndexLoadSnapshot(cfg.name).?;
+    try std.testing.expect(!current.token.eql(stale.token));
+    try std.testing.expect(stale.token.incarnation_id != current.token.incarnation_id);
+    try std.testing.expectEqual(stale.token.revision, current.token.revision);
+    try std.testing.expectEqual(stale.token.action, current.token.action);
+    try std.testing.expectEqual(stale.token.config_hash, current.token.config_hash);
+
+    const Fence = struct {
+        fn lock(_: *anyopaque) void {}
+        fn unlock(_: *anyopaque) void {}
+    };
+    var fence_context: u8 = 0;
+    const result = try manager.retryFailedIndexLoads(
+        &store,
+        2,
+        true,
+        .{ .name = cfg.name, .token = stale.token },
+        1,
+        .{
+            .ptr = &fence_context,
+            .lock_fn = Fence.lock,
+            .unlock_fn = Fence.unlock,
+        },
+    );
+    try std.testing.expectEqual(@as(usize, 0), result.recovered);
+    try std.testing.expectEqual(@as(usize, 1), result.remaining);
+    try std.testing.expectEqual(.stale, result.target_outcome);
+    const after = manager.failedIndexLoadSnapshot(cfg.name).?;
+    try std.testing.expect(after.token.eql(current.token));
+    try std.testing.expectEqual(current.retry_attempts, after.retry_attempts);
+}
+
+test "targeted quarantine retry preserves exact repair claim authority" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-repair-authority");
+    defer cleanupIndexManagerDir(path);
+
+    var store = try docstore_mod.DocStore.open(alloc, path, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    const cfg: types.IndexConfig = .{
+        .name = "repair-owned",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":",
+    };
+    try manager.recordFailedIndexLoad(cfg, error.IncompleteBulkPublish);
+    const initial = manager.failedIndexLoadSnapshot(cfg.name).?;
+    const repair_id: u128 = 71;
+    try std.testing.expectEqual(.claimed, std.meta.activeTag(manager.claimFailedIndexLoadRepair(
+        cfg.name,
+        .{ .exact = initial.token },
+        repair_id,
+    )));
+
+    const Fence = struct {
+        fn lock(_: *anyopaque) void {}
+        fn unlock(_: *anyopaque) void {}
+    };
+    var fence_context: u8 = 0;
+    const fence = IndexManager.CatalogPublicationFence{
+        .ptr = &fence_context,
+        .lock_fn = Fence.lock,
+        .unlock_fn = Fence.unlock,
+    };
+
+    const unauthorized = try manager.retryFailedIndexLoads(
+        &store,
+        1,
+        true,
+        .{ .name = cfg.name, .token = initial.token },
+        1,
+        fence,
+    );
+    try std.testing.expectEqual(.repair_claimed, unauthorized.target_outcome);
+    try std.testing.expectEqual(@as(u32, 0), manager.failedIndexLoadSnapshot(cfg.name).?.retry_attempts);
+
+    const authorized = try manager.retryFailedIndexLoads(
+        &store,
+        2,
+        true,
+        .{
+            .name = cfg.name,
+            .token = initial.token,
+            .authority = .{ .repair_claim = repair_id },
+        },
+        1,
+        fence,
+    );
+    try std.testing.expectEqual(.attempted_failed, authorized.target_outcome);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.manual_intervention, authorized.target_action.?);
+    try std.testing.expectEqual(@as(usize, 0), authorized.recovered);
+    try std.testing.expectEqual(@as(usize, 1), authorized.remaining);
+    const after = manager.failedIndexLoadSnapshot(cfg.name).?;
+    try std.testing.expectEqual(@as(u32, 1), after.retry_attempts);
+    try std.testing.expectEqual(repair_id, after.claim_owner_repair_id.?);
+    try std.testing.expect(!after.token.eql(initial.token));
+}
+
+test "manual load failures beyond one inspection window cannot hide automatic repair" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-action-partition-window");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    const manual_names = [_][]const u8{
+        "manual-0", "manual-1", "manual-2", "manual-3", "manual-4",
+        "manual-5", "manual-6", "manual-7", "manual-8",
+    };
+    for (manual_names) |name| try manager.recordFailedIndexLoad(.{
+        .name = name,
+        .kind = .dense_vector,
+        .config_json = "{}",
+    }, error.InvalidIndexConfig);
+    try manager.recordFailedIndexLoad(.{
+        .name = "automatic-after-window",
+        .kind = .dense_vector,
+        .config_json = "{}",
+    }, error.IncompleteBulkPublish);
+
+    const summary = manager.failedIndexLoadSummary();
+    try std.testing.expectEqual(@as(usize, 10), summary.total);
+    try std.testing.expectEqual(@as(usize, 9), summary.manual_intervention);
+    try std.testing.expectEqual(@as(usize, 1), summary.rebuild_from_artifacts);
+
+    // A limit=1 automatic quantum goes directly to the repairable entry; its
+    // latency is independent of the number and insertion order of manual debt.
+    var quantum = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 1);
+    defer quantum.deinit(alloc);
+    try std.testing.expect(!quantum.sweep_complete);
+    try std.testing.expectEqual(@as(usize, 1), quantum.candidates.len);
+    try std.testing.expectEqualStrings("automatic-after-window", quantum.candidates[0].config.name);
+}
+
+test "automatic load failure sweep reports completion only after full bounded rotation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-automatic-sweep");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    const names = [_][]const u8{
+        "automatic-0", "automatic-1", "automatic-2", "automatic-3", "automatic-4",
+        "automatic-5", "automatic-6", "automatic-7", "automatic-8", "automatic-9",
+    };
+    for (names) |name| try manager.recordFailedIndexLoad(.{
+        .name = name,
+        .kind = .dense_vector,
+        .config_json = "{}",
+    }, error.IncompleteBulkPublish);
+
+    var first = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 8);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 10), first.action_total);
+    try std.testing.expectEqual(@as(usize, 8), first.candidates.len);
+    try std.testing.expect(!first.sweep_complete);
+    for (first.candidates) |*candidate| candidate.classified = true;
+    const first_finished = manager.finishFailedIndexLoadRecoveryQuantum(
+        .rebuild_from_artifacts,
+        first.queue_epoch,
+        first.candidates,
+    );
+    try std.testing.expect(!first_finished.sweep_complete);
+
+    var second = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 8);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), second.candidates.len);
+    try std.testing.expect(!second.sweep_complete);
+    for (second.candidates) |*candidate| candidate.classified = true;
+    const second_finished = manager.finishFailedIndexLoadRecoveryQuantum(
+        .rebuild_from_artifacts,
+        second.queue_epoch,
+        second.candidates,
+    );
+    try std.testing.expect(second_finished.sweep_complete);
+}
+
+test "automatic load failure sweep completion is rejected after incarnation mutation" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-automatic-sweep-epoch");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    try manager.recordFailedIndexLoad(.{
+        .name = "automatic",
+        .kind = .dense_vector,
+        .config_json = "{}",
+    }, error.IncompleteBulkPublish);
+
+    var stale = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 1);
+    defer stale.deinit(alloc);
+    try std.testing.expect(!stale.sweep_complete);
+    stale.candidates[0].classified = true;
+
+    // A retry can discover a new incarnation of the same failure while the
+    // detached candidate is being classified. The stale quantum must not
+    // certify that newer debt as fully inspected.
+    manager.updateFailedIndexLoadError("automatic", error.IncompleteBulkPublish, 1);
+    const rejected = manager.finishFailedIndexLoadRecoveryQuantum(
+        .rebuild_from_artifacts,
+        stale.queue_epoch,
+        stale.candidates,
+    );
+    try std.testing.expectEqual(@as(usize, 1), rejected.action_total);
+    try std.testing.expect(!rejected.sweep_complete);
+    try std.testing.expect(rejected.queue_epoch != stale.queue_epoch);
+
+    var current = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 1);
+    defer current.deinit(alloc);
+    current.candidates[0].classified = true;
+    const accepted = manager.finishFailedIndexLoadRecoveryQuantum(
+        .rebuild_from_artifacts,
+        current.queue_epoch,
+        current.candidates,
+    );
+    try std.testing.expect(accepted.sweep_complete);
+}
+
+test "automatic load failure mutation preserves rotating discovery fairness" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-automatic-fairness");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    const names = [_][]const u8{ "automatic-a", "automatic-b", "automatic-c" };
+    for (names) |name| try manager.recordFailedIndexLoad(.{
+        .name = name,
+        .kind = .dense_vector,
+        .config_json = "{}",
+    }, error.IncompleteBulkPublish);
+
+    var first = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 1);
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("automatic-a", first.candidates[0].config.name);
+
+    // Churn in an already visited incarnation invalidates completeness but
+    // must not rewind selection to the start of the ring.
+    manager.updateFailedIndexLoadError("automatic-a", error.IncompleteBulkPublish, 1);
+    var second = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 1);
+    defer second.deinit(alloc);
+    try std.testing.expectEqualStrings("automatic-b", second.candidates[0].config.name);
+
+    manager.updateFailedIndexLoadError("automatic-a", error.IncompleteBulkPublish, 2);
+    var third = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 1);
+    defer third.deinit(alloc);
+    try std.testing.expectEqualStrings("automatic-c", third.candidates[0].config.name);
+}
+
+test "automatic load failure acknowledgements compose out of order" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-automatic-out-of-order");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    const names = [_][]const u8{ "automatic-a", "automatic-b", "automatic-c", "automatic-d" };
+    for (names) |name| try manager.recordFailedIndexLoad(.{
+        .name = name,
+        .kind = .dense_vector,
+        .config_json = "{}",
+    }, error.IncompleteBulkPublish);
+
+    var first = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 2);
+    defer first.deinit(alloc);
+    var second = try manager.failedIndexLoadRecoveryCandidates(alloc, .rebuild_from_artifacts, 2);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(first.queue_epoch, second.queue_epoch);
+    try std.testing.expectEqualStrings("automatic-a", first.candidates[0].config.name);
+    try std.testing.expectEqualStrings("automatic-c", second.candidates[0].config.name);
+
+    for (second.candidates) |*candidate| candidate.classified = true;
+    const second_finished = manager.finishFailedIndexLoadRecoveryQuantum(
+        .rebuild_from_artifacts,
+        second.queue_epoch,
+        second.candidates,
+    );
+    try std.testing.expect(!second_finished.sweep_complete);
+
+    for (first.candidates) |*candidate| candidate.classified = true;
+    const first_finished = manager.finishFailedIndexLoadRecoveryQuantum(
+        .rebuild_from_artifacts,
+        first.queue_epoch,
+        first.candidates,
+    );
+    try std.testing.expect(first_finished.sweep_complete);
+}
+
+test "failed load reclassification cannot inherit a destination epoch marker" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = indexManagerTmpPathWithSuffix(&path_buf, "failed-load-reclassification-epoch");
+    defer cleanupIndexManagerDir(path);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path));
+    defer manager.deinit();
+    try manager.recordFailedIndexLoad(.{
+        .name = "moving",
+        .kind = .dense_vector,
+        .config_json = "{}",
+    }, error.InvalidIndexConfig);
+
+    var manual = try manager.failedIndexLoadRecoveryCandidates(alloc, .manual_intervention, 1);
+    defer manual.deinit(alloc);
+    manual.candidates[0].classified = true;
+    const manual_finished = manager.finishFailedIndexLoadRecoveryQuantum(
+        .manual_intervention,
+        manual.queue_epoch,
+        manual.candidates,
+    );
+    try std.testing.expect(manual_finished.sweep_complete);
+
+    // Both empty action queues begin at epoch 1, so the first destination
+    // mutation reaches the same numeric epoch previously acknowledged in the
+    // source queue. The moved entry must nevertheless remain unclassified.
+    manager.updateFailedIndexLoadError("moving", error.TableReadChurn, 1);
+    var retry = try manager.failedIndexLoadRecoveryCandidates(alloc, .retry_open, 1);
+    defer retry.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), retry.candidates.len);
+    try std.testing.expectEqualStrings("moving", retry.candidates[0].config.name);
 }
 
 test "remove drops runtime index load state" {
