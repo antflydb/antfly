@@ -77,6 +77,7 @@ test "distributed join ownership and transport failures remain retryable and fai
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.UnknownGroup));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.NotLeader));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.SendFailed));
     try std.testing.expectEqual(error.DistributedQueryUnavailable, normalizeDistributedJoinOperationalError(error.FinalizerAcknowledgementUnavailable));
     try std.testing.expectEqual(error.InternalFailure, normalizeDistributedJoinOperationalError(error.InternalFailure));
 }
@@ -1618,6 +1619,9 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
         error.Timeout => return error.Timeout,
         error.Cancelled => return error.Cancelled,
         else => {
+            const normalized = normalizeDistributedJoinOperationalError(err);
+            if (normalized == error.DistributedQueryUnavailable)
+                return error.DistributedQueryUnavailable;
             std.log.err("distributed join primary query failed table={s} right_table={s} err={}", .{ table_name, join.right_table, err });
             return error.InternalFailure;
         },
@@ -1653,6 +1657,9 @@ pub fn executeSupportedJoinedPublicTableQueryRequest(
             error.Timeout => return error.Timeout,
             error.Cancelled => return error.Cancelled,
             else => {
+                const normalized = normalizeDistributedJoinOperationalError(err);
+                if (normalized == error.DistributedQueryUnavailable)
+                    return error.DistributedQueryUnavailable;
                 std.log.err("distributed shuffle join failed table={s} err={}", .{ table_name, err });
                 return error.InternalFailure;
             },

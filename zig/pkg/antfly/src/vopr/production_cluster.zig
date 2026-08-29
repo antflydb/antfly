@@ -175,6 +175,16 @@ pub const Fixture = struct {
         frames_sent: u64 = 0,
     };
 
+    const JoinLifecycleObserver = struct {
+        fixture: *Fixture,
+        node_index: usize,
+    };
+
+    pub const JoinOwnerRestartFaultObserver = struct {
+        ptr: *anyopaque,
+        activate: *const fn (ptr: *anyopaque, node_index: usize) anyerror!void,
+    };
+
     const node_count = metadata_sim.VoprPublicClusterFixture.node_count;
     const initial_groups = [_]u64{
         metadata_sim.VoprPublicClusterFixture.data_group_id,
@@ -260,6 +270,7 @@ pub const Fixture = struct {
     data_catalogs: [node_count][]u8 = undefined,
     data_catalog_count: usize = 0,
     data_servers: [node_count]DataServer = undefined,
+    join_lifecycle_observers: [node_count]JoinLifecycleObserver = undefined,
     data_server_count: usize = 0,
     data_server_live: [node_count]bool = .{false} ** node_count,
     data_raft_listeners: [node_count]raft_transport.HttpxRuntime = undefined,
@@ -325,6 +336,32 @@ pub const Fixture = struct {
     join_worker_retry_failed_group_id: u64 = 0,
     join_worker_retry_recovered_group_id: u64 = 0,
     join_worker_retry_sound: bool = false,
+    join_owner_restart_job_id: u64 = 0,
+    join_owner_restart_partition_index: usize = 0,
+    join_owner_restart_failed_group_id: u64 = 0,
+    join_owner_restart_recovered_group_id: u64 = 0,
+    join_owner_restart_target_index: usize = 0,
+    join_owner_restart_recovery_index: usize = 0,
+    join_owner_restart_coordinator_index: usize = 0,
+    join_owner_restart_campaign_configured: bool = false,
+    join_owner_restart_target_configured: bool = false,
+    join_owner_restart_fault_observer: ?JoinOwnerRestartFaultObserver = null,
+    join_owner_restart_requested: bool = false,
+    join_owner_restart_down: bool = false,
+    join_owner_restart_recovered: bool = false,
+    join_owner_restart_initial_status: u16 = 0,
+    join_owner_restart_initial_rejected_without_partial: bool = false,
+    join_owner_restart_initial_query_active: bool = false,
+    join_owner_restart_recovery_query_active: bool = false,
+    join_owner_restart_recovery_join: bool = false,
+    join_owner_restart_post_reconstruction_read: bool = false,
+    join_owner_restart_sound: bool = false,
+    join_owner_restart_failure: ?anyerror = null,
+    join_restart_requested: std.Io.Semaphore = .{},
+    join_restart_down: std.Io.Semaphore = .{},
+    join_restart_recover: std.Io.Semaphore = .{},
+    join_restart_recovered: std.Io.Semaphore = .{},
+    join_restart_future: ?std.Io.Future(void) = null,
     join_cancellation_boundary_observed: bool = false,
     join_cancellation_job_id: u64 = 0,
     join_cancellation_owner_group_id: u64 = 0,
@@ -438,12 +475,16 @@ pub const Fixture = struct {
     join_enabled: bool = false,
     join_cancellation_enabled: bool = false,
     join_worker_retry_enabled: bool = false,
+    join_owner_restart_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
 
     pub fn create(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
         const self = try alloc.create(Fixture);
         self.* = .{ .alloc = alloc, .sim = sim };
+        for (&self.join_lifecycle_observers, 0..) |*observer, index| {
+            observer.* = .{ .fixture = self, .node_index = index };
+        }
         self.http_disconnect_probe = .{ .vopr_io = sim };
         return self;
     }
@@ -500,6 +541,20 @@ pub const Fixture = struct {
         self.join_worker_retry_enabled = enabled;
     }
 
+    pub fn setJoinOwnerRestartEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.join_owner_restart_enabled = enabled;
+    }
+
+    pub fn setJoinOwnerRestartFaultObserver(
+        self: *Fixture,
+        observer: JoinOwnerRestartFaultObserver,
+    ) void {
+        std.debug.assert(self.phase == .leaders_ready);
+        std.debug.assert(self.join_owner_restart_enabled);
+        self.join_owner_restart_fault_observer = observer;
+    }
+
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
         std.debug.assert(self.phase == .created);
         self.fault_mode = mode;
@@ -519,6 +574,24 @@ pub const Fixture = struct {
             return error.InvalidProductionGraphRestartTarget;
         self.graph_restart_target_index = index;
         self.graph_restart_target_configured = true;
+    }
+
+    /// Select the deterministic right-table group and a public coordinator
+    /// that cannot execute that group's worker locally. The exact process is
+    /// deliberately selected at the production worker boundary: leadership
+    /// may legitimately change while the fixture publishes its 64 durable
+    /// rows, so selecting it during deployment registration would be stale.
+    fn prepareJoinOwnerRestartCampaign(self: *Fixture) !void {
+        if (self.phase != .reads_complete or !self.join_owner_restart_enabled)
+            return error.InvalidProductionJoinOwnerRestartTarget;
+        const group_id = metadata_sim.VoprPublicClusterFixture.data_group_id;
+        const coordinator_index = for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+            const raft = server.data_raft orelse continue;
+            if (raft.host.http_host.host.raftStatus(group_id) == null) break index;
+        } else return error.ProductionDataJoinRemoteCoordinatorMissing;
+        self.join_owner_restart_coordinator_index = coordinator_index;
+        self.join_owner_restart_failed_group_id = group_id;
+        self.join_owner_restart_campaign_configured = true;
     }
 
     /// Freeze the advertised link selected by the deployment manifest before
@@ -585,6 +658,11 @@ pub const Fixture = struct {
             (!self.join_enabled or self.join_cancellation_enabled or
                 self.active_split_enabled or self.fault_mode != .clean))
             return error.InvalidProductionClusterJoinWorkerRetryMode;
+        if (self.join_owner_restart_enabled and
+            (!self.join_enabled or self.join_cancellation_enabled or
+                self.join_worker_retry_enabled or self.active_split_enabled or
+                self.fault_mode != .clean))
+            return error.InvalidProductionClusterJoinOwnerRestartMode;
         switch (self.fault_mode) {
             .clean => {},
             .graph_hydration_transport_failure => if (!self.graph_enabled or
@@ -799,7 +877,7 @@ pub const Fixture = struct {
                 .internal_service_secret = internal_service_secret,
                 .internal_service_issuer = internal_service_issuer,
                 .distributed_join_lifecycle_hook = .{
-                    .ptr = self,
+                    .ptr = &self.join_lifecycle_observers[index],
                     .reach_fn = observeDistributedJoinLifecycle,
                 },
                 .join_job_store = &self.join_job_stores[index],
@@ -1096,10 +1174,67 @@ pub const Fixture = struct {
         ptr: *anyopaque,
         event: api_distributed_join.LifecycleEvent,
     ) !void {
-        const self: *Fixture = @ptrCast(@alignCast(ptr));
+        const observer: *JoinLifecycleObserver = @ptrCast(@alignCast(ptr));
+        const self = observer.fixture;
         switch (event.phase) {
             .partition_worker_started => {
                 self.join_partition_worker_started_count +|= 1;
+                if (self.join_owner_restart_enabled) {
+                    if (!self.join_owner_restart_requested) {
+                        if (!self.join_owner_restart_campaign_configured)
+                            return error.ProductionJoinOwnerRestartTargetMissing;
+                        if (event.owner_group_id != self.join_owner_restart_failed_group_id) return;
+                        if (event.job_id == 0) {
+                            self.failure = error.ProductionJoinOwnerRestartIdentityMissing;
+                            return error.ProductionJoinOwnerRestartIdentityMissing;
+                        }
+                        if (observer.node_index == self.join_owner_restart_coordinator_index) {
+                            self.failure = error.ProductionDataJoinRemoteCoordinatorMissing;
+                            return error.ProductionDataJoinRemoteCoordinatorMissing;
+                        }
+                        self.join_owner_restart_target_index = observer.node_index;
+                        self.join_owner_restart_target_configured = true;
+                        const fault_observer = self.join_owner_restart_fault_observer orelse {
+                            self.failure = error.ProductionJoinOwnerRestartFaultObserverMissing;
+                            return error.ProductionJoinOwnerRestartFaultObserverMissing;
+                        };
+                        fault_observer.activate(fault_observer.ptr, observer.node_index) catch |err| {
+                            self.failure = err;
+                            return err;
+                        };
+                        self.join_owner_restart_job_id = event.job_id;
+                        self.join_owner_restart_partition_index = event.partition_index;
+                        self.join_owner_restart_requested = true;
+                        self.join_restart_requested.post(self.sim.io());
+                        // Return immediately so the serving handler can unwind
+                        // while the restart owner tears down this exact process.
+                        return error.InjectedJoinPartitionOwnerCrash;
+                    }
+                    if (self.join_owner_restart_recovered_group_id == 0 and
+                        event.partition_index == self.join_owner_restart_partition_index and
+                        event.owner_group_id != self.join_owner_restart_failed_group_id)
+                    {
+                        if (!self.join_owner_restart_down)
+                            self.join_restart_down.wait(self.sim.io()) catch return;
+                        if (observer.node_index == self.join_owner_restart_target_index)
+                            return error.ProductionJoinOwnerRestartRetriedOnStoppedProcess;
+                        self.join_owner_restart_recovered_group_id = event.owner_group_id;
+                        self.join_owner_restart_recovery_index = observer.node_index;
+                        self.join_restart_recover.post(self.sim.io());
+                        self.join_restart_recovered.wait(self.sim.io()) catch return;
+                        if (!self.join_owner_restart_recovered)
+                            return error.ProductionJoinOwnerReconstructionMissing;
+                    }
+                    // The process failure invalidates the complete public
+                    // operation. Once a different worker and reconstructed
+                    // process have been observed, fence every remaining
+                    // initial-request attempt so the coordinator exhausts as
+                    // retryable unavailability without publishing a prefix.
+                    // A fresh idempotent public request runs with this fence
+                    // disabled and must return the complete result.
+                    if (self.join_owner_restart_initial_query_active)
+                        return error.DistributedQueryUnavailable;
+                }
                 if (self.join_worker_retry_enabled and
                     !self.join_worker_retry_failure_injected)
                 {
@@ -1491,6 +1626,50 @@ pub const Fixture = struct {
         self.graph_restart_recovered.post(self.sim.io());
     }
 
+    fn driveJoinOwnerRestart(self: *Fixture) void {
+        self.join_restart_requested.wait(self.sim.io()) catch return;
+        if (self.driver_stop or self.teardown_started) return;
+        self.stopDataServerForRestart(self.join_owner_restart_target_index) catch |err| {
+            self.failJoinOwnerRestart(err);
+            return;
+        };
+        self.join_owner_restart_down = true;
+        self.join_restart_down.post(self.sim.io());
+
+        // Keep the exact serving process absent until the durable coordinator
+        // has selected a different group for the same partition. Reconstruct
+        // it before allowing that replacement worker to collect rows, so the
+        // two-replica source group can recover quorum for the full scan.
+        self.join_restart_recover.wait(self.sim.io()) catch return;
+        if (self.teardown_started) return;
+        self.restartDataServer(self.join_owner_restart_target_index) catch |err| {
+            self.failJoinOwnerRestart(err);
+            return;
+        };
+        self.join_owner_restart_recovered = true;
+        self.join_restart_recovered.post(self.sim.io());
+        // The fixture exposes the production control supervisor as an
+        // explicitly driven owner. Keep that owner live across the public
+        // recovery request; otherwise a two-voter group can lose the stable
+        // leader observed above and remain in pre-candidate indefinitely.
+        while (!self.driver_stop and !self.teardown_started and !self.workload_done and
+            !self.join_owner_restart_recovery_join)
+        {
+            self.runOneControlRound() catch |err| {
+                self.failJoinOwnerRestart(err);
+                return;
+            };
+            self.sim.io().sleep(.fromMilliseconds(8), .awake) catch return;
+        }
+    }
+
+    fn failJoinOwnerRestart(self: *Fixture, err: anyerror) void {
+        self.join_owner_restart_failure = err;
+        self.driver_failure = err;
+        self.join_restart_down.post(self.sim.io());
+        self.join_restart_recovered.post(self.sim.io());
+    }
+
     fn stopDataServerForRestart(self: *Fixture, index: usize) !void {
         if (index >= self.data_server_count or !self.data_server_live[index])
             return error.ProductionDataRestartTargetUnavailable;
@@ -1536,16 +1715,127 @@ pub const Fixture = struct {
                 self.data_raft_uri_live[index] = false;
             }
         }
-        // A process restart rebinds its stable advertised endpoints; it is not
-        // a metadata topology mutation. Reassert the local durable identity,
-        // then refresh every route consumer from the unchanged catalog.
-        try self.data_servers[index].acceptAuthoritativeStoreRegistration(index + 1, index + 1);
+        // A process restart preserves the stable node/store IDs while rotating
+        // the reporter incarnation and rebinding its advertised endpoints.
+        // Register through the production metadata path so delayed reports
+        // from the destroyed process are fenced and leader routing can move.
+        try self.data_servers[index].registerNodeIfConfigured();
         for (self.data_servers[0..self.data_server_count], 0..) |*server, server_index| {
             if (!self.data_server_live[server_index]) continue;
             try server.refreshRemoteMetadataSnapshot();
         }
         self.data_server_paused[index] = false;
-        for (initial_groups) |group_id| try self.waitForDataLeader(group_id);
+        try self.waitForStableDataLeaders();
+        try self.waitForDataRoutingReady();
+    }
+
+    fn waitForDataRoutingReady(self: *Fixture) !void {
+        for (0..4_096) |round| {
+            if (round % 8 == 0) {
+                try self.runOneControlRound();
+                try self.metadata.?.cluster.stepAll();
+            }
+            var all_routes_ready = true;
+            for (self.data_servers[0..self.data_server_count], 0..) |*server, source_index| {
+                if (!self.data_server_live[source_index]) continue;
+                const router = server.read_source.distributed_router orelse {
+                    all_routes_ready = false;
+                    break;
+                };
+                groups: for (initial_groups) |group_id| {
+                    var route = (try api_table_router.resolveGroupRoute(
+                        self.alloc,
+                        server.read_source.catalog,
+                        router,
+                        group_id,
+                        .prefer_leader,
+                    )) orelse {
+                        all_routes_ready = false;
+                        break;
+                    };
+                    defer route.deinit(self.alloc);
+                    const routed_index = switch (route) {
+                        .local => source_index,
+                        .remote => |remote| blk: {
+                            if (remote.node_id == 0 or remote.node_id > self.data_server_count) {
+                                all_routes_ready = false;
+                                break :groups;
+                            }
+                            break :blk @as(usize, @intCast(remote.node_id - 1));
+                        },
+                    };
+                    if (!self.data_server_live[routed_index] or
+                        self.data_servers[routed_index].data_raft == null)
+                    {
+                        all_routes_ready = false;
+                        break;
+                    }
+                    const routed_status = self.data_servers[routed_index].data_raft.?.host.http_host.host.raftStatus(group_id) orelse {
+                        all_routes_ready = false;
+                        break;
+                    };
+                    if (routed_status.soft.role != .leader or
+                        routed_status.soft.leader_id == null or
+                        routed_status.soft.leader_id.? != routed_status.id)
+                    {
+                        all_routes_ready = false;
+                        break;
+                    }
+                    const probe: struct {
+                        table: []const u8,
+                        key: []const u8,
+                        expected: []const u8,
+                    } = switch (group_id) {
+                        metadata_sim.VoprPublicClusterFixture.data_group_id => .{
+                            .table = "docs",
+                            .key = "doc:c",
+                            .expected = "production-left",
+                        },
+                        metadata_sim.VoprPublicClusterFixture.graph_data_group_id => .{
+                            .table = "docs",
+                            .key = "doc:x",
+                            .expected = "production-right",
+                        },
+                        metadata_sim.VoprPublicClusterFixture.tenant_data_group_id => .{
+                            .table = "tenant_b_docs",
+                            .key = "tenant:q",
+                            .expected = "production-tenant",
+                        },
+                        else => unreachable,
+                    };
+                    var lookup = self.data_servers[routed_index].read_source.source().lookupGroupLocal(
+                        self.alloc,
+                        group_id,
+                        probe.table,
+                        probe.key,
+                        .{},
+                        .stale,
+                    ) catch {
+                        all_routes_ready = false;
+                        break;
+                    } orelse {
+                        all_routes_ready = false;
+                        break;
+                    };
+                    defer lookup.deinit(self.alloc);
+                    if (std.mem.indexOf(u8, lookup.json, probe.expected) == null) {
+                        all_routes_ready = false;
+                        break;
+                    }
+                }
+                if (!all_routes_ready) break;
+            }
+            if (all_routes_ready) return;
+            if (round % 16 == 15) {
+                for (self.data_servers[0..self.data_server_count], 0..) |*server, server_index| {
+                    if (!self.data_server_live[server_index]) continue;
+                    try server.refreshRemoteMetadataSnapshot();
+                }
+            }
+            if (self.driver_failure) |err| return err;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.ProductionDataRoutingRecoveryTimeout;
     }
 
     pub fn start(self: *Fixture) void {
@@ -1582,6 +1872,22 @@ pub const Fixture = struct {
             self.graph_restart_future = null;
         }
         if (self.failure == null) self.failure = self.graph_owner_restart_failure;
+        if (self.join_restart_future) |*future| {
+            if (self.join_owner_restart_requested) {
+                // If the public operation failed before selecting another
+                // worker, never leave the production owner intentionally down.
+                if (self.join_owner_restart_down and !self.join_owner_restart_recovered and
+                    self.join_owner_restart_failure == null)
+                {
+                    self.join_restart_recover.post(self.sim.io());
+                }
+                future.await(self.sim.io());
+            } else {
+                future.cancel(self.sim.io());
+            }
+            self.join_restart_future = null;
+        }
+        if (self.failure == null) self.failure = self.join_owner_restart_failure;
         self.driver_stop = true;
         if (self.driver_future) |*future| {
             // The driver polls this stop bit at a 1 ms logical cadence. Join
@@ -1741,6 +2047,10 @@ pub const Fixture = struct {
             if (self.join_cancellation_enabled) {
                 self.join_cancellation_sound = try self.runJoinCancellationQuery();
                 self.join_sound = self.join_cancellation_sound;
+            } else if (self.join_owner_restart_enabled) {
+                self.join_restart_future = self.sim.io().async(driveJoinOwnerRestart, .{self});
+                self.join_owner_restart_sound = try self.runJoinOwnerRestartQuery();
+                self.join_sound = self.join_owner_restart_sound;
             } else if (self.join_worker_retry_enabled) {
                 self.join_worker_retry_sound = try self.runJoinQuery();
                 self.join_sound = self.join_worker_retry_sound;
@@ -1930,7 +2240,8 @@ pub const Fixture = struct {
     fn durableJoinEnabled(self: *const Fixture) bool {
         return self.fault_mode == .join_finalizer_ack_failure or
             self.join_cancellation_enabled or
-            self.join_worker_retry_enabled;
+            self.join_worker_retry_enabled or
+            self.join_owner_restart_enabled;
     }
 
     fn durableJoinTenantBatchAlloc(self: *Fixture) ![]u8 {
@@ -2046,6 +2357,79 @@ pub const Fixture = struct {
         return self.join_cancellation_recovered;
     }
 
+    fn runJoinOwnerRestartQuery(self: *Fixture) !bool {
+        try self.prepareJoinOwnerRestartCampaign();
+
+        self.join_owner_restart_initial_query_active = true;
+        var response = self.client.fetchQueryRaw(
+            self.data_api_uris[self.join_owner_restart_coordinator_index],
+            "tenant_b_docs",
+            durable_join_query_body,
+        ) catch {
+            self.join_owner_restart_initial_query_active = false;
+            return false;
+        };
+        self.join_owner_restart_initial_query_active = false;
+        defer response.deinit(self.alloc);
+        self.join_owner_restart_initial_status = response.status;
+        self.join_owner_restart_initial_rejected_without_partial =
+            response.status == 503 and
+            std.mem.indexOf(u8, response.body, "\"code\":\"distributed_query_unavailable\"") != null and
+            std.mem.indexOf(u8, response.body, "\"retryable\":true") != null and
+            std.mem.indexOf(u8, response.body, "\"hits\"") == null and
+            std.mem.indexOf(u8, response.body, "production-tenant") == null and
+            std.mem.indexOf(u8, response.body, "production-left") == null and
+            std.mem.indexOf(u8, response.body, "production-right") == null;
+        if (!self.join_owner_restart_initial_rejected_without_partial) return false;
+
+        // The fail-closed response is emitted only after a replacement worker
+        // has selected the partition and the stopped process is reconstructed.
+        // Still settle the state bit here so the assertion is independent of
+        // which waiter consumes the reconstruction semaphore.
+        if (self.join_owner_restart_requested) {
+            while (!self.join_owner_restart_down and self.join_owner_restart_failure == null)
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            if (self.join_owner_restart_down and
+                self.join_owner_restart_recovered_group_id == 0 and
+                self.join_owner_restart_failure == null)
+            {
+                // No alternate owner was selected before the public operation
+                // failed closed.
+                // Reconstruct the deliberately stopped process for clean
+                // ownership, then let the exact evidence check fail closed.
+                self.join_restart_recover.post(self.sim.io());
+            }
+            while (!self.join_owner_restart_recovered and self.join_owner_restart_failure == null)
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        if (!self.join_owner_restart_requested or !self.join_owner_restart_down or
+            !self.join_owner_restart_recovered or self.join_owner_restart_failure != null or
+            self.join_owner_restart_job_id == 0 or
+            self.join_owner_restart_recovered_group_id == 0 or
+            self.join_owner_restart_recovered_group_id == self.join_owner_restart_failed_group_id or
+            self.join_owner_restart_recovery_index == self.join_owner_restart_target_index)
+            return false;
+
+        self.join_owner_restart_recovery_query_active = true;
+        defer self.join_owner_restart_recovery_query_active = false;
+        self.join_owner_restart_recovery_join = try self.runJoinQuery();
+        if (!self.join_owner_restart_recovery_join) return false;
+
+        // Address the rebuilt endpoint directly. This is stronger than merely
+        // observing the replacement worker: it proves the destroyed process
+        // rebound its stable listener and can serve production routing again.
+        var rebuilt_read = self.client.fetchLookupResponse(
+            self.data_api_uris[self.join_owner_restart_target_index],
+            "tenant_b_docs",
+            "tenant:q",
+            null,
+        ) catch return false;
+        defer rebuilt_read.deinit(self.alloc);
+        self.join_owner_restart_post_reconstruction_read = rebuilt_read.status == 200 and
+            std.mem.indexOf(u8, rebuilt_read.body, "production-tenant") != null;
+        return self.join_owner_restart_post_reconstruction_read;
+    }
+
     fn fetchJoinQuery(
         self: *Fixture,
         uri: []const u8,
@@ -2115,11 +2499,47 @@ pub const Fixture = struct {
             worker_retries != .integer or finalizer_retries != .integer or
             attempts != .array)
             return false;
-        if (self.join_worker_retry_enabled) {
-            if (!self.join_worker_retry_failure_injected or
-                self.join_worker_retry_job_id == 0 or
-                self.join_worker_retry_failed_group_id == 0 or
-                self.join_worker_retry_recovered_group_id == 0 or
+        if (self.join_owner_restart_enabled and self.join_owner_restart_recovery_query_active) {
+            if (worker_retries.integer != 0 or worker_attempts != .array or
+                worker_attempts.array.items.len == 0 or finalizer_retries.integer != 0 or
+                attempts.array.items.len != 1)
+                return false;
+            for (worker_attempts.array.items) |worker_attempt| {
+                if (worker_attempt != .object) return false;
+                const worker_ok = worker_attempt.object.get("succeeded") orelse return false;
+                if (worker_ok != .bool or !worker_ok.bool) return false;
+            }
+            const finalizer = attempts.array.items[0];
+            if (finalizer != .object) return false;
+            const finalizer_group = finalizer.object.get("worker_group_id") orelse return false;
+            const finalizer_ok = finalizer.object.get("succeeded") orelse return false;
+            return finalizer_group == .integer and finalizer_group.integer != 0 and
+                finalizer_ok == .bool and finalizer_ok.bool;
+        }
+        if (self.join_worker_retry_enabled or self.join_owner_restart_enabled) {
+            const failure_injected = if (self.join_owner_restart_enabled)
+                self.join_owner_restart_requested and self.join_owner_restart_down and
+                    self.join_owner_restart_recovered
+            else
+                self.join_worker_retry_failure_injected;
+            const job_id = if (self.join_owner_restart_enabled)
+                self.join_owner_restart_job_id
+            else
+                self.join_worker_retry_job_id;
+            const partition_index = if (self.join_owner_restart_enabled)
+                self.join_owner_restart_partition_index
+            else
+                self.join_worker_retry_partition_index;
+            const failed_group_id = if (self.join_owner_restart_enabled)
+                self.join_owner_restart_failed_group_id
+            else
+                self.join_worker_retry_failed_group_id;
+            const recovered_group_id = if (self.join_owner_restart_enabled)
+                self.join_owner_restart_recovered_group_id
+            else
+                self.join_worker_retry_recovered_group_id;
+            if (!failure_injected or job_id == 0 or
+                failed_group_id == 0 or recovered_group_id == 0 or
                 worker_retries.integer != 1 or
                 worker_attempts != .array or worker_attempts.array.items.len < 2 or
                 finalizer_retries.integer != 0 or attempts.array.items.len != 1)
@@ -2145,15 +2565,15 @@ pub const Fixture = struct {
             }
             return failed_partition == .integer and
                 failed_partition.integer >= 0 and
-                @as(usize, @intCast(failed_partition.integer)) == self.join_worker_retry_partition_index and
+                @as(usize, @intCast(failed_partition.integer)) == partition_index and
                 failed_group == .integer and
-                failed_group.integer == self.join_worker_retry_failed_group_id and
+                failed_group.integer == failed_group_id and
                 failed_ok == .bool and !failed_ok.bool and
                 recovered_partition == .integer and
                 recovered_partition.integer >= 0 and
-                @as(usize, @intCast(recovered_partition.integer)) == self.join_worker_retry_partition_index and
+                @as(usize, @intCast(recovered_partition.integer)) == partition_index and
                 recovered_group == .integer and
-                recovered_group.integer == self.join_worker_retry_recovered_group_id and
+                recovered_group.integer == recovered_group_id and
                 recovered_group.integer != failed_group.integer and
                 recovered_ok == .bool and recovered_ok.bool and
                 finalizer_group == .integer and finalizer_group.integer != 0 and
@@ -3152,6 +3572,61 @@ pub const Fixture = struct {
         return error.ProductionDataLeaderTimeout;
     }
 
+    fn waitForStableDataLeaders(self: *Fixture) !void {
+        var stable_rounds: usize = 0;
+        for (0..30_000) |round| {
+            // This fixture borrows the production control loop behind an
+            // explicit driver. A restarted two-voter group can be momentarily
+            // leaderful and then fall back to pre-candidate; keep the real
+            // campaign/reconciliation owner advancing until every initial
+            // group agrees on one leader for a sustained window.
+            if (round % 8 == 0) try self.runOneControlRound();
+
+            var all_stable = true;
+            for (initial_groups) |group_id| {
+                var replica_count: usize = 0;
+                var leader_count: usize = 0;
+                var leader_id: ?u64 = null;
+                for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+                    if (!self.data_server_live[index]) continue;
+                    const raft = server.data_raft orelse continue;
+                    const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
+                    replica_count += 1;
+                    if (status.soft.role == .leader and
+                        status.soft.leader_id != null and
+                        status.soft.leader_id.? == status.id)
+                    {
+                        leader_count += 1;
+                        leader_id = status.id;
+                    }
+                }
+                if (replica_count != 2 or leader_count != 1) {
+                    all_stable = false;
+                    break;
+                }
+                for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
+                    if (!self.data_server_live[index]) continue;
+                    const raft = server.data_raft orelse continue;
+                    const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
+                    if (status.soft.leader_id != leader_id) {
+                        all_stable = false;
+                        break;
+                    }
+                }
+                if (!all_stable) break;
+            }
+            if (all_stable) {
+                stable_rounds += 1;
+                if (stable_rounds == 32) return;
+            } else {
+                stable_rounds = 0;
+            }
+            if (self.driver_failure) |err| return err;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        }
+        return error.ProductionDataLeaderTimeout;
+    }
+
     fn currentDataLeaderIndex(self: *Fixture, group_id: u64) ?usize {
         for (self.data_servers[0..self.data_server_count], 0..) |*server, index| {
             if (!self.data_server_live[index]) continue;
@@ -3387,6 +3862,10 @@ pub const Fixture = struct {
             future.cancel(self.sim.io());
             self.graph_restart_future = null;
         }
+        if (self.join_restart_future) |*future| {
+            future.cancel(self.sim.io());
+            self.join_restart_future = null;
+        }
         if (self.driver_future) |*future| {
             future.cancel(self.sim.io());
             self.driver_future = null;
@@ -3454,6 +3933,20 @@ pub const Fixture = struct {
         join_worker_retry_failed_group_id: u64,
         join_worker_retry_recovered_group_id: u64,
         join_worker_retry_ok: bool,
+        join_owner_restart_job_id: u64,
+        join_owner_restart_partition_index: usize,
+        join_owner_restart_failed_group_id: u64,
+        join_owner_restart_recovered_group_id: u64,
+        join_owner_restart_target_index: usize,
+        join_owner_restart_recovery_index: usize,
+        join_owner_restart_requested: bool,
+        join_owner_restart_down: bool,
+        join_owner_restart_recovered: bool,
+        join_owner_restart_initial_status: u16,
+        join_owner_restart_initial_rejected_without_partial: bool,
+        join_owner_restart_recovery_join: bool,
+        join_owner_restart_post_reconstruction_read: bool,
+        join_owner_restart_ok: bool,
         join_cancellation_boundary_observed: bool,
         join_cancellation_job_id: u64,
         join_cancellation_owner_group_id: u64,
@@ -3535,6 +4028,7 @@ pub const Fixture = struct {
                 (!self.join_enabled or self.join_sound) and
                 (!self.join_cancellation_enabled or self.join_cancellation_sound) and
                 (!self.join_worker_retry_enabled or self.join_worker_retry_sound) and
+                (!self.join_owner_restart_enabled or self.join_owner_restart_sound) and
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
@@ -3557,6 +4051,20 @@ pub const Fixture = struct {
             .join_worker_retry_failed_group_id = self.join_worker_retry_failed_group_id,
             .join_worker_retry_recovered_group_id = self.join_worker_retry_recovered_group_id,
             .join_worker_retry_ok = self.join_worker_retry_sound,
+            .join_owner_restart_job_id = self.join_owner_restart_job_id,
+            .join_owner_restart_partition_index = self.join_owner_restart_partition_index,
+            .join_owner_restart_failed_group_id = self.join_owner_restart_failed_group_id,
+            .join_owner_restart_recovered_group_id = self.join_owner_restart_recovered_group_id,
+            .join_owner_restart_target_index = self.join_owner_restart_target_index,
+            .join_owner_restart_recovery_index = self.join_owner_restart_recovery_index,
+            .join_owner_restart_requested = self.join_owner_restart_requested,
+            .join_owner_restart_down = self.join_owner_restart_down,
+            .join_owner_restart_recovered = self.join_owner_restart_recovered,
+            .join_owner_restart_initial_status = self.join_owner_restart_initial_status,
+            .join_owner_restart_initial_rejected_without_partial = self.join_owner_restart_initial_rejected_without_partial,
+            .join_owner_restart_recovery_join = self.join_owner_restart_recovery_join,
+            .join_owner_restart_post_reconstruction_read = self.join_owner_restart_post_reconstruction_read,
+            .join_owner_restart_ok = self.join_owner_restart_sound,
             .join_cancellation_boundary_observed = self.join_cancellation_boundary_observed,
             .join_cancellation_job_id = self.join_cancellation_job_id,
             .join_cancellation_owner_group_id = self.join_cancellation_owner_group_id,

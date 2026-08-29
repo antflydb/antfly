@@ -7801,7 +7801,21 @@ pub const DataServer = struct {
     fn dataReadRouterGroupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const raft = self.data_raft orelse return null;
-        return raft.host.http_host.host.leaderId(group_id);
+        // A host that owns this group has the freshest leader observation.
+        // Non-member coordinators may retain a pre-restart leader hint in the
+        // managed host indefinitely because they no longer receive that
+        // group's Raft traffic. Never let such a hint override authoritative
+        // metadata routing.
+        if (raft.host.http_host.host.raftStatus(group_id) != null)
+            return raft.host.http_host.host.leaderId(group_id);
+
+        var snapshot = self.read_source.catalog.adminSnapshot() catch return null;
+        defer self.read_source.catalog.freeAdminSnapshot(&snapshot);
+        const status = findMergedSnapshotGroupStatus(snapshot.merged_group_statuses, group_id) orelse return null;
+        if (!status.leader_known or status.leader_store_id == 0) return null;
+        const store = findSnapshotStore(snapshot.stores, status.leader_store_id) orelse return null;
+        if (!store.live or !std.mem.eql(u8, store.health_class, "healthy")) return null;
+        return store.node_id;
     }
 
     fn dataReadRouterNodeBaseUri(ptr: *anyopaque, alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
