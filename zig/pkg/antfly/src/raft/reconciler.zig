@@ -267,6 +267,7 @@ pub const ReconcileResult = struct {
     removed: usize = 0,
     refreshed_peers: usize = 0,
     membership_proposals: usize = 0,
+    catalog_mutation_outcome: catalog.ReplicaCatalogMutationOutcome = .unchanged,
 };
 
 const PreparedEnsure = struct {
@@ -336,14 +337,15 @@ pub const PreparedReconcile = struct {
     pub fn commit(self: *PreparedReconcile) !ReconcileResult {
         if (!self.durability_complete or self.committed or self.aborted) return error.InvalidReconcilePhase;
 
+        var catalog_mutation_outcome: catalog.ReplicaCatalogMutationOutcome = .unchanged;
         if (self.catalog_upserts.len > 0 or self.removals.len > 0) {
-            try self.owner.host.commitReplicaCatalog(
+            catalog_mutation_outcome = try self.owner.host.commitReplicaCatalog(
                 self.catalog_revision,
                 self.catalog_upserts,
                 self.removals,
             );
         }
-        var result: ReconcileResult = .{};
+        var result: ReconcileResult = .{ .catalog_mutation_outcome = catalog_mutation_outcome };
         for (self.ensures) |*entry| {
             const intent = self.intents[entry.intent_index];
             const prepared = if (entry.replica) |*replica| replica else return error.InvalidReconcilePhase;
@@ -829,6 +831,10 @@ test "prepared reconcile publishes catalog admission atomically before runtime p
 
     const result = try prepared.commit();
     try std.testing.expectEqual(@as(usize, 1), result.ensured);
+    try std.testing.expectEqual(
+        catalog.ReplicaCatalogMutationOutcome.published_durable,
+        result.catalog_mutation_outcome,
+    );
     try std.testing.expectEqual(host_mod.HostedReplicaStatus.active, host.status(502));
     {
         const records = try replica_catalog.catalog().listReplicas(std.testing.allocator);
@@ -849,7 +855,7 @@ test "prepared reconcile rejects catalog races without clobbering concurrent adm
     };
     var replica_catalog = catalog.MemoryReplicaCatalog.init(std.testing.allocator);
     defer replica_catalog.deinit();
-    try replica_catalog.catalog().upsertReplica(.{
+    _ = try replica_catalog.catalog().upsertReplica(.{
         .group_id = 501,
         .replica_id = 1,
         .local_node_id = 1,
@@ -887,7 +893,7 @@ test "prepared reconcile rejects catalog races without clobbering concurrent adm
         try std.testing.expectEqual(@as(u64, 501), staged[0].group_id);
     }
 
-    try replica_catalog.catalog().upsertReplica(.{
+    _ = try replica_catalog.catalog().upsertReplica(.{
         .group_id = 503,
         .replica_id = 3,
         .local_node_id = 1,

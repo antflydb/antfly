@@ -20,6 +20,7 @@ pub const ReplicaBootstrapSource = impl.ReplicaBootstrapSource;
 pub const SnapshotBootstrapRecord = impl.SnapshotBootstrapRecord;
 pub const ReplicaRecord = impl.ReplicaRecord;
 pub const ReplicaCatalog = impl.ReplicaCatalog;
+pub const ReplicaCatalogMutationOutcome = impl.ReplicaCatalogMutationOutcome;
 pub const MemoryReplicaCatalog = impl.MemoryReplicaCatalog;
 pub const FileReplicaCatalog = impl.FileReplicaCatalog;
 pub const freeReplicaRecords = impl.freeReplicaRecords;

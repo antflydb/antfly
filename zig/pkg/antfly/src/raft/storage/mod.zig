@@ -17,6 +17,7 @@ pub const catalog = @import("catalog.zig");
 pub const ReplicaBootstrapMode = catalog.ReplicaBootstrapMode;
 pub const ReplicaRecord = catalog.ReplicaRecord;
 pub const ReplicaCatalog = catalog.ReplicaCatalog;
+pub const ReplicaCatalogMutationOutcome = catalog.ReplicaCatalogMutationOutcome;
 pub const MemoryReplicaCatalog = catalog.MemoryReplicaCatalog;
 pub const FileReplicaCatalog = catalog.FileReplicaCatalog;
 pub const file_snapshot_store = @import("file_snapshot_store.zig");

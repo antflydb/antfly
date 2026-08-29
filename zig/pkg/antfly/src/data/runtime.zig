@@ -27755,7 +27755,7 @@ test "data server wires configured HA executors into API server" {
     {
         var replica_catalog = try antfly.raft.FileReplicaCatalog.init(alloc, replica_catalog_path);
         defer replica_catalog.deinit();
-        try replica_catalog.catalog().upsertReplica(.{
+        _ = try replica_catalog.catalog().upsertReplica(.{
             .group_id = 1,
             .replica_id = 101,
             .local_node_id = 11,

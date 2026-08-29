@@ -221,7 +221,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
             .start_optional_runtimes = false,
         });
         if (try staged.publish() != .durable) return error.LiveDBPublicationConflict;
-        try catalog.catalog().upsertReplica(.{
+        _ = try catalog.catalog().upsertReplica(.{
             .group_id = replica.group_id,
             .replica_id = request.target_replica_id,
             .local_node_id = request.target_local_node_id,

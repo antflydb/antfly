@@ -136,6 +136,7 @@ pub const MetadataPlacementState = reconciler.MetadataPlacementState;
 pub const PeerResolver = peer_resolver.PeerResolver;
 pub const PeerEndpoint = peer_resolver.PeerEndpoint;
 pub const ReplicaCatalog = storage.ReplicaCatalog;
+pub const ReplicaCatalogMutationOutcome = storage.ReplicaCatalogMutationOutcome;
 pub const ReplicaRecord = storage.ReplicaRecord;
 pub const MemoryReplicaCatalog = storage.MemoryReplicaCatalog;
 pub const FileReplicaCatalog = storage.FileReplicaCatalog;

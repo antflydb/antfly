@@ -167,6 +167,7 @@ pub const HostMetrics = struct {
     reconcile_rounds: usize = 0,
     ensure_replica_calls: usize = 0,
     remove_replica_calls: usize = 0,
+    catalog_durability_uncertainties: usize = 0,
     endpoint_refreshes: usize = 0,
     endpoint_removals: usize = 0,
     inbound_message_enqueues: usize = 0,
@@ -376,9 +377,14 @@ pub const Host = struct {
 
         // Persist admission before publication. A crash between these steps
         // leaves a recoverable catalog entry instead of an untracked live group.
-        if (persist_catalog) if (self.deps.replica_catalog) |replica_catalog| {
-            try replica_catalog.upsertReplica(record);
-        };
+        const catalog_mutation_outcome: catalog.ReplicaCatalogMutationOutcome = if (persist_catalog)
+            if (self.deps.replica_catalog) |replica_catalog|
+                try replica_catalog.upsertReplica(record)
+            else
+                .unchanged
+        else
+            .unchanged;
+        self.noteCatalogMutationOutcome(catalog_mutation_outcome);
         return .{
             .factory = factory,
             .descriptor = descriptor,
@@ -435,13 +441,23 @@ pub const Host = struct {
         expected_revision: ?u64,
         upserts: []const catalog.ReplicaRecord,
         removals: []const u64,
-    ) !void {
-        const replica_catalog = self.deps.replica_catalog orelse return;
-        try replica_catalog.applyBatch(
+    ) !catalog.ReplicaCatalogMutationOutcome {
+        const replica_catalog = self.deps.replica_catalog orelse return .unchanged;
+        const outcome = try replica_catalog.applyBatch(
             expected_revision orelse return error.MissingReplicaCatalogRevision,
             upserts,
             removals,
         );
+        self.noteCatalogMutationOutcome(outcome);
+        return outcome;
+    }
+
+    pub fn noteCatalogMutationOutcome(
+        self: *Host,
+        outcome: catalog.ReplicaCatalogMutationOutcome,
+    ) void {
+        if (outcome == .published_durability_uncertain)
+            self.metrics.catalog_durability_uncertainties += 1;
     }
 
     pub fn removePreparedReplica(self: *Host, group_id: u64) !void {
@@ -483,9 +499,11 @@ pub const Host = struct {
         if (self.runtime_host.group(group_id) == null) return error.UnknownGroup;
         // Persist removal intent before tearing down the live owner. A catalog
         // failure therefore remains retryable through normal reconciliation.
-        if (self.deps.replica_catalog) |replica_catalog| {
-            _ = try replica_catalog.removeReplica(group_id);
-        }
+        const catalog_mutation_outcome: catalog.ReplicaCatalogMutationOutcome = if (self.deps.replica_catalog) |replica_catalog|
+            try replica_catalog.removeReplica(group_id)
+        else
+            .unchanged;
+        self.noteCatalogMutationOutcome(catalog_mutation_outcome);
         try self.runtime_host.removeReplica(group_id);
         self.metrics.remove_replica_calls += 1;
         self.clearBootstrapStatus(group_id);
@@ -1222,10 +1240,11 @@ pub fn mergeRuntimeHooks(base: RuntimeHooks, overlay: RuntimeHooks) RuntimeHooks
     return merged;
 }
 
-test "host can ensure and remove a replica" {
+test "host completes published uncertain catalog mutations but stops on pre-publish failure" {
     const Factory = struct {
         alloc: std.mem.Allocator,
         store: *raft_engine.core.MemoryStorage,
+        fail_install: bool = false,
 
         fn iface(self: *@This()) ReplicaDescriptorFactory {
             return .{
@@ -1249,7 +1268,7 @@ test "host can ensure and remove a replica" {
                         .group_id = record.group_id,
                         .peers = peers[0..],
                         .election_tick = 5,
-                        .heartbeat_tick = 1,
+                        .heartbeat_tick = if (self.fail_install) 0 else 1,
                         .pre_vote = false,
                     },
                     .storage = self.store.storage(),
@@ -1272,6 +1291,8 @@ test "host can ensure and remove a replica" {
     const RemovalCatalog = struct {
         fail_remove: bool = true,
         remove_calls: usize = 0,
+        upsert_outcome: catalog.ReplicaCatalogMutationOutcome = .published_durable,
+        remove_outcome: catalog.ReplicaCatalogMutationOutcome = .published_durable,
 
         fn iface(self: *@This()) catalog.ReplicaCatalog {
             return .{
@@ -1286,13 +1307,16 @@ test "host can ensure and remove a replica" {
             };
         }
 
-        fn upsertReplica(_: *anyopaque, _: catalog.ReplicaRecord) !void {}
+        fn upsertReplica(ptr: *anyopaque, _: catalog.ReplicaRecord) !catalog.ReplicaCatalogMutationOutcome {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.upsert_outcome;
+        }
 
-        fn removeReplica(ptr: *anyopaque, _: u64) !bool {
+        fn removeReplica(ptr: *anyopaque, _: u64) !catalog.ReplicaCatalogMutationOutcome {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.remove_calls += 1;
             if (self.fail_remove) return error.InjectedCatalogRemovalFailure;
-            return true;
+            return self.remove_outcome;
         }
 
         fn listReplicas(_: *anyopaque, alloc: std.mem.Allocator) ![]catalog.ReplicaRecord {
@@ -1308,7 +1332,9 @@ test "host can ensure and remove a replica" {
             _: u64,
             _: []const catalog.ReplicaRecord,
             _: []const u64,
-        ) !void {}
+        ) !catalog.ReplicaCatalogMutationOutcome {
+            return .unchanged;
+        }
     };
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -1333,9 +1359,29 @@ test "host can ensure and remove a replica" {
     try std.testing.expectEqual(.active, host.status(41));
 
     replica_catalog.fail_remove = false;
+    replica_catalog.remove_outcome = .published_durability_uncertain;
     try host.removeReplica(41);
     try std.testing.expectEqual(.absent, host.status(41));
     try std.testing.expectEqual(@as(usize, 2), replica_catalog.remove_calls);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().catalog_durability_uncertainties);
+
+    replica_catalog.upsert_outcome = .published_durability_uncertain;
+    _ = try host.ensureReplica(.{
+        .group_id = 42,
+        .replica_id = 1,
+        .local_node_id = 1,
+    });
+    try std.testing.expectEqual(.active, host.status(42));
+    try std.testing.expectEqual(@as(usize, 2), host.metricsSnapshot().catalog_durability_uncertainties);
+
+    factory.fail_install = true;
+    try std.testing.expectError(error.InvalidHeartbeatTick, host.ensureReplica(.{
+        .group_id = 43,
+        .replica_id = 1,
+        .local_node_id = 1,
+    }));
+    try std.testing.expectEqual(.absent, host.status(43));
+    try std.testing.expectEqual(@as(usize, 3), host.metricsSnapshot().catalog_durability_uncertainties);
 }
 
 test "host rejects live snapshot uploads addressed to another node" {
