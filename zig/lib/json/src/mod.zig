@@ -279,6 +279,29 @@ test "parseFromSlice stays source-compatible with std.json callers" {
     try std.testing.expectEqual(false, parsed.value.enabled);
 }
 
+test "generated OpenAPI object metadata preserves automatic SIMD admission" {
+    const T = struct {
+        optional_value: ?u32 = null,
+
+        pub const antflyOpenApiFieldMetadata = .{
+            .{ "optional_value", "optional_value", true },
+        };
+
+        pub fn jsonParse(_: Allocator, _: anytype, _: ParseOptions) !@This() {
+            return error.TestExpectedError;
+        }
+    };
+    const input = " " ** 256;
+    const selection = backendSelectionForTypedSlice(T, input, .{ .simd_min_input_len = 0 });
+    if (simdTargetSupported()) {
+        try std.testing.expectEqual(Backend.simd, selection.selected);
+        try std.testing.expectEqual(BackendSelectionReason.simd_partial_backend, selection.reason);
+    } else {
+        try std.testing.expectEqual(Backend.stdlib, selection.selected);
+        try std.testing.expectEqual(BackendSelectionReason.unsupported_target, selection.reason);
+    }
+}
+
 test "parseFromSliceLeaky supports Value callers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

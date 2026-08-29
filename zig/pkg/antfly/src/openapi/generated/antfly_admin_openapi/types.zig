@@ -24,28 +24,23 @@ pub const CommitAppendRequest = struct {
     commit_timestamp_ns: ?i64 = null,
     sync_policy: HASyncPolicy,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "payload", "payload", false },
+        .{ "kind", "kind", true },
+        .{ "payload_codec", "payload_codec", true },
+        .{ "shard_id", "shard_id", true },
+        .{ "table_id", "table_id", true },
+        .{ "commit_timestamp_ns", "commit_timestamp_ns", true },
+        .{ "sync_policy", "sync_policy", false },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "payload", .zig_name = "payload", .rejects_null = false },
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = true },
-            .{ .json_name = "payload_codec", .zig_name = "payload_codec", .rejects_null = true },
-            .{ .json_name = "shard_id", .zig_name = "shard_id", .rejects_null = true },
-            .{ .json_name = "table_id", .zig_name = "table_id", .rejects_null = true },
-            .{ .json_name = "commit_timestamp_ns", .zig_name = "commit_timestamp_ns", .rejects_null = true },
-            .{ .json_name = "sync_policy", .zig_name = "sync_policy", .rejects_null = false },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "payload", .zig_name = "payload", .rejects_null = false },
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = true },
-            .{ .json_name = "payload_codec", .zig_name = "payload_codec", .rejects_null = true },
-            .{ .json_name = "shard_id", .zig_name = "shard_id", .rejects_null = true },
-            .{ .json_name = "table_id", .zig_name = "table_id", .rejects_null = true },
-            .{ .json_name = "commit_timestamp_ns", .zig_name = "commit_timestamp_ns", .rejects_null = true },
-            .{ .json_name = "sync_policy", .zig_name = "sync_policy", .rejects_null = false },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -94,32 +89,25 @@ pub const FenceAcquireRequest = struct {
     force: bool,
     reason: ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "identity", "identity", false },
+        .{ "old_primary_id", "old_primary_id", false },
+        .{ "promoted_node_id", "promoted_node_id", false },
+        .{ "new_timeline_id", "new_timeline_id", false },
+        .{ "new_epoch", "new_epoch", false },
+        .{ "required_lsn", "required_lsn", false },
+        .{ "observed_lsn", "observed_lsn", false },
+        .{ "force", "force", false },
+        .{ "reason", "reason", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "old_primary_id", .zig_name = "old_primary_id", .rejects_null = false },
-            .{ .json_name = "promoted_node_id", .zig_name = "promoted_node_id", .rejects_null = false },
-            .{ .json_name = "new_timeline_id", .zig_name = "new_timeline_id", .rejects_null = false },
-            .{ .json_name = "new_epoch", .zig_name = "new_epoch", .rejects_null = false },
-            .{ .json_name = "required_lsn", .zig_name = "required_lsn", .rejects_null = false },
-            .{ .json_name = "observed_lsn", .zig_name = "observed_lsn", .rejects_null = false },
-            .{ .json_name = "force", .zig_name = "force", .rejects_null = false },
-            .{ .json_name = "reason", .zig_name = "reason", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "old_primary_id", .zig_name = "old_primary_id", .rejects_null = false },
-            .{ .json_name = "promoted_node_id", .zig_name = "promoted_node_id", .rejects_null = false },
-            .{ .json_name = "new_timeline_id", .zig_name = "new_timeline_id", .rejects_null = false },
-            .{ .json_name = "new_epoch", .zig_name = "new_epoch", .rejects_null = false },
-            .{ .json_name = "required_lsn", .zig_name = "required_lsn", .rejects_null = false },
-            .{ .json_name = "observed_lsn", .zig_name = "observed_lsn", .rejects_null = false },
-            .{ .json_name = "force", .zig_name = "force", .rejects_null = false },
-            .{ .json_name = "reason", .zig_name = "reason", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -205,20 +193,19 @@ pub const HACurrentFenceResponse = struct {
     held: bool,
     receipt: ?HAFenceReceipt = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "held", "held", false },
+        .{ "receipt", "receipt", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "schema_version", .zig_name = "schema_version", .rejects_null = false },
-            .{ .json_name = "held", .zig_name = "held", .rejects_null = false },
-            .{ .json_name = "receipt", .zig_name = "receipt", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "schema_version", .zig_name = "schema_version", .rejects_null = false },
-            .{ .json_name = "held", .zig_name = "held", .rejects_null = false },
-            .{ .json_name = "receipt", .zig_name = "receipt", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -320,28 +307,23 @@ pub const HAOwnerJobDecision = struct {
     next_lsn: i64,
     promotion_handoff: ?HAPromotionHandoff = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "role", "role", false },
+        .{ "action", "action", false },
+        .{ "identity", "identity", false },
+        .{ "durable_lsn", "durable_lsn", false },
+        .{ "next_lsn", "next_lsn", false },
+        .{ "promotion_handoff", "promotion_handoff", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = false },
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "action", .zig_name = "action", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "durable_lsn", .zig_name = "durable_lsn", .rejects_null = false },
-            .{ .json_name = "next_lsn", .zig_name = "next_lsn", .rejects_null = false },
-            .{ .json_name = "promotion_handoff", .zig_name = "promotion_handoff", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = false },
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "action", .zig_name = "action", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "durable_lsn", .zig_name = "durable_lsn", .rejects_null = false },
-            .{ .json_name = "next_lsn", .zig_name = "next_lsn", .rejects_null = false },
-            .{ .json_name = "promotion_handoff", .zig_name = "promotion_handoff", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -377,30 +359,24 @@ pub const HAPrimarySnapshot = struct {
     durability: ?HADurabilityDecision = null,
     lease_watchdog: ?HALeaseWatchdogProof = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "node_id", "node_id", false },
+        .{ "identity", "identity", false },
+        .{ "current_lsn", "current_lsn", false },
+        .{ "slots", "slots", false },
+        .{ "retention", "retention", false },
+        .{ "durability", "durability", true },
+        .{ "lease_watchdog", "lease_watchdog", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "node_id", .zig_name = "node_id", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "current_lsn", .zig_name = "current_lsn", .rejects_null = false },
-            .{ .json_name = "slots", .zig_name = "slots", .rejects_null = false },
-            .{ .json_name = "retention", .zig_name = "retention", .rejects_null = false },
-            .{ .json_name = "durability", .zig_name = "durability", .rejects_null = true },
-            .{ .json_name = "lease_watchdog", .zig_name = "lease_watchdog", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "node_id", .zig_name = "node_id", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "current_lsn", .zig_name = "current_lsn", .rejects_null = false },
-            .{ .json_name = "slots", .zig_name = "slots", .rejects_null = false },
-            .{ .json_name = "retention", .zig_name = "retention", .rejects_null = false },
-            .{ .json_name = "durability", .zig_name = "durability", .rejects_null = true },
-            .{ .json_name = "lease_watchdog", .zig_name = "lease_watchdog", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -574,24 +550,21 @@ pub const HARejoinAssessResponse = struct {
     /// Present when `/ha/rejoin/reseed` marked the former-primary slot for base-backup reseed.
     reseed: ?HARejoinReseedResult = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "schema_version", "schema_version", false },
+        .{ "action", "action", false },
+        .{ "assessment", "assessment", false },
+        .{ "rewind", "rewind", true },
+        .{ "reseed", "reseed", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "schema_version", .zig_name = "schema_version", .rejects_null = false },
-            .{ .json_name = "action", .zig_name = "action", .rejects_null = false },
-            .{ .json_name = "assessment", .zig_name = "assessment", .rejects_null = false },
-            .{ .json_name = "rewind", .zig_name = "rewind", .rejects_null = true },
-            .{ .json_name = "reseed", .zig_name = "reseed", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "schema_version", .zig_name = "schema_version", .rejects_null = false },
-            .{ .json_name = "action", .zig_name = "action", .rejects_null = false },
-            .{ .json_name = "assessment", .zig_name = "assessment", .rejects_null = false },
-            .{ .json_name = "rewind", .zig_name = "rewind", .rejects_null = true },
-            .{ .json_name = "reseed", .zig_name = "reseed", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -996,50 +969,34 @@ pub const HAStandbySnapshot = struct {
     can_serve_safe_reads: bool,
     lease_watchdog: ?HALeaseWatchdogProof = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "node_id", "node_id", false },
+        .{ "identity", "identity", false },
+        .{ "received_lsn", "received_lsn", false },
+        .{ "applied_lsn", "applied_lsn", false },
+        .{ "safe_read_lsn", "safe_read_lsn", false },
+        .{ "upstream_lsn", "upstream_lsn", false },
+        .{ "write_lag_lsn", "write_lag_lsn", false },
+        .{ "receive_lag_lsn", "receive_lag_lsn", false },
+        .{ "apply_lag_lsn", "apply_lag_lsn", false },
+        .{ "last_error", "last_error", false },
+        .{ "last_attempt_ns", "last_attempt_ns", false },
+        .{ "last_success_ns", "last_success_ns", false },
+        .{ "replication_failures_total", "replication_failures_total", false },
+        .{ "unapplied_lsn_count", "unapplied_lsn_count", false },
+        .{ "caught_up_to_received", "caught_up_to_received", false },
+        .{ "can_serve_safe_reads", "can_serve_safe_reads", false },
+        .{ "lease_watchdog", "lease_watchdog", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "node_id", .zig_name = "node_id", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "received_lsn", .zig_name = "received_lsn", .rejects_null = false },
-            .{ .json_name = "applied_lsn", .zig_name = "applied_lsn", .rejects_null = false },
-            .{ .json_name = "safe_read_lsn", .zig_name = "safe_read_lsn", .rejects_null = false },
-            .{ .json_name = "upstream_lsn", .zig_name = "upstream_lsn", .rejects_null = false },
-            .{ .json_name = "write_lag_lsn", .zig_name = "write_lag_lsn", .rejects_null = false },
-            .{ .json_name = "receive_lag_lsn", .zig_name = "receive_lag_lsn", .rejects_null = false },
-            .{ .json_name = "apply_lag_lsn", .zig_name = "apply_lag_lsn", .rejects_null = false },
-            .{ .json_name = "last_error", .zig_name = "last_error", .rejects_null = false },
-            .{ .json_name = "last_attempt_ns", .zig_name = "last_attempt_ns", .rejects_null = false },
-            .{ .json_name = "last_success_ns", .zig_name = "last_success_ns", .rejects_null = false },
-            .{ .json_name = "replication_failures_total", .zig_name = "replication_failures_total", .rejects_null = false },
-            .{ .json_name = "unapplied_lsn_count", .zig_name = "unapplied_lsn_count", .rejects_null = false },
-            .{ .json_name = "caught_up_to_received", .zig_name = "caught_up_to_received", .rejects_null = false },
-            .{ .json_name = "can_serve_safe_reads", .zig_name = "can_serve_safe_reads", .rejects_null = false },
-            .{ .json_name = "lease_watchdog", .zig_name = "lease_watchdog", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "node_id", .zig_name = "node_id", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "received_lsn", .zig_name = "received_lsn", .rejects_null = false },
-            .{ .json_name = "applied_lsn", .zig_name = "applied_lsn", .rejects_null = false },
-            .{ .json_name = "safe_read_lsn", .zig_name = "safe_read_lsn", .rejects_null = false },
-            .{ .json_name = "upstream_lsn", .zig_name = "upstream_lsn", .rejects_null = false },
-            .{ .json_name = "write_lag_lsn", .zig_name = "write_lag_lsn", .rejects_null = false },
-            .{ .json_name = "receive_lag_lsn", .zig_name = "receive_lag_lsn", .rejects_null = false },
-            .{ .json_name = "apply_lag_lsn", .zig_name = "apply_lag_lsn", .rejects_null = false },
-            .{ .json_name = "last_error", .zig_name = "last_error", .rejects_null = false },
-            .{ .json_name = "last_attempt_ns", .zig_name = "last_attempt_ns", .rejects_null = false },
-            .{ .json_name = "last_success_ns", .zig_name = "last_success_ns", .rejects_null = false },
-            .{ .json_name = "replication_failures_total", .zig_name = "replication_failures_total", .rejects_null = false },
-            .{ .json_name = "unapplied_lsn_count", .zig_name = "unapplied_lsn_count", .rejects_null = false },
-            .{ .json_name = "caught_up_to_received", .zig_name = "caught_up_to_received", .rejects_null = false },
-            .{ .json_name = "can_serve_safe_reads", .zig_name = "can_serve_safe_reads", .rejects_null = false },
-            .{ .json_name = "lease_watchdog", .zig_name = "lease_watchdog", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1175,24 +1132,21 @@ pub const HASyncPolicy = struct {
     /// Caller-visible action when synchronous durability is not currently satisfied.
     failure_policy: ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "selection", "selection", true },
+        .{ "required", "required", true },
+        .{ "standby_names", "standby_names", true },
+        .{ "failure_policy", "failure_policy", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = false },
-            .{ .json_name = "selection", .zig_name = "selection", .rejects_null = true },
-            .{ .json_name = "required", .zig_name = "required", .rejects_null = true },
-            .{ .json_name = "standby_names", .zig_name = "standby_names", .rejects_null = true },
-            .{ .json_name = "failure_policy", .zig_name = "failure_policy", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "mode", .zig_name = "mode", .rejects_null = false },
-            .{ .json_name = "selection", .zig_name = "selection", .rejects_null = true },
-            .{ .json_name = "required", .zig_name = "required", .rejects_null = true },
-            .{ .json_name = "standby_names", .zig_name = "standby_names", .rejects_null = true },
-            .{ .json_name = "failure_policy", .zig_name = "failure_policy", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1237,26 +1191,22 @@ pub const HAWriteDecision = struct {
     next_lsn: i64,
     promotion_handoff: ?HAPromotionHandoff = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "action", "action", false },
+        .{ "identity", "identity", false },
+        .{ "durable_lsn", "durable_lsn", false },
+        .{ "next_lsn", "next_lsn", false },
+        .{ "promotion_handoff", "promotion_handoff", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "action", .zig_name = "action", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "durable_lsn", .zig_name = "durable_lsn", .rejects_null = false },
-            .{ .json_name = "next_lsn", .zig_name = "next_lsn", .rejects_null = false },
-            .{ .json_name = "promotion_handoff", .zig_name = "promotion_handoff", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "action", .zig_name = "action", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "durable_lsn", .zig_name = "durable_lsn", .rejects_null = false },
-            .{ .json_name = "next_lsn", .zig_name = "next_lsn", .rejects_null = false },
-            .{ .json_name = "promotion_handoff", .zig_name = "promotion_handoff", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1284,20 +1234,19 @@ pub const OwnerJobCheckRequest = struct {
     kind: []const u8,
     expected_identity: ?HAIdentity = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "kind", "kind", false },
+        .{ "expected_identity", "expected_identity", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = false },
-            .{ .json_name = "expected_identity", .zig_name = "expected_identity", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "kind", .zig_name = "kind", .rejects_null = false },
-            .{ .json_name = "expected_identity", .zig_name = "expected_identity", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1340,22 +1289,20 @@ pub const ReadCheckRequest = struct {
     required_metadata_lsn: OpenApiOptionalNullable(i64) = .absent,
     metadata_applied_lsn: OpenApiOptionalNullable(i64) = .absent,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "consistency", "consistency", true },
+        .{ "required_lsn", "required_lsn", false },
+        .{ "required_metadata_lsn", "required_metadata_lsn", false },
+        .{ "metadata_applied_lsn", "metadata_applied_lsn", false },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "consistency", .zig_name = "consistency", .rejects_null = true },
-            .{ .json_name = "required_lsn", .zig_name = "required_lsn", .rejects_null = false },
-            .{ .json_name = "required_metadata_lsn", .zig_name = "required_metadata_lsn", .rejects_null = false },
-            .{ .json_name = "metadata_applied_lsn", .zig_name = "metadata_applied_lsn", .rejects_null = false },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "consistency", .zig_name = "consistency", .rejects_null = true },
-            .{ .json_name = "required_lsn", .zig_name = "required_lsn", .rejects_null = false },
-            .{ .json_name = "required_metadata_lsn", .zig_name = "required_metadata_lsn", .rejects_null = false },
-            .{ .json_name = "metadata_applied_lsn", .zig_name = "metadata_applied_lsn", .rejects_null = false },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1413,26 +1360,22 @@ pub const RejoinAssessRequest = struct {
     /// Durable promotion fence receipt. Omit to prove the rejoin path rejects unfenced former primaries.
     receipt: ?HAFenceReceipt = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "node_id", "node_id", false },
+        .{ "identity", "identity", false },
+        .{ "last_lsn", "last_lsn", false },
+        .{ "retained_from_lsn", "retained_from_lsn", false },
+        .{ "allow_rewind_after_forced_promotion", "allow_rewind_after_forced_promotion", false },
+        .{ "receipt", "receipt", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "node_id", .zig_name = "node_id", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "last_lsn", .zig_name = "last_lsn", .rejects_null = false },
-            .{ .json_name = "retained_from_lsn", .zig_name = "retained_from_lsn", .rejects_null = false },
-            .{ .json_name = "allow_rewind_after_forced_promotion", .zig_name = "allow_rewind_after_forced_promotion", .rejects_null = false },
-            .{ .json_name = "receipt", .zig_name = "receipt", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "node_id", .zig_name = "node_id", .rejects_null = false },
-            .{ .json_name = "identity", .zig_name = "identity", .rejects_null = false },
-            .{ .json_name = "last_lsn", .zig_name = "last_lsn", .rejects_null = false },
-            .{ .json_name = "retained_from_lsn", .zig_name = "retained_from_lsn", .rejects_null = false },
-            .{ .json_name = "allow_rewind_after_forced_promotion", .zig_name = "allow_rewind_after_forced_promotion", .rejects_null = false },
-            .{ .json_name = "receipt", .zig_name = "receipt", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1538,30 +1481,24 @@ pub const StorageMaintenanceJob = struct {
     result: ?StorageMaintenanceResult = null,
     @"error": ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "job_id", "job_id", false },
+        .{ "operation", "operation", false },
+        .{ "state", "state", false },
+        .{ "created_at_ms", "created_at_ms", false },
+        .{ "started_at_ms", "started_at_ms", true },
+        .{ "completed_at_ms", "completed_at_ms", true },
+        .{ "result", "result", true },
+        .{ "error", "error", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "job_id", .zig_name = "job_id", .rejects_null = false },
-            .{ .json_name = "operation", .zig_name = "operation", .rejects_null = false },
-            .{ .json_name = "state", .zig_name = "state", .rejects_null = false },
-            .{ .json_name = "created_at_ms", .zig_name = "created_at_ms", .rejects_null = false },
-            .{ .json_name = "started_at_ms", .zig_name = "started_at_ms", .rejects_null = true },
-            .{ .json_name = "completed_at_ms", .zig_name = "completed_at_ms", .rejects_null = true },
-            .{ .json_name = "result", .zig_name = "result", .rejects_null = true },
-            .{ .json_name = "error", .zig_name = "error", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "job_id", .zig_name = "job_id", .rejects_null = false },
-            .{ .json_name = "operation", .zig_name = "operation", .rejects_null = false },
-            .{ .json_name = "state", .zig_name = "state", .rejects_null = false },
-            .{ .json_name = "created_at_ms", .zig_name = "created_at_ms", .rejects_null = false },
-            .{ .json_name = "started_at_ms", .zig_name = "started_at_ms", .rejects_null = true },
-            .{ .json_name = "completed_at_ms", .zig_name = "completed_at_ms", .rejects_null = true },
-            .{ .json_name = "result", .zig_name = "result", .rejects_null = true },
-            .{ .json_name = "error", .zig_name = "error", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1634,34 +1571,26 @@ pub const StorageMaintenanceResult = struct {
     live_file_count: ?i64 = null,
     live_bytes: ?i64 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "valid", "valid", true },
+        .{ "issue", "issue", true },
+        .{ "file_size", "file_size", true },
+        .{ "valid_prefix_size", "valid_prefix_size", true },
+        .{ "reclaimable_bytes", "reclaimable_bytes", true },
+        .{ "before_size", "before_size", true },
+        .{ "after_size", "after_size", true },
+        .{ "reclaimed_bytes", "reclaimed_bytes", true },
+        .{ "live_file_count", "live_file_count", true },
+        .{ "live_bytes", "live_bytes", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "valid", .zig_name = "valid", .rejects_null = true },
-            .{ .json_name = "issue", .zig_name = "issue", .rejects_null = true },
-            .{ .json_name = "file_size", .zig_name = "file_size", .rejects_null = true },
-            .{ .json_name = "valid_prefix_size", .zig_name = "valid_prefix_size", .rejects_null = true },
-            .{ .json_name = "reclaimable_bytes", .zig_name = "reclaimable_bytes", .rejects_null = true },
-            .{ .json_name = "before_size", .zig_name = "before_size", .rejects_null = true },
-            .{ .json_name = "after_size", .zig_name = "after_size", .rejects_null = true },
-            .{ .json_name = "reclaimed_bytes", .zig_name = "reclaimed_bytes", .rejects_null = true },
-            .{ .json_name = "live_file_count", .zig_name = "live_file_count", .rejects_null = true },
-            .{ .json_name = "live_bytes", .zig_name = "live_bytes", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "valid", .zig_name = "valid", .rejects_null = true },
-            .{ .json_name = "issue", .zig_name = "issue", .rejects_null = true },
-            .{ .json_name = "file_size", .zig_name = "file_size", .rejects_null = true },
-            .{ .json_name = "valid_prefix_size", .zig_name = "valid_prefix_size", .rejects_null = true },
-            .{ .json_name = "reclaimable_bytes", .zig_name = "reclaimable_bytes", .rejects_null = true },
-            .{ .json_name = "before_size", .zig_name = "before_size", .rejects_null = true },
-            .{ .json_name = "after_size", .zig_name = "after_size", .rejects_null = true },
-            .{ .json_name = "reclaimed_bytes", .zig_name = "reclaimed_bytes", .rejects_null = true },
-            .{ .json_name = "live_file_count", .zig_name = "live_file_count", .rejects_null = true },
-            .{ .json_name = "live_bytes", .zig_name = "live_bytes", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1748,18 +1677,18 @@ pub const WriteCheckRequest = struct {
     role: []const u8,
     expected_identity: ?HAIdentity = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "role", "role", false },
+        .{ "expected_identity", "expected_identity", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "expected_identity", .zig_name = "expected_identity", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "role", .zig_name = "role", .rejects_null = false },
-            .{ .json_name = "expected_identity", .zig_name = "expected_identity", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1819,17 +1748,11 @@ pub fn OpenApiOptionalNullable(comptime T: type) type {
     };
 }
 
-const OpenApiObjectField = struct {
-    json_name: []const u8,
-    zig_name: []const u8,
-    rejects_null: bool = false,
-};
-
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.
 fn openApiParseObject(
     comptime T: type,
-    comptime openapi_fields: []const OpenApiObjectField,
+    comptime openapi_fields: anytype,
     allocator: std.mem.Allocator,
     source: anytype,
     options: std.json.ParseOptions,
@@ -1852,11 +1775,11 @@ fn openApiParseObject(
 
         inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
-            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 openApiFreeAllocatedToken(allocator, name_token.?);
                 name_token = null;
-                if (openapi_field.rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (openapi_field[2] and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
                 if (fields_seen[i]) {
                     switch (options.duplicate_field_behavior) {
                         .use_first => {
@@ -1882,7 +1805,7 @@ fn openApiParseObject(
 
 fn openApiParseObjectFromValue(
     comptime T: type,
-    comptime openapi_fields: []const OpenApiObjectField,
+    comptime openapi_fields: anytype,
     allocator: std.mem.Allocator,
     source: std.json.Value,
     options: std.json.ParseOptions,
@@ -1899,9 +1822,9 @@ fn openApiParseObjectFromValue(
         const field_name = entry.key_ptr.*;
         inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
-            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
-                if (openapi_field.rejects_null and entry.value_ptr.* == .null) return error.UnexpectedToken;
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
                 @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
                 fields_seen[i] = true;
                 break;
@@ -1912,10 +1835,10 @@ fn openApiParseObjectFromValue(
     return result;
 }
 
-fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: []const OpenApiObjectField, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
     @setEvalBranchQuota(100_000);
     inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
-        if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
         if (!fields_seen[i]) {
             if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
         }

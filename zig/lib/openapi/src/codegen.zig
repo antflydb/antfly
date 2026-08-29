@@ -373,10 +373,11 @@ test "generate 3.1 types with nullable and ref siblings" {
     try std.testing.expect(std.mem.indexOf(u8, out, "status: ?PetStatus = null,") != null);
     // Optional non-nullable properties keep ergonomic `?T` fields while their
     // generated object parser rejects explicit JSON null according to OpenAPI.
-    try std.testing.expect(std.mem.indexOf(u8, out, "return try openApiParseObject(@This(), &.{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, ".json_name = \"status\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, ".json_name = \"audit.event\", .zig_name = \"audit_event\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, ".json_name = \"type\", .zig_name = \"type\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "pub const antflyOpenApiFieldMetadata = .{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".{ \"status\", \"status\", true }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".{ \"audit.event\", \"audit_event\", true }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".{ \"type\", \"type\", true }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return try openApiParseObject(@This(), antflyOpenApiFieldMetadata") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "fn openApiParseObject(") != null);
 }
 

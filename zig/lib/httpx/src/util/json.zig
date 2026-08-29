@@ -35,8 +35,7 @@ pub const Json = struct {
         return stringifyJsonAlloc(allocator, value, .{ .emit_null_optional_fields = false });
     }
 
-    /// Backwards-compatible request-oriented spelling. Requests and responses
-    /// share the same OpenAPI property-presence rules.
+    /// Request-oriented spelling for OpenAPI property-presence semantics.
     pub fn stringifyRequest(allocator: Allocator, value: anytype) ![]u8 {
         return stringifyOpenApi(allocator, value);
     }

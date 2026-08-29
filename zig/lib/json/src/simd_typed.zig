@@ -18,12 +18,24 @@ const simd_stage1 = @import("simd_stage1.zig");
 const Allocator = std.mem.Allocator;
 const json = std.json;
 
+/// Generated OpenAPI objects retain std.json-compatible `jsonParse` methods
+/// for fallback targets while publishing field metadata that this parser can
+/// enforce directly. Treat those methods as adapters, not opaque custom
+/// parsers, so supported typed responses stay on the SIMD path.
+fn hasOpenApiFieldMetadata(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasDecl(T, "antflyOpenApiFieldMetadata"),
+        else => false,
+    };
+}
+
 pub fn supportsType(comptime T: type) bool {
     // OpenAPI response types can be wide, nested unions. Keep the capability
     // walk proportional to the generated type instead of Zig's small default
     // comptime branch budget.
     @setEvalBranchQuota(100_000);
-    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or std.meta.hasFn(T, "jsonParse")) return true;
+    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or
+        (std.meta.hasFn(T, "jsonParse") and !hasOpenApiFieldMetadata(T))) return true;
 
     switch (@typeInfo(T)) {
         .bool, .int, .float, .comptime_int, .comptime_float => return true,
@@ -56,7 +68,8 @@ pub fn supportsType(comptime T: type) bool {
 
 pub fn containsCustomJsonParseType(comptime T: type) bool {
     @setEvalBranchQuota(100_000);
-    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or std.meta.hasFn(T, "jsonParse")) return true;
+    if (std.meta.hasFn(T, "jsonParseFromSliceLeaky") or
+        (std.meta.hasFn(T, "jsonParse") and !hasOpenApiFieldMetadata(T))) return true;
 
     switch (@typeInfo(T)) {
         .optional => |info| return containsCustomJsonParseType(info.child),
@@ -165,7 +178,7 @@ const Parser = struct {
             const raw = try self.captureValueSliceForStdlib();
             return T.jsonParseFromSliceLeaky(self.allocator, raw, self.options);
         }
-        if (comptime std.meta.hasFn(T, "jsonParse")) {
+        if (comptime std.meta.hasFn(T, "jsonParse") and !hasOpenApiFieldMetadata(T)) {
             return self.parseViaStdlibSubtree(T);
         }
 
@@ -286,8 +299,12 @@ const Parser = struct {
                 try self.parseStructFieldAtIndex(T, info, &result, &seen, i);
                 matched = true;
             } else inline for (info.fields, 0..) |field, i| {
-                if (std.mem.eql(u8, field.name, field_name.slice())) {
-                    self.rememberStructField(T, field.name, i);
+                const json_field_name = comptime structFieldJsonName(T, field.name, i);
+                if (std.mem.eql(u8, json_field_name, field_name.slice())) {
+                    self.rememberStructField(T, json_field_name, i);
+                    if (comptime structFieldRejectsNull(T, field.name, i)) {
+                        if (self.startsWith("null")) return error.UnexpectedToken;
+                    }
                     if (seen[i]) {
                         switch (self.options.duplicate_field_behavior) {
                             .use_first => {
@@ -341,6 +358,9 @@ const Parser = struct {
     ) json.ParseError(json.Scanner)!void {
         inline for (info.fields, 0..) |field, i| {
             if (field_index == i) {
+                if (comptime structFieldRejectsNull(T, field.name, i)) {
+                    if (self.startsWith("null")) return error.UnexpectedToken;
+                }
                 if (seen[i]) {
                     switch (self.options.duplicate_field_behavior) {
                         .use_first => {
@@ -357,6 +377,23 @@ const Parser = struct {
             }
         }
         unreachable;
+    }
+
+    fn structFieldJsonName(comptime T: type, comptime zig_name: []const u8, comptime field_index: usize) []const u8 {
+        if (!hasOpenApiFieldMetadata(T)) return zig_name;
+        const metadata = T.antflyOpenApiFieldMetadata;
+        const fields = @typeInfo(T).@"struct".fields;
+        if (metadata.len != fields.len)
+            @compileError("OpenAPI field metadata must match the generated struct");
+        if (!std.mem.eql(u8, zig_name, metadata[field_index][1]))
+            @compileError("OpenAPI field metadata order does not match the generated struct");
+        return metadata[field_index][0];
+    }
+
+    fn structFieldRejectsNull(comptime T: type, comptime zig_name: []const u8, comptime field_index: usize) bool {
+        if (!hasOpenApiFieldMetadata(T)) return false;
+        _ = structFieldJsonName(T, zig_name, field_index);
+        return T.antflyOpenApiFieldMetadata[field_index][2];
     }
 
     fn cachedStructFieldIndex(self: *const Parser, comptime T: type, field_name: []const u8) ?usize {
@@ -1316,6 +1353,38 @@ test "simd typed parser prefers allocation-light raw subtree parsers" {
     var parsed = try parseFromSlice(T, alloc, raw, .{}, structural);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u32, 4), parsed.value.custom.value);
+}
+
+test "simd typed parser consumes generated OpenAPI field metadata without custom fallback" {
+    const alloc = std.testing.allocator;
+    const OpenApiObject = struct {
+        optional_value: ?u32 = null,
+
+        pub const antflyOpenApiFieldMetadata = .{
+            .{ "wire.value", "optional_value", true },
+        };
+
+        pub fn jsonParse(_: Allocator, _: anytype, _: json.ParseOptions) !@This() {
+            return error.TestExpectedError;
+        }
+    };
+
+    try std.testing.expect(!containsCustomJsonParseType(OpenApiObject));
+
+    const valid = "{\"wire.value\":7}";
+    var valid_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, valid);
+    defer valid_structural.deinit(alloc);
+    var parsed = try parseFromSlice(OpenApiObject, alloc, valid, .{}, valid_structural);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, 7), parsed.value.optional_value);
+
+    const invalid = "{\"wire.value\":null}";
+    var invalid_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, invalid);
+    defer invalid_structural.deinit(alloc);
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        parseFromSliceLeaky(OpenApiObject, alloc, invalid, .{}, invalid_structural),
+    );
 }
 
 test "simd typed parser captures composite subtrees for custom jsonParse" {

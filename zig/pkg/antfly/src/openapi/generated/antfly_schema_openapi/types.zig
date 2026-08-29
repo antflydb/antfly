@@ -77,30 +77,24 @@ pub const DocumentFieldMapping = struct {
     /// Named one-level multifields emitted from this property's value. For example, a text title can expose a sortable keyword subfield.
     fields: ?std.json.ArrayHashMap(DocumentSubfieldMapping) = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "analyzer", "analyzer", true },
+        .{ "index", "index", true },
+        .{ "store", "store", true },
+        .{ "include_in_all", "include_in_all", true },
+        .{ "sortable", "sortable", true },
+        .{ "missing_null_policy", "missing_null_policy", true },
+        .{ "fields", "fields", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
-            .{ .json_name = "analyzer", .zig_name = "analyzer", .rejects_null = true },
-            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
-            .{ .json_name = "store", .zig_name = "store", .rejects_null = true },
-            .{ .json_name = "include_in_all", .zig_name = "include_in_all", .rejects_null = true },
-            .{ .json_name = "sortable", .zig_name = "sortable", .rejects_null = true },
-            .{ .json_name = "missing_null_policy", .zig_name = "missing_null_policy", .rejects_null = true },
-            .{ .json_name = "fields", .zig_name = "fields", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
-            .{ .json_name = "analyzer", .zig_name = "analyzer", .rejects_null = true },
-            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
-            .{ .json_name = "store", .zig_name = "store", .rejects_null = true },
-            .{ .json_name = "include_in_all", .zig_name = "include_in_all", .rejects_null = true },
-            .{ .json_name = "sortable", .zig_name = "sortable", .rejects_null = true },
-            .{ .json_name = "missing_null_policy", .zig_name = "missing_null_policy", .rejects_null = true },
-            .{ .json_name = "fields", .zig_name = "fields", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -148,18 +142,18 @@ pub const DocumentSchema = struct {
     /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
     schema: ?std.json.Value = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "description", "description", true },
+        .{ "schema", "schema", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "description", .zig_name = "description", .rejects_null = true },
-            .{ .json_name = "schema", .zig_name = "schema", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "description", .zig_name = "description", .rejects_null = true },
-            .{ .json_name = "schema", .zig_name = "schema", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -192,28 +186,23 @@ pub const DocumentSubfieldMapping = struct {
     /// Missing/null sort policy. The current production policy rejects missing or null native sort values.
     missing_null_policy: ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "analyzer", "analyzer", true },
+        .{ "index", "index", true },
+        .{ "store", "store", true },
+        .{ "include_in_all", "include_in_all", true },
+        .{ "sortable", "sortable", true },
+        .{ "missing_null_policy", "missing_null_policy", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
-            .{ .json_name = "analyzer", .zig_name = "analyzer", .rejects_null = true },
-            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
-            .{ .json_name = "store", .zig_name = "store", .rejects_null = true },
-            .{ .json_name = "include_in_all", .zig_name = "include_in_all", .rejects_null = true },
-            .{ .json_name = "sortable", .zig_name = "sortable", .rejects_null = true },
-            .{ .json_name = "missing_null_policy", .zig_name = "missing_null_policy", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
-            .{ .json_name = "analyzer", .zig_name = "analyzer", .rejects_null = true },
-            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
-            .{ .json_name = "store", .zig_name = "store", .rejects_null = true },
-            .{ .json_name = "include_in_all", .zig_name = "include_in_all", .rejects_null = true },
-            .{ .json_name = "sortable", .zig_name = "sortable", .rejects_null = true },
-            .{ .json_name = "missing_null_policy", .zig_name = "missing_null_policy", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -266,28 +255,23 @@ pub const DynamicTemplate = struct {
     match_mapping_type: ?[]const u8 = null,
     mapping: ?TemplateFieldMapping = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "name", "name", true },
+        .{ "match", "match", true },
+        .{ "unmatch", "unmatch", true },
+        .{ "path_match", "path_match", true },
+        .{ "path_unmatch", "path_unmatch", true },
+        .{ "match_mapping_type", "match_mapping_type", true },
+        .{ "mapping", "mapping", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "name", .zig_name = "name", .rejects_null = true },
-            .{ .json_name = "match", .zig_name = "match", .rejects_null = true },
-            .{ .json_name = "unmatch", .zig_name = "unmatch", .rejects_null = true },
-            .{ .json_name = "path_match", .zig_name = "path_match", .rejects_null = true },
-            .{ .json_name = "path_unmatch", .zig_name = "path_unmatch", .rejects_null = true },
-            .{ .json_name = "match_mapping_type", .zig_name = "match_mapping_type", .rejects_null = true },
-            .{ .json_name = "mapping", .zig_name = "mapping", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "name", .zig_name = "name", .rejects_null = true },
-            .{ .json_name = "match", .zig_name = "match", .rejects_null = true },
-            .{ .json_name = "unmatch", .zig_name = "unmatch", .rejects_null = true },
-            .{ .json_name = "path_match", .zig_name = "path_match", .rejects_null = true },
-            .{ .json_name = "path_unmatch", .zig_name = "path_unmatch", .rejects_null = true },
-            .{ .json_name = "match_mapping_type", .zig_name = "match_mapping_type", .rejects_null = true },
-            .{ .json_name = "mapping", .zig_name = "mapping", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -418,28 +402,23 @@ pub const TableSchema = struct {
     /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
     dynamic_templates: ?[]const DynamicTemplate = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "version", "version", true },
+        .{ "default_type", "default_type", true },
+        .{ "enforce_types", "enforce_types", true },
+        .{ "document_schemas", "document_schemas", true },
+        .{ "ttl_field", "ttl_field", true },
+        .{ "ttl_duration", "ttl_duration", true },
+        .{ "dynamic_templates", "dynamic_templates", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "version", .zig_name = "version", .rejects_null = true },
-            .{ .json_name = "default_type", .zig_name = "default_type", .rejects_null = true },
-            .{ .json_name = "enforce_types", .zig_name = "enforce_types", .rejects_null = true },
-            .{ .json_name = "document_schemas", .zig_name = "document_schemas", .rejects_null = true },
-            .{ .json_name = "ttl_field", .zig_name = "ttl_field", .rejects_null = true },
-            .{ .json_name = "ttl_duration", .zig_name = "ttl_duration", .rejects_null = true },
-            .{ .json_name = "dynamic_templates", .zig_name = "dynamic_templates", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "version", .zig_name = "version", .rejects_null = true },
-            .{ .json_name = "default_type", .zig_name = "default_type", .rejects_null = true },
-            .{ .json_name = "enforce_types", .zig_name = "enforce_types", .rejects_null = true },
-            .{ .json_name = "document_schemas", .zig_name = "document_schemas", .rejects_null = true },
-            .{ .json_name = "ttl_field", .zig_name = "ttl_field", .rejects_null = true },
-            .{ .json_name = "ttl_duration", .zig_name = "ttl_duration", .rejects_null = true },
-            .{ .json_name = "dynamic_templates", .zig_name = "dynamic_templates", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -492,28 +471,23 @@ pub const TemplateFieldMapping = struct {
     /// Missing/null sort policy for this mapped field. The current production policy rejects missing or null native sort values so sorted cursors remain replayable JSON scalar tuples.
     missing_null_policy: ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "type", "type", true },
+        .{ "analyzer", "analyzer", true },
+        .{ "index", "index", true },
+        .{ "store", "store", true },
+        .{ "include_in_all", "include_in_all", true },
+        .{ "sortable", "sortable", true },
+        .{ "missing_null_policy", "missing_null_policy", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
-            .{ .json_name = "analyzer", .zig_name = "analyzer", .rejects_null = true },
-            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
-            .{ .json_name = "store", .zig_name = "store", .rejects_null = true },
-            .{ .json_name = "include_in_all", .zig_name = "include_in_all", .rejects_null = true },
-            .{ .json_name = "sortable", .zig_name = "sortable", .rejects_null = true },
-            .{ .json_name = "missing_null_policy", .zig_name = "missing_null_policy", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "type", .zig_name = "type", .rejects_null = true },
-            .{ .json_name = "analyzer", .zig_name = "analyzer", .rejects_null = true },
-            .{ .json_name = "index", .zig_name = "index", .rejects_null = true },
-            .{ .json_name = "store", .zig_name = "store", .rejects_null = true },
-            .{ .json_name = "include_in_all", .zig_name = "include_in_all", .rejects_null = true },
-            .{ .json_name = "sortable", .zig_name = "sortable", .rejects_null = true },
-            .{ .json_name = "missing_null_policy", .zig_name = "missing_null_policy", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -550,17 +524,11 @@ pub const TemplateFieldMapping = struct {
     }
 };
 
-const OpenApiObjectField = struct {
-    json_name: []const u8,
-    zig_name: []const u8,
-    rejects_null: bool = false,
-};
-
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.
 fn openApiParseObject(
     comptime T: type,
-    comptime openapi_fields: []const OpenApiObjectField,
+    comptime openapi_fields: anytype,
     allocator: std.mem.Allocator,
     source: anytype,
     options: std.json.ParseOptions,
@@ -583,11 +551,11 @@ fn openApiParseObject(
 
         inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
-            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 openApiFreeAllocatedToken(allocator, name_token.?);
                 name_token = null;
-                if (openapi_field.rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (openapi_field[2] and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
                 if (fields_seen[i]) {
                     switch (options.duplicate_field_behavior) {
                         .use_first => {
@@ -613,7 +581,7 @@ fn openApiParseObject(
 
 fn openApiParseObjectFromValue(
     comptime T: type,
-    comptime openapi_fields: []const OpenApiObjectField,
+    comptime openapi_fields: anytype,
     allocator: std.mem.Allocator,
     source: std.json.Value,
     options: std.json.ParseOptions,
@@ -630,9 +598,9 @@ fn openApiParseObjectFromValue(
         const field_name = entry.key_ptr.*;
         inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
-            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
-                if (openapi_field.rejects_null and entry.value_ptr.* == .null) return error.UnexpectedToken;
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
                 @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
                 fields_seen[i] = true;
                 break;
@@ -643,10 +611,10 @@ fn openApiParseObjectFromValue(
     return result;
 }
 
-fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: []const OpenApiObjectField, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
     @setEvalBranchQuota(100_000);
     inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
-        if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
         if (!fields_seen[i]) {
             if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
         }

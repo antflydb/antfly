@@ -42,50 +42,34 @@ pub const BraveSearchConfig = struct {
     /// Enable spellcheck suggestions
     spellcheck: ?bool = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "freshness", "freshness", true },
+        .{ "text_decorations", "text_decorations", true },
+        .{ "spellcheck", "spellcheck", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "freshness", .zig_name = "freshness", .rejects_null = true },
-            .{ .json_name = "text_decorations", .zig_name = "text_decorations", .rejects_null = true },
-            .{ .json_name = "spellcheck", .zig_name = "spellcheck", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "freshness", .zig_name = "freshness", .rejects_null = true },
-            .{ .json_name = "text_decorations", .zig_name = "text_decorations", .rejects_null = true },
-            .{ .json_name = "spellcheck", .zig_name = "spellcheck", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -208,56 +192,37 @@ pub const ExaSearchConfig = struct {
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "search_type", "search_type", true },
+        .{ "num_results", "num_results", true },
+        .{ "start_published_date", "start_published_date", true },
+        .{ "end_published_date", "end_published_date", true },
+        .{ "include_domains", "include_domains", true },
+        .{ "exclude_domains", "exclude_domains", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "search_type", .zig_name = "search_type", .rejects_null = true },
-            .{ .json_name = "num_results", .zig_name = "num_results", .rejects_null = true },
-            .{ .json_name = "start_published_date", .zig_name = "start_published_date", .rejects_null = true },
-            .{ .json_name = "end_published_date", .zig_name = "end_published_date", .rejects_null = true },
-            .{ .json_name = "include_domains", .zig_name = "include_domains", .rejects_null = true },
-            .{ .json_name = "exclude_domains", .zig_name = "exclude_domains", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "search_type", .zig_name = "search_type", .rejects_null = true },
-            .{ .json_name = "num_results", .zig_name = "num_results", .rejects_null = true },
-            .{ .json_name = "start_published_date", .zig_name = "start_published_date", .rejects_null = true },
-            .{ .json_name = "end_published_date", .zig_name = "end_published_date", .rejects_null = true },
-            .{ .json_name = "include_domains", .zig_name = "include_domains", .rejects_null = true },
-            .{ .json_name = "exclude_domains", .zig_name = "exclude_domains", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -363,26 +328,22 @@ pub const FetchConfig = struct {
     /// Download timeout in seconds
     timeout_seconds: ?i64 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "s3_credentials", "s3_credentials", false },
+        .{ "max_content_length", "max_content_length", true },
+        .{ "allowed_hosts", "allowed_hosts", true },
+        .{ "block_private_ips", "block_private_ips", true },
+        .{ "max_download_size_bytes", "max_download_size_bytes", true },
+        .{ "timeout_seconds", "timeout_seconds", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "s3_credentials", .zig_name = "s3_credentials", .rejects_null = false },
-            .{ .json_name = "max_content_length", .zig_name = "max_content_length", .rejects_null = true },
-            .{ .json_name = "allowed_hosts", .zig_name = "allowed_hosts", .rejects_null = true },
-            .{ .json_name = "block_private_ips", .zig_name = "block_private_ips", .rejects_null = true },
-            .{ .json_name = "max_download_size_bytes", .zig_name = "max_download_size_bytes", .rejects_null = true },
-            .{ .json_name = "timeout_seconds", .zig_name = "timeout_seconds", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "s3_credentials", .zig_name = "s3_credentials", .rejects_null = false },
-            .{ .json_name = "max_content_length", .zig_name = "max_content_length", .rejects_null = true },
-            .{ .json_name = "allowed_hosts", .zig_name = "allowed_hosts", .rejects_null = true },
-            .{ .json_name = "block_private_ips", .zig_name = "block_private_ips", .rejects_null = true },
-            .{ .json_name = "max_download_size_bytes", .zig_name = "max_download_size_bytes", .rejects_null = true },
-            .{ .json_name = "timeout_seconds", .zig_name = "timeout_seconds", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -433,26 +394,22 @@ pub const FetchResult = struct {
     /// Time taken to fetch and process in milliseconds
     fetch_time_ms: ?i64 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "url", "url", false },
+        .{ "title", "title", true },
+        .{ "content", "content", false },
+        .{ "content_type", "content_type", true },
+        .{ "truncated", "truncated", true },
+        .{ "fetch_time_ms", "fetch_time_ms", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "url", .zig_name = "url", .rejects_null = false },
-            .{ .json_name = "title", .zig_name = "title", .rejects_null = true },
-            .{ .json_name = "content", .zig_name = "content", .rejects_null = false },
-            .{ .json_name = "content_type", .zig_name = "content_type", .rejects_null = true },
-            .{ .json_name = "truncated", .zig_name = "truncated", .rejects_null = true },
-            .{ .json_name = "fetch_time_ms", .zig_name = "fetch_time_ms", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "url", .zig_name = "url", .rejects_null = false },
-            .{ .json_name = "title", .zig_name = "title", .rejects_null = true },
-            .{ .json_name = "content", .zig_name = "content", .rejects_null = false },
-            .{ .json_name = "content_type", .zig_name = "content_type", .rejects_null = true },
-            .{ .json_name = "truncated", .zig_name = "truncated", .rejects_null = true },
-            .{ .json_name = "fetch_time_ms", .zig_name = "fetch_time_ms", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -517,48 +474,33 @@ pub const LinkupSearchConfig = struct {
     /// Linkup response shape to request
     output_type: ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "depth", "depth", true },
+        .{ "output_type", "output_type", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "depth", .zig_name = "depth", .rejects_null = true },
-            .{ .json_name = "output_type", .zig_name = "output_type", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "depth", .zig_name = "depth", .rejects_null = true },
-            .{ .json_name = "output_type", .zig_name = "output_type", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -669,48 +611,33 @@ pub const SerperSearchConfig = struct {
     /// Time period filter: d=day, w=week, m=month, y=year
     time_period: ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "search_type", "search_type", true },
+        .{ "time_period", "time_period", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "search_type", .zig_name = "search_type", .rejects_null = true },
-            .{ .json_name = "time_period", .zig_name = "time_period", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "search_type", .zig_name = "search_type", .rejects_null = true },
-            .{ .json_name = "time_period", .zig_name = "time_period", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -827,54 +754,36 @@ pub const TavilySearchConfig = struct {
     /// Exclude results from these domains
     exclude_domains: ?[]const []const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "search_depth", "search_depth", true },
+        .{ "include_answer", "include_answer", true },
+        .{ "include_raw_content", "include_raw_content", true },
+        .{ "include_domains", "include_domains", true },
+        .{ "exclude_domains", "exclude_domains", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "search_depth", .zig_name = "search_depth", .rejects_null = true },
-            .{ .json_name = "include_answer", .zig_name = "include_answer", .rejects_null = true },
-            .{ .json_name = "include_raw_content", .zig_name = "include_raw_content", .rejects_null = true },
-            .{ .json_name = "include_domains", .zig_name = "include_domains", .rejects_null = true },
-            .{ .json_name = "exclude_domains", .zig_name = "exclude_domains", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "search_depth", .zig_name = "search_depth", .rejects_null = true },
-            .{ .json_name = "include_answer", .zig_name = "include_answer", .rejects_null = true },
-            .{ .json_name = "include_raw_content", .zig_name = "include_raw_content", .rejects_null = true },
-            .{ .json_name = "include_domains", .zig_name = "include_domains", .rejects_null = true },
-            .{ .json_name = "exclude_domains", .zig_name = "exclude_domains", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -995,46 +904,32 @@ pub const VertexSearchConfig = struct {
     /// Google Cloud search service flavor
     service: ?[]const u8 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+        .{ "service", "service", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "service", .zig_name = "service", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-            .{ .json_name = "service", .zig_name = "service", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1137,44 +1032,31 @@ pub const WebSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1295,24 +1177,21 @@ pub const WebSearchResponse = struct {
     /// Time taken to perform the search in milliseconds
     search_time_ms: ?i64 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "query", "query", true },
+        .{ "results", "results", false },
+        .{ "answer", "answer", true },
+        .{ "total_results", "total_results", true },
+        .{ "search_time_ms", "search_time_ms", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "query", .zig_name = "query", .rejects_null = true },
-            .{ .json_name = "results", .zig_name = "results", .rejects_null = false },
-            .{ .json_name = "answer", .zig_name = "answer", .rejects_null = true },
-            .{ .json_name = "total_results", .zig_name = "total_results", .rejects_null = true },
-            .{ .json_name = "search_time_ms", .zig_name = "search_time_ms", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "query", .zig_name = "query", .rejects_null = true },
-            .{ .json_name = "results", .zig_name = "results", .rejects_null = false },
-            .{ .json_name = "answer", .zig_name = "answer", .rejects_null = true },
-            .{ .json_name = "total_results", .zig_name = "total_results", .rejects_null = true },
-            .{ .json_name = "search_time_ms", .zig_name = "search_time_ms", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1354,26 +1233,22 @@ pub const WebSearchResult = struct {
     /// Relevance score (provider-specific)
     score: ?f32 = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "title", "title", false },
+        .{ "url", "url", false },
+        .{ "snippet", "snippet", true },
+        .{ "source", "source", true },
+        .{ "published_date", "published_date", true },
+        .{ "score", "score", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "title", .zig_name = "title", .rejects_null = false },
-            .{ .json_name = "url", .zig_name = "url", .rejects_null = false },
-            .{ .json_name = "snippet", .zig_name = "snippet", .rejects_null = true },
-            .{ .json_name = "source", .zig_name = "source", .rejects_null = true },
-            .{ .json_name = "published_date", .zig_name = "published_date", .rejects_null = true },
-            .{ .json_name = "score", .zig_name = "score", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "title", .zig_name = "title", .rejects_null = false },
-            .{ .json_name = "url", .zig_name = "url", .rejects_null = false },
-            .{ .json_name = "snippet", .zig_name = "snippet", .rejects_null = true },
-            .{ .json_name = "source", .zig_name = "source", .rejects_null = true },
-            .{ .json_name = "published_date", .zig_name = "published_date", .rejects_null = true },
-            .{ .json_name = "score", .zig_name = "score", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1434,44 +1309,31 @@ pub const YouSearchConfig = struct {
     /// Ask the provider to return highlighted passages when supported
     include_highlights: ?bool = null,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "api_key", "api_key", true },
+        .{ "endpoint", "endpoint", true },
+        .{ "project_id", "project_id", true },
+        .{ "location", "location", true },
+        .{ "data_store", "data_store", true },
+        .{ "serving_config", "serving_config", true },
+        .{ "credentials_path", "credentials_path", true },
+        .{ "max_results", "max_results", true },
+        .{ "timeout_ms", "timeout_ms", true },
+        .{ "safe_search", "safe_search", true },
+        .{ "language", "language", true },
+        .{ "region", "region", true },
+        .{ "include_content", "include_content", true },
+        .{ "include_highlights", "include_highlights", true },
+    };
+
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), &.{
-            .{ .json_name = "provider", .zig_name = "provider", .rejects_null = false },
-            .{ .json_name = "api_key", .zig_name = "api_key", .rejects_null = true },
-            .{ .json_name = "endpoint", .zig_name = "endpoint", .rejects_null = true },
-            .{ .json_name = "project_id", .zig_name = "project_id", .rejects_null = true },
-            .{ .json_name = "location", .zig_name = "location", .rejects_null = true },
-            .{ .json_name = "data_store", .zig_name = "data_store", .rejects_null = true },
-            .{ .json_name = "serving_config", .zig_name = "serving_config", .rejects_null = true },
-            .{ .json_name = "credentials_path", .zig_name = "credentials_path", .rejects_null = true },
-            .{ .json_name = "max_results", .zig_name = "max_results", .rejects_null = true },
-            .{ .json_name = "timeout_ms", .zig_name = "timeout_ms", .rejects_null = true },
-            .{ .json_name = "safe_search", .zig_name = "safe_search", .rejects_null = true },
-            .{ .json_name = "language", .zig_name = "language", .rejects_null = true },
-            .{ .json_name = "region", .zig_name = "region", .rejects_null = true },
-            .{ .json_name = "include_content", .zig_name = "include_content", .rejects_null = true },
-            .{ .json_name = "include_highlights", .zig_name = "include_highlights", .rejects_null = true },
-        }, allocator, source, options);
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -1538,17 +1400,11 @@ pub const YouSearchConfig = struct {
     }
 };
 
-const OpenApiObjectField = struct {
-    json_name: []const u8,
-    zig_name: []const u8,
-    rejects_null: bool = false,
-};
-
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.
 fn openApiParseObject(
     comptime T: type,
-    comptime openapi_fields: []const OpenApiObjectField,
+    comptime openapi_fields: anytype,
     allocator: std.mem.Allocator,
     source: anytype,
     options: std.json.ParseOptions,
@@ -1571,11 +1427,11 @@ fn openApiParseObject(
 
         inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
-            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 openApiFreeAllocatedToken(allocator, name_token.?);
                 name_token = null;
-                if (openapi_field.rejects_null and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
+                if (openapi_field[2] and try source.peekNextTokenType() == .null) return error.UnexpectedToken;
                 if (fields_seen[i]) {
                     switch (options.duplicate_field_behavior) {
                         .use_first => {
@@ -1601,7 +1457,7 @@ fn openApiParseObject(
 
 fn openApiParseObjectFromValue(
     comptime T: type,
-    comptime openapi_fields: []const OpenApiObjectField,
+    comptime openapi_fields: anytype,
     allocator: std.mem.Allocator,
     source: std.json.Value,
     options: std.json.ParseOptions,
@@ -1618,9 +1474,9 @@ fn openApiParseObjectFromValue(
         const field_name = entry.key_ptr.*;
         inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
             if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
-            if (std.mem.eql(u8, openapi_field.json_name, field_name)) {
-                if (openapi_field.rejects_null and entry.value_ptr.* == .null) return error.UnexpectedToken;
+            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+            if (std.mem.eql(u8, openapi_field[0], field_name)) {
+                if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
                 @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
                 fields_seen[i] = true;
                 break;
@@ -1631,10 +1487,10 @@ fn openApiParseObjectFromValue(
     return result;
 }
 
-fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: []const OpenApiObjectField, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
     @setEvalBranchQuota(100_000);
     inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
-        if (comptime !std.mem.eql(u8, field.name, openapi_field.zig_name)) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
         if (!fields_seen[i]) {
             if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
         }

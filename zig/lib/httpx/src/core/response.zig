@@ -124,6 +124,22 @@ pub const Response = struct {
         var resp = Self.init(allocator, status_code);
         errdefer resp.deinit();
         try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
+        resp.body = try Json.stringify(allocator, value);
+        resp.body_owned = true;
+
+        if (resp.body) |b| {
+            try resp.headers.setContentLength(b.len);
+        }
+        return resp;
+    }
+
+    /// Creates a schema-aware OpenAPI JSON response. Optional fields whose
+    /// value represents absence are omitted while required nullable fields are
+    /// preserved by generated type serializers.
+    pub fn fromOpenApiJson(allocator: Allocator, status_code: u16, value: anytype) !Self {
+        var resp = Self.init(allocator, status_code);
+        errdefer resp.deinit();
+        try resp.headers.set(HeaderName.CONTENT_TYPE, "application/json");
         resp.body = try Json.stringifyOpenApi(allocator, value);
         resp.body_owned = true;
 
@@ -210,6 +226,18 @@ pub const ResponseBuilder = struct {
 
     /// Sets a JSON body with appropriate Content-Type.
     pub fn json(self: *Self, value: anytype) !*Self {
+        _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
+        self.freeOwnedBody();
+        const serialized = try Json.stringify(self.allocator, value);
+        self.body_data = serialized;
+        self.body_owned = true;
+        return self;
+    }
+
+    /// Sets a schema-aware OpenAPI JSON body. This is intentionally explicit:
+    /// a generic Zig optional cannot distinguish an absent property from an
+    /// explicitly present JSON null without its OpenAPI schema.
+    pub fn openApiJson(self: *Self, value: anytype) !*Self {
         _ = try self.header(HeaderName.CONTENT_TYPE, "application/json");
         self.freeOwnedBody();
         const serialized = try Json.stringifyOpenApi(self.allocator, value);
@@ -357,7 +385,7 @@ test "Response fromText and fromJson constructors" {
     try std.testing.expect(json_resp.text() != null);
 }
 
-test "OpenAPI JSON responses omit absent optional fields" {
+test "generic JSON responses preserve explicit null optional fields" {
     const allocator = std.testing.allocator;
     const Payload = struct {
         ok: bool,
@@ -365,6 +393,22 @@ test "OpenAPI JSON responses omit absent optional fields" {
     };
 
     var response = try Response.fromJson(allocator, 200, Payload{ .ok = true });
+    defer response.deinit();
+    var parsed = try ant_json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(true, parsed.value.object.get("ok").?.bool);
+    try std.testing.expectEqual(std.json.Value.null, parsed.value.object.get("note").?);
+}
+
+test "explicit OpenAPI JSON responses omit absent optional fields" {
+    const allocator = std.testing.allocator;
+    const Payload = struct {
+        ok: bool,
+        note: ?[]const u8 = null,
+    };
+
+    var response = try Response.fromOpenApiJson(allocator, 200, Payload{ .ok = true });
     defer response.deinit();
     var parsed = try ant_json.parseFromSlice(std.json.Value, allocator, response.body.?, .{});
     defer parsed.deinit();
