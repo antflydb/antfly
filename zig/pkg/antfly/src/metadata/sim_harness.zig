@@ -4046,7 +4046,7 @@ fn placementIntentEquals(
         const other = right.record.snapshot_bootstrap.?;
         if (snapshot.from_node_id != other.from_node_id) return false;
         if (snapshot.term != other.term) return false;
-        if (snapshot.format != other.format) return false;
+        if (snapshot.effectiveFormat() != other.effectiveFormat()) return false;
         if (!std.mem.eql(u8, snapshot.snapshot_id, other.snapshot_id)) return false;
         if (!std.mem.eql(u8, snapshot.uri, other.uri)) return false;
     }

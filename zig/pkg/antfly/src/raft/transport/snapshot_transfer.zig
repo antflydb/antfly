@@ -12,6 +12,10 @@ pub const protocol_version: u32 = 2;
 pub const http_route_version: u32 = 1;
 pub const digest_len = std.crypto.hash.sha2.Sha256.digest_length;
 pub const max_manifest_bytes: usize = 256 * 1024;
+/// Absolute protocol ceiling for a single snapshot chunk. Keep this shared by
+/// the client, HTTP listener, and artifact store so configuration cannot pass
+/// startup and then fail halfway through a transfer.
+pub const max_chunk_bytes: usize = 4 * 1024 * 1024;
 pub const max_members_per_set: usize = 16 * 1024;
 const magic = "AFSNAP2\x00";
 

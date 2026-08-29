@@ -45,6 +45,7 @@ pub const SnapshotStore = struct {
     pub const VTable = struct {
         put_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, body: []const u8) anyerror!void,
         get_snapshot: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) anyerror![]u8,
+        release_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8) anyerror!void = null,
         begin_chunked_snapshot: ?*const fn (ptr: *anyopaque, manifest: snapshot_transfer.Manifest, snapshot_id: []const u8) anyerror!void = null,
         put_snapshot_chunk: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8, offset: u64, body: []const u8) anyerror!void = null,
         commit_chunked_snapshot: ?*const fn (
@@ -276,6 +277,18 @@ pub const HttpServer = struct {
                 };
             }
         }
+        if (req.method == .DELETE) {
+            if (routes.Routes.matchSnapshotFetch(req.uri)) |snapshot_id| {
+                const store = self.snapshot_store orelse return error.MissingSnapshotStore;
+                const release = store.vtable.release_snapshot orelse
+                    return error.UnsupportedSnapshotRelease;
+                release(store.ptr, snapshot_id) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+                return try self.textResponse(204, "");
+            }
+        }
         return .{
             .status = 404,
             .content_type = try self.alloc.dupe(u8, "text/plain"),
@@ -400,7 +413,7 @@ pub const HttpServer = struct {
                 const offset = try parseRequiredU64Header(req, snapshot_offset_header);
                 const requested_len = try parseRequiredU64Header(req, snapshot_chunk_length_header);
                 const max_len = std.math.cast(usize, requested_len) orelse return error.InvalidSnapshotChunkLength;
-                if (max_len == 0 or max_len > common_http.default_max_request_bytes)
+                if (max_len == 0 or max_len > snapshot_transfer.max_chunk_bytes)
                     return error.InvalidSnapshotChunkLength;
                 const body = store.vtable.get_snapshot_chunk.?(store.ptr, self.alloc, snapshot_id, offset, max_len) catch |err| switch (err) {
                     error.FileNotFound => return try self.textResponse(404, "snapshot artifact not found"),
@@ -715,6 +728,7 @@ test "http server stores and fetches snapshot bodies by route" {
                 .vtable = &.{
                     .put_snapshot = putSnapshot,
                     .get_snapshot = getSnapshot,
+                    .release_snapshot = releaseSnapshot,
                 },
             };
         }
@@ -730,6 +744,12 @@ test "http server stores and fetches snapshot bodies by route" {
             _ = snapshot_id;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try alloc.dupe(u8, self.body orelse return error.FileNotFound);
+        }
+
+        fn releaseSnapshot(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.body) |body| std.testing.allocator.free(body);
+            self.body = null;
         }
     };
 
@@ -778,6 +798,13 @@ test "http server stores and fetches snapshot bodies by route" {
     defer fetch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), fetch.status);
     try std.testing.expectEqualStrings("snapshot-body", fetch.body);
+
+    var release = try server.handle(.{ .method = .DELETE, .uri = fetch_path });
+    defer release.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 204), release.status);
+    var released = try server.handle(.{ .method = .GET, .uri = fetch_path });
+    defer released.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), released.status);
 }
 
 test "http server dispatches live snapshot uploads to handler" {

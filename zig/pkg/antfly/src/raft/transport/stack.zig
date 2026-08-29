@@ -18,6 +18,7 @@ const http_common = @import("http_common.zig");
 const http_driver = @import("http_driver.zig");
 const http_server = @import("http_server.zig");
 const http_snapshot = @import("http_snapshot.zig");
+const snapshot_transfer = @import("snapshot_transfer.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 
 pub const HttpTransportStackConfig = struct {
@@ -40,6 +41,11 @@ pub const HttpTransportStack = struct {
         io: ?std.Io,
         snapshot_resolver: ?http_snapshot.SnapshotTargetResolver,
     ) !HttpTransportStack {
+        if (cfg.snapshot.chunk_size == 0 or
+            cfg.snapshot.chunk_size > snapshot_transfer.max_chunk_bytes or
+            cfg.snapshot.max_snapshot_bytes == 0 or
+            cfg.snapshot.legacy_fallback_max_request_bytes == 0)
+            return error.InvalidSnapshotTransferLimits;
         var owned_io_impl: ?*std.Io.Threaded = null;
         errdefer if (owned_io_impl) |io_impl| {
             io_impl.deinit();

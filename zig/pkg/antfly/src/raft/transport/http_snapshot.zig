@@ -318,7 +318,7 @@ pub const HttpSnapshotTransport = struct {
         uri: []const u8,
         identity_headers: []const common.RequestHeader,
     ) !void {
-        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > 4 * 1024 * 1024)
+        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > snapshot_transfer.max_chunk_bytes)
             return error.InvalidSnapshotChunkSize;
         const manifest: snapshot_transfer.Manifest = .{
             .group_id = req.group_id,
@@ -396,7 +396,7 @@ pub const HttpSnapshotTransport = struct {
         receiver: raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver,
     ) !void {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
-        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > 4 * 1024 * 1024)
+        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > snapshot_transfer.max_chunk_bytes)
             return error.InvalidSnapshotChunkSize;
         switch (effectiveLocatorFormat(req.locator, routes.Routes.snapshot_fetch_v2)) {
             .legacy_envelope_v1 => return try self.fetchSnapshotLegacy(req, receiver),
@@ -427,7 +427,27 @@ pub const HttpSnapshotTransport = struct {
         const snapshot = try decodeSnapshotEnvelopeWithLimits(self.alloc, legacy.body, .{
             .max_snapshot_bytes = self.cfg.max_snapshot_bytes,
         });
-        return try receiver.receiveSnapshot(req, snapshot);
+        try receiver.receiveSnapshot(req, snapshot);
+        var release = self.executor.execute(self.alloc, .{
+            .method = .DELETE,
+            .uri = req.locator.uri,
+        }) catch |err| {
+            // Release was added after the v1 transfer. Consumption succeeded,
+            // so an older server must not turn it into a failed restore; its
+            // TTL cleanup remains the compatibility fallback.
+            std.log.warn("legacy snapshot fetch artifact release deferred snapshot_id={s} err={s}", .{
+                req.locator.snapshot_id,
+                @errorName(err),
+            });
+            return;
+        };
+        defer release.deinit(self.alloc);
+        if (release.status < 200 or release.status >= 300) {
+            std.log.warn("legacy snapshot fetch artifact release deferred snapshot_id={s} status={d}", .{
+                req.locator.snapshot_id,
+                release.status,
+            });
+        }
     }
 
     fn fetchSnapshotV2Resolved(
@@ -1045,6 +1065,7 @@ test "http snapshot transport posts and fetches serialized snapshots" {
                 .vtable = &.{
                     .put_snapshot = putSnapshot,
                     .get_snapshot = getSnapshot,
+                    .release_snapshot = releaseSnapshot,
                 },
             };
         }
@@ -1060,6 +1081,12 @@ test "http snapshot transport posts and fetches serialized snapshots" {
             _ = snapshot_id;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return try alloc.dupe(u8, self.body.?);
+        }
+
+        fn releaseSnapshot(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.body) |body| std.testing.allocator.free(body);
+            self.body = null;
         }
     };
 
@@ -1125,6 +1152,7 @@ test "http snapshot transport posts and fetches serialized snapshots" {
     try std.testing.expectEqual(@as(usize, 1), receiver.seen);
     try std.testing.expectEqual(@as(u64, 12), receiver.index);
     try std.testing.expectEqual(@as(usize, 0), executor.v2_requests);
+    try std.testing.expect(store_impl.body == null);
 }
 
 test "http snapshot transport resolves upload uri when locator is absent" {

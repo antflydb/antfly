@@ -501,14 +501,13 @@ pub const MetadataHttpClient = struct {
         const WireResult = struct {
             table_id: u64,
             expected_transition_generation: u64,
-            group_ids: []const u64,
         };
         var parsed = try parseJson(WireResult, self.alloc, resp.body);
         defer parsed.deinit();
         return .{
             .table_id = parsed.value.table_id,
             .expected_transition_generation = parsed.value.expected_transition_generation,
-            .group_ids = try self.alloc.dupe(u64, parsed.value.group_ids),
+            .group_ids = try self.alloc.alloc(u64, 0),
         };
     }
 
@@ -654,7 +653,6 @@ pub const MetadataHttpClient = struct {
             const WireResult = struct {
                 table_id: u64,
                 expected_transition_generation: u64,
-                group_ids: []const u64,
             };
             var parsed = std.json.parseFromSlice(
                 WireResult,
@@ -666,7 +664,7 @@ pub const MetadataHttpClient = struct {
             return .{
                 .table_id = parsed.value.table_id,
                 .expected_transition_generation = parsed.value.expected_transition_generation,
-                .group_ids = try self.alloc.dupe(u64, parsed.value.group_ids),
+                .group_ids = try self.alloc.alloc(u64, 0),
             };
         }
         return switch (resp.status) {
@@ -1579,10 +1577,16 @@ test "metadata http client forwards table create and drop to the internal route"
         .expected_uri_suffix = routes.Routes.internal_forwarded_table_mutation,
         .expected_body = null,
         .success_status = 200,
-        .success_body = "{\"table_id\":7,\"expected_transition_generation\":11,\"group_ids\":[301,302]}",
+        .success_body = "{\"table_id\":7,\"expected_transition_generation\":11,\"cleanup\":\"replica_catalog_retirement_v1\"}",
     };
     var drop_client = MetadataHttpClient.init(std.testing.allocator, drop_exec.executor());
-    try drop_client.dropTableForwarded("http://127.0.0.1:9000", "sales%2Farchive");
+    var drop_result = try drop_client.forwardTableDropMutationExact(
+        "http://127.0.0.1:9000",
+        "sales%2Farchive",
+        .{ .remaining_ms = 5_000, .forwards_remaining = 2, .campaign_allowed = true },
+    );
+    defer drop_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), drop_result.group_ids.len);
     try std.testing.expectEqual(@as(usize, 1), drop_exec.attempts);
 }
 

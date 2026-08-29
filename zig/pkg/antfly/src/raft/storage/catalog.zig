@@ -89,13 +89,33 @@ pub const SnapshotBootstrapRecord = struct {
     uri: []const u8 = "",
     format: raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat = .unknown,
 
+    pub fn inferFormat(snapshot_id: []const u8, uri: []const u8) raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat {
+        const v2_routes = [_][]const u8{
+            "/raft/v2/snapshot/upload",
+            "/raft/v2/snapshot/fetch",
+        };
+        for (v2_routes) |route| {
+            const pos = std.mem.lastIndexOf(u8, uri, route) orelse continue;
+            const suffix = uri[pos + route.len ..];
+            if (suffix.len == snapshot_id.len + 1 and suffix[0] == '/' and
+                std.mem.eql(u8, suffix[1..], snapshot_id))
+                return .chunked_manifest_v2;
+        }
+        return .unknown;
+    }
+
+    pub fn effectiveFormat(self: SnapshotBootstrapRecord) raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat {
+        if (self.format != .unknown) return self.format;
+        return inferFormat(self.snapshot_id, self.uri);
+    }
+
     pub fn clone(self: SnapshotBootstrapRecord, alloc: std.mem.Allocator) !SnapshotBootstrapRecord {
         var cloned = SnapshotBootstrapRecord{
             .from_node_id = self.from_node_id,
             .term = self.term,
             .snapshot_id = try alloc.dupe(u8, self.snapshot_id),
             .uri = "",
-            .format = self.format,
+            .format = self.effectiveFormat(),
         };
         errdefer alloc.free(cloned.snapshot_id);
         cloned.uri = try alloc.dupe(u8, self.uri);
@@ -115,7 +135,7 @@ pub const SnapshotBootstrapRecord = struct {
             .locator = .{
                 .snapshot_id = try alloc.dupe(u8, self.snapshot_id),
                 .uri = "",
-                .format = self.format,
+                .format = self.effectiveFormat(),
             },
             .fetch_immediately = true,
         };
@@ -279,7 +299,7 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         const other = right.snapshot_bootstrap.?;
         if (snapshot.from_node_id != other.from_node_id) return false;
         if (snapshot.term != other.term) return false;
-        if (snapshot.format != other.format) return false;
+        if (snapshot.effectiveFormat() != other.effectiveFormat()) return false;
         if (!std.mem.eql(u8, snapshot.snapshot_id, other.snapshot_id)) return false;
         if (!std.mem.eql(u8, snapshot.uri, other.uri)) return false;
     }

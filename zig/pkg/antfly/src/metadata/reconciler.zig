@@ -1272,9 +1272,21 @@ fn snapshotBootstrapEqual(
     if (a == null or b == null) return false;
     return a.?.from_node_id == b.?.from_node_id and
         a.?.term == b.?.term and
-        a.?.format == b.?.format and
+        a.?.effectiveFormat() == b.?.effectiveFormat() and
         std.mem.eql(u8, a.?.snapshot_id, b.?.snapshot_id) and
         std.mem.eql(u8, a.?.uri, b.?.uri);
+}
+
+test "metadata reconciler normalizes versioned snapshot uri without a new wire tag" {
+    const legacy_wire: @import("../raft/catalog.zig").SnapshotBootstrapRecord = .{
+        .from_node_id = 7,
+        .term = 11,
+        .snapshot_id = "snap-91",
+        .uri = "http://127.0.0.1:7777/raft/v2/snapshot/fetch/snap-91",
+    };
+    var explicit = legacy_wire;
+    explicit.format = .chunked_manifest_v2;
+    try std.testing.expect(snapshotBootstrapEqual(legacy_wire, explicit));
 }
 
 fn backupRestoreBootstrapEqual(

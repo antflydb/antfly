@@ -6545,6 +6545,7 @@ pub const ProvisionedTableWriteSource = struct {
     // Hosted storage shares a process-wide cache whose mutex must fence both
     // foreground opens and persistent dropped-table recovery jobs.
     dropped_table_cleanup_outer_mutex: ?*std.atomic.Mutex = null,
+    dropped_table_job_owner_mutex: std.atomic.Mutex = .unlocked,
     dropped_table_delete_owner_id: u64 = 0,
     dropped_table_recovery_started: std.atomic.Value(bool) = .init(false),
     dropped_table_recovery_scheduled: std.atomic.Value(bool) = .init(false),
@@ -6602,13 +6603,19 @@ pub const ProvisionedTableWriteSource = struct {
     startup_catch_up_backoff_mutex: std.atomic.Mutex = .unlocked,
     startup_catch_up_backoff_epoch: std.atomic.Value(u64) = .init(1),
     startup_catch_up_backoff_alloc: std.mem.Allocator = std.heap.page_allocator,
-    quiesced: bool = false,
+    lifecycle: std.atomic.Value(Lifecycle) = .init(.open),
     startup_catch_up_backoffs: std.AutoHashMapUnmanaged(u64, StartupCatchUpBackoff) = .empty,
     active_table_activities: std.ArrayListUnmanaged(TableActivity) = .empty,
     // Protected by table_activity_mutex. Repair handoff publications capture
     // this node-local generation before observing status and may retire only
     // that exact edge, including across activity-entry prune/recreate (ABA).
     next_repair_handoff_generation: u64 = 1,
+
+    const Lifecycle = enum(u8) {
+        open,
+        closing,
+        closed,
+    };
 
     const TableActivity = struct {
         // Owned by active_table_activities; entries must be created via activityEntryLocked.
@@ -7162,7 +7169,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn transactionRecoveryConfig(self: *ProvisionedTableWriteSource) db_mod.transaction_runtime.Config {
         const backend_runtime = self.backend_runtime orelse return .{};
-        if (backend_runtime.io() == null or self.quiesced) return .{};
+        if (backend_runtime.io() == null or !self.isOpen()) return .{};
         const replicated = self.raft_batcher != null;
         return .{
             .enabled = true,
@@ -7195,7 +7202,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !void {
         const self: *ProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
         const ref = distributed_txn.parseParticipantRef(participant) orelse return error.InvalidParticipant;
-        if (self.quiesced) return error.Canceled;
+        if (!self.isOpen()) return error.Canceled;
         const alloc = std.heap.page_allocator;
         if (self.raft_batcher) |batcher| {
             try batcher.batchGroup(alloc, ref.group_id, ref.table_name, .{
@@ -7311,8 +7318,21 @@ pub const ProvisionedTableWriteSource = struct {
     /// pointers are borrowed, so a standalone source must remain safe to
     /// destroy after its optional cache owner has already gone away.
     pub fn quiesce(self: *ProvisionedTableWriteSource) void {
-        if (self.quiesced) return;
-        self.closeDroppedTableDeletes();
+        lockAtomic(&self.dropped_table_job_owner_mutex);
+        if (self.lifecycle.load(.acquire) != .open) {
+            self.dropped_table_job_owner_mutex.unlock();
+            return;
+        }
+        // Close admission before observing the owner id. A scheduler either
+        // completes its submission under this mutex and is drained below, or
+        // observes `.closing` and cannot retain `self` in a new job.
+        self.lifecycle.store(.closing, .release);
+        const dropped_table_owner_id = self.dropped_table_delete_owner_id;
+        self.dropped_table_job_owner_mutex.unlock();
+        if (dropped_table_owner_id != 0) {
+            if (self.backend_runtime) |runtime|
+                runtime.durable_jobs.closeOwner(dropped_table_owner_id);
+        }
         const io = self.table_activity_threaded.io();
         self.restore_repair_shutdown.store(true, .release);
         self.restore_repair_work_group.cancel(io);
@@ -7341,7 +7361,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.recovering_replica_retirement_intents.deinit(std.heap.page_allocator);
         self.recovering_replica_retirement_intents = .empty;
         self.replica_retirement_intent_mutex.unlock();
-        self.quiesced = true;
+        self.lifecycle.store(.closed, .release);
     }
 
     pub fn deinit(self: *ProvisionedTableWriteSource) void {
@@ -7457,7 +7477,28 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
+    fn isOpen(self: *const ProvisionedTableWriteSource) bool {
+        return self.lifecycle.load(.acquire) == .open;
+    }
+
+    /// The lifecycle mutex is an admission gate, not just owner-id storage.
+    /// Holding it through `submit` establishes a total order with quiesce:
+    /// every accepted job belongs to the owner quiesce closes and drains.
+    fn submitDroppedTableJob(
+        self: *ProvisionedTableWriteSource,
+        runtime: *db_mod.background_runtime.BackendRuntime,
+        input_job: db_mod.background_runtime.Job,
+    ) !void {
+        lockAtomic(&self.dropped_table_job_owner_mutex);
+        defer self.dropped_table_job_owner_mutex.unlock();
+        if (self.lifecycle.load(.acquire) != .open) return error.Canceled;
+        const owner_id = try self.droppedTableDeleteOwnerIdLocked(runtime);
+        var job = input_job;
+        job.owner_id = owner_id;
+        try runtime.durable_jobs.submit(job);
+    }
+
+    fn droppedTableDeleteOwnerIdLocked(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
         if (self.dropped_table_delete_owner_id == 0) {
             self.dropped_table_delete_owner_id = try runtime.allocOwnerId();
         }
@@ -7465,16 +7506,12 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn drainDroppedTableDeletes(self: *ProvisionedTableWriteSource) void {
-        if (self.dropped_table_delete_owner_id == 0) return;
+        lockAtomic(&self.dropped_table_job_owner_mutex);
+        const owner_id = self.dropped_table_delete_owner_id;
+        self.dropped_table_job_owner_mutex.unlock();
+        if (owner_id == 0) return;
         if (self.backend_runtime) |runtime| {
-            runtime.durable_jobs.drainOwner(self.dropped_table_delete_owner_id);
-        }
-    }
-
-    fn closeDroppedTableDeletes(self: *ProvisionedTableWriteSource) void {
-        if (self.dropped_table_delete_owner_id == 0) return;
-        if (self.backend_runtime) |runtime| {
-            runtime.durable_jobs.closeOwner(self.dropped_table_delete_owner_id);
+            runtime.durable_jobs.drainOwner(owner_id);
         }
     }
 
@@ -7952,7 +7989,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn scheduleDroppedTableRecoveryRetry(self: *ProvisionedTableWriteSource) void {
-        if (self.quiesced) return;
+        if (!self.isOpen()) return;
         if (self.dropped_table_recovery_retry_scheduled.swap(true, .acq_rel)) return;
         const runtime = self.backend_runtime orelse {
             self.dropped_table_recovery_retry_scheduled.store(false, .release);
@@ -7991,12 +8028,8 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         };
         work.* = .{ .source = self };
-        runtime.durable_jobs.submit(.{
-            .owner_id = self.droppedTableDeleteOwnerId(runtime) catch {
-                std.heap.page_allocator.destroy(work);
-                self.dropped_table_recovery_retry_scheduled.store(false, .release);
-                return;
-            },
+        self.submitDroppedTableJob(runtime, .{
+            .owner_id = 0,
             .class = .cleanup,
             .ptr = work,
             .run = RetryWork.run,
@@ -8008,7 +8041,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn scheduleDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
-        if (self.quiesced) return;
+        if (!self.isOpen()) return;
         _ = self.dropped_table_recovery_requested.fetchAdd(1, .release);
         if (self.dropped_table_recovery_scheduled.swap(true, .acq_rel)) return;
         const runtime = self.backend_runtime orelse {
@@ -8033,12 +8066,8 @@ pub const ProvisionedTableWriteSource = struct {
             return;
         };
         work.* = .{ .source = self };
-        runtime.durable_jobs.submit(.{
-            .owner_id = self.droppedTableDeleteOwnerId(runtime) catch {
-                std.heap.page_allocator.destroy(work);
-                self.dropped_table_recovery_scheduled.store(false, .release);
-                return;
-            },
+        self.submitDroppedTableJob(runtime, .{
+            .owner_id = 0,
             .class = .cleanup,
             .ptr = work,
             .run = Work.run,
@@ -8056,8 +8085,8 @@ pub const ProvisionedTableWriteSource = struct {
         const owned_path = try std.heap.page_allocator.dupe(u8, path);
         errdefer std.heap.page_allocator.free(owned_path);
         work.* = .{ .path = owned_path, .recovery_source = self };
-        try runtime.durable_jobs.submit(.{
-            .owner_id = try self.droppedTableDeleteOwnerId(runtime),
+        try self.submitDroppedTableJob(runtime, .{
+            .owner_id = 0,
             .class = .cleanup,
             .ptr = work,
             .run = DroppedTableDeleteWork.run,
@@ -44370,6 +44399,77 @@ test "dropped table recovery drains a wake coalesced during the active scan" {
     try std.testing.expectEqual(@as(usize, 2), probe.passes);
     try std.testing.expectEqual(@as(u64, 2), source.dropped_table_recovery_requested.load(.acquire));
     try std.testing.expect(!source.dropped_table_recovery_scheduled.load(.acquire));
+}
+
+test "provisioned source quiesce closes cleanup admission and drains accepted owner jobs" {
+    if (builtin.os.tag == .freestanding) return;
+
+    const JobProbe = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        deinits: std.atomic.Value(u32) = .init(0),
+
+        fn run(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.deinits.fetchAdd(1, .acq_rel);
+        }
+    };
+    const Quiesce = struct {
+        source: *ProvisionedTableWriteSource,
+        complete: std.atomic.Value(bool) = .init(false),
+
+        fn run(self: *@This()) void {
+            self.source.quiesce();
+            self.complete.store(true, .release);
+        }
+    };
+
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(
+        std.testing.allocator,
+        .{ .backend = .io_threaded },
+    );
+    defer runtime.deinit();
+    var source = ProvisionedTableWriteSource.init("unused", table_catalog.emptyCatalogSource());
+    defer source.deinit();
+    source.backend_runtime = runtime.ptr();
+    var probe = JobProbe{};
+    try source.submitDroppedTableJob(runtime.ptr(), .{
+        .owner_id = 0,
+        .class = .cleanup,
+        .ptr = &probe,
+        .run = JobProbe.run,
+        .deinit = JobProbe.deinit,
+    });
+    while (!probe.entered.load(.acquire)) std.Thread.yield() catch {};
+
+    var quiesce = Quiesce{ .source = &source };
+    const thread = try std.Thread.spawn(.{}, Quiesce.run, .{&quiesce});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        probe.release.store(true, .release);
+        thread.join();
+    };
+    while (source.lifecycle.load(.acquire) == .open) std.Thread.yield() catch {};
+    try std.testing.expect(!quiesce.complete.load(.acquire));
+    probe.release.store(true, .release);
+    thread.join();
+    thread_joined = true;
+
+    try std.testing.expect(quiesce.complete.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), probe.deinits.load(.acquire));
+    try std.testing.expectError(error.Canceled, source.submitDroppedTableJob(runtime.ptr(), .{
+        .owner_id = 0,
+        .class = .cleanup,
+        .ptr = &probe,
+        .run = JobProbe.run,
+        .deinit = JobProbe.deinit,
+    }));
 }
 
 test "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart" {

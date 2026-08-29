@@ -7897,8 +7897,13 @@ fn appendPlacementIntent(
     try appendInt(alloc, out, u32, @intCast(intent.peer_node_ids.len));
     for (intent.peer_node_ids) |node_id| try appendInt(alloc, out, u64, node_id);
     try appendInt(alloc, out, u64, intent.store_id);
-    const source_tag: u8 = if (intent.record.snapshot_bootstrap) |snapshot|
-        if (snapshot.format == .unknown) 1 else 3
+    // Keep emitting the established snapshot source shape during rolling
+    // upgrades. The isolated v2 URI namespace is the durable protocol
+    // discriminator and the transport already resolves `.unknown` from it;
+    // duplicating that fact in a new un-negotiated tag would make an older
+    // metadata voter unable to apply otherwise compatible entries.
+    const source_tag: u8 = if (intent.record.snapshot_bootstrap != null)
+        1
     else if (intent.record.backup_restore_bootstrap != null)
         2
     else
@@ -7913,7 +7918,9 @@ fn appendPlacementIntent(
             try out.appendSlice(alloc, snapshot.snapshot_id);
             try appendInt(alloc, out, u32, @intCast(snapshot.uri.len));
             try out.appendSlice(alloc, snapshot.uri);
-            if (source_tag == 3) try out.append(alloc, @intFromEnum(snapshot.format));
+            // Tag 3 remains decoder-only so entries created by development
+            // versions are recoverable, but production proposals stay on the
+            // rolling-compatible tag 1 representation.
         },
         2 => {
             const backup = intent.record.backup_restore_bootstrap.?;
@@ -8854,7 +8861,7 @@ fn readPlacementIntent(
                     pos.* += 1;
                     if (decoded == .unknown) return error.InvalidMetadataTransitionEncoding;
                     break :blk decoded;
-                } else .unknown;
+                } else raft_catalog.SnapshotBootstrapRecord.inferFormat(snapshot_id, uri);
                 snapshot_bootstrap = .{
                     .from_node_id = from_node_id,
                     .term = term,

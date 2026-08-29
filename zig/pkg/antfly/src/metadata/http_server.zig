@@ -2236,7 +2236,7 @@ pub const MetadataHttpServer = struct {
         return ctx.json(.{
             .table_id = result.table_id,
             .expected_transition_generation = result.expected_transition_generation,
-            .group_ids = result.group_ids,
+            .cleanup = "replica_catalog_retirement_v1",
         });
     }
 
@@ -2267,7 +2267,7 @@ pub const MetadataHttpServer = struct {
         return ctx.json(.{
             .table_id = result.table_id,
             .expected_transition_generation = result.expected_transition_generation,
-            .group_ids = result.group_ids,
+            .cleanup = "replica_catalog_retirement_v1",
         });
     }
 

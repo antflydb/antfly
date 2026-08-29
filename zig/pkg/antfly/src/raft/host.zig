@@ -22,6 +22,7 @@ const backup_restore = @import("storage/backup_restore.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const peer_resolver = @import("peer_resolver.zig");
 const transport = @import("transport/mod.zig");
+const snapshot_transfer = @import("transport/snapshot_transfer.zig");
 
 pub const default_max_inbound_messages_per_round: usize = 1024;
 pub const default_http_listener_max_connection_threads: u32 = 32;
@@ -1096,7 +1097,10 @@ pub const HttpHost = struct {
         // largest end-to-end safe chunk instead of failing only during fetch.
         transport_config.snapshot.chunk_size = @min(
             transport_config.snapshot.chunk_size,
-            @min(cfg.listener.max_request_bytes, cfg.executor.max_response_bytes),
+            @min(
+                snapshot_transfer.max_chunk_bytes,
+                @min(cfg.listener.max_request_bytes, cfg.executor.max_response_bytes),
+            ),
         );
         if (transport_config.snapshot.chunk_size == 0)
             return error.InvalidSnapshotTransferLimits;
@@ -1119,7 +1123,8 @@ pub const HttpHost = struct {
             errdefer alloc.destroy(snapshot_store);
             snapshot_store.* = try transport.FileSnapshotStore.init(alloc, .{
                 .root_dir = cfg.transport.snapshot.root_dir,
-                .max_snapshot_bytes = cfg.max_snapshot_bytes,
+                .max_snapshot_bytes = @min(cfg.max_snapshot_bytes, transport_config.snapshot.max_snapshot_bytes),
+                .max_chunk_bytes = transport_config.snapshot.chunk_size,
                 .artifact_policy = cfg.snapshot_artifact_policy,
             });
             break :blk snapshot_store;
