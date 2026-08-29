@@ -24,6 +24,10 @@ pub const SnapshotArtifactPolicy = struct {
     max_count: usize = 1024,
     staging_ttl_ns: i128 = 15 * std.time.ns_per_min,
     committed_ttl_ns: i128 = 24 * std.time.ns_per_hour,
+    /// Sliding lease renewed by manifest and chunk reads. It fences committed
+    /// TTL cleanup across the gaps between HTTP requests without keeping a
+    /// file descriptor or worker alive for every transfer.
+    active_fetch_lease_ns: i128 = 5 * std.time.ns_per_min,
 };
 
 pub const FileSnapshotStoreConfig = struct {
@@ -43,12 +47,15 @@ pub const FileSnapshotStore = struct {
     upload_locks: [64]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 64,
     artifact_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     next_artifact_maintenance_ns: std.atomic.Value(u64) = .init(0),
+    fetch_lease_mutex: std.atomic.Mutex = .unlocked,
+    fetch_leases: std.StringHashMapUnmanaged(i128) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, cfg: FileSnapshotStoreConfig) !FileSnapshotStore {
-        if (cfg.max_snapshot_bytes == 0 or cfg.max_chunk_bytes == 0 or
+        if (cfg.max_snapshot_bytes == 0 or cfg.max_chunk_bytes < snapshot_transfer.min_chunk_bytes or
             cfg.max_chunk_bytes > snapshot_transfer.max_chunk_bytes)
             return error.InvalidSnapshotTransferLimits;
-        if (cfg.artifact_policy.max_bytes == 0 or cfg.artifact_policy.max_count == 0)
+        if (cfg.artifact_policy.max_bytes == 0 or cfg.artifact_policy.max_count == 0 or
+            cfg.artifact_policy.active_fetch_lease_ns <= 0)
             return error.InvalidSnapshotArtifactPolicy;
         var self: FileSnapshotStore = .{
             .alloc = alloc,
@@ -71,6 +78,9 @@ pub const FileSnapshotStore = struct {
     }
 
     pub fn deinit(self: *FileSnapshotStore) void {
+        var lease_keys = self.fetch_leases.keyIterator();
+        while (lease_keys.next()) |key| self.alloc.free(key.*);
+        self.fetch_leases.deinit(self.alloc);
         self.alloc.free(self.root_dir);
         self.io_impl.deinit();
         self.* = undefined;
@@ -91,8 +101,14 @@ pub const FileSnapshotStore = struct {
                 .get_snapshot_chunk = getSnapshotChunk,
                 .abort_chunked_snapshot = abortChunkedSnapshot,
                 .release_chunked_snapshot = releaseChunkedSnapshot,
+                .max_chunk_bytes = maxChunkBytes,
             },
         };
+    }
+
+    fn maxChunkBytes(ptr: *anyopaque) usize {
+        const self: *FileSnapshotStore = @ptrCast(@alignCast(ptr));
+        return self.cfg.max_chunk_bytes;
     }
 
     fn putSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, body: []const u8) !void {
@@ -322,7 +338,10 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const committed_path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(committed_path);
-        return try self.readManifest(alloc, committed_path);
+        var manifest = try self.readManifest(alloc, committed_path);
+        errdefer manifest.deinit(alloc);
+        try self.renewFetchLease(snapshot_id);
+        return manifest;
     }
 
     fn getSnapshotUploadManifest(
@@ -366,6 +385,7 @@ pub const FileSnapshotStore = struct {
         defer self.alloc.free(path);
         var manifest = try self.readManifest(alloc, path);
         defer manifest.deinit(alloc);
+        try self.renewFetchLease(snapshot_id);
         if (offset >= manifest.data_len) return try alloc.dupe(u8, &.{});
         const len: usize = @intCast(@min(max_len, manifest.data_len - offset));
         const chunk = try alloc.alloc(u8, len);
@@ -402,6 +422,7 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(path);
+        self.clearFetchLease(snapshot_id);
         const deleted = if (std.Io.Dir.cwd().deleteFile(io(self), path))
             true
         else |err| switch (err) {
@@ -482,6 +503,8 @@ pub const FileSnapshotStore = struct {
             if (!lock.tryLock()) continue;
             const removed = removed: {
                 defer lock.unlock();
+                if (!artifact.staging and self.fetchLeaseActive(artifact.snapshot_id, now_ns))
+                    break :removed false;
                 const current = dir.statFile(io(self), entry.name, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :removed false,
                     else => return err,
@@ -496,6 +519,35 @@ pub const FileSnapshotStore = struct {
             deleted = deleted or removed;
         }
         if (deleted) try fs_paths.syncDirPortable(io(self), self.root_dir);
+    }
+
+    fn renewFetchLease(self: *FileSnapshotStore, snapshot_id: []const u8) !void {
+        const deadline = std.Io.Timestamp.now(io(self), .real).toNanoseconds() +|
+            self.cfg.artifact_policy.active_fetch_lease_ns;
+        platform_sync.lockYielding(&self.fetch_lease_mutex);
+        defer self.fetch_lease_mutex.unlock();
+        if (self.fetch_leases.getPtr(snapshot_id)) |existing| {
+            existing.* = deadline;
+            return;
+        }
+        const owned_id = try self.alloc.dupe(u8, snapshot_id);
+        errdefer self.alloc.free(owned_id);
+        try self.fetch_leases.putNoClobber(self.alloc, owned_id, deadline);
+    }
+
+    fn clearFetchLease(self: *FileSnapshotStore, snapshot_id: []const u8) void {
+        platform_sync.lockYielding(&self.fetch_lease_mutex);
+        defer self.fetch_lease_mutex.unlock();
+        if (self.fetch_leases.fetchRemove(snapshot_id)) |removed| self.alloc.free(removed.key);
+    }
+
+    fn fetchLeaseActive(self: *FileSnapshotStore, snapshot_id: []const u8, now_ns: i128) bool {
+        platform_sync.lockYielding(&self.fetch_lease_mutex);
+        defer self.fetch_lease_mutex.unlock();
+        const deadline = self.fetch_leases.get(snapshot_id) orelse return false;
+        if (deadline > now_ns) return true;
+        if (self.fetch_leases.fetchRemove(snapshot_id)) |removed| self.alloc.free(removed.key);
+        return false;
     }
 
     fn deferArtifactMaintenance(self: *FileSnapshotStore) void {
@@ -693,7 +745,7 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
     defer std.testing.allocator.free(root_dir);
     var store = try FileSnapshotStore.init(std.testing.allocator, .{
         .root_dir = root_dir,
-        .max_chunk_bytes = 4,
+        .max_chunk_bytes = snapshot_transfer.min_chunk_bytes,
     });
     defer store.deinit();
     var voters = [_]u64{ 1, 2 };
@@ -771,6 +823,66 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
     try std.testing.expectError(
         error.FileNotFound,
         iface.vtable.get_snapshot_manifest.?(iface.ptr, std.testing.allocator, "snap-v2"),
+    );
+}
+
+test "active chunked fetch lease fences committed artifact expiry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps-fetch-lease", .{tmp.sub_path});
+    defer std.testing.allocator.free(root_dir);
+    var store = try FileSnapshotStore.init(std.testing.allocator, .{
+        .root_dir = root_dir,
+        .artifact_policy = .{
+            .committed_ttl_ns = std.time.ns_per_ms,
+            .active_fetch_lease_ns = 20 * std.time.ns_per_ms,
+        },
+    });
+    defer store.deinit();
+    const body = "lease-protected";
+    const manifest: snapshot_transfer.Manifest = .{
+        .group_id = 93,
+        .from = 0,
+        .to = 2,
+        .request_term = 0,
+        .metadata = .{ .index = 14, .term = 4 },
+        .data_len = body.len,
+        .digest = snapshot_transfer.digest(body),
+    };
+    const iface = store.store();
+    try iface.vtable.begin_chunked_snapshot.?(iface.ptr, manifest, "leased");
+    try iface.vtable.put_snapshot_chunk.?(iface.ptr, "leased", 0, body);
+    try std.testing.expect((try iface.vtable.commit_chunked_snapshot.?(
+        iface.ptr,
+        std.testing.allocator,
+        "leased",
+        false,
+    )) == null);
+
+    var fetched_manifest = try iface.vtable.get_snapshot_manifest.?(
+        iface.ptr,
+        std.testing.allocator,
+        "leased",
+    );
+    fetched_manifest.deinit(std.testing.allocator);
+    try store.io().sleep(.fromMilliseconds(2), .awake);
+    store.next_artifact_maintenance_ns.store(0, .release);
+    const chunk = try iface.vtable.get_snapshot_chunk.?(
+        iface.ptr,
+        std.testing.allocator,
+        "leased",
+        0,
+        body.len,
+    );
+    defer std.testing.allocator.free(chunk);
+    try std.testing.expectEqualStrings(body, chunk);
+
+    // An abandoned fetch eventually becomes reclaimable again.
+    try store.io().sleep(.fromMilliseconds(25), .awake);
+    store.next_artifact_maintenance_ns.store(0, .release);
+    try std.testing.expectError(
+        error.FileNotFound,
+        iface.vtable.get_snapshot_manifest.?(iface.ptr, std.testing.allocator, "leased"),
     );
 }
 

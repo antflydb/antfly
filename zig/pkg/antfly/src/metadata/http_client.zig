@@ -634,8 +634,19 @@ pub const MetadataHttpClient = struct {
             return error.MetadataMutationOutcomeUnknown;
         };
         defer resp.deinit(self.alloc);
+        const outcome_header = responseHeader(resp, routes.Routes.raft_mutation_outcome_header);
+        if (outcome_header == null) {
+            // An older metadata leader does not serve this versioned internal
+            // route. A completed 404/405 response proves the handler never
+            // admitted the mutation, so report an upgrade gate rather than an
+            // ambiguous outcome that tells users to investigate committed
+            // state. Logical handler errors always carry the outcome header.
+            if (resp.status == 404 or resp.status == 405 or resp.status == 426)
+                return error.TableTopologyProtocolUpgradeRequired;
+            return error.MetadataMutationOutcomeUnknown;
+        }
         const outcome = raft_mutation_forwarding.parseOutcome(
-            responseHeader(resp, routes.Routes.raft_mutation_outcome_header),
+            outcome_header,
             routes.Routes.raft_mutation_outcome_not_proposed,
             routes.Routes.raft_mutation_outcome_unknown,
             routes.Routes.raft_mutation_outcome_committed,
@@ -1588,6 +1599,46 @@ test "metadata http client forwards table create and drop to the internal route"
     defer drop_result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), drop_result.group_ids.len);
     try std.testing.expectEqual(@as(usize, 1), drop_exec.attempts);
+}
+
+test "metadata http client treats a missing forwarded mutation route as an upgrade gate" {
+    const LegacyExecutor = struct {
+        attempts: usize = 0,
+
+        fn executor(self: *@This()) http_common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(
+                u8,
+                req.uri,
+                routes.Routes.internal_forwarded_table_mutation,
+            ));
+            return .{
+                .status = 404,
+                .content_type = try alloc.dupe(u8, "text/plain"),
+                .body = try alloc.dupe(u8, "not found"),
+            };
+        }
+    };
+
+    var executor = LegacyExecutor{};
+    var client = MetadataHttpClient.init(std.testing.allocator, executor.executor());
+    try std.testing.expectError(
+        error.TableTopologyProtocolUpgradeRequired,
+        client.forwardTableMutation(
+            "http://127.0.0.1:9000",
+            .create_table,
+            "docs",
+            "{\"num_shards\":1}",
+            .{ .remaining_ms = 5_000, .forwards_remaining = 1, .campaign_allowed = false },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 1), executor.attempts);
 }
 
 test "metadata http client rejects invalid forwarded table names before I/O" {

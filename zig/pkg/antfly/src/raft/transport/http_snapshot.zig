@@ -167,9 +167,16 @@ pub const HttpSnapshotTransport = struct {
         {
             if (try self.resolveV2UploadTarget(req, snapshot_id, uri)) |target| {
                 defer target.deinit(self.alloc);
-                if (requested_format == .chunked_manifest_v2 or
-                    try self.peerSupportsSnapshotV2(target.capabilities_uri, req.from))
-                    return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers);
+                const capabilities = self.peerSnapshotV2Capabilities(target.capabilities_uri, req.from);
+                if (requested_format == .chunked_manifest_v2) {
+                    const peer_max = if (capabilities) |value|
+                        value.max_chunk_bytes
+                    else
+                        snapshot_transfer.min_chunk_bytes;
+                    return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers, peer_max);
+                }
+                if (capabilities) |value|
+                    return try self.sendChunkedSnapshot(req, target.upload_uri, &live_headers, value.max_chunk_bytes);
             }
             if (!legacy_fits or requested_format == .chunked_manifest_v2)
                 return error.SnapshotTransferProtocolUpgradeRequired;
@@ -269,28 +276,37 @@ pub const HttpSnapshotTransport = struct {
         return .unknown;
     }
 
-    fn peerSupportsSnapshotV2(
+    const PeerSnapshotV2Capabilities = struct {
+        max_chunk_bytes: usize,
+    };
+
+    fn peerSnapshotV2Capabilities(
         self: *HttpSnapshotTransport,
         capabilities_uri: []const u8,
         source_node_id: u64,
-    ) !bool {
+    ) ?PeerSnapshotV2Capabilities {
         var resp = self.executor.execute(self.alloc, .{
             .method = .GET,
             .uri = capabilities_uri,
             .source_node_id = if (source_node_id == 0) null else source_node_id,
-        }) catch return false;
+        }) catch return null;
         defer resp.deinit(self.alloc);
-        if (resp.status < 200 or resp.status >= 300) return false;
+        if (resp.status < 200 or resp.status >= 300) return null;
         const Capabilities = struct {
             snapshot_transfer_protocol_version: u32 = 0,
             snapshot_transfer_route_version: u32 = 0,
+            snapshot_max_chunk_bytes: usize = snapshot_transfer.min_chunk_bytes,
         };
         const parsed = std.json.parseFromSlice(Capabilities, self.alloc, resp.body, .{
             .ignore_unknown_fields = true,
-        }) catch return false;
+        }) catch return null;
         defer parsed.deinit();
-        return parsed.value.snapshot_transfer_protocol_version >= snapshot_transfer.protocol_version and
-            parsed.value.snapshot_transfer_route_version >= snapshot_transfer.http_route_version;
+        if (parsed.value.snapshot_transfer_protocol_version < snapshot_transfer.protocol_version or
+            parsed.value.snapshot_transfer_route_version < snapshot_transfer.http_route_version or
+            parsed.value.snapshot_max_chunk_bytes < snapshot_transfer.min_chunk_bytes or
+            parsed.value.snapshot_max_chunk_bytes > snapshot_transfer.max_chunk_bytes)
+            return null;
+        return .{ .max_chunk_bytes = parsed.value.snapshot_max_chunk_bytes };
     }
 
     fn sendLegacySnapshot(
@@ -317,9 +333,15 @@ pub const HttpSnapshotTransport = struct {
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotSendRequest,
         uri: []const u8,
         identity_headers: []const common.RequestHeader,
+        peer_max_chunk_bytes: usize,
     ) !void {
-        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > snapshot_transfer.max_chunk_bytes)
+        if (self.cfg.chunk_size < snapshot_transfer.min_chunk_bytes or
+            self.cfg.chunk_size > snapshot_transfer.max_chunk_bytes)
             return error.InvalidSnapshotChunkSize;
+        if (peer_max_chunk_bytes < snapshot_transfer.min_chunk_bytes or
+            peer_max_chunk_bytes > snapshot_transfer.max_chunk_bytes)
+            return error.InvalidSnapshotChunkSize;
+        const transfer_chunk_size = @min(self.cfg.chunk_size, peer_max_chunk_bytes);
         const manifest: snapshot_transfer.Manifest = .{
             .group_id = req.group_id,
             .from = req.from,
@@ -358,7 +380,7 @@ pub const HttpSnapshotTransport = struct {
 
         var offset: usize = 0;
         while (offset < req.snapshot.data.len) {
-            const end = @min(req.snapshot.data.len, offset + self.cfg.chunk_size);
+            const end = @min(req.snapshot.data.len, offset + transfer_chunk_size);
             var offset_buf: [32]u8 = undefined;
             const encoded_offset = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
             var chunk_headers: [7]common.RequestHeader = undefined;
@@ -396,7 +418,8 @@ pub const HttpSnapshotTransport = struct {
         receiver: raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver,
     ) !void {
         const self: *HttpSnapshotTransport = @ptrCast(@alignCast(ptr));
-        if (self.cfg.chunk_size == 0 or self.cfg.chunk_size > snapshot_transfer.max_chunk_bytes)
+        if (self.cfg.chunk_size < snapshot_transfer.min_chunk_bytes or
+            self.cfg.chunk_size > snapshot_transfer.max_chunk_bytes)
             return error.InvalidSnapshotChunkSize;
         switch (effectiveLocatorFormat(req.locator, routes.Routes.snapshot_fetch_v2)) {
             .legacy_envelope_v1 => return try self.fetchSnapshotLegacy(req, receiver),
@@ -459,9 +482,13 @@ pub const HttpSnapshotTransport = struct {
         const target = (try self.resolveV2FetchTarget(req)) orelse
             return error.SnapshotTransferProtocolUpgradeRequired;
         defer target.deinit(self.alloc);
-        if (require_capability and !try self.peerSupportsSnapshotV2(target.capabilities_uri, 0))
-            return error.SnapshotArtifactNotFound;
-        return try self.fetchSnapshotV2(req, receiver, target.fetch_uri);
+        const capabilities = self.peerSnapshotV2Capabilities(target.capabilities_uri, 0);
+        if (require_capability and capabilities == null) return error.SnapshotArtifactNotFound;
+        const peer_max = if (capabilities) |value|
+            value.max_chunk_bytes
+        else
+            snapshot_transfer.min_chunk_bytes;
+        return try self.fetchSnapshotV2(req, receiver, target.fetch_uri, peer_max);
     }
 
     fn mapSnapshotFetchStatus(status: u16) !void {
@@ -537,7 +564,12 @@ pub const HttpSnapshotTransport = struct {
         req: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest,
         receiver: raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver,
         fetch_uri: []const u8,
+        peer_max_chunk_bytes: usize,
     ) !void {
+        if (peer_max_chunk_bytes < snapshot_transfer.min_chunk_bytes or
+            peer_max_chunk_bytes > snapshot_transfer.max_chunk_bytes)
+            return error.InvalidSnapshotChunkSize;
+        const transfer_chunk_size = @min(self.cfg.chunk_size, peer_max_chunk_bytes);
         const manifest_headers = [_]common.RequestHeader{
             .{ .name = "x-antfly-raft-snapshot-protocol", .value = "2" },
             .{ .name = "x-antfly-raft-snapshot-operation", .value = "manifest" },
@@ -565,10 +597,11 @@ pub const HttpSnapshotTransport = struct {
         if (manifest.data_len > self.cfg.max_snapshot_bytes) return error.SnapshotTooLarge;
         const data_len = std.math.cast(usize, manifest.data_len) orelse return error.SnapshotTooLarge;
         const data = try self.alloc.alloc(u8, data_len);
-        errdefer self.alloc.free(data);
+        var data_owned = true;
+        defer if (data_owned) self.alloc.free(data);
         var offset: usize = 0;
         while (offset < data.len) {
-            const requested = @min(self.cfg.chunk_size, data.len - offset);
+            const requested = @min(transfer_chunk_size, data.len - offset);
             var offset_buf: [32]u8 = undefined;
             var length_buf: [32]u8 = undefined;
             const encoded_offset = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
@@ -599,6 +632,10 @@ pub const HttpSnapshotTransport = struct {
             return error.SnapshotChecksumMismatch;
         const metadata = manifest.metadata;
         manifest.metadata = .{};
+        // SnapshotReceiver owns both allocations once invoked, even when Raft
+        // admission returns an error. Relinquish locally before the call so an
+        // error cannot double-free the receiver's message.
+        data_owned = false;
         try receiver.receiveSnapshot(req, .{ .metadata = metadata, .data = data });
 
         const release_headers = [_]common.RequestHeader{
@@ -1001,6 +1038,73 @@ test "v2 bootstrap artifact validates its owner instead of a Raft sender" {
     try std.testing.expect(receiver.seen);
 }
 
+test "v2 fetch transfers snapshot ownership before receiver errors" {
+    const Executor = struct {
+        manifest: []const u8,
+
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{ .ptr = self, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const operation = req.header("x-antfly-raft-snapshot-operation") orelse "";
+            if (std.mem.eql(u8, operation, "manifest")) return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
+                .body = try alloc.dupe(u8, self.manifest),
+            };
+            if (std.mem.eql(u8, operation, "chunk")) return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/x-antflydb-raft-snapshot-chunk-v2"),
+                .body = try alloc.dupe(u8, "owned"),
+            };
+            return .{ .status = 204 };
+        }
+    };
+    const Receiver = struct {
+        fn receive(
+            _: *anyopaque,
+            _: raft_engine.runtime.snapshot_transport_iface.SnapshotFetchRequest,
+            input_snapshot: raft_engine.core.types.Snapshot,
+        ) !void {
+            var snapshot = input_snapshot;
+            defer snapshot.deinit(std.testing.allocator);
+            return error.TestReceiverRejected;
+        }
+
+        fn iface() raft_engine.runtime.snapshot_transport_iface.SnapshotReceiver {
+            return .{ .ptr = undefined, .vtable = &.{ .receive_snapshot = receive } };
+        }
+    };
+
+    const manifest: snapshot_transfer.Manifest = .{
+        .group_id = 92,
+        .from = 0,
+        .to = 8,
+        .request_term = 0,
+        .metadata = .{ .index = 13, .term = 5 },
+        .data_len = "owned".len,
+        .digest = snapshot_transfer.digest("owned"),
+    };
+    const encoded = try snapshot_transfer.encode(std.testing.allocator, manifest);
+    defer std.testing.allocator.free(encoded);
+    var executor = Executor{ .manifest = encoded };
+    var transport = HttpSnapshotTransport.init(std.testing.allocator, .{ .root_dir = "/tmp" }, executor.iface(), null);
+    try std.testing.expectError(
+        error.TestReceiverRejected,
+        transport.transport().fetchSnapshot(.{
+            .group_id = 92,
+            .from = 8,
+            .locator = .{
+                .snapshot_id = "owned-error",
+                .uri = "/raft/v2/snapshot/fetch/owned-error",
+                .format = .chunked_manifest_v2,
+            },
+        }, Receiver.iface()),
+    );
+}
+
 test "http snapshot transport posts and fetches serialized snapshots" {
     const RecordingExecutor = struct {
         server: *http_server.HttpServer,
@@ -1327,6 +1431,7 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
     const Executor = struct {
         transfer_requests: usize = 0,
         saw_artifact_manifest: bool = false,
+        max_chunk_body: usize = 0,
 
         fn iface(self: *@This()) common.RequestExecutor {
             return .{ .ptr = self, .vtable = &.{ .execute = execute } };
@@ -1337,7 +1442,11 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
             if (std.mem.eql(u8, req.uri, routes.Routes.capabilities)) {
                 return .{
                     .status = 200,
-                    .body = try alloc.dupe(u8, "{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":1}"),
+                    .body = try std.fmt.allocPrint(
+                        alloc,
+                        "{{\"snapshot_transfer_protocol_version\":2,\"snapshot_transfer_route_version\":1,\"snapshot_max_chunk_bytes\":{d}}}",
+                        .{snapshot_transfer.min_chunk_bytes},
+                    ),
                 };
             }
             try std.testing.expectEqualStrings("/raft/v2/snapshot/upload/snap-v2", req.uri);
@@ -1352,6 +1461,8 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
                     },
                     .live_install => return error.TestUnexpectedResult,
                 }
+            } else if (std.mem.eql(u8, req.header("x-antfly-raft-snapshot-operation") orelse "", "chunk")) {
+                self.max_chunk_body = @max(self.max_chunk_body, req.body.len);
             }
             return .{ .status = 201 };
         }
@@ -1361,12 +1472,15 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
     var transport = HttpSnapshotTransport.init(std.testing.allocator, .{
         .root_dir = "/tmp",
     }, executor.iface(), null);
+    const body = try std.testing.allocator.alloc(u8, snapshot_transfer.min_chunk_bytes + 1);
+    defer std.testing.allocator.free(body);
+    @memset(body, 's');
     try transport.transport().sendSnapshot(.{
         .group_id = 91,
         .to = 2,
         .snapshot = .{
             .metadata = .{ .index = 12, .term = 4 },
-            .data = @constCast("store-only-snapshot"),
+            .data = body,
         },
         .locator = .{
             .snapshot_id = "snap-v2",
@@ -1375,7 +1489,8 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
         },
     });
     try std.testing.expect(executor.saw_artifact_manifest);
-    try std.testing.expectEqual(@as(usize, 3), executor.transfer_requests);
+    try std.testing.expectEqual(@as(usize, 4), executor.transfer_requests);
+    try std.testing.expectEqual(snapshot_transfer.min_chunk_bytes, executor.max_chunk_body);
 
     // Catalogs written before the explicit format field can still carry the
     // v2 route. That persisted route must remain authoritative after upgrade.
@@ -1384,12 +1499,12 @@ test "versioned v2 store-only upload uses its locator and artifact purpose" {
         .to = 2,
         .snapshot = .{
             .metadata = .{ .index = 12, .term = 4 },
-            .data = @constCast("store-only-snapshot"),
+            .data = body,
         },
         .locator = .{
             .snapshot_id = "snap-v2",
             .uri = "/raft/v2/snapshot/upload/snap-v2",
         },
     });
-    try std.testing.expectEqual(@as(usize, 6), executor.transfer_requests);
+    try std.testing.expectEqual(@as(usize, 8), executor.transfer_requests);
 }

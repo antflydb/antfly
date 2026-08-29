@@ -97,7 +97,11 @@ pub const LocalSnapshotTransport = struct {
             .metadata = metadata,
             .data = data,
         };
-        errdefer snapshot.deinit(self.alloc);
+        var snapshot_owned = true;
+        defer if (snapshot_owned) snapshot.deinit(self.alloc);
+        // SnapshotReceiver takes ownership at the call boundary, including
+        // error returns from the Raft admission path.
+        snapshot_owned = false;
         try receiver.receiveSnapshot(.{
             .group_id = req.group_id,
             .from = req.from,

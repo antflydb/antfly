@@ -52,6 +52,9 @@ pub const SnapshotReceiver = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Takes ownership of `snapshot` when invoked, whether the callback
+        /// succeeds or fails. This keeps transport error paths from guessing
+        /// whether a partially admitted Raft message still owns its buffers.
         receive_snapshot: *const fn (
             ptr: *anyopaque,
             req: SnapshotFetchRequest,

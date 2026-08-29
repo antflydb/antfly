@@ -1102,7 +1102,7 @@ pub const HttpHost = struct {
                 @min(cfg.listener.max_request_bytes, cfg.executor.max_response_bytes),
             ),
         );
-        if (transport_config.snapshot.chunk_size == 0)
+        if (transport_config.snapshot.chunk_size < snapshot_transfer.min_chunk_bytes)
             return error.InvalidSnapshotTransferLimits;
         // The std Threaded timeout path uses process signals for cancellation.
         // Keep each asynchronous peer lane on an independent I/O pool so one
@@ -1124,7 +1124,10 @@ pub const HttpHost = struct {
             snapshot_store.* = try transport.FileSnapshotStore.init(alloc, .{
                 .root_dir = cfg.transport.snapshot.root_dir,
                 .max_snapshot_bytes = @min(cfg.max_snapshot_bytes, transport_config.snapshot.max_snapshot_bytes),
-                .max_chunk_bytes = transport_config.snapshot.chunk_size,
+                // Inbound acceptance is a protocol/listener property, not the
+                // local client's outbound chunk preference. Peers negotiate
+                // this independently through the capability endpoint.
+                .max_chunk_bytes = @min(snapshot_transfer.max_chunk_bytes, cfg.listener.max_request_bytes),
                 .artifact_policy = cfg.snapshot_artifact_policy,
             });
             break :blk snapshot_store;

@@ -59,6 +59,7 @@ pub const SnapshotStore = struct {
         get_snapshot_chunk: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, offset: u64, max_len: usize) anyerror![]u8 = null,
         abort_chunked_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8) anyerror!void = null,
         release_chunked_snapshot: ?*const fn (ptr: *anyopaque, snapshot_id: []const u8) anyerror!void = null,
+        max_chunk_bytes: ?*const fn (ptr: *anyopaque) usize = null,
     };
 
     pub fn putSnapshot(self: SnapshotStore, alloc: std.mem.Allocator, snapshot_id: []const u8, body: []const u8) !void {
@@ -75,6 +76,17 @@ pub const SnapshotStore = struct {
             self.vtable.get_snapshot_upload_manifest != null and self.vtable.get_snapshot_chunk != null and
             self.vtable.abort_chunked_snapshot != null and
             self.vtable.release_chunked_snapshot != null;
+    }
+
+    pub fn maxChunkBytes(self: SnapshotStore, server_max_request_bytes: usize) usize {
+        const store_max = if (self.vtable.max_chunk_bytes) |get_max|
+            get_max(self.ptr)
+        else
+            snapshot_transfer.max_chunk_bytes;
+        return @min(
+            snapshot_transfer.max_chunk_bytes,
+            @min(server_max_request_bytes, store_max),
+        );
     }
 };
 
@@ -199,7 +211,7 @@ pub const HttpServer = struct {
                 .content_type = content_type,
                 .body = try std.fmt.allocPrint(
                     self.alloc,
-                    "{{\"data_raft_batch_protocol_version\":{d},\"snapshot_transfer_protocol_version\":{d},\"snapshot_transfer_route_version\":{d}}}",
+                    "{{\"data_raft_batch_protocol_version\":{d},\"snapshot_transfer_protocol_version\":{d},\"snapshot_transfer_route_version\":{d},\"snapshot_max_chunk_bytes\":{d}}}",
                     .{
                         data_raft_protocol.batch_protocol_version,
                         if (self.snapshot_store) |store|
@@ -208,6 +220,10 @@ pub const HttpServer = struct {
                             0,
                         if (self.snapshot_store) |store|
                             if (store.supportsChunkedTransfer()) snapshot_transfer.http_route_version else 0
+                        else
+                            0,
+                        if (self.snapshot_store) |store|
+                            if (store.supportsChunkedTransfer()) store.maxChunkBytes(self.cfg.max_request_bytes) else 0
                         else
                             0,
                     },
@@ -564,6 +580,7 @@ test "http server exposes health and data raft protocol capabilities" {
         data_raft_batch_protocol_version: u16,
         snapshot_transfer_protocol_version: u32,
         snapshot_transfer_route_version: u32,
+        snapshot_max_chunk_bytes: usize,
     };
     const parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, capabilities.body, .{});
     defer parsed.deinit();
@@ -573,6 +590,7 @@ test "http server exposes health and data raft protocol capabilities" {
     );
     try std.testing.expectEqual(@as(u32, 0), parsed.value.snapshot_transfer_protocol_version);
     try std.testing.expectEqual(@as(u32, 0), parsed.value.snapshot_transfer_route_version);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.snapshot_max_chunk_bytes);
 }
 
 test "http server advertises isolated snapshot routes only for complete stores" {
@@ -631,6 +649,7 @@ test "http server advertises isolated snapshot routes only for complete stores" 
     const Parsed = struct {
         snapshot_transfer_protocol_version: u32,
         snapshot_transfer_route_version: u32,
+        snapshot_max_chunk_bytes: usize,
     };
     const parsed = try std.json.parseFromSlice(Parsed, std.testing.allocator, capabilities.body, .{
         .ignore_unknown_fields = true,
@@ -643,6 +662,10 @@ test "http server advertises isolated snapshot routes only for complete stores" 
     try std.testing.expectEqual(
         snapshot_transfer.http_route_version,
         parsed.value.snapshot_transfer_route_version,
+    );
+    try std.testing.expectEqual(
+        snapshot_transfer.max_chunk_bytes,
+        parsed.value.snapshot_max_chunk_bytes,
     );
 
     const UploadHandler = struct {

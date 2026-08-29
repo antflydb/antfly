@@ -1881,14 +1881,17 @@ pub const MultiRaft = struct {
         snapshot: core.types.Snapshot,
     ) !void {
         const self: *MultiRaft = @ptrCast(@alignCast(ptr));
+        var owned_snapshot = snapshot;
+        defer owned_snapshot.deinit(self.alloc);
         const grp = self.group(req.group_id) orelse return error.UnknownGroup;
         var msg: core.Message = .{
             .msg_type = .snapshot,
             .from = req.from,
             .to = grp.localNodeId(),
             .term = req.term,
-            .snapshot = snapshot,
+            .snapshot = owned_snapshot,
         };
+        owned_snapshot = .{};
         defer msg.deinit(self.alloc);
         try self.step(req.group_id, msg);
     }
