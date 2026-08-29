@@ -154,6 +154,11 @@ pub const IndexRepairIntent = struct {
     /// count is diagnostic/accounting state and is not used for correctness.
     build_resume_key: ?[]u8 = null,
     build_reprocessed: u64 = 0,
+    /// Durable candidate replay progress before activation. Once `phase`
+    /// reaches `activating`, this is the immutable sequence certified by the
+    /// ready manifest and installed by the pointer publication. Later serving
+    /// progress belongs to the projection checkpoint and must not rewrite this
+    /// crash-recovery identity.
     candidate_applied_sequence: u64 = 0,
     /// Reconstructible node plan, not a durable reservation. The estimate is
     /// candidate bytes; planned bytes additionally include replay/WAL growth

@@ -2680,9 +2680,6 @@ pub const ArtifactRepairRunOptions = struct {
     /// Installed by the durable owner after admission. Shadow construction
     /// invokes it only at bounded publication/window boundaries.
     capacity_check: ?RepairCapacityCheck = null,
-    /// Internal recursion fence: the durable owner has already admitted and
-    /// claimed this intent and is invoking the lower-level rebuild engine.
-    executing_durable_index_repair: bool = false,
     /// Managed operator requests persist/enqueue intent work and return
     /// immediately. Standalone callers leave this false and advance through
     /// the same state machine synchronously.
