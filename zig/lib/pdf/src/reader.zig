@@ -4737,17 +4737,21 @@ pub const Reader = struct {
             if (glyph_cache) |cache| try cache.checkCancellation();
             var simple_code: ?u8 = null;
             var cid_code: ?u16 = null;
+            var source_code: u32 = 0;
+            var code_len: usize = 1;
             const glyph_index = (if (truetype.raw_code_bytes > 0) blk: {
                 if (raw_offset >= raw_bytes.len) break;
                 const decoded = if (truetype.cid_encoding) |encoding|
                     encoding.decode(raw_bytes[raw_offset..])
                 else blk_decode: {
-                    const code_len = @min(truetype.raw_code_bytes, raw_bytes.len - raw_offset);
-                    const source = parseRawCode(raw_bytes[raw_offset .. raw_offset + code_len]);
-                    break :blk_decode CidDecodedCode{ .source = source, .cid = if (source <= std.math.maxInt(u16)) @intCast(source) else null, .len = code_len };
+                    const raw_code_len = @min(truetype.raw_code_bytes, raw_bytes.len - raw_offset);
+                    const source = parseRawCode(raw_bytes[raw_offset .. raw_offset + raw_code_len]);
+                    break :blk_decode CidDecodedCode{ .source = source, .cid = if (source <= std.math.maxInt(u16)) @intCast(source) else null, .len = raw_code_len };
                 };
                 if (decoded.len == 0) break;
                 raw_offset += decoded.len;
+                source_code = decoded.source;
+                code_len = decoded.len;
                 cid_code = decoded.cid orelse break :blk null;
                 if (truetype.cid_to_gid) |map| {
                     break :blk @as(?u16, map.glyphIndex(cid_code.?));
@@ -4804,10 +4808,13 @@ pub const Reader = struct {
                 try appendFontOutlineShapesAlloc(alloc, out, run, glyph_x, scale, outline, mode, glyph_y);
             }
             const spacing = run.char_spacing + if (simple_code == ' ') run.word_spacing else 0.0;
-            if (run.vertical)
-                cursor_y += if (vertical_metric) |metric| metric.w1_y * run.font_size / 1000.0 - run.char_spacing else -horizontal_advance - run.char_spacing
-            else
-                cursor_x += (horizontal_advance + spacing) * run.horizontal_scale;
+            if (run.vertical) {
+                const vertical_advance = if (vertical_metric) |metric|
+                    verticalCodeAdvanceMagnitude(metric.w1_y, code_len, source_code, run.font_size, run.char_spacing, run.word_spacing)
+                else
+                    horizontal_advance - embeddedCffTextSpacing(code_len, source_code, run.char_spacing, run.word_spacing);
+                cursor_y -= vertical_advance;
+            } else cursor_x += (horizontal_advance + spacing) * run.horizontal_scale;
         }
         return true;
     }
@@ -4988,7 +4995,10 @@ pub const Reader = struct {
             }
             const spacing = cff_otf.textSpacing(decoded.len, decoded.source, run.char_spacing, run.word_spacing);
             if (run.vertical)
-                cursor_y += if (vertical_metric) |metric| metric.w1_y * run.font_size / 1000.0 - run.char_spacing else -glyph.advance * run.font_size / 1000.0 - run.char_spacing
+                cursor_y -= if (vertical_metric) |metric|
+                    verticalCodeAdvanceMagnitude(metric.w1_y, decoded.len, decoded.source, run.font_size, run.char_spacing, run.word_spacing)
+                else
+                    glyph.advance * run.font_size / 1000.0 - spacing
             else
                 cursor_x += (glyph.advance * run.font_size / 1000.0 + spacing) * run.horizontal_scale;
         }
@@ -5051,7 +5061,10 @@ pub const Reader = struct {
             }
             const spacing = cff.textSpacing(decoded.len, decoded.source, run.char_spacing, run.word_spacing);
             if (run.vertical)
-                cursor_y += if (vertical_metric) |metric| metric.w1_y * scale - run.char_spacing else -glyph.advance * scale - run.char_spacing
+                cursor_y -= if (vertical_metric) |metric|
+                    verticalCodeAdvanceMagnitude(metric.w1_y, decoded.len, decoded.source, run.font_size, run.char_spacing, run.word_spacing)
+                else
+                    glyph.advance * scale - spacing
             else
                 cursor_x += (glyph.advance * scale + spacing) * run.horizontal_scale;
         }
@@ -7931,7 +7944,10 @@ pub const Reader = struct {
 
         const Section = enum { none, codespace, cidchar, cidrange };
         var section: Section = .none;
-        var max_code_bytes: usize = 1;
+        // Identity-H and Identity-V contribute their two-byte codespace to a
+        // derived CMap. Local one-byte overrides may coexist with that base,
+        // but must not shrink the inherited identity fallback to one byte.
+        var max_code_bytes: usize = if (inherited_identity) 2 else 1;
         var pending_identity: ?bool = null;
         var expect_wmode = false;
         var scanner = syntax.Scanner.init(self.alloc, decoded);
@@ -7955,6 +7971,7 @@ pub const Reader = struct {
                     if (pending_identity) |vertical| {
                         result.identity = true;
                         result.vertical = vertical;
+                        max_code_bytes = @max(max_code_bytes, 2);
                     } else return error.UnsupportedPdfRendering;
                     pending_identity = null;
                     continue;
@@ -11225,25 +11242,11 @@ fn applyTextRunOperator(
                 .string => try appendTextRunDecodedString(alloc, out, state, current_clip_points.items, current_clip_fill_rule.*, fonts, paint_order.*, item.string),
                 .integer => |value| {
                     const vertical = state.current_font_index != null and fonts[state.current_font_index.?].isVertical();
-                    const adjust = (@as(f64, @floatFromInt(value)) / 1000.0) * state.font_size * if (vertical) 1.0 else state.horizontal_scale;
-                    if (vertical) {
-                        state.x += adjust * state.text_c;
-                        state.y += adjust * state.text_d;
-                    } else {
-                        state.x -= adjust * state.text_a;
-                        state.y -= adjust * state.text_b;
-                    }
+                    applyTextArrayAdjustment(state, @floatFromInt(value), vertical);
                 },
                 .real => |value| {
                     const vertical = state.current_font_index != null and fonts[state.current_font_index.?].isVertical();
-                    const adjust = (value / 1000.0) * state.font_size * if (vertical) 1.0 else state.horizontal_scale;
-                    if (vertical) {
-                        state.x += adjust * state.text_c;
-                        state.y += adjust * state.text_d;
-                    } else {
-                        state.x -= adjust * state.text_a;
-                        state.y -= adjust * state.text_b;
-                    }
+                    applyTextArrayAdjustment(state, value, vertical);
                 },
                 else => {},
             }
@@ -12654,6 +12657,28 @@ fn appendTextRunDecodedString(
     }
 }
 
+/// A numeric TJ element is subtracted from the active writing coordinate.
+/// Horizontal scaling applies only in horizontal writing mode.
+fn applyTextArrayAdjustment(state: *TextRunState, value: f64, vertical: bool) void {
+    const adjust = (value / 1000.0) * state.font_size * if (vertical) 1.0 else state.horizontal_scale;
+    if (vertical) {
+        state.x -= adjust * state.text_c;
+        state.y -= adjust * state.text_d;
+    } else {
+        state.x -= adjust * state.text_a;
+        state.y -= adjust * state.text_b;
+    }
+}
+
+/// `advance_width` is stored as a positive distance along the negative text-y
+/// axis for vertical runs. PDF's signed displacement is
+/// `w1_y * font_size / 1000 + Tc + Tw`, so negate the complete expression,
+/// including spacing, rather than negating only the glyph metric.
+fn verticalCodeAdvanceMagnitude(w1_y: f64, code_len: usize, source_code: u32, font_size: f64, char_spacing: f64, word_spacing: f64) f64 {
+    const spacing = embeddedCffTextSpacing(code_len, source_code, char_spacing, word_spacing);
+    return -w1_y * font_size / 1000.0 - spacing;
+}
+
 fn estimateDecodedAdvance(decoded: []const u8, state: TextRunState) f64 {
     var advance: f64 = 0;
     var it = std.unicode.Utf8View.init(decoded) catch {
@@ -12762,7 +12787,7 @@ fn measureFontAdvanceAlloc(
                 const width = if (decoded_code.cid) |cid| truetype.cid_widths.?.width(cid) else truetype.cid_widths.?.default_width;
                 if (truetype.vertical and truetype.cid_vertical_metrics != null and decoded_code.cid != null) {
                     const metric = truetype.cid_vertical_metrics.?.metric(decoded_code.cid.?, width);
-                    advance += -metric.w1_y * state.font_size / 1000.0 + state.char_spacing;
+                    advance += verticalCodeAdvanceMagnitude(metric.w1_y, decoded_code.len, decoded_code.source, state.font_size, state.char_spacing, state.word_spacing);
                 } else {
                     advance += (width * state.font_size / 1000.0 + state.char_spacing) * state.horizontal_scale;
                 }
@@ -12790,7 +12815,7 @@ fn measureFontAdvanceAlloc(
             const glyph_width = if (decoded_code.cid) |cid| if (cff_otf.glyphForCode(cid)) |glyph| glyph.advance else 600 else 600;
             if (cff_otf.vertical and cff_otf.cid_vertical_metrics != null and decoded_code.cid != null) {
                 const metric = cff_otf.cid_vertical_metrics.?.metric(decoded_code.cid.?, glyph_width);
-                advance += -metric.w1_y * state.font_size / 1000.0 + state.char_spacing;
+                advance += verticalCodeAdvanceMagnitude(metric.w1_y, decoded_code.len, decoded_code.source, state.font_size, state.char_spacing, state.word_spacing);
             } else {
                 advance += (glyph_width * state.font_size / 1000.0 + cff_otf.textSpacing(decoded_code.len, decoded_code.source, state.char_spacing, state.word_spacing)) * state.horizontal_scale;
             }
@@ -12814,7 +12839,7 @@ fn measureFontAdvanceAlloc(
             const glyph_width = if (decoded_code.cid) |cid| if (cff.glyphForCode(cid)) |glyph| glyph.advance else 600 else 600;
             if (cff.vertical and cff.cid_vertical_metrics != null and decoded_code.cid != null) {
                 const metric = cff.cid_vertical_metrics.?.metric(decoded_code.cid.?, glyph_width);
-                advance += -metric.w1_y * scale + state.char_spacing;
+                advance += verticalCodeAdvanceMagnitude(metric.w1_y, decoded_code.len, decoded_code.source, state.font_size, state.char_spacing, state.word_spacing);
             } else {
                 advance += (glyph_width * scale + cff.textSpacing(decoded_code.len, decoded_code.source, state.char_spacing, state.word_spacing)) * state.horizontal_scale;
             }
@@ -22065,6 +22090,62 @@ test "embedded Type0 CMap decodes bounded chars ranges and vertical mode" {
     try std.testing.expectEqual(CidDecodedCode{ .source = 0x20, .cid = 7, .len = 1 }, encoding.decode(&.{0x20}));
     try std.testing.expectEqual(CidDecodedCode{ .source = 0x81, .cid = 21, .len = 1 }, encoding.decode(&.{0x81}));
     try std.testing.expectEqual(CidDecodedCode{ .source = 0x01, .cid = 1, .len = 1 }, encoding.decode(&.{0x01}));
+}
+
+test "Identity usecmap preserves its inherited two-byte codespace" {
+    const alloc = std.testing.allocator;
+    const content_cmap = "/Identity-H usecmap\n";
+    const content_object = try std.fmt.allocPrint(
+        alloc,
+        "2 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n",
+        .{ content_cmap.len, content_cmap },
+    );
+    defer alloc.free(content_object);
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog >>\nendobj\n",
+        content_object,
+        "3 0 obj\n<< /Length 0 /UseCMap /Identity-V >>\nstream\nendstream\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+
+    var reader = try Reader.init(alloc, sample);
+    defer reader.deinit();
+    inline for (.{ @as(u32, 2), @as(u32, 3) }) |object_id| {
+        var object = try reader.readIndirectObject(.{ .id = object_id, .gen = 0 });
+        defer object.deinit(alloc);
+        var encoding = try reader.parseCidEncodingAlloc(&object);
+        defer encoding.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), encoding.code_bytes);
+        try std.testing.expectEqual(
+            CidDecodedCode{ .source = 0x41, .cid = 0x41, .len = 2 },
+            encoding.decode(&.{ 0x00, 0x41 }),
+        );
+        try std.testing.expectEqual(object_id == 3, encoding.vertical);
+    }
+}
+
+test "vertical text displacement applies spacing and TJ with PDF signs" {
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 3),
+        verticalCodeAdvanceMagnitude(-1000, 1, ' ', 10, 2, 5),
+        0.0001,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f64, 8),
+        verticalCodeAdvanceMagnitude(-1000, 2, 0x0020, 10, 2, 5),
+        0.0001,
+    );
+
+    var vertical_state = TextRunState{ .font_size = 10, .x = 7, .y = 11 };
+    applyTextArrayAdjustment(&vertical_state, 200, true);
+    try std.testing.expectApproxEqAbs(@as(f64, 7), vertical_state.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 9), vertical_state.y, 0.0001);
+
+    var horizontal_state = TextRunState{ .font_size = 10, .horizontal_scale = 0.5, .x = 7, .y = 11 };
+    applyTextArrayAdjustment(&horizontal_state, 200, false);
+    try std.testing.expectApproxEqAbs(@as(f64, 6), horizontal_state.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 11), horizontal_state.y, 0.0001);
 }
 
 test "embedded CFF word spacing applies only to single-byte space codes" {

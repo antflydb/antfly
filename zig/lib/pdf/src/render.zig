@@ -113,7 +113,7 @@ pub fn renderPageContentPngInBoxRotatedCancelable(
     var raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation);
     defer alloc.free(raw.rgba);
     try cancellation.check();
-    try rotateRawPageCanvasAlloc(alloc, &raw, rotation);
+    try rotateRawPageCanvasAlloc(alloc, &raw, rotation, cancellation);
     try cancellation.check();
     return try image.png.encodeRgba(alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba);
 }
@@ -124,7 +124,7 @@ const RawPageCanvas = struct {
     height: usize,
 };
 
-fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation) !void {
+fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
     switch (rotation) {
         .none => return,
         .clockwise_180 => {
@@ -135,6 +135,7 @@ fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: Pag
                 left += 1;
                 right -= 1;
             }) {
+                if (left & 16_383 == 0) try cancellation.check();
                 const left_offset = left * 4;
                 const right_offset = right * 4;
                 for (0..4) |channel| {
@@ -149,6 +150,7 @@ fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: Pag
             // write remains cache-friendly. Source reads are necessarily
             // column-strided for a quarter turn.
             for (0..raw.width) |dst_y| {
+                if (dst_y & 31 == 0) try cancellation.check();
                 for (0..raw.height) |dst_x| {
                     const src_x = if (rotation == .clockwise_90) dst_y else raw.width - 1 - dst_y;
                     const src_y = if (rotation == .clockwise_90) raw.height - 1 - dst_x else dst_x;
@@ -852,7 +854,7 @@ fn drawImageRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, margin
             const dst = (py * canvas_w + px) * 4;
             var sample: [4]u8 = undefined;
             if (coverage_minify) {
-                sample = coveragePreservingBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d);
+                sample = try coveragePreservingBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, cancellation);
             } else if (filtered) {
                 sample = bilinearImageSample(run, u, 1.0 - v);
             } else {
@@ -867,16 +869,111 @@ fn drawImageRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, margin
     }
 }
 
-/// OCR benefits from retaining the ink coverage of one-bit scans when many
-/// source pixels collapse into one destination pixel. A fixed 4x4 stratified
-/// footprint is deterministic and bounded, handles rotated/sheared image
-/// matrices through the inverse transform, and averages premultiplied color
-/// so masks do not grow dark fringes.
-fn coveragePreservingBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64) [4]u8 {
-    const offsets = [_]f64{ 0.125, 0.375, 0.625, 0.875 };
+const SourceFootprint = struct {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+
+    fn area(self: SourceFootprint) f64 {
+        return @max(0.0, self.max_x - self.min_x) * @max(0.0, self.max_y - self.min_y);
+    }
+};
+
+fn imageSourceFootprint(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64) ?SourceFootprint {
+    var footprint = SourceFootprint{
+        .min_x = std.math.inf(f64),
+        .max_x = -std.math.inf(f64),
+        .min_y = std.math.inf(f64),
+        .max_y = -std.math.inf(f64),
+    };
+    const corners = [_][2]f64{
+        .{ -0.5, -0.5 },
+        .{ 0.5, -0.5 },
+        .{ -0.5, 0.5 },
+        .{ 0.5, 0.5 },
+    };
+    for (corners) |corner| {
+        const dx = world_x + corner[0] - run.e;
+        const dy = world_y + corner[1] - run.f;
+        const u = inv_a * dx + inv_c * dy;
+        const v = inv_b * dx + inv_d * dy;
+        if (!finite(u) or !finite(v)) return null;
+        const source_x = u * @as(f64, @floatFromInt(run.width));
+        const source_y = (1.0 - v) * @as(f64, @floatFromInt(run.height));
+        footprint.min_x = @min(footprint.min_x, source_x);
+        footprint.max_x = @max(footprint.max_x, source_x);
+        footprint.min_y = @min(footprint.min_y, source_y);
+        footprint.max_y = @max(footprint.max_y, source_y);
+    }
+    return if (footprint.area() > 0) footprint else null;
+}
+
+fn channelByte(value: f64) u8 {
+    return @intFromFloat(@round(std.math.clamp(value, 0.0, 255.0)));
+}
+
+/// Exact premultiplied box integration for axis-aligned and quarter-turned
+/// image matrices. The source rectangles of adjacent destination pixels form
+/// a partition during ordinary minification, so total work remains linear in
+/// the source image instead of growing with the reduction ratio.
+fn boxFilteredBilevelSample(run: reader.ImageRun, footprint: SourceFootprint, cancellation: reader.CancellationProbe) ![4]u8 {
+    const total_area = footprint.area();
+    if (total_area <= 0 or !finite(total_area)) return .{ 0, 0, 0, 0 };
+    const width_f: f64 = @floatFromInt(run.width);
+    const height_f: f64 = @floatFromInt(run.height);
+    const min_x = std.math.clamp(footprint.min_x, 0.0, width_f);
+    const max_x = std.math.clamp(footprint.max_x, 0.0, width_f);
+    const min_y = std.math.clamp(footprint.min_y, 0.0, height_f);
+    const max_y = std.math.clamp(footprint.max_y, 0.0, height_f);
+    if (min_x >= max_x or min_y >= max_y) return .{ 0, 0, 0, 0 };
+
+    const x0: usize = @intFromFloat(@floor(min_x));
+    const x1: usize = @intFromFloat(@ceil(max_x));
+    const y0: usize = @intFromFloat(@floor(min_y));
+    const y1: usize = @intFromFloat(@ceil(max_y));
+    var alpha_area: f64 = 0;
+    var premultiplied_area: [3]f64 = .{ 0, 0, 0 };
+    var sy = y0;
+    while (sy < y1) : (sy += 1) {
+        if ((sy - y0) & 31 == 0) try cancellation.check();
+        const y_weight = @max(0.0, @min(max_y, @as(f64, @floatFromInt(sy + 1))) - @max(min_y, @as(f64, @floatFromInt(sy))));
+        var sx = x0;
+        while (sx < x1) : (sx += 1) {
+            if ((sx - x0) & 4095 == 0) try cancellation.check();
+            const x_weight = @max(0.0, @min(max_x, @as(f64, @floatFromInt(sx + 1))) - @max(min_x, @as(f64, @floatFromInt(sx))));
+            const weight = x_weight * y_weight;
+            if (weight <= 0) continue;
+            const src = (sy * @as(usize, run.width) + sx) * 4;
+            const alpha: f64 = @floatFromInt(run.rgba[src + 3]);
+            alpha_area += alpha * weight;
+            for (0..3) |channel| premultiplied_area[channel] += @as(f64, @floatFromInt(run.rgba[src + channel])) * alpha * weight;
+        }
+    }
+    const averaged_alpha = alpha_area / total_area;
+    var result: [4]u8 = .{ 0, 0, 0, channelByte(averaged_alpha) };
+    if (alpha_area > 0) {
+        for (0..3) |channel| result[channel] = channelByte(premultiplied_area[channel] / alpha_area);
+    }
+    return result;
+}
+
+/// Bounded adaptive fallback for genuinely sheared/rotated footprints. Sample
+/// density follows the source footprint up to 16 strata per destination axis,
+/// avoiding the fixed 4x4 alias pattern without permitting adversarial affine
+/// transforms to multiply work without limit.
+fn adaptiveAffineBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64, footprint: SourceFootprint, cancellation: reader.CancellationProbe) ![4]u8 {
+    const samples_x: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_x - footprint.min_x))));
+    const samples_y: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_y - footprint.min_y))));
+    const sample_count = samples_x * samples_y;
+    const sample_count_u32: u32 = @intCast(sample_count);
     var alpha_sum: u32 = 0;
     var premultiplied_sum: [3]u64 = .{ 0, 0, 0 };
-    for (offsets) |oy| for (offsets) |ox| {
+    for (0..samples_y) |sample_y_index| for (0..samples_x) |sample_x_index| {
+        const ox = (@as(f64, @floatFromInt(sample_x_index)) + 0.5) / @as(f64, @floatFromInt(samples_x));
+        const oy = (@as(f64, @floatFromInt(sample_y_index)) + 0.5) / @as(f64, @floatFromInt(samples_y));
+        const sample_index = sample_y_index * samples_x + sample_x_index;
+        if (sample_index & 63 == 0) try cancellation.check();
         const sample_world_x = world_x + ox - 0.5;
         const sample_world_y = world_y - oy + 0.5;
         const dx = sample_world_x - run.e;
@@ -891,12 +988,21 @@ fn coveragePreservingBilevelSample(run: reader.ImageRun, world_x: f64, world_y: 
         alpha_sum += alpha;
         for (0..3) |channel| premultiplied_sum[channel] += @as(u64, run.rgba[src + channel]) * alpha;
     };
-    const averaged_alpha: u8 = @intCast((alpha_sum + 8) / 16);
+    const averaged_alpha: u8 = @intCast((alpha_sum + sample_count_u32 / 2) / sample_count_u32);
     var result: [4]u8 = .{ 0, 0, 0, averaged_alpha };
     if (alpha_sum != 0) for (0..3) |channel| {
         result[channel] = @intCast((premultiplied_sum[channel] + alpha_sum / 2) / alpha_sum);
     };
     return result;
+}
+
+fn coveragePreservingBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64, cancellation: reader.CancellationProbe) ![4]u8 {
+    const footprint = imageSourceFootprint(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d) orelse return .{ 0, 0, 0, 0 };
+    const epsilon = 0.000000001;
+    const orthogonal = (@abs(inv_b) <= epsilon and @abs(inv_c) <= epsilon) or
+        (@abs(inv_a) <= epsilon and @abs(inv_d) <= epsilon);
+    if (orthogonal) return try boxFilteredBilevelSample(run, footprint, cancellation);
+    return try adaptiveAffineBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, footprint, cancellation);
 }
 
 fn bilinearImageSample(run: reader.ImageRun, u: f64, v: f64) [4]u8 {
@@ -983,7 +1089,7 @@ fn drawShapeRunAllocCancelable(
     const scanline_fill = run.kind == .fill and run.antialias and run.closed and
         run.clip_points == null and run.points.len >= 3;
     if (!scanline_fill) {
-        drawShapeRun(canvas, canvas_w, canvas_h, min_x, max_y, run);
+        try drawShapeRunCancelable(canvas, canvas_w, canvas_h, min_x, max_y, run, cancellation);
         return;
     }
 
@@ -1074,6 +1180,10 @@ fn drawShapeRunAllocCancelable(
 }
 
 fn drawShapeRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_y: f64, run: reader.ShapeRun) void {
+    drawShapeRunCancelable(canvas, canvas_w, canvas_h, min_x, max_y, run, .{}) catch unreachable;
+}
+
+fn drawShapeRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_y: f64, run: reader.ShapeRun, cancellation: reader.CancellationProbe) !void {
     const bounds = shapeRunBounds(run);
     const x0 = floorToCanvas(bounds.min_x - min_x, canvas_w);
     const x1 = ceilToCanvas(bounds.max_x - min_x, canvas_w);
@@ -1083,6 +1193,7 @@ fn drawShapeRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_
 
     var py = y0;
     while (py < y1) : (py += 1) {
+        if ((py - y0) & 31 == 0) try cancellation.check();
         var px = x0;
         while (px < x1) : (px += 1) {
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
@@ -2548,7 +2659,7 @@ test "raw page rotation normalizes dimensions and pixel orientation" {
             @memset(raw.rgba[pixel * 4 .. pixel * 4 + 4], @intCast(pixel));
         }
 
-        try rotateRawPageCanvasAlloc(alloc, &raw, case.rotation);
+        try rotateRawPageCanvasAlloc(alloc, &raw, case.rotation, .{});
         try std.testing.expectEqual(case.width, raw.width);
         try std.testing.expectEqual(case.height, raw.height);
         for (case.expected, 0..) |expected, pixel| {
@@ -3272,6 +3383,64 @@ test "OCR bilevel minification preserves source ink coverage" {
     try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[1]);
     try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[2]);
     try std.testing.expectEqual(@as(u8, 0xff), ocr_canvas[3]);
+}
+
+test "OCR bilevel area filter retains thin rules beyond four-to-one minification" {
+    var rgba = [_]u8{0xff} ** (8 * 4);
+    rgba[0] = 0;
+    rgba[1] = 0;
+    rgba[2] = 0;
+    const run: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 8,
+        .height = 1,
+        .bilevel = true,
+        .ocr_coverage_minify = true,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    };
+
+    var canvas = [_]u8{0xff} ** 4;
+    drawImageRun(&canvas, 1, 1, 0, 0, 1, run);
+    try std.testing.expect(canvas[0] >= 222 and canvas[0] <= 224);
+    try std.testing.expectEqual(canvas[0], canvas[1]);
+    try std.testing.expectEqual(canvas[0], canvas[2]);
+    try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
+}
+
+test "legacy shape raster path observes cancellation" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    var canvas = [_]u8{0xff} ** (32 * 32 * 4);
+    const points = [_][2]f64{ .{ 1, 1 }, .{ 31, 31 } };
+    try std.testing.expectError(error.Canceled, drawShapeRunAllocCancelable(
+        std.testing.allocator,
+        &canvas,
+        32,
+        32,
+        0,
+        32,
+        .{
+            .kind = .stroke,
+            .color = .{ 0, 0, 0, 0xff },
+            .stroke_width = 1,
+            .closed = false,
+            .points = @constCast(&points),
+            .antialias = true,
+        },
+        .{ .is_cancelled_fn = Cancelled.check },
+    ));
 }
 
 test "draw shape run round cap paints endpoint beyond segment" {
