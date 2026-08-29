@@ -12024,6 +12024,10 @@ pub const ProvisionedTableWriteSource = struct {
             .{
                 .backend_runtime = backend_runtime,
                 .restore_open_options = self.restore_open_options,
+                .embedding_options = .{
+                    .antfly_provider = self.antfly_provider,
+                    .inference_api_url = self.inference_api_url,
+                },
                 .destination_authorizer = self.destination_authorizer,
             },
         );
@@ -12116,7 +12120,12 @@ pub const ProvisionedTableWriteSource = struct {
             // this cache-admission boundary so a staged same-name retirement
             // cannot lose its pending retry signal. This pass is idempotent;
             // if cleanup already completed it admits the replacement now.
-            const index_summary = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, table.indexes_json);
+            const index_summary = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, table.indexes_json, .{
+                .embedding_options = .{
+                    .antfly_provider = self.antfly_provider,
+                    .inference_api_url = self.inference_api_url,
+                },
+            });
             summary.merge(index_summary);
             if (index_summary.indexes_pending != 0 and !admitted_new_cache_entry) {
                 // A newly admitted managed DB publishes the pending edge via
@@ -15328,6 +15337,10 @@ pub const ProvisionedTableWriteSource = struct {
                 indexes_json,
                 .{
                     .drain_resolver_backfill = false,
+                    .embedding_options = .{
+                        .antfly_provider = self.antfly_provider,
+                        .inference_api_url = self.inference_api_url,
+                    },
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
                 },
@@ -16060,14 +16073,19 @@ pub const ProvisionedTableWriteSource = struct {
                 // Reconciliation owns the desired-state diff. Pre-deleting
                 // configured names would turn an unchanged generation into a
                 // destructive rebuild and race its durable cleanup fence.
+                const reconcile_options: metadata_table_provisioner.ReconcileDbIndexOptions = .{
+                    .drain_resolver_backfill = false,
+                    .embedding_options = .{
+                        .antfly_provider = self.antfly_provider,
+                        .inference_api_url = self.inference_api_url,
+                    },
+                    .source_table = table_name,
+                    .destination_authorizer = self.destination_authorizer,
+                };
                 const reconcile_summary = if (target_index_name) |target|
-                    try metadata_table_provisioner.reconcileDbIndexTarget(alloc, cached.db, indexes_json, target)
+                    try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, cached.db, indexes_json, target, reconcile_options)
                 else
-                    try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
-                        .drain_resolver_backfill = false,
-                        .source_table = table_name,
-                        .destination_authorizer = self.destination_authorizer,
-                    });
+                    try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, reconcile_options);
                 if (reconcile_summary.indexes_pending != 0) {
                     _ = try cached.db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                     if (try cached.db.hasPendingIndexRepairIntents(alloc)) {
@@ -16253,14 +16271,19 @@ pub const ProvisionedTableWriteSource = struct {
         if (metadata.indexes_json) |indexes_json| {
             // Preserve matching generations and let the provisioner retire
             // only definitions whose desired configuration actually changed.
+            const reconcile_options: metadata_table_provisioner.ReconcileDbIndexOptions = .{
+                .drain_resolver_backfill = false,
+                .embedding_options = .{
+                    .antfly_provider = self.antfly_provider,
+                    .inference_api_url = self.inference_api_url,
+                },
+                .source_table = table_name,
+                .destination_authorizer = self.destination_authorizer,
+            };
             const reconcile_summary = if (target_index_name) |target|
-                try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, target)
+                try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, &db, indexes_json, target, reconcile_options)
             else
-                try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
-                    .drain_resolver_backfill = false,
-                    .source_table = table_name,
-                    .destination_authorizer = self.destination_authorizer,
-                });
+                try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, reconcile_options);
             if (reconcile_summary.indexes_pending != 0) {
                 _ = try db.advanceGeneratedArtifactCleanupPage(metadata.target_index_name);
                 if (try db.hasPendingIndexRepairIntents(alloc)) {
@@ -16855,6 +16878,10 @@ pub const ProvisionedTableWriteSource = struct {
                     );
                     _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, indexes_json, .{
                         .drain_resolver_backfill = false,
+                        .embedding_options = .{
+                            .antfly_provider = self.antfly_provider,
+                            .inference_api_url = self.inference_api_url,
+                        },
                         .source_table = table_name,
                         .destination_authorizer = self.destination_authorizer,
                     });
@@ -17020,7 +17047,12 @@ pub const ProvisionedTableWriteSource = struct {
                 try validateProvisionedDbIdentityNamespace(alloc, self.catalog, table_name, group_id, cached.db);
                 try applyLocalTableSchemaJson(alloc, cached.db, schema_json);
                 if (indexes_json) |value| {
-                    _ = try metadata_table_provisioner.reconcileDbIndexes(alloc, cached.db, value);
+                    _ = try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, cached.db, value, .{
+                        .embedding_options = .{
+                            .antfly_provider = self.antfly_provider,
+                            .inference_api_url = self.inference_api_url,
+                        },
+                    });
                 }
                 try drainManagedDbBeforeClose(cached.db);
                 try publishRuntimeStatusSnapshotConsistent(self, alloc, table_name, group_id, cached.db);
@@ -22657,10 +22689,10 @@ test "table write index validation checks expanded algebraic config semantics" {
     ));
 
     try validateIndexConfig(alloc, "relations_graph",
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]"}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[*]"}}
     );
     try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "relations_graph",
-        \\{"type":"graph","source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[0]"}}
+        \\{"type":"graph","source":{"artifact":"relations_v1","path":"$.relations[0]"}}
     ));
     try std.testing.expectError(error.InvalidCreateTableRequest, validateIndexConfig(alloc, "relations_graph",
         \\{"type":"graph","edge_types":[{"name":"mentions","topology":"dag"}]}
@@ -23399,15 +23431,21 @@ fn applyIndexCreateToCachedDb(
         secret_store,
         remote_content,
     );
-    _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, db, indexes_json, index_name);
+    _ = try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, db, indexes_json, index_name, .{
+        .embedding_options = .{
+            .antfly_provider = antfly_provider,
+            .inference_api_url = inference_api_url,
+        },
+    });
 }
 
 fn reconcileDbArtifactEnrichmentsFromIndexesJson(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     indexes_json: []const u8,
+    embedding_options: managed_embedder.InitOptions,
 ) !void {
-    const enrichments = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    const enrichments = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
     indexes_api.sortArtifactEnrichmentsByDependency(enrichments);
     for (enrichments) |cfg| {
@@ -23565,11 +23603,17 @@ fn reconcileCachedLocalTableIndexDrop(
             cached_active = false;
             return err;
         };
-        _ = metadata_table_provisioner.reconcileDbIndexTarget(
+        _ = metadata_table_provisioner.reconcileDbIndexTargetWithOptions(
             alloc,
             cached.db,
             metadata.indexes_json,
             index_name,
+            .{
+                .embedding_options = .{
+                    .antfly_provider = self.antfly_provider,
+                    .inference_api_url = self.inference_api_url,
+                },
+            },
         ) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
             cached_active = false;
@@ -23768,7 +23812,12 @@ fn reconcileUncachedLocalTableIndexCreate(
         });
         defer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
-        _ = try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, index_name);
+        _ = try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, &db, indexes_json, index_name, .{
+            .embedding_options = .{
+                .antfly_provider = self.antfly_provider,
+                .inference_api_url = self.inference_api_url,
+            },
+        });
         recordLocalIndexCreateRepairDebt(alloc, &db, group_id, repair_group_ids);
 
         publishPostCommitIndexRuntimeStatusBestEffort(
@@ -25025,7 +25074,10 @@ fn reconfigureManagedDbEnrichments(
         secret_store,
         remote_content,
     );
-    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json);
+    try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json, .{
+        .antfly_provider = antfly_provider,
+        .inference_api_url = inference_api_url,
+    });
 }
 
 fn reconfigureManagedDbEnrichmentRuntime(
@@ -25432,14 +25484,19 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
         return db;
     }
 
+    const index_reconcile_options: metadata_table_provisioner.ReconcileDbIndexOptions = .{
+        .drain_resolver_backfill = options.drain_resolver_backfill,
+        .embedding_options = .{
+            .antfly_provider = antfly_provider,
+            .inference_api_url = options.inference_api_url,
+        },
+        .source_table = options.source_table,
+        .destination_authorizer = options.destination_authorizer,
+    };
     const summary = if (options.reconcile_target_index_name) |target_index_name|
-        try metadata_table_provisioner.reconcileDbIndexTarget(alloc, &db, indexes_json, target_index_name)
+        try metadata_table_provisioner.reconcileDbIndexTargetWithOptions(alloc, &db, indexes_json, target_index_name, index_reconcile_options)
     else
-        try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, .{
-            .drain_resolver_backfill = options.drain_resolver_backfill,
-            .source_table = options.source_table,
-            .destination_authorizer = options.destination_authorizer,
-        });
+        try metadata_table_provisioner.reconcileDbIndexesWithOptions(alloc, &db, indexes_json, index_reconcile_options);
     if (summary.indexManagerCatalogChanged() or options.reconcile_for_replicated_apply) {
         // First-open provisioning can mutate the live index manager. Reopen so
         // request work runs against the stabilized post-reconcile state.
@@ -25592,7 +25649,7 @@ test "provisioning detects model backed graph shorthand assets inside config_jso
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"body\"},\"producer_json\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}}"
+        \\  "config_json":"{\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"body\"},\"producer_json\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\"}}}}"
         \\}]
     ));
 }
@@ -25603,14 +25660,14 @@ test "provisioning does not require asset producer for copy graph shorthand asse
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
+        \\  "config_json":"{\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
         \\}]
     )));
     try std.testing.expect(try indexesJsonHasGeneratedEnrichment(alloc,
         \\[{
         \\  "name":"relations_graph",
         \\  "kind":"graph",
-        \\  "config_json":"{\"source\":{\"kind\":\"artifact\",\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
+        \\  "config_json":"{\"source\":{\"artifact\":\"relations_v1\"},\"artifact\":{\"name\":\"relations_v1\",\"kind\":\"asset\",\"source\":{\"type\":\"field\",\"value\":\"relations\"}}}"
         \\}]
     ));
 }

@@ -6038,7 +6038,8 @@ const metadata_incarnation_extension_version: u16 = 1;
 const store_record_extension_magic = "afsx1";
 const store_record_extension_legacy_version: u16 = 1;
 const store_record_extension_reporter_version: u16 = 2;
-const store_record_extension_version: u16 = 3;
+const store_record_extension_native_restore_version: u16 = 3;
+const store_record_extension_version: u16 = 4;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
 
@@ -7084,17 +7085,24 @@ fn appendStoreRecordExtensions(
         record.reporter_incarnation,
         record.status_generation,
     )) return error.InvalidStoreReporterFence;
+    if (!metadata_table_manager.artifactSourcesProtocolValid(
+        record.reporter_incarnation,
+        record.artifact_sources_protocol_version,
+    )) return error.InvalidStoreReporterFence;
     var observation_count: u32 = 0;
     for (record.group_statuses) |status| {
         if (status.observed_reallocation_request_id != 0) observation_count += 1;
     }
     const has_reporter_fence = record.reporter_incarnation != 0 or record.status_generation != 0;
+    const has_artifact_protocol = record.artifact_sources_protocol_version != 0;
     const has_native_restore_capability = record.native_generation_restore_version != 0;
-    if (observation_count == 0 and !has_reporter_fence and !has_native_restore_capability) return;
+    if (observation_count == 0 and !has_reporter_fence and !has_artifact_protocol and !has_native_restore_capability) return;
 
     try out.appendSlice(alloc, store_record_extension_magic);
-    const version: u16 = if (has_native_restore_capability)
+    const version: u16 = if (has_artifact_protocol)
         store_record_extension_version
+    else if (has_native_restore_capability)
+        store_record_extension_native_restore_version
     else if (has_reporter_fence)
         store_record_extension_reporter_version
     else
@@ -7104,8 +7112,11 @@ fn appendStoreRecordExtensions(
         try appendInt(alloc, out, u64, record.reporter_incarnation);
         try appendInt(alloc, out, u64, record.status_generation);
     }
-    if (version >= store_record_extension_version)
+    if (version >= store_record_extension_native_restore_version) {
         try appendInt(alloc, out, u16, record.native_generation_restore_version);
+    }
+    if (version >= store_record_extension_version)
+        try appendInt(alloc, out, u16, record.artifact_sources_protocol_version);
     try appendInt(alloc, out, u32, observation_count);
     for (record.group_statuses, 0..) |status, status_index| {
         if (status.observed_reallocation_request_id == 0) continue;
@@ -7187,6 +7198,7 @@ fn readStoreRecord(alloc: std.mem.Allocator, encoded: []const u8, pos: *usize) !
         .node_id = node_id,
         .reporter_incarnation = extensions.reporter_incarnation,
         .status_generation = extensions.status_generation,
+        .artifact_sources_protocol_version = extensions.artifact_sources_protocol_version,
         .native_generation_restore_version = extensions.native_generation_restore_version,
         .api_url = api_url,
         .raft_url = raft_url,
@@ -7211,7 +7223,7 @@ fn readStoreRecordExtensions(
     encoded: []const u8,
     pos: *usize,
     group_statuses: []metadata.GroupStatusReport,
-) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0 } {
+) !struct { reporter_incarnation: u64 = 0, status_generation: u64 = 0, native_generation_restore_version: u16 = 0, artifact_sources_protocol_version: u16 = 0 } {
     if (pos.* == encoded.len) return .{};
     if (pos.* + store_record_extension_magic.len > encoded.len or
         !std.mem.eql(
@@ -7227,6 +7239,7 @@ fn readStoreRecordExtensions(
     const version = try readInt(encoded, pos, u16);
     if (version != store_record_extension_legacy_version and
         version != store_record_extension_reporter_version and
+        version != store_record_extension_native_restore_version and
         version != store_record_extension_version) return error.InvalidMetadataTransitionEncoding;
     const reporter_incarnation = if (version >= store_record_extension_reporter_version)
         try readInt(encoded, pos, u64)
@@ -7237,10 +7250,18 @@ fn readStoreRecordExtensions(
     else
         0;
     if (reporter_incarnation == 0 and status_generation != 0) return error.InvalidMetadataTransitionEncoding;
-    const native_generation_restore_version = if (version >= store_record_extension_version)
+    const native_generation_restore_version = if (version >= store_record_extension_native_restore_version)
         try readInt(encoded, pos, u16)
     else
         0;
+    const artifact_sources_protocol_version = if (version >= store_record_extension_version)
+        try readInt(encoded, pos, u16)
+    else
+        0;
+    if (!metadata_table_manager.artifactSourcesProtocolValid(
+        reporter_incarnation,
+        artifact_sources_protocol_version,
+    )) return error.InvalidMetadataTransitionEncoding;
     const observation_count = try readInt(encoded, pos, u32);
     var observation_index: u32 = 0;
     while (observation_index < observation_count) : (observation_index += 1) {
@@ -7255,6 +7276,7 @@ fn readStoreRecordExtensions(
     return .{
         .reporter_incarnation = reporter_incarnation,
         .status_generation = status_generation,
+        .artifact_sources_protocol_version = artifact_sources_protocol_version,
         .native_generation_restore_version = native_generation_restore_version,
     };
 }
@@ -7294,10 +7316,18 @@ fn appendRuntimeGroupStatusRecord(
 }
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
+    var version = runtime_status_protocol.legacy_record_version;
     for (record.indexes) |index| {
-        if (index.repair_status != null) return runtime_status_protocol.repair_status_record_version;
+        for (index.source_replay) |source| if (source.failed)
+            return runtime_status_protocol.artifact_source_failure_status_record_version;
+        if (index.source_replay.len != 0) {
+            version = @max(version, runtime_status_protocol.artifact_source_status_record_version);
+        }
+        if (index.repair_status != null) {
+            version = @max(version, runtime_status_protocol.repair_status_record_version);
+        }
     }
-    return runtime_status_protocol.legacy_record_version;
+    return version;
 }
 
 fn appendRuntimeEnrichmentStatusRecord(
@@ -7726,6 +7756,17 @@ fn appendRuntimeIndexStatusRecord(
             if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
         );
     }
+    if (version >= runtime_status_protocol.artifact_source_status_record_version) {
+        try appendInt(alloc, out, u16, @intCast(record.source_replay.len));
+        for (record.source_replay) |source| {
+            try appendRequiredString(alloc, out, source.artifact_name);
+            try appendInt(alloc, out, u64, source.published_sequence);
+            try appendInt(alloc, out, u64, source.target_sequence);
+            if (version >= runtime_status_protocol.artifact_source_failure_status_record_version) {
+                try out.append(alloc, if (source.failed) 1 else 0);
+            }
+        }
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -7791,6 +7832,35 @@ fn readRuntimeIndexStatusRecord(
         if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
+    const source_replay_count = if (version >= runtime_status_protocol.artifact_source_status_record_version)
+        try readInt(encoded, pos, u16)
+    else
+        0;
+    const source_replay = try alloc.alloc(metadata.RuntimeIndexSourceReplayStatusReport, source_replay_count);
+    var source_count: usize = 0;
+    errdefer {
+        for (source_replay[0..source_count]) |source| alloc.free(source.artifact_name);
+        if (source_replay.len > 0) alloc.free(source_replay);
+    }
+    while (source_count < source_replay_count) : (source_count += 1) {
+        const artifact_name = try readRequiredString(alloc, encoded, pos);
+        errdefer alloc.free(artifact_name);
+        const published_sequence = try readInt(encoded, pos, u64);
+        const target_sequence = try readInt(encoded, pos, u64);
+        const failed = if (version >= runtime_status_protocol.artifact_source_failure_status_record_version) blk: {
+            if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+            const value = encoded[pos.*];
+            pos.* += 1;
+            if (value > 1) return error.InvalidMetadataTransitionEncoding;
+            break :blk value == 1;
+        } else false;
+        source_replay[source_count] = .{
+            .artifact_name = artifact_name,
+            .published_sequence = published_sequence,
+            .target_sequence = target_sequence,
+            .failed = failed,
+        };
+    }
     return .{
         .name = name,
         .kind = kind,
@@ -7812,6 +7882,7 @@ fn readRuntimeIndexStatusRecord(
         .replay_applied_sequence = replay_applied_sequence,
         .replay_target_sequence = replay_target_sequence,
         .replay_catch_up_required = replay_catch_up_required,
+        .source_replay = source_replay,
         .repair_status = repair_status,
         .repair_active_generation_serviceable = repair_active_generation_serviceable,
     };
@@ -13238,6 +13309,31 @@ test "metadata raft apply store transition codec preserves native generation res
     );
 }
 
+test "metadata raft apply store transition codec preserves combined store capabilities" {
+    const encoded = try encodeTransitionCommand(std.testing.allocator, .{
+        .register_store = .{
+            .store_id = 101,
+            .node_id = 201,
+            .reporter_incarnation = 0x1234,
+            .native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version,
+            .artifact_sources_protocol_version = metadata_table_manager.artifact_sources_protocol_version,
+        },
+    });
+    defer std.testing.allocator.free(encoded);
+
+    var decoded = (try decodeTransitionCommand(std.testing.allocator, encoded)) orelse
+        return error.InvalidMetadataTransitionEncoding;
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        metadata_table_manager.native_generation_restore_protocol_version,
+        decoded.register_store.native_generation_restore_version,
+    );
+    try std.testing.expectEqual(
+        metadata_table_manager.artifact_sources_protocol_version,
+        decoded.register_store.artifact_sources_protocol_version,
+    );
+}
+
 test "metadata raft apply store transition codec rejects generation without incarnation" {
     try std.testing.expectError(
         error.InvalidStoreReporterFence,
@@ -13583,6 +13679,12 @@ test "metadata raft apply store runtime status codec preserves document identity
             .coverage_config_hash = 0x1234,
             .coverage_identity_ready = true,
             .coverage_summary_ready = true,
+            .source_replay = @constCast((&[_]metadata.RuntimeIndexSourceReplayStatusReport{.{
+                .artifact_name = "document_chunks_v1",
+                .published_sequence = 17,
+                .target_sequence = 19,
+                .failed = true,
+            }})[0..]),
             .repair_status = .rebuilding,
             .repair_active_generation_serviceable = true,
         }})[0..]),
@@ -13632,6 +13734,11 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
     try std.testing.expect(status.indexes[0].coverage_identity_ready);
     try std.testing.expect(status.indexes[0].coverage_summary_ready);
+    try std.testing.expectEqual(@as(usize, 1), status.indexes[0].source_replay.len);
+    try std.testing.expectEqualStrings("document_chunks_v1", status.indexes[0].source_replay[0].artifact_name);
+    try std.testing.expectEqual(@as(u64, 17), status.indexes[0].source_replay[0].published_sequence);
+    try std.testing.expectEqual(@as(u64, 19), status.indexes[0].source_replay[0].target_sequence);
+    try std.testing.expect(status.indexes[0].source_replay[0].failed);
     try std.testing.expectEqual(metadata.IndexRepairStatus.rebuilding, status.indexes[0].repair_status.?);
     try std.testing.expect(status.indexes[0].repair_active_generation_serviceable);
 }
@@ -13648,7 +13755,7 @@ test "metadata runtime index status decoder accepts version ten records" {
         .replay_applied_sequence = 9,
         .replay_target_sequence = 11,
         .replay_catch_up_required = true,
-    }, runtime_status_protocol.current_record_version);
+    }, runtime_status_protocol.repair_status_record_version);
 
     // Version 10 ended immediately after replay_catch_up_required. Remove the
     // version-11 optional load-error tag and the two version-13 repair bytes.
@@ -13668,6 +13775,39 @@ test "metadata runtime index status decoder accepts version ten records" {
     try std.testing.expectEqual(@as(?[]const u8, null), decoded.load_error);
     try std.testing.expect(decoded.repair_status == null);
     try std.testing.expect(!decoded.repair_active_generation_serviceable);
+}
+
+test "metadata runtime index status decoder defaults version fifteen source failures safely" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(@as(u16, 15), runtime_status_protocol.artifact_source_status_record_version);
+    try std.testing.expectEqual(@as(u16, 16), runtime_status_protocol.artifact_source_failure_status_record_version);
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(alloc);
+    const sources = [_]metadata.RuntimeIndexSourceReplayStatusReport{.{
+        .artifact_name = "chunk_vectors",
+        .published_sequence = 7,
+        .target_sequence = 9,
+        // V15 cannot represent this field; the decoder must not consume a byte
+        // from the following record or manufacture a terminal failure.
+        .failed = true,
+    }};
+    try appendRuntimeIndexStatusRecord(alloc, &encoded, .{
+        .name = "semantic",
+        .kind = "dense_vector",
+        .source_replay = @constCast(sources[0..]),
+    }, runtime_status_protocol.artifact_source_status_record_version);
+
+    var pos: usize = 0;
+    const decoded = try readRuntimeIndexStatusRecord(
+        alloc,
+        encoded.items,
+        &pos,
+        runtime_status_protocol.artifact_source_status_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
+    try std.testing.expectEqual(encoded.items.len, pos);
+    try std.testing.expectEqual(@as(usize, 1), decoded.source_replay.len);
+    try std.testing.expect(!decoded.source_replay[0].failed);
 }
 
 test "metadata runtime status writer preserves the version twelve rolling-upgrade contract" {

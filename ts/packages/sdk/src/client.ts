@@ -4,6 +4,7 @@
  */
 
 import createClient, { type Client } from "openapi-fetch";
+import { validateCreateIndexRequestRelationships } from "./index-config.js";
 import type { paths } from "./public-api.js";
 import type {
   AntflyAuth,
@@ -16,9 +17,10 @@ import type {
   ChatMessage,
   ChatStreamCallbacks,
   ClusterRestoreRequest,
+  ClusterStatus,
   ConnectionsResponse,
-  CreateIndexRequest,
   CreatedIndex,
+  CreateIndexRequest,
   CreateTableRequest,
   CreateUserRequest,
   DocumentArtifactManifest,
@@ -77,11 +79,7 @@ export interface RestoreJobPage {
 export interface IndexOperations {
   list(tableName: string): Promise<IndexStatus[]>;
   get(tableName: string, indexName: string): Promise<IndexStatus>;
-  create(
-    tableName: string,
-    indexName: string,
-    config: CreateIndexRequest
-  ): Promise<CreatedIndex>;
+  create(tableName: string, indexName: string, config: CreateIndexRequest): Promise<CreatedIndex>;
   drop(tableName: string, indexName: string): Promise<true>;
 }
 
@@ -95,6 +93,29 @@ export const QUERY_TEMPORARILY_UNAVAILABLE_CODES = [
 ] as const;
 
 export type QueryTemporarilyUnavailableCode = (typeof QUERY_TEMPORARILY_UNAVAILABLE_CODES)[number];
+
+export const INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES = [
+  "index_capability_upgrade_pending",
+  "index_probe_unavailable",
+] as const;
+
+export type IndexMutationTemporarilyUnavailableCode =
+  (typeof INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES)[number];
+
+/** A retryable index mutation admission or validation failure. */
+export class IndexMutationTemporarilyUnavailableError extends Error {
+  readonly status = 503 as const;
+  readonly retryable = true as const;
+
+  constructor(
+    message: string,
+    readonly code: IndexMutationTemporarilyUnavailableCode,
+    readonly retryAfterSeconds: number | undefined
+  ) {
+    super(message);
+    this.name = "IndexMutationTemporarilyUnavailableError";
+  }
+}
 
 /** A retryable query dependency or read-availability failure. */
 export class QueryTemporarilyUnavailableError extends Error {
@@ -261,6 +282,27 @@ function queryError(prefix: string, error: unknown, response: Response | undefin
       message,
       code as QueryTemporarilyUnavailableCode,
       retryAfterSeconds
+    );
+  }
+  return new Error(message);
+}
+
+function indexMutationError(prefix: string, error: unknown, response: Response | undefined): Error {
+  const detail =
+    error && typeof error === "object" ? (error as Record<string, unknown>) : undefined;
+  const code = detail?.error;
+  const message = `${prefix}: ${apiErrorMessage(error)}`;
+  if (
+    response?.status === 503 &&
+    typeof code === "string" &&
+    (INDEX_MUTATION_TEMPORARILY_UNAVAILABLE_CODES as readonly string[]).includes(code) &&
+    detail?.retryable === true
+  ) {
+    const retryAfter = Number.parseInt(response.headers.get("Retry-After") ?? "", 10);
+    return new IndexMutationTemporarilyUnavailableError(
+      message,
+      code as IndexMutationTemporarilyUnavailableCode,
+      Number.isSafeInteger(retryAfter) && retryAfter > 0 ? retryAfter : undefined
     );
   }
   return new Error(message);
@@ -484,9 +526,10 @@ export class AntflyClient {
   /**
    * Get cluster status
    */
-  async getStatus() {
+  async getStatus(): Promise<ClusterStatus> {
     const { data, error } = await this.client.GET("/db/v1/status");
     if (error) throw new Error(`Failed to get status: ${errorMessage(error)}`);
+    if (!data) throw new Error("Failed to get status: response body was empty");
     return data;
   }
 
@@ -984,12 +1027,20 @@ export class AntflyClient {
      * Create a new table
      */
     create: async (tableName: string, config: CreateTableRequest = {}) => {
-      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}", {
+      for (const [indexName, indexConfig] of Object.entries(config.indexes ?? {})) {
+        try {
+          validateCreateIndexRequestRelationships(indexConfig);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new TypeError(`Invalid index ${JSON.stringify(indexName)}: ${detail}`);
+        }
+      }
+      const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}", {
         params: { path: { tableName } },
         body: config,
       });
       if (error) {
-        throw new Error(`Failed to create table: ${apiErrorMessage(error, "unknown error")}`);
+        throw indexMutationError("Failed to create table", error, response);
       }
       return data;
     },
@@ -1082,14 +1133,17 @@ export class AntflyClient {
       request: RestoreRequest,
       options?: RestoreOptions
     ): Promise<RestoreJob> => {
-      const { data, error } = await this.client.POST("/db/v1/tables/{tableName}/restore", {
-        params: { path: { tableName } },
-        ...(options?.idempotencyKey
-          ? { headers: { "Idempotency-Key": options.idempotencyKey } }
-          : {}),
-        body: request,
-      });
-      if (error) throw new Error(`Restore failed: ${error.error}`);
+      const { data, error, response } = await this.client.POST(
+        "/db/v1/tables/{tableName}/restore",
+        {
+          params: { path: { tableName } },
+          ...(options?.idempotencyKey
+            ? { headers: { "Idempotency-Key": options.idempotencyKey } }
+            : {}),
+          body: request,
+        }
+      );
+      if (error) throw indexMutationError("Restore failed", error, response);
       if (!data) throw new Error("Restore failed: unexpected empty response");
       return data;
     },
@@ -1534,6 +1588,7 @@ export class AntflyClient {
      * Create a new index
      */
     create: async (tableName: string, indexName: string, config: CreateIndexRequest) => {
+      validateCreateIndexRequestRelationships(config);
       const { data, error, response } = await this.client.POST(
         "/db/v1/tables/{tableName}/indexes/{indexName}",
         {
@@ -1555,23 +1610,27 @@ export class AntflyClient {
           detail.retryable === true
         ) {
           const retryAfterHeader = response.headers.get("Retry-After");
-          const parsedRetryAfter = retryAfterHeader && /^[1-9]\d*$/.test(retryAfterHeader)
-            ? Number(retryAfterHeader)
-            : NaN;
-          const retryAfterSeconds = Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0
-            ? parsedRetryAfter
-            : undefined;
-          const retryAfterMs = typeof detail.retry_after_ms === "number" &&
+          const parsedRetryAfter =
+            retryAfterHeader && /^[1-9]\d*$/.test(retryAfterHeader)
+              ? Number(retryAfterHeader)
+              : NaN;
+          const retryAfterSeconds =
+            Number.isFinite(parsedRetryAfter) && parsedRetryAfter > 0
+              ? parsedRetryAfter
+              : undefined;
+          const retryAfterMs =
+            typeof detail.retry_after_ms === "number" &&
             Number.isFinite(detail.retry_after_ms) &&
             detail.retry_after_ms > 0
-            ? detail.retry_after_ms
-            : (retryAfterSeconds ?? 0) * 1000;
-          const message = typeof detail.message === "string" && detail.message
-            ? detail.message
-            : "storage capacity is temporarily exhausted";
+              ? detail.retry_after_ms
+              : (retryAfterSeconds ?? 0) * 1000;
+          const message =
+            typeof detail.message === "string" && detail.message
+              ? detail.message
+              : "storage capacity is temporarily exhausted";
           throw new StorageResourceExhaustedError(message, retryAfterMs, retryAfterSeconds);
         }
-        throw new Error(`Failed to create index: ${detail.error}`);
+        throw indexMutationError("Failed to create index", error, response);
       }
       if (!data) throw new Error("Failed to create index: unexpected empty response");
       return data;

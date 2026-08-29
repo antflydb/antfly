@@ -4000,7 +4000,9 @@ pub export fn antfly_db_search_json(
     defer query_arena.deinit();
     const query_alloc = query_arena.allocator();
 
-    const return_mode: db_mod.types.ReturnMode = if (std.mem.eql(u8, parsed.value.return_mode, "chunk"))
+    const return_mode: db_mod.types.ReturnMode = if (std.mem.eql(u8, parsed.value.return_mode, "member"))
+        .member
+    else if (std.mem.eql(u8, parsed.value.return_mode, "chunk"))
         .chunk
     else if (std.mem.eql(u8, parsed.value.return_mode, "parent_with_chunks"))
         .parent_with_chunks

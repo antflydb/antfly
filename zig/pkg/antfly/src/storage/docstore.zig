@@ -111,6 +111,7 @@ fn appendReplayArtifactsForHint(
             .dense_vector, .sparse_vector => isEmbeddingReplayArtifactKey(key),
             .graph => internal_keys.isGraphEdgeArtifactKey(key) or
                 internal_keys.isAssetArtifactKey(key) or
+                internal_keys.isChunkArtifactRecordKey(key) or
                 internal_keys.isResolutionArtifactKey(key),
             .resolution => internal_keys.isAssetArtifactKey(key),
             .promotion => internal_keys.isResolutionArtifactKey(key),
@@ -1623,6 +1624,45 @@ pub const DocStore = struct {
         return owned;
     }
 
+    /// Scan only keys with the given prefix after `after_key`. Unlike
+    /// `scanPrefixPage`, this never copies values into the caller allocator;
+    /// maintenance cursors can therefore discover a very large value without
+    /// transiently materializing it before their own admission checks run.
+    pub fn scanPrefixKeysPage(
+        self: *DocStore,
+        alloc: Allocator,
+        prefix: []const u8,
+        after_key: ?[]const u8,
+        limit: usize,
+    ) ![][]u8 {
+        if (limit == 0) return try alloc.dupe([]u8, &.{});
+
+        var txn = try self.beginReadTxn();
+        defer txn.abort();
+
+        var cur = try txn.openCursor();
+        defer cur.close();
+
+        var results = std.ArrayListUnmanaged([]u8).empty;
+        errdefer {
+            for (results.items) |key| alloc.free(key);
+            results.deinit(alloc);
+        }
+
+        const bounded_after_key = if (after_key) |key| if (std.mem.startsWith(u8, key, prefix)) key else null else null;
+        const seek_key = bounded_after_key orelse prefix;
+        var entry = (try cur.seekAtOrAfter(seek_key)) orelse return try results.toOwnedSlice(alloc);
+        while (true) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            if (bounded_after_key == null or std.mem.order(u8, entry.key, bounded_after_key.?) == .gt) {
+                try results.append(alloc, try alloc.dupe(u8, entry.key));
+                if (results.items.len >= limit) break;
+            }
+            entry = (try cur.next()) orelse break;
+        }
+        return try results.toOwnedSlice(alloc);
+    }
+
     /// Scan keys in [lower, upper). Caller owns returned slices.
     pub fn scanRange(self: *DocStore, alloc: Allocator, lower: []const u8, upper: []const u8) ![]OwnedKVPair {
         var txn = try self.beginReadTxn();
@@ -2859,12 +2899,14 @@ test "docstore indexes replay rows by hint and truncates them" {
     defer alloc.free(graph_artifact_key);
     const graph_asset_artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
     defer alloc.free(graph_asset_artifact_key);
+    const graph_chunk_artifact_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "relation_chunks_v1", 0);
+    defer alloc.free(graph_chunk_artifact_key);
     const record = change_journal_mod.Record{
         .sequence = 7,
         .changed_doc_keys = &.{"doc:a"},
         .deleted_doc_keys = &.{"doc:deleted"},
         .overwritten_doc_keys = &.{"doc:old"},
-        .changed_artifact_keys = &.{ embedding_artifact_key, graph_artifact_key, graph_asset_artifact_key },
+        .changed_artifact_keys = &.{ embedding_artifact_key, graph_artifact_key, graph_asset_artifact_key, graph_chunk_artifact_key },
         .target_hints = &.{ .dense_vector, .full_text, .graph },
     };
     const payload = try change_journal_mod.encodeRecord(alloc, record);
@@ -2933,9 +2975,10 @@ test "docstore indexes replay rows by hint and truncates them" {
     try std.testing.expectEqual(@as(usize, 0), graph_record.record.changed_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 1), graph_record.record.deleted_doc_keys.len);
     try std.testing.expectEqual(@as(usize, 0), graph_record.record.overwritten_doc_keys.len);
-    try std.testing.expectEqual(@as(usize, 2), graph_record.record.changed_artifact_keys.len);
+    try std.testing.expectEqual(@as(usize, 3), graph_record.record.changed_artifact_keys.len);
     try std.testing.expectEqualStrings(graph_artifact_key, graph_record.record.changed_artifact_keys[0]);
     try std.testing.expectEqualStrings(graph_asset_artifact_key, graph_record.record.changed_artifact_keys[1]);
+    try std.testing.expectEqualStrings(graph_chunk_artifact_key, graph_record.record.changed_artifact_keys[2]);
 
     const sparse_entries = try store.iterateReplayEntriesFromHint(alloc, 7, .sparse_vector);
     defer {

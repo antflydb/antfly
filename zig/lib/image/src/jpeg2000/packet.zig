@@ -17,6 +17,7 @@ const codestream = @import("codestream.zig");
 const tile = @import("tile.zig");
 const tagtree = @import("tagtree.zig");
 const codeblock = @import("codeblock.zig");
+const decode_control = @import("decode_control.zig");
 const quantization = @import("quantization.zig");
 
 pub const native_port_available = true;
@@ -3223,6 +3224,7 @@ pub fn executeTier1Segments(
         zero_bit_plane_adjustment,
         context_init_policy,
         null,
+        .{},
     );
 }
 
@@ -3237,6 +3239,32 @@ pub fn executeTier1SegmentsForState(
     zero_bit_plane_adjustment: i8,
     context_init_policy: codeblock.ContextInitPolicy,
 ) !Tier1Execution {
+    return executeTier1SegmentsForStateWithCancellation(
+        allocator,
+        model,
+        codestream_bytes,
+        state,
+        sign_policy,
+        refinement_policy,
+        magnitude_policy,
+        zero_bit_plane_adjustment,
+        context_init_policy,
+        .{},
+    );
+}
+
+pub fn executeTier1SegmentsForStateWithCancellation(
+    allocator: std.mem.Allocator,
+    model: *const PacketModel,
+    codestream_bytes: []const u8,
+    state: *const codestream.State,
+    sign_policy: codeblock.SignPolicy,
+    refinement_policy: codeblock.RefinementPolicy,
+    magnitude_policy: codeblock.MagnitudePolicy,
+    zero_bit_plane_adjustment: i8,
+    context_init_policy: codeblock.ContextInitPolicy,
+    cancellation: decode_control.CancellationProbe,
+) !Tier1Execution {
     return executeTier1SegmentsWithBitplaneResolver(
         allocator,
         model,
@@ -3248,6 +3276,7 @@ pub fn executeTier1SegmentsForState(
         zero_bit_plane_adjustment,
         context_init_policy,
         state,
+        cancellation,
     );
 }
 
@@ -3262,7 +3291,9 @@ fn executeTier1SegmentsWithBitplaneResolver(
     zero_bit_plane_adjustment: i8,
     context_init_policy: codeblock.ContextInitPolicy,
     state: ?*const codestream.State,
+    cancellation: decode_control.CancellationProbe,
 ) !Tier1Execution {
+    try cancellation.check();
     var plan = try Tier1ExecutionPlan.init(allocator, model);
     defer plan.deinit();
 
@@ -3274,6 +3305,7 @@ fn executeTier1SegmentsWithBitplaneResolver(
     }
 
     for (codeblocks, 0..) |*codeblock_state, state_index| {
+        try cancellation.check();
         codeblock_state.* = try decodeTier1Codeblock(
             allocator,
             model,
@@ -3287,6 +3319,7 @@ fn executeTier1SegmentsWithBitplaneResolver(
             zero_bit_plane_adjustment,
             context_init_policy,
             state,
+            cancellation,
         );
         initialized_codeblocks += 1;
     }
@@ -3314,10 +3347,40 @@ pub fn visitTier1CodeblocksForState(
     context_init_policy: codeblock.ContextInitPolicy,
     visitor: Tier1CodeblockVisitor,
 ) !void {
+    return visitTier1CodeblocksForStateWithCancellation(
+        allocator,
+        model,
+        codestream_bytes,
+        state,
+        sign_policy,
+        refinement_policy,
+        magnitude_policy,
+        zero_bit_plane_adjustment,
+        context_init_policy,
+        visitor,
+        .{},
+    );
+}
+
+pub fn visitTier1CodeblocksForStateWithCancellation(
+    allocator: std.mem.Allocator,
+    model: *const PacketModel,
+    codestream_bytes: []const u8,
+    state: *const codestream.State,
+    sign_policy: codeblock.SignPolicy,
+    refinement_policy: codeblock.RefinementPolicy,
+    magnitude_policy: codeblock.MagnitudePolicy,
+    zero_bit_plane_adjustment: i8,
+    context_init_policy: codeblock.ContextInitPolicy,
+    visitor: Tier1CodeblockVisitor,
+    cancellation: decode_control.CancellationProbe,
+) !void {
+    try cancellation.check();
     var plan = try Tier1ExecutionPlan.init(allocator, model);
     defer plan.deinit();
 
     for (model.codeblock_states, 0..) |_, state_index| {
+        try cancellation.check();
         var codeblock_state = try decodeTier1Codeblock(
             allocator,
             model,
@@ -3331,6 +3394,7 @@ pub fn visitTier1CodeblocksForState(
             zero_bit_plane_adjustment,
             context_init_policy,
             state,
+            cancellation,
         );
         defer codeblock_state.deinit();
         try visitor.visit(visitor.context, &codeblock_state);
@@ -3426,7 +3490,9 @@ fn decodeTier1Codeblock(
     zero_bit_plane_adjustment: i8,
     context_init_policy: codeblock.ContextInitPolicy,
     state: ?*const codestream.State,
+    cancellation: decode_control.CancellationProbe,
 ) !Tier1CodeblockState {
+    try cancellation.check();
     if (state_index >= model.codeblock_states.len) return error.InvalidPacketStateIndex;
     const model_state = model.codeblock_states[state_index];
     const adjusted_zero_bit_planes = adjustedZeroBitPlanesForExecution(
@@ -3461,6 +3527,7 @@ fn decodeTier1Codeblock(
 
     var cursor = first_segment_index;
     while (true) {
+        try cancellation.check();
         const segment = plan.segments[cursor];
         total_body_length = std.math.add(usize, total_body_length, segment.body_length) catch
             return error.TruncatedPacketBody;
@@ -3482,6 +3549,7 @@ fn decodeTier1Codeblock(
     var body_offset: usize = 0;
     cursor = first_segment_index;
     while (true) {
+        try cancellation.check();
         const segment = plan.segments[cursor];
         const segment_end = std.math.add(usize, segment.body_offset, segment.body_length) catch
             return error.TruncatedPacketBody;
@@ -3554,7 +3622,7 @@ fn decodeTier1Codeblock(
     defer combined_plan.deinit(allocator);
 
     if (segment_code_block_style.termination or segment_code_block_style.bypass) {
-        try codeblock.executeContributionPassPlanMqWithSegments(
+        try codeblock.executeContributionPassPlanMqWithSegmentsAndCancellation(
             allocator,
             &result.grid,
             &combined_plan,
@@ -3565,9 +3633,10 @@ fn decodeTier1Codeblock(
             segment_magnitude_policy,
             segment_context_init_policy,
             segment_code_block_style,
+            cancellation,
         );
     } else {
-        try codeblock.executeContributionPassPlanMq(
+        try codeblock.executeContributionPassPlanMqWithCancellation(
             allocator,
             &result.grid,
             &combined_plan,
@@ -3577,6 +3646,7 @@ fn decodeTier1Codeblock(
             segment_magnitude_policy,
             segment_context_init_policy,
             segment_code_block_style,
+            cancellation,
         );
     }
     result.executed_passes +%= total_passes;
