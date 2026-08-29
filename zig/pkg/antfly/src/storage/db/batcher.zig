@@ -302,14 +302,15 @@ const DenseReplayAccumulator = struct {
         var owned = try cloneDenseEmbeddingWrite(self.alloc, embedding);
         errdefer deinitDenseEmbeddingWrite(self.alloc, &owned);
 
-        const owned_map_key = try self.alloc.dupe(u8, embedding.doc_key);
+        const vector_key = denseEmbeddingIdentityKey(embedding);
+        const owned_map_key = try self.alloc.dupe(u8, vector_key);
         errdefer self.alloc.free(owned_map_key);
 
         const parent_key = try self.resolveDenseParentDocKey(embedding);
         defer if (parent_key.owned) |owned_parent| self.alloc.free(owned_parent);
 
-        const found_existing = self.dense_embeddings.contains(embedding.doc_key);
-        if (!found_existing) try self.recordDenseVectorForParent(parent_key.key, embedding.doc_key);
+        const found_existing = self.dense_embeddings.contains(vector_key);
+        if (!found_existing) try self.recordDenseVectorForParent(parent_key.key, vector_key);
 
         const gop = try self.dense_embeddings.getOrPut(self.alloc, owned_map_key);
         if (gop.found_existing) {
@@ -528,7 +529,8 @@ const SparseReplayAccumulator = struct {
         var owned = try cloneSparseEmbeddingWrite(self.alloc, embedding);
         errdefer deinitSparseEmbeddingWrite(self.alloc, &owned);
 
-        const owned_map_key = try indexDocKeyAlloc(self.alloc, embedding.index_name, embedding.doc_key);
+        const member_key = embedding.artifact_key orelse embedding.doc_key;
+        const owned_map_key = try indexDocKeyAlloc(self.alloc, embedding.index_name, member_key);
         errdefer self.alloc.free(owned_map_key);
 
         const gop = try self.sparse_embeddings.getOrPut(self.alloc, owned_map_key);
@@ -924,13 +926,25 @@ fn documentHasAnyTargetKind(doc: derived_types.DerivedDocument, kind: derived_ty
 fn lessThanDenseEmbedding(_: void, lhs: derived_types.DerivedDenseEmbeddingWrite, rhs: derived_types.DerivedDenseEmbeddingWrite) bool {
     const index_cmp = std.mem.order(u8, lhs.index_name, rhs.index_name);
     if (index_cmp != .eq) return index_cmp == .lt;
-    return std.mem.order(u8, lhs.doc_key, rhs.doc_key) == .lt;
+    const doc_cmp = std.mem.order(u8, lhs.doc_key, rhs.doc_key);
+    if (doc_cmp != .eq) return doc_cmp == .lt;
+    return std.mem.order(u8, denseEmbeddingIdentityKey(lhs), denseEmbeddingIdentityKey(rhs)) == .lt;
+}
+
+fn denseEmbeddingIdentityKey(embedding: derived_types.DerivedDenseEmbeddingWrite) []const u8 {
+    return embedding.artifact_key orelse embedding.doc_key;
 }
 
 fn lessThanSparseEmbedding(_: void, lhs: derived_types.DerivedSparseEmbeddingWrite, rhs: derived_types.DerivedSparseEmbeddingWrite) bool {
     const index_cmp = std.mem.order(u8, lhs.index_name, rhs.index_name);
     if (index_cmp != .eq) return index_cmp == .lt;
-    return std.mem.order(u8, lhs.doc_key, rhs.doc_key) == .lt;
+    const doc_cmp = std.mem.order(u8, lhs.doc_key, rhs.doc_key);
+    if (doc_cmp != .eq) return doc_cmp == .lt;
+    return std.mem.order(u8, sparseEmbeddingIdentityKey(lhs), sparseEmbeddingIdentityKey(rhs)) == .lt;
+}
+
+fn sparseEmbeddingIdentityKey(embedding: derived_types.DerivedSparseEmbeddingWrite) []const u8 {
+    return embedding.artifact_key orelse embedding.doc_key;
 }
 
 fn lessThanGraphClear(_: void, lhs: derived_types.DerivedGraphDocClear, rhs: derived_types.DerivedGraphDocClear) bool {
@@ -1058,6 +1072,76 @@ test "replay batcher tuple map keys preserve embedded delimiters" {
     const graph_b = try edgeKeyAlloc(alloc, "src", "dst\x00edge", "kind");
     defer alloc.free(graph_b);
     try std.testing.expect(!std.mem.eql(u8, graph_a, graph_b));
+}
+
+pub fn testDenseReplayPreservesMultipleArtifactMembers() !void {
+    const alloc = std.testing.allocator;
+    var accumulator = DenseReplayAccumulator{
+        .alloc = alloc,
+        .index_name = "document_vectors",
+    };
+    defer accumulator.deinit();
+
+    try accumulator.appendBatch(.{ .dense_embeddings = &.{
+        .{
+            .index_name = "document_vectors",
+            .doc_key = "doc:multi",
+            .artifact_key = "artifact:title",
+            .vector = &[_]f32{ 1, 0, 0 },
+        },
+        .{
+            .index_name = "document_vectors",
+            .doc_key = "doc:multi",
+            .artifact_key = "artifact:body",
+            .vector = &[_]f32{ 0, 1, 0 },
+        },
+    } }, 1);
+
+    var batch = try accumulator.takeBatch();
+    defer derived_types.deinitDerivedBatch(alloc, &batch);
+    try std.testing.expectEqual(@as(usize, 2), batch.dense_embeddings.len);
+    try std.testing.expectEqualStrings("artifact:body", batch.dense_embeddings[0].artifact_key.?);
+    try std.testing.expectEqualStrings("artifact:title", batch.dense_embeddings[1].artifact_key.?);
+}
+
+test "dense replay preserves multiple artifact members for one source key" {
+    try testDenseReplayPreservesMultipleArtifactMembers();
+}
+
+pub fn testSparseReplayPreservesMultipleArtifactMembers() !void {
+    const alloc = std.testing.allocator;
+    var accumulator = SparseReplayAccumulator{
+        .alloc = alloc,
+        .index_name = "document_sparse",
+    };
+    defer accumulator.deinit();
+
+    try accumulator.appendBatch(.{ .sparse_embeddings = &.{
+        .{
+            .index_name = "document_sparse",
+            .doc_key = "doc:multi",
+            .artifact_key = "artifact:title",
+            .indices = &[_]u32{1},
+            .values = &[_]f32{0.75},
+        },
+        .{
+            .index_name = "document_sparse",
+            .doc_key = "doc:multi",
+            .artifact_key = "artifact:body",
+            .indices = &[_]u32{2},
+            .values = &[_]f32{0.5},
+        },
+    } }, 1);
+
+    var batch = try accumulator.takeBatch();
+    defer derived_types.deinitDerivedBatch(alloc, &batch);
+    try std.testing.expectEqual(@as(usize, 2), batch.sparse_embeddings.len);
+    try std.testing.expectEqualStrings("artifact:body", batch.sparse_embeddings[0].artifact_key.?);
+    try std.testing.expectEqualStrings("artifact:title", batch.sparse_embeddings[1].artifact_key.?);
+}
+
+test "sparse replay preserves multiple artifact members for one source key" {
+    try testSparseReplayPreservesMultipleArtifactMembers();
 }
 
 fn cloneGraphWrite(alloc: Allocator, write: types.GraphEdgeWrite) !types.GraphEdgeWrite {

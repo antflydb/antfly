@@ -791,6 +791,15 @@ fn storeHasRuntimeRepairStatus(record: metadata_table_manager.StoreRecord) bool 
     return false;
 }
 
+fn storeHasRuntimeArtifactSourceStatus(record: metadata_table_manager.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (index_status.source_replay.len != 0) return true;
+        }
+    }
+    return false;
+}
+
 fn reportsHaveRuntimeRepairStatus(reports: []const metadata_table_manager.StoreStatusReport) bool {
     for (reports) |report| {
         for (report.runtime_statuses) |runtime_status| {
@@ -832,9 +841,23 @@ fn stripRuntimeRepairStatus(record: *metadata_table_manager.StoreRecord) void {
     }
 }
 
+fn stripRuntimeArtifactSourceStatus(
+    alloc: std.mem.Allocator,
+    record: *metadata_table_manager.StoreRecord,
+) void {
+    for (record.runtime_statuses) |*runtime_status| {
+        for (runtime_status.indexes) |*index_status| {
+            for (index_status.source_replay) |source| alloc.free(source.artifact_name);
+            if (index_status.source_replay.len > 0) alloc.free(index_status.source_replay);
+            index_status.source_replay = &.{};
+        }
+    }
+}
+
 fn stripRuntimeReporterFence(record: *metadata_table_manager.StoreRecord) void {
     record.reporter_incarnation = 0;
     record.status_generation = 0;
+    record.artifact_sources_protocol_version = 0;
     record.native_generation_restore_version = 0;
 }
 
@@ -855,7 +878,9 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+                storeHasRuntimeArtifactSourceStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.artifact_sources_protocol_version != 0 or
                 record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             // Unlike registration, an upsert carrying an incarnation may be a
@@ -868,6 +893,7 @@ fn runtimeStatusProtocolSafeCommand(
             }
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
             stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .upsert_store = legacy_record };
@@ -878,11 +904,14 @@ fn runtimeStatusProtocolSafeCommand(
                 record.status_generation,
             )) return error.InvalidStoreReporterFence;
             const needs_current_protocol = storeHasRuntimeRepairStatus(record) or
+                storeHasRuntimeArtifactSourceStatus(record) or
                 record.reporter_incarnation != 0 or record.status_generation != 0 or
+                record.artifact_sources_protocol_version != 0 or
                 record.native_generation_restore_version != 0;
             if (!needs_current_protocol or service.runtimeStatusRepairProtocolReady()) return command;
             var legacy_record = try metadata_table_manager.cloneStore(service.alloc, record);
             stripRuntimeRepairStatus(&legacy_record);
+            stripRuntimeArtifactSourceStatus(service.alloc, &legacy_record);
             stripRuntimeReporterFence(&legacy_record);
             owned_legacy_store.* = legacy_record;
             return .{ .register_store = legacy_record };

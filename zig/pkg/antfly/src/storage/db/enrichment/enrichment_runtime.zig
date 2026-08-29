@@ -27,6 +27,9 @@ const internal_keys = @import("../../internal_keys.zig");
 const hierarchy_navigation = @import("../../hierarchy_navigation.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const change_journal_mod = @import("../derived/change_journal.zig");
+const graph_asset_state = @import("../graph_asset_state.zig");
+const graph_edge_contender = @import("../graph_edge_contender.zig");
+const graph_state_name = @import("../graph_state_name.zig");
 const replay_source_mod = @import("../derived/replay_source.zig");
 const derived_types = @import("../derived/derived_types.zig");
 const enrichment_types = @import("enrichment_types.zig");
@@ -1495,6 +1498,9 @@ fn clearIsolatedFailedIndexes(runtime: *EnrichmentRuntime) void {
     var it = runtime.isolated_failed_indexes.iterator();
     while (it.next()) |entry| runtime.alloc.free(@constCast(entry.key_ptr.*));
     runtime.isolated_failed_indexes.clearAndFree(runtime.alloc);
+    var source_it = runtime.isolated_failed_sources.iterator();
+    while (source_it.next()) |entry| runtime.alloc.free(@constCast(entry.key_ptr.*));
+    runtime.isolated_failed_sources.clearAndFree(runtime.alloc);
 }
 
 fn markIsolatedFailedIndex(runtime: *EnrichmentRuntime, index_name: []const u8) void {
@@ -1502,6 +1508,28 @@ fn markIsolatedFailedIndex(runtime: *EnrichmentRuntime, index_name: []const u8) 
     const owned_key = runtime.alloc.dupe(u8, index_name) catch return;
     errdefer runtime.alloc.free(owned_key);
     runtime.isolated_failed_indexes.put(runtime.alloc, owned_key, {}) catch return;
+}
+
+fn markIsolatedFailedSource(runtime: *EnrichmentRuntime, index_name: []const u8, artifact_name: []const u8) void {
+    if (index_name.len == 0 or artifact_name.len == 0 or index_name.len > std.math.maxInt(u32)) return;
+    const key = runtime.alloc.alloc(u8, @sizeOf(u32) + index_name.len + artifact_name.len) catch return;
+    errdefer runtime.alloc.free(key);
+    std.mem.writeInt(u32, key[0..4], @intCast(index_name.len), .big);
+    @memcpy(key[4 .. 4 + index_name.len], index_name);
+    @memcpy(key[4 + index_name.len ..], artifact_name);
+    if (runtime.isolated_failed_sources.getKey(key) != null) {
+        runtime.alloc.free(key);
+        return;
+    }
+    runtime.isolated_failed_sources.put(runtime.alloc, key, {}) catch return;
+}
+
+fn isolatedFailedSourceMatches(key: []const u8, index_name: []const u8, artifact_name: []const u8) bool {
+    if (key.len < @sizeOf(u32)) return false;
+    const index_len: usize = std.mem.readInt(u32, key[0..4], .big);
+    if (index_len > key.len - 4) return false;
+    return std.mem.eql(u8, key[4 .. 4 + index_len], index_name) and
+        std.mem.eql(u8, key[4 + index_len ..], artifact_name);
 }
 
 fn generatedArtifactAlreadyPublished(runtime: *EnrichmentRuntime, artifact_key: []const u8) bool {
@@ -1761,6 +1789,7 @@ fn shouldStoreChunkArtifacts(
     request: enrichment_types.GeneratedEnrichmentRequest,
     has_durable_text_consumer: bool,
 ) !bool {
+    if (request.persist_artifact) return true;
     if (request.full_text_index) return true;
     if (has_durable_text_consumer) return true;
     if (request.chunker_json.len == 0) return true;
@@ -2189,6 +2218,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     chunk_artifact_bytes_written: u64 = 0,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(
         alloc: Allocator,
@@ -2519,6 +2549,12 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
         return self.isolated_failed_indexes.contains(index_name);
     }
+
+    pub fn indexSourceHasIsolatedFailure(self: *@This(), index_name: []const u8, artifact_name: []const u8) bool {
+        var it = self.isolated_failed_sources.iterator();
+        while (it.next()) |entry| if (isolatedFailedSourceMatches(entry.key_ptr.*, index_name, artifact_name)) return true;
+        return false;
+    }
 } else struct {
     alloc: Allocator,
     io_impl: ?*Io.Threaded,
@@ -2585,6 +2621,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     last_error_name: ?[]const u8 = null,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
+    isolated_failed_sources: std.StringHashMapUnmanaged(void) = .empty,
     status_hook: ?StatusHook = null,
     future: ?Io.Future(void) = null,
 
@@ -3100,6 +3137,15 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         return self.isolated_failed_indexes.contains(index_name);
     }
 
+    pub fn indexSourceHasIsolatedFailure(self: *EnrichmentRuntime, index_name: []const u8, artifact_name: []const u8) bool {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        var it = self.isolated_failed_sources.iterator();
+        while (it.next()) |entry| if (isolatedFailedSourceMatches(entry.key_ptr.*, index_name, artifact_name)) return true;
+        return false;
+    }
+
     fn recordError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
         std.log.err("enrichment worker failed: {s}", .{@errorName(err)});
         var status: enrichment_state.RuntimeStatus = .{};
@@ -3588,6 +3634,7 @@ fn noteTerminalRequestFailure(
     runtime: *EnrichmentRuntime,
     sequence: u64,
     indexes: []const []const u8,
+    artifact_name: []const u8,
     completed_failure_fingerprint: u64,
 ) !void {
     const maybe_io = if (runtime.io_impl) |io_impl| io_impl.io() else null;
@@ -3616,7 +3663,10 @@ fn noteTerminalRequestFailure(
     runtime.retrying = false;
     runtime.next_retry_at_ms = 0;
     runtime.worker_failed = false;
-    for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
+    for (indexes) |index_name| if (index_name.len > 0) {
+        markIsolatedFailedIndex(runtime, index_name);
+        markIsolatedFailedSource(runtime, index_name, artifact_name);
+    };
     const status = runtimeStatusSnapshot(runtime);
     if (maybe_io) |io| {
         broadcastRuntimeStateChanged(runtime, io);
@@ -3669,6 +3719,15 @@ fn skipPersistedRequestFailure(
         if (!try pending_fn(failure_ctx, failure_identity, index_name)) return false;
     }
 
+    // Rehydrate the source-local diagnostic from the durable repair ledger on
+    // crash replay. The aggregate terminal envelope is intentionally compact,
+    // so the exact request identity is recovered only after the bounded ledger
+    // lookup above proves that this failure is still current.
+    for (indexes) |index_name| if (index_name.len > 0) {
+        markIsolatedFailedIndex(runtime, index_name);
+        markIsolatedFailedSource(runtime, index_name, failure_identity.artifact_name);
+    };
+
     if (runtime.coverage_apply_mutex != null) {
         try queueDerivedCoverageOutcome(runtime, window, request, indexes, .terminal_failed);
     }
@@ -3716,7 +3775,16 @@ fn recordIsolatedRequestError(runtime: *EnrichmentRuntime, window: ?*GeneratedRe
             try markDerivedCoverageTerminalFailedForIndex(runtime, index_name, request);
         }
     }
-    try noteTerminalRequestFailure(runtime, request.sequence, indexes, requestFailureFingerprint(request));
+    try noteTerminalRequestFailure(
+        runtime,
+        request.sequence,
+        indexes,
+        switch (request.kind) {
+            .dense_embedding, .sparse_embedding => requestEmbeddingName(request),
+            .asset, .chunk_text => requestArtifactName(request),
+        },
+        requestFailureFingerprint(request),
+    );
     runtime.notifyStatusHook();
 }
 
@@ -3728,6 +3796,17 @@ const TestFailureCapture = struct {
         const self: *TestFailureCapture = @ptrCast(@alignCast(ptr));
         self.failure = failure;
         self.count += 1;
+    }
+
+    fn pending(ptr: *anyopaque, failure: FailureIdentity, index_name: []const u8) !bool {
+        const self: *TestFailureCapture = @ptrCast(@alignCast(ptr));
+        const recorded = self.failure orelse return false;
+        return std.mem.eql(u8, recorded.index_name, index_name) and
+            recorded.kind == failure.kind and
+            std.mem.eql(u8, recorded.artifact_name, failure.artifact_name) and
+            std.mem.eql(u8, recorded.source_artifact_name, failure.source_artifact_name) and
+            std.mem.eql(u8, recorded.doc_key, failure.doc_key) and
+            recorded.sequence == failure.sequence;
     }
 };
 
@@ -3829,6 +3908,9 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expect(!runtime.worker_failed);
     try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
     try std.testing.expect(!runtime.indexHasIsolatedFailure("healthy_text"));
+    try std.testing.expect(runtime.indexSourceHasIsolatedFailure("bad_visual", "clipclap"));
+    try std.testing.expect(!runtime.indexSourceHasIsolatedFailure("bad_visual", "other_embedding"));
+    try std.testing.expect(!runtime.indexSourceHasIsolatedFailure("healthy_text", "clipclap"));
     const persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 1), persisted.error_count);
     try std.testing.expectEqual(@as(u64, 1), persisted.fatal_error_count);
@@ -3844,6 +3926,24 @@ test "isolated enrichment request error does not mark worker failed" {
     try std.testing.expectEqualStrings("UnsupportedEmbeddingProvider", failure.error_name);
     try std.testing.expectEqual(@as(u64, 7), failure.attempts);
     try std.testing.expectEqual(@as(u64, 11), failure.sequence);
+
+    // Model a restart/new replay episode: the in-memory diagnostic is empty,
+    // while the terminal envelope and repair ledger remain durable. Skipping
+    // that parked request must reconstruct the exact failed source.
+    clearIsolatedFailedIndexes(&runtime);
+    runtime.failure_pending_fn = TestFailureCapture.pending;
+    var replay_window = GeneratedReplayWindow{ .alloc = alloc };
+    defer replay_window.deinit();
+    try std.testing.expect(try skipPersistedRequestFailure(&runtime, &replay_window, .{
+        .kind = .dense_embedding,
+        .index_name = "bad_visual",
+        .embedding_name = "clipclap",
+        .doc_key = "doc:1",
+        .source_field = "image_url",
+        .sequence = 11,
+    }));
+    try std.testing.expect(runtime.indexHasIsolatedFailure("bad_visual"));
+    try std.testing.expect(runtime.indexSourceHasIsolatedFailure("bad_visual", "clipclap"));
 }
 
 test "chunked dense terminal failure is recorded once per parent request" {
@@ -7402,10 +7502,10 @@ fn materializeGraphAssetForRuntime(
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
-        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+        const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
-        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc);
+        const edge_limit = graph_asset_state.effectiveEdgeLimit(graph_entry.max_edges_per_document);
+        const graph_writes = try runtimeGraphWritesFromArtifactValueAlloc(runtime.alloc, graph_entry.config.name, request.doc_key, value, source, request.content_type, raw_doc, graph_asset_state.hard_max_relation_items_per_artifact);
         defer runtimeFreeGraphWrites(runtime.alloc, graph_writes);
 
         var writes = std.ArrayListUnmanaged(KVPair).empty;
@@ -7416,17 +7516,19 @@ fn materializeGraphAssetForRuntime(
             }
             writes.deinit(runtime.alloc);
         }
+        var write_positions = RuntimeWritePositions.empty;
+        defer write_positions.deinit(runtime.alloc);
         for (graph_writes) |write| {
             const key = try internal_keys.graphEdgeArtifactKeyAlloc(runtime.alloc, write.source, write.index_name, write.edge_type, write.target);
             var key_owned = true;
             errdefer if (key_owned) runtime.alloc.free(key);
-            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, write.weight, write.created_at, write.updated_at, write.metadata_json);
+            const payload = try enrichment_artifact_codec.encodeGraphEdgeAlloc(runtime.alloc, null, graph_entry.config.coverage_generation, write.weight, write.created_at, write.updated_at, write.metadata_json);
             var payload_owned = true;
             errdefer if (payload_owned) runtime.alloc.free(payload);
-            try writes.append(runtime.alloc, .{ .key = key, .value = payload });
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+            try runtimeUpsertOwnedKVWrite(runtime.alloc, &writes, &write_positions, key, payload);
             key_owned = false;
             payload_owned = false;
-            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         }
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
@@ -7435,16 +7537,14 @@ fn materializeGraphAssetForRuntime(
             deletes.deinit(runtime.alloc);
         }
 
-        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
+        const state_name = try runtimeGraphArtifactStateNameAlloc(runtime.alloc, request);
+        defer runtime.alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, state_name);
         defer runtime.alloc.free(state_key);
-        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
-            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
-            for (previous_keys) |previous_key| {
-                if (runtimeContainsKVKey(writes.items, previous_key)) continue;
-                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            }
-        } else {
+        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
+        defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
+        try appendRuntimeGraphAssetStateSegmentDeletes(runtime, state_key, &deletes);
+        if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
@@ -7459,15 +7559,54 @@ fn materializeGraphAssetForRuntime(
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, writes.items);
+        const graph_write_count = writes.items.len;
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, graph_entry.config.coverage_generation, writes.items);
         var state_owned = true;
         defer if (state_owned) runtime.alloc.free(state_value);
-        try writes.append(runtime.alloc, .{
-            .key = try runtime.alloc.dupe(u8, state_key),
-            .value = state_value,
-        });
-        state_owned = false;
 
+        var reconciled = try runtimeReconcileGraphEdgeContenders(
+            runtime,
+            request.doc_key,
+            graph_entry.config.name,
+            state_key,
+            previous_keys orelse &.{},
+            writes.items[0..graph_write_count],
+            graph_entry.config.coverage_generation,
+        );
+        defer reconciled.deinit(runtime.alloc);
+        if (reconciled.visible_count > edge_limit) return error.ResourceLimitExceeded;
+        var affected = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (affected.items) |key| runtime.alloc.free(key);
+            affected.deinit(runtime.alloc);
+        }
+        if (previous_keys) |keys| for (keys) |key| try appendUniqueDupeKey(runtime.alloc, &affected, key);
+        for (writes.items[0..graph_write_count]) |write| try appendUniqueDupeKey(runtime.alloc, &affected, write.key);
+        for (affected.items) |edge_key| {
+            if (reconciled.winners.map.get(edge_key)) |winner| {
+                const payload = try runtime.alloc.dupe(u8, winner.payload);
+                var payload_owned = true;
+                errdefer if (payload_owned) runtime.alloc.free(payload);
+                try runtimeUpsertOwnedKVWriteDupeKey(runtime.alloc, &writes, &write_positions, edge_key, payload);
+                payload_owned = false;
+            } else if (!runtimeContainsConstKey(deletes.items, edge_key)) {
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, edge_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, edge_key);
+            }
+        }
+        try runtimeUpsertOwnedKVWriteDupeKey(runtime.alloc, &writes, &write_positions, state_key, state_value);
+        state_owned = false;
+        for (reconciled.writes.items) |write| {
+            const contender_value = try runtime.alloc.dupe(u8, write.value);
+            var contender_value_owned = true;
+            errdefer if (contender_value_owned) runtime.alloc.free(contender_value);
+            try runtimeUpsertOwnedKVWriteDupeKey(runtime.alloc, &writes, &write_positions, write.key, contender_value);
+            contender_value_owned = false;
+        }
+        for (reconciled.deletes.items) |key| {
+            if (runtimeContainsKVKey(writes.items, key) or runtimeContainsConstKey(deletes.items, key)) continue;
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
+        }
         if (writes.items.len > 0 or deletes.items.len > 0) {
             try storePutBatchWithRetry(runtime, writes.items, deletes.items);
         }
@@ -7483,8 +7622,7 @@ fn materializeGraphAssetDeleteForRuntime(
     const artifact_name = requestArtifactName(request);
 
     for (runtime.index_manager.graphIndexes()) |graph_entry| {
-        const source = graph_entry.artifact_source orelse continue;
-        if (!std.mem.eql(u8, source.artifact_name, artifact_name)) continue;
+        const source = runtime.index_manager.graphArtifactSourceForArtifact(graph_entry.config.name, artifact_name) orelse continue;
 
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer {
@@ -7492,15 +7630,14 @@ fn materializeGraphAssetDeleteForRuntime(
             deletes.deinit(runtime.alloc);
         }
 
-        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, artifact_name);
+        const state_name = try runtimeGraphArtifactStateNameAlloc(runtime.alloc, request);
+        defer runtime.alloc.free(state_name);
+        const state_key = try graphAssetStateKeyAlloc(runtime.alloc, request.doc_key, graph_entry.config.name, state_name);
         defer runtime.alloc.free(state_key);
-        if (try loadGraphAssetStateKeysAlloc(runtime, state_key)) |previous_keys| {
-            defer freeOwnedConstKeySlice(runtime.alloc, previous_keys);
-            for (previous_keys) |previous_key| {
-                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, previous_key));
-                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, previous_key);
-            }
-        } else {
+        const previous_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, graph_entry.config.coverage_generation);
+        defer if (previous_keys) |keys| freeOwnedConstKeySlice(runtime.alloc, keys);
+        try appendRuntimeGraphAssetStateSegmentDeletes(runtime, state_key, &deletes);
+        if (previous_keys == null and runtime.index_manager.graphArtifactSources(graph_entry.config.name).len <= 1) {
             const protected_keys = try runtimeResolutionMentionStateKeysForGraphSourceAlloc(runtime, request.doc_key, graph_entry.config.name, source);
             defer freeOwnedConstKeySlice(runtime.alloc, protected_keys);
             const prefix = try internal_keys.graphArtifactIndexPrefixAlloc(runtime.alloc, request.doc_key, graph_entry.config.name);
@@ -7514,11 +7651,60 @@ fn materializeGraphAssetDeleteForRuntime(
             }
         }
 
-        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, &.{});
+        const state_value = try encodeGraphAssetStateKeysAlloc(runtime.alloc, graph_entry.config.coverage_generation, &.{});
         defer runtime.alloc.free(state_value);
-        const writes = [_]KVPair{.{ .key = state_key, .value = state_value }};
-        if (writes.len > 0 or deletes.items.len > 0) {
-            try storePutBatchWithRetry(runtime, &writes, deletes.items);
+        var writes = std.ArrayListUnmanaged(KVPair).empty;
+        defer {
+            for (writes.items) |write| {
+                runtime.alloc.free(@constCast(write.key));
+                runtime.alloc.free(@constCast(write.value));
+            }
+            writes.deinit(runtime.alloc);
+        }
+        var affected = std.ArrayListUnmanaged([]u8).empty;
+        defer {
+            for (affected.items) |key| runtime.alloc.free(key);
+            affected.deinit(runtime.alloc);
+        }
+        if (previous_keys) |keys| for (keys) |edge_key| try appendUniqueDupeKey(runtime.alloc, &affected, edge_key);
+        var reconciled = try runtimeReconcileGraphEdgeContenders(
+            runtime,
+            request.doc_key,
+            graph_entry.config.name,
+            state_key,
+            previous_keys orelse &.{},
+            &.{},
+            graph_entry.config.coverage_generation,
+        );
+        defer reconciled.deinit(runtime.alloc);
+        for (affected.items) |edge_key| {
+            if (reconciled.winners.map.get(edge_key)) |winner| {
+                const payload = try runtime.alloc.dupe(u8, winner.payload);
+                try writes.append(runtime.alloc, .{
+                    .key = try runtime.alloc.dupe(u8, edge_key),
+                    .value = payload,
+                });
+            } else if (!runtimeContainsConstKey(deletes.items, edge_key)) {
+                try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, edge_key));
+                try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, edge_key);
+            }
+        }
+        try writes.append(runtime.alloc, .{
+            .key = try runtime.alloc.dupe(u8, state_key),
+            .value = try runtime.alloc.dupe(u8, state_value),
+        });
+        for (reconciled.writes.items) |write| {
+            try writes.append(runtime.alloc, .{
+                .key = try runtime.alloc.dupe(u8, write.key),
+                .value = try runtime.alloc.dupe(u8, write.value),
+            });
+        }
+        for (reconciled.deletes.items) |key| {
+            if (runtimeContainsKVKey(writes.items, key) or runtimeContainsConstKey(deletes.items, key)) continue;
+            try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
+        }
+        if (writes.items.len > 0 or deletes.items.len > 0) {
+            try storePutBatchWithRetry(runtime, writes.items, deletes.items);
         }
     }
 }
@@ -7528,6 +7714,358 @@ fn runtimeContainsKVKey(items: []const KVPair, key: []const u8) bool {
         if (std.mem.eql(u8, item.key, key)) return true;
     }
     return false;
+}
+
+const RuntimeWritePositions = std.StringHashMapUnmanaged(usize);
+
+fn runtimeUpsertOwnedKVWrite(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    positions: *RuntimeWritePositions,
+    key: []u8,
+    value: []u8,
+) !void {
+    if (positions.get(key)) |position| {
+        alloc.free(key);
+        alloc.free(@constCast(writes.items[position].value));
+        writes.items[position].value = value;
+        return;
+    }
+    const position = writes.items.len;
+    try writes.append(alloc, .{ .key = key, .value = value });
+    errdefer _ = writes.pop();
+    try positions.put(alloc, key, position);
+}
+
+fn runtimeUpsertOwnedKVWriteDupeKey(
+    alloc: Allocator,
+    writes: *std.ArrayListUnmanaged(KVPair),
+    positions: *RuntimeWritePositions,
+    key: []const u8,
+    value: []u8,
+) !void {
+    const owned_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(owned_key);
+    try runtimeUpsertOwnedKVWrite(alloc, writes, positions, owned_key, value);
+}
+
+const RuntimeGraphEdgeWinner = struct {
+    owner_state_key: []u8,
+    payload: []u8,
+    source_priority: usize,
+};
+
+const RuntimeGraphEdgeWinners = struct {
+    map: std.StringHashMapUnmanaged(RuntimeGraphEdgeWinner) = .empty,
+
+    fn deinit(self: *RuntimeGraphEdgeWinners, alloc: Allocator) void {
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            alloc.free(@constCast(entry.key_ptr.*));
+            alloc.free(entry.value_ptr.owner_state_key);
+            alloc.free(entry.value_ptr.payload);
+        }
+        self.map.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn runtimeGraphStateSourcePriorityAlloc(
+    runtime: *EnrichmentRuntime,
+    state_key: []const u8,
+    state_prefix: []const u8,
+    index_name: []const u8,
+) !?usize {
+    const sources = runtime.index_manager.graphArtifactSources(index_name);
+    if (!std.mem.startsWith(u8, state_key, state_prefix)) return null;
+    const terminator = internal_keys.findComponentTerminator(state_key, state_prefix.len) orelse return null;
+    const state_name = try internal_keys.decodeBodyAlloc(runtime.alloc, state_key[state_prefix.len..terminator]);
+    defer runtime.alloc.free(state_name);
+    return graph_state_name.materializedSourcePriority(state_name, sources);
+}
+
+const RuntimeGraphContenderChange = struct {
+    state_key: []const u8,
+    source_priority: usize,
+    payload: ?[]const u8,
+};
+
+const RuntimeGraphContenderChanges = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(RuntimeGraphContenderChange));
+
+const RuntimeGraphContenderResult = struct {
+    winners: RuntimeGraphEdgeWinners = .{},
+    writes: std.ArrayListUnmanaged(KVPair) = .empty,
+    deletes: std.ArrayListUnmanaged([]const u8) = .empty,
+    visible_count: usize = 0,
+
+    fn deinit(self: *RuntimeGraphContenderResult, alloc: Allocator) void {
+        self.winners.deinit(alloc);
+        for (self.writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        self.writes.deinit(alloc);
+        for (self.deletes.items) |key| alloc.free(@constCast(key));
+        self.deletes.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn runtimeAppendGraphContenderChange(
+    alloc: Allocator,
+    changes: *RuntimeGraphContenderChanges,
+    edge_key: []const u8,
+    state_key: []const u8,
+    source_priority: usize,
+    payload: ?[]const u8,
+) !void {
+    const gop = try changes.getOrPut(alloc, edge_key);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    for (gop.value_ptr.items) |*change| {
+        if (!std.mem.eql(u8, change.state_key, state_key)) continue;
+        change.source_priority = source_priority;
+        change.payload = payload;
+        return;
+    }
+    try gop.value_ptr.append(alloc, .{ .state_key = state_key, .source_priority = source_priority, .payload = payload });
+}
+
+fn runtimeGraphContenderStateChanged(changes: []const RuntimeGraphContenderChange, state_key: []const u8) bool {
+    for (changes) |change| if (std.mem.eql(u8, change.state_key, state_key)) return true;
+    return false;
+}
+
+fn runtimeConsiderGraphEdgeWinner(
+    alloc: Allocator,
+    winners: *RuntimeGraphEdgeWinners,
+    edge_key: []const u8,
+    state_key: []const u8,
+    source_priority: usize,
+    payload: []const u8,
+) !void {
+    if (winners.map.getPtr(edge_key)) |winner| {
+        if (source_priority > winner.source_priority or
+            (source_priority == winner.source_priority and std.mem.order(u8, state_key, winner.owner_state_key) != .lt)) return;
+        const owner = try alloc.dupe(u8, state_key);
+        errdefer alloc.free(owner);
+        const owned_payload = try alloc.dupe(u8, payload);
+        alloc.free(winner.owner_state_key);
+        alloc.free(winner.payload);
+        winner.* = .{ .owner_state_key = owner, .payload = owned_payload, .source_priority = source_priority };
+        return;
+    }
+    const owned_edge = try alloc.dupe(u8, edge_key);
+    errdefer alloc.free(owned_edge);
+    const owner = try alloc.dupe(u8, state_key);
+    errdefer alloc.free(owner);
+    const owned_payload = try alloc.dupe(u8, payload);
+    errdefer alloc.free(owned_payload);
+    try winners.map.put(alloc, owned_edge, .{ .owner_state_key = owner, .payload = owned_payload, .source_priority = source_priority });
+}
+
+fn runtimeReconcileGlobalGraphEdgeWinner(
+    runtime: *EnrichmentRuntime,
+    index_name: []const u8,
+    expected_generation: u64,
+    edge_key: []const u8,
+    edge_changes: []const RuntimeGraphContenderChange,
+    result: *RuntimeGraphContenderResult,
+) !void {
+    const alloc = runtime.alloc;
+    const prefix = try internal_keys.graphGlobalEdgeContenderEdgePrefixAlloc(alloc, index_name, expected_generation, edge_key);
+    defer alloc.free(prefix);
+    const upper = try internal_keys.nextPrefixAlloc(alloc, prefix);
+    defer if (upper) |value| alloc.free(value);
+
+    const ScanState = struct {
+        alloc: Allocator,
+        index_name: []const u8,
+        generation: u64,
+        edge_key: []const u8,
+        edge_changes: []const RuntimeGraphContenderChange,
+        winners: *RuntimeGraphEdgeWinners,
+
+        fn scan(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!backend_scan.ScanAction {
+            const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+            const view = (try graph_edge_contender.decode(value, state.generation)) orelse return .@"continue";
+            if (!std.mem.eql(u8, view.edge_key, state.edge_key)) return error.InvalidGraphEdgeContender;
+            const expected_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(
+                state.alloc,
+                state.index_name,
+                state.generation,
+                state.edge_key,
+                view.source_priority,
+                view.state_key,
+            );
+            defer state.alloc.free(expected_key);
+            if (!std.mem.eql(u8, key, expected_key)) return error.InvalidGraphEdgeContender;
+            if (runtimeGraphContenderStateChanged(state.edge_changes, view.state_key)) return .@"continue";
+            const authenticated = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(state.alloc, view.payload, state.generation)) orelse return error.InvalidGraphEdgeContender;
+            defer state.alloc.free(authenticated);
+            try runtimeConsiderGraphEdgeWinner(state.alloc, state.winners, state.edge_key, view.state_key, view.source_priority, authenticated);
+            return .stop;
+        }
+    };
+    var scan_state = ScanState{
+        .alloc = alloc,
+        .index_name = index_name,
+        .generation = expected_generation,
+        .edge_key = edge_key,
+        .edge_changes = edge_changes,
+        .winners = &result.winners,
+    };
+    try backend_scan.scanWithContext(&runtime.store, prefix, if (upper) |value| value else "", .{}, &scan_state, ScanState.scan);
+
+    for (edge_changes) |change| {
+        const contender_key = try internal_keys.graphGlobalEdgeContenderKeyAlloc(alloc, index_name, expected_generation, edge_key, change.source_priority, change.state_key);
+        if (change.payload) |payload| {
+            const authenticated = (try enrichment_artifact_codec.authenticateGraphEdgeGenerationAlloc(alloc, payload, expected_generation)) orelse return error.InvalidGraphEdgeContender;
+            defer alloc.free(authenticated);
+            const contender_value = try graph_edge_contender.encodeAlloc(alloc, expected_generation, change.source_priority, edge_key, change.state_key, authenticated);
+            try result.writes.append(alloc, .{ .key = contender_key, .value = contender_value });
+            try runtimeConsiderGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, authenticated);
+        } else {
+            try result.deletes.append(alloc, contender_key);
+        }
+    }
+}
+
+fn runtimeReconcileGraphEdgeContenders(
+    runtime: *EnrichmentRuntime,
+    doc_key: []const u8,
+    index_name: []const u8,
+    state_key: []const u8,
+    previous_keys: []const []const u8,
+    graph_writes: []const KVPair,
+    expected_generation: u64,
+) !RuntimeGraphContenderResult {
+    const alloc = runtime.alloc;
+    var result = RuntimeGraphContenderResult{};
+    errdefer result.deinit(alloc);
+    var changes = RuntimeGraphContenderChanges.empty;
+    defer {
+        var values = changes.valueIterator();
+        while (values.next()) |items| items.deinit(alloc);
+        changes.deinit(alloc);
+    }
+    const state_prefix = try internal_keys.graphAssetStateIndexPrefixAlloc(alloc, doc_key, index_name);
+    defer alloc.free(state_prefix);
+    const source_priority = try runtimeGraphStateSourcePriorityAlloc(runtime, state_key, state_prefix, index_name) orelse return error.InvalidGraphStateName;
+    for (previous_keys) |edge_key| {
+        try runtimeAppendGraphContenderChange(alloc, &changes, edge_key, state_key, source_priority, null);
+    }
+    for (graph_writes) |write| try runtimeAppendGraphContenderChange(alloc, &changes, write.key, state_key, source_priority, write.value);
+
+    const count_key = try internal_keys.graphEdgeContenderCountKeyAlloc(alloc, doc_key, index_name);
+    defer alloc.free(count_key);
+    const raw_count = storeGetAlloc(runtime, count_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    defer if (raw_count) |raw| alloc.free(raw);
+    const count_present = raw_count != null and (try graph_edge_contender.decodeVisibleCount(raw_count.?, expected_generation)) != null;
+    result.visible_count = if (raw_count) |raw| (try graph_edge_contender.decodeVisibleCount(raw, expected_generation)) orelse 0 else 0;
+    var saw_current_contender = false;
+    var bulk_existing_edges = std.StringHashMapUnmanaged(void).empty;
+    defer bulk_existing_edges.deinit(alloc);
+    var bulk_surviving_edges = std.StringHashMapUnmanaged(void).empty;
+    defer bulk_surviving_edges.deinit(alloc);
+    const bulk_scan = count_present and graph_edge_contender.shouldBulkScan(changes.count(), result.visible_count);
+    if (bulk_scan) {
+        const index_prefix = try internal_keys.graphEdgeContenderIndexPrefixAlloc(alloc, doc_key, index_name);
+        defer alloc.free(index_prefix);
+        const existing = try backend_scan.scanPrefix(alloc, &runtime.store, index_prefix);
+        defer backend_scan.freeResults(alloc, existing);
+        for (existing) |contender| {
+            if (std.mem.eql(u8, contender.key, count_key)) continue;
+            const view = (try graph_edge_contender.decode(contender.value, expected_generation)) orelse continue;
+            const edge_key = changes.getKey(view.edge_key) orelse continue;
+            const edge_changes = changes.get(edge_key).?;
+            const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
+            defer alloc.free(expected_key);
+            if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+            saw_current_contender = true;
+            try bulk_existing_edges.put(alloc, edge_key, {});
+            if (runtimeGraphContenderStateChanged(edge_changes.items, view.state_key)) continue;
+            try bulk_surviving_edges.put(alloc, edge_key, {});
+        }
+    }
+
+    var it = changes.iterator();
+    while (it.next()) |entry| {
+        const edge_key = entry.key_ptr.*;
+        const edge_changes = entry.value_ptr.items;
+        var existed_before = bulk_existing_edges.contains(edge_key);
+        var exists_after = bulk_surviving_edges.contains(edge_key);
+        if (!bulk_scan and count_present) {
+            const prefix = try internal_keys.graphEdgeContenderEdgePrefixAlloc(alloc, doc_key, index_name, edge_key);
+            defer alloc.free(prefix);
+            const existing = try backend_scan.scanPrefix(alloc, &runtime.store, prefix);
+            defer backend_scan.freeResults(alloc, existing);
+            for (existing) |contender| {
+                const view = (try graph_edge_contender.decode(contender.value, expected_generation)) orelse continue;
+                if (!std.mem.eql(u8, view.edge_key, edge_key)) return error.InvalidGraphEdgeContender;
+                const expected_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, view.state_key);
+                defer alloc.free(expected_key);
+                if (!std.mem.eql(u8, contender.key, expected_key)) return error.InvalidGraphEdgeContender;
+                saw_current_contender = true;
+                existed_before = true;
+                if (runtimeGraphContenderStateChanged(edge_changes, view.state_key)) continue;
+                exists_after = true;
+            }
+        }
+        for (edge_changes) |change| {
+            const contender_key = try internal_keys.graphEdgeContenderKeyAlloc(alloc, doc_key, index_name, edge_key, change.state_key);
+            if (change.payload != null) {
+                const contender_value = try graph_edge_contender.encodeAlloc(alloc, expected_generation, change.source_priority, edge_key, change.state_key, "");
+                try result.writes.append(alloc, .{ .key = contender_key, .value = contender_value });
+                exists_after = true;
+            } else {
+                try result.deletes.append(alloc, contender_key);
+            }
+        }
+        if (!existed_before and exists_after) {
+            result.visible_count = std.math.add(usize, result.visible_count, 1) catch return error.ResourceLimitExceeded;
+        } else if (existed_before and !exists_after) {
+            if (result.visible_count == 0) return error.InvalidGraphEdgeContenderCount;
+            result.visible_count -= 1;
+        }
+    }
+    if (saw_current_contender and !count_present) return error.InvalidGraphEdgeContenderCount;
+    const encoded_count = try graph_edge_contender.encodeVisibleCount(expected_generation, result.visible_count);
+    try result.writes.append(alloc, .{ .key = try alloc.dupe(u8, count_key), .value = try alloc.dupe(u8, &encoded_count) });
+
+    result.winners.deinit(alloc);
+    result.winners = .{};
+    var global_it = changes.iterator();
+    while (global_it.next()) |entry| {
+        try runtimeReconcileGlobalGraphEdgeWinner(
+            runtime,
+            index_name,
+            expected_generation,
+            entry.key_ptr.*,
+            entry.value_ptr.items,
+            &result,
+        );
+    }
+    return result;
+}
+
+fn runtimeGraphArtifactStateNameAlloc(
+    alloc: Allocator,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+) ![]u8 {
+    const artifact_name = requestArtifactName(request);
+    const artifact_ref = types.ArtifactRef{
+        .document_id = @constCast(request.doc_key),
+        .name = @constCast(artifact_name),
+        .kind = switch (request.kind) {
+            .chunk_text => .chunk,
+            .asset => .asset,
+            .dense_embedding, .sparse_embedding => .embedding,
+        },
+    };
+    return try graph_state_name.artifactAlloc(alloc, artifact_ref);
 }
 
 fn runtimeContainsConstKey(items: []const []const u8, key: []const u8) bool {
@@ -7545,6 +8083,7 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     source: index_manager_mod.GraphArtifactSource,
     artifact_content_type: []const u8,
     raw_doc: ?[]const u8,
+    edge_limit: usize,
 ) ![]types.GraphEdgeWrite {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -7553,16 +8092,19 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
     const doc_value: ?std.json.Value = if (parsed_doc) |doc| doc.value else null;
 
     var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-    errdefer runtimeFreeGraphWrites(alloc, writes.items);
+    errdefer {
+        for (writes.items) |write| runtimeFreeGraphWriteFields(alloc, write);
+        writes.deinit(alloc);
+    }
 
     switch (source.format) {
-        .extraction_relation => try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value),
+        .extraction_relation => try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit),
         .extraction_graph => {
             if (source.path.len > 0) {
-                try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                try runtimeAppendRelationItemsFromPath(alloc, &writes, index_name, doc_key, doc_value, parsed.value, source.path, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit);
             } else if (parsed.value == .object) {
-                if (parsed.value.object.get("relations")) |relations| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
-                if (parsed.value.object.get("edges")) |edges| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value);
+                if (parsed.value.object.get("relations")) |relations| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, relations, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit);
+                if (parsed.value.object.get("edges")) |edges| try runtimeAppendRelationValueItems(alloc, &writes, index_name, doc_key, doc_value, edges, source.mapping, source.artifact_name, artifact_content_type, parsed.value, edge_limit);
             }
         },
     }
@@ -7571,14 +8113,42 @@ fn runtimeGraphWritesFromArtifactValueAlloc(
 }
 
 fn runtimeFreeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
-    for (writes) |write| {
-        alloc.free(@constCast(write.index_name));
-        alloc.free(@constCast(write.source));
-        alloc.free(@constCast(write.target));
-        alloc.free(@constCast(write.edge_type));
-        if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-    }
+    for (writes) |write| runtimeFreeGraphWriteFields(alloc, write);
     if (writes.len > 0) alloc.free(writes);
+}
+
+fn runtimeFreeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) void {
+    alloc.free(@constCast(write.index_name));
+    alloc.free(@constCast(write.source));
+    alloc.free(@constCast(write.target));
+    alloc.free(@constCast(write.edge_type));
+    if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
+}
+
+test "enrichment runtime graph materializer rejects non-finite mapped weights" {
+    const alloc = std.testing.allocator;
+    const source = index_manager_mod.GraphArtifactSource{
+        .artifact_name = @constCast("relations_v1"),
+        .mapping = .{ .weight_template = @constCast("{{ _item.score }}") },
+    };
+    for ([_][]const u8{ "NaN", "Inf", "-Inf" }) |weight| {
+        const raw = try std.fmt.allocPrint(
+            alloc,
+            "{{\"type\":\"mentions\",\"target\":\"doc:b\",\"score\":\"{s}\"}}",
+            .{weight},
+        );
+        defer alloc.free(raw);
+        try std.testing.expectError(error.InvalidGraphEdges, runtimeGraphWritesFromArtifactValueAlloc(
+            alloc,
+            "relations_graph",
+            "doc:a",
+            raw,
+            source,
+            "application/json",
+            null,
+            100,
+        ));
+    }
 }
 
 fn runtimeAppendRelationItemsFromPath(
@@ -7593,10 +8163,11 @@ fn runtimeAppendRelationItemsFromPath(
     artifact_name: []const u8,
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
+    edge_limit: usize,
 ) !void {
-    if (path.len == 0 or std.mem.eql(u8, path, "$")) return runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value);
+    if (path.len == 0 or std.mem.eql(u8, path, "$")) return runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, root, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
     const selected = runtimeSelectGraphArtifactPath(root, path) orelse return;
-    try runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value);
+    try runtimeAppendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
 }
 
 fn runtimeSelectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
@@ -7626,11 +8197,12 @@ fn runtimeAppendRelationValueItems(
     artifact_name: []const u8,
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
+    edge_limit: usize,
 ) !void {
     if (value == .array) {
-        for (value.array.items, 0..) |item, i| try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value);
+        for (value.array.items, 0..) |item, i| try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, item, i, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
     } else {
-        try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value);
+        try runtimeAppendRelationItem(alloc, writes, index_name, doc_key, doc_value, value, 0, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
     }
 }
 
@@ -7646,6 +8218,7 @@ fn runtimeAppendRelationItem(
     artifact_name: []const u8,
     artifact_content_type: []const u8,
     artifact_value: std.json.Value,
+    edge_limit: usize,
 ) !void {
     if (item != .object) return;
     const mapped_edge_type = if (mapping.edge_type_template.len > 0)
@@ -7659,18 +8232,7 @@ fn runtimeAppendRelationItem(
         runtimeJsonStringField(item, "type") orelse runtimeJsonStringField(item, "edge_type") orelse runtimeJsonStringField(item, "relation") orelse return;
     if (edge_type.len == 0) return;
 
-    const mapped_source = if (mapping.source_template.len > 0)
-        try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_source) |value| alloc.free(value);
-    const source_doc = if (mapped_source) |value| blk: {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-        break :blk if (trimmed.len > 0) trimmed else doc_key;
-    } else if (item.object.get("source")) |source_value|
-        runtimeJsonEndpointDocumentIdResolved(source_value, artifact_value) orelse doc_key
-    else
-        doc_key;
+    const source_doc = doc_key;
 
     const mapped_target = if (mapping.target_template.len > 0)
         try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
@@ -7685,6 +8247,7 @@ fn runtimeAppendRelationItem(
         const target_value = item.object.get("target") orelse return;
         break :blk runtimeJsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
     };
+    if (writes.items.len >= edge_limit) return error.ResourceLimitExceeded;
 
     const weight = if (mapping.weight_template.len > 0) blk: {
         const rendered = try runtimeRenderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
@@ -7692,17 +8255,26 @@ fn runtimeAppendRelationItem(
         const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
         break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
     } else runtimeJsonFloatField(item, "weight") orelse runtimeJsonFloatField(item, "confidence") orelse 1.0;
+    if (!std.math.isFinite(weight)) return error.InvalidGraphEdges;
     const metadata_json = if (mapping.metadata_template_json.len > 0)
         try runtimeRenderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
     else
         try std.json.Stringify.valueAlloc(alloc, item, .{});
     errdefer alloc.free(metadata_json);
 
+    const owned_index_name = try alloc.dupe(u8, index_name);
+    errdefer alloc.free(owned_index_name);
+    const owned_source = try alloc.dupe(u8, source_doc);
+    errdefer alloc.free(owned_source);
+    const owned_target = try alloc.dupe(u8, target_doc);
+    errdefer alloc.free(owned_target);
+    const owned_edge_type = try alloc.dupe(u8, edge_type);
+    errdefer alloc.free(owned_edge_type);
     try writes.append(alloc, .{
-        .index_name = try alloc.dupe(u8, index_name),
-        .source = try alloc.dupe(u8, source_doc),
-        .target = try alloc.dupe(u8, target_doc),
-        .edge_type = try alloc.dupe(u8, edge_type),
+        .index_name = owned_index_name,
+        .source = owned_source,
+        .target = owned_target,
+        .edge_type = owned_edge_type,
         .weight = weight,
         .metadata_json = metadata_json,
     });
@@ -8291,7 +8863,7 @@ fn processMaterializedChunkDenseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashSource(text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -8516,7 +9088,7 @@ fn processMaterializedChunkSparseRequest(
                 const text = (try chunkPayloadTextAlloc(ctx.runtime.alloc, value, ctx.request.source_field)) orelse return .@"continue";
                 var text_owned = true;
                 errdefer if (text_owned) ctx.runtime.alloc.free(text);
-                const source_hash = enrichment_artifact_codec.hashSource(text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(text, ctx.request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(ctx.runtime.alloc, key, ctx.embedding_artifact_name);
                 var embedding_key_owned = true;
                 errdefer if (embedding_key_owned) ctx.runtime.alloc.free(embedding_key);
@@ -8614,7 +9186,7 @@ fn collectPlainDenseBatchItem(
         return null;
     };
     errdefer runtime.alloc.free(@constCast(source_text));
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     errdefer runtime.alloc.free(artifact_key);
@@ -8827,7 +9399,7 @@ fn processChunkedDenseWindow(
             }
 
             source_loop: for (source_set.sources) |*source| {
-                const source_hash = enrichment_artifact_codec.hashSource(source.text);
+                const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
                 const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, embedding_artifact_name);
                 defer runtime.alloc.free(embedding_key);
                 if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -9119,7 +9691,6 @@ fn processChunkText(
     if (request.chunk_size == 0 and request.chunker_json.len == 0) return;
 
     const chunks = try getOrCreateRequestChunks(runtime, request, chunk_cache);
-    if (chunks.len == 0) return;
 
     const artifact_name = requestArtifactName(request);
     const include_default_full_text = request.full_text_index or
@@ -9135,6 +9706,14 @@ fn processChunkText(
     const desired_chunk_keys = try chunkKeysForChunks(runtime.alloc, request.doc_key, artifact_name, desired_chunks);
     defer freeKeyList(runtime.alloc, desired_chunk_keys);
     const stale_vector_keys = try deleteStaleChunkArtifacts(runtime, request.doc_key, artifact_name, desired_chunk_keys);
+    // Graph reconciliation consumes the artifact journal, not the vector/text
+    // deletion stream. Publish stale chunk identities there as well so graph
+    // edges disappear when a source document shrinks or is rechunked.
+    for (stale_vector_keys) |key| {
+        if (internal_keys.isChunkArtifactRecordKey(key)) {
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        }
+    }
     if (chunks.len == 0) {
         try mergeOwnedDeletedKeysIntoWindow(runtime, window, stale_vector_keys);
         return;
@@ -9183,6 +9762,9 @@ fn processChunkText(
         }
 
         try storePutBatchWithRetry(runtime, writes, &.{});
+        for (writes) |write| {
+            try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, write.key);
+        }
     }
 
     if (text_indexes.len == 0) {
@@ -9298,7 +9880,7 @@ fn processDenseEmbedding(
         for (chunk_embeddings) |embedding| {
             if (embedding.vector.len > 0) try appendUniqueDupeKey(runtime.alloc, &window.deleted_keys, embedding.doc_key);
         }
-        try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, embedding_artifact_name, chunk_embeddings);
+        try writeChunkEmbeddingArtifacts(runtime, request.doc_key, request.source_field, request.producer_json, embedding_artifact_name, chunk_embeddings);
         try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
         var expanded = try expandDenseEmbeddingsForConsumers(runtime, chunk_embeddings, consumer_indexes);
         defer {
@@ -9362,7 +9944,7 @@ fn processDenseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -9463,7 +10045,7 @@ fn processSparseEmbedding(
         return;
     };
     defer runtime.alloc.free(source_text);
-    const source_hash = enrichment_artifact_codec.hashSource(source_text);
+    const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source_text, request.producer_json);
 
     const artifact_key = try embeddingArtifactKey(runtime, request.doc_key, embedding_artifact_name);
     defer runtime.alloc.free(artifact_key);
@@ -9514,7 +10096,7 @@ fn buildChunkDenseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -9640,7 +10222,7 @@ fn buildChunkSparseEmbeddingsFromSources(
         const chunk_key = try runtime.alloc.dupe(u8, source.key);
         var chunk_key_owned = true;
         errdefer if (chunk_key_owned) runtime.alloc.free(chunk_key);
-        const source_hash = enrichment_artifact_codec.hashSource(source.text);
+        const source_hash = enrichment_artifact_codec.hashEmbeddingSource(source.text, request.producer_json);
         const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(runtime.alloc, source.key, requestEmbeddingName(request));
         defer runtime.alloc.free(embedding_key);
         if (try shouldSkipEmbeddingArtifact(runtime, embedding_key, source_hash)) {
@@ -11380,7 +11962,7 @@ fn graphAssetStateKeyAlloc(alloc: Allocator, doc_key: []const u8, index_name: []
 }
 
 fn runtimeMentionGraphStateNameAlloc(alloc: Allocator, source_artifact: []const u8, resolution_artifact: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}\x1fresolution_mentions\x1f{s}", .{ source_artifact, resolution_artifact });
+    return try graph_state_name.mentionAlloc(alloc, source_artifact, resolution_artifact);
 }
 
 fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
@@ -11390,6 +11972,7 @@ fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
     source: index_manager_mod.GraphArtifactSource,
 ) ![][]const u8 {
     if (source.mention_edge_type.len == 0) return try runtime.alloc.alloc([]const u8, 0);
+    const generation = (runtime.index_manager.graphIndex(index_name) orelse return error.IndexNotFound).config.coverage_generation;
 
     var protected = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
@@ -11405,7 +11988,7 @@ fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
         const state_key = try graphAssetStateKeyAlloc(runtime.alloc, doc_key, index_name, state_name);
         defer runtime.alloc.free(state_key);
 
-        const state_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key) orelse continue;
+        const state_keys = try loadGraphAssetStateKeysAlloc(runtime, state_key, generation) orelse continue;
         defer freeOwnedConstKeySlice(runtime.alloc, state_keys);
         for (state_keys) |key| {
             try protected.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
@@ -11415,40 +11998,69 @@ fn runtimeResolutionMentionStateKeysForGraphSourceAlloc(
     return try protected.toOwnedSlice(runtime.alloc);
 }
 
-fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, writes: []const KVPair) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try appendU32Big(&out, alloc, @intCast(writes.len));
-    for (writes) |write| {
-        try appendU32Big(&out, alloc, @intCast(write.key.len));
-        try out.appendSlice(alloc, write.key);
-    }
-    return try out.toOwnedSlice(alloc);
+fn encodeGraphAssetStateKeysAlloc(alloc: Allocator, generation: u64, writes: []const KVPair) ![]u8 {
+    return try graph_asset_state.encodeAlloc(alloc, generation, writes);
 }
 
-fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8) !?[][]const u8 {
+fn appendRuntimeGraphAssetStateSegmentDeletes(
+    runtime: *EnrichmentRuntime,
+    state_key: []const u8,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
+        error.NotFound => return,
+        else => return err,
+    };
+    defer runtime.alloc.free(raw);
+    if (try graph_asset_state.format(raw) != .v5) return;
+    const root = try graph_asset_state.segmentedRoot(raw);
+    for (0..root.segment_count) |segment_index| {
+        const key = try internal_keys.graphAssetStateSegmentKeyAlloc(runtime.alloc, state_key, @intCast(segment_index));
+        if (runtimeContainsConstKey(deletes.items, key)) {
+            runtime.alloc.free(key);
+        } else {
+            try deletes.append(runtime.alloc, key);
+        }
+    }
+}
+
+fn loadGraphAssetStateKeysAlloc(runtime: *EnrichmentRuntime, state_key: []const u8, expected_generation: u64) !?[][]u8 {
     const alloc = runtime.alloc;
     const raw = storeGetAlloc(runtime, state_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return null,
     };
     defer alloc.free(raw);
-    var pos: usize = 0;
-    const count = readU32Big(raw, &pos) catch return null;
-    const keys = try alloc.alloc([]const u8, count);
-    var initialized: usize = 0;
-    errdefer {
-        for (keys[0..initialized]) |key| alloc.free(@constCast(key));
-        alloc.free(keys);
-    }
-    for (keys) |*key| {
-        const len = readU32Big(raw, &pos) catch return error.InvalidGraphAssetState;
-        if (len > raw.len - pos) return error.InvalidGraphAssetState;
-        key.* = try alloc.dupe(u8, raw[pos..][0..len]);
-        pos += len;
-        initialized += 1;
-    }
-    return keys;
+    if (try graph_asset_state.coverageGeneration(raw) != expected_generation) return null;
+    return switch (try graph_asset_state.format(raw)) {
+        .v4 => try graph_asset_state.decodeKeysAlloc(alloc, raw),
+        .v5 => blk: {
+            const root = try graph_asset_state.segmentedRoot(raw);
+            const root_key_count: usize = root.key_count;
+            var all = std.ArrayListUnmanaged([]u8).empty;
+            var encoded_bytes: usize = 0;
+            errdefer {
+                for (all.items) |key| alloc.free(key);
+                all.deinit(alloc);
+            }
+            for (0..root.segment_count) |segment_index| {
+                const segment_key = try internal_keys.graphAssetStateSegmentKeyAlloc(alloc, state_key, @intCast(segment_index));
+                defer alloc.free(segment_key);
+                const segment_raw = storeGetAlloc(runtime, segment_key) catch return error.InvalidGraphAssetState;
+                defer alloc.free(segment_raw);
+                encoded_bytes = std.math.add(usize, encoded_bytes, segment_raw.len) catch return error.ResourceLimitExceeded;
+                if (encoded_bytes > graph_asset_state.hard_max_manifest_bytes) return error.ResourceLimitExceeded;
+                const segment_keys = try graph_asset_state.decodeSegmentKeysAlloc(alloc, segment_raw, expected_generation);
+                defer if (segment_keys.len > 0) alloc.free(segment_keys);
+                if (all.items.len > root_key_count or segment_keys.len > root_key_count - all.items.len) {
+                    return error.InvalidGraphAssetState;
+                }
+                try all.appendSlice(alloc, segment_keys);
+            }
+            if (all.items.len != root.key_count) return error.InvalidGraphAssetState;
+            break :blk try all.toOwnedSlice(alloc);
+        },
+    };
 }
 
 fn readU32Big(bytes: []const u8, pos: *usize) !u32 {
@@ -11482,6 +12094,7 @@ fn writeChunkEmbeddingArtifacts(
     runtime: *EnrichmentRuntime,
     parent_doc_key: []const u8,
     source_field: []const u8,
+    producer_json: []const u8,
     artifact_name: []const u8,
     embeddings: []derived_types.DerivedDenseEmbeddingWrite,
 ) !void {
@@ -11495,7 +12108,7 @@ fn writeChunkEmbeddingArtifacts(
             .artifact_name = artifact_name,
             .source_field = source_field,
             .source_key = embedding.doc_key,
-            .source_hash = try chunkArtifactSourceHash(runtime, embedding.doc_key, source_field),
+            .source_hash = try chunkArtifactSourceHash(runtime, embedding.doc_key, source_field, producer_json),
             .vector = embedding.vector,
         });
         embedding.artifact_key = artifact_key;
@@ -11574,7 +12187,7 @@ fn deleteStaleChunkArtifacts(
     return try stale_vector_keys.toOwnedSlice(runtime.alloc);
 }
 
-fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8) !?u64 {
+fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, source_field: []const u8, producer_json: []const u8) !?u64 {
     const raw = storeGetAlloc(runtime, chunk_key) catch |err| switch (err) {
         std.mem.Allocator.Error.OutOfMemory => return err,
         else => return null,
@@ -11586,7 +12199,7 @@ fn chunkArtifactSourceHash(runtime: *EnrichmentRuntime, chunk_key: []const u8, s
     if (parsed.value != .object) return null;
     const source = parsed.value.object.get(source_field) orelse return null;
     if (source != .string) return null;
-    return enrichment_artifact_codec.hashSource(source.string);
+    return enrichment_artifact_codec.hashEmbeddingSource(source.string, producer_json);
 }
 
 fn chunkPayloadHasText(alloc: Allocator, payload: []const u8, source_field: []const u8) !bool {
@@ -12750,14 +13363,14 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     runtime.consecutive_retry_count = 6;
     runtime.retry_failure_fingerprint = 91;
     runtime.retry_failure_count = 4;
-    try noteTerminalRequestFailure(&runtime, 7, &.{}, 92);
+    try noteTerminalRequestFailure(&runtime, 7, &.{}, "", 92);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u32, 0), persisted.consecutive_retry_count);
     try std.testing.expectEqual(@as(u64, 91), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 4), persisted.retry_failure_count);
 
     // Parking the request which owns the budget retires that debt.
-    try noteTerminalRequestFailure(&runtime, 8, &.{}, 91);
+    try noteTerminalRequestFailure(&runtime, 8, &.{}, "", 91);
     persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
     try std.testing.expectEqual(@as(u64, 0), persisted.retry_failure_fingerprint);
     try std.testing.expectEqual(@as(u32, 0), persisted.retry_failure_count);

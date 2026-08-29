@@ -3441,7 +3441,7 @@ paths:
         '409':
           $ref: '#/components/responses/HierarchyCursorStale'
         '422':
-          $ref: '#/components/responses/UnsupportedExactSort'
+          $ref: '#/components/responses/UnsupportedQuery'
         '503':
           $ref: '#/components/responses/QueryTemporarilyUnavailable'
         '500':
@@ -3844,13 +3844,15 @@ paths:
               schema:
                 $ref: '#/components/schemas/Table'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          $ref: '#/components/responses/IndexMutationBadRequest'
         '422':
           description: Durable destinations cannot be bound to this credential type
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/IndexMutationServiceUnavailable'
       security:
         - BasicAuth: []
         - ApiKeyAuth: []
@@ -3924,7 +3926,7 @@ paths:
         '409':
           $ref: '#/components/responses/HierarchyCursorStale'
         '422':
-          $ref: '#/components/responses/UnsupportedExactSort'
+          $ref: '#/components/responses/UnsupportedQuery'
         '404':
           $ref: '#/components/responses/NotFound'
         '503':
@@ -4198,7 +4200,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/IndexMutationServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -5369,7 +5371,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/CreatedIndex'
         '400':
-          $ref: '#/components/responses/BadRequest'
+          $ref: '#/components/responses/IndexMutationBadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '405':
@@ -5385,7 +5387,7 @@ paths:
         '429':
           $ref: '#/components/responses/StorageResourceExhausted'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/IndexMutationServiceUnavailable'
         '500':
           $ref: '#/components/responses/InternalServerError'
       security:
@@ -7918,6 +7920,48 @@ components:
           description: Suggested minimum retry delay in milliseconds.
       required:
         - error
+    UnsupportedIndexCapabilityError:
+      type: object
+      additionalProperties: false
+      description: The requested index depends on a capability unavailable in the current deployment.
+      required:
+        - error
+        - message
+        - retryable
+      properties:
+        error:
+          type: string
+          enum:
+            - unsupported_index_capability
+        message:
+          type: string
+          enum:
+            - artifact-backed index sources are not supported by this deployment
+        retryable:
+          type: boolean
+          enum:
+            - false
+    IndexMutationServiceUnavailableError:
+      type: object
+      additionalProperties: false
+      description: A retryable index mutation failure, including a distributed artifact-source protocol
+        fence or a temporarily unavailable model probe.
+      required:
+        - error
+        - message
+        - retryable
+      properties:
+        error:
+          type: string
+          enum:
+            - index_capability_upgrade_pending
+            - index_probe_unavailable
+        message:
+          type: string
+        retryable:
+          type: boolean
+          enum:
+            - true
     MetadataCapabilityUnavailableError:
       type: object
       additionalProperties: false
@@ -8232,6 +8276,119 @@ components:
           enum:
             - false
           description: Retrying the same cursor cannot succeed; restart traversal instead.
+    UnsupportedHierarchyGroupingError:
+      type: object
+      additionalProperties: false
+      description: A requested hierarchy grouping level cannot represent every member because at least
+        one selected source lacks durable document-unit identity.
+      required:
+        - status
+        - error
+        - message
+        - reason
+        - field
+        - action
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - unsupported_hierarchy_grouping
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable remediation using only public query fields.
+        reason:
+          type: string
+          enum:
+            - unit_identity_unavailable
+          description: Stable reason the requested hierarchy level is unavailable.
+        field:
+          type: string
+          enum:
+            - hierarchy.group_by.level
+          description: Public request field that selected the unsupported grouping level.
+        action:
+          type: string
+          enum:
+            - use_source_grouping_or_direct_members
+          description: Select source grouping, omit group_by for direct members, or use an index whose
+            every source is unit-backed.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Retrying the same request cannot succeed without changing its hierarchy grouping.
+    UnsupportedQueryError:
+      type: object
+      additionalProperties: false
+      description: A query requests an unsupported feature without a more specific structured diagnostic.
+      required:
+        - status
+        - error
+        - message
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 422
+        error:
+          type: string
+          enum:
+            - unsupported_query_request
+          description: Stable machine-readable error code.
+        message:
+          type: string
+          description: Human-readable error summary.
+        retryable:
+          type: boolean
+          enum:
+            - false
+          description: Retrying the same request cannot succeed without changing it.
+    QueryFilterError:
+      type: object
+      additionalProperties: false
+      description: A public filter or exclusion query contains an invalid or unsupported node.
+      required:
+        - status
+        - error
+        - message
+        - field
+        - offending_node
+        - retryable
+      properties:
+        status:
+          type: integer
+          format: int32
+          enum:
+            - 400
+            - 422
+        error:
+          type: string
+          enum:
+            - invalid_query_request
+            - unsupported_query_request
+        message:
+          type: string
+        field:
+          type: string
+          enum:
+            - filter_query
+            - exclusion_query
+        offending_node:
+          type: string
+          description: Stable name of the first invalid or unsupported filter node.
+        retryable:
+          type: boolean
+          enum:
+            - false
     ExactSortError:
       type: object
       additionalProperties: false
@@ -8341,6 +8498,29 @@ components:
         - degraded
         - error
       description: Overall health status of the cluster
+    IndexRuntimeCapabilities:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact_sources
+        - artifact_sources_state
+      description: Deployment-level index capabilities clients can inspect before submitting index mutations.
+      properties:
+        artifact_sources:
+          type: boolean
+          description: Whether full-text, embedding, and graph indexes may currently consume generated
+            artifact streams through either single-source or multi-source request forms. Equivalent to
+            artifact_sources_state=available.
+        artifact_sources_state:
+          $ref: '#/components/schemas/ArtifactSourcesCapabilityState'
+    ArtifactSourcesCapabilityState:
+      type: string
+      enum:
+        - available
+        - upgrade_pending
+        - unsupported
+      description: Whether artifact-backed index mutations are accepted now, temporarily fenced during
+        a distributed rolling upgrade, or permanently unsupported by this deployment.
     ClusterStatus:
       type: object
       required:
@@ -8364,6 +8544,8 @@ components:
             - standalone
             - serverless
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: '#/components/schemas/IndexRuntimeCapabilities'
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
         runtime_config:
@@ -8394,6 +8576,8 @@ components:
             - standalone
             - serverless
           description: Runtime deployment topology
+        index_capabilities:
+          $ref: '#/components/schemas/IndexRuntimeCapabilities'
         secret_store:
           $ref: '#/components/schemas/SecretStoreStatus'
         runtime_config:
@@ -9031,6 +9215,7 @@ components:
         - corrupt_artifact
         - unreadable_artifact
         - enrichment_failed
+        - resource_limit_exceeded
     RepairTarget:
       type: string
       description: Repair subsystem to inspect or run.
@@ -9068,6 +9253,11 @@ components:
         unit_id:
           type: string
           description: Unit identifier for unit-scoped artifacts, when applicable.
+        index_source_artifact_name:
+          type: string
+          description: Canonical artifact stream configured on the affected index. This is the authoritative
+            source-readiness identity and is distinct from the producer input and the derived artifact
+            being repaired.
         source_artifact_name:
           type: string
           description: Source artifact stream used to produce this artifact, when applicable.
@@ -10306,7 +10496,7 @@ components:
           type: object
           additionalProperties:
             x-go-type-skip-optional-pointer: false
-            $ref: '#/components/schemas/IndexConfig'
+            $ref: '#/components/schemas/CreatedIndex'
         shards:
           type: object
           additionalProperties:
@@ -10751,7 +10941,7 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/IndexStats'
         config:
-          $ref: '#/components/schemas/IndexConfig'
+          $ref: '#/components/schemas/CreatedIndex'
         status:
           $ref: '#/components/schemas/IndexStats'
     LsmStorageStatus:
@@ -13726,7 +13916,9 @@ components:
 
         matches are returned. `ancestors` only controls projected context and never changes result
 
-        cardinality. Omit `hierarchy` entirely to retain the legacy default result shape.
+        cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit
+
+        source-grouped result shape.
       allOf:
         - not:
             description: Relevance grouping and sequential child traversal are separate operations.
@@ -13876,6 +14068,8 @@ components:
                   - required:
                       - full_text_search
                   - required:
+                      - full_text_index
+                  - required:
                       - filter_query
                   - required:
                       - exclusion_query
@@ -13986,6 +14180,32 @@ components:
           example:
             query: +body:computer +category:technology
             boost: 1.0
+        full_text_index:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          maxLength: 256
+          x-antfly-runtime-validation: Requires full_text_search or at least one scoring text clause after
+            normalizing the query AST; filter-only and exclusion-only query trees receive HTTP 422.
+          description: >
+            Full-text index used by `full_text_search` and by scoring text clauses in `query`.
+
+            Use this to query a named document- or artifact-backed full-text index. The selected
+
+            index must exist and have type `full_text`. Omit this field to use the table's active
+
+            schema full-text index, preserving v0.2 behavior. Structured document filters continue
+
+            to use the active schema index even when retrieval uses a named artifact index. This
+
+            selector is invalid without `full_text_search` or a scoring text clause in `query` and
+
+            receives HTTP 422. This semantic relationship is enforced after the recursive query AST
+
+            is normalized; OpenAPI presence checks cannot accurately distinguish scoring clauses
+
+            from filter-only or exclusion-only trees.
+          example: document_text
         semantic_search:
           type: string
           x-antfly-max-utf8-bytes: 1048576
@@ -14049,9 +14269,23 @@ components:
           items:
             type: string
           description: >
-            List of vector index names to use for semantic search. Required when using semantic_search.
+            Embedding index names selected for `semantic_search` or explicit `embeddings`.
 
-            Multiple indexes can be specified, and their results will be merged using RRF.
+            Dense and sparse indexes are supported when the corresponding query representation is
+
+            supplied. Provisioned deployments require at least one index for `semantic_search`;
+
+            serverless may infer its single published dense index when this field is omitted. When
+
+            `embeddings` is supplied without this field, the embedding map keys select the indexes.
+
+            Provisioned results from multiple indexes are merged using RRF. Serverless currently
+
+            executes at most one dense and one sparse index per request; it rejects multiple
+
+            same-kind selectors and omitted selectors when more than one corresponding index is
+
+            published rather than choosing an index by catalog order.
           example:
             - title_body_nomic
             - description_embedding
@@ -15436,6 +15670,9 @@ components:
           description: Unit identifier when the hit is attached to a document unit.
         artifact:
           $ref: '#/components/schemas/HierarchyArtifact'
+        matched_artifact:
+          $ref: '#/components/schemas/HierarchyArtifact'
+          description: Artifact member that supplied the score for a source-level grouped hit.
         ancestors:
           $ref: '#/components/schemas/QueryHitHierarchyAncestors'
         evidence:
@@ -15454,7 +15691,7 @@ components:
         chunks:
           type: array
           deprecated: true
-          description: Legacy child chunk hits included for source-level rollups.
+          description: Deprecated child chunk hits included by the v0.2-compatible implicit source rollup.
           items:
             $ref: '#/components/schemas/HierarchyMatchHit'
     QueryHit:
@@ -15506,11 +15743,14 @@ components:
 
             group includes nested matches. Standard fields include `level`,
 
-            `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and
+            `parent_doc_key`, optional `parent_unit_id`, `artifact` or `matched_artifact`, `matches`,
+            and
 
             `ancestors` with response-local or requested DB-backed source/unit context when available.
 
-            Legacy rollup requests continue to use `chunks` instead of `matches`.
+            V0.2-compatible implicit rollup requests continue to use the deprecated
+
+            `chunks` field instead of `matches`.
         _sort:
           type: array
           items: {}
@@ -16707,6 +16947,14 @@ components:
           type: integer
           minimum: 0
           description: Expected embedding dimension for embedding enrichments.
+        vector_space:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          minLength: 1
+          description: Optional stable model/token-space identifier for embedding artifacts. When omitted
+            on every source, Antfly requires the effective producers to be semantically equivalent. To
+            combine intentionally compatible but distinct producers, set the same identifier on every
+            source. Explicit and implicit modes cannot be mixed; dimensions are always validated independently.
         chunk_size:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -16735,34 +16983,49 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           writeOnly: true
-          description: Write-only serialized asset producer configuration. It may contain provider credentials
-            and is never returned.
+          description: Write-only serialized producer configuration. For managed embedding enrichments
+            Antfly stores a canonical semantic producer identity here; credentials and execution policy
+            are excluded.
         execution:
           $ref: '#/components/schemas/ExecutionPolicy'
           description: Non-semantic execution policy for this enrichment producer. This does not participate
             in generated artifact identity.
-    CreateIndexCommon:
+    FullTextArtifactIndexSource:
       type: object
-      description: Fields shared by every create-index variant. The index name is owned by the request
-        path.
+      additionalProperties: false
+      required:
+        - artifact
+      description: Textual artifact stream consumed by a full-text index, with an optional source-local
+        projection.
       properties:
-        description:
+        artifact:
           type: string
-          description: Optional description of the index and its purpose
-        version:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          default: 0
-          description: Version of the index implementation. Defaults to 0.
-        enrichments:
-          type: array
-          items:
-            $ref: '#/components/schemas/EnrichmentConfig'
-          x-go-type-skip-optional-pointer: true
-          description: Inline managed enrichment definitions required by this index.
+          minLength: 1
+          description: Stable name of a chunk or textual asset artifact stream. Artifact names must be
+            unique within the index.
+        field:
+          type: string
+          minLength: 1
+          description: Optional field selected from this artifact's records. When omitted, the index-level
+            field is inherited; when both are omitted, Antfly indexes the default text projection.
     FullTextIndexConfig:
       type: object
+      x-antfly-mutually-exclusive:
+        - - sources
+          - artifact_name
       properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/FullTextArtifactIndexSource'
+          x-go-type-skip-optional-pointer: true
+          description: Chunk or textual asset streams indexed together; every artifact record is an independent
+            full-text member. A source-local field overrides the shared index-level field for that stream.
+            Artifact names must be unique. Requires index_capabilities.artifact_sources=true and is rejected
+            by serverless deployments.
         mem_only:
           x-go-type-skip-optional-pointer: true
           type: boolean
@@ -16770,25 +17033,18 @@ components:
         field:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Document field indexed as text. Omit for the table's default full-document text
-            index.
+          minLength: 1
+          description: Content field indexed as text. With an artifact source, this selects the field
+            within each artifact record; without one, it selects a document field. String values and arrays
+            of strings are indexed; missing, null, and non-text values produce no posting. Omit to index
+            the default text projection.
         artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Generated artifact stream indexed as text. Use with matching inline enrichments.
-    CreateFullTextIndexRequest:
-      description: Create a full-text index.
-      allOf:
-        - $ref: '#/components/schemas/CreateIndexCommon'
-        - $ref: '#/components/schemas/FullTextIndexConfig'
-        - type: object
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              enum:
-                - full_text
+          minLength: 1
+          description: Single-source convenience form. Mutually exclusive with sources; normalized responses
+            use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
     IndexPublicationPolicy:
       type: string
       enum:
@@ -16806,6 +17062,18 @@ components:
         - best_effort
       default: strict
       description: How generation-scoped source outcomes determine derived-index completeness.
+    ArtifactIndexSource:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      description: Named generated artifact stream consumed by an index. Producer inputs belong on the
+        matching enrichment.
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+          description: Stable name of a generated artifact stream.
     DistanceMetric:
       x-go-type-skip-optional-pointer: true
       type: string
@@ -18057,6 +18325,22 @@ components:
         vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index
         (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be
         auto-detected.
+      x-antfly-mutually-exclusive:
+        - - sources
+          - external
+        - - sources
+          - field
+        - - sources
+          - template
+        - - sources
+          - chunker
+        - - sources
+          - embedding_name
+        - - sources
+          - source_artifact_name
+      x-antfly-dependent-required:
+        source_artifact_name:
+          - embedding_name
       properties:
         publication_policy:
           $ref: '#/components/schemas/IndexPublicationPolicy'
@@ -18089,17 +18373,36 @@ components:
           x-go-type-skip-optional-pointer: true
           type: string
           description: Field to extract embeddings from (managed indexes only; not allowed when external=true)
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ArtifactIndexSource'
+          x-go-type-skip-optional-pointer: true
+          description: Embedding artifact streams indexed together. Each artifact record is an independent
+            vector member identified by (artifact name, source key). All sources must use the same dense
+            vector space or sparse token space. Not allowed with external, field, template, chunker, embedding_name,
+            or source_artifact_name. Requires index_capabilities.artifact_sources=true and is rejected
+            by serverless deployments.
         embedding_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Generated embedding artifact name consumed by this vector index. Use with a matching
-            embedding enrichment for artifact-backed managed embeddings.
+          minLength: 1
+          description: Released v0.2 single-source alternative request form. Mutually exclusive with sources.
+            Required when source_artifact_name is set. Responses also expose canonical sources while preserving
+            these fields. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
         source_artifact_name:
           x-go-type-skip-optional-pointer: true
           type: string
-          description: Artifact stream consumed by the embedding enrichment backing this vector index.
-            This is descriptive public configuration; the matching enrichment defines the materialized
-            source.
+          minLength: 1
+          deprecated: true
+          x-deprecated-reason: Set source_artifact_name only on the matching embedding enrichment.
+          description: Deprecated v0.2 descriptive field. When supplied for compatibility, embedding_name
+            is required and this value must exactly match the source_artifact_name on the authoritative
+            embedding enrichment. New clients should declare the relationship only on that enrichment.
         template:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -18145,19 +18448,82 @@ components:
         execution:
           $ref: '#/components/schemas/IndexExecutionConfig'
           description: Non-semantic execution policy for shorthand-created chunking or embedding producers.
-    CreateEmbeddingsIndexRequest:
-      description: Create a dense or sparse embeddings index.
-      allOf:
-        - $ref: '#/components/schemas/CreateIndexCommon'
-        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
-        - type: object
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              enum:
-                - embeddings
+    GraphTemplateValue:
+      description: A literal string or finite numeric value, or a Handlebars template evaluated for each
+        materialized graph item.
+      anyOf:
+        - type: string
+        - type: number
+          format: double
+    GraphArtifactNodeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: Maps each artifact item to graph node identifiers.
+      properties:
+        model:
+          type: string
+          enum:
+            - document
+            - external
+          default: document
+        target:
+          $ref: '#/components/schemas/GraphTemplateValue'
+    GraphArtifactEdgeMappingConfig:
+      type: object
+      additionalProperties: false
+      description: Maps each artifact item to an edge type, weight, and public metadata.
+      properties:
+        type:
+          $ref: '#/components/schemas/GraphTemplateValue'
+        weight:
+          $ref: '#/components/schemas/GraphTemplateValue'
+        metadata:
+          type: object
+          additionalProperties: true
+          description: JSON metadata template copied onto each materialized edge. Sensitive keys are omitted
+            from create responses.
+    GraphArtifactContextConfig:
+      type: object
+      additionalProperties: false
+      description: Document fields made available to graph mapping templates through `_doc.value`.
+      properties:
+        doc_fields:
+          type: array
+          items:
+            type: string
+            minLength: 1
+    GraphArtifactSourceConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      description: Artifact stream materialized into graph edges. Each source artifact is limited to 16
+        MiB and 1,000,000 relation items so live apply, repair, split, and restore share one bounded admission
+        contract. Artifact-backed graph sources require index_capabilities.artifact_sources=true and are
+        rejected by serverless deployments.
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+        path:
+          type: string
+          pattern: ^(\$|\$\.[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*(\[\*\])?)?$
+          description: Optional root path selecting the graph payload. Supports `$`, dot-separated ASCII
+            field names such as `$.relations`, and an optional terminal `[*]` such as `$.relations[*]`.
+        format:
+          type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
+          default: extraction_relation
+        mention_edge_type:
+          type: string
+        nodes:
+          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
+        edge:
+          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
+        context:
+          $ref: '#/components/schemas/GraphArtifactContextConfig'
     EdgeTypeConfig:
       type: object
       description: Configuration for a specific edge type
@@ -18211,31 +18577,6 @@ components:
             type: string
       required:
         - name
-    GraphArtifactSourceConfig:
-      type: object
-      additionalProperties: false
-      required:
-        - kind
-        - artifact
-      description: Artifact stream materialized into graph edges.
-      properties:
-        kind:
-          type: string
-          enum:
-            - artifact
-        artifact:
-          type: string
-          minLength: 1
-        path:
-          type: string
-        format:
-          type: string
-          enum:
-            - extraction_relation
-            - extraction_graph
-          default: extraction_relation
-        mention_edge_type:
-          type: string
     GraphArtifactProducerSourceConfig:
       type: object
       additionalProperties: false
@@ -18280,52 +18621,6 @@ components:
           additionalProperties: true
           writeOnly: true
           description: Write-only producer configuration; it may contain credentials and is never returned.
-    GraphTemplateValue:
-      description: A literal numeric value or a Handlebars template evaluated for each materialized graph
-        item.
-      anyOf:
-        - type: string
-        - type: number
-          format: double
-    GraphArtifactNodeMappingConfig:
-      type: object
-      additionalProperties: false
-      description: Maps each artifact item to graph node identifiers.
-      properties:
-        model:
-          type: string
-          enum:
-            - document
-            - external
-          default: document
-        source:
-          $ref: '#/components/schemas/GraphTemplateValue'
-        target:
-          $ref: '#/components/schemas/GraphTemplateValue'
-    GraphArtifactEdgeMappingConfig:
-      type: object
-      additionalProperties: false
-      description: Maps each artifact item to an edge type, weight, and public metadata.
-      properties:
-        type:
-          $ref: '#/components/schemas/GraphTemplateValue'
-        weight:
-          $ref: '#/components/schemas/GraphTemplateValue'
-        metadata:
-          type: object
-          additionalProperties: true
-          description: JSON metadata template copied onto each materialized edge. Sensitive keys are omitted
-            from create responses.
-    GraphArtifactContextConfig:
-      type: object
-      additionalProperties: false
-      description: Document fields made available to graph mapping templates through `_doc.value`.
-      properties:
-        doc_fields:
-          type: array
-          items:
-            type: string
-            minLength: 1
     GraphBoundedTraversalConfig:
       type: object
       additionalProperties: false
@@ -18424,7 +18719,22 @@ components:
     GraphIndexConfig:
       type: object
       description: Configuration for graph index type
+      x-antfly-mutually-exclusive:
+        - - sources
+          - source
       properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/GraphArtifactSourceConfig'
+          x-go-type-skip-optional-pointer: true
+          description: Ordered chunk or JSON asset streams whose edge-like values are unioned into this
+            graph index. Artifact names must be unique within the array because the artifact name is the
+            source identity. Earlier sources win when multiple sources materialize the same edge identity.
+            Requires index_capabilities.artifact_sources=true and is rejected by serverless deployments.
         summarizer:
           description: Configuration for generating node summaries (enables tree navigation in Retrieval
             Agent)
@@ -18450,23 +18760,133 @@ components:
         max_edges_per_document:
           x-go-type-skip-optional-pointer: true
           type: integer
-          description: Maximum number of edges per document (0 = unlimited)
+          minimum: 0
+          maximum: 1000000
+          description: Maximum number of distinct visible edges materialized per document after source
+            precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000).
+            Independent aggregate reconciliation budgets bound work across overlapping source manifests.
         source:
+          description: Single-source convenience form. Mutually exclusive with sources; normalized responses
+            use sources. Requires index_capabilities.artifact_sources=true and is rejected by serverless
+            deployments.
           $ref: '#/components/schemas/GraphArtifactSourceConfig'
         artifact:
           $ref: '#/components/schemas/GraphArtifactProducerConfig'
-        nodes:
-          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
-        edge:
-          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
-        context:
-          $ref: '#/components/schemas/GraphArtifactContextConfig'
+          description: Single asset-producer shorthand. It must be paired with exactly one source selecting
+            the same artifact name.
         algebraic_planning:
           $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
         resolvers:
           type: array
           items:
             $ref: '#/components/schemas/GraphResolverConfig'
+    AlgebraicIndexConfig:
+      type: object
+      description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema
+        derivation, while materializations remain engine-owned.
+      properties:
+        derive_from_schema:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          description: When true, derive the algebraic capability sidecar from the table schema. Internal
+            fields and materialization definitions are not public API.
+    IndexType:
+      type: string
+      enum:
+        - full_text
+        - embeddings
+        - graph
+        - algebraic
+      description: The type of the index.
+    IndexConfig:
+      type: object
+      description: Configuration for an index
+      oneOf:
+        - $ref: '#/components/schemas/FullTextIndexConfig'
+        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
+        - $ref: '#/components/schemas/GraphIndexConfig'
+        - $ref: '#/components/schemas/AlgebraicIndexConfig'
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          description: Name of the index
+        description:
+          type: string
+          description: Optional description of the index and its purpose
+        type:
+          $ref: '#/components/schemas/IndexType'
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: Version of the index implementation. Defaults to 0.
+        enrichments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnrichmentConfig'
+          x-go-type-skip-optional-pointer: true
+          description: Inline managed enrichment definitions required by this index. Enrichments are table-level
+            generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact
+            stream.
+          example:
+            - name: document_chunks_v1
+              kind: chunk
+              field: text
+              source_artifact_name: document_units_v1
+              chunk_size: 512
+            - name: document_chunk_dense_v1
+              kind: embedding
+              field: text
+              source_artifact_name: document_chunks_v1
+              expected_dims: 768
+    CreateIndexCommon:
+      type: object
+      description: Fields shared by every create-index variant. The index name is owned by the request
+        path.
+      properties:
+        description:
+          type: string
+          description: Optional description of the index and its purpose
+        version:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          default: 0
+          description: Version of the index implementation. Defaults to 0.
+        enrichments:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnrichmentConfig'
+          x-go-type-skip-optional-pointer: true
+          description: Inline managed enrichment definitions required by this index.
+    CreateFullTextIndexRequest:
+      description: Create a full-text index.
+      allOf:
+        - $ref: '#/components/schemas/CreateIndexCommon'
+        - $ref: '#/components/schemas/FullTextIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - full_text
+    CreateEmbeddingsIndexRequest:
+      description: Create a dense or sparse embeddings index.
+      allOf:
+        - $ref: '#/components/schemas/CreateIndexCommon'
+        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - embeddings
     CreateGraphIndexRequest:
       description: Create a graph index.
       allOf:
@@ -18480,16 +18900,6 @@ components:
               type: string
               enum:
                 - graph
-    AlgebraicIndexConfig:
-      type: object
-      description: Schema-derived algebraic sidecar configuration. Public requests may opt into schema
-        derivation, while materializations remain engine-owned.
-      properties:
-        derive_from_schema:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          description: When true, derive the algebraic capability sidecar from the table schema. Internal
-            fields and materialization definitions are not public API.
     CreateAlgebraicIndexRequest:
       description: Create a schema-derived algebraic index.
       allOf:
@@ -18505,6 +18915,11 @@ components:
                 - algebraic
     CreateIndexRequest:
       description: Type-safe configuration for a new index. The index name is owned by the request path.
+      x-antfly-sdk-alternative:
+        description: SDK builders also accept the named IndexConfig form and convert it to this path-identified
+          request. This is an alternative construction API, not a deprecated wire request.
+        schema:
+          $ref: '#/components/schemas/IndexConfig'
       oneOf:
         - $ref: '#/components/schemas/CreateFullTextIndexRequest'
         - $ref: '#/components/schemas/CreateEmbeddingsIndexRequest'
@@ -18803,34 +19218,59 @@ components:
             that don't have explicit mappings and dynamic mapping is enabled, templates are
 
             evaluated in order to determine how those fields should be indexed.
-    IndexType:
-      type: string
-      enum:
-        - full_text
-        - embeddings
-        - graph
-        - algebraic
-      description: The type of the index.
-    IndexConfig:
+    CreatedEnrichmentConfig:
       type: object
-      description: Configuration for an index
-      oneOf:
-        - $ref: '#/components/schemas/FullTextIndexConfig'
-        - $ref: '#/components/schemas/EmbeddingsIndexConfig'
-        - $ref: '#/components/schemas/GraphIndexConfig'
-        - $ref: '#/components/schemas/AlgebraicIndexConfig'
+      additionalProperties: false
       required:
         - name
-        - type
+        - kind
+      description: Credential-free normalized enrichment configuration returned after index creation.
       properties:
         name:
           type: string
-          description: Name of the index
+        kind:
+          $ref: '#/components/schemas/EnrichmentKind'
+        field:
+          type: string
+        template:
+          type: string
+        source_artifact_name:
+          type: string
+        expected_dims:
+          type: integer
+          minimum: 0
+        vector_space:
+          type: string
+          minLength: 1
+          description: Optional stable model/token-space identifier asserted for this embedding artifact.
+        chunk_size:
+          type: integer
+          minimum: 0
+        chunk_overlap:
+          type: integer
+          minimum: 0
+        chunker_json:
+          type: string
+        full_text_index:
+          type: boolean
+          default: false
+        content_type:
+          type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
+    CreatedIndexCommon:
+      type: object
+      description: Fields returned for every newly created index. Provider credentials are write-only
+        and are never returned.
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Name of the created index
         description:
           type: string
           description: Optional description of the index and its purpose
-        type:
-          $ref: '#/components/schemas/IndexType'
         version:
           x-go-type-skip-optional-pointer: true
           type: integer
@@ -18839,22 +19279,305 @@ components:
         enrichments:
           type: array
           items:
-            $ref: '#/components/schemas/EnrichmentConfig'
+            $ref: '#/components/schemas/CreatedEnrichmentConfig'
           x-go-type-skip-optional-pointer: true
-          description: Inline managed enrichment definitions required by this index. Enrichments are table-level
-            generated artifacts such as chunks, asset-derived document units, or embeddings over an artifact
-            stream.
-          example:
-            - name: document_chunks_v1
-              kind: chunk
-              field: text
-              source_artifact_name: document_units_v1
-              chunk_size: 512
-            - name: document_chunk_dense_v1
-              kind: embedding
-              field: text
-              source_artifact_name: document_chunks_v1
-              expected_dims: 768
+          description: Normalized inline managed enrichment definitions required by this index.
+    CreatedFullTextIndexConfig:
+      type: object
+      description: Canonical full-text configuration returned after creation. Single-source alternative
+        request forms are represented through sources.
+      properties:
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/FullTextArtifactIndexSource'
+        mem_only:
+          type: boolean
+        field:
+          type: string
+    CreatedFullTextIndex:
+      description: Normalized effective full-text index configuration returned after creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/CreatedFullTextIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - full_text
+    CreatedProviderConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - provider
+      description: Credential-free provider configuration returned after index creation. Only non-secret
+        provider settings are represented.
+      properties:
+        provider:
+          type: string
+          description: Configured provider discriminator.
+        model:
+          type: string
+          description: Configured provider model when applicable.
+        models:
+          type: array
+          items:
+            type: string
+        project_id:
+          type: string
+        location:
+          type: string
+        region:
+          type: string
+        url:
+          type: string
+          format: uri
+        api_url:
+          type: string
+          format: uri
+        dimension:
+          type: integer
+          minimum: 1
+        dimensions:
+          type: integer
+          minimum: 1
+        input_type:
+          type: string
+        truncate:
+          type: string
+        strip_new_lines:
+          type: boolean
+        batch_size:
+          type: integer
+          minimum: 1
+        temperature:
+          type: number
+          format: float
+        max_tokens:
+          type: integer
+          minimum: 1
+        top_p:
+          type: number
+          format: float
+        top_k:
+          type: integer
+        frequency_penalty:
+          type: number
+          format: float
+        presence_penalty:
+          type: number
+          format: float
+        timeout:
+          type: integer
+          minimum: 1
+    CreatedEmbeddingsIndexConfig:
+      type: object
+      description: Credential-free normalized embeddings configuration returned after creation. Single-source
+        v0.2 fields are preserved alongside canonical sources for read compatibility.
+      properties:
+        publication_policy:
+          $ref: '#/components/schemas/IndexPublicationPolicy'
+        coverage_policy:
+          $ref: '#/components/schemas/DerivedCoveragePolicy'
+        external:
+          type: boolean
+          default: false
+        sparse:
+          type: boolean
+          default: false
+        dimension:
+          type: integer
+          minimum: 1
+        field:
+          type: string
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ArtifactIndexSource'
+          description: Embedding artifact streams indexed together as independent vector members.
+        embedding_name:
+          type: string
+          readOnly: true
+          description: Released v0.2 single-source read field, preserved when that request form created
+            the index. Canonical source identity is also returned through sources.
+        source_artifact_name:
+          type: string
+          readOnly: true
+          deprecated: true
+          x-deprecated-reason: Use the matching embedding enrichment's source_artifact_name; it is authoritative.
+          description: Deprecated v0.2 descriptive source read field, preserved when supplied with embedding_name.
+            The matching enrichment is authoritative.
+        template:
+          type: string
+        distance_metric:
+          $ref: '#/components/schemas/DistanceMetric'
+        mem_only:
+          type: boolean
+        embedder:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        summarizer:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        chunker:
+          $ref: '#/components/schemas/ChunkerConfig'
+        top_k:
+          type: integer
+          minimum: 1
+          default: 10
+        min_weight:
+          type: number
+          format: float
+          default: 0.0
+        chunk_size:
+          type: integer
+          minimum: 64
+          default: 1024
+        execution:
+          $ref: '#/components/schemas/IndexExecutionConfig'
+    CreatedEmbeddingsIndex:
+      description: Normalized effective dense or sparse embeddings index configuration returned after
+        creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/CreatedEmbeddingsIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - embeddings
+    CreatedGraphArtifactSourceConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+      description: Canonical artifact stream materialized into graph edges.
+      properties:
+        artifact:
+          type: string
+          minLength: 1
+        path:
+          type: string
+        format:
+          type: string
+          enum:
+            - extraction_relation
+            - extraction_graph
+          default: extraction_relation
+        mention_edge_type:
+          type: string
+        nodes:
+          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
+        edge:
+          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
+        context:
+          $ref: '#/components/schemas/GraphArtifactContextConfig'
+    CreatedGraphArtifactProducerConfig:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - kind
+        - source
+      description: Credential-free graph artifact producer configuration returned after creation.
+      properties:
+        name:
+          type: string
+          minLength: 1
+        kind:
+          type: string
+          enum:
+            - asset
+        source:
+          $ref: '#/components/schemas/GraphArtifactProducerSourceConfig'
+        content_type:
+          type: string
+        execution:
+          $ref: '#/components/schemas/ExecutionPolicy'
+    CreatedGraphIndexConfig:
+      type: object
+      description: Credential-free normalized graph configuration returned after creation.
+      properties:
+        summarizer:
+          $ref: '#/components/schemas/CreatedProviderConfig'
+        template:
+          type: string
+        edge_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/EdgeTypeConfig'
+        max_edges_per_document:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+          description: Maximum number of distinct visible edges materialized per document after source
+            precedence and identity deduplication. Zero uses the server safety limit (currently 1,000,000).
+            Independent aggregate reconciliation budgets bound work across overlapping source manifests.
+        sources:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/CreatedGraphArtifactSourceConfig'
+        artifact:
+          $ref: '#/components/schemas/CreatedGraphArtifactProducerConfig'
+        algebraic_planning:
+          $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
+        resolvers:
+          type: array
+          items:
+            $ref: '#/components/schemas/GraphResolverConfig'
+    CreatedGraphIndex:
+      description: Normalized effective graph index configuration returned after creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/CreatedGraphIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - graph
+    CreatedAlgebraicIndex:
+      description: Normalized effective schema-derived algebraic index configuration returned after creation.
+      allOf:
+        - $ref: '#/components/schemas/CreatedIndexCommon'
+        - $ref: '#/components/schemas/AlgebraicIndexConfig'
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              enum:
+                - algebraic
+    CreatedIndex:
+      description: Discriminated normalized configuration returned after an index is created.
+      oneOf:
+        - $ref: '#/components/schemas/CreatedFullTextIndex'
+        - $ref: '#/components/schemas/CreatedEmbeddingsIndex'
+        - $ref: '#/components/schemas/CreatedGraphIndex'
+        - $ref: '#/components/schemas/CreatedAlgebraicIndex'
+      discriminator:
+        propertyName: type
+        mapping:
+          full_text: '#/components/schemas/CreatedFullTextIndex'
+          embeddings: '#/components/schemas/CreatedEmbeddingsIndex'
+          graph: '#/components/schemas/CreatedGraphIndex'
+          algebraic: '#/components/schemas/CreatedAlgebraicIndex'
     IndexReadinessState:
       type: string
       enum:
@@ -18865,6 +19588,59 @@ components:
       description: Lifecycle state for the desired index incarnation. A failed desired repair may coexist
         with queryable=true when a separately proven serving incarnation remains available; clients must
         use the explicit milestone booleans.
+    IndexReadinessReason:
+      type: string
+      enum:
+        - load_failure
+        - enrichment_failure
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - incarnation_pending
+        - source_publication
+        - repair
+        - backfill
+        - coverage
+        - replay
+        - publication
+      description: Stable machine-readable reason why an index is pending, partial, or failed.
+    IndexSourceReadinessReason:
+      type: string
+      enum:
+        - index_failed
+        - enrichment_failure
+        - repair
+        - runtime_unavailable
+        - shard_observation_incomplete
+        - source_observation_incomplete
+        - publication
+      description: Stable machine-readable reason why an artifact source is pending or failed.
+    IndexSourceReadinessStatus:
+      type: object
+      additionalProperties: false
+      required:
+        - artifact
+        - state
+        - complete
+        - pending_reasons
+      properties:
+        artifact:
+          type: string
+          description: Configured artifact stream identity.
+        state:
+          type: string
+          enum:
+            - pending
+            - ready
+            - failed
+        complete:
+          type: boolean
+          description: Whether this source is fully observed and published on every expected shard.
+        pending_reasons:
+          type: array
+          items:
+            $ref: '#/components/schemas/IndexSourceReadinessReason'
+          description: Stable, machine-readable blockers or failure reasons for this source. Empty when
+            state is ready.
     IndexReadinessStatus:
       type: object
       additionalProperties: false
@@ -18898,8 +19674,14 @@ components:
         pending_reasons:
           type: array
           items:
-            type: string
-          description: Stable, machine-readable blockers. Empty when state is ready.
+            $ref: '#/components/schemas/IndexReadinessReason'
+          description: Stable, machine-readable blockers or failure reasons. Empty when state is ready.
+        sources:
+          type: array
+          description: Operational readiness for each configured artifact stream. Present only for artifact-backed
+            indexes, in configuration order.
+          items:
+            $ref: '#/components/schemas/IndexSourceReadinessStatus'
     IndexRepairStatus:
       type: object
       description: Compact user-facing state for an automatic index repair. Detailed diagnostics are available
@@ -22548,299 +23330,6 @@ components:
           items:
             type: string
           description: IDs of retrieved documents (for retrieval metrics)
-    CreatedEnrichmentConfig:
-      type: object
-      additionalProperties: false
-      required:
-        - name
-        - kind
-      description: Credential-free normalized enrichment configuration returned after index creation.
-      properties:
-        name:
-          type: string
-        kind:
-          $ref: '#/components/schemas/EnrichmentKind'
-        field:
-          type: string
-        template:
-          type: string
-        source_artifact_name:
-          type: string
-        expected_dims:
-          type: integer
-          minimum: 0
-        chunk_size:
-          type: integer
-          minimum: 0
-        chunk_overlap:
-          type: integer
-          minimum: 0
-        chunker_json:
-          type: string
-        full_text_index:
-          type: boolean
-          default: false
-        content_type:
-          type: string
-        execution:
-          $ref: '#/components/schemas/ExecutionPolicy'
-    CreatedIndexCommon:
-      type: object
-      description: Fields returned for every newly created index. Provider credentials are write-only
-        and are never returned.
-      required:
-        - name
-      properties:
-        name:
-          type: string
-          description: Name of the created index
-        description:
-          type: string
-          description: Optional description of the index and its purpose
-        version:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          default: 0
-          description: Version of the index implementation. Defaults to 0.
-        enrichments:
-          type: array
-          items:
-            $ref: '#/components/schemas/CreatedEnrichmentConfig'
-          x-go-type-skip-optional-pointer: true
-          description: Normalized inline managed enrichment definitions required by this index.
-    CreatedFullTextIndex:
-      description: Normalized effective full-text index configuration returned after creation.
-      allOf:
-        - $ref: '#/components/schemas/CreatedIndexCommon'
-        - $ref: '#/components/schemas/FullTextIndexConfig'
-        - type: object
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              enum:
-                - full_text
-    CreatedProviderConfig:
-      type: object
-      additionalProperties: false
-      required:
-        - provider
-      description: Credential-free provider configuration returned after index creation. Only non-secret
-        provider settings are represented.
-      properties:
-        provider:
-          type: string
-          description: Configured provider discriminator.
-        model:
-          type: string
-          description: Configured provider model when applicable.
-        models:
-          type: array
-          items:
-            type: string
-        project_id:
-          type: string
-        location:
-          type: string
-        region:
-          type: string
-        url:
-          type: string
-          format: uri
-        api_url:
-          type: string
-          format: uri
-        dimension:
-          type: integer
-          minimum: 1
-        dimensions:
-          type: integer
-          minimum: 1
-        input_type:
-          type: string
-        truncate:
-          type: string
-        strip_new_lines:
-          type: boolean
-        batch_size:
-          type: integer
-          minimum: 1
-        temperature:
-          type: number
-          format: float
-        max_tokens:
-          type: integer
-          minimum: 1
-        top_p:
-          type: number
-          format: float
-        top_k:
-          type: integer
-        frequency_penalty:
-          type: number
-          format: float
-        presence_penalty:
-          type: number
-          format: float
-        timeout:
-          type: integer
-          minimum: 1
-    CreatedEmbeddingsIndexConfig:
-      type: object
-      description: Credential-free normalized embeddings configuration returned after creation.
-      properties:
-        publication_policy:
-          $ref: '#/components/schemas/IndexPublicationPolicy'
-        coverage_policy:
-          $ref: '#/components/schemas/DerivedCoveragePolicy'
-        external:
-          type: boolean
-          default: false
-        sparse:
-          type: boolean
-          default: false
-        dimension:
-          type: integer
-          minimum: 1
-        field:
-          type: string
-        embedding_name:
-          type: string
-        source_artifact_name:
-          type: string
-        template:
-          type: string
-        distance_metric:
-          $ref: '#/components/schemas/DistanceMetric'
-        mem_only:
-          type: boolean
-        embedder:
-          $ref: '#/components/schemas/CreatedProviderConfig'
-        summarizer:
-          $ref: '#/components/schemas/CreatedProviderConfig'
-        chunker:
-          $ref: '#/components/schemas/ChunkerConfig'
-        top_k:
-          type: integer
-          minimum: 1
-          default: 10
-        min_weight:
-          type: number
-          format: float
-          default: 0.0
-        chunk_size:
-          type: integer
-          minimum: 64
-          default: 1024
-        execution:
-          $ref: '#/components/schemas/IndexExecutionConfig'
-    CreatedEmbeddingsIndex:
-      description: Normalized effective dense or sparse embeddings index configuration returned after
-        creation.
-      allOf:
-        - $ref: '#/components/schemas/CreatedIndexCommon'
-        - $ref: '#/components/schemas/CreatedEmbeddingsIndexConfig'
-        - type: object
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              enum:
-                - embeddings
-    CreatedGraphArtifactProducerConfig:
-      type: object
-      additionalProperties: false
-      required:
-        - name
-        - kind
-        - source
-      description: Credential-free graph artifact producer configuration returned after creation.
-      properties:
-        name:
-          type: string
-          minLength: 1
-        kind:
-          type: string
-          enum:
-            - asset
-        source:
-          $ref: '#/components/schemas/GraphArtifactProducerSourceConfig'
-        content_type:
-          type: string
-        execution:
-          $ref: '#/components/schemas/ExecutionPolicy'
-    CreatedGraphIndexConfig:
-      type: object
-      description: Credential-free normalized graph configuration returned after creation.
-      properties:
-        summarizer:
-          $ref: '#/components/schemas/CreatedProviderConfig'
-        template:
-          type: string
-        edge_types:
-          type: array
-          items:
-            $ref: '#/components/schemas/EdgeTypeConfig'
-        max_edges_per_document:
-          type: integer
-        source:
-          $ref: '#/components/schemas/GraphArtifactSourceConfig'
-        artifact:
-          $ref: '#/components/schemas/CreatedGraphArtifactProducerConfig'
-        nodes:
-          $ref: '#/components/schemas/GraphArtifactNodeMappingConfig'
-        edge:
-          $ref: '#/components/schemas/GraphArtifactEdgeMappingConfig'
-        context:
-          $ref: '#/components/schemas/GraphArtifactContextConfig'
-        algebraic_planning:
-          $ref: '#/components/schemas/GraphAlgebraicPlanningConfig'
-        resolvers:
-          type: array
-          items:
-            $ref: '#/components/schemas/GraphResolverConfig'
-    CreatedGraphIndex:
-      description: Normalized effective graph index configuration returned after creation.
-      allOf:
-        - $ref: '#/components/schemas/CreatedIndexCommon'
-        - $ref: '#/components/schemas/CreatedGraphIndexConfig'
-        - type: object
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              enum:
-                - graph
-    CreatedAlgebraicIndex:
-      description: Normalized effective schema-derived algebraic index configuration returned after creation.
-      allOf:
-        - $ref: '#/components/schemas/CreatedIndexCommon'
-        - $ref: '#/components/schemas/AlgebraicIndexConfig'
-        - type: object
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              enum:
-                - algebraic
-    CreatedIndex:
-      description: Discriminated normalized configuration returned after an index is created.
-      oneOf:
-        - $ref: '#/components/schemas/CreatedFullTextIndex'
-        - $ref: '#/components/schemas/CreatedEmbeddingsIndex'
-        - $ref: '#/components/schemas/CreatedGraphIndex'
-        - $ref: '#/components/schemas/CreatedAlgebraicIndex'
-      discriminator:
-        propertyName: type
-        mapping:
-          full_text: '#/components/schemas/CreatedFullTextIndex'
-          embeddings: '#/components/schemas/CreatedEmbeddingsIndex'
-          graph: '#/components/schemas/CreatedGraphIndex'
-          algebraic: '#/components/schemas/CreatedAlgebraicIndex'
     InferenceError:
       type: object
       required:
@@ -25875,6 +26364,14 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    IndexMutationBadRequest:
+      description: Invalid index configuration or a deployment capability mismatch
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/UnsupportedIndexCapabilityError'
+              - $ref: '#/components/schemas/Error'
     PayloadTooLarge:
       description: Request body exceeds the configured size limit
       content:
@@ -25905,6 +26402,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
+    IndexMutationServiceUnavailable:
+      description: Index validation is temporarily unavailable or a distributed rolling upgrade has not
+        yet converged.
+      headers:
+        Retry-After:
+          required: false
+          description: Minimum number of seconds clients should wait when the failure is retryable.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            anyOf:
+              - $ref: '#/components/schemas/IndexMutationServiceUnavailableError'
+              - $ref: '#/components/schemas/Error'
     BackupMetadataUnavailable:
       description: Backup could not establish the required metadata authority before starting side effects.
       headers:
@@ -25998,6 +26511,16 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ExactSortError'
+    UnsupportedQuery:
+      description: The query is valid JSON but requests an unsupported execution or result contract
+      content:
+        application/json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/ExactSortError'
+              - $ref: '#/components/schemas/QueryFilterError'
+              - $ref: '#/components/schemas/UnsupportedHierarchyGroupingError'
+              - $ref: '#/components/schemas/UnsupportedQueryError'
     HierarchyCursorStale:
       description: The hierarchy changed after the traversal cursor was issued
       content:

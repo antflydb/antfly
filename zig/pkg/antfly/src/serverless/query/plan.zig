@@ -95,6 +95,7 @@ fn validateSupportedPublicSearchFields(object: std.json.ObjectMap) !void {
         const supported = std.mem.eql(u8, key, "table") or
             std.mem.eql(u8, key, "query") or
             std.mem.eql(u8, key, "full_text_search") or
+            std.mem.eql(u8, key, "full_text_index") or
             std.mem.eql(u8, key, "semantic_search") or
             std.mem.eql(u8, key, "embedding_template") or
             std.mem.eql(u8, key, "indexes") or
@@ -206,6 +207,7 @@ fn parsePublicSearchPlanAlloc(
         .filter_prefix = if (query_request.filter_prefix) |value| try alloc.dupe(u8, value) else null,
         .filter_text = if (text_clauses.filter_text) |value| try alloc.dupe(u8, value.text) else null,
         .exclusion_text = if (text_clauses.exclusion_text) |value| try alloc.dupe(u8, value.text) else null,
+        .full_text_index = if (query_request.full_text_index) |value| try alloc.dupe(u8, value) else null,
         .vector = public_vector,
         .sparse = public_sparse,
         .semantic_search = if (query_request.semantic_search) |value| try alloc.dupe(u8, value) else null,
@@ -249,6 +251,7 @@ fn parsePublicSearchPlanAlloc(
 
     if (req.embedding_template != null and req.semantic_search == null) return error.InvalidQueryRequest;
     if (req.semantic_search != null and req.vector != null) return error.InvalidQueryRequest;
+    if (req.full_text_index != null and !has_text) return error.InvalidQueryRequest;
 
     try validateSearchRequest(req);
 
@@ -497,12 +500,26 @@ fn resolveSearchSources(
         (req.mode == .sparse or req.mode == .hybrid) and
         (req.sparse != null and req.sparse.?.len != 0);
     var resolved = try published_search_sources.resolveRequested(req.indexes, needs_vector, needs_sparse);
-    if (req.semantic_search != null and resolved.findVector() == null) {
+
+    // The published-segment executor currently has one vector and one sparse
+    // execution lane. Omitted selectors are safe only when the catalog is
+    // unambiguous; otherwise fail closed instead of making result quality
+    // depend on catalog insertion order.
+    if (needs_vector and resolved.findVector() == null) {
+        if (published_search_sources.countKind(.vector) > 1) return error.UnsupportedQueryRequest;
         const fallback = published_search_sources.findVector() orelse return error.InvalidQueryRequest;
         try resolved.append(.{ .vector = fallback });
     }
+    if (needs_sparse and resolved.findSparse() == null) {
+        if (published_search_sources.countKind(.sparse) > 1) return error.UnsupportedQueryRequest;
+        const fallback = published_search_sources.findSparse() orelse return error.InvalidQueryRequest;
+        try resolved.append(.{ .sparse = fallback });
+    }
     if (needs_text and resolved.findText() == null) {
-        if (published_search_sources.findText()) |fallback| {
+        if (req.full_text_index) |index_name| {
+            const selected = published_search_sources.findTextByName(index_name) orelse return error.InvalidQueryRequest;
+            try resolved.append(.{ .text = selected });
+        } else if (published_search_sources.findText()) |fallback| {
             try resolved.append(.{ .text = fallback });
         }
     }
@@ -566,6 +583,76 @@ test "search plan defaults semantic-only requests to vector mode and resolves de
     defer plan.deinit(alloc);
     try std.testing.expectEqual(request.QueryMode.vector, plan.request.mode);
     try std.testing.expectEqualStrings(search_sources.default_chunk_embedding_index_name, plan.vectorSource().?.index_name);
+}
+
+test "serverless search plan rejects ambiguous and multiple same-lane embedding selectors" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.PublishedSearchSources{
+        .items = @constCast(&[_]search_sources.SearchSourceDescriptor{
+            .{ .text = .{ .index_name = search_sources.default_full_text_index_name } },
+            .{ .vector = .{
+                .index_name = "semantic_a",
+                .document_source = .top_level_embedding,
+                .embedding_name = "semantic_a",
+            } },
+            .{ .vector = .{
+                .index_name = "semantic_b",
+                .document_source = .top_level_embedding,
+                .embedding_name = "semantic_b",
+            } },
+            .{ .sparse = .{
+                .index_name = "sparse_a",
+                .document_source = .sparse_embedding,
+                .embedding_name = "sparse_a",
+            } },
+            .{ .sparse = .{
+                .index_name = "sparse_b",
+                .document_source = .sparse_embedding,
+                .embedding_name = "sparse_b",
+            } },
+        }),
+    };
+
+    // An omitted selector must not make behavior depend on catalog order.
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"semantic_search\":\"cat\"}", sources),
+    );
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"vector\":[1,0,0],\"mode\":\"vector\"}", sources),
+    );
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"sparse\":[{\"term\":\"cat\",\"weight\":1}],\"mode\":\"sparse\"}", sources),
+    );
+
+    // Explicit same-lane fan-out is also rejected until the serverless reader
+    // can execute and fuse every selected segment.
+    try std.testing.expectError(
+        error.UnsupportedQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"semantic_search\":\"cat\",\"indexes\":[\"semantic_a\",\"semantic_b\"]}",
+            sources,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"semantic_search\":\"cat\",\"indexes\":[\"semantic_a\",\"sparse_a\"]}",
+            sources,
+        ),
+    );
+
+    var selected = try parseSearchPlanAlloc(
+        alloc,
+        "{\"semantic_search\":\"cat\",\"indexes\":[\"semantic_b\"]}",
+        sources,
+    );
+    defer selected.deinit(alloc);
+    try std.testing.expectEqualStrings("semantic_b", selected.vectorSource().?.index_name);
 }
 
 test "search plan accepts public dense embeddings map" {
@@ -772,6 +859,68 @@ test "search plan accepts public full text query strings for supported fields" {
     try std.testing.expectEqual(request.QueryOperator.any_terms, plan.request.operator);
     try std.testing.expectEqualStrings("alpha bravo", plan.request.text);
     try std.testing.expectEqual(@as(usize, 5), plan.request.limit);
+}
+
+test "serverless search plan selects a named full text source" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.PublishedSearchSources{
+        .items = @constCast(&[_]search_sources.SearchSourceDescriptor{
+            .{ .text = .{ .index_name = search_sources.default_full_text_index_name } },
+            .{ .text = .{ .index_name = "title_text" } },
+        }),
+    };
+    var plan = try parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_index\":\"title_text\",\"full_text_search\":{\"query\":\"body:alpha\"}}",
+        sources,
+    );
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqualStrings("title_text", plan.request.full_text_index.?);
+    try std.testing.expectEqualStrings("title_text", plan.sources.findText().?.index_name);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"full_text_index\":\"missing\",\"full_text_search\":{\"query\":\"body:alpha\"}}",
+            sources,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(alloc, "{\"full_text_index\":\"title_text\",\"limit\":5}", sources),
+    );
+}
+
+test "serverless named full text selection is independent of embedding indexes" {
+    const alloc = std.testing.allocator;
+    const sources = search_sources.PublishedSearchSources{
+        .items = @constCast(&[_]search_sources.SearchSourceDescriptor{
+            .{ .text = .{ .index_name = search_sources.default_full_text_index_name } },
+            .{ .text = .{ .index_name = "title_text" } },
+            .{ .vector = .{
+                .index_name = search_sources.default_chunk_embedding_index_name,
+                .document_source = .chunk_embeddings_or_top_level,
+            } },
+        }),
+    };
+    var plan = try parseSearchPlanAlloc(
+        alloc,
+        "{\"full_text_index\":\"title_text\",\"full_text_search\":{\"query\":\"body:alpha\"},\"semantic_search\":\"alpha\",\"indexes\":[\"serverless_chunk\"]}",
+        sources,
+    );
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqualStrings("title_text", plan.sources.findText().?.index_name);
+    try std.testing.expectEqualStrings(search_sources.default_chunk_embedding_index_name, plan.sources.findVector().?.index_name);
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseSearchPlanAlloc(
+            alloc,
+            "{\"full_text_index\":\"title_text\",\"full_text_search\":{\"query\":\"body:alpha\"},\"indexes\":[\"full_text_index_v0\"]}",
+            sources,
+        ),
+    );
 }
 
 test "search plan rejects unsupported public full text fields" {
