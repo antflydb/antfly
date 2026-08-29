@@ -225,7 +225,7 @@ pub fn reconcileReplicaRootWithOptions(
         var io_impl: ?std.Io.Threaded = null;
         defer if (io_impl) |*owned| owned.deinit();
         const io = if (options.backend_runtime) |runtime|
-            runtime.io() orelse return error.BackendRuntimeIoUnavailable
+            runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
         else blk: {
             io_impl = std.Io.Threaded.init(alloc, .{});
             break :blk io_impl.?.io();

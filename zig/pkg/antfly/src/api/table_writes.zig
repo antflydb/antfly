@@ -5490,7 +5490,7 @@ pub const BoundTableWriteSource = struct {
             return try exportPortableBackupShard(alloc, db, plan.backup_root, plan.backup_id, 0, plan.io);
         }
 
-        const snapshot_io = plan.io orelse db.backend_runtime.io() orelse
+        const snapshot_io = plan.io orelse db.backend_runtime.filesystemIo() orelse
             return error.BackendRuntimeIoUnavailable;
         try reclaimStaleNativeSnapshotAttempts(alloc, snapshot_io, db.core.path);
         const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, "local");
@@ -10128,7 +10128,7 @@ pub const ProvisionedTableWriteSource = struct {
             var provision_io_impl: ?std.Io.Threaded = null;
             defer if (provision_io_impl) |*owned| owned.deinit();
             const provision_io = if (active_backend_runtime) |runtime|
-                runtime.io() orelse return error.BackendRuntimeIoUnavailable
+                runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
             else blk: {
                 provision_io_impl = std.Io.Threaded.init(alloc, .{});
                 break :blk provision_io_impl.?.io();
@@ -15893,7 +15893,7 @@ pub const ProvisionedTableWriteSource = struct {
     ) !NativeBackupShardSnapshot {
         std.debug.assert(plan.format == .native);
 
-        const snapshot_io = plan.io orelse db.backend_runtime.io() orelse
+        const snapshot_io = plan.io orelse db.backend_runtime.filesystemIo() orelse
             return error.BackendRuntimeIoUnavailable;
         try reclaimStaleNativeSnapshotAttempts(alloc, snapshot_io, db_path);
         const group_label = try std.fmt.allocPrint(alloc, "g{d}", .{group_id});
@@ -31342,7 +31342,10 @@ test "provisioned table write source routes batch writes across ranges" {
 
     var backend_runtime = try db_mod.background_runtime.BackendRuntime.init(
         alloc,
-        .{ .backend = .manual },
+        .{
+            .backend = .manual,
+            .filesystem_io = io_impl.io(),
+        },
     );
     defer backend_runtime.deinit();
     var write_cache = ProvisionedTableWriteCache.init(alloc);

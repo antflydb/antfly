@@ -2410,11 +2410,12 @@ fn loadOrCreateDurableRootIdentity(
     path: []const u8,
 ) !root_identity.State {
     if (backend_runtime) |runtime| {
-        if (runtime.io()) |io| return try root_identity.loadOrCreate(alloc, io, path);
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
+        return try root_identity.loadOrCreate(alloc, io, path);
     }
-    // Manual executors intentionally have no shared I/O lane. Keep the
-    // fallback at this operation boundary so every identity helper still uses
-    // one caller-owned Io rather than constructing its own executor.
+    // Legacy callers may omit a runtime entirely. Keep their fallback at this
+    // operation boundary; a supplied runtime must carry its own filesystem
+    // authority so storage work never creates a hidden executor.
     var io_impl = threadedIo();
     defer io_impl.deinit();
     return try root_identity.loadOrCreate(alloc, io_impl.io(), path);
@@ -3380,7 +3381,7 @@ pub const DB = struct {
     }
 
     fn acquireSnapshotReplayMutation(self: *DB) !snapshot_admission_mod.SnapshotAdmission.MutationLease {
-        if (self.backend_runtime.io()) |io| {
+        if (self.backend_runtime.filesystemIo()) |io| {
             return try self.core.snapshot_replay_admission.acquireMutationIo(
                 io,
                 @as(?types.CancellationToken, null),
@@ -15742,7 +15743,7 @@ pub const DB = struct {
                 }
             }
         }
-        const io = self.backend_runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        const io = self.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         const snapshot_parent = try std.fmt.allocPrint(self.alloc, "{s}.snapshots", .{self.core.path});
         defer self.alloc.free(snapshot_parent);
         const snapshot_root = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ snapshot_parent, id });
@@ -16026,7 +16027,7 @@ pub const DB = struct {
         native_manifest: ?*const native_backup.Manifest,
     ) !void {
         try cancellation.check();
-        const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.io() else null;
+        const shared_io = restore_io orelse if (opts.backend_runtime) |runtime| runtime.filesystemIo() else null;
         const identity_io = if (restore_identity != null)
             shared_io orelse return error.BackendRuntimeIoUnavailable
         else
@@ -16127,7 +16128,7 @@ pub const DB = struct {
         identity: RestoreIdentity,
     ) !void {
         const runtime = opts.backend_runtime orelse return error.BackendRuntimeIoUnavailable;
-        const io = runtime.io() orelse return error.BackendRuntimeIoUnavailable;
+        const io = runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
         return try restoreSnapshotToDeferredRuntimeRepairWithIo(
             staged_generation,
             alloc,
@@ -16799,7 +16800,7 @@ pub const DB = struct {
     }
 
     pub fn restoreRuntimeRepairNeeded(self: *DB) !bool {
-        if (self.backend_runtime.io()) |io| {
+        if (self.backend_runtime.filesystemIo()) |io| {
             return try restoreRuntimeRepairNeededForPathWithIo(self.alloc, io, self.core.path);
         }
         return try restoreRuntimeRepairNeededForPath(self.alloc, self.core.path);
@@ -16826,7 +16827,7 @@ pub const DB = struct {
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeeded(self: *DB, alloc: Allocator) !bool {
-        if (self.backend_runtime.io()) |io| {
+        if (self.backend_runtime.filesystemIo()) |io| {
             return try self.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io);
         }
         var io_impl = threadedIo();
@@ -16961,7 +16962,7 @@ pub const DB = struct {
     }
 
     fn repairRestoreRuntimeStateIfNeeded(self: *DB, alloc: Allocator) !bool {
-        if (self.backend_runtime.io()) |io| {
+        if (self.backend_runtime.filesystemIo()) |io| {
             return try self.repairRestoreRuntimeStateIfNeededWithIo(alloc, io);
         }
         var io_impl = threadedIo();
@@ -92903,7 +92904,14 @@ test "db native snapshot exports self-contained generation" {
     const path = tempPath(&path_buf);
     defer cleanupTempDir(path);
 
-    var db = try DB.open(alloc, std.mem.span(path), .{});
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
+    defer runtime.deinit();
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+    });
     defer db.close();
 
     try db.batch(.{
@@ -93440,13 +93448,20 @@ test "db native deferred restore preserves generated dense generation without em
     defer transition.deinit();
     var staged = try transition.beginStaging();
     defer staged.deinit();
-    try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
+    var restore_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
+    defer restore_runtime.deinit();
+    try DB.restoreSnapshotToDeferredRuntimeRepair(
         &staged,
         alloc,
-        std.testing.io,
         snapshot_root,
         staged.path(),
-        .{ .primary_backend = primary_backend },
+        .{
+            .primary_backend = primary_backend,
+            .backend_runtime = restore_runtime.ptr(),
+        },
         .{
             .backup_id = "native-fast",
             .location = "local",
