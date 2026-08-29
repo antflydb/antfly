@@ -113,6 +113,8 @@ pub const RestoreIntentIdentity = struct {
     connection: []const u8,
     artifact_size_bytes: u64,
     artifact_sha256: []const u8,
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
 };
 
 pub fn restoreIntentIdentity(record: RangeRecord) RestoreIntentIdentity {
@@ -126,6 +128,8 @@ pub fn restoreIntentIdentity(record: RangeRecord) RestoreIntentIdentity {
         .connection = record.restore_connection,
         .artifact_size_bytes = record.restore_artifact_size_bytes,
         .artifact_sha256 = record.restore_artifact_sha256,
+        .native_manifest_size_bytes = record.restore_native_manifest_size_bytes,
+        .native_manifest_sha256 = record.restore_native_manifest_sha256,
     };
 }
 
@@ -138,7 +142,9 @@ pub fn restoreIntentMatchesRange(expected: RestoreIntentIdentity, record: RangeR
         std.mem.eql(u8, expected.snapshot_path, record.restore_snapshot_path) and
         std.mem.eql(u8, expected.connection, record.restore_connection) and
         expected.artifact_size_bytes == record.restore_artifact_size_bytes and
-        std.mem.eql(u8, expected.artifact_sha256, record.restore_artifact_sha256);
+        std.mem.eql(u8, expected.artifact_sha256, record.restore_artifact_sha256) and
+        expected.native_manifest_size_bytes == record.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, expected.native_manifest_sha256, record.restore_native_manifest_sha256);
 }
 
 pub fn cloneRestoreIntentIdentity(
@@ -157,6 +163,8 @@ pub fn cloneRestoreIntentIdentity(
     errdefer alloc.free(connection);
     const artifact_sha256 = try alloc.dupe(u8, identity.artifact_sha256);
     errdefer alloc.free(artifact_sha256);
+    const native_manifest_sha256 = try alloc.dupe(u8, identity.native_manifest_sha256);
+    errdefer alloc.free(native_manifest_sha256);
     return .{
         .group_id = identity.group_id,
         .table_id = identity.table_id,
@@ -167,6 +175,8 @@ pub fn cloneRestoreIntentIdentity(
         .connection = connection,
         .artifact_size_bytes = identity.artifact_size_bytes,
         .artifact_sha256 = artifact_sha256,
+        .native_manifest_size_bytes = identity.native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256,
     };
 }
 
@@ -180,6 +190,7 @@ pub fn freeRestoreIntentIdentity(
     alloc.free(identity.snapshot_path);
     alloc.free(identity.connection);
     alloc.free(identity.artifact_sha256);
+    alloc.free(identity.native_manifest_sha256);
 }
 
 pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeRecord) !void {
@@ -200,6 +211,8 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     errdefer alloc.free(connection);
     const artifact_sha256 = try alloc.dupe(u8, "");
     errdefer alloc.free(artifact_sha256);
+    const native_manifest_sha256 = try alloc.dupe(u8, "");
+    errdefer alloc.free(native_manifest_sha256);
 
     alloc.free(record.restore_backup_id);
     alloc.free(record.restore_artifact_backup_id);
@@ -207,6 +220,7 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     alloc.free(record.restore_snapshot_path);
     alloc.free(record.restore_connection);
     alloc.free(record.restore_artifact_sha256);
+    alloc.free(record.restore_native_manifest_sha256);
     record.restore_backup_id = backup_id;
     record.restore_artifact_backup_id = artifact_backup_id;
     record.restore_location = location;
@@ -214,6 +228,8 @@ pub fn clearOwnedRangeRestoreIntent(alloc: std.mem.Allocator, record: *RangeReco
     record.restore_connection = connection;
     record.restore_artifact_size_bytes = 0;
     record.restore_artifact_sha256 = artifact_sha256;
+    record.restore_native_manifest_size_bytes = 0;
+    record.restore_native_manifest_sha256 = native_manifest_sha256;
     record.completed_restore_fingerprint = completed_restore_fingerprint;
 }
 
@@ -234,6 +250,8 @@ pub fn rangeRecordsEqual(lhs: RangeRecord, rhs: RangeRecord) bool {
         std.mem.eql(u8, lhs.restore_connection, rhs.restore_connection) and
         lhs.restore_artifact_size_bytes == rhs.restore_artifact_size_bytes and
         std.mem.eql(u8, lhs.restore_artifact_sha256, rhs.restore_artifact_sha256) and
+        lhs.restore_native_manifest_size_bytes == rhs.restore_native_manifest_size_bytes and
+        std.mem.eql(u8, lhs.restore_native_manifest_sha256, rhs.restore_native_manifest_sha256) and
         std.mem.eql(
             u8,
             &lhs.completed_restore_fingerprint,
@@ -271,6 +289,12 @@ pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
 pub const node_lifecycle_finalizing = "finalizing";
 
+/// Data-store protocol required to stage, validate, and atomically publish a
+/// native backup generation without discarding validated generated indexes.
+/// Persisting this per store lets metadata fence restore placement during a
+/// rolling data-plane upgrade instead of relying on the metadata codec level.
+pub const native_generation_restore_protocol_version: u16 = 1;
+
 pub fn nodeLifecycleActive(lifecycle: []const u8) bool {
     return std.mem.eql(u8, lifecycle, node_lifecycle_active);
 }
@@ -293,6 +317,7 @@ pub const StoreRecord = struct {
     reporter_incarnation: u64 = 0,
     /// Highest status snapshot generation accepted for `reporter_incarnation`.
     status_generation: u64 = 0,
+    native_generation_restore_version: u16 = 0,
     api_url: []const u8 = "",
     raft_url: []const u8 = "",
     role: []const u8 = "data",
@@ -863,6 +888,8 @@ pub const RestoreProgressRecord = struct {
     location: []const u8 = "",
     snapshot_path: []const u8 = "",
     artifact_sha256: []const u8 = "",
+    native_manifest_size_bytes: u64 = 0,
+    native_manifest_sha256: []const u8 = "",
     primary_restored: bool = false,
     runtime_repair_complete: bool = false,
     phase: []const u8 = "",
@@ -1763,6 +1790,8 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     errdefer alloc.free(restore_connection);
     const restore_artifact_sha256 = try alloc.dupe(u8, record.restore_artifact_sha256);
     errdefer alloc.free(restore_artifact_sha256);
+    const restore_native_manifest_sha256 = try alloc.dupe(u8, record.restore_native_manifest_sha256);
+    errdefer alloc.free(restore_native_manifest_sha256);
     return .{
         .group_id = record.group_id,
         .range_id = if (record.range_id == 0) record.group_id else record.range_id,
@@ -1779,6 +1808,8 @@ pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
         .restore_connection = restore_connection,
         .restore_artifact_size_bytes = record.restore_artifact_size_bytes,
         .restore_artifact_sha256 = restore_artifact_sha256,
+        .restore_native_manifest_size_bytes = record.restore_native_manifest_size_bytes,
+        .restore_native_manifest_sha256 = restore_native_manifest_sha256,
         .completed_restore_fingerprint = record.completed_restore_fingerprint,
     };
 }
@@ -1809,6 +1840,7 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.restore_snapshot_path);
     alloc.free(record.restore_connection);
     alloc.free(record.restore_artifact_sha256);
+    alloc.free(record.restore_native_manifest_sha256);
 }
 
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
@@ -1822,6 +1854,8 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
     errdefer alloc.free(snapshot_path);
     const artifact_sha256 = try alloc.dupe(u8, record.artifact_sha256);
     errdefer alloc.free(artifact_sha256);
+    const native_manifest_sha256 = try alloc.dupe(u8, record.native_manifest_sha256);
+    errdefer alloc.free(native_manifest_sha256);
     const phase = try alloc.dupe(u8, record.phase);
     errdefer alloc.free(phase);
     const last_error = try alloc.dupe(u8, record.last_error);
@@ -1835,6 +1869,8 @@ pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRec
         .location = location,
         .snapshot_path = snapshot_path,
         .artifact_sha256 = artifact_sha256,
+        .native_manifest_size_bytes = record.native_manifest_size_bytes,
+        .native_manifest_sha256 = native_manifest_sha256,
         .primary_restored = record.primary_restored,
         .runtime_repair_complete = record.runtime_repair_complete,
         .phase = phase,
@@ -1849,6 +1885,7 @@ pub fn freeRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressReco
     alloc.free(record.location);
     alloc.free(record.snapshot_path);
     alloc.free(record.artifact_sha256);
+    alloc.free(record.native_manifest_sha256);
     alloc.free(record.phase);
     alloc.free(record.last_error);
 }
@@ -1969,6 +2006,7 @@ pub fn cloneStore(alloc: std.mem.Allocator, record: StoreRecord) !StoreRecord {
         .node_id = record.node_id,
         .reporter_incarnation = record.reporter_incarnation,
         .status_generation = record.status_generation,
+        .native_generation_restore_version = record.native_generation_restore_version,
         .api_url = api_url,
         .raft_url = raft_url,
         .role = role,

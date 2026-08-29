@@ -164,11 +164,12 @@ one completed batch out to every exact consumer index, but activity from an
 unrelated index, table, or stale incarnation must never be attributed to the
 requested index.
 
-Activity is carried in runtime-status record v14. Mixed-version metadata groups
-omit this volatile telemetry until v14 support is proven by every current
-member; v13 repair and reporter-fence facts continue to publish independently.
-This downgrade is safe because activity is explanatory only and is never an
-input to admission or lifecycle milestones.
+Activity is carried in runtime-status record v14, shared with the mandatory
+native-generation restore capability. Mixed-version metadata groups omit this
+volatile telemetry until v14 support is proven by every current member; v13
+repair and reporter-fence facts continue to publish independently. This
+downgrade is safe because activity is explanatory only and is never an input to
+admission or lifecycle milestones; native restore identity remains fail-closed.
 
 ## Full-Text Routing From Enrichments
 

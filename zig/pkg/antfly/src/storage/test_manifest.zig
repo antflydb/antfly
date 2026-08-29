@@ -86,6 +86,7 @@ comptime {
     _ = @import("db/maintenance/transaction_runtime.zig");
     _ = @import("db/maintenance/ttl_runtime.zig");
     _ = @import("db/mod.zig");
+    _ = @import("db/native_backup.zig");
     _ = @import("db/ownership.zig");
     _ = @import("db/planning_stats.zig");
     _ = @import("db/promotion_runtime.zig");
@@ -98,6 +99,7 @@ comptime {
     _ = @import("db/resolution_handoff.zig");
     _ = @import("db/resolution_runtime.zig");
     _ = @import("db/root_identity.zig");
+    _ = @import("db/snapshot_admission.zig");
     _ = @import("db/template_remote_stub.zig");
     _ = @import("db/template_stub.zig");
     _ = @import("db/transform.zig");

@@ -350,12 +350,14 @@ publication. This keeps status useful for UX while preserving fail-closed
 admission and bounded request-path performance.
 
 Distributed publication is codec-versioned by payload capability. Repair facts
-and reporter fences require runtime-status record v13; embedding activity
-requires v14. During rolling upgrades, metadata negotiates the minimum version
-needed by each payload. A v13-capable cluster therefore continues publishing
-repair safety facts while v14 activity is omitted until every current metadata
-member proves support. Capability proofs are scoped to the metadata incarnation,
-membership fingerprint, and required version.
+and reporter fences require runtime-status record v13; embedding activity and
+the native-generation restore capability share v14. During rolling upgrades,
+metadata negotiates the minimum version needed by each payload. A v13-capable
+cluster therefore continues publishing repair safety facts while volatile v14
+activity is omitted until every current metadata member proves support. Native
+restore identity remains mandatory and fail-closed at that same v14 boundary.
+Capability proofs are scoped to the metadata incarnation, membership
+fingerprint, and required version.
 
 ### Metrics
 

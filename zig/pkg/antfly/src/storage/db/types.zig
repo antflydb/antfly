@@ -2611,6 +2611,22 @@ pub const RepairCancelCheck = struct {
     }
 };
 
+/// Stable adapter from restore/request cancellation to the repair subsystem's
+/// cooperative callback. The adapter must remain alive while the returned
+/// check is borrowed by a repair quantum.
+pub const RepairCancellation = struct {
+    token: CancellationToken,
+
+    fn requested(ptr: *anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.token.isCancelled();
+    }
+
+    pub fn check(self: *@This()) RepairCancelCheck {
+        return .{ .ptr = self, .is_requested = requested };
+    }
+};
+
 /// Cooperative scheduler preemption checked only at durable reconstruction
 /// boundaries. Unlike cancellation, yielding is a successful partial pass: the
 /// candidate remains reopenable and its scan cursor is persisted before the

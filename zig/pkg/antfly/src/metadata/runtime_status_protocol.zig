@@ -24,4 +24,9 @@ pub const repair_status_record_version: u16 = 13;
 /// The fields remain observability-only and are stripped while any metadata
 /// voter has not advertised V14 support.
 pub const embedding_activity_record_version: u16 = 14;
-pub const current_record_version: u16 = embedding_activity_record_version;
+/// V14 gates both metadata transitions whose trailing native-restore identity
+/// is mandatory and StoreRecord's data-plane native-generation capability.
+/// The only released predecessor we support is V12 from v0.2.0, so both parts
+/// of the new native-restore contract share one negotiated upgrade boundary.
+pub const native_restore_identity_record_version: u16 = 14;
+pub const current_record_version: u16 = native_restore_identity_record_version;
