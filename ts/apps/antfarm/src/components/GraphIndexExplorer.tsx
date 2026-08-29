@@ -25,14 +25,13 @@ import { ForceGraph, type GraphData, type GraphEdge, type GraphNode } from "@ant
 import type {
   EdgeTypeConfig,
   GraphNodesResult,
-  GraphPathsResult,
   GraphPathEdge,
   GraphPathEndpoint,
   GraphPathObjective,
+  GraphPathsResult,
   GraphQuery,
   GraphResult,
   IndexStatus,
-  QueryRequest,
 } from "@antfly/sdk";
 import { GitBranch, Hash, Loader2, Network, RefreshCw, Route, Search } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -173,7 +172,9 @@ function addNode(
   });
 }
 
-function graphVisualizationResult(result: GraphResult | null): GraphNodesResult | GraphPathsResult | null {
+function graphVisualizationResult(
+  result: GraphResult | null
+): GraphNodesResult | GraphPathsResult | null {
   return result?.kind === "nodes" || result?.kind === "paths" ? result : null;
 }
 
@@ -325,7 +326,7 @@ export function GraphIndexExplorer({
       const response = await api.tables.query(tableName, {
         filter_query: { match_all: {} },
         limit: 20,
-      } as QueryRequest);
+      });
       const keys =
         response?.responses?.[0]?.hits?.hits?.map((hit) => hit._id).filter(Boolean) ?? [];
       setSampleKeys(keys);
@@ -382,7 +383,7 @@ export function GraphIndexExplorer({
       const response = await api.tables.query(tableName, {
         graph_queries: { explorer: graphQuery },
         limit: 10,
-      } as QueryRequest);
+      });
       const graphResult = response?.responses?.[0]?.graph_results?.explorer ?? null;
       setResult(graphResult);
     } catch (err) {

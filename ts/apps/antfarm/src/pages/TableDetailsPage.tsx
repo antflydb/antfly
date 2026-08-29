@@ -48,13 +48,7 @@ import {
   TabsTrigger,
   Textarea,
 } from "@antfly/design-system";
-import type {
-  Table as AntflyTable,
-  IndexStatus,
-  QueryRequest,
-  QueryResult,
-  TableStatus,
-} from "@antfly/sdk";
+import type { Table as AntflyTable, IndexStatus, QueryResult, TableStatus } from "@antfly/sdk";
 import { queryResultTotalHits } from "@antfly/sdk";
 import { ReloadIcon } from "@radix-ui/react-icons";
 import type React from "react";
@@ -484,7 +478,7 @@ const TableDetailsPage: React.FC<TableDetailsPageProps> = ({ currentSection = "o
         filter_query: { match_all: {} },
         count: true,
         limit: 0,
-      } as QueryRequest);
+      });
       if (activeTableName.current !== tableName) return;
       setDocumentCount(queryResultTotalHits(response?.responses?.[0]) ?? null);
     } catch {

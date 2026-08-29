@@ -7368,7 +7368,7 @@ pub const IndexPublicationPolicy = enum {
     }
 };
 
-/// Authoritative query-readiness and completeness state for the desired index incarnation.
+/// Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
 pub const IndexReadinessState = enum {
     pending,
     queryable_partial,
@@ -7471,6 +7471,49 @@ pub const IndexRepairStatus = struct {
     state: []const u8,
     /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
     action_required: bool,
+    /// Whether this repair currently prevents the proven serving incarnation from answering queries.
+    blocks_queryable: bool,
+    /// Whether this repair prevents the desired incarnation from satisfying the complete milestone.
+    blocks_complete: bool,
+    /// Diagnostic reason automation stopped. Present only when action_required is true.
+    reason: ?[]const u8 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            .{ .json_name = "state", .zig_name = "state", .rejects_null = false },
+            .{ .json_name = "action_required", .zig_name = "action_required", .rejects_null = false },
+            .{ .json_name = "blocks_queryable", .zig_name = "blocks_queryable", .rejects_null = false },
+            .{ .json_name = "blocks_complete", .zig_name = "blocks_complete", .rejects_null = false },
+            .{ .json_name = "reason", .zig_name = "reason", .rejects_null = true },
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            .{ .json_name = "state", .zig_name = "state", .rejects_null = false },
+            .{ .json_name = "action_required", .zig_name = "action_required", .rejects_null = false },
+            .{ .json_name = "blocks_queryable", .zig_name = "blocks_queryable", .rejects_null = false },
+            .{ .json_name = "blocks_complete", .zig_name = "blocks_complete", .rejects_null = false },
+            .{ .json_name = "reason", .zig_name = "reason", .rejects_null = true },
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("state");
+        try jw.write(self.state);
+        try jw.objectField("action_required");
+        try jw.write(self.action_required);
+        try jw.objectField("blocks_queryable");
+        try jw.write(self.blocks_queryable);
+        try jw.objectField("blocks_complete");
+        try jw.write(self.blocks_complete);
+        if (self.reason) |value| {
+            try jw.objectField("reason");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// Statistics for an index

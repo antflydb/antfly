@@ -2765,9 +2765,6 @@ pub const ArtifactRepairRunOptions = struct {
     /// Installed by the durable owner after admission. Shadow construction
     /// invokes it only at bounded publication/window boundaries.
     capacity_check: ?RepairCapacityCheck = null,
-    /// Internal recursion fence: the durable owner has already admitted and
-    /// claimed this intent and is invoking the lower-level rebuild engine.
-    executing_durable_index_repair: bool = false,
     /// Managed operator requests persist/enqueue intent work and return
     /// immediately. Standalone callers leave this false and advance through
     /// the same state machine synchronously.
@@ -2930,6 +2927,20 @@ pub const AlgebraicProgressStatus = struct {
 pub const DBIndexStats = struct {
     name: []const u8,
     kind: IndexKind,
+    // Status-plane overlay used to fence one catalog target while retaining
+    // authoritative observations for unaffected sibling indexes. This is an
+    // internal observation fact and is not serialized in the public API.
+    runtime_observation_stale: bool = false,
+    // A cache merge may retain serviceability for one exact derived-index
+    // incarnation while its already-open runtime publishes catch-up status.
+    // This proof never originates in persisted DB stats and is cleared by a
+    // fresh observation, a root change, or an incarnation change.
+    runtime_observation_serviceable: bool = false,
+    // The status cache proved that this index is an untouched sibling of one
+    // exact in-place catalog target. Unlike generic derived-incarnation
+    // continuity, this proof can retain authority across table-level opening
+    // metadata and applies to every index kind. It is never persisted.
+    runtime_observation_targeted_sibling: bool = false,
     // Error name recorded when the index's persisted artifacts failed to
     // load (e.g. "UnsupportedVersion"); null for healthy indexes.
     load_error: ?[]const u8 = null,
@@ -2972,6 +2983,9 @@ pub const DBIndexStats = struct {
     // Compact lifecycle used when DBIndexStats crosses process boundaries.
     // The full local durable diagnostics remain authoritative when present.
     index_repair_status: ?IndexRepairStatus = null,
+    // Separate from lifecycle because a terminal scheduler checkpoint can be
+    // retryable while paused/irrecoverable states require operator action.
+    index_repair_action_required: bool = false,
     // Internal proof that the active managed-admission generation is safe to
     // query. Under progressive publication it may still have incomplete source
     // coverage; repair intent remains authoritative until full convergence.

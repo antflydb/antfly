@@ -9939,7 +9939,7 @@ export interface components {
             enrichments?: components["schemas"]["EnrichmentConfig"][];
         } & (components["schemas"]["FullTextIndexConfig"] | components["schemas"]["EmbeddingsIndexConfig"] | components["schemas"]["GraphIndexConfig"] | components["schemas"]["AlgebraicIndexConfig"]);
         /**
-         * @description Authoritative query-readiness and completeness state for the desired index incarnation.
+         * @description Lifecycle state for the desired index incarnation. A failed desired repair may coexist with queryable=true when a separately proven serving incarnation remains available; clients must use the explicit milestone booleans.
          * @enum {string}
          */
         IndexReadinessState: "pending" | "queryable_partial" | "ready" | "failed";
@@ -9973,6 +9973,12 @@ export interface components {
             state: "rebuilding" | "waiting" | "paused" | "failed";
             /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
             action_required: boolean;
+            /** @description Whether this repair currently prevents the proven serving incarnation from answering queries. */
+            blocks_queryable: boolean;
+            /** @description Whether this repair prevents the desired incarnation from satisfying the complete milestone. */
+            blocks_complete: boolean;
+            /** @description Diagnostic reason automation stopped. Present only when action_required is true. */
+            reason?: string;
         };
         FullTextIndexStats: {
             /**

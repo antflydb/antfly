@@ -22,6 +22,7 @@ const build_options = @import("build_options");
 const scraping = @import("antfly_scraping");
 const fs_paths = @import("../common/fs_paths.zig");
 const common_secrets = @import("../common/secrets.zig");
+const index_repair_status = @import("../common/index_repair_status.zig");
 const CancellationToken = @import("../common/cancellation.zig").CancellationToken;
 const api_operation = @import("operation.zig");
 const search_pattern_filter = @import("../search/pattern_filter.zig");
@@ -9394,6 +9395,21 @@ pub const ApiHttpServer = struct {
         unavailable,
     };
 
+    fn runtimeIndexRepairLifecycle(item: db_mod.types.DBIndexStats) index_repair_status.LifecycleProjection {
+        const status = item.index_repair_status orelse index_repair_status.summarize(
+            item.index_repair_id != null,
+            item.index_repair_automation,
+            item.index_repair_phase,
+            item.index_repair_wait_reason,
+            item.index_repair_action_required,
+        );
+        return index_repair_status.projectLifecycle(
+            status,
+            item.index_repair_action_required,
+            item.index_repair_active_generation_serviceable,
+        );
+    }
+
     fn runtimeStatusHasCurrentLifecycleEvidence(metadata: runtime_status.RuntimeStatusMetadata) bool {
         return metadata.freshness == .fresh or metadata.freshness == .catching_up;
     }
@@ -9419,20 +9435,23 @@ pub const ApiHttpServer = struct {
                     if (std.mem.eql(u8, item.name, index_name)) break item;
                 } else continue;
                 observed_group_index = true;
-                if (index.load_error != null) return .unavailable;
-                // Terminal and operator-paused repairs are actionable failures,
-                // not retryable publication windows.
-                if (std.mem.eql(u8, index.index_repair_phase, "terminal") or
-                    std.mem.eql(u8, index.index_repair_automation, "paused")) return .unavailable;
+                const repair_lifecycle = runtimeIndexRepairLifecycle(index);
+                // The storage owner supplies an incarnation/version-scoped
+                // serviceability proof. Candidate failure diagnostics remain
+                // visible, but cannot revoke a generation that admission still
+                // serves. Without that proof, actionable repair fails closed.
+                if (index.load_error != null and !repair_lifecycle.active_generation_serviceable) return .unavailable;
+                if (repair_lifecycle.blocks_queryable and repair_lifecycle.action_required) return .unavailable;
                 if (index.backfill_active or
                     index.replay_catch_up_required or
                     index.catch_up_active or
-                    index.index_repair_id != null or
+                    repair_lifecycle.blocks_queryable or
+                    repair_lifecycle.present or
                     index.replay_applied_sequence < index.replay_target_sequence or
                     index.catch_up_applied_sequence < index.catch_up_target_sequence)
                 {
                     group_active_build = true;
-                } else if (index.repair_degraded) {
+                } else if (index.repair_degraded and !repair_lifecycle.active_generation_serviceable) {
                     return .unavailable;
                 }
             }
@@ -19756,6 +19775,8 @@ test "api http missing index classification requires active rebuild evidence" {
         .repair_degraded = true,
         .index_repair_id = 42,
         .index_repair_phase = "terminal",
+        .index_repair_status = .failed,
+        .index_repair_action_required = true,
     }};
     const terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 10,
@@ -19773,6 +19794,8 @@ test "api http missing index classification requires active rebuild evidence" {
         .index_repair_id = 42,
         .index_repair_phase = "building",
         .index_repair_automation = "paused",
+        .index_repair_status = .paused,
+        .index_repair_action_required = true,
     }};
     const paused_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
         .group_id = 10,
@@ -19782,6 +19805,29 @@ test "api http missing index classification requires active rebuild evidence" {
     try std.testing.expectEqual(
         ApiHttpServer.RuntimeIndexLifecycle.unavailable,
         ApiHttpServer.runtimeIndexLifecycle(paused_statuses[0..], &expected_group_ids, "semantic_idx"),
+    );
+
+    const retained_terminal_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .load_error = "CandidateManifestInvalid",
+        .repair_degraded = true,
+        .index_repair_id = 45,
+        .index_repair_phase = "terminal",
+        .index_repair_status = .failed,
+        .index_repair_action_required = true,
+        .index_repair_active_generation_serviceable = true,
+    }};
+    const retained_terminal_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{
+        .group_id = 10,
+        .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+        .stats = .{ .indexes = @constCast(retained_terminal_indexes[0..]) },
+    }};
+    // Candidate diagnostics remain actionable, but the exact active-generation
+    // proof is authoritative for query admission.
+    try std.testing.expectEqual(
+        ApiHttpServer.RuntimeIndexLifecycle.rebuilding,
+        ApiHttpServer.runtimeIndexLifecycle(retained_terminal_statuses[0..], &expected_group_ids, "semantic_idx"),
     );
 
     const degraded_indexes = [_]db_mod.types.DBIndexStats{.{
@@ -19818,6 +19864,8 @@ test "api http missing index classification requires active rebuild evidence" {
             .repair_degraded = true,
             .index_repair_id = 44,
             .index_repair_phase = "terminal",
+            .index_repair_status = .failed,
+            .index_repair_action_required = true,
         },
     };
     const mixed_statuses = [_]runtime_status.LocalTableRuntimeStatus{.{

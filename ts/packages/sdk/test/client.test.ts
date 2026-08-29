@@ -190,7 +190,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
 
-      const request: QueryRequest = {
+      const request: TableQueryRequest = {
         table: "products",
         full_text_search: {
           match: "laptop",
@@ -318,7 +318,7 @@ describe("AntflyClient", () => {
         error: undefined,
       });
       const controller = new AbortController();
-      const request: QueryRequest = { limit: 3 };
+      const request: TableQueryRequest = { limit: 3 };
 
       await client.tables.query("products", request, { signal: controller.signal });
 

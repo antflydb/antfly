@@ -1,9 +1,4 @@
-import type {
-  AntflyClient,
-  GraphResult,
-  IndexStatus,
-  QueryRequest,
-} from "@antfly/sdk";
+import type { AntflyClient, GraphResult, IndexStatus, TableQueryRequest } from "@antfly/sdk";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { GraphIndexExplorer } from "../components/GraphIndexExplorer";
 import { ApiConfigContext } from "../contexts/api-config-context";
@@ -154,38 +149,38 @@ const shortestPathResult: GraphResult = {
   paths: [
     {
       path: {
-      nodes: [
-        { key: "paper:graph-rag" },
-        { key: "paper:agent-memory" },
-        { key: "paper:entity-links" },
-      ],
-      edges: [
-        {
-          from: { key: "paper:graph-rag" },
-          to: { key: "paper:agent-memory" },
-          direction: "out",
-          type: "extends",
-          weight: 0.88,
-        },
-        {
-          from: { key: "paper:agent-memory" },
-          to: { key: "paper:entity-links" },
-          direction: "out",
-          type: "mentions",
-          weight: 0.72,
-        },
-      ],
-      length: 2,
-      objective: "min_hops",
-      weight_sum: 1.6,
-      objective_value: 2,
+        nodes: [
+          { key: "paper:graph-rag" },
+          { key: "paper:agent-memory" },
+          { key: "paper:entity-links" },
+        ],
+        edges: [
+          {
+            from: { key: "paper:graph-rag" },
+            to: { key: "paper:agent-memory" },
+            direction: "out",
+            type: "extends",
+            weight: 0.88,
+          },
+          {
+            from: { key: "paper:agent-memory" },
+            to: { key: "paper:entity-links" },
+            direction: "out",
+            type: "mentions",
+            weight: 0.72,
+          },
+        ],
+        length: 2,
+        objective: "min_hops",
+        weight_sum: 1.6,
+        objective_value: 2,
       },
     },
   ],
   stats: { returned_items: 1, truncated: false },
 };
 
-function graphResultFor(request: QueryRequest): GraphResult {
+function graphResultFor(request: TableQueryRequest): GraphResult {
   const query = request.graph_queries?.explorer;
   if (query && "shortest_path" in query) return shortestPathResult;
   return traversalResult;
@@ -193,7 +188,7 @@ function graphResultFor(request: QueryRequest): GraphResult {
 
 const fakeClient = {
   tables: {
-    query: async (_tableName: string, request: QueryRequest) => {
+    query: async (_tableName: string, request: TableQueryRequest) => {
       if (!request.graph_queries) {
         return {
           responses: [
