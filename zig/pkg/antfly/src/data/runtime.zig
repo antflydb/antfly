@@ -5091,6 +5091,7 @@ pub const DataServer = struct {
     const ha_replication_default_max_response_bytes = 8 * 1024 * 1024;
     const ha_standby_replication_retry_interval_ns = 1 * std.time.ns_per_s;
     const ha_standby_replication_connect_timeout_ms = 10_000;
+    const ha_seed_snapshot_preflight_timeout_ns = 30 * std.time.ns_per_s;
 
     fn haStandbyReplicationHTTPExecutorConfig() antfly.common.http.StdHttpExecutorConfig {
         return .{
@@ -6233,6 +6234,30 @@ pub const DataServer = struct {
         return .{ .root = published_root };
     }
 
+    /// Converge process-local replay/enrichment work before seed capture takes
+    /// the exclusive HA mutation boundary. Background enrichment completion is
+    /// itself a durable primary mutation and must never be waited on while that
+    /// boundary is closed; doing so deadlocks capture and every HA state route.
+    /// The bounded verification inside DB.snapshotHASeed closes the remaining
+    /// race and converts it into a retryable busy result.
+    fn prepareDefaultHASeedSnapshotMaintenance(self: *DataServer) !void {
+        var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
+        defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
+        if (metadata_snapshot.tables.len == 0 or metadata_snapshot.ranges.len == 0)
+            return error.HASeedSnapshotIncompleteTopology;
+
+        const deadline_ns = platform_time.monotonicNs() +| ha_seed_snapshot_preflight_timeout_ns;
+        for (metadata_snapshot.ranges) |range| {
+            const table = findHASeedTable(metadata_snapshot.tables, range.table_id) orelse
+                return error.HASeedSnapshotTableMissingFromTopology;
+            try self.write_source.prepareHASeedReplicaSnapshot(
+                table.name,
+                range.group_id,
+                deadline_ns,
+            );
+        }
+    }
+
     fn findHASeedRange(ranges: []const antfly.metadata.RangeRecord, group_id: u64) ?antfly.metadata.RangeRecord {
         for (ranges) |range| if (range.group_id == group_id) return range;
         return null;
@@ -6535,6 +6560,13 @@ pub const DataServer = struct {
             return error.HASeedCaptureAlreadyInProgress;
         }
         defer self.ha_seed_capture_active.store(false, .release);
+
+        // The production provider snapshots live managed DBs. Drain their
+        // finite replay/enrichment tail before closing the process-wide
+        // mutation barrier; the provider performs a second bounded check after
+        // the close. Custom providers own their own immutable source contract.
+        if (self.ha_cfg.seed_snapshot_provider == null)
+            try self.prepareDefaultHASeedSnapshotMaintenance();
 
         // Global ordering is non-negotiable: capture excludes every durable
         // mutation before freezing the role pointer that keeps Primary alive.

@@ -17659,7 +17659,46 @@ pub const DB = struct {
     }
 
     pub fn snapshot(self: *DB, id: []const u8) !u64 {
-        return try self.snapshotInternal(id, false, .none);
+        return try self.snapshotInternal(id, false, .none, null);
+    }
+
+    /// Drain every durable replay/enrichment effect that a portable HA seed
+    /// must include before the runtime freezes its process-wide mutation
+    /// boundary. Seed capture calls this before taking that boundary: a
+    /// background enrichment completion may itself be a primary mutation and
+    /// therefore cannot make progress once the exclusive HA barrier is held.
+    pub fn prepareHASeedSnapshot(self: *DB, deadline_ns: u64) !void {
+        while (true) {
+            self.runMaintenanceUntilWithCancellation(
+                self.currentMaintenanceTargetSequence(),
+                .{},
+                .none,
+                deadline_ns,
+            ) catch |err| switch (err) {
+                // A retryable provider failure has already committed its
+                // source mutation. Seed preflight is the safe place to absorb
+                // that finite retry: returning it to the operator adds a full
+                // reconciliation round trip, while waiting after the global
+                // barrier closes would deadlock its eventual publication.
+                error.EnrichmentRetryInProgress => {
+                    const now_ns = platform_time.monotonicNs();
+                    if (now_ns >= deadline_ns) return error.EnrichmentWaitTimeout;
+                    sleepNs(@min(25 * std.time.ns_per_ms, deadline_ns - now_ns));
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
+    }
+
+    /// Capture a portable seed with a bounded final maintenance verification.
+    /// The runtime has already drained maintenance before freezing writes, but
+    /// the deadline closes the race between that preflight and acquisition of
+    /// the global HA barrier. A raced follow-up fails retryably instead of
+    /// holding HA state/control traffic forever.
+    pub fn snapshotHASeed(self: *DB, id: []const u8, maintenance_deadline_ns: u64) !u64 {
+        return try self.snapshotInternal(id, false, .none, maintenance_deadline_ns);
     }
 
     /// Captures the primary store and its validated generated projections as
@@ -17669,7 +17708,7 @@ pub const DB = struct {
     }
 
     pub fn snapshotNativeWithCancellation(self: *DB, id: []const u8, cancellation: types.CancellationToken) !u64 {
-        return try self.snapshotInternal(id, true, cancellation);
+        return try self.snapshotInternal(id, true, cancellation, null);
     }
 
     const SnapshotFenceTestHook = struct {
@@ -17680,7 +17719,13 @@ pub const DB = struct {
     };
     var test_snapshot_fence_hook: ?SnapshotFenceTestHook = null;
 
-    fn snapshotInternal(self: *DB, id: []const u8, include_generated: bool, cancellation: types.CancellationToken) !u64 {
+    fn snapshotInternal(
+        self: *DB,
+        id: []const u8,
+        include_generated: bool,
+        cancellation: types.CancellationToken,
+        maintenance_deadline_ns: ?u64,
+    ) !u64 {
         // Serialize only snapshot construction/publication. Normal writes can
         // resume before native manifest hashing, while same-ID captures cannot
         // race the fresh-directory check or atomic rename.
@@ -17721,7 +17766,16 @@ pub const DB = struct {
             // Portable snapshots omit generated files, but their replay log and
             // durable watermarks must still describe a converged generation so
             // restore can deterministically rebuild every managed projection.
-            try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+            if (maintenance_deadline_ns) |deadline_ns| {
+                try self.runMaintenanceUntilWithCancellation(
+                    self.currentMaintenanceTargetSequence(),
+                    .{},
+                    cancellation,
+                    deadline_ns,
+                );
+            } else {
+                try self.runMaintenanceUntil(self.currentMaintenanceTargetSequence(), .{});
+            }
             lockApply(self);
             var apply_held = true;
             defer if (apply_held) self.core.unlockApply();
@@ -70944,6 +70998,100 @@ test "storage.ha seed capture barrier prevents local commit without matching wal
     const stored = (try db.get(alloc, "doc:b")) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);
     try std.testing.expectEqualStrings("{\"title\":\"bravo\"}", stored);
+}
+
+test "storage.ha seed snapshot predrains enrichment before exclusive capture" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+
+    const alloc = std.testing.allocator;
+    var db_path_buf: [256]u8 = undefined;
+    const db_path = tempPath(&db_path_buf);
+    defer cleanupTempDir(db_path);
+    defer {
+        var snapshots_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(db_path)})) |snapshots| {
+            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+        } else |_| {}
+    }
+    var ha_log_path_buf: [256]u8 = undefined;
+    const ha_log_path = tempPath(&ha_log_path_buf);
+    defer cleanupTempDir(ha_log_path);
+    var ha_slots_path_buf: [256]u8 = undefined;
+    const ha_slots_path = tempPath(&ha_slots_path_buf);
+    defer cleanupTempDir(ha_slots_path);
+
+    var primary = try ha_primary_mod.Primary.open(alloc, ha_log_path, ha_slots_path, .{
+        .cluster_id = 252,
+        .shard_id = 5,
+        .table_id = 11,
+        .timeline_id = 1,
+        .epoch = 1,
+    }, .{});
+    defer primary.close();
+
+    var gated = GateDenseEmbedder{
+        .allowed_successes = .init(0),
+        .blocked_error = error.ResourceTemporarilyUnavailable,
+    };
+    var barrier: HAMutationBarrier = .{};
+    var db = try DB.open(alloc, std.mem.span(db_path), .{
+        .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
+        .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ha_async_batch_mirror = .{
+            .primary = &primary,
+            .mutation_barrier = &barrier,
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "semantic_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"semantic_idx\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha concept overview\"}" }},
+        .sync_level = .write,
+    });
+
+    var attempts: usize = 0;
+    while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        if (gated.blocked_requests.load(.acquire) > 0) break;
+        sleepNs(10 * std.time.ns_per_ms);
+    }
+    try std.testing.expect(gated.blocked_requests.load(.acquire) > 0);
+
+    // This is the production deadlock ordering: capture has frozen durable
+    // mutations while enrichment still needs a shared lease to publish its
+    // result. The final verification must return within its budget, never wait
+    // forever with HA state locked.
+    {
+        var premature_capture = barrier.acquireExclusive();
+        defer premature_capture.release();
+        gated.allowAll();
+        const premature_started_ns = platform_time.monotonicNs();
+        if (db.snapshotHASeed("premature", premature_started_ns +| 50 * std.time.ns_per_ms)) |_| {
+            return error.TestExpectedSeedSnapshotRuntimeBusy;
+        } else |err| {
+            try std.testing.expect(err == error.EnrichmentWaitTimeout or err == error.EnrichmentRetryInProgress);
+        }
+        try std.testing.expect(platform_time.monotonicNs() -| premature_started_ns < std.time.ns_per_s);
+    }
+
+    // Production performs this drain before taking the exclusive barrier.
+    try db.prepareHASeedSnapshot(platform_time.monotonicNs() +| 10 * std.time.ns_per_s);
+    var capture = barrier.acquireExclusive();
+    defer capture.release();
+    const snapshot_size = try db.snapshotHASeed(
+        "predrained",
+        platform_time.monotonicNs() +| std.time.ns_per_s,
+    );
+    try std.testing.expect(snapshot_size > 0);
 }
 
 test "storage.ha fence cannot strand a local commit beyond the HA tail" {

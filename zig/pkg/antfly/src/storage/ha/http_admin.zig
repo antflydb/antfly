@@ -251,7 +251,11 @@ pub const Server = struct {
         defer if (primary_fence_lease) |*lease| lease.release();
         const state_mutex = self.auth.state_mutex;
         if (state_mutex) |mutex| {
-            platform_sync.lockYielding(mutex);
+            // HA status/actions are reconciliation traffic, not an unbounded
+            // waiter queue. A long seed/fence transition must shed concurrent
+            // probes so disconnected operator retries cannot accumulate
+            // hundreds of spinning request workers behind one state owner.
+            if (!mutex.tryLock()) return try textResponse(self.alloc, 503, "HAStateTransitionBusy");
         }
         defer if (state_mutex) |mutex| mutex.unlock();
         defer if (self.auth.state_changed) |hook| hook.run();
@@ -2454,6 +2458,9 @@ fn commandErrorStatus(err: anyerror) u16 {
         error.SyncPolicyUnsatisfied,
         error.NonMonotonicFenceGeneration,
         => 409,
+        error.HASeedCaptureAlreadyInProgress,
+        error.HASeedSnapshotRuntimeBusy,
+        => 503,
         error.SlotNotFound,
         error.BackupStartNotFound,
         error.BackupSlotNotFound,
@@ -3507,6 +3514,25 @@ test "storage.ha http admin holds state lock through mutation hook" {
     try std.testing.expect(observation.hook_observed_lock);
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
+}
+
+test "storage.ha http admin sheds requests while state transition is busy" {
+    const alloc = std.testing.allocator;
+    var mutex: std.atomic.Mutex = .unlocked;
+    var server = Server.initWithOptions(alloc, .{}, .{ .state_mutex = &mutex });
+    defer server.deinit();
+
+    try std.testing.expect(mutex.tryLock());
+    var busy = try server.handle(.{ .method = .GET, .uri = Routes.ready });
+    defer busy.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), busy.status);
+    try std.testing.expectEqualStrings("HAStateTransitionBusy", busy.body);
+    mutex.unlock();
+
+    var ready = try server.handle(.{ .method = .GET, .uri = Routes.ready });
+    defer ready.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 503), ready.status);
+    try std.testing.expectEqualStrings("not ready", ready.body);
 }
 
 test "storage.ha http admin reports unsafe promotion as conflict" {

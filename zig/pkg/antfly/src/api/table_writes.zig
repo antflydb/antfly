@@ -12117,6 +12117,30 @@ pub const ProvisionedTableWriteSource = struct {
         return try captureHASeedDbSnapshot(alloc, &db, path, snapshot_token, destination_root);
     }
 
+    /// Drain a live writer before the runtime freezes the process-wide HA
+    /// mutation barrier. Cold replicas have no process-local maintenance debt;
+    /// they are opened and verified by the capture path after the freeze.
+    pub fn prepareHASeedReplicaSnapshot(
+        self: *ProvisionedTableWriteSource,
+        table_name: []const u8,
+        group_id: u64,
+        deadline_ns: u64,
+    ) !void {
+        var probe = self.probeManagedWriterGroupBestEffort(table_name, group_id);
+        defer probe.deinit();
+        switch (probe) {
+            .unknown => return error.HASeedSnapshotRuntimeBusy,
+            .absent => return,
+            .leased => |*cached| cached.db.prepareHASeedSnapshot(deadline_ns) catch |err| switch (err) {
+                error.EnrichmentWaitCanceled,
+                error.EnrichmentWaitTimeout,
+                error.EnrichmentRetryInProgress,
+                => return error.HASeedSnapshotRuntimeBusy,
+                else => return err,
+            },
+        }
+    }
+
     fn captureHASeedDbSnapshot(
         alloc: std.mem.Allocator,
         db: *db_mod.DB,
@@ -12134,7 +12158,14 @@ pub const ProvisionedTableWriteSource = struct {
         defer io_impl.deinit();
         Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
         defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
-        _ = try db.snapshot(snapshot_token);
+        const maintenance_deadline_ns = platform_time.monotonicNs() +| std.time.ns_per_s;
+        _ = db.snapshotHASeed(snapshot_token, maintenance_deadline_ns) catch |err| switch (err) {
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.EnrichmentRetryInProgress,
+            => return error.HASeedSnapshotRuntimeBusy,
+            else => return err,
+        };
         try backups_api.copyDirectoryRecursive(alloc, snapshot_root, destination_root);
     }
 
