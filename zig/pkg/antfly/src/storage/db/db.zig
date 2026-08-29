@@ -36002,7 +36002,9 @@ fn buildDerivedBatch(
         try appendOwnedConstBytes(alloc, &changed_artifact_keys_list, key);
     }
     for (deleted_artifact_keys) |key| {
-        if (!internal_keys.isAssetArtifactKey(key) and !internal_keys.isGraphEdgeArtifactKey(key)) continue;
+        if (!internal_keys.isAssetArtifactKey(key) and
+            !internal_keys.isChunkArtifactRecordKey(key) and
+            !internal_keys.isGraphEdgeArtifactKey(key)) continue;
         try appendOwnedConstBytes(alloc, &changed_artifact_keys_list, key);
     }
 
