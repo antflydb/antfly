@@ -123,6 +123,9 @@ pub const Jp2ColorMetadata = struct {
     color_method: ?box.ColorMethod = null,
     enumerated_color_space: ?u32 = null,
     has_icc_profile: bool = false,
+    /// Borrowed from the JP2 container bytes and valid for the lifetime of the
+    /// decode input. Consumers must apply or copy it before releasing input.
+    icc_profile: []const u8 = &.{},
     /// Indexed by codestream component. Five is the maximum component count
     /// accepted by the U8 decoder, so metadata remains allocation-free after
     /// the JP2 box parser returns.
@@ -141,6 +144,7 @@ pub const Jp2ColorMetadata = struct {
             metadata.color_method = color_spec.method;
             if (color_spec.method == .enumerated) metadata.enumerated_color_space = color_spec.enum_cs;
             metadata.has_icc_profile = color_spec.method == .restricted_icc or color_spec.method == .any_icc;
+            if (metadata.has_icc_profile) metadata.icc_profile = color_spec.icc_profile;
         }
         if (parsed.cdef) |definitions| {
             for (definitions) |definition| {

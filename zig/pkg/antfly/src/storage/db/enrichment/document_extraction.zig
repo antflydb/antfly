@@ -123,9 +123,35 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
             effective_dpi: u16,
             width: u32,
             height: u32,
+            quality: RenderQuality = .native,
+            diagnostics: ?PageRenderDiagnostics = null,
+        };
+
+        pub const RenderQuality = enum { native, degraded, compatibility_backend };
+        pub const RenderProfile = enum { exact, ocr };
+        pub const TextFallbackReason = enum {
+            missing_font,
+            unsupported_font,
+            missing_text_data,
+            missing_glyph,
+            invalid_font_program,
+            outline_too_complex,
+            unsupported_resource,
+            materialization_limit,
+            vector_work_limit,
+            font_work_limit,
+            other,
+        };
+        pub const PageRenderDiagnostics = struct {
+            fallback_text_groups: u32 = 0,
+            first_fallback_reason: ?TextFallbackReason = null,
         };
 
         pub fn renderParsedPagePngAdaptiveAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64, _: u32) anyerror!RenderedPagePng {
+            return error.PdfRenderingUnavailable;
+        }
+
+        pub fn renderParsedPagePngAdaptiveWithProfileAlloc(_: Allocator, _: *reader.Reader, _: usize, _: u16, _: u64, _: u32, _: RenderProfile) anyerror!RenderedPagePng {
             return error.PdfRenderingUnavailable;
         }
     }
@@ -289,6 +315,22 @@ pub fn renderPdfPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_numbe
 
 pub const RenderedPdfPage = pdf.RenderedPagePng;
 
+pub fn recordPdfRenderQualityWarningAlloc(alloc: Allocator, unit: *Unit, rendered: RenderedPdfPage) !void {
+    if (rendered.quality == .native) return;
+    const fallback_groups = if (rendered.diagnostics) |diagnostics| diagnostics.fallback_text_groups else 0;
+    const fallback_reason = if (rendered.diagnostics) |diagnostics|
+        if (diagnostics.first_fallback_reason) |reason| @tagName(reason) else "none"
+    else
+        "none";
+    const quality_name = @tagName(rendered.quality);
+    const warning = if (unit.extraction_warning) |existing|
+        try std.fmt.allocPrint(alloc, "{s};pdf_render_quality:{s}:fallback_groups={d}:reason={s}", .{ existing, quality_name, fallback_groups, fallback_reason })
+    else
+        try std.fmt.allocPrint(alloc, "pdf_render_quality:{s}:fallback_groups={d}:reason={s}", .{ quality_name, fallback_groups, fallback_reason });
+    if (unit.extraction_warning) |existing| alloc.free(existing);
+    unit.extraction_warning = warning;
+}
+
 pub const PdfRenderSession = struct {
     parsed: pdf.reader.Reader,
 
@@ -310,7 +352,7 @@ pub const PdfRenderSession = struct {
     }
 
     pub fn renderPagePngAdaptiveAlloc(self: *PdfRenderSession, alloc: Allocator, page_number: usize, dpi: u16, max_pixels: u64, max_dimension: u32) !RenderedPdfPage {
-        return try pdf.renderParsedPagePngAdaptiveAlloc(alloc, &self.parsed, page_number, dpi, max_pixels, max_dimension);
+        return try pdf.renderParsedPagePngAdaptiveWithProfileAlloc(alloc, &self.parsed, page_number, dpi, max_pixels, max_dimension, .ocr);
     }
 };
 
@@ -726,6 +768,128 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     if (embedded.corrupted_line_ratio != ocr.corrupted_line_ratio) return ocr.corrupted_line_ratio < embedded.corrupted_line_ratio;
     if (embedded.single_char_word_ratio != ocr.single_char_word_ratio) return ocr.single_char_word_ratio < embedded.single_char_word_ratio;
     return ocr.trimmed_len > embedded.trimmed_len;
+}
+
+/// Content-aware merger policy for numeric tables. Vision OCR can improve
+/// prose quality while silently dropping dense cells; when embedded PDF text
+/// contains a substantial numeric table, require the OCR candidate to retain
+/// most of its numeric-token occurrences before replacing it.
+pub fn preferOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !bool {
+    return (try chooseOcrTextForContentAlloc(alloc, embedded_text, ocr_text, embedded, ocr)) != .embedded;
+}
+
+pub const OcrTextChoice = enum { embedded, ocr, ocr_with_embedded_numeric_rows };
+
+pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !OcrTextChoice {
+    const quality_prefers_ocr = preferOcrText(embedded, ocr);
+    if (!quality_prefers_ocr) return .embedded;
+    const numeric_recall = try numericTokenRecallAlloc(alloc, embedded_text, ocr_text);
+    if (numeric_recall.reference_count >= 8 and numeric_recall.recall < 0.85 and
+        embedded.replacement_char_ratio <= 0.20)
+        return .ocr_with_embedded_numeric_rows;
+    return .ocr;
+}
+
+/// Append only numeric-rich embedded lines containing occurrences absent from
+/// OCR. Candidate token counts are consumed in document order, so repeated
+/// values are handled as a multiset instead of being mistaken for one match.
+pub fn mergeOcrWithEmbeddedNumericRowsAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8) ![]u8 {
+    var candidate_counts = std.StringHashMapUnmanaged(u32).empty;
+    defer candidate_counts.deinit(alloc);
+    var tokens = std.mem.tokenizeAny(u8, ocr_text, &std.ascii.whitespace);
+    while (tokens.next()) |raw| {
+        const token = normalizedNumericToken(raw) orelse continue;
+        const entry = try candidate_counts.getOrPut(alloc, token);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* +|= 1;
+    }
+
+    var retained = std.ArrayList(u8).empty;
+    defer retained.deinit(alloc);
+    var previous_line: ?[]const u8 = null;
+    var previous_appended = false;
+    var lines = std.mem.splitScalar(u8, embedded_text, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        var numeric_count: usize = 0;
+        var missing_count: usize = 0;
+        tokens = std.mem.tokenizeAny(u8, line, &std.ascii.whitespace);
+        while (tokens.next()) |raw| {
+            const token = normalizedNumericToken(raw) orelse continue;
+            numeric_count += 1;
+            if (candidate_counts.getPtr(token)) |count| {
+                if (count.* > 0) {
+                    count.* -= 1;
+                    continue;
+                }
+            }
+            missing_count += 1;
+        }
+        if (numeric_count >= 2 and missing_count > 0) {
+            if (!previous_appended) if (previous_line) |header| {
+                if (header.len > 0) {
+                    try retained.appendSlice(alloc, header);
+                    try retained.append(alloc, '\n');
+                }
+            };
+            try retained.appendSlice(alloc, line);
+            try retained.append(alloc, '\n');
+            previous_appended = true;
+        } else {
+            previous_appended = false;
+        }
+        previous_line = line;
+    }
+    if (retained.items.len == 0) return try alloc.dupe(u8, ocr_text);
+    return try std.fmt.allocPrint(
+        alloc,
+        "{s}\n\n--- Embedded PDF table rows preserved for numeric accuracy ---\n{s}",
+        .{ std.mem.trimEnd(u8, ocr_text, &std.ascii.whitespace), std.mem.trimEnd(u8, retained.items, &std.ascii.whitespace) },
+    );
+}
+
+const NumericTokenRecall = struct { reference_count: usize, recall: f64 };
+
+fn numericTokenRecallAlloc(alloc: Allocator, reference: []const u8, candidate: []const u8) !NumericTokenRecall {
+    var remaining = std.StringHashMapUnmanaged(u32).empty;
+    defer remaining.deinit(alloc);
+    var reference_count: usize = 0;
+    var tokens = std.mem.tokenizeAny(u8, reference, &std.ascii.whitespace);
+    while (tokens.next()) |raw| {
+        const token = normalizedNumericToken(raw) orelse continue;
+        reference_count += 1;
+        // Keys borrow from `reference`, which outlives this page-local map.
+        // Avoid one allocation per table cell while preserving duplicate
+        // counts for recall.
+        const entry = try remaining.getOrPut(alloc, token);
+        if (!entry.found_existing) {
+            entry.key_ptr.* = token;
+            entry.value_ptr.* = 0;
+        }
+        entry.value_ptr.* +|= 1;
+    }
+    if (reference_count == 0) return .{ .reference_count = 0, .recall = 1.0 };
+
+    var matched: usize = 0;
+    tokens = std.mem.tokenizeAny(u8, candidate, &std.ascii.whitespace);
+    while (tokens.next()) |raw| {
+        const token = normalizedNumericToken(raw) orelse continue;
+        if (remaining.getPtr(token)) |count| if (count.* > 0) {
+            count.* -= 1;
+            matched += 1;
+        };
+    }
+    return .{
+        .reference_count = reference_count,
+        .recall = @as(f64, @floatFromInt(matched)) / @as(f64, @floatFromInt(reference_count)),
+    };
+}
+
+fn normalizedNumericToken(raw: []const u8) ?[]const u8 {
+    const token = std.mem.trim(u8, raw, "|,;:()[]{}<>$%*`_\"");
+    if (token.len == 0 or token.len > 64) return null;
+    for (token) |byte| if (std.ascii.isDigit(byte)) return token;
+    return null;
 }
 
 pub fn ocrQualityJsonAlloc(alloc: Allocator, quality: OcrQuality) ![]u8 {
@@ -3806,6 +3970,48 @@ test "OCR text selection retains embedded text on ties and chooses a better tran
     try std.testing.expect(trivial_ocr.too_short);
     try std.testing.expect(!embedded.too_short);
     try std.testing.expect(!preferOcrText(embedded, trivial_ocr));
+}
+
+test "OCR text selection preserves dense embedded numeric tables" {
+    const alloc = std.testing.allocator;
+    const config = OcrQualityConfig{};
+    const embedded_text = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
+    const missing_cells = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
+    const preserved_cells = "Quarter Revenue Cost Margin Q1 101 81 20 Q2 115 90 25 Q3 124 94 30 Q4 140 100 40 with complete table values and readable prose.";
+    const embedded = assessOcrQuality(embedded_text, config);
+    const missing = assessOcrQuality(missing_cells, config);
+    const preserved = assessOcrQuality(preserved_cells, config);
+    try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(alloc, embedded_text, missing_cells, embedded, missing));
+    try std.testing.expect(try preferOcrTextForContentAlloc(alloc, embedded_text, preserved_cells, embedded, preserved));
+
+    const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded_text, missing_cells);
+    defer alloc.free(merged);
+    try std.testing.expect(std.mem.startsWith(u8, merged, missing_cells));
+    try std.testing.expect(std.mem.indexOf(u8, merged, "Q1 101 81 20") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "Q4 140 100 40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, merged, "numeric accuracy") != null);
+}
+
+test "PDF render quality warning preserves prior diagnostics and fallback reason" {
+    const alloc = std.testing.allocator;
+    var unit = Unit{
+        .unit_id = try alloc.dupe(u8, "page-1"),
+        .unit_type = try alloc.dupe(u8, "page"),
+        .text = try alloc.dupe(u8, "text"),
+        .method = try alloc.dupe(u8, "pdf_text"),
+        .extraction_warning = try alloc.dupe(u8, "existing"),
+    };
+    defer unit.deinit(alloc);
+    try recordPdfRenderQualityWarningAlloc(alloc, &unit, .{
+        .png = @constCast(&.{}),
+        .requested_dpi = 150,
+        .effective_dpi = 150,
+        .width = 1,
+        .height = 1,
+        .quality = .degraded,
+        .diagnostics = .{ .fallback_text_groups = 2, .first_fallback_reason = .outline_too_complex },
+    });
+    try std.testing.expectEqualStrings("existing;pdf_render_quality:degraded:fallback_groups=2:reason=outline_too_complex", unit.extraction_warning.?);
 }
 
 test "OCR meaningful content rejects punctuation while retaining text and table values" {

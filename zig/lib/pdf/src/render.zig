@@ -95,9 +95,26 @@ pub fn renderPageContentPngInBoxRotated(
     shape_runs: []const reader.ShapeRun,
     rotation: PageRotation,
 ) ![]u8 {
-    var raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs);
+    return try renderPageContentPngInBoxRotatedCancelable(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, rotation, .{});
+}
+
+pub fn renderPageContentPngInBoxRotatedCancelable(
+    alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    rotation: PageRotation,
+    cancellation: reader.CancellationProbe,
+) ![]u8 {
+    try cancellation.check();
+    var raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation);
     defer alloc.free(raw.rgba);
+    try cancellation.check();
     try rotateRawPageCanvasAlloc(alloc, &raw, rotation);
+    try cancellation.check();
     return try image.png.encodeRgba(alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba);
 }
 
@@ -452,7 +469,9 @@ fn renderChildGroupAlloc(
     shape_runs: []const reader.ShapeRun,
     plan: *const RenderPlan,
     group_index: usize,
+    cancellation: reader.CancellationProbe,
 ) anyerror!void {
+    try cancellation.check();
     const meta = plan.groups[group_index];
     const child = try alloc.alloc(u8, width * height * 4);
     defer alloc.free(child);
@@ -461,7 +480,7 @@ fn renderChildGroupAlloc(
     } else {
         @memcpy(child, target);
     }
-    try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout);
+    try renderGroupChildrenAlloc(alloc, child, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, group_index + 1, meta.knockout, cancellation);
     if (meta.isolated) {
         compositeGroupCanvas(target, child);
     } else {
@@ -482,14 +501,16 @@ fn renderChoiceAlloc(
     shape_runs: []const reader.ShapeRun,
     plan: *const RenderPlan,
     choice: RenderChoice,
+    cancellation: reader.CancellationProbe,
 ) !void {
+    try cancellation.check();
     switch (choice) {
         .text => |idx| drawTextRun(canvas, width, height, 0, page_box.min_x, page_box.max_y, text_runs[idx]),
-        .image => |idx| drawImageRun(canvas, width, height, 0, page_box.min_x, page_box.max_y, image_runs[idx]),
-        .shading => |idx| drawShadingRun(canvas, width, height, page_box.min_x, page_box.max_y, shading_runs[idx]),
-        .pattern => |idx| try drawPatternRun(alloc, canvas, width, height, page_box.min_x, page_box.max_y, pattern_runs[idx]),
-        .shape => |idx| drawShapeRun(canvas, width, height, page_box.min_x, page_box.max_y, shape_runs[idx]),
-        .group => |idx| try renderChildGroupAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, idx),
+        .image => |idx| try drawImageRunCancelable(canvas, width, height, 0, page_box.min_x, page_box.max_y, image_runs[idx], cancellation),
+        .shading => |idx| try drawShadingRunCancelable(canvas, width, height, page_box.min_x, page_box.max_y, shading_runs[idx], cancellation),
+        .pattern => |idx| try drawPatternRunCancelable(alloc, canvas, width, height, page_box.min_x, page_box.max_y, pattern_runs[idx], cancellation),
+        .shape => |idx| try drawShapeRunAllocCancelable(alloc, canvas, width, height, page_box.min_x, page_box.max_y, shape_runs[idx], cancellation),
+        .group => |idx| try renderChildGroupAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, idx, cancellation),
     }
 }
 
@@ -584,6 +605,7 @@ fn renderGroupChildrenAlloc(
     plan: *const RenderPlan,
     schedule_index: usize,
     knockout: bool,
+    cancellation: reader.CancellationProbe,
 ) anyerror!void {
     const backdrop = if (knockout) try alloc.dupe(u8, canvas) else null;
     defer if (backdrop) |buf| alloc.free(buf);
@@ -591,14 +613,15 @@ fn renderGroupChildrenAlloc(
     defer if (scratch) |buf| alloc.free(buf);
 
     for (plan.schedules[schedule_index].items) |choice| {
+        try cancellation.check();
         if (knockout) {
             const rect = renderChoicePixelRect(choice, width, height, page_box, text_runs, image_runs, pattern_runs, shape_runs);
             if (rect.empty()) continue;
             copyCanvasRect(scratch.?, backdrop.?, width, rect);
-            try renderChoiceAlloc(alloc, scratch.?, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
+            try renderChoiceAlloc(alloc, scratch.?, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice, cancellation);
             replaceCanvasWhereChangedRect(canvas, scratch.?, backdrop.?, width, rect);
         } else {
-            try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice);
+            try renderChoiceAlloc(alloc, canvas, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, plan, choice, cancellation);
         }
     }
 }
@@ -611,7 +634,9 @@ fn renderPageContentRgbaInBoxAlloc(
     shading_runs: []const reader.ShadingRun,
     pattern_runs: []const reader.PatternRun,
     shape_runs: []const reader.ShapeRun,
+    cancellation: reader.CancellationProbe,
 ) !RawPageCanvas {
+    try cancellation.check();
     const page_w = @max(1.0, page_box.max_x - page_box.min_x);
     const page_h = @max(1.0, page_box.max_y - page_box.min_y);
     const width = ceilPositiveToUsize(page_w, 1);
@@ -628,7 +653,7 @@ fn renderPageContentRgbaInBoxAlloc(
     const rgba = try alloc.alloc(u8, rgba_len);
     errdefer alloc.free(rgba);
     @memset(rgba, 0xff);
-    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false);
+    try renderGroupChildrenAlloc(alloc, rgba, width, height, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, &plan, 0, false, cancellation);
 
     return .{ .rgba = rgba, .width = width, .height = height };
 }
@@ -781,6 +806,10 @@ fn drawTextRun(
 }
 
 fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, min_x: f64, max_y: f64, run: reader.ImageRun) void {
+    drawImageRunCancelable(canvas, canvas_w, canvas_h, margin, min_x, max_y, run, .{}) catch unreachable;
+}
+
+fn drawImageRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, min_x: f64, max_y: f64, run: reader.ImageRun, cancellation: reader.CancellationProbe) !void {
     const det = run.a * run.d - run.b * run.c;
     if (@abs(det) < 0.000001) return;
 
@@ -800,9 +829,15 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
     // boundaries for bilevel scans and line art when /Interpolate is absent
     // or false, even when the image is minified.
     const filtered = run.interpolate;
+    const projected_width = @sqrt(run.a * run.a + run.b * run.b);
+    const projected_height = @sqrt(run.c * run.c + run.d * run.d);
+    const coverage_minify = run.ocr_coverage_minify and run.bilevel and
+        (@as(f64, @floatFromInt(run.width)) > projected_width or
+            @as(f64, @floatFromInt(run.height)) > projected_height);
 
     var py = y0;
     while (py < y1) : (py += 1) {
+        if ((py - y0) & 31 == 0) try cancellation.check();
         var px = x0;
         while (px < x1) : (px += 1) {
             const world_x = pixelWorldX(min_x, margin, px);
@@ -816,7 +851,9 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
 
             const dst = (py * canvas_w + px) * 4;
             var sample: [4]u8 = undefined;
-            if (filtered) {
+            if (coverage_minify) {
+                sample = coveragePreservingBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d);
+            } else if (filtered) {
                 sample = bilinearImageSample(run, u, 1.0 - v);
             } else {
                 const sx = @min(run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(run.width))))));
@@ -828,6 +865,38 @@ fn drawImageRun(canvas: []u8, canvas_w: usize, canvas_h: usize, margin: usize, m
             blendPixelMode(canvas, dst, sample, run.blend_mode);
         }
     }
+}
+
+/// OCR benefits from retaining the ink coverage of one-bit scans when many
+/// source pixels collapse into one destination pixel. A fixed 4x4 stratified
+/// footprint is deterministic and bounded, handles rotated/sheared image
+/// matrices through the inverse transform, and averages premultiplied color
+/// so masks do not grow dark fringes.
+fn coveragePreservingBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64) [4]u8 {
+    const offsets = [_]f64{ 0.125, 0.375, 0.625, 0.875 };
+    var alpha_sum: u32 = 0;
+    var premultiplied_sum: [3]u64 = .{ 0, 0, 0 };
+    for (offsets) |oy| for (offsets) |ox| {
+        const sample_world_x = world_x + ox - 0.5;
+        const sample_world_y = world_y - oy + 0.5;
+        const dx = sample_world_x - run.e;
+        const dy = sample_world_y - run.f;
+        const u = inv_a * dx + inv_c * dy;
+        const v = inv_b * dx + inv_d * dy;
+        if (!finite(u) or !finite(v) or u < 0 or u > 1 or v < 0 or v > 1) continue;
+        const sx = @min(run.width - 1, @as(u32, @intFromFloat(@floor(u * @as(f64, @floatFromInt(run.width))))));
+        const sy = @min(run.height - 1, @as(u32, @intFromFloat(@floor((1.0 - v) * @as(f64, @floatFromInt(run.height))))));
+        const src = (@as(usize, sy) * @as(usize, run.width) + @as(usize, sx)) * 4;
+        const alpha = run.rgba[src + 3];
+        alpha_sum += alpha;
+        for (0..3) |channel| premultiplied_sum[channel] += @as(u64, run.rgba[src + channel]) * alpha;
+    };
+    const averaged_alpha: u8 = @intCast((alpha_sum + 8) / 16);
+    var result: [4]u8 = .{ 0, 0, 0, averaged_alpha };
+    if (alpha_sum != 0) for (0..3) |channel| {
+        result[channel] = @intCast((premultiplied_sum[channel] + alpha_sum / 2) / alpha_sum);
+    };
+    return result;
 }
 
 fn bilinearImageSample(run: reader.ImageRun, u: f64, v: f64) [4]u8 {
@@ -878,6 +947,130 @@ fn imageRunBounds(run: reader.ImageRun) struct { min_x: f64, max_x: f64, min_y: 
         .min_y = @min(@min(y0, y1), @min(y2, y3)),
         .max_y = @max(@max(y0, y1), @max(y2, y3)),
     };
+}
+
+const FillIntersection = struct {
+    x: f64,
+    winding_delta: i8,
+};
+
+/// Font outlines are antialiased fills with potentially thousands of edges.
+/// Testing every edge at every pixel is quadratic in glyph detail and made
+/// valid traced/CJK fonts indistinguishable from hostile input. Build the
+/// crossings once per subpixel scanline, then fill spans in raster order.
+fn drawShapeRunAlloc(
+    alloc: Allocator,
+    canvas: []u8,
+    canvas_w: usize,
+    canvas_h: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.ShapeRun,
+) !void {
+    return try drawShapeRunAllocCancelable(alloc, canvas, canvas_w, canvas_h, min_x, max_y, run, .{});
+}
+
+fn drawShapeRunAllocCancelable(
+    alloc: Allocator,
+    canvas: []u8,
+    canvas_w: usize,
+    canvas_h: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.ShapeRun,
+    cancellation: reader.CancellationProbe,
+) !void {
+    const scanline_fill = run.kind == .fill and run.antialias and run.closed and
+        run.clip_points == null and run.points.len >= 3;
+    if (!scanline_fill) {
+        drawShapeRun(canvas, canvas_w, canvas_h, min_x, max_y, run);
+        return;
+    }
+
+    const bounds = shapeRunBounds(run);
+    const x0 = floorToCanvas(bounds.min_x - min_x, canvas_w);
+    const x1 = ceilToCanvas(bounds.max_x - min_x, canvas_w);
+    const y0 = floorToCanvas(max_y - bounds.max_y, canvas_h);
+    const y1 = ceilToCanvas(max_y - bounds.min_y, canvas_h);
+    if (x0 >= x1 or y0 >= y1) return;
+
+    const coverage = try alloc.alloc(u8, x1 - x0);
+    defer alloc.free(coverage);
+    var intersections = std.ArrayList(FillIntersection).empty;
+    defer intersections.deinit(alloc);
+    try intersections.ensureTotalCapacity(alloc, run.points.len);
+
+    const implicit_starts = [_]usize{0};
+    const starts: []const usize = run.subpath_starts orelse &implicit_starts;
+    const y_offsets = [_]f64{ 0.25, 0.75 };
+    const x_offsets = [_]f64{ 0.25, 0.75 };
+    var py = y0;
+    while (py < y1) : (py += 1) {
+        if ((py - y0) & 31 == 0) try cancellation.check();
+        @memset(coverage, 0);
+        for (y_offsets) |oy| {
+            intersections.clearRetainingCapacity();
+            const sample_y = max_y - (@as(f64, @floatFromInt(py)) + oy);
+            if (run.clip_box) |clip| if (sample_y < clip.min_y or sample_y > clip.max_y) continue;
+            for (starts, 0..) |start, subpath_index| {
+                const end = if (subpath_index + 1 < starts.len) starts[subpath_index + 1] else run.points.len;
+                if (end <= start + 2) continue;
+                var previous = run.points[end - 1];
+                for (run.points[start..end]) |point| {
+                    const low_y = @min(previous[1], point[1]);
+                    const high_y = @max(previous[1], point[1]);
+                    if (sample_y >= low_y and sample_y < high_y and high_y > low_y) {
+                        const t = (sample_y - previous[1]) / (point[1] - previous[1]);
+                        intersections.appendAssumeCapacity(.{
+                            .x = previous[0] + t * (point[0] - previous[0]),
+                            .winding_delta = if (point[1] > previous[1]) 1 else -1,
+                        });
+                    }
+                    previous = point;
+                }
+            }
+            if (intersections.items.len < 2) continue;
+            std.mem.sort(FillIntersection, intersections.items, {}, struct {
+                fn lessThan(_: void, left: FillIntersection, right: FillIntersection) bool {
+                    return left.x < right.x;
+                }
+            }.lessThan);
+
+            var winding: i32 = 0;
+            var parity = false;
+            var crossing: usize = 0;
+            while (crossing < intersections.items.len) {
+                const left_x = intersections.items[crossing].x;
+                var next = crossing;
+                var delta: i32 = 0;
+                while (next < intersections.items.len and @abs(intersections.items[next].x - left_x) <= 0.000000001) : (next += 1) {
+                    delta += intersections.items[next].winding_delta;
+                }
+                if (run.fill_rule == .even_odd) parity = parity != ((next - crossing) % 2 == 1) else winding += delta;
+                if (next >= intersections.items.len) break;
+                const right_x = intersections.items[next].x;
+                const inside = if (run.fill_rule == .even_odd) parity else winding != 0;
+                if (inside and right_x > left_x) {
+                    const px_start = @max(x0, floorToCanvas(left_x - min_x, canvas_w));
+                    const px_end = @min(x1, ceilToCanvas(right_x - min_x, canvas_w));
+                    var px = px_start;
+                    while (px < px_end) : (px += 1) for (x_offsets) |ox| {
+                        const sample_x = min_x + @as(f64, @floatFromInt(px)) + ox;
+                        const inside_clip = if (run.clip_box) |clip| sample_x >= clip.min_x and sample_x <= clip.max_x else true;
+                        if (inside_clip and sample_x >= left_x and sample_x < right_x) coverage[px - x0] += 1;
+                    };
+                }
+                crossing = next;
+            }
+        }
+
+        for (coverage, 0..) |sample_coverage, local_x| {
+            if (sample_coverage == 0) continue;
+            var color = run.color;
+            color[3] = @intCast((@as(u16, color[3]) * sample_coverage + 2) / 4);
+            blendPixelMode(canvas, (py * canvas_w + x0 + local_x) * 4, color, run.blend_mode);
+        }
+    }
 }
 
 fn drawShapeRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_y: f64, run: reader.ShapeRun) void {
@@ -936,9 +1129,14 @@ fn shapeCoverage4x(px: usize, py: usize, min_x: f64, max_y: f64, run: reader.Sha
 }
 
 fn drawShadingRun(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_y: f64, run: reader.ShadingRun) void {
+    drawShadingRunCancelable(canvas, canvas_w, canvas_h, min_x, max_y, run, .{}) catch unreachable;
+}
+
+fn drawShadingRunCancelable(canvas: []u8, canvas_w: usize, canvas_h: usize, min_x: f64, max_y: f64, run: reader.ShadingRun, cancellation: reader.CancellationProbe) !void {
     const has_clip = run.clip_box != null or run.clip_points != null;
     var py: usize = 0;
     while (py < canvas_h) : (py += 1) {
+        if (py & 31 == 0) try cancellation.check();
         var px: usize = 0;
         while (px < canvas_w) : (px += 1) {
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
@@ -963,6 +1161,19 @@ fn drawPatternRun(
     min_x: f64,
     max_y: f64,
     run: reader.PatternRun,
+) anyerror!void {
+    return try drawPatternRunCancelable(alloc, canvas, canvas_w, canvas_h, min_x, max_y, run, .{});
+}
+
+fn drawPatternRunCancelable(
+    alloc: Allocator,
+    canvas: []u8,
+    canvas_w: usize,
+    canvas_h: usize,
+    min_x: f64,
+    max_y: f64,
+    run: reader.PatternRun,
+    cancellation: reader.CancellationProbe,
 ) anyerror!void {
     const ShapeKind = @FieldType(reader.ShapeRun, "kind");
     const bounds = shapeRunBounds(.{
@@ -998,6 +1209,7 @@ fn drawPatternRun(
         const shading = run.shading orelse return;
         var py: usize = y0;
         while (py < y1) : (py += 1) {
+            if ((py - y0) & 31 == 0) try cancellation.check();
             var px: usize = x0;
             while (px < x1) : (px += 1) {
                 const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
@@ -1052,7 +1264,7 @@ fn drawPatternRun(
         return;
     }
 
-    const tile = try renderPatternTileCanvasAlloc(alloc, run);
+    const tile = try renderPatternTileCanvasAlloc(alloc, run, cancellation);
     defer alloc.free(tile.rgba);
     const det = run.pattern_matrix.a * run.pattern_matrix.d - run.pattern_matrix.b * run.pattern_matrix.c;
     if (@abs(det) < 0.000001) return;
@@ -1063,6 +1275,7 @@ fn drawPatternRun(
 
     var py = y0;
     while (py < y1) : (py += 1) {
+        if ((py - y0) & 31 == 0) try cancellation.check();
         var px = x0;
         while (px < x1) : (px += 1) {
             const world_x = min_x + (@as(f64, @floatFromInt(px)) + 0.5);
@@ -1141,7 +1354,7 @@ const RawTile = struct {
     height: usize,
 };
 
-fn renderPatternTileCanvasAlloc(alloc: Allocator, run: reader.PatternRun) anyerror!RawTile {
+fn renderPatternTileCanvasAlloc(alloc: Allocator, run: reader.PatternRun, cancellation: reader.CancellationProbe) anyerror!RawTile {
     const raw = try renderPageContentRgbaInBoxAlloc(
         alloc,
         run.pattern_bbox,
@@ -1150,6 +1363,7 @@ fn renderPatternTileCanvasAlloc(alloc: Allocator, run: reader.PatternRun) anyerr
         run.tile_shading_runs,
         run.tile_pattern_runs,
         run.tile_shape_runs,
+        cancellation,
     );
     return .{ .rgba = raw.rgba, .width = raw.width, .height = raw.height };
 }
@@ -1635,12 +1849,14 @@ fn drawAffineFallbackGlyph(
     if (@abs(det) < 0.000001) return;
     const ascent = effectiveRunAscent(run);
     const descent = effectiveRunDescent(run);
+    const glyph_x = if (run.vertical) -local_w / 2.0 else local_x;
+    const glyph_y = if (run.vertical) -local_x else 0;
 
     const corners = [_][2]f64{
-        .{ run.x + run.a * local_x - run.c * descent, run.y + run.b * local_x - run.d * descent },
-        .{ run.x + run.a * (local_x + local_w) - run.c * descent, run.y + run.b * (local_x + local_w) - run.d * descent },
-        .{ run.x + run.a * local_x + run.c * ascent, run.y + run.b * local_x + run.d * ascent },
-        .{ run.x + run.a * (local_x + local_w) + run.c * ascent, run.y + run.b * (local_x + local_w) + run.d * ascent },
+        .{ run.x + run.a * glyph_x + run.c * (glyph_y - descent), run.y + run.b * glyph_x + run.d * (glyph_y - descent) },
+        .{ run.x + run.a * (glyph_x + local_w) + run.c * (glyph_y - descent), run.y + run.b * (glyph_x + local_w) + run.d * (glyph_y - descent) },
+        .{ run.x + run.a * glyph_x + run.c * (glyph_y + ascent), run.y + run.b * glyph_x + run.d * (glyph_y + ascent) },
+        .{ run.x + run.a * (glyph_x + local_w) + run.c * (glyph_y + ascent), run.y + run.b * (glyph_x + local_w) + run.d * (glyph_y + ascent) },
     };
 
     var min_world_x = corners[0][0];
@@ -1677,9 +1893,9 @@ fn drawAffineFallbackGlyph(
             const dx = world_x - run.x;
             const dy = world_y - run.y;
             const lx = inv_a * dx + inv_c * dy;
-            const ly = inv_b * dx + inv_d * dy;
-            if (lx < local_x or lx >= local_x + local_w or ly <= -descent or ly > ascent) continue;
-            if (fallbackGlyphModeColor(run, codepoint, local_x, local_w, lx, ly)) |color| {
+            const ly = inv_b * dx + inv_d * dy - glyph_y;
+            if (lx < glyph_x or lx >= glyph_x + local_w or ly <= -descent or ly > ascent) continue;
+            if (fallbackGlyphModeColor(run, codepoint, glyph_x, local_w, lx, ly)) |color| {
                 blendPixelMode(rgba, (py * width + px) * 4, color, run.blend_mode);
             }
         }
@@ -2067,7 +2283,7 @@ test "knockout groups remove prior sibling contribution before compositing" {
         },
     };
 
-    const raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, &.{}, &.{}, &.{}, &.{}, &shape_runs);
+    const raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, &.{}, &.{}, &.{}, &.{}, &shape_runs, .{});
     defer alloc.free(raw.rgba);
 
     const corner = (0 * raw.width + 0) * 4;
@@ -2116,7 +2332,7 @@ test "non isolated knockout groups preserve backdrop while replacing sibling ove
         },
     };
 
-    const raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, &.{}, &.{}, &.{}, &.{}, &shape_runs);
+    const raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, &.{}, &.{}, &.{}, &.{}, &shape_runs, .{});
     defer alloc.free(raw.rgba);
 
     const corner = (0 * raw.width + 0) * 4;
@@ -2164,7 +2380,7 @@ test "nested non isolated groups composite against parent backdrop" {
         },
     };
 
-    const raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, &.{}, &.{}, &.{}, &.{}, &shape_runs);
+    const raw = try renderPageContentRgbaInBoxAlloc(alloc, page_box, &.{}, &.{}, &.{}, &.{}, &shape_runs, .{});
     defer alloc.free(raw.rgba);
 
     const center = (1 * raw.width + 1) * 4;
@@ -2208,6 +2424,7 @@ fn estimateRunWidthFallback(run: reader.TextRun) f64 {
 }
 
 fn baseRunCodepointAdvance(run: reader.TextRun, cp: u21) f64 {
+    if (run.vertical) return run.font_size + run.char_spacing;
     const glyph = run.font_size * 0.6;
     const spacing = run.char_spacing + if (cp == ' ') run.word_spacing else 0.0;
     return (glyph + spacing) * run.horizontal_scale;
@@ -2229,11 +2446,15 @@ pub fn textRunBounds(run: reader.TextRun) struct { min_x: f64, max_x: f64, min_y
     const width_est = estimateRunWidth(run);
     const ascent = effectiveRunAscent(run);
     const descent = effectiveRunDescent(run);
+    const local_min_x = if (run.vertical) -run.font_size / 2.0 else 0;
+    const local_max_x = if (run.vertical) run.font_size / 2.0 else width_est;
+    const local_min_y = if (run.vertical) -width_est - descent else -descent;
+    const local_max_y = ascent;
     const corners = [_][2]f64{
-        .{ run.x - run.c * descent, run.y - run.d * descent },
-        .{ run.x + run.a * width_est - run.c * descent, run.y + run.b * width_est - run.d * descent },
-        .{ run.x + run.c * ascent, run.y + run.d * ascent },
-        .{ run.x + run.a * width_est + run.c * ascent, run.y + run.b * width_est + run.d * ascent },
+        .{ run.x + run.a * local_min_x + run.c * local_min_y, run.y + run.b * local_min_x + run.d * local_min_y },
+        .{ run.x + run.a * local_max_x + run.c * local_min_y, run.y + run.b * local_max_x + run.d * local_min_y },
+        .{ run.x + run.a * local_min_x + run.c * local_max_y, run.y + run.b * local_min_x + run.d * local_max_y },
+        .{ run.x + run.a * local_max_x + run.c * local_max_y, run.y + run.b * local_max_x + run.d * local_max_y },
     };
 
     var min_x = corners[0][0];
@@ -2399,6 +2620,27 @@ test "text run bounds respect ascent and descent" {
     try std.testing.expectApproxEqAbs(@as(f64, 29), bounds.max_y, 0.001);
 }
 
+test "vertical text run bounds follow its negative y advance" {
+    const bounds = textRunBounds(.{
+        .text = @constCast("AB"),
+        .x = 10,
+        .y = 30,
+        .font_size = 10,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .vertical = true,
+        .advance_width = 20,
+        .ascent = 8,
+        .descent = 2,
+    });
+    try std.testing.expectApproxEqAbs(@as(f64, 5), bounds.min_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 15), bounds.max_x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 8), bounds.min_y, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 38), bounds.max_y, 0.001);
+}
+
 test "draw shape run renders open stroked path pixels" {
     const alloc = std.testing.allocator;
     const points = try alloc.dupe([2]f64, &.{ .{ 2, 2 }, .{ 18, 18 } });
@@ -2464,6 +2706,55 @@ test "draw shape run distinguishes nonzero and even-odd fill" {
     const center = ((10 * 20) + 10) * 4;
     try std.testing.expectEqual(@as(u8, 0), canvas_nonzero[center]);
     try std.testing.expectEqual(@as(u8, 0xff), canvas_evenodd[center]);
+}
+
+test "scanline antialias fill matches bounded point sampling" {
+    const alloc = std.testing.allocator;
+    const points = try alloc.dupe([2]f64, &.{
+        .{ 2, 2 }, .{ 18, 2 }, .{ 18, 18 }, .{ 2, 18 },
+        .{ 6, 6 }, .{ 6, 14 }, .{ 14, 14 }, .{ 14, 6 },
+    });
+    defer alloc.free(points);
+    const starts = try alloc.dupe(usize, &.{ 0, 4 });
+    defer alloc.free(starts);
+
+    const run = reader.ShapeRun{
+        .kind = .fill,
+        .fill_rule = .nonzero,
+        .color = .{ 17, 31, 47, 0xd9 },
+        .stroke_width = 0,
+        .closed = true,
+        .clip_box = .{ .min_x = 3.25, .min_y = 4.25, .max_x = 16.75, .max_y = 17.75 },
+        .points = points,
+        .subpath_starts = starts,
+        .antialias = true,
+    };
+    var expected: [20 * 20 * 4]u8 = undefined;
+    var actual: [20 * 20 * 4]u8 = undefined;
+    @memset(&expected, 0xff);
+    @memset(&actual, 0xff);
+    drawShapeRun(&expected, 20, 20, 0, 20, run);
+    try drawShapeRunAlloc(alloc, &actual, 20, 20, 0, 20, run);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+test "page raster cancellation propagates before paint" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(error.Canceled, renderPageContentPngInBoxRotatedCancelable(
+        std.testing.allocator,
+        .{ .min_x = 0, .min_y = 0, .max_x = 10, .max_y = 10 },
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        &.{},
+        .none,
+        .{ .is_cancelled_fn = Cancelled.check },
+    ));
 }
 
 test "draw shape run respects clip box" {
@@ -2945,6 +3236,42 @@ test "image minification honors explicit interpolation policy" {
     try std.testing.expect(filtered[0] > 0 and filtered[2] > 0);
     try std.testing.expectEqual(@as(u8, 0), filtered[1]);
     try std.testing.expectEqual(@as(u8, 0xff), filtered[3]);
+}
+
+test "OCR bilevel minification preserves source ink coverage" {
+    var rgba = [_]u8{
+        0x00, 0x00, 0x00, 0xff,
+        0xff, 0xff, 0xff, 0xff,
+    };
+    const exact: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 2,
+        .height = 1,
+        .bilevel = true,
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    };
+
+    var exact_canvas = [_]u8{0xff} ** 4;
+    drawImageRun(&exact_canvas, 1, 1, 0, 0, 1, exact);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0xff, 0xff }, &exact_canvas);
+
+    var ocr_canvas = [_]u8{0xff} ** 4;
+    var ocr = exact;
+    ocr.ocr_coverage_minify = true;
+    drawImageRun(&ocr_canvas, 1, 1, 0, 0, 1, ocr);
+    try std.testing.expect(ocr_canvas[0] >= 120 and ocr_canvas[0] <= 135);
+    try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[1]);
+    try std.testing.expectEqual(ocr_canvas[0], ocr_canvas[2]);
+    try std.testing.expectEqual(@as(u8, 0xff), ocr_canvas[3]);
 }
 
 test "draw shape run round cap paints endpoint beyond segment" {

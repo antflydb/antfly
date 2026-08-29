@@ -31,11 +31,35 @@ pub const RenderedPagePng = struct {
     effective_dpi: u16,
     width: u32,
     height: u32,
+    quality: RenderQuality = .native,
+    diagnostics: ?reader.PageRenderDiagnostics = null,
 
     pub fn deinit(self: *RenderedPagePng, alloc: Allocator) void {
         alloc.free(self.png);
         self.* = undefined;
     }
+};
+
+pub const RenderQuality = enum {
+    /// Every supported page paint operation was rendered by the native Zig
+    /// path within its deterministic limits.
+    native,
+    /// Native rendering completed, but one or more text groups used the
+    /// bounded raster-font fallback. Callers may still OCR the result while
+    /// surfacing the diagnostic counters.
+    degraded,
+    /// Native decoding rejected an unsupported construct and a compatibility
+    /// backend produced the pixels. This is never selected on platforms
+    /// without such a backend.
+    compatibility_backend,
+};
+
+pub const RenderProfile = enum {
+    /// Preserve PDF sampling semantics exactly, including nearest-neighbor
+    /// minification when /Interpolate is absent.
+    exact,
+    /// Preserve bilevel ink coverage during minification for OCR inputs.
+    ocr,
 };
 
 pub const Backend = struct {
@@ -89,13 +113,13 @@ pub fn renderPagePngAlloc(alloc: Allocator, pdf_bytes: []const u8, page_number: 
 
 pub fn renderParsedPagePngAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
     if (dpi < minimum_requested_render_dpi or dpi > 600) return error.InvalidRenderDpi;
-    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels);
+    return try renderParsedPagePngEffectiveAlloc(alloc, parsed, page_number, dpi, max_pixels, .exact);
 }
 
-fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64) ![]u8 {
+fn renderParsedPagePngEffectiveAlloc(alloc: Allocator, parsed: *reader.Reader, page_number: usize, dpi: u16, max_pixels: u64, profile: RenderProfile) ![]u8 {
     if (page_number == 0 or page_number > try parsed.pageCount()) return error.InvalidPageNumber;
     const rotation = try normalizedPageRotation(try parsed.extractPageRotation(page_number));
-    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation);
+    return try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation, profile, null);
 }
 
 fn renderParsedPagePngEffectiveWithRotationAlloc(
@@ -105,18 +129,21 @@ fn renderParsedPagePngEffectiveWithRotationAlloc(
     dpi: u16,
     max_pixels: u64,
     rotation: render.PageRotation,
+    profile: RenderProfile,
+    used_compatibility_backend: ?*bool,
 ) ![]u8 {
-    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation) catch |err| switch (err) {
+    if (used_compatibility_backend) |value| value.* = false;
+    return renderParsedPagePngNativeAlloc(alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
         error.UnexpectedEof,
-        => if (builtin.os.tag == .macos)
-            try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation)
-        else
-            return err,
+        => if (builtin.os.tag == .macos) blk: {
+            if (used_compatibility_backend) |value| value.* = true;
+            break :blk try darwin_render.renderPagePngAlloc(alloc, parsed.sourceBytes(), page_number, dpi, max_pixels, rotation);
+        } else return err,
         else => return err,
     };
 }
@@ -128,8 +155,10 @@ fn renderParsedPagePngNativeAlloc(
     dpi: u16,
     max_pixels: u64,
     rotation: render.PageRotation,
+    profile: RenderProfile,
 ) ![]u8 {
     const reader_alloc = parsed.allocator();
+    try parsed.checkCancellation();
     if (dpi < minimum_direct_render_dpi or dpi > 600) return error.InvalidRenderDpi;
     // Reject oversized pages before decoding page images and font resources.
     const unscaled_box = try parsed.extractPageBox(page_number);
@@ -140,6 +169,10 @@ fn renderParsedPagePngNativeAlloc(
     if (preflight_width > std.math.maxInt(u32) or preflight_height > std.math.maxInt(u32)) return error.RenderedPageTooLarge;
     var render_runs = try parsed.extractPageRenderRunsForRasterAlloc(page_number, @intFromFloat(preflight_width), @intFromFloat(preflight_height));
     defer render_runs.deinit(reader_alloc);
+    try parsed.checkCancellation();
+    if (profile == .ocr) {
+        for (render_runs.image_runs) |*run| run.ocr_coverage_minify = run.bilevel;
+    }
     scalePageRenderRuns(&render_runs, scale);
     alignPageBoxToPixelGrid(&render_runs.page_box);
     const page_box = render_runs.page_box;
@@ -173,7 +206,11 @@ fn renderParsedPagePngNativeAlloc(
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation);
+    try parsed.checkCancellation();
+    const png = try render.renderPageContentPngInBoxRotatedCancelable(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation, parsed.cancellationProbe());
+    errdefer alloc.free(png);
+    try parsed.checkCancellation();
+    return png;
 }
 
 fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
@@ -198,6 +235,18 @@ pub fn renderParsedPagePngAdaptiveAlloc(
     requested_dpi: u16,
     max_pixels: u64,
     max_dimension: u32,
+) !RenderedPagePng {
+    return try renderParsedPagePngAdaptiveWithProfileAlloc(alloc, parsed, page_number, requested_dpi, max_pixels, max_dimension, .exact);
+}
+
+pub fn renderParsedPagePngAdaptiveWithProfileAlloc(
+    alloc: Allocator,
+    parsed: *reader.Reader,
+    page_number: usize,
+    requested_dpi: u16,
+    max_pixels: u64,
+    max_dimension: u32,
+    profile: RenderProfile,
 ) !RenderedPagePng {
     if (page_number == 0) return error.InvalidPageNumber;
     if (requested_dpi < 72 or requested_dpi > 600) return error.InvalidRenderDpi;
@@ -229,12 +278,19 @@ pub fn renderParsedPagePngAdaptiveAlloc(
         effective_dpi -= 1;
     }
 
+    parsed.clearRenderDiagnostics();
+    var used_compatibility_backend = false;
+    const png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation, profile, &used_compatibility_backend);
+    const diagnostics = if (used_compatibility_backend) null else parsed.lastRenderDiagnostics();
+    const degraded = if (diagnostics) |value| value.fallback_text_groups != 0 else false;
     return .{
-        .png = try renderParsedPagePngEffectiveWithRotationAlloc(alloc, parsed, page_number, effective_dpi, max_pixels, rotation),
+        .png = png,
         .requested_dpi = requested_dpi,
         .effective_dpi = effective_dpi,
         .width = width,
         .height = height,
+        .quality = if (used_compatibility_backend) .compatibility_backend else if (degraded) .degraded else .native,
+        .diagnostics = diagnostics,
     };
 }
 

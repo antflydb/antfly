@@ -4615,6 +4615,8 @@ pub fn build(b: *std.Build) void {
             "document extraction generated OCR bypasses unsupported native batch",
             "document-wide OCR resource failure preserves units and marks pending pages",
             "OCR pending metadata construction is allocation-failure safe",
+            "OCR text selection preserves dense embedded numeric tables",
+            "PDF render quality warning preserves prior diagnostics and fallback reason",
             "generated text provider config is validated while parsing extraction config",
             "PDF text regions use reconstructed output spans",
             "public enrichment validation rejects invalid execution and producer config",

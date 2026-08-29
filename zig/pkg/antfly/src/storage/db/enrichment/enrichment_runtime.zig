@@ -5619,6 +5619,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
                 units[idx].ocr_rendered_width = rendered_page.width;
                 units[idx].ocr_rendered_height = rendered_page.height;
                 units[idx].ocr_rendered_bytes = rendered_page.png.len;
+                try document_extraction_mod.recordPdfRenderQualityWarningAlloc(alloc, &units[idx], rendered_page);
                 rendered = rendered_page.png;
                 logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, rendered_page.effective_dpi, rendered_page.width, rendered_page.height, rendered_page.png.len, render_started_ns, null);
             }
@@ -5894,6 +5895,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
         unit.ocr_rendered_width = page.width;
         unit.ocr_rendered_height = page.height;
         unit.ocr_rendered_bytes = page.png.len;
+        try document_extraction_mod.recordPdfRenderQualityWarningAlloc(runtime.alloc, unit, page);
         break :blk page.png;
     } else null;
     defer if (rendered) |png| runtime.alloc.free(png);
@@ -5955,7 +5957,7 @@ fn applyRuntimeGeneratedUnitText(
         unit.ocr_attempted = true;
         const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
         const output_quality = document_extraction_mod.assessOcrQuality(parsed.text, quality_config);
-        const prefer_ocr = document_extraction_mod.preferOcrText(embedded_quality, output_quality);
+        const text_choice = try document_extraction_mod.chooseOcrTextForContentAlloc(alloc, unit.text, parsed.text, embedded_quality, output_quality);
         {
             const owned_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
             errdefer alloc.free(owned_embedded_quality);
@@ -5966,7 +5968,7 @@ fn applyRuntimeGeneratedUnitText(
             if (unit.ocr_output_quality) |value| alloc.free(value);
             unit.ocr_output_quality = owned_output_quality;
         }
-        if (!prefer_ocr) {
+        if (text_choice == .embedded) {
             const owned_extraction_status = try alloc.dupe(u8, "completed_embedded_preferred");
             errdefer alloc.free(owned_extraction_status);
             const owned_method = try alloc.dupe(u8, "pdf_text");
@@ -5979,16 +5981,39 @@ fn applyRuntimeGeneratedUnitText(
             parsed.deinit(alloc);
             return;
         }
+        if (text_choice == .ocr_with_embedded_numeric_rows) {
+            const merged = try document_extraction_mod.mergeOcrWithEmbeddedNumericRowsAlloc(alloc, unit.text, parsed.text);
+            alloc.free(parsed.text);
+            parsed.text = merged;
+            const hybrid_warning = if (parsed.warning) |warning|
+                try std.fmt.allocPrint(alloc, "{s};ocr_numeric_table_hybrid", .{warning})
+            else
+                try alloc.dupe(u8, "ocr_numeric_table_hybrid");
+            if (parsed.warning) |warning| alloc.free(warning);
+            parsed.warning = hybrid_warning;
+        }
     }
     const owned_method = try alloc.dupe(u8, method);
     errdefer alloc.free(owned_method);
     const owned_status = try alloc.dupe(u8, status);
     errdefer alloc.free(owned_status);
 
+    const render_warning = unit.extraction_warning;
+    const parsed_warning = parsed.warning;
+    const final_warning: ?[]u8 = if (render_warning != null and parsed_warning != null)
+        try std.fmt.allocPrint(alloc, "{s};{s}", .{ render_warning.?, parsed_warning.? })
+    else if (render_warning) |value|
+        try alloc.dupe(u8, value)
+    else
+        parsed_warning;
     alloc.free(unit.text);
     alloc.free(unit.method);
     if (unit.extraction_status) |value| alloc.free(value);
-    if (unit.extraction_warning) |value| alloc.free(value);
+    if (render_warning) |value| alloc.free(value);
+    if (parsed_warning) |warning| if (final_warning) |final| {
+        if (final.ptr != warning.ptr) alloc.free(warning);
+    };
+    parsed.warning = null;
     unit.text = parsed.text;
     parsed.text = &.{};
     unit.method = owned_method;
@@ -6006,8 +6031,7 @@ fn applyRuntimeGeneratedUnitText(
             unit.transcript_confidence = parsed.confidence;
         },
     }
-    unit.extraction_warning = parsed.warning;
-    parsed.warning = null;
+    unit.extraction_warning = final_warning;
     const start = unit.char_start orelse 0;
     unit.char_start = start;
     unit.char_end = std.math.cast(u32, @as(usize, @intCast(start)) + unit.text.len);
