@@ -5988,6 +5988,7 @@ pub const DataServer = struct {
             for (topology_replicas.items) |replica| {
                 alloc.free(replica.snapshot_path);
                 alloc.free(replica.logical_sha256);
+                if (replica.snapshot_manifest_sha256) |sha256| alloc.free(sha256);
             }
             topology_replicas.deinit(alloc);
         }
@@ -6016,12 +6017,20 @@ pub const DataServer = struct {
             defer alloc.free(store_path);
             const digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, store_path);
             errdefer alloc.free(digest);
+            const snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+                destination_root,
+                antfly.db.logical_snapshot_manifest_file_name,
+            });
+            defer alloc.free(snapshot_manifest_path);
+            const snapshot_manifest_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, snapshot_manifest_path);
+            errdefer alloc.free(snapshot_manifest_digest);
             try topology_replicas.append(alloc, .{
                 .group_id = group_id,
                 .table_id = range.table_id,
                 .table_name = table.name,
                 .snapshot_path = snapshot_path,
                 .logical_sha256 = digest,
+                .snapshot_manifest_sha256 = snapshot_manifest_digest,
                 .identity_table_id = table.table_id,
                 .identity_shard_id = range.doc_identity_shard_id,
                 .identity_range_id = range.doc_identity_range_id,
@@ -6309,7 +6318,9 @@ pub const DataServer = struct {
             defer alloc.free(expected_path);
             if (!std.mem.eql(u8, replica.snapshot_path, expected_path) or
                 replica.table_id == 0 or replica.table_name.len == 0 or
-                !validLowerSha256(replica.logical_sha256))
+                !validLowerSha256(replica.logical_sha256) or
+                (replica.snapshot_manifest_sha256 != null and
+                    !validLowerSha256(replica.snapshot_manifest_sha256.?)))
                 return error.InvalidHASeedSnapshotTopology;
             const store_path = try std.fs.path.join(alloc, &.{ prepared_root, replica.snapshot_path, "store.bin" });
             defer alloc.free(store_path);
@@ -6317,6 +6328,18 @@ pub const DataServer = struct {
             defer alloc.free(actual_digest);
             if (!std.mem.eql(u8, actual_digest, replica.logical_sha256))
                 return error.HASeedSnapshotLogicalDigestMismatch;
+            if (replica.snapshot_manifest_sha256) |expected_sha256| {
+                const snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+                    prepared_root,
+                    replica.snapshot_path,
+                    antfly.db.logical_snapshot_manifest_file_name,
+                });
+                defer alloc.free(snapshot_manifest_path);
+                const actual_snapshot_manifest_digest = try haSeedSnapshotFileSha256HexAlloc(alloc, io, snapshot_manifest_path);
+                defer alloc.free(actual_snapshot_manifest_digest);
+                if (!std.mem.eql(u8, actual_snapshot_manifest_digest, expected_sha256))
+                    return error.HASeedSnapshotLogicalDigestMismatch;
+            }
         }
 
         var root = try std.Io.Dir.cwd().openDir(io, prepared_root, .{ .iterate = true });
@@ -6349,6 +6372,14 @@ pub const DataServer = struct {
                     const journal_rel = try std.fs.path.join(alloc, &.{ replica.snapshot_path, "change-journal.bin" });
                     defer alloc.free(journal_rel);
                     if (std.mem.eql(u8, entry.path, journal_rel)) break;
+                    if (replica.snapshot_manifest_sha256 != null) {
+                        const snapshot_manifest_rel = try std.fs.path.join(alloc, &.{
+                            replica.snapshot_path,
+                            antfly.db.logical_snapshot_manifest_file_name,
+                        });
+                        defer alloc.free(snapshot_manifest_rel);
+                        if (std.mem.eql(u8, entry.path, snapshot_manifest_rel)) break;
+                    }
                 } else return error.HASeedSnapshotUnexpectedArtifact;
                 continue;
             }
@@ -10868,6 +10899,7 @@ pub const DataServer = struct {
             .store_id = registration.store_id,
             .node_id = registration.node_id,
             .reporter_incarnation = try self.reporterIncarnation(),
+            .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
             .api_url = api_url,
             .raft_url = raft_url,
             .role = registration.role,
@@ -11463,11 +11495,14 @@ pub const DataServer = struct {
         const reporter_incarnation = try self.reporterIncarnation();
         if (snapshot.status.runtime_status_protocol_ready_version >=
             metadata_runtime_status_protocol.current_record_version and
-            !storeReporterIncarnationVisible(
+            (!storeReporterIncarnationVisible(
                 snapshot.stores,
                 registration.store_id,
                 reporter_incarnation,
-            ))
+            ) or !storeNativeGenerationRestoreCapabilityVisible(
+                snapshot.stores,
+                registration.store_id,
+            )))
         {
             // A process that registered while v13 was still rolling out has a
             // legacy zero-incarnation record. Re-register once activation is
@@ -16989,6 +17024,7 @@ fn storeRegistrationVisible(
         // process incarnation and stale processes lose report authority.
         if (store.reporter_incarnation != 0 and
             store.reporter_incarnation != record.reporter_incarnation) continue;
+        if (store.native_generation_restore_version != record.native_generation_restore_version) continue;
         return true;
     }
     return false;
@@ -17003,6 +17039,37 @@ fn storeReporterIncarnationVisible(
         if (store.store_id == store_id) return store.reporter_incarnation == reporter_incarnation;
     }
     return false;
+}
+
+fn storeNativeGenerationRestoreCapabilityVisible(
+    stores: []const antfly.metadata.table_manager.StoreRecord,
+    store_id: u64,
+) bool {
+    for (stores) |store| {
+        if (store.store_id == store_id) {
+            return store.native_generation_restore_version >=
+                antfly.metadata.table_manager.native_generation_restore_protocol_version;
+        }
+    }
+    return false;
+}
+
+test "data store registration waits for native generation capability acknowledgment" {
+    const expected = antfly.metadata.table_manager.StoreRecord{
+        .store_id = 101,
+        .node_id = 11,
+        .role = "data",
+        .reporter_incarnation = 0x1234,
+        .native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version,
+    };
+    var committed = expected;
+    committed.native_generation_restore_version = 0;
+
+    try std.testing.expect(!storeRegistrationVisible(&.{committed}, expected));
+    try std.testing.expect(!storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
+    committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
+    try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
+    try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
 }
 
 fn findRangeByGroupId(
@@ -27275,9 +27342,11 @@ const TestHASeedSnapshotProvider = struct {
         defer snapshot_db.close();
         const snapshot_token = try std.fmt.allocPrint(alloc, "{s}-g1", .{request.generation});
         defer alloc.free(snapshot_token);
-        _ = try snapshot_db.snapshot(snapshot_token);
         const source_snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ self.db_path, snapshot_token });
         defer alloc.free(source_snapshot_root);
+        std.Io.Dir.cwd().deleteTree(io, source_snapshot_root) catch {};
+        defer std.Io.Dir.cwd().deleteTree(io, source_snapshot_root) catch {};
+        _ = try snapshot_db.snapshot(snapshot_token);
         try antfly.public_api.backups.copyDirectoryRecursive(alloc, source_snapshot_root, replica_snapshot_root);
 
         const store_path = try std.fs.path.join(alloc, &.{ replica_snapshot_root, "store.bin" });
@@ -27290,6 +27359,20 @@ const TestHASeedSnapshotProvider = struct {
         for (digest, 0..) |byte, index| {
             digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
             digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+        }
+        const snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+            replica_snapshot_root,
+            antfly.db.logical_snapshot_manifest_file_name,
+        });
+        defer alloc.free(snapshot_manifest_path);
+        const snapshot_manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(io, snapshot_manifest_path, alloc, .limited(4096));
+        defer alloc.free(snapshot_manifest_bytes);
+        var snapshot_manifest_digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(snapshot_manifest_bytes, &snapshot_manifest_digest, .{});
+        var snapshot_manifest_digest_hex: [std.crypto.hash.sha2.Sha256.digest_length * 2]u8 = undefined;
+        for (snapshot_manifest_digest, 0..) |byte, index| {
+            snapshot_manifest_digest_hex[index * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+            snapshot_manifest_digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
         }
 
         const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
@@ -27317,6 +27400,7 @@ const TestHASeedSnapshotProvider = struct {
                 .table_name = "docs",
                 .snapshot_path = "replicas/group-1",
                 .logical_sha256 = digest_hex[0..],
+                .snapshot_manifest_sha256 = snapshot_manifest_digest_hex[0..],
                 .identity_table_id = 20,
                 .identity_shard_id = 10,
                 .identity_range_id = 1,
@@ -27834,9 +27918,12 @@ test "data server wires configured HA executors into API server" {
         captured_replica.snapshot_path,
     });
     defer alloc.free(captured_snapshot_root);
-    const captured_journal_path = try std.fs.path.join(alloc, &.{ captured_snapshot_root, "change-journal.bin" });
-    defer alloc.free(captured_journal_path);
-    try std.Io.Dir.accessAbsolute(io_impl.io(), captured_journal_path, .{});
+    const captured_snapshot_manifest_path = try std.fs.path.join(alloc, &.{
+        captured_snapshot_root,
+        antfly.db.logical_snapshot_manifest_file_name,
+    });
+    defer alloc.free(captured_snapshot_manifest_path);
+    try std.Io.Dir.accessAbsolute(io_impl.io(), captured_snapshot_manifest_path, .{});
     const restored_db_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restored/group-1/table-db" });
     defer alloc.free(restored_db_path);
     {

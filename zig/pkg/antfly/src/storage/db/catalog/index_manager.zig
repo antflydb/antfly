@@ -18,6 +18,8 @@ const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
+const CancellationToken = @import("../../../common/cancellation.zig").CancellationToken;
+const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const process_memory = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
@@ -4549,6 +4551,215 @@ pub const IndexManager = struct {
         for (self.sparse_indexes.items) |*entry| try entry.index.sync(force);
         for (self.graph_indexes.items) |*entry| try entry.index.sync(force);
         for (self.algebraic_indexes.items) |*entry| try entry.index.sync(force);
+    }
+
+    pub fn nativeBackupBackendId(self: *const IndexManager, kind: types.IndexKind) []const u8 {
+        return switch (kind) {
+            .full_text => @tagName(self.text_main_backend),
+            .dense_vector => @tagName(self.dense_storage_backend),
+            .sparse_vector => @tagName(self.sparse_backend),
+            .graph => @tagName(self.graph_reverse_backend),
+            // Algebraic indexes are materialized in the primary namespace and
+            // have no independently selectable physical backend.
+            .algebraic => "primary",
+        };
+    }
+
+    /// Native backup is a physical-generation contract, not merely a codec
+    /// label. Backends opt in only when a durable boundary can be converted to
+    /// immutable files that remain stable after capture admission reopens.
+    pub fn nativeBackupSupportsImmutableCheckpoint(self: *const IndexManager, kind: types.IndexKind) bool {
+        return switch (kind) {
+            .full_text => self.text_main_backend == .lsm and nativeBackupStoragePublicationCompatible(self.text_lsm_storage),
+            .dense_vector => self.dense_storage_backend == .lsm and nativeBackupStoragePublicationCompatible(self.dense_lsm_storage),
+            .sparse_vector => self.sparse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.sparse_lsm_storage),
+            .graph => self.graph_reverse_backend == .lsm and nativeBackupStoragePublicationCompatible(self.graph_lsm_storage),
+            .algebraic => true,
+        };
+    }
+
+    fn nativeBackupStoragePublicationCompatible(storage: ?lsm_backend_mod.Storage) bool {
+        // Restore publication is a host-directory rename today. A storage
+        // provider may participate only when its logical paths are the same
+        // native paths that are atomically published by that rename. Other
+        // providers fail closed until they expose generation-stage/promote.
+        return storage == null or storage.?.supportsHostPathGenerationPublication();
+    }
+
+    pub const NativeBackupCheckpoints = struct {
+        alloc: Allocator,
+        artifacts: std.ArrayListUnmanaged(Artifact) = .empty,
+
+        const Artifact = struct {
+            index_name: []u8,
+            backend_root: []const u8,
+            checkpoint: union(enum) {
+                lsm: lsm_backend_mod.Backend.NativeCheckpoint,
+                text_segments: persistent_mod.PersistentIndex.NativeSegmentCheckpoint,
+            },
+        };
+
+        pub fn deinit(self: *NativeBackupCheckpoints) void {
+            for (self.artifacts.items) |*artifact| {
+                switch (artifact.checkpoint) {
+                    inline else => |*checkpoint| checkpoint.deinit(),
+                }
+                self.alloc.free(artifact.index_name);
+            }
+            self.artifacts.deinit(self.alloc);
+            self.* = undefined;
+        }
+
+        pub fn materialize(
+            self: *const NativeBackupCheckpoints,
+            io: std.Io,
+            staging_root: []const u8,
+            cancellation: CancellationToken,
+        ) !u64 {
+            return try self.materializeWithSink(io, staging_root, cancellation, null);
+        }
+
+        pub fn materializeWithSink(
+            self: *const NativeBackupCheckpoints,
+            io: std.Io,
+            staging_root: []const u8,
+            cancellation: CancellationToken,
+            sink: ?native_artifact_sink.Sink,
+        ) !u64 {
+            var total: u64 = 0;
+            const indexes_root = try std.fmt.allocPrint(self.alloc, "{s}/indexes", .{staging_root});
+            defer self.alloc.free(indexes_root);
+            try fs_paths.createDirPathPortable(io, indexes_root);
+            for (self.artifacts.items) |*artifact| {
+                try cancellation.check();
+                const destination = if (artifact.backend_root.len == 0)
+                    try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ indexes_root, artifact.index_name })
+                else
+                    try std.fmt.allocPrint(self.alloc, "{s}/{s}/{s}", .{ indexes_root, artifact.index_name, artifact.backend_root });
+                defer self.alloc.free(destination);
+                const copied = switch (artifact.checkpoint) {
+                    .lsm => |*checkpoint| try checkpoint.materializeWithSink(io, destination, cancellation, sink),
+                    .text_segments => |*checkpoint| try checkpoint.materializeWithSink(
+                        self.alloc,
+                        io,
+                        destination,
+                        cancellation,
+                        sink,
+                    ),
+                };
+                total = std.math.add(u64, total, copied) catch return error.FileTooBig;
+            }
+            try fs_paths.syncDirPortable(io, indexes_root);
+            return total;
+        }
+    };
+
+    /// Pins the exact immutable generations owned by the opened index
+    /// backends. No directory walk or corpus-byte copy occurs here, so the
+    /// caller can release revision/mutation fences immediately afterwards.
+    pub fn pinNativeBackupCheckpoints(self: *IndexManager) !NativeBackupCheckpoints {
+        if (comptime builtin.os.tag == .freestanding) return error.Unsupported;
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+
+        var result = NativeBackupCheckpoints{ .alloc = self.alloc };
+        errdefer result.deinit();
+        for (self.text_indexes.items) |*entry| {
+            try result.artifacts.ensureUnusedCapacity(self.alloc, 3);
+            const main_name = try self.alloc.dupe(u8, entry.config.name);
+            const wal_name = self.alloc.dupe(u8, entry.config.name) catch |err| {
+                self.alloc.free(main_name);
+                return err;
+            };
+            const checkpoints = entry.persistent.pinNativeCheckpoints() catch |err| {
+                self.alloc.free(wal_name);
+                self.alloc.free(main_name);
+                return err;
+            };
+            result.artifacts.appendAssumeCapacity(.{
+                .index_name = main_name,
+                .backend_root = "index",
+                .checkpoint = .{ .lsm = checkpoints.main },
+            });
+            result.artifacts.appendAssumeCapacity(.{
+                .index_name = wal_name,
+                .backend_root = "wal",
+                .checkpoint = .{ .lsm = checkpoints.wal },
+            });
+            if (checkpoints.segments) |segments| {
+                const segment_name = self.alloc.dupe(u8, entry.config.name) catch |err| {
+                    // Both LSM checkpoints have moved into `result`, while the
+                    // retained segment snapshot has not.
+                    var retained = segments;
+                    retained.deinit();
+                    return err;
+                };
+                result.artifacts.appendAssumeCapacity(.{
+                    .index_name = segment_name,
+                    .backend_root = "segments",
+                    .checkpoint = .{ .text_segments = segments },
+                });
+            }
+        }
+        for (self.dense_indexes.items) |*entry| {
+            try result.artifacts.ensureUnusedCapacity(self.alloc, 1);
+            const name = try self.alloc.dupe(u8, entry.config.name);
+            const checkpoint = entry.index.pinNativeCheckpoint() catch |err| {
+                self.alloc.free(name);
+                return err;
+            };
+            result.artifacts.appendAssumeCapacity(.{ .index_name = name, .backend_root = "", .checkpoint = .{ .lsm = checkpoint } });
+        }
+        for (self.sparse_indexes.items) |*entry| {
+            try result.artifacts.ensureUnusedCapacity(self.alloc, 1);
+            const name = try self.alloc.dupe(u8, entry.config.name);
+            const checkpoint = entry.index.pinNativeCheckpoint() catch |err| {
+                self.alloc.free(name);
+                return err;
+            };
+            result.artifacts.appendAssumeCapacity(.{ .index_name = name, .backend_root = "", .checkpoint = .{ .lsm = checkpoint } });
+        }
+        for (self.graph_indexes.items) |*entry| {
+            try result.artifacts.ensureUnusedCapacity(self.alloc, 2);
+            const outgoing_name = try self.alloc.dupe(u8, entry.config.name);
+            const reverse_name = self.alloc.dupe(u8, entry.config.name) catch |err| {
+                self.alloc.free(outgoing_name);
+                return err;
+            };
+            const checkpoints = entry.index.pinNativeCheckpoints() catch |err| {
+                self.alloc.free(reverse_name);
+                self.alloc.free(outgoing_name);
+                return err;
+            };
+            result.artifacts.appendAssumeCapacity(.{
+                .index_name = outgoing_name,
+                .backend_root = "forward",
+                .checkpoint = .{ .lsm = checkpoints.outgoing },
+            });
+            result.artifacts.appendAssumeCapacity(.{
+                .index_name = reverse_name,
+                .backend_root = "reverse",
+                .checkpoint = .{ .lsm = checkpoints.reverse },
+            });
+        }
+        return result;
+    }
+
+    /// Publish every mutable LSM generation before native snapshot pinning.
+    /// This is intentionally separate from `syncAll`: sync is a durability
+    /// operation, while this establishes manifested immutable runs. Native
+    /// capture omits the appendable WAL payloads after this boundary.
+    pub fn checkpointAllLsmWalsAfterDurableBoundary(self: *IndexManager) !void {
+        self.catalog_mutex.lockShared();
+        defer self.catalog_mutex.unlockShared();
+        for (self.text_indexes.items) |*entry|
+            try entry.persistent.checkpointLsmWalAfterDurableBoundary();
+        for (self.dense_indexes.items) |*entry|
+            try entry.index.checkpointLsmWalAfterDurableBoundary();
+        for (self.sparse_indexes.items) |*entry|
+            try entry.index.checkpointLsmWalAfterDurableBoundary();
+        for (self.graph_indexes.items) |*entry|
+            try entry.index.checkpointLsmWalAfterDurableBoundary();
     }
 
     pub fn syncIndexByName(self: *IndexManager, name: []const u8, force: bool) !void {
