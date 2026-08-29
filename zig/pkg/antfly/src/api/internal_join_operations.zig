@@ -34,6 +34,8 @@ pub const Operations = struct {
 
     fn mapExecutionError(err: anyerror) Error {
         return switch (err) {
+            error.Canceled, error.Cancelled => error.Canceled,
+            error.DeadlineExceeded => error.DeadlineExceeded,
             error.InvalidQueryRequest => error.InvalidQueryRequest,
             error.UnsupportedQueryRequest => error.UnsupportedQueryRequest,
             error.TableNotFound, error.UnknownGroup => error.NotFound,
@@ -42,6 +44,21 @@ pub const Operations = struct {
             error.DocIdentityNamespaceMismatch => error.DocIdentityNamespaceMismatch,
             else => error.Internal,
         };
+    }
+
+    /// Bind transport-neutral request lifetime to every internal worker
+    /// execution. `join_context` is process-scoped; cancellation and deadlines
+    /// are request-scoped and must never be lost when crossing this boundary.
+    fn requestJoinContext(context: distributed_join.JoinContext, request: operation.RequestContext) distributed_join.JoinContext {
+        const deadline_ns = if (context.execution_deadline_ns) |context_deadline|
+            if (request.deadline_ns) |request_deadline| @min(context_deadline, request_deadline) else context_deadline
+        else
+            request.deadline_ns;
+        var out = context.withExecutionDeadline(deadline_ns);
+        if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null) {
+            out = out.withCancellation(request.cancellation);
+        }
+        return out;
     }
 
     fn executionDependencies(self: Operations) Error!struct {
@@ -87,7 +104,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies();
         return distributed_join.executeJoinFinalizeWorkerLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             self.job_store,
             alloc,
             deps.reads,
@@ -108,7 +125,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies();
         return distributed_join.executeJoinRowsLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             alloc,
             deps.reads,
             group_id,
@@ -128,7 +145,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies();
         return distributed_join.executeJoinUnmatchedLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             alloc,
             deps.reads,
             group_id,
@@ -148,7 +165,7 @@ pub const Operations = struct {
         try request.ensureActive();
         const deps = try self.executionDependencies();
         return distributed_join.executeJoinPartitionWorkerLocalTyped(
-            deps.context,
+            requestJoinContext(deps.context, request),
             self.job_store,
             alloc,
             deps.reads,

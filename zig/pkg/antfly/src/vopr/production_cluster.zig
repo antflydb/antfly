@@ -317,6 +317,15 @@ pub const Fixture = struct {
     join_finalizer_ack_failure_injected: bool = false,
     join_finalizer_persisted_group_id: u64 = 0,
     durable_join_takeover_sound: bool = false,
+    join_partition_worker_started_count: u64 = 0,
+    join_partition_worker_completed_count: u64 = 0,
+    join_cancellation_boundary_observed: bool = false,
+    join_cancellation_job_id: u64 = 0,
+    join_cancellation_owner_group_id: u64 = 0,
+    join_cancellation_requested: bool = false,
+    join_cancellation_observed: bool = false,
+    join_cancellation_recovered: bool = false,
+    join_cancellation_sound: bool = false,
     graph_sound: bool = false,
     graph_hydration_sound: bool = false,
     graph_hydration_started_count: u64 = 0,
@@ -421,6 +430,7 @@ pub const Fixture = struct {
     graph_inflight_authorization_revocation_enabled: bool = false,
     graph_stale_snapshot_retry_exhaustion_enabled: bool = false,
     join_enabled: bool = false,
+    join_cancellation_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
 
@@ -471,6 +481,11 @@ pub const Fixture = struct {
     pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.join_enabled = enabled;
+    }
+
+    pub fn setJoinCancellationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.join_cancellation_enabled = enabled;
     }
 
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
@@ -551,6 +566,9 @@ pub const Fixture = struct {
         if (self.graph_stale_snapshot_retry_exhaustion_enabled and
             (!self.graph_enabled or !self.active_split_enabled))
             return error.InvalidProductionClusterGraphStaleSnapshotMode;
+        if (self.join_cancellation_enabled and
+            (!self.join_enabled or self.active_split_enabled or self.fault_mode != .clean))
+            return error.InvalidProductionClusterJoinCancellationMode;
         switch (self.fault_mode) {
             .clean => {},
             .graph_hydration_transport_failure => if (!self.graph_enabled or
@@ -1063,18 +1081,45 @@ pub const Fixture = struct {
         event: api_distributed_join.LifecycleEvent,
     ) !void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
-        if (self.fault_mode != .join_finalizer_ack_failure or
-            event.phase != .finalizer_result_persisted or
-            self.join_finalizer_ack_failure_injected)
-            return;
-        if (event.owner_group_id == 0) return;
-        self.join_finalizer_ack_failure_injected = true;
-        self.join_finalizer_persisted_group_id = event.owner_group_id;
-        // The result and shared ownership record are durable, but the worker
-        // process fails before acknowledging the internal finalizer request.
-        // The coordinator must hand the stable job to another owner, which
-        // imports the cached result instead of repeating completed work.
-        return error.InjectedJoinFinalizerAcknowledgementFailure;
+        switch (event.phase) {
+            .partition_worker_started => {
+                self.join_partition_worker_started_count +|= 1;
+                if (!self.join_cancellation_enabled or
+                    self.join_partition_worker_started_count != 1)
+                    return;
+                const cancellation = event.cancellation orelse {
+                    self.failure = error.ProductionJoinCancellationTokenMissing;
+                    return error.ProductionJoinCancellationTokenMissing;
+                };
+                if (event.job_id == 0 or event.owner_group_id == 0) {
+                    self.failure = error.ProductionJoinCancellationWorkerIdentityMissing;
+                    return error.ProductionJoinCancellationWorkerIdentityMissing;
+                }
+                self.join_cancellation_boundary_observed = true;
+                self.join_cancellation_job_id = event.job_id;
+                self.join_cancellation_owner_group_id = event.owner_group_id;
+                for (0..1_000) |_| {
+                    if (cancellation.isCancelled()) return;
+                    try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                }
+                self.failure = error.ProductionJoinCancellationNotObserved;
+                return error.ProductionJoinCancellationNotObserved;
+            },
+            .partition_worker_completed => self.join_partition_worker_completed_count +|= 1,
+            .finalizer_result_persisted => {
+                if (self.fault_mode != .join_finalizer_ack_failure or
+                    self.join_finalizer_ack_failure_injected or
+                    event.owner_group_id == 0)
+                    return;
+                self.join_finalizer_ack_failure_injected = true;
+                self.join_finalizer_persisted_group_id = event.owner_group_id;
+                // The result and shared ownership record are durable, but the worker
+                // process fails before acknowledging the internal finalizer request.
+                // The coordinator must hand the stable job to another owner, which
+                // imports the cached result instead of repeating completed work.
+                return error.InjectedJoinFinalizerAcknowledgementFailure;
+            },
+        }
     }
 
     fn ensureMetadataIncarnation(self: *Fixture) !void {
@@ -1545,7 +1590,7 @@ pub const Fixture = struct {
             join_right_batch_body
         else
             ordinary_right_batch_body;
-        const durable_tenant_body = if (self.fault_mode == .join_finalizer_ack_failure)
+        const durable_tenant_body = if (self.durableJoinEnabled())
             try self.durableJoinTenantBatchAlloc()
         else
             null;
@@ -1651,7 +1696,12 @@ pub const Fixture = struct {
             if (!try self.waitForDocIdentityReady("tenant_b_docs", 64) or
                 !try self.waitForDocIdentityReady("docs", 64))
                 return error.ProductionDataJoinIdentityPublicationTimeout;
-            self.join_sound = try self.runJoinQuery();
+            if (self.join_cancellation_enabled) {
+                self.join_cancellation_sound = try self.runJoinCancellationQuery();
+                self.join_sound = self.join_cancellation_sound;
+            } else {
+                self.join_sound = try self.runJoinQuery();
+            }
             self.phase = .join_query_complete;
             if (!self.join_sound) return error.ProductionDataDistributedJoinFailed;
         }
@@ -1832,6 +1882,11 @@ pub const Fixture = struct {
         }
     }
 
+    fn durableJoinEnabled(self: *const Fixture) bool {
+        return self.fault_mode == .join_finalizer_ack_failure or
+            self.join_cancellation_enabled;
+    }
+
     fn durableJoinTenantBatchAlloc(self: *Fixture) ![]u8 {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
@@ -1861,7 +1916,7 @@ pub const Fixture = struct {
         // execution spanning at least two production groups.
         for (0..node_count * 4) |attempt| {
             const uri = self.data_api_uris[attempt % node_count];
-            const query_body = if (self.fault_mode == .join_finalizer_ack_failure)
+            const query_body = if (self.durableJoinEnabled())
                 durable_join_query_body
             else
                 join_query_body;
@@ -1898,6 +1953,61 @@ pub const Fixture = struct {
         return false;
     }
 
+    fn runJoinCancellationQuery(self: *Fixture) !bool {
+        const started_before = self.join_partition_worker_started_count;
+        const completed_before = self.join_partition_worker_completed_count;
+        var in_flight = self.sim.io().async(fetchJoinQuery, .{
+            self,
+            self.data_api_uris[1],
+            durable_join_query_body,
+        });
+        defer if (in_flight.any_future != null) {
+            const canceled_response: ?common_http.HttpResponse = in_flight.cancel(self.sim.io()) catch null;
+            if (canceled_response) |response_value| {
+                var response = response_value;
+                response.deinit(self.alloc);
+            }
+        };
+
+        for (0..1_000) |_| {
+            if (self.join_partition_worker_started_count > started_before) break;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        } else return false;
+        if (!self.join_cancellation_boundary_observed or
+            self.join_cancellation_job_id == 0 or
+            self.join_cancellation_owner_group_id == 0 or
+            self.join_partition_worker_started_count != started_before + 1 or
+            self.join_partition_worker_completed_count != completed_before)
+            return false;
+
+        self.join_cancellation_requested = true;
+        const cancelled_request = blk: {
+            var response = in_flight.cancel(self.sim.io()) catch |err| switch (err) {
+                error.Canceled, error.Cancelled => break :blk true,
+                else => break :blk false,
+            };
+            defer response.deinit(self.alloc);
+            break :blk false;
+        };
+        self.join_cancellation_observed = cancelled_request and
+            self.join_partition_worker_completed_count == completed_before;
+        if (!self.join_cancellation_observed) return false;
+
+        self.join_sound = try self.runJoinQuery();
+        self.join_cancellation_recovered = self.join_sound and
+            self.join_partition_worker_started_count > started_before + 1 and
+            self.join_partition_worker_completed_count > completed_before;
+        return self.join_cancellation_recovered;
+    }
+
+    fn fetchJoinQuery(
+        self: *Fixture,
+        uri: []const u8,
+        body: []const u8,
+    ) !common_http.HttpResponse {
+        return self.client.fetchQueryRaw(uri, "tenant_b_docs", body);
+    }
+
     fn joinResponseComplete(self: *Fixture, body: []const u8) !bool {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
         defer parsed.deinit();
@@ -1908,7 +2018,7 @@ pub const Fixture = struct {
         const hits_value = response_value.object.get("hits") orelse return false;
         if (hits_value != .object) return false;
         const hit_items_value = hits_value.object.get("hits") orelse return false;
-        const durable = self.fault_mode == .join_finalizer_ack_failure;
+        const durable = self.durableJoinEnabled();
         const expected_rows: usize = if (durable) durable_join_row_count else 2;
         if (hit_items_value != .array or hit_items_value.array.items.len != expected_rows) return false;
 
@@ -1951,16 +2061,28 @@ pub const Fixture = struct {
         const execution_mode = join_value.object.get("execution_mode") orelse return false;
         const job_phase = join_value.object.get("job_phase") orelse return false;
         const finalizer_retries = join_value.object.get("finalizer_retries") orelse return false;
-        const imported_owner = join_value.object.get("imported_owner_group_id") orelse return false;
-        const imported_cached = join_value.object.get("imported_cached_result") orelse return false;
         const attempts = join_value.object.get("finalizer_attempts") orelse return false;
         if (strategy != .string or !std.mem.eql(u8, strategy.string, "shuffle") or
             execution_mode != .string or !std.mem.eql(u8, execution_mode.string, "distributed_durable") or
             job_phase != .string or !std.mem.eql(u8, job_phase.string, "succeeded") or
-            finalizer_retries != .integer or finalizer_retries.integer != 1 or
+            finalizer_retries != .integer or attempts != .array)
+            return false;
+        if (self.join_cancellation_enabled) {
+            if (finalizer_retries.integer != 0 or attempts.array.items.len != 1) return false;
+            const successful_attempt = attempts.array.items[0];
+            if (successful_attempt != .object) return false;
+            const successful_group = successful_attempt.object.get("worker_group_id") orelse return false;
+            const successful_ok = successful_attempt.object.get("succeeded") orelse return false;
+            return successful_group == .integer and successful_group.integer != 0 and
+                successful_ok == .bool and successful_ok.bool;
+        }
+
+        const imported_owner = join_value.object.get("imported_owner_group_id") orelse return false;
+        const imported_cached = join_value.object.get("imported_cached_result") orelse return false;
+        if (finalizer_retries.integer != 1 or
             imported_owner != .integer or imported_owner.integer != self.join_finalizer_persisted_group_id or
             imported_cached != .bool or !imported_cached.bool or
-            attempts != .array or attempts.array.items.len != 2)
+            attempts.array.items.len != 2)
             return false;
         const failed_attempt = attempts.array.items[0];
         const successful_attempt = attempts.array.items[1];
@@ -3232,6 +3354,15 @@ pub const Fixture = struct {
         join_finalizer_ack_failure_injected: bool,
         join_finalizer_persisted_group_id: u64,
         durable_join_takeover_ok: bool,
+        join_partition_worker_started_count: u64,
+        join_partition_worker_completed_count: u64,
+        join_cancellation_boundary_observed: bool,
+        join_cancellation_job_id: u64,
+        join_cancellation_owner_group_id: u64,
+        join_cancellation_requested: bool,
+        join_cancellation_observed: bool,
+        join_cancellation_recovered: bool,
+        join_cancellation_ok: bool,
         graph_query_ok: bool,
         graph_hydration_ok: bool,
         graph_hydration_started_count: u64,
@@ -3304,6 +3435,7 @@ pub const Fixture = struct {
                 self.read_sound and
                 self.tenant_sound and
                 (!self.join_enabled or self.join_sound) and
+                (!self.join_cancellation_enabled or self.join_cancellation_sound) and
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
@@ -3318,6 +3450,15 @@ pub const Fixture = struct {
             .join_finalizer_ack_failure_injected = self.join_finalizer_ack_failure_injected,
             .join_finalizer_persisted_group_id = self.join_finalizer_persisted_group_id,
             .durable_join_takeover_ok = self.durable_join_takeover_sound,
+            .join_partition_worker_started_count = self.join_partition_worker_started_count,
+            .join_partition_worker_completed_count = self.join_partition_worker_completed_count,
+            .join_cancellation_boundary_observed = self.join_cancellation_boundary_observed,
+            .join_cancellation_job_id = self.join_cancellation_job_id,
+            .join_cancellation_owner_group_id = self.join_cancellation_owner_group_id,
+            .join_cancellation_requested = self.join_cancellation_requested,
+            .join_cancellation_observed = self.join_cancellation_observed,
+            .join_cancellation_recovered = self.join_cancellation_recovered,
+            .join_cancellation_ok = self.join_cancellation_sound,
             .graph_query_ok = self.graph_sound,
             .graph_hydration_ok = self.graph_hydration_sound,
             .graph_hydration_started_count = self.graph_hydration_started_count,

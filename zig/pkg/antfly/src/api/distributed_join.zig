@@ -85,13 +85,20 @@ test "distributed join ownership and transport failures remain retryable and fai
 /// Callers may use these to coordinate process lifecycle, fault injection, or
 /// diagnostics without replacing the planner, worker protocol, or job store.
 pub const LifecyclePhase = enum {
+    partition_worker_started,
+    partition_worker_completed,
     finalizer_result_persisted,
 };
 
 pub const LifecycleEvent = struct {
     phase: LifecyclePhase,
-    job_id: u64,
-    owner_group_id: u64,
+    job_id: u64 = 0,
+    owner_group_id: u64 = 0,
+    partition_index: usize = 0,
+    /// Borrowed for the synchronous hook call only. A hook may park at this
+    /// lease-free worker boundary until the owning request is canceled, but
+    /// must not retain the token.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const LifecycleHook = struct {
@@ -3270,6 +3277,14 @@ pub fn executeJoinPartitionWorkerLocalTyped(
     job_store.setContext(worker_ctx);
     try worker_ctx.ensureExecutionDeadline();
     if (!std.mem.eql(u8, req.join.right_table, table_name)) return error.InvalidQueryRequest;
+    try worker_ctx.reachLifecycle(.{
+        .phase = .partition_worker_started,
+        .job_id = req.job_id orelse 0,
+        .owner_group_id = worker_group_id,
+        .partition_index = req.partition_index,
+        .cancellation = worker_ctx.cancellation,
+    });
+    try worker_ctx.ensureExecutionDeadline();
 
     var right_hits_owned: ?[]std.json.Value = null;
     defer if (right_hits_owned) |owned| {
@@ -3294,7 +3309,7 @@ pub fn executeJoinPartitionWorkerLocalTyped(
         break :blk right_hits_owned.?;
     };
 
-    var merged = mergeJoinedRightHitsAllocWithContext(worker_ctx, alloc, req.left_hits, req.join, right_hits, &.{}, req.appended_left_field) catch |err| {
+    const merged = mergeJoinedRightHitsAllocWithContext(worker_ctx, alloc, req.left_hits, req.join, right_hits, &.{}, req.appended_left_field) catch |err| {
         std.log.err("join partition merge failed worker_group_id={d} partition_index={d} err={}", .{
             worker_group_id,
             req.partition_index,
@@ -3302,8 +3317,22 @@ pub fn executeJoinPartitionWorkerLocalTyped(
         });
         return err;
     };
-    errdefer merged.deinit(alloc);
-    return joinPartitionExecutionResultFromShell(merged, .{});
+    var result = joinPartitionExecutionResultFromShell(merged, .{});
+    worker_ctx.ensureExecutionDeadline() catch |err| {
+        result.deinit(alloc);
+        return err;
+    };
+    worker_ctx.reachLifecycle(.{
+        .phase = .partition_worker_completed,
+        .job_id = req.job_id orelse 0,
+        .owner_group_id = worker_group_id,
+        .partition_index = req.partition_index,
+        .cancellation = worker_ctx.cancellation,
+    }) catch |err| {
+        result.deinit(alloc);
+        return err;
+    };
+    return result;
 }
 
 fn collectJoinPartitionRightRows(
