@@ -454,6 +454,10 @@ pub const default_io_concurrent_limit: u32 = threaded_io_limits.service;
 
 pub const Config = struct {
     backend: Backend = runtime_backend.defaultExecutorBackend(),
+    /// Optional caller-owned synchronous filesystem authority. Manual
+    /// runtimes use this for lifecycle locks and durable metadata without
+    /// acquiring a worker executor. It must outlive the runtime.
+    filesystem_io: ?Io = null,
 };
 
 /// Atomic admission gate for a lane whose backing executor is destroyed only
@@ -722,6 +726,7 @@ pub const BackendRuntime = struct {
     owner_registry: *OwnerRegistry,
     native_storage_pool: *storage_io.NativeStoragePool,
     lsm_owner_clone_registry: LsmOwnerCloneRegistry,
+    borrowed_filesystem_io: ?Io = null,
     io_impl: ?*IoImpl = null,
     raft_inbound_io_impl: ?*IoImpl = null,
     raft_outbound_io_impl: ?*IoImpl = null,
@@ -767,6 +772,7 @@ pub const BackendRuntime = struct {
             .owner_registry = owner_registry,
             .native_storage_pool = native_storage_pool,
             .lsm_owner_clone_registry = LsmOwnerCloneRegistry.init(alloc),
+            .borrowed_filesystem_io = config.filesystem_io,
             .durable_jobs = undefined,
         };
         runtime.durable_jobs = InlineDurableJobLane.lane(owner_registry);
@@ -861,6 +867,12 @@ pub const BackendRuntime = struct {
     pub fn io(self: *BackendRuntime) ?Io {
         if (comptime builtin.os.tag == .freestanding) return null;
         return if (self.io_impl) |io_impl| io_impl.io() else null;
+    }
+
+    /// I/O authority for synchronous storage work. Unlike `io`, this may be
+    /// caller-owned and does not imply that background scheduling is enabled.
+    pub fn filesystemIo(self: *BackendRuntime) ?Io {
+        return self.io() orelse self.borrowed_filesystem_io;
     }
 
     pub fn nativeStoragePool(self: *BackendRuntime) *storage_io.NativeStoragePool {
@@ -1490,13 +1502,18 @@ test "lane lease gate closes admission and drains a committed borrower" {
 }
 
 test "backend runtime handle owns a stable runtime pointer" {
-    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{ .backend = .manual });
+    var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer handle.deinit();
 
     const first = handle.ptr();
     const second = handle.ptr();
     try std.testing.expect(first == second);
     try std.testing.expect(first.io_impl == null);
+    try std.testing.expect(first.io() == null);
+    try std.testing.expect(first.filesystemIo() != null);
 }
 
 test "backend runtime durable lane runs inline jobs" {

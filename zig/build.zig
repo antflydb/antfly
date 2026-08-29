@@ -6261,6 +6261,9 @@ pub fn build(b: *std.Build) void {
             "provisioned writer cache starts DB workers after stable entry installation",
             "table write source restore acquires lifecycle unless caller reserves it",
             "provisioned native backup restore repeats through shared read and write owners",
+            "native backup reclaims crash-left snapshot attempts from durable markers",
+            "native backup reclaims a crash marker before snapshot root creation",
+            "native backup never reclaims an old attempt with a live lease",
             "provisioned create succeeds when post-commit runtime status is fenced",
             "provisioned create reuses a generation opened by startup reconciliation",
             "provisioned owner clone snapshot preserves retired runtime counters",
@@ -6361,6 +6364,7 @@ pub fn build(b: *std.Build) void {
             "prepared first generation reconciliation removes an unvalidated candidate",
             "committed generation reconciliation preserves the validated candidate",
             "generation publication marker parsing preserves allocator exhaustion",
+            "manual generation runtime uses an explicit filesystem io authority",
         },
     });
     const run_api_table_writes_production_regression_tests = addFilteredTestRunArtifact(b, api_table_writes_production_regression_tests);
@@ -6377,6 +6381,9 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
+            "native backup reclaims crash-left snapshot attempts from durable markers",
+            "native backup reclaims a crash marker before snapshot root creation",
+            "native backup never reclaims an old attempt with a live lease",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
@@ -7676,10 +7683,13 @@ pub fn build(b: *std.Build) void {
 
     const db_restore_managed_tests = b.addTest(.{
         .root_module = db_test_mod,
-        .filters = &.{"db restore snapshot replays managed chunked dense embeddings"},
+        .filters = &.{
+            "db restore snapshot replays managed chunked dense embeddings",
+            "native restore backend configuration is resolved exactly once",
+        },
     });
     const run_db_restore_managed_tests = addFilteredTestRunArtifact(b, db_restore_managed_tests);
-    const db_restore_managed_step = b.step("db-restore-managed-test", "Run the focused managed chunked dense restore DB test");
+    const db_restore_managed_step = b.step("db-restore-managed-test", "Run focused managed native restore DB tests");
     db_restore_managed_step.dependOn(&run_db_restore_managed_tests.step);
 
     const provisioned_write_cache_failed_close_tests = b.addTest(.{

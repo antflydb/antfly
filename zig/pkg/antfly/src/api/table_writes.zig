@@ -77,10 +77,37 @@ const native_snapshot_attempt_marker_suffix = ".native-backup-attempt.json";
 const native_snapshot_attempt_marker_directory = ".native-backup-attempts";
 const native_snapshot_attempt_stale_ns: i128 = 24 * std.time.ns_per_hour;
 const native_snapshot_attempt_reclaim_limit: usize = 8;
+const native_snapshot_attempt_scan_limit: usize = 8192;
 
 const NativeSnapshotAttemptMarker = struct {
     snapshot_token: []const u8,
     created_at_unix_ns: i128,
+};
+
+/// Process/crash ownership for one native snapshot export. The kernel lease is
+/// the authority that an attempt is still active; wall-clock age is used only
+/// to bound how often abandoned attempts are considered for reclamation.
+const NativeSnapshotAttempt = struct {
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    marker_path: []u8,
+    lease: std.Io.File,
+    active: bool = true,
+
+    fn deinit(self: *@This()) void {
+        if (!self.active) return;
+        self.lease.close(self.io);
+        deleteNativeSnapshotAttemptMarker(self.io, self.marker_path);
+        self.alloc.free(self.marker_path);
+        self.active = false;
+    }
+
+    fn abandonForTest(self: *@This()) void {
+        std.debug.assert(builtin.is_test and self.active);
+        self.lease.close(self.io);
+        self.alloc.free(self.marker_path);
+        self.active = false;
+    }
 };
 
 fn nativeSnapshotAttemptMarkerPathAlloc(
@@ -102,7 +129,7 @@ fn createNativeSnapshotAttemptMarker(
     db_path: []const u8,
     snapshot_token: []const u8,
     created_at_unix_ns: i128,
-) ![]u8 {
+) !NativeSnapshotAttempt {
     const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{db_path});
     defer alloc.free(snapshot_parent);
     try fs_paths.createDirPathPortable(io, snapshot_parent);
@@ -117,8 +144,14 @@ fn createNativeSnapshotAttemptMarker(
         .created_at_unix_ns = created_at_unix_ns,
     }, .{});
     defer alloc.free(body);
-    var file = try fs_paths.createFilePortable(io, marker_path, .{ .truncate = true, .exclusive = true });
-    defer file.close(io);
+    var file = try std.Io.Dir.cwd().createFile(io, marker_path, .{
+        .read = true,
+        .truncate = true,
+        .exclusive = true,
+        .lock = .exclusive,
+        .lock_nonblocking = true,
+    });
+    errdefer file.close(io);
     var buffer: [4096]u8 = undefined;
     var writer = file.writer(io, &buffer);
     try writer.interface.writeAll(body);
@@ -126,7 +159,12 @@ fn createNativeSnapshotAttemptMarker(
     try file.sync(io);
     try fs_paths.syncDirPortable(io, marker_directory);
     try fs_paths.syncDirPortable(io, snapshot_parent);
-    return marker_path;
+    return .{
+        .alloc = alloc,
+        .io = io,
+        .marker_path = marker_path,
+        .lease = file,
+    };
 }
 
 fn deleteNativeSnapshotAttemptMarker(io: std.Io, marker_path: []const u8) void {
@@ -166,8 +204,13 @@ fn reclaimStaleNativeSnapshotAttempts(
         defer dir.close(io);
         var iterator = dir.iterate();
         var examined: usize = 0;
-        while (examined < 64 and stale_tokens.items.len < native_snapshot_attempt_reclaim_limit) : (examined += 1) {
-            const entry = try iterator.next(io) orelse break;
+        while (try iterator.next(io)) |entry| {
+            examined += 1;
+            // Reclamation is bounded maintenance, not backup admission. A
+            // large marker directory may defer some cleanup, but must not
+            // turn historical cleanup debt into a foreground backup outage.
+            if (examined > native_snapshot_attempt_scan_limit) break;
+            if (stale_tokens.items.len == native_snapshot_attempt_reclaim_limit) break;
             if (entry.kind != .file or entry.name.len <= native_snapshot_attempt_marker_suffix.len or
                 !std.mem.endsWith(u8, entry.name, native_snapshot_attempt_marker_suffix))
             {
@@ -179,7 +222,20 @@ fn reclaimStaleNativeSnapshotAttempts(
             {
                 continue;
             }
-            var created_at_unix_ns: i128 = @intCast((try dir.statFile(io, entry.name, .{ .follow_symlinks = false })).mtime.toNanoseconds());
+            // Age identifies candidates; the nonblocking kernel lease below is
+            // the only proof that their owner is gone.
+            var lease = dir.openFile(io, entry.name, .{
+                .mode = .read_write,
+                .lock = .exclusive,
+                .lock_nonblocking = true,
+            }) catch |err| switch (err) {
+                error.WouldBlock => continue,
+                error.FileNotFound => continue,
+                error.FileLocksUnsupported => return error.FileLocksUnsupported,
+                else => return err,
+            };
+            defer lease.close(io);
+            var created_at_unix_ns: i128 = @intCast((try lease.stat(io)).mtime.toNanoseconds());
             const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ marker_directory, entry.name });
             defer alloc.free(marker_path);
             if (std.Io.Dir.cwd().readFileAlloc(io, marker_path, alloc, .limited(4096)) catch null) |raw| {
@@ -203,6 +259,9 @@ fn reclaimStaleNativeSnapshotAttempts(
     for (stale_tokens.items) |token| {
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_parent, token });
         defer alloc.free(snapshot_root);
+        // `deleteTree` is already idempotent for an absent path. Propagate
+        // type/permission failures so a non-directory collision cannot be
+        // silently orphaned while its durable marker is removed.
         try std.Io.Dir.cwd().deleteTree(io, snapshot_root);
 
         var cleanup_dir = std.Io.Dir.cwd().openDir(io, snapshot_parent, .{ .iterate = true }) catch |err| switch (err) {
@@ -242,14 +301,14 @@ test "native backup reclaims crash-left snapshot attempts from durable markers" 
     const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
     defer alloc.free(db_path);
     const token = "backup-g7-attempt-00000000000000000000000000000000";
-    const marker_path = try createNativeSnapshotAttemptMarker(
+    var attempt = try createNativeSnapshotAttemptMarker(
         alloc,
         std.testing.io,
         db_path,
         token,
         platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
     );
-    defer alloc.free(marker_path);
+    defer attempt.deinit();
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, token });
     defer alloc.free(snapshot_root);
     try fs_paths.createDirPathPortable(std.testing.io, snapshot_root);
@@ -258,9 +317,59 @@ test "native backup reclaims crash-left snapshot attempts from durable markers" 
     try fs_paths.createDirPathPortable(std.testing.io, staging_root);
 
     try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    const marker_path = try alloc.dupe(u8, attempt.marker_path);
+    defer alloc.free(marker_path);
+    attempt.abandonForTest();
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{}));
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, staging_root, .{}));
+}
+
+test "native backup reclaims a crash marker before snapshot root creation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-11111111111111111111111111111111";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    const marker_path = try alloc.dupe(u8, attempt.marker_path);
+    defer alloc.free(marker_path);
+    attempt.abandonForTest();
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+}
+
+test "native backup never reclaims an old attempt with a live lease" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-db", .{tmp.sub_path});
+    defer alloc.free(db_path);
+    const token = "backup-g7-attempt-22222222222222222222222222222222";
+    var attempt = try createNativeSnapshotAttemptMarker(
+        alloc,
+        std.testing.io,
+        db_path,
+        token,
+        platform_time.realtimeNs() - 25 * std.time.ns_per_hour,
+    );
+    defer attempt.deinit();
+    const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, token });
+    defer alloc.free(snapshot_root);
+    try fs_paths.createDirPathPortable(std.testing.io, snapshot_root);
+
+    try reclaimStaleNativeSnapshotAttempts(alloc, std.testing.io, db_path);
+    try std.Io.Dir.cwd().access(std.testing.io, attempt.marker_path, .{});
+    try std.Io.Dir.cwd().access(std.testing.io, snapshot_root, .{});
 }
 
 test "native restore admits selective repair only with authenticated generation manifest" {
@@ -5386,15 +5495,14 @@ pub const BoundTableWriteSource = struct {
         try reclaimStaleNativeSnapshotAttempts(alloc, snapshot_io, db.core.path);
         const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, "local");
         defer alloc.free(snapshot_token);
-        const attempt_marker_path = try createNativeSnapshotAttemptMarker(
+        var snapshot_attempt = try createNativeSnapshotAttemptMarker(
             alloc,
             snapshot_io,
             db.core.path,
             snapshot_token,
             platform_time.realtimeNs(),
         );
-        defer alloc.free(attempt_marker_path);
-        defer deleteNativeSnapshotAttemptMarker(snapshot_io, attempt_marker_path);
+        defer snapshot_attempt.deinit();
         _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db.core.path, snapshot_token });
@@ -5448,6 +5556,19 @@ pub const BoundTableWriteSource = struct {
         if (plan.reconcile_only) return error.RestoreIdentityMismatch;
         const db = try self.activeDb();
 
+        const native_restore_plan: ?db_mod.NativeRestoreOpenPlan = if (plan.manifest.format == .native) blk: {
+            const resolved = try db_mod.DB.resolveNativeRestoreOpenPlan(db.core.path, .{
+                .primary_backend = db.primary_backend,
+                .backend_runtime = db.backend_runtime,
+            });
+            // External namespaces require a backend-owned stage/promote
+            // capability. Fail before integrity-scanning corpus bytes or
+            // closing the currently serving DB.
+            if (resolved.physicalRootMode() != .filesystem_managed)
+                return error.NativeBackupStorageBackendUnsupported;
+            break :blk resolved;
+        } else null;
+
         const shard = &plan.manifest.shards[0];
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ plan.backup_root, shard.snapshot_path });
         defer alloc.free(snapshot_root);
@@ -5485,14 +5606,22 @@ pub const BoundTableWriteSource = struct {
             .primary_backend = primary_backend,
             .backend_runtime = backend_runtime,
         };
+        var effective_recovery_open_options = recovery_open_options;
+        var effective_restored_open_options = restored_open_options;
+        if (native_restore_plan) |resolved| {
+            effective_recovery_open_options = try resolved.optionsForTarget(db_path);
+            effective_recovery_open_options.identity_namespace = identity_namespace;
+            effective_restored_open_options = try resolved.optionsForTarget(db_path);
+        }
         const publication_outcome = restoreBoundTableGeneration(
             alloc,
             snapshot_root,
             db_path,
-            restored_open_options,
+            effective_restored_open_options,
+            native_restore_plan,
             plan,
         ) catch |restore_err| {
-            self.db.* = db_mod.DB.open(alloc, db_path, recovery_open_options) catch |reopen_err| {
+            self.db.* = db_mod.DB.open(alloc, db_path, effective_recovery_open_options) catch |reopen_err| {
                 std.log.err("bound restore recovery failed phase=reopen restore_class={s} reopen_class={s}", .{
                     @errorName(restore_err),
                     @errorName(reopen_err),
@@ -5503,7 +5632,7 @@ pub const BoundTableWriteSource = struct {
             owned_backend_runtime = null;
             return restore_err;
         };
-        self.db.* = db_mod.DB.open(alloc, db_path, restored_open_options) catch |reopen_err| {
+        self.db.* = db_mod.DB.open(alloc, db_path, effective_restored_open_options) catch |reopen_err| {
             std.log.err("bound restore recovery failed phase=published_reopen class={s}", .{@errorName(reopen_err)});
             return reopen_err;
         };
@@ -5517,15 +5646,24 @@ pub const BoundTableWriteSource = struct {
         snapshot_root: []const u8,
         live_path: []const u8,
         open_options: db_mod.OpenOptions,
+        native_restore_plan: ?db_mod.NativeRestoreOpenPlan,
         plan: backups_api.TableRestorePlan,
     ) !db_mod.generation_lifecycle.PublicationOutcome {
         try plan.cancellation.check();
-        var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(live_path, open_options.backend_runtime);
+        const backend_runtime = open_options.backend_runtime orelse return error.MissingBackendRuntime;
+        const restore_io = plan.io orelse backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
+        var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(
+            live_path,
+            open_options.backend_runtime,
+            restore_io,
+        );
         defer transition.deinit();
         var staged = try transition.beginStaging();
         defer staged.deinit();
-        const backend_runtime = open_options.backend_runtime orelse return error.MissingBackendRuntime;
-        const restore_io = plan.io orelse backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+        const candidate_open_options = if (native_restore_plan) |resolved|
+            resolved.optionsForPath(staged.path())
+        else
+            open_options;
 
         switch (plan.manifest.format) {
             .portable => {
@@ -5549,7 +5687,7 @@ pub const BoundTableWriteSource = struct {
                     restore_io,
                     snapshot_root,
                     staged.path(),
-                    open_options,
+                    candidate_open_options,
                     plan.cancellation,
                 );
                 if (!restored_native_generation) {
@@ -5557,7 +5695,7 @@ pub const BoundTableWriteSource = struct {
                     // Complete their derived indexes in the restore job without
                     // imposing a foreground deadline or inventing a Raft repair
                     // identity for this process-local database.
-                    var staged_open_options = open_options;
+                    var staged_open_options = candidate_open_options;
                     staged_open_options.staged_generation = &staged;
                     var restored = try db_mod.DB.open(alloc, staged.path(), staged_open_options);
                     defer restored.close();
@@ -5573,7 +5711,7 @@ pub const BoundTableWriteSource = struct {
                     // while creating durable intents for only the damaged or
                     // incompatible ones. Keep the candidate unservable until
                     // every such intent has activated and validated.
-                    var staged_open_options = open_options;
+                    var staged_open_options = candidate_open_options;
                     staged_open_options.open_mode = .writer_no_replay;
                     staged_open_options.staged_generation = &staged;
                     staged_open_options.start_index_workers = false;
@@ -15706,7 +15844,7 @@ pub const ProvisionedTableWriteSource = struct {
 
     const NativeBackupShardSnapshot = struct {
         snapshot_root: []const u8,
-        attempt_marker_path: []const u8,
+        snapshot_attempt: NativeSnapshotAttempt,
         dest_root: []const u8,
         io: std.Io,
         cancellation: db_mod.types.CancellationToken,
@@ -15715,9 +15853,8 @@ pub const ProvisionedTableWriteSource = struct {
 
         fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             deleteLocalNativeSnapshot(self.io, self.snapshot_root);
-            deleteNativeSnapshotAttemptMarker(self.io, self.attempt_marker_path);
+            self.snapshot_attempt.deinit();
             alloc.free(@constCast(self.snapshot_root));
-            alloc.free(@constCast(self.attempt_marker_path));
             alloc.free(@constCast(self.dest_root));
             if (self.owns_shard) self.shard.deinit(alloc);
             self.* = undefined;
@@ -15758,17 +15895,14 @@ pub const ProvisionedTableWriteSource = struct {
         defer alloc.free(group_label);
         const snapshot_token = try nativeSnapshotAttemptTokenAlloc(alloc, snapshot_io, plan.backup_id, group_label);
         defer alloc.free(snapshot_token);
-        const attempt_marker_path = try createNativeSnapshotAttemptMarker(
+        var snapshot_attempt = try createNativeSnapshotAttemptMarker(
             alloc,
             snapshot_io,
             db_path,
             snapshot_token,
             platform_time.realtimeNs(),
         );
-        errdefer {
-            deleteNativeSnapshotAttemptMarker(snapshot_io, attempt_marker_path);
-            alloc.free(attempt_marker_path);
-        }
+        errdefer snapshot_attempt.deinit();
         _ = try db.snapshotNativeWithCancellation(snapshot_token, plan.cancellation);
 
         const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
@@ -15786,7 +15920,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         return .{
             .snapshot_root = snapshot_root,
-            .attempt_marker_path = attempt_marker_path,
+            .snapshot_attempt = snapshot_attempt,
             .dest_root = dest_root,
             .io = snapshot_io,
             .cancellation = plan.cancellation,
@@ -15915,7 +16049,11 @@ pub const ProvisionedTableWriteSource = struct {
         defer if (prepared_generation) |*generation| generation.deinit();
 
         if (!plan.reconcile_only) {
-            preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntime(path, self.backend_runtime);
+            preparation = try db_mod.generation_lifecycle.beginProcessPreparationWithRuntimeAndIo(
+                path,
+                self.backend_runtime,
+                restore_io,
+            );
             prepared_generation = backup_restore.prepareRestoreSnapshotToPathWithPreparation(&preparation.?, alloc, path, group_id, restore_source, .{
                 .expected_table_name = table_name,
                 .expected_identity_namespace = identity_namespace,
@@ -43971,7 +44109,7 @@ test "provisioned create reuses a generation opened by startup reconciliation" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/create-startup-owner-race", .{tmp.sub_path});

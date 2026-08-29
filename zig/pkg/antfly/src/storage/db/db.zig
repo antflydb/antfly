@@ -325,6 +325,14 @@ test "document extraction templated inline source size is rejected before persis
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, doc_key));
 }
 
+const BackendConfigurationResolution = struct {
+    path_fingerprint: u64,
+};
+
+fn backendConfigurationPathFingerprint(path: []const u8) u64 {
+    return std.hash.Wyhash.hash(0x9e3779b97f4a7c15, path);
+}
+
 pub const OpenOptions = struct {
     pub const PhysicalRootMode = enum {
         /// The DB path names a directory-backed physical root. DB owns its
@@ -385,10 +393,10 @@ pub const OpenOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
-    /// Internal capability bit: the runtime's storage configurator has already
-    /// resolved this path. Restore planning sets it so materialization,
-    /// validation, and DB.open all consume one immutable backend decision.
-    backend_configuration_resolved: bool = false,
+    /// Private proof installed only by `NativeRestoreOpenPlan.optionsForPath`.
+    /// A path-bound proof prevents a copied option set from silently skipping
+    /// configuration for a different DB namespace.
+    _backend_configuration_resolution: ?BackendConfigurationResolution = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     start_index_workers: bool = true,
@@ -449,6 +457,33 @@ pub const OpenOptions = struct {
     /// client-write guard. A standby gate also suppresses mutating background
     /// runtimes at open, even if the generic runtime defaults are enabled.
     ha_write_gate: ?HAWriteGate = null,
+};
+
+/// Immutable backend decision shared by every phase of one native restore.
+/// The runtime configurator is evaluated once against the final logical DB
+/// identity; candidate opens receive an explicit path-bound proof and never
+/// invoke it again.
+pub const NativeRestoreOpenPlan = struct {
+    options: OpenOptions,
+    target_path_fingerprint: u64,
+
+    pub fn optionsForPath(self: @This(), path: []const u8) OpenOptions {
+        var opts = self.options;
+        opts._backend_configuration_resolution = .{
+            .path_fingerprint = backendConfigurationPathFingerprint(path),
+        };
+        return opts;
+    }
+
+    pub fn optionsForTarget(self: @This(), target_path: []const u8) !OpenOptions {
+        if (backendConfigurationPathFingerprint(target_path) != self.target_path_fingerprint)
+            return error.NativeRestoreTargetPathMismatch;
+        return self.optionsForPath(target_path);
+    }
+
+    pub fn physicalRootMode(self: @This()) OpenOptions.PhysicalRootMode {
+        return self.options.physical_root_mode;
+    }
 };
 
 pub const OpenMode = OpenOptions.OpenMode;
@@ -3448,7 +3483,10 @@ pub const DB = struct {
             // options until a runtime has adopted them so partial opens have
             // exactly one cleanup owner.
             errdefer if (opts.enrichment) |*cfg| deinitOwnedEnrichmentConfig(alloc, cfg);
-            if (!opts.backend_configuration_resolved) {
+            if (opts._backend_configuration_resolution) |resolution| {
+                if (resolution.path_fingerprint != backendConfigurationPathFingerprint(path))
+                    return error.BackendConfigurationPathMismatch;
+            } else {
                 if (opts.backend_runtime) |runtime| {
                     if (runtime.db_open_configurator) |configurator| {
                         try configurator.configure(path, &opts);
@@ -3803,22 +3841,31 @@ pub const DB = struct {
     /// Resolves the exact storage configuration used by native restore before
     /// any corpus bytes are fetched. The returned options are safe to pass to
     /// DB.open without invoking a path-sensitive configurator a second time.
-    pub fn resolveNativeRestoreOpenOptions(
-        path: []const u8,
-        identity_namespace: ?doc_identity.Namespace,
-        backend_runtime: ?*background_runtime_mod.BackendRuntime,
-    ) !OpenOptions {
-        var opts = OpenOptions{
-            .identity_namespace = identity_namespace,
-            .backend_runtime = backend_runtime,
-        };
-        if (backend_runtime) |runtime| {
+    pub fn resolveNativeRestoreOpenPlan(
+        target_path: []const u8,
+        requested_options: OpenOptions,
+    ) !NativeRestoreOpenPlan {
+        var opts = requested_options;
+        if (opts.backend_runtime) |runtime| {
             if (runtime.db_open_configurator) |configurator| {
-                try configurator.configure(path, &opts);
+                try configurator.configure(target_path, &opts);
             }
         }
-        opts.backend_configuration_resolved = true;
-        return opts;
+        // A restore plan is intentionally copyable across candidate,
+        // recovery, and published opens. Storage configurators may install
+        // borrowed backend capabilities, but may not smuggle move-only
+        // enrichment ownership into it.
+        if (opts.enrichment != null) return error.NativeRestoreConfiguratorOwnedStateUnsupported;
+        // Host-directory publication cannot safely rebase a separate index
+        // namespace selected by a path-sensitive configurator. Such providers
+        // must implement backend-owned stage/promote before advertising native
+        // restore support.
+        if (opts.physical_root_mode == .filesystem_managed and opts.index_base_path != null)
+            return error.NativeBackupStorageBackendUnsupported;
+        return .{
+            .options = opts,
+            .target_path_fingerprint = backendConfigurationPathFingerprint(target_path),
+        };
     }
 
     pub fn close(self: *DB) void {
@@ -4605,6 +4652,12 @@ pub const DB = struct {
             self.runtime_alloc.destroy(runtime);
         }
         self.core.deinit();
+        // Publication locks are opened and closed through the DB runtime's
+        // `std.Io`. Release the read generation before destroying an owned
+        // runtime, while still retaining the lease until all physical DB
+        // state has closed.
+        if (self.generation_read_lease) |*lease| lease.deinit();
+        self.generation_read_lease = null;
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
         self.async_context.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.async_context);
@@ -4612,8 +4665,6 @@ pub const DB = struct {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
         }
-        if (self.generation_read_lease) |*lease| lease.deinit();
-        self.generation_read_lease = null;
         self.* = undefined;
         self.closed = true;
     }
@@ -47943,7 +47994,10 @@ test "db batch projected admission includes payload and internal record overhead
 test "db open borrows shared backend runtime" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var first_path_buf: [256]u8 = undefined;
@@ -47984,7 +48038,10 @@ test "db open borrows shared backend runtime" {
 
 test "db close retires runtime owners for memory primary backend" {
     const alloc = std.testing.allocator;
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -48071,7 +48128,10 @@ test "db repair capacity treats unsupported observation as accounting only" {
 test "db open downgrades borrowed manual backend runtime to manual executor" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -48090,7 +48150,10 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
 test "db text merge enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -48107,7 +48170,10 @@ test "db text merge enabled requires backend runtime io" {
 test "db enrichment enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
@@ -48311,7 +48377,10 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
 test "db ttl cleanup enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -48332,7 +48401,10 @@ const TestTransactionRecoveryResolver = struct {
 test "db transaction recovery enabled requires backend runtime io" {
     const alloc = std.testing.allocator;
 
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .filesystem_io = std.testing.io,
+    });
     defer runtime.deinit();
 
     var path_buf: [256]u8 = undefined;
@@ -92907,6 +92979,9 @@ test "native restore backend configuration is resolved exactly once" {
     var path_buf: [256]u8 = undefined;
     const path = std.mem.span(tempPath(&path_buf));
     defer cleanupTempDir(path);
+    var candidate_path_buf: [256]u8 = undefined;
+    const candidate_path = std.mem.span(tempPath(&candidate_path_buf));
+    defer cleanupTempDir(candidate_path);
 
     const ConfiguratorContext = struct {
         expected_path: []const u8,
@@ -92923,19 +92998,25 @@ test "native restore backend configuration is resolved exactly once" {
         }
     };
     var context = ConfiguratorContext{ .expected_path = path };
-    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual });
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
     runtime.ptr().db_open_configurator = .{
         .ptr = &context,
         .configure_fn = ConfiguratorContext.configure,
     };
 
-    const resolved = try DB.resolveNativeRestoreOpenOptions(path, null, runtime.ptr());
-    try std.testing.expect(resolved.backend_configuration_resolved);
+    const resolved = try DB.resolveNativeRestoreOpenPlan(path, .{ .backend_runtime = runtime.ptr() });
     try std.testing.expectEqual(@as(usize, 1), context.calls);
-    var db = try DB.open(alloc, path, resolved);
+    var candidate = try DB.open(alloc, candidate_path, resolved.optionsForPath(candidate_path));
+    candidate.close();
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    var db = try DB.open(alloc, path, try resolved.optionsForTarget(path));
     defer db.close();
     try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectError(
+        error.NativeRestoreTargetPathMismatch,
+        resolved.optionsForTarget(candidate_path),
+    );
 }
 
 test "db native snapshot admission bounds capture under concurrent writes" {

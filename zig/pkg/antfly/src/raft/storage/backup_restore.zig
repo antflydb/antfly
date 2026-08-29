@@ -55,12 +55,13 @@ const RestoreIoScope = struct {
 
     fn init(alloc: std.mem.Allocator, restore: RestoreSource) !RestoreIoScope {
         if (restore.backend_runtime) |runtime| {
-            const runtime_io = runtime.io() orelse return error.BackendRuntimeIoUnavailable;
-            return .{ .alloc = alloc, .io_value = runtime_io };
+            if (runtime.filesystemIo()) |runtime_io|
+                return .{ .alloc = alloc, .io_value = runtime_io };
         }
         if (restore.open_options.io orelse restore.io) |shared_io| {
             return .{ .alloc = alloc, .io_value = shared_io };
         }
+        if (restore.backend_runtime != null) return error.BackendRuntimeIoUnavailable;
         const owned = try alloc.create(std.Io.Threaded);
         errdefer alloc.destroy(owned);
         owned.* = threaded_io_limits.initService(alloc);
@@ -174,9 +175,10 @@ pub fn applyRestoreSnapshotToPathWithOptions(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !void {
-    var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntimeAndIo(
         path,
         restore.backend_runtime,
+        restore.open_options.io orelse restore.io,
     );
     defer transition.deinit();
     try applyRestoreSnapshotToPathWithExclusiveTransition(&transition, alloc, path, group_id, restore, options);
@@ -559,13 +561,16 @@ fn prepareRestoreSnapshot(
     // v0.2.0 native snapshots predate the generation manifest. Preserve their
     // released compatibility path, including whole-tree integrity validation;
     // unreleased intermediate manifest schemas are never inferred here.
-    const legacy_restore_open_options = try db_mod.DB.resolveNativeRestoreOpenOptions(
-        staged_path,
-        options.expected_identity_namespace,
-        restore.backend_runtime,
+    const legacy_restore_plan = try db_mod.DB.resolveNativeRestoreOpenPlan(
+        path,
+        .{
+            .identity_namespace = options.expected_identity_namespace,
+            .backend_runtime = restore.backend_runtime,
+        },
     );
-    if (legacy_restore_open_options.physical_root_mode != .filesystem_managed)
+    if (legacy_restore_plan.physicalRootMode() != .filesystem_managed)
         return error.NativeBackupStorageBackendUnsupported;
+    const legacy_restore_open_options = legacy_restore_plan.optionsForPath(staged_path);
     const snapshot_root = try stageRestoreSnapshot(alloc, io, path, &location, snapshot_path, restore.cancellation);
     defer {
         destroyPathIfExistsWithIo(io, snapshot_root);
@@ -635,17 +640,20 @@ fn applyManifestNativeRestore(
     }
 
     const staged_path = staged_generation.path();
-    const restore_open_options = try db_mod.DB.resolveNativeRestoreOpenOptions(
-        staged_path,
-        options.expected_identity_namespace,
-        restore.backend_runtime,
+    const restore_plan = try db_mod.DB.resolveNativeRestoreOpenPlan(
+        staged_generation.livePath(),
+        .{
+            .identity_namespace = options.expected_identity_namespace,
+            .backend_runtime = restore.backend_runtime,
+        },
     );
     // Directory exchange cannot publish a composed external namespace. Reject
     // immediately after the authenticated bounded manifest read, before any
     // primary or projection corpus transfer. Portable restore remains the
     // source-portable fallback for these backends.
-    if (restore_open_options.physical_root_mode != .filesystem_managed)
+    if (restore_plan.physicalRootMode() != .filesystem_managed)
         return error.NativeBackupStorageBackendUnsupported;
+    const restore_open_options = restore_plan.optionsForPath(staged_path);
     const logical_primary_root = try std.fmt.allocPrint(alloc, "{s}/.native-primary-import", .{staged_path});
     defer alloc.free(logical_primary_root);
     defer destroyPathIfExistsWithIo(io, logical_primary_root);
