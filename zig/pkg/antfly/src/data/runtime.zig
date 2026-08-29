@@ -1808,6 +1808,11 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
         try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_write_failures_total", "counter", "Durable incoming-graph route directory write failures", api_request_stats.incoming_graph_routes.durable_write_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_writes_coalesced_total", "counter", "Durable incoming-graph route hints superseded in the bounded write coalescer", api_request_stats.incoming_graph_routes.durable_writes_coalesced);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_writes_dropped_total", "counter", "Best-effort durable incoming-graph route hints dropped under bounded queue pressure", api_request_stats.incoming_graph_routes.durable_writes_dropped);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_batches_committed_total", "counter", "Bounded durable incoming-graph route batches committed", api_request_stats.incoming_graph_routes.durable_batches_committed);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_pending_entries", "gauge", "Durable incoming-graph route hints awaiting background persistence", api_request_stats.incoming_graph_routes.pending_durable_entries);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_pending_bytes", "gauge", "Encoded durable incoming-graph route hint bytes awaiting background persistence", api_request_stats.incoming_graph_routes.pending_durable_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_bytes", "gauge", "Shared inference cache bytes in use", api_request_stats.inference_cache_budget.used_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_limit_bytes", "gauge", "Shared inference cache byte limit", api_request_stats.inference_cache_budget.max_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_rejected_reservations_total", "counter", "Shared inference cache reservations rejected by the hard limit", api_request_stats.inference_cache_budget.rejected_reservations);
@@ -27162,6 +27167,11 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_misses_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_read_failures_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_write_failures_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_writes_coalesced_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_writes_dropped_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_batches_committed_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_pending_entries 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_pending_bytes 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_resource_disk_reserved_bytes 0") != null);

@@ -5717,7 +5717,7 @@ pub const IndexManager = struct {
                 errdefer self.alloc.free(retired_name);
                 const record = try decodeGeneratedArtifactCleanupRecord(row.value);
                 const conflicts = std.mem.eql(u8, retired_name, cfg.name) or
-                    (refs.chunk_name != null and record.chunk_name != null and std.mem.eql(u8, refs.chunk_name.?, record.chunk_name.?)) or
+                    (record.chunk_name != null and artifactRefsConsumeChunkNamespace(refs, record.chunk_name.?)) or
                     cleanupRecordConflictsWithEmbeddingRefs(record, refs);
                 if (conflicts) return retired_name;
                 self.alloc.free(retired_name);
@@ -7756,28 +7756,43 @@ pub const IndexManager = struct {
 
     const ArtifactRefs = struct {
         chunk_name: ?[]u8 = null,
+        /// Artifact streams consumed as chunk/textual inputs by full-text and
+        /// graph indexes. Keep this distinct from generated `chunk_name`: the
+        /// latter expresses cleanup ownership while this collection expresses
+        /// admission dependencies, including every normalized source.
+        source_artifact_names: [][]u8 = &.{},
         embedding_name: ?[]u8 = null,
         embedding_names: [][]u8 = &.{},
-        asset_name: ?[]u8 = null,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.chunk_name) |value| alloc.free(value);
+            for (self.source_artifact_names) |value| alloc.free(value);
+            if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
             if (self.embedding_name) |value| alloc.free(value);
             for (self.embedding_names) |value| alloc.free(value);
             if (self.embedding_names.len > 0) alloc.free(self.embedding_names);
-            if (self.asset_name) |value| alloc.free(value);
             self.* = undefined;
         }
     };
+
+    fn artifactRefsConsumeChunkNamespace(refs: ArtifactRefs, candidate: []const u8) bool {
+        if (refs.chunk_name) |configured| {
+            if (std.mem.eql(u8, configured, candidate)) return true;
+        }
+        return containsOwnedString(refs.source_artifact_names, candidate);
+    }
 
     fn artifactRefsFromConfig(self: *IndexManager, cfg: types.IndexConfig) !ArtifactRefs {
         switch (cfg.kind) {
             .full_text => {
                 const text_cfg = try parseTextConfig(self.alloc, cfg.config_json);
                 defer text_cfg.deinit(self.alloc);
-                return .{
+                var refs = ArtifactRefs{
                     .chunk_name = if (text_cfg.source_artifact_name) |name| try self.alloc.dupe(u8, name) else null,
                 };
+                errdefer refs.deinit(self.alloc);
+                refs.source_artifact_names = try cloneOwnedStrings(self.alloc, text_cfg.source_artifact_names);
+                return refs;
             },
             .dense_vector => {
                 const dense_cfg = try parseDenseConfig(self.alloc, cfg.config_json);
@@ -7837,12 +7852,17 @@ pub const IndexManager = struct {
             .graph => {
                 var graph_cfg = try parseGraphConfig(self.alloc, cfg.config_json);
                 defer graph_cfg.deinit(self.alloc);
-                return .{
-                    .asset_name = if (graph_cfg.artifact_sources.len == 1)
-                        try self.alloc.dupe(u8, graph_cfg.artifact_sources[0].artifact_name)
-                    else
-                        null,
-                };
+                const names = try self.alloc.alloc([]u8, graph_cfg.artifact_sources.len);
+                var initialized: usize = 0;
+                errdefer {
+                    for (names[0..initialized]) |name| self.alloc.free(name);
+                    if (names.len > 0) self.alloc.free(names);
+                }
+                for (graph_cfg.artifact_sources, names) |source, *name| {
+                    name.* = try self.alloc.dupe(u8, source.artifact_name);
+                    initialized += 1;
+                }
+                return .{ .source_artifact_names = names };
             },
             .algebraic => return .{},
         }
@@ -8959,6 +8979,11 @@ pub const IndexManager = struct {
         generation: u64,
         config_fingerprint: ?u64,
     };
+
+    pub fn coverageIdentityForIndex(self: *const IndexManager, index_name: []const u8) ?CoverageIdentity {
+        const cfg = self.get(index_name) orelse return null;
+        return coverageIdentityForConfig(cfg.*);
+    }
 
     pub fn coverageIdentityMapAlloc(self: *const IndexManager, alloc: Allocator) !std.StringHashMapUnmanaged(CoverageIdentity) {
         var identities = std.StringHashMapUnmanaged(CoverageIdentity).empty;
@@ -26925,6 +26950,33 @@ test "generated artifact cleanup upgrades v2 debt without losing its cursor or o
     const sparse_retired_name = (try manager.pendingGeneratedArtifactCleanupIndexForConfigAlloc(&store, sparse_replacement_cfg)) orelse return error.TestUnexpectedResult;
     defer alloc.free(sparse_retired_name);
     try std.testing.expectEqualStrings("legacy_vectors", sparse_retired_name);
+
+    const full_text_replacement_cfg: types.IndexConfig = .{
+        .name = "artifact_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"chunks_v1\"},{\"artifact\":\"other_chunks\"}]}",
+    };
+    const full_text_retired_name = (try manager.pendingGeneratedArtifactCleanupIndexForConfigAlloc(&store, full_text_replacement_cfg)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(full_text_retired_name);
+    try std.testing.expectEqualStrings("legacy_vectors", full_text_retired_name);
+
+    const graph_replacement_cfg: types.IndexConfig = .{
+        .name = "artifact_graph",
+        .kind = .graph,
+        .config_json = "{\"sources\":[{\"artifact\":\"other_chunks\",\"path\":\"$.edges[*]\"},{\"artifact\":\"chunks_v1\",\"path\":\"$.relations[*]\"}]}",
+    };
+    const graph_retired_name = (try manager.pendingGeneratedArtifactCleanupIndexForConfigAlloc(&store, graph_replacement_cfg)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(graph_retired_name);
+    try std.testing.expectEqualStrings("legacy_vectors", graph_retired_name);
+
+    for ([_]types.IndexConfig{
+        .{ .name = "artifact_text_single", .kind = .full_text, .config_json = "{\"artifact_name\":\"chunks_v1\"}" },
+        .{ .name = "artifact_graph_single", .kind = .graph, .config_json = "{\"source\":{\"artifact\":\"chunks_v1\",\"path\":\"$.relations[*]\"}}" },
+    }) |single_source_cfg| {
+        const single_retired_name = (try manager.pendingGeneratedArtifactCleanupIndexForConfigAlloc(&store, single_source_cfg)) orelse return error.TestUnexpectedResult;
+        defer alloc.free(single_retired_name);
+        try std.testing.expectEqualStrings("legacy_vectors", single_retired_name);
+    }
 }
 
 test "graph retirement durably removes edge artifacts and source state before same-name recreation" {

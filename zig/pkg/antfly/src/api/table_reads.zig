@@ -6547,6 +6547,17 @@ fn graphHydrateOnPreparedDb(
     req: distributed_graph.GraphHydrateRequest,
     search_req: db_mod.types.SearchRequest,
 ) !distributed_graph.GraphHydrateResponse {
+    if (req.incoming_index_name.len > 0) {
+        if (!req.incoming_index_identity.valid()) return error.IndexGenerationMismatch;
+        const actual = db.core.index_manager.coverageIdentityForIndex(req.incoming_index_name) orelse
+            return error.IndexGenerationMismatch;
+        if (actual.generation != req.incoming_index_identity.incarnation or
+            actual.config_fingerprint == null or
+            actual.config_fingerprint.? != req.incoming_index_identity.config_hash)
+        {
+            return error.IndexGenerationMismatch;
+        }
+    }
     const hits = if (req.include_hits)
         try db.graphHydrateKeysForInternalRead(alloc, search_req, req.keys)
     else
@@ -6565,6 +6576,7 @@ fn graphHydrateOnPreparedDb(
             )
         else
             @constCast((&[_]bool{})[0..]),
+        .incoming_index_identity = req.incoming_index_identity,
     };
 }
 

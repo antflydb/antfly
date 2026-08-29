@@ -2004,6 +2004,7 @@ pub const ApiHttpServer = struct {
         session_maintenance: u64 = 0,
         backup_maintenance: u64 = 0,
         index_installation: u64 = 0,
+        incoming_graph_routes: u64 = 0,
     };
 
     fn allocRuntimeOwnerIds(runtime: ?*db_mod.background_runtime.BackendRuntime) !RuntimeOwnerIds {
@@ -2021,6 +2022,7 @@ pub const ApiHttpServer = struct {
         ids.session_maintenance = try active.allocOwnerId();
         ids.backup_maintenance = try active.allocOwnerId();
         ids.index_installation = try active.allocOwnerId();
+        ids.incoming_graph_routes = try active.allocOwnerId();
         return ids;
     }
 
@@ -2108,6 +2110,16 @@ pub const ApiHttpServer = struct {
     ) ApiHttpServer {
         const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
         const api_io = queryEmbeddingCacheIo(cfg);
+        var incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.initWithDurableStore(
+            owner_alloc,
+            cfg.incoming_graph_route_store,
+        );
+        if (cfg.backend_runtime) |runtime| {
+            incoming_graph_routes.attachDurableJobLane(
+                runtime.durable_jobs,
+                owner_ids.incoming_graph_routes,
+            );
+        }
         return .{
             .alloc = request_alloc,
             .owner_alloc = owner_alloc,
@@ -2119,10 +2131,7 @@ pub const ApiHttpServer = struct {
             .table_reads = table_read_source,
             .table_writes = table_write_source,
             .foreign_registry = cfg.foreign_registry,
-            .incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.initWithDurableStore(
-                owner_alloc,
-                cfg.incoming_graph_route_store,
-            ),
+            .incoming_graph_routes = incoming_graph_routes,
             .created_at_ns = platform_time.monotonicNs(),
             .txn_sessions = blk: {
                 var registry = transactions_api.SessionRegistry.initWithOptions(

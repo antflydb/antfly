@@ -30,6 +30,7 @@ const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_traversal_mod = @import("../graph/traversal.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
+const background_runtime = @import("../storage/background_runtime.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
 const algebraic_ir = db_mod.algebraic.ir;
@@ -210,10 +211,24 @@ pub const Worker = struct {
 
 pub const IncomingSourceGroupsRequest = struct {
     index_name: []const u8,
+    index_identity: GraphIndexIdentity = .{},
     keys: []const []const u8,
     topology_epoch: u64,
     identity_read_generation: ?u64 = null,
     identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration = &.{},
+};
+
+pub const GraphIndexIdentity = struct {
+    incarnation: u64 = 0,
+    config_hash: u64 = 0,
+
+    pub fn valid(self: @This()) bool {
+        return self.incarnation != 0 and self.config_hash != 0;
+    }
+
+    pub fn eql(self: @This(), other: @This()) bool {
+        return self.incarnation == other.incarnation and self.config_hash == other.config_hash;
+    }
 };
 
 pub const IncomingSourceGroupEntry = struct {
@@ -256,13 +271,23 @@ pub const IncomingSourceGroupCache = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     durable_mutex: std.atomic.Mutex = .unlocked,
+    pending_mutex: std.atomic.Mutex = .unlocked,
     durable_store: ?*backend_erased.Store = null,
+    durable_jobs: ?background_runtime.DurableJobLane = null,
+    durable_job_owner_id: u64 = 0,
     entries: std.StringHashMapUnmanaged([]u64) = .empty,
     resident_bytes: usize = 0,
+    pending_durable: std.AutoHashMapUnmanaged(u32, PendingDurableWrite) = .empty,
+    pending_durable_bytes: usize = 0,
+    durable_flush_scheduled: bool = false,
+    closing: bool = false,
     durable_hits: std.atomic.Value(u64) = .init(0),
     durable_misses: std.atomic.Value(u64) = .init(0),
     durable_read_failures: std.atomic.Value(u64) = .init(0),
     durable_write_failures: std.atomic.Value(u64) = .init(0),
+    durable_writes_coalesced: std.atomic.Value(u64) = .init(0),
+    durable_writes_dropped: std.atomic.Value(u64) = .init(0),
+    durable_batches_committed: std.atomic.Value(u64) = .init(0),
 
     const max_resident_bytes: usize = 16 * 1024 * 1024;
     const max_entries: usize = 65_536;
@@ -273,12 +298,26 @@ pub const IncomingSourceGroupCache = struct {
     const durable_slot_count: u32 = 1 << 20;
     const DurableKey = [durable_key_prefix.len + @sizeOf(u32)]u8;
     const durable_value_header_len = durable_value_magic.len + route_digest_len + route_digest_len + @sizeOf(u32);
+    const max_pending_durable_entries: usize = 16_384;
+    const max_pending_durable_bytes: usize = 8 * 1024 * 1024;
+    const max_durable_flush_entries: usize = 512;
+    const max_durable_flush_bytes: usize = 4 * 1024 * 1024;
 
     pub const Stats = struct {
         durable_hits: u64 = 0,
         durable_misses: u64 = 0,
         durable_read_failures: u64 = 0,
         durable_write_failures: u64 = 0,
+        durable_writes_coalesced: u64 = 0,
+        durable_writes_dropped: u64 = 0,
+        durable_batches_committed: u64 = 0,
+        pending_durable_entries: usize = 0,
+        pending_durable_bytes: usize = 0,
+    };
+
+    const PendingDurableWrite = struct {
+        durable_key: DurableKey,
+        encoded: []u8,
     };
 
     const NormalizedEntry = struct {
@@ -306,27 +345,67 @@ pub const IncomingSourceGroupCache = struct {
         self.durable_store = durable_store;
     }
 
+    /// Attach a process-owned background lane. The owner must be unique to
+    /// this directory; closeOwner provides the lifetime fence during deinit.
+    pub fn attachDurableJobLane(
+        self: *@This(),
+        lane: background_runtime.DurableJobLane,
+        owner_id: u64,
+    ) void {
+        std.debug.assert(owner_id != 0);
+        self.durable_jobs = lane;
+        self.durable_job_owner_id = owner_id;
+    }
+
     pub fn stats(self: *const @This()) Stats {
+        platform_sync.lockYielding(@constCast(&self.pending_mutex));
+        const pending_entries = self.pending_durable.count();
+        const pending_bytes = self.pending_durable_bytes;
+        @constCast(&self.pending_mutex).unlock();
         return .{
             .durable_hits = self.durable_hits.load(.monotonic),
             .durable_misses = self.durable_misses.load(.monotonic),
             .durable_read_failures = self.durable_read_failures.load(.monotonic),
             .durable_write_failures = self.durable_write_failures.load(.monotonic),
+            .durable_writes_coalesced = self.durable_writes_coalesced.load(.monotonic),
+            .durable_writes_dropped = self.durable_writes_dropped.load(.monotonic),
+            .durable_batches_committed = self.durable_batches_committed.load(.monotonic),
+            .pending_durable_entries = pending_entries,
+            .pending_durable_bytes = pending_bytes,
         };
     }
 
     pub fn deinit(self: *@This()) void {
+        platform_sync.lockYielding(&self.pending_mutex);
+        self.closing = true;
+        self.pending_mutex.unlock();
+        if (self.durable_jobs) |lane| lane.closeOwner(self.durable_job_owner_id);
+
         platform_sync.lockYielding(&self.mutex);
         self.clearLocked();
         self.entries.deinit(self.alloc);
         self.mutex.unlock();
+
+        platform_sync.lockYielding(&self.pending_mutex);
+        var pending_it = self.pending_durable.valueIterator();
+        while (pending_it.next()) |pending| self.alloc.free(pending.encoded);
+        self.pending_durable.deinit(self.alloc);
+        self.pending_durable_bytes = 0;
+        self.pending_mutex.unlock();
         self.* = undefined;
     }
 
     pub fn clear(self: *@This()) void {
         platform_sync.lockYielding(&self.mutex);
-        defer self.mutex.unlock();
         self.clearLocked();
+        self.mutex.unlock();
+
+        platform_sync.lockYielding(&self.pending_mutex);
+        defer self.pending_mutex.unlock();
+        var it = self.pending_durable.valueIterator();
+        while (it.next()) |pending| self.alloc.free(pending.encoded);
+        self.pending_durable.clearRetainingCapacity();
+        self.pending_durable_bytes = 0;
     }
 
     pub fn resolveAlloc(
@@ -407,9 +486,9 @@ pub const IncomingSourceGroupCache = struct {
         response: IncomingSourceGroupsResponse,
     ) !void {
         if (!response.complete or response.entries.len != req.keys.len) return error.InvalidGraphIncomingRouteResult;
-        // A topology epoch alone cannot fence graph mutations. Requests that
-        // lack either a scalar single-shard generation or a distributed
-        // generation vector remain exact-probe-only.
+        // A topology epoch alone cannot fence graph mutations or index
+        // recreation. Requests without both an index identity and either a
+        // scalar or distributed read generation remain exact-probe-only.
         if (!incomingRouteRequestHasReadFence(req)) return;
         const fence = incomingRouteFence(table_name, req);
         const normalized = try self.alloc.alloc(NormalizedEntry, req.keys.len);
@@ -435,7 +514,11 @@ pub const IncomingSourceGroupCache = struct {
         }
 
         if (self.durable_store != null) {
-            self.persistNormalized(table_name, req.index_name, req.keys, fence, normalized) catch {
+            const persist_result = if (self.durable_jobs != null and !self.durable_jobs.?.executesInline())
+                self.enqueueNormalized(table_name, req.index_name, req.keys, fence, normalized)
+            else
+                self.persistNormalized(table_name, req.index_name, req.keys, fence, normalized);
+            persist_result catch {
                 _ = self.durable_write_failures.fetchAdd(1, .monotonic);
             };
         }
@@ -563,21 +646,212 @@ pub const IncomingSourceGroupCache = struct {
         for (keys, normalized) |key, entry| {
             const identity = incomingRouteDurableIdentity(table_name, index_name, key);
             const durable_key = incomingRouteDurableKey(identity);
-            const encoded_len = try std.math.add(usize, durable_value_header_len, try std.math.mul(usize, entry.groups.len, @sizeOf(u64)));
-            const encoded = try self.alloc.alloc(u8, encoded_len);
+            const encoded = try encodeIncomingRouteDurableValueAlloc(self.alloc, identity, fence, entry.groups);
             defer self.alloc.free(encoded);
-            @memcpy(encoded[0..durable_value_magic.len], durable_value_magic);
-            @memcpy(encoded[durable_value_magic.len..][0..route_digest_len], &identity);
-            @memcpy(encoded[durable_value_magic.len + route_digest_len ..][0..route_digest_len], &fence);
-            const count_offset = durable_value_magic.len + route_digest_len + route_digest_len;
-            std.mem.writeInt(u32, encoded[count_offset..][0..@sizeOf(u32)], @intCast(entry.groups.len), .big);
-            var offset = durable_value_header_len;
-            for (entry.groups) |group| {
-                std.mem.writeInt(u64, encoded[offset..][0..@sizeOf(u64)], group, .big);
-                offset += @sizeOf(u64);
-            }
             try batch.put(&durable_key, encoded);
         }
+        try batch.commit();
+        _ = self.durable_batches_committed.fetchAdd(1, .monotonic);
+    }
+
+    fn encodeIncomingRouteDurableValueAlloc(
+        alloc: std.mem.Allocator,
+        identity: [route_digest_len]u8,
+        fence: [route_digest_len]u8,
+        groups: []const u64,
+    ) ![]u8 {
+        const encoded_len = try std.math.add(usize, durable_value_header_len, try std.math.mul(usize, groups.len, @sizeOf(u64)));
+        const encoded = try alloc.alloc(u8, encoded_len);
+        @memcpy(encoded[0..durable_value_magic.len], durable_value_magic);
+        @memcpy(encoded[durable_value_magic.len..][0..route_digest_len], &identity);
+        @memcpy(encoded[durable_value_magic.len + route_digest_len ..][0..route_digest_len], &fence);
+        const count_offset = durable_value_magic.len + route_digest_len + route_digest_len;
+        std.mem.writeInt(u32, encoded[count_offset..][0..@sizeOf(u32)], @intCast(groups.len), .big);
+        var offset = durable_value_header_len;
+        for (groups) |group| {
+            std.mem.writeInt(u64, encoded[offset..][0..@sizeOf(u64)], group, .big);
+            offset += @sizeOf(u64);
+        }
+        return encoded;
+    }
+
+    fn enqueueNormalized(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        keys: []const []const u8,
+        fence: [route_digest_len]u8,
+        normalized: []const NormalizedEntry,
+    ) !void {
+        if (keys.len != normalized.len) return error.InvalidGraphIncomingRouteResult;
+        defer self.scheduleDurableFlush();
+        for (keys, normalized) |key, entry| {
+            const identity = incomingRouteDurableIdentity(table_name, index_name, key);
+            const durable_key = incomingRouteDurableKey(identity);
+            const encoded_len = try std.math.add(usize, durable_value_header_len, try std.math.mul(usize, entry.groups.len, @sizeOf(u64)));
+            if (!self.durableWriteMayFit(durable_key, encoded_len)) {
+                _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
+                continue;
+            }
+            const encoded = try encodeIncomingRouteDurableValueAlloc(self.alloc, identity, fence, entry.groups);
+            try self.enqueueEncodedDurableWrite(durable_key, encoded);
+        }
+    }
+
+    fn durableWriteMayFit(self: *@This(), durable_key: DurableKey, encoded_len: usize) bool {
+        if (encoded_len > max_pending_durable_bytes) return false;
+        const slot = std.mem.readInt(u32, durable_key[durable_key_prefix.len..][0..@sizeOf(u32)], .big);
+        platform_sync.lockYielding(&self.pending_mutex);
+        defer self.pending_mutex.unlock();
+        if (self.closing) return false;
+        if (self.pending_durable.get(slot)) |existing| {
+            const retained_bytes = self.pending_durable_bytes - existing.encoded.len;
+            return retained_bytes <= max_pending_durable_bytes - encoded_len;
+        }
+        return self.pending_durable.count() < max_pending_durable_entries and
+            self.pending_durable_bytes <= max_pending_durable_bytes - encoded_len;
+    }
+
+    fn enqueueEncodedDurableWrite(self: *@This(), durable_key: DurableKey, encoded: []u8) !void {
+        const slot = std.mem.readInt(u32, durable_key[durable_key_prefix.len..][0..@sizeOf(u32)], .big);
+        platform_sync.lockYielding(&self.pending_mutex);
+        defer self.pending_mutex.unlock();
+        if (self.closing) {
+            self.alloc.free(encoded);
+            _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+        if (self.pending_durable.getPtr(slot)) |existing| {
+            const retained_bytes = self.pending_durable_bytes - existing.encoded.len;
+            if (encoded.len > max_pending_durable_bytes or
+                retained_bytes > max_pending_durable_bytes - encoded.len)
+            {
+                self.alloc.free(encoded);
+                _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
+                return;
+            }
+            self.pending_durable_bytes -= existing.encoded.len;
+            self.alloc.free(existing.encoded);
+            existing.* = .{ .durable_key = durable_key, .encoded = encoded };
+            self.pending_durable_bytes += encoded.len;
+            _ = self.durable_writes_coalesced.fetchAdd(1, .monotonic);
+            return;
+        }
+        if (self.pending_durable.count() >= max_pending_durable_entries or
+            encoded.len > max_pending_durable_bytes or
+            self.pending_durable_bytes > max_pending_durable_bytes - encoded.len)
+        {
+            self.alloc.free(encoded);
+            _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
+            return;
+        }
+        self.pending_durable.putNoClobber(self.alloc, slot, .{
+            .durable_key = durable_key,
+            .encoded = encoded,
+        }) catch |err| {
+            self.alloc.free(encoded);
+            return err;
+        };
+        self.pending_durable_bytes += encoded.len;
+    }
+
+    const DurableFlushJob = struct {
+        cache: *IncomingSourceGroupCache,
+
+        fn run(ptr: *anyopaque) anyerror!void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            job.cache.flushPendingDurableWrites();
+        }
+
+        fn deinit(ptr: *anyopaque) void {
+            const job: *@This() = @ptrCast(@alignCast(ptr));
+            job.cache.alloc.destroy(job);
+        }
+    };
+
+    fn scheduleDurableFlush(self: *@This()) void {
+        const lane = self.durable_jobs orelse return;
+        if (lane.executesInline()) return;
+        platform_sync.lockYielding(&self.pending_mutex);
+        if (self.closing or self.durable_flush_scheduled or self.pending_durable.count() == 0) {
+            self.pending_mutex.unlock();
+            return;
+        }
+        self.durable_flush_scheduled = true;
+        self.pending_mutex.unlock();
+
+        const job = self.alloc.create(DurableFlushJob) catch {
+            platform_sync.lockYielding(&self.pending_mutex);
+            self.durable_flush_scheduled = false;
+            self.pending_mutex.unlock();
+            _ = self.durable_write_failures.fetchAdd(1, .monotonic);
+            return;
+        };
+        job.* = .{ .cache = self };
+        lane.submit(.{
+            .owner_id = self.durable_job_owner_id,
+            .class = .commit_durable,
+            .ptr = job,
+            .run = DurableFlushJob.run,
+            .deinit = DurableFlushJob.deinit,
+        }) catch {
+            self.alloc.destroy(job);
+            platform_sync.lockYielding(&self.pending_mutex);
+            self.durable_flush_scheduled = false;
+            self.pending_mutex.unlock();
+            _ = self.durable_write_failures.fetchAdd(1, .monotonic);
+        };
+    }
+
+    fn flushPendingDurableWrites(self: *@This()) void {
+        while (true) {
+            var slots: [max_durable_flush_entries]u32 = undefined;
+            var writes: [max_durable_flush_entries]PendingDurableWrite = undefined;
+            var count: usize = 0;
+            var bytes: usize = 0;
+
+            platform_sync.lockYielding(&self.pending_mutex);
+            var it = self.pending_durable.iterator();
+            while (it.next()) |entry| {
+                const next_bytes = bytes +| entry.value_ptr.encoded.len;
+                if (count > 0 and next_bytes > max_durable_flush_bytes) break;
+                slots[count] = entry.key_ptr.*;
+                bytes = next_bytes;
+                count += 1;
+                if (count == max_durable_flush_entries) break;
+            }
+            if (count == 0) {
+                // Publish idleness while holding the same mutex used by
+                // enqueue/schedule. A concurrent producer therefore either
+                // observes the current worker or schedules its successor;
+                // no write can be stranded in the handoff window.
+                self.durable_flush_scheduled = false;
+                self.pending_mutex.unlock();
+                return;
+            }
+            for (slots[0..count], 0..) |slot, i| {
+                const removed = self.pending_durable.fetchRemove(slot) orelse unreachable;
+                writes[i] = removed.value;
+                self.pending_durable_bytes -= removed.value.encoded.len;
+            }
+            self.pending_mutex.unlock();
+            self.persistEncodedDurableBatch(writes[0..count]) catch {
+                for (writes[0..count]) |write| self.alloc.free(write.encoded);
+                _ = self.durable_write_failures.fetchAdd(1, .monotonic);
+                continue;
+            };
+            for (writes[0..count]) |write| self.alloc.free(write.encoded);
+            _ = self.durable_batches_committed.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn persistEncodedDurableBatch(self: *@This(), writes: []const PendingDurableWrite) !void {
+        const store = self.durable_store orelse return error.GraphIncomingRouteDirectoryUnavailable;
+        platform_sync.lockYielding(&self.durable_mutex);
+        defer self.durable_mutex.unlock();
+        var batch = try store.beginBatch();
+        errdefer batch.abort();
+        for (writes) |write| try batch.put(&write.durable_key, write.encoded);
         try batch.commit();
     }
 
@@ -609,7 +883,8 @@ pub const IncomingSourceGroupCache = struct {
 };
 
 fn incomingRouteRequestHasReadFence(req: IncomingSourceGroupsRequest) bool {
-    return req.identity_read_generation != null or req.identity_read_generations.len > 0;
+    return req.index_identity.valid() and
+        (req.identity_read_generation != null or req.identity_read_generations.len > 0);
 }
 
 fn incomingRouteCacheKeyAlloc(
@@ -623,7 +898,14 @@ fn incomingRouteCacheKeyAlloc(
     return out;
 }
 
-fn incomingRouteDurableIdentity(table_name: []const u8, index_name: []const u8, key: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+fn incomingRouteDurableIdentity(
+    table_name: []const u8,
+    index_name: []const u8,
+    key: []const u8,
+) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    // Keep one bounded durable slot per logical route. Index incarnations are
+    // carried in the value fence, so recreation overwrites this slot instead
+    // of leaking one durable entry per historical generation.
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hashIncomingRouteComponent(&hasher, table_name);
     hashIncomingRouteComponent(&hasher, index_name);
@@ -649,6 +931,8 @@ fn incomingRouteFence(
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hashIncomingRouteComponent(&hasher, table_name);
     hashIncomingRouteComponent(&hasher, req.index_name);
+    hashIncomingRouteU64(&hasher, req.index_identity.incarnation);
+    hashIncomingRouteU64(&hasher, req.index_identity.config_hash);
     hashIncomingRouteU64(&hasher, req.topology_epoch);
     hasher.update(&.{@intFromBool(req.identity_read_generation != null)});
     if (req.identity_read_generation) |generation| hashIncomingRouteU64(&hasher, generation);
@@ -933,6 +1217,7 @@ pub const GraphHydrateRequest = struct {
     include_stored: bool = true,
     include_hits: bool = true,
     incoming_index_name: []const u8 = "",
+    incoming_index_identity: GraphIndexIdentity = .{},
     incoming_index_name_owned: bool = false,
     resolved_doc_filter: ?*const anyopaque = null,
     resolved_doc_filter_owned: bool = false,
@@ -962,6 +1247,7 @@ pub const GraphHydrateRequest = struct {
 pub const GraphHydrateResponse = struct {
     hits: []db_mod.types.SearchHit = &.{},
     has_incoming: []bool = &.{},
+    incoming_index_identity: GraphIndexIdentity = .{},
 
     pub fn deinit(self: *GraphHydrateResponse, alloc: std.mem.Allocator) void {
         for (self.hits) |*hit| hit.deinit(alloc);
@@ -1164,12 +1450,16 @@ const GraphHydrateRequestJson = struct {
     include_stored: bool = true,
     include_hits: bool = true,
     incoming_index_name: []const u8 = "",
+    incoming_index_incarnation: u64 = 0,
+    incoming_index_config_hash: u64 = 0,
     _resolved_doc_filter: ?std.json.Value = null,
 };
 
 const GraphHydrateResponseJson = struct {
     hits: []const db_mod.types.SearchHit = &.{},
     has_incoming: []const bool = &.{},
+    incoming_index_incarnation: u64 = 0,
+    incoming_index_config_hash: u64 = 0,
 };
 
 const GraphEdgesRequestJson = struct {
@@ -1472,6 +1762,7 @@ const TargetNodeSet = struct {
 const GraphAdmissionTableState = struct {
     table_name: []u8,
     topology_epoch: u64 = 0,
+    graph_index_identity: GraphIndexIdentity = .{},
     identity_read_generation: ?u64 = null,
     identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration = &.{},
     filter_query_json: []u8 = &.{},
@@ -1510,6 +1801,7 @@ const GraphNodeAdmissionContext = struct {
     catalog: table_catalog.CatalogSource,
     worker: Worker,
     source_table: []const u8,
+    graph_index_name: []const u8,
     source_topology_epoch: u64,
     source_identity_read_generation: ?u64,
     source_identity_read_generations: []const db_mod.types.ShardIdentityReadGeneration,
@@ -1527,6 +1819,7 @@ const GraphNodeAdmissionContext = struct {
         catalog: table_catalog.CatalogSource,
         worker: Worker,
         source_table: []const u8,
+        graph_index_name: []const u8,
         source_topology_epoch: u64,
         req: db_mod.types.SearchRequest,
         source_result_identity_read_generation: ?u64,
@@ -1539,6 +1832,7 @@ const GraphNodeAdmissionContext = struct {
             .catalog = catalog,
             .worker = worker,
             .source_table = source_table,
+            .graph_index_name = graph_index_name,
             .source_topology_epoch = source_topology_epoch,
             .source_identity_read_generation = req.identity_read_generation orelse source_result_identity_read_generation,
             .source_identity_read_generations = source_identity_read_generations,
@@ -1647,10 +1941,15 @@ const GraphNodeAdmissionContext = struct {
         }
         requires_admission = requires_hydration or
             self.node_filter.filter_prefix.len > 0;
+        const graph_index_identity = if (allowed)
+            (try catalogGraphIndexIdentity(self.alloc, self.catalog, table_name, self.graph_index_name)) orelse GraphIndexIdentity{}
+        else
+            GraphIndexIdentity{};
 
         var state = GraphAdmissionTableState{
             .table_name = owned_name,
             .topology_epoch = topology_epoch,
+            .graph_index_identity = graph_index_identity,
             .identity_read_generation = identity_read_generation,
             .identity_read_generations = identity_read_generations,
             .filter_query_json = filter_query_json,
@@ -1827,6 +2126,7 @@ fn executeSingleCrossRange(
         catalog,
         worker,
         table_name,
+        graph_query.query.index_name,
         topology_epoch,
         req,
         base_result.identity_read_generation,
@@ -3195,6 +3495,7 @@ fn appendIncomingProbeBatchWindow(
         table_state.table_name,
         .{
             .index_name = index_name,
+            .index_identity = table_state.graph_index_identity,
             .keys = keys,
             .topology_epoch = table_state.topology_epoch,
             .identity_read_generation = table_state.identity_read_generation,
@@ -3253,6 +3554,7 @@ fn appendIncomingProbeBatchWindow(
             table_name_inner: []const u8,
             topology_epoch_inner: u64,
             index_name_inner: []const u8,
+            index_identity_inner: GraphIndexIdentity,
             keys_inner: []const []const u8,
             entry: Entry,
             consistency_inner: raft_mod.ReadConsistency,
@@ -3264,15 +3566,21 @@ fn appendIncomingProbeBatchWindow(
                 .include_stored = false,
                 .include_hits = false,
                 .incoming_index_name = index_name_inner,
+                .incoming_index_identity = index_identity_inner,
             };
             defer req.deinit(a);
-            return try worker_inner.executeGraphHydrate(
+            var response = try worker_inner.executeGraphHydrate(
                 a,
                 entry.group_id,
                 table_name_inner,
                 req,
                 consistency_inner,
             );
+            errdefer response.deinit(a);
+            if (!response.incoming_index_identity.eql(req.incoming_index_identity)) {
+                return error.IndexGenerationMismatch;
+            }
+            return response;
         }
 
         fn appendPositive(
@@ -3303,6 +3611,7 @@ fn appendIncomingProbeBatchWindow(
                     table_name_inner: []const u8,
                     topology_epoch_inner: u64,
                     index_name_inner: []const u8,
+                    index_identity_inner: GraphIndexIdentity,
                     keys_inner: []const []const u8,
                     entry: Entry,
                     consistency_inner: raft_mod.ReadConsistency,
@@ -3313,6 +3622,7 @@ fn appendIncomingProbeBatchWindow(
                         table_name_inner,
                         topology_epoch_inner,
                         index_name_inner,
+                        index_identity_inner,
                         keys_inner,
                         entry,
                         consistency_inner,
@@ -3338,6 +3648,7 @@ fn appendIncomingProbeBatchWindow(
                         table_state.table_name,
                         table_state.topology_epoch,
                         index_name,
+                        table_state.graph_index_identity,
                         probe_keys,
                         entry,
                         consistency,
@@ -3363,6 +3674,7 @@ fn appendIncomingProbeBatchWindow(
             table_state.table_name,
             table_state.topology_epoch,
             index_name,
+            table_state.graph_index_identity,
             probe_keys,
             entry,
             consistency,
@@ -3401,6 +3713,7 @@ fn recordObservedIncomingGroups(
         table_state.table_name,
         .{
             .index_name = index_name,
+            .index_identity = table_state.graph_index_identity,
             .keys = keys,
             .topology_epoch = table_state.topology_epoch,
             .identity_read_generation = table_state.identity_read_generation,
@@ -3417,6 +3730,7 @@ test "distributed graph incoming probe expands only positive source shards" {
     const TestState = struct {
         calls: usize = 0,
         max_keys_per_call: usize = 0,
+        echo_index_identity: bool = true,
     };
     const FakeWorker = struct {
         fn iface(state: *TestState) Worker {
@@ -3451,7 +3765,10 @@ test "distributed graph incoming probe expands only positive source shards" {
             try std.testing.expectEqualStrings("graph_idx", req.incoming_index_name);
             const mask = try a.alloc(bool, req.keys.len);
             @memset(mask, false);
-            if (req.keys.len != 2) return .{ .has_incoming = mask };
+            if (req.keys.len != 2) return .{
+                .has_incoming = mask,
+                .incoming_index_identity = if (state.echo_index_identity) req.incoming_index_identity else .{},
+            };
             const expected: [2]bool = switch (group_id) {
                 11 => .{ true, false },
                 22 => .{ false, true },
@@ -3459,7 +3776,10 @@ test "distributed graph incoming probe expands only positive source shards" {
                 else => return error.UnexpectedTestCall,
             };
             @memcpy(mask, &expected);
-            return .{ .has_incoming = mask };
+            return .{
+                .has_incoming = mask,
+                .incoming_index_identity = if (state.echo_index_identity) req.incoming_index_identity else .{},
+            };
         }
     };
 
@@ -3467,6 +3787,7 @@ test "distributed graph incoming probe expands only positive source shards" {
     const table_state = GraphAdmissionTableState{
         .table_name = @constCast("docs"),
         .topology_epoch = 9,
+        .graph_index_identity = .{ .incarnation = 41, .config_hash = 99 },
         .allowed = true,
         .requires_admission = false,
         .requires_hydration = false,
@@ -3512,6 +3833,21 @@ test "distributed graph incoming probe expands only positive source shards" {
     try std.testing.expectEqual(@as(usize, 9), state.calls);
     try std.testing.expectEqual(@as(usize, 256), state.max_keys_per_call);
     try std.testing.expectEqual(@as(usize, 0), bounded_batches.count());
+
+    state.echo_index_identity = false;
+    var mismatched_batches = GraphExpandBatches.empty;
+    defer freeFrontierBatches(alloc, &mismatched_batches);
+    try std.testing.expectError(error.IndexGenerationMismatch, appendIncomingProbeBatches(
+        alloc,
+        FakeWorker.iface(&state),
+        &mismatched_batches,
+        &table_state,
+        &.{11},
+        &.{0},
+        &.{"doc:a"},
+        "graph_idx",
+        .read_index,
+    ));
 }
 
 test "incoming graph route cache is exact and generation fenced" {
@@ -3525,6 +3861,7 @@ test "incoming graph route cache is exact and generation fenced" {
     };
     const req = IncomingSourceGroupsRequest{
         .index_name = "relations",
+        .index_identity = .{ .incarnation = 41, .config_hash = 99 },
         .keys = &.{ "doc:a", "doc:b" },
         .topology_epoch = 9,
         .identity_read_generations = &generations,
@@ -3551,12 +3888,146 @@ test "incoming graph route cache is exact and generation fenced" {
     };
     var miss = try cache.resolveAlloc(alloc, "docs", .{
         .index_name = req.index_name,
+        .index_identity = req.index_identity,
         .keys = req.keys,
         .topology_epoch = req.topology_epoch,
         .identity_read_generations = &newer_generations,
     });
     defer miss.deinit(alloc);
     try std.testing.expect(!miss.complete);
+
+    var recreated_miss = try cache.resolveAlloc(alloc, "docs", .{
+        .index_name = req.index_name,
+        .index_identity = .{ .incarnation = 42, .config_hash = 100 },
+        .keys = req.keys,
+        .topology_epoch = req.topology_epoch,
+        .identity_read_generations = req.identity_read_generations,
+    });
+    defer recreated_miss.deinit(alloc);
+    try std.testing.expect(!recreated_miss.complete);
+}
+
+test "incoming graph route durable hint coalescer is byte bounded" {
+    const alloc = std.testing.allocator;
+    var cache = IncomingSourceGroupCache.init(alloc);
+    defer cache.deinit();
+
+    const index_identity = GraphIndexIdentity{ .incarnation = 41, .config_hash = 99 };
+    const fence = incomingRouteFence("docs", .{
+        .index_name = "relations",
+        .index_identity = index_identity,
+        .keys = &.{},
+        .topology_epoch = 9,
+        .identity_read_generation = 101,
+    });
+    const first = [_]IncomingSourceGroupCache.NormalizedEntry{.{
+        .cache_key = @constCast("unused"),
+        .groups = @constCast(&[_]u64{11}),
+    }};
+    try cache.enqueueNormalized("docs", "relations", &.{"doc:a"}, fence, &first);
+    try cache.enqueueNormalized("docs", "relations", &.{"doc:a"}, fence, &first);
+    var snapshot = cache.stats();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending_durable_entries);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.durable_writes_coalesced);
+
+    const groups = try alloc.alloc(u64, IncomingSourceGroupCache.max_source_groups_per_key);
+    defer alloc.free(groups);
+    for (groups, 0..) |*group, i| group.* = @intCast(i + 1);
+    const large = [_]IncomingSourceGroupCache.NormalizedEntry{.{
+        .cache_key = @constCast("unused"),
+        .groups = groups,
+    }};
+    for (0..20) |i| {
+        const key = try std.fmt.allocPrint(alloc, "doc:large:{d}", .{i});
+        defer alloc.free(key);
+        try cache.enqueueNormalized("docs", "relations", &.{key}, fence, &large);
+    }
+    snapshot = cache.stats();
+    try std.testing.expect(snapshot.pending_durable_entries <= IncomingSourceGroupCache.max_pending_durable_entries);
+    try std.testing.expect(snapshot.pending_durable_bytes <= IncomingSourceGroupCache.max_pending_durable_bytes);
+    try std.testing.expect(snapshot.durable_writes_dropped > 0);
+}
+
+test "incoming graph route durable writes leave the query path" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "incoming-graph-routes-async-test" });
+    defer store.deinit();
+
+    const DeferredLane = struct {
+        job: ?background_runtime.Job = null,
+
+        fn lane(self: *@This()) background_runtime.DurableJobLane {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.job != null) return error.TestUnexpectedResult;
+            self.job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn closeOwner(ptr: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.runPending() catch @panic("deferred route job failed");
+        }
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        fn runPending(self: *@This()) !void {
+            const job = self.job orelse return;
+            self.job = null;
+            defer job.deinit(job.ptr);
+            try job.run(job.ptr);
+        }
+
+        const vtable = background_runtime.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = closeOwner,
+            .poll = poll,
+            .executes_inline = false,
+        };
+    };
+
+    var deferred = DeferredLane{};
+    const req = IncomingSourceGroupsRequest{
+        .index_name = "relations",
+        .index_identity = .{ .incarnation = 41, .config_hash = 99 },
+        .keys = &.{"doc:a"},
+        .topology_epoch = 9,
+        .identity_read_generation = 101,
+    };
+    var cache = IncomingSourceGroupCache.initWithDurableStore(alloc, &store);
+    defer cache.deinit();
+    cache.attachDurableJobLane(deferred.lane(), 1);
+    try cache.record("docs", req, .{
+        .entries = @constCast(&[_]IncomingSourceGroupEntry{
+            .{ .source_group_ids = @constCast(&[_]u64{22}) },
+        }),
+        .complete = true,
+    });
+    try std.testing.expect(deferred.job != null);
+    try std.testing.expectEqual(@as(usize, 1), cache.stats().pending_durable_entries);
+
+    var l1_hit = try cache.resolveAlloc(alloc, "docs", req);
+    defer l1_hit.deinit(alloc);
+    try std.testing.expect(l1_hit.complete);
+    try std.testing.expectEqualSlices(u64, &.{22}, l1_hit.entries[0].source_group_ids);
+
+    try deferred.runPending();
+    try std.testing.expectEqual(@as(usize, 0), cache.stats().pending_durable_entries);
+    var restarted = IncomingSourceGroupCache.initWithDurableStore(alloc, &store);
+    defer restarted.deinit();
+    var durable_hit = try restarted.resolveAlloc(alloc, "docs", req);
+    defer durable_hit.deinit(alloc);
+    try std.testing.expect(durable_hit.complete);
+    try std.testing.expectEqualSlices(u64, &.{22}, durable_hit.entries[0].source_group_ids);
 }
 
 test "incoming graph route directory survives cache restart and replaces stale fences" {
@@ -3573,6 +4044,7 @@ test "incoming graph route directory survives cache restart and replaces stale f
     const keys = [_][]const u8{"doc:a"};
     const req = IncomingSourceGroupsRequest{
         .index_name = "relations",
+        .index_identity = .{ .incarnation = 41, .config_hash = 99 },
         .keys = &keys,
         .topology_epoch = 9,
         .identity_read_generations = &generations,
@@ -3594,6 +4066,7 @@ test "incoming graph route directory survives cache restart and replaces stale f
     };
     const newer_req = IncomingSourceGroupsRequest{
         .index_name = req.index_name,
+        .index_identity = req.index_identity,
         .keys = &keys,
         .topology_epoch = req.topology_epoch,
         .identity_read_generations = &newer_generations,
@@ -3629,6 +4102,32 @@ test "incoming graph route directory survives cache restart and replaces stale f
     defer new_hit.deinit(alloc);
     try std.testing.expect(new_hit.complete);
     try std.testing.expectEqualSlices(u64, &.{11}, new_hit.entries[0].source_group_ids);
+
+    const recreated_req = IncomingSourceGroupsRequest{
+        .index_name = newer_req.index_name,
+        .index_identity = .{ .incarnation = 42, .config_hash = 100 },
+        .keys = newer_req.keys,
+        .topology_epoch = newer_req.topology_epoch,
+        .identity_read_generations = newer_req.identity_read_generations,
+    };
+    var recreated_miss = try restarted.resolveAlloc(alloc, "docs", recreated_req);
+    defer recreated_miss.deinit(alloc);
+    try std.testing.expect(!recreated_miss.complete);
+    try restarted.record("docs", recreated_req, .{
+        .entries = @constCast(&[_]IncomingSourceGroupEntry{
+            .{ .source_group_ids = @constCast(&[_]u64{33}) },
+        }),
+        .complete = true,
+    });
+    var incarnation_restart = IncomingSourceGroupCache.initWithDurableStore(alloc, &store);
+    defer incarnation_restart.deinit();
+    var stale_incarnation_miss = try incarnation_restart.resolveAlloc(alloc, "docs", newer_req);
+    defer stale_incarnation_miss.deinit(alloc);
+    try std.testing.expect(!stale_incarnation_miss.complete);
+    var recreated_hit = try incarnation_restart.resolveAlloc(alloc, "docs", recreated_req);
+    defer recreated_hit.deinit(alloc);
+    try std.testing.expect(recreated_hit.complete);
+    try std.testing.expectEqualSlices(u64, &.{33}, recreated_hit.entries[0].source_group_ids);
 
     // These logical keys intentionally share the same 20-bit durable slot.
     // The later observation may evict the earlier hint, but the full identity
@@ -4311,6 +4810,8 @@ pub fn probeIncomingEdgesForKeys(
     @memset(route_resolved, false);
 
     try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
+    const index_identity = (try catalogGraphIndexIdentity(alloc, catalog, table_name, index_name)) orelse
+        return error.IndexNotFound;
     const group_ids = try table_catalog.resolveGroupsForSpan(alloc, catalog, table_name, "", "");
     defer if (group_ids.len > 0) alloc.free(group_ids);
     try table_catalog.validateTopologyEpoch(alloc, catalog, table_name, topology_epoch);
@@ -4327,6 +4828,7 @@ pub fn probeIncomingEdgesForKeys(
             table_name,
             .{
                 .index_name = index_name,
+                .index_identity = index_identity,
                 .keys = keys[route_start..route_end],
                 .topology_epoch = topology_epoch,
                 .identity_read_generation = identity_read_generation,
@@ -4393,6 +4895,7 @@ pub fn probeIncomingEdgesForKeys(
             topology_epoch_inner: u64,
             identity_generation_inner: ?u64,
             index_name_inner: []const u8,
+            index_identity_inner: GraphIndexIdentity,
             entry: Entry,
             consistency_inner: raft_mod.ReadConsistency,
         ) !GraphHydrateResponse {
@@ -4403,15 +4906,21 @@ pub fn probeIncomingEdgesForKeys(
                 .include_stored = false,
                 .include_hits = false,
                 .incoming_index_name = index_name_inner,
+                .incoming_index_identity = index_identity_inner,
             };
             defer req.deinit(a);
-            return try worker_inner.executeGraphHydrate(
+            var response = try worker_inner.executeGraphHydrate(
                 a,
                 entry.group_id,
                 table_name_inner,
                 req,
                 consistency_inner,
             );
+            errdefer response.deinit(a);
+            if (!response.incoming_index_identity.eql(index_identity_inner)) {
+                return error.IndexGenerationMismatch;
+            }
+            return response;
         }
 
         fn copy(mask: []const bool, entry: Entry, output: []bool) !void {
@@ -4446,6 +4955,7 @@ pub fn probeIncomingEdgesForKeys(
                     topology_epoch_inner: u64,
                     identity_generation_inner: ?u64,
                     index_name_inner: []const u8,
+                    index_identity_inner: GraphIndexIdentity,
                     entry: Entry,
                     consistency_inner: raft_mod.ReadConsistency,
                 ) void {
@@ -4456,6 +4966,7 @@ pub fn probeIncomingEdgesForKeys(
                         topology_epoch_inner,
                         identity_generation_inner,
                         index_name_inner,
+                        index_identity_inner,
                         entry,
                         consistency_inner,
                     ) catch |err| {
@@ -4485,6 +4996,7 @@ pub fn probeIncomingEdgesForKeys(
                         topology_epoch,
                         identity_read_generation,
                         index_name,
+                        index_identity,
                         Entry{ .group_id = group_id, .keys = probe_keys, .indexes = probe_indexes },
                         consistency,
                     });
@@ -4519,6 +5031,7 @@ pub fn probeIncomingEdgesForKeys(
             topology_epoch,
             identity_read_generation,
             index_name,
+            index_identity,
             entry,
             consistency,
         );
@@ -4537,7 +5050,12 @@ test "distributed graph root probe retires resolved keys between shard waves" {
     };
     const FakeCatalog = struct {
         const tables = [_]metadata_table_manager.TableRecord{
-            .{ .table_id = 7, .name = "docs", .placement_role = "data" },
+            .{
+                .table_id = 7,
+                .name = "docs",
+                .placement_role = "data",
+                .indexes_json = "{\"graph_idx\":{\"type\":\"graph\"}}",
+            },
         };
         const ranges = [_]metadata_table_manager.RangeRecord{
             .{ .group_id = 11, .table_id = 7, .start_key = "", .end_key = "g" },
@@ -4611,7 +5129,10 @@ test "distributed graph root probe retires resolved keys between shard waves" {
                 },
                 else => return error.UnexpectedTestCall,
             }
-            return .{ .has_incoming = mask };
+            return .{
+                .has_incoming = mask,
+                .incoming_index_identity = req.incoming_index_identity,
+            };
         }
     };
 
@@ -4657,6 +5178,8 @@ pub fn encodeGraphHydrateRequest(alloc: std.mem.Allocator, req: GraphHydrateRequ
         .include_stored = req.include_stored,
         .include_hits = req.include_hits,
         .incoming_index_name = req.incoming_index_name,
+        .incoming_index_incarnation = req.incoming_index_identity.incarnation,
+        .incoming_index_config_hash = req.incoming_index_identity.config_hash,
     });
     if (req.resolved_doc_filter == null) return encoded;
     defer alloc.free(encoded);
@@ -4703,6 +5226,10 @@ pub fn parseGraphHydrateRequest(alloc: std.mem.Allocator, body: []const u8) !Gra
         .include_stored = parsed.value.include_stored,
         .include_hits = parsed.value.include_hits,
         .incoming_index_name = incoming_index_name,
+        .incoming_index_identity = .{
+            .incarnation = parsed.value.incoming_index_incarnation,
+            .config_hash = parsed.value.incoming_index_config_hash,
+        },
         .incoming_index_name_owned = incoming_index_name.len > 0,
         .resolved_doc_filter = if (parsed_filter) |filter| filter.resolved_doc_filter else null,
         .resolved_doc_filter_owned = parsed_filter != null,
@@ -4716,6 +5243,8 @@ pub fn encodeGraphHydrateResponse(alloc: std.mem.Allocator, res: GraphHydrateRes
     return try jsonStringifyAlloc(alloc, GraphHydrateResponseJson{
         .hits = res.hits,
         .has_incoming = res.has_incoming,
+        .incoming_index_incarnation = res.incoming_index_identity.incarnation,
+        .incoming_index_config_hash = res.incoming_index_identity.config_hash,
     });
 }
 
@@ -4736,6 +5265,10 @@ pub fn parseGraphHydrateResponse(alloc: std.mem.Allocator, body: []const u8) !Gr
             try alloc.dupe(bool, parsed.value.has_incoming)
         else
             @constCast((&[_]bool{})[0..]),
+        .incoming_index_identity = .{
+            .incarnation = parsed.value.incoming_index_incarnation,
+            .config_hash = parsed.value.incoming_index_config_hash,
+        },
     };
 }
 
@@ -6021,6 +6554,25 @@ fn catalogGraphIndexEnablesAlgebraicSemiring(
     defer lookup.deinit();
     if (indexes_api.inferIndexType(index_name, lookup.config) != .graph) return false;
     return graphConfigEnablesAlgebraicSemiring(lookup.config);
+}
+
+fn catalogGraphIndexIdentity(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    index_name: []const u8,
+) !?GraphIndexIdentity {
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    const table = tables_api.findTableByName(&snapshot, table_name) orelse return null;
+    var lookup = (try indexes_api.lookupSingleIndexConfig(alloc, table.indexes_json, index_name)) orelse return null;
+    defer lookup.deinit();
+    if (indexes_api.inferIndexType(index_name, lookup.config) != .graph) return null;
+    const identity = (try indexes_api.indexRuntimeIdentity(alloc, index_name, lookup.config)) orelse return null;
+    return .{
+        .incarnation = identity.incarnation,
+        .config_hash = identity.config_hash,
+    };
 }
 
 fn graphConfigEnablesAlgebraicSemiring(config: std.json.Value) bool {
@@ -7437,6 +7989,7 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
         FakeCatalog.iface(),
         FakeWorker.iface(&state),
         "docs",
+        "graph_idx",
         0,
         .{
             .identity_read_generation = 44,
@@ -7470,6 +8023,7 @@ pub fn testCrossTableHydrateAppliesTargetAuthorizationAndClearsOrdinals(alloc: s
         FakeCatalog.iface(),
         FakeWorker.iface(&state),
         "docs",
+        "graph_idx",
         0,
         .{ .graph_table_read_authorizer = denying_authorizer.iface() },
         null,
@@ -8048,6 +8602,7 @@ test "distributed graph expand request preserves algebraic semiring planning fla
         .include_stored = false,
         .include_hits = false,
         .incoming_index_name = "graph_idx",
+        .incoming_index_identity = .{ .incarnation = 41, .config_hash = 99 },
         .resolved_doc_filter = &filter,
         .resolved_doc_filter_wire_context = req.resolved_doc_filter_wire_context,
     };
@@ -8064,9 +8619,11 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     try std.testing.expect(!parsed_hydrate.include_stored);
     try std.testing.expect(!parsed_hydrate.include_hits);
     try std.testing.expectEqualStrings("graph_idx", parsed_hydrate.incoming_index_name);
+    try std.testing.expect(parsed_hydrate.incoming_index_identity.eql(.{ .incarnation = 41, .config_hash = 99 }));
 
     var hydrate_response = GraphHydrateResponse{
         .has_incoming = try alloc.dupe(bool, &.{true}),
+        .incoming_index_identity = hydrate_req.incoming_index_identity,
     };
     defer hydrate_response.deinit(alloc);
     const hydrate_response_encoded = try encodeGraphHydrateResponse(alloc, hydrate_response);
@@ -8074,6 +8631,7 @@ test "distributed graph expand request preserves algebraic semiring planning fla
     var parsed_hydrate_response = try parseGraphHydrateResponse(alloc, hydrate_response_encoded);
     defer parsed_hydrate_response.deinit(alloc);
     try std.testing.expectEqualSlices(bool, &.{true}, parsed_hydrate_response.has_incoming);
+    try std.testing.expect(parsed_hydrate_response.incoming_index_identity.eql(hydrate_req.incoming_index_identity));
 
     const hydrate_generation_pos = std.mem.indexOf(u8, hydrate_encoded, generation_field) orelse return error.TestUnexpectedResult;
     const hydrate_without_top_generation = try alloc.alloc(u8, hydrate_encoded.len - generation_field.len);
@@ -8424,6 +8982,7 @@ test "distributed graph edge reader carries identity generation" {
         FakeCatalog.iface(),
         FakeWorker.iface(&state),
         "docs",
+        "graph_idx",
         topology_epoch,
         .{ .identity_read_generation = 12345 },
         null,

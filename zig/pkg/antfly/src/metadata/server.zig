@@ -24,7 +24,6 @@ const metadata_http_server = @import("http_server.zig");
 const public_api_http_server = @import("../api/http_server.zig");
 const public_api_kernel = @import("../api/kernel_bridge.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
-const api_distributed_graph = @import("../api/distributed_graph.zig");
 const api_table_reads = @import("../api/table_reads.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
@@ -60,7 +59,6 @@ pub const MetadataServer = struct {
     owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null,
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
-    owned_incoming_graph_routes: ?*api_distributed_graph.IncomingSourceGroupCache = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
     owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
@@ -137,11 +135,6 @@ pub const MetadataServer = struct {
         errdefer if (owned_admin_http_server) |admin_http_server| alloc.destroy(admin_http_server);
         var owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null;
         errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
-        var owned_incoming_graph_routes: ?*api_distributed_graph.IncomingSourceGroupCache = null;
-        errdefer if (owned_incoming_graph_routes) |cache| {
-            cache.deinit();
-            alloc.destroy(cache);
-        };
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
         var owned_public_http_server: ?*public_api_kernel.ApiHttpServer = null;
@@ -190,13 +183,6 @@ pub const MetadataServer = struct {
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );
-            const incoming_graph_routes = try alloc.create(api_distributed_graph.IncomingSourceGroupCache);
-            incoming_graph_routes.* = api_distributed_graph.IncomingSourceGroupCache.initWithDurableStore(
-                alloc,
-                cfg.api_server_cfg.incoming_graph_route_store,
-            );
-            owned_incoming_graph_routes = incoming_graph_routes;
-            _ = public_read_source.withIncomingGraphRoutes(incoming_graph_routes);
             _ = public_read_source.withInternalServiceAuth(
                 cfg.api_server_cfg.internal_service_secret,
                 cfg.api_server_cfg.internal_service_issuer,
@@ -244,6 +230,7 @@ pub const MetadataServer = struct {
             );
             try public_http_server.attachReplicatedRestoreJobStore(metadataRestoreJobPersistence(svc));
             owned_public_http_server = public_http_server;
+            _ = public_read_source.withIncomingGraphRoutes(&public_http_server.incoming_graph_routes);
 
             const mux = try alloc.create(MetadataAdminMux);
             mux.* = .{
@@ -281,7 +268,6 @@ pub const MetadataServer = struct {
             .owned_hosted_shard_db = owned_hosted_shard_db,
             .owned_admin_http_server = owned_admin_http_server,
             .owned_public_read_source = owned_public_read_source,
-            .owned_incoming_graph_routes = owned_incoming_graph_routes,
             .owned_public_write_source = owned_public_write_source,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
@@ -325,10 +311,6 @@ pub const MetadataServer = struct {
         }
         if (self.owned_public_read_source) |read_source| {
             self.alloc.destroy(read_source);
-        }
-        if (self.owned_incoming_graph_routes) |cache| {
-            cache.deinit();
-            self.alloc.destroy(cache);
         }
         if (self.owned_admin_http_server) |admin_http_server| {
             self.alloc.destroy(admin_http_server);
