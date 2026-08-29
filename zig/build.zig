@@ -10476,15 +10476,15 @@ pub fn build(b: *std.Build) void {
                 // budget can overlap more units while a smaller cgroup
                 // automatically schedules only the subset that fits.
                 // aarch64-macOS ReleaseFast codegen reached 9.95 GB with
-                // platform frameworks. Linux ARM64 reached 4.99 GB in the
-                // v0.2.1-rc0 release build, so reserve 6 GiB rather than
-                // forcing the scheduler to discard a completed 4 GiB claim.
-                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 6) * 1024 * 1024 * 1024,
+                // platform frameworks. Linux ARM64 reached 8.96 GB in a
+                // production ReleaseFast build, so reserve 10 GiB.
+                .api_kernel => @as(usize, if (target.result.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
                 // Before the serverless split, clean aarch64-macOS ReleaseFast
                 // storage codegen reached 17.42 GB (16.23 GiB). Keep the old
                 // conservative reservations until both release runners have
-                // measured the smaller storage-only closure.
-                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
+                // measured the smaller storage-only closure. Linux ARM64 also
+                // exceeds 18 GiB in a production ReleaseFast build.
+                .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 24) * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
                 // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS
