@@ -1157,6 +1157,11 @@ pub const BackendRuntime = struct {
 pub const BackendRuntimeHandle = struct {
     alloc: Allocator,
     runtime: *BackendRuntime,
+    /// Filesystem executor owned by this handle and lent to a manual runtime.
+    /// Keeping the authority in the same move-only value as the runtime makes
+    /// runtime handoff atomic and prevents callers from preserving one while
+    /// accidentally destroying the other.
+    owned_filesystem_io: ?*IoImpl = null,
 
     pub fn init(alloc: Allocator, config: Config) !BackendRuntimeHandle {
         const runtime = try alloc.create(BackendRuntime);
@@ -1168,10 +1173,27 @@ pub const BackendRuntimeHandle = struct {
         };
     }
 
+    pub fn initManualWithOwnedFilesystemIo(alloc: Allocator) !BackendRuntimeHandle {
+        if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
+        const filesystem_io = try initIoLane(alloc, threaded_io_limits.service);
+        errdefer deinitIoLane(alloc, filesystem_io);
+        var handle = try init(alloc, .{
+            .backend = .manual,
+            .filesystem_io = filesystem_io.io(),
+        });
+        handle.owned_filesystem_io = filesystem_io;
+        return handle;
+    }
+
     pub fn deinit(self: *BackendRuntimeHandle) void {
         self.runtime.deinit();
         self.alloc.destroy(self.runtime);
+        if (self.owned_filesystem_io) |io_impl| deinitIoLane(self.alloc, io_impl);
         self.* = undefined;
+    }
+
+    pub fn ownsFilesystemIo(self: *const BackendRuntimeHandle) bool {
+        return self.owned_filesystem_io != null;
     }
 
     pub fn ptr(self: *BackendRuntimeHandle) *BackendRuntime {

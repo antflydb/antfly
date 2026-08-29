@@ -1478,22 +1478,6 @@ fn backgroundRuntimeAllocator(fallback: Allocator) Allocator {
     return std.heap.smp_allocator;
 }
 
-fn createOwnedFilesystemIo(alloc: Allocator) !*background_runtime_mod.IoImpl {
-    if (comptime builtin.os.tag == .freestanding) {
-        return error.UnsupportedPlatform;
-    } else {
-        const io_impl = try alloc.create(background_runtime_mod.IoImpl);
-        errdefer alloc.destroy(io_impl);
-        io_impl.* = threaded_io_limits.initService(alloc);
-        return io_impl;
-    }
-}
-
-fn destroyOwnedFilesystemIo(alloc: Allocator, io_impl: *background_runtime_mod.IoImpl) void {
-    if (comptime builtin.os.tag != .freestanding) io_impl.deinit();
-    alloc.destroy(io_impl);
-}
-
 const AppliedSequenceCoalescer = struct {
     pending: std.StringHashMapUnmanaged(u64) = .empty,
     last_flush_ns: u64 = 0,
@@ -3674,9 +3658,6 @@ pub const DB = struct {
     repair_cleanup_owner_id: u64,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
-    /// Synchronous filesystem authority lent to an internally owned manual
-    /// backend runtime. It must outlive both the publication lease and runtime.
-    owned_filesystem_io: ?*background_runtime_mod.IoImpl,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
     executor: *derived_executor_mod.Executor,
@@ -4001,24 +3982,18 @@ pub const DB = struct {
                 }
             }
             const runtime_alloc = backgroundRuntimeAllocator(alloc);
-            var owned_filesystem_io: ?*background_runtime_mod.IoImpl = null;
-            errdefer if (owned_filesystem_io) |io_impl|
-                destroyOwnedFilesystemIo(runtime_alloc, io_impl);
             var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
             errdefer if (owned_backend_runtime) |*handle| handle.deinit();
             const backend_runtime = opts.backend_runtime orelse blk_runtime: {
-                var filesystem_io: ?Io = null;
                 if (opts.executor.backend == .manual and
                     opts.physical_root_mode == .filesystem_managed)
                 {
-                    const io_impl = try createOwnedFilesystemIo(runtime_alloc);
-                    owned_filesystem_io = io_impl;
-                    if (comptime builtin.os.tag != .freestanding) filesystem_io = io_impl.io();
+                    owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.initManualWithOwnedFilesystemIo(runtime_alloc);
+                } else {
+                    owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
+                        .backend = opts.executor.backend,
+                    });
                 }
-                owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
-                    .backend = opts.executor.backend,
-                    .filesystem_io = filesystem_io,
-                });
                 break :blk_runtime owned_backend_runtime.?.runtime;
             };
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
@@ -4164,7 +4139,6 @@ pub const DB = struct {
                 .backend_owner_id = backend_owner_id,
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
-                .owned_filesystem_io = owned_filesystem_io,
                 .owned_resource_manager = owned_resource_manager,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
@@ -4196,7 +4170,6 @@ pub const DB = struct {
             var executor_ready = false;
             owned_async_context = null;
             owned_backend_runtime = null;
-            owned_filesystem_io = null;
             owned_resource_manager = null;
             owned_executor = null;
             generation_read_lease = null;
@@ -5256,8 +5229,6 @@ pub const DB = struct {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
         }
-        if (self.owned_filesystem_io) |io_impl|
-            destroyOwnedFilesystemIo(self.runtime_alloc, io_impl);
         self.* = undefined;
         self.closed = true;
     }
@@ -18749,6 +18720,15 @@ pub const DB = struct {
     }
 
     pub fn repairRestoreRuntimeStateStepIfNeededWithIo(self: *DB, alloc: Allocator, io: Io) !bool {
+        return try self.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(alloc, io, .{});
+    }
+
+    pub fn repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
+        self: *DB,
+        alloc: Allocator,
+        io: Io,
+        repair_options: types.ArtifactRepairRunOptions,
+    ) !bool {
         var state = (try readRestoreStateForPathAllocWithIo(alloc, io, self.core.path)) orelse return false;
         defer state.deinit(alloc);
         if (!state.primary_restored or state.runtime_repair_complete) return false;
@@ -18756,7 +18736,7 @@ pub const DB = struct {
 
         if (std.mem.eql(u8, phase, "repair_indexes")) {
             std.log.info("restore runtime repair phase=repair_indexes", .{});
-            if (!try self.repairNativeRestoreProjectionIntentsStep(alloc, .{}))
+            if (!try self.repairNativeRestoreProjectionIntentsStep(alloc, repair_options))
                 return error.RestoreRuntimeRepairIncomplete;
             try self.updateRestoreRuntimeRepairPhaseWithIo(alloc, io, "complete", true);
             return true;
@@ -50247,7 +50227,7 @@ test "db open owns filesystem io for its manual backend runtime" {
         .executor = .{ .backend = .manual },
     });
     try std.testing.expect(db.owned_backend_runtime != null);
-    try std.testing.expect(db.owned_filesystem_io != null);
+    try std.testing.expect(db.owned_backend_runtime.?.ownsFilesystemIo());
     try std.testing.expect(db.backend_runtime.io() == null);
     try std.testing.expect(db.backend_runtime.filesystemIo() != null);
     db.close();
@@ -97164,6 +97144,42 @@ test "db native restore preserves primary generation and repairs only a missing 
         index_repair_state.Trigger.projection_generation_invalid,
         repair_state.entries.items[0].intent.trigger,
     );
+
+    // Restore cancellation must reach the corpus-scale generation repair, not
+    // merely the loop surrounding it. A pre-cancelled quantum leaves the
+    // durable intent pending and the staged generation unpublished.
+    var repair_db = try DB.open(alloc, staged.path(), .{
+        .primary_backend = primary_backend,
+        .open_mode = .writer_no_replay,
+        .staged_generation = &staged,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+    });
+    defer repair_db.close();
+    const CancellationProbe = struct {
+        requests: usize = 0,
+
+        fn requested(ptr: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.requests += 1;
+            return true;
+        }
+    };
+    var cancellation_probe = CancellationProbe{};
+    try std.testing.expectError(
+        error.RestoreRuntimeRepairIncomplete,
+        repair_db.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
+            alloc,
+            std.testing.io,
+            .{ .cancel_check = .{
+                .ptr = &cancellation_probe,
+                .is_requested = CancellationProbe.requested,
+            } },
+        ),
+    );
+    try std.testing.expect(cancellation_probe.requests > 0);
+    try std.testing.expect(try repair_db.restoreRuntimeRepairNeeded());
 }
 
 test "db restore snapshot recreates logical store for durable lsm primary backend" {

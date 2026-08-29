@@ -257,9 +257,14 @@ fn repairPreparedRestoreUntilComplete(
     const open_options = try preparedRestoreOpenOptionsForRepair(prepared, restore, options);
     var restored = try db_mod.DB.open(alloc, prepared.path(), open_options);
     defer restored.close();
+    var repair_cancellation = db_mod.types.RepairCancellation{ .token = restore.cancellation };
     while (try restored.restoreRuntimeRepairNeeded()) {
         try restore.cancellation.check();
-        _ = restored.repairRestoreRuntimeStateStepIfNeededWithIo(alloc, io) catch |err| switch (err) {
+        _ = restored.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
+            alloc,
+            io,
+            .{ .cancel_check = repair_cancellation.check() },
+        ) catch |err| switch (err) {
             error.RestoreRuntimeRepairIncomplete,
             error.RestoreDenseArtifactRebuildIncomplete,
             error.RestoreDenseConfigProofIncomplete,

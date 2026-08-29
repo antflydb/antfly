@@ -784,13 +784,19 @@ fn repairRestoredDbRuntimeStateUntilCompleteWithIo(
     open_attempts: usize,
     cancellation: db_mod.types.CancellationToken,
 ) !void {
+    var repair_cancellation = db_mod.types.RepairCancellation{ .token = cancellation };
     var attempts: usize = 0;
     std.log.info("restore asynchronous repair begin group_id={d}", .{group_id});
     while (true) {
         try cancellation.check();
         if (!try db.restoreRuntimeRepairNeeded()) break;
         attempts += 1;
-        const repaired = db.repairRestoreRuntimeStateStepIfNeeded(alloc) catch |err| switch (err) {
+        const repair_io = db.backend_runtime.filesystemIo() orelse io;
+        const repaired = db.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
+            alloc,
+            repair_io,
+            .{ .cancel_check = repair_cancellation.check() },
+        ) catch |err| switch (err) {
             error.RestoreRuntimeRepairIncomplete,
             error.RestoreDenseArtifactRebuildIncomplete,
             error.RestoreDenseConfigProofIncomplete,
@@ -816,26 +822,13 @@ fn repairRestoredDbRuntimeStateUntilCompleteWithIo(
     });
 }
 
-const NativeRestoreRepairCancellation = struct {
-    token: db_mod.types.CancellationToken,
-
-    fn requested(ptr: *anyopaque) bool {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return self.token.isCancelled();
-    }
-
-    fn check(self: *@This()) db_mod.types.RepairCancelCheck {
-        return .{ .ptr = self, .is_requested = requested };
-    }
-};
-
 fn repairNativeRestoreProjectionsUntilCompleteWithIo(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
     io: Io,
     cancellation: db_mod.types.CancellationToken,
 ) !void {
-    var cancel_ctx = NativeRestoreRepairCancellation{ .token = cancellation };
+    var cancel_ctx = db_mod.types.RepairCancellation{ .token = cancellation };
     var attempts: usize = 0;
     while (true) {
         try cancellation.check();
@@ -27750,7 +27743,12 @@ test "bound table write source backs up and restores a local table" {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
-    var db = try db_mod.DB.open(alloc, path, .{});
+    var db = try db_mod.DB.open(alloc, path, .{
+        // Exercise transfer of the runtime-owned filesystem authority across
+        // the close/restore/reopen boundary. Threaded runtimes own their
+        // executor internally and cannot expose a split-ownership regression.
+        .executor = .{ .backend = .manual },
+    });
     defer {
         db.close();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
