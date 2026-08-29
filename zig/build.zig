@@ -7388,6 +7388,12 @@ pub fn build(b: *std.Build) void {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
     });
     const run_production_cluster_durable_join_cancellation_vopr_tests = b.addRunArtifact(production_cluster_durable_join_cancellation_vopr_tests);
+    const production_cluster_durable_join_worker_retry_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production durable shuffle partition worker failover exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_durable_join_worker_retry_vopr_tests = b.addRunArtifact(production_cluster_durable_join_worker_retry_vopr_tests);
     const production_cluster_graph_split_overlapping_faults_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane graph active split overlapping link resource faults exact replay"},
@@ -7420,6 +7426,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_join_split_vopr_tests,
         run_production_cluster_durable_join_takeover_vopr_tests,
         run_production_cluster_durable_join_cancellation_vopr_tests,
+        run_production_cluster_durable_join_worker_retry_vopr_tests,
         run_production_cluster_graph_split_overlapping_faults_vopr_tests,
         run_production_cluster_graph_split_socket_pressure_vopr_tests,
         run_production_cluster_service_rate_vopr_tests,
@@ -7490,6 +7497,11 @@ pub fn build(b: *std.Build) void {
         "Exact-replay public cancellation propagating into an outstanding durable-shuffle partition worker",
     );
     production_cluster_durable_join_cancellation_vopr_test_step.dependOn(&run_production_cluster_durable_join_cancellation_vopr_tests.step);
+    const production_cluster_durable_join_worker_retry_vopr_test_step = b.step(
+        "production-cluster-durable-join-worker-retry-vopr-test",
+        "Exact-replay durable-shuffle partition failover across production worker groups",
+    );
+    production_cluster_durable_join_worker_retry_vopr_test_step.dependOn(&run_production_cluster_durable_join_worker_retry_vopr_tests.step);
     const production_cluster_graph_split_overlapping_faults_vopr_test_step = b.step(
         "production-cluster-graph-split-overlapping-faults-vopr-test",
         "Exact-replay overlapping graph transport and all-owner memory faults during an active split",
@@ -7502,7 +7514,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run every focused production DataServer cluster history through v30",
+        "Run every focused production DataServer cluster history through v31",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7515,6 +7527,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_join_split_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_takeover_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_cancellation_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_worker_retry_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_overlapping_faults_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_socket_pressure_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_service_rate_vopr_test_step);

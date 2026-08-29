@@ -319,6 +319,12 @@ pub const Fixture = struct {
     durable_join_takeover_sound: bool = false,
     join_partition_worker_started_count: u64 = 0,
     join_partition_worker_completed_count: u64 = 0,
+    join_worker_retry_failure_injected: bool = false,
+    join_worker_retry_job_id: u64 = 0,
+    join_worker_retry_partition_index: usize = 0,
+    join_worker_retry_failed_group_id: u64 = 0,
+    join_worker_retry_recovered_group_id: u64 = 0,
+    join_worker_retry_sound: bool = false,
     join_cancellation_boundary_observed: bool = false,
     join_cancellation_job_id: u64 = 0,
     join_cancellation_owner_group_id: u64 = 0,
@@ -431,6 +437,7 @@ pub const Fixture = struct {
     graph_stale_snapshot_retry_exhaustion_enabled: bool = false,
     join_enabled: bool = false,
     join_cancellation_enabled: bool = false,
+    join_worker_retry_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
 
@@ -486,6 +493,11 @@ pub const Fixture = struct {
     pub fn setJoinCancellationEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.join_cancellation_enabled = enabled;
+    }
+
+    pub fn setJoinWorkerRetryEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.join_worker_retry_enabled = enabled;
     }
 
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
@@ -569,6 +581,10 @@ pub const Fixture = struct {
         if (self.join_cancellation_enabled and
             (!self.join_enabled or self.active_split_enabled or self.fault_mode != .clean))
             return error.InvalidProductionClusterJoinCancellationMode;
+        if (self.join_worker_retry_enabled and
+            (!self.join_enabled or self.join_cancellation_enabled or
+                self.active_split_enabled or self.fault_mode != .clean))
+            return error.InvalidProductionClusterJoinWorkerRetryMode;
         switch (self.fault_mode) {
             .clean => {},
             .graph_hydration_transport_failure => if (!self.graph_enabled or
@@ -1084,6 +1100,22 @@ pub const Fixture = struct {
         switch (event.phase) {
             .partition_worker_started => {
                 self.join_partition_worker_started_count +|= 1;
+                if (self.join_worker_retry_enabled and
+                    !self.join_worker_retry_failure_injected)
+                {
+                    if (event.job_id == 0 or event.owner_group_id == 0) {
+                        self.failure = error.ProductionJoinWorkerRetryIdentityMissing;
+                        return error.ProductionJoinWorkerRetryIdentityMissing;
+                    }
+                    self.join_worker_retry_failure_injected = true;
+                    self.join_worker_retry_job_id = event.job_id;
+                    self.join_worker_retry_partition_index = event.partition_index;
+                    self.join_worker_retry_failed_group_id = event.owner_group_id;
+                    // Fail before any right-row collection or result
+                    // publication. The production shuffle engine must record
+                    // this attempt and retry the same partition elsewhere.
+                    return error.InjectedJoinPartitionWorkerFailure;
+                }
                 if (!self.join_cancellation_enabled or
                     self.join_partition_worker_started_count != 1)
                     return;
@@ -1105,7 +1137,17 @@ pub const Fixture = struct {
                 self.failure = error.ProductionJoinCancellationNotObserved;
                 return error.ProductionJoinCancellationNotObserved;
             },
-            .partition_worker_completed => self.join_partition_worker_completed_count +|= 1,
+            .partition_worker_completed => {
+                self.join_partition_worker_completed_count +|= 1;
+                if (self.join_worker_retry_enabled and
+                    self.join_worker_retry_failure_injected and
+                    self.join_worker_retry_recovered_group_id == 0 and
+                    event.partition_index == self.join_worker_retry_partition_index and
+                    event.owner_group_id != self.join_worker_retry_failed_group_id)
+                {
+                    self.join_worker_retry_recovered_group_id = event.owner_group_id;
+                }
+            },
             .finalizer_result_persisted => {
                 if (self.fault_mode != .join_finalizer_ack_failure or
                     self.join_finalizer_ack_failure_injected or
@@ -1699,6 +1741,9 @@ pub const Fixture = struct {
             if (self.join_cancellation_enabled) {
                 self.join_cancellation_sound = try self.runJoinCancellationQuery();
                 self.join_sound = self.join_cancellation_sound;
+            } else if (self.join_worker_retry_enabled) {
+                self.join_worker_retry_sound = try self.runJoinQuery();
+                self.join_sound = self.join_worker_retry_sound;
             } else {
                 self.join_sound = try self.runJoinQuery();
             }
@@ -1884,7 +1929,8 @@ pub const Fixture = struct {
 
     fn durableJoinEnabled(self: *const Fixture) bool {
         return self.fault_mode == .join_finalizer_ack_failure or
-            self.join_cancellation_enabled;
+            self.join_cancellation_enabled or
+            self.join_worker_retry_enabled;
     }
 
     fn durableJoinTenantBatchAlloc(self: *Fixture) ![]u8 {
@@ -2060,13 +2106,59 @@ pub const Fixture = struct {
         const strategy = join_value.object.get("strategy_used") orelse return false;
         const execution_mode = join_value.object.get("execution_mode") orelse return false;
         const job_phase = join_value.object.get("job_phase") orelse return false;
+        const worker_retries = join_value.object.get("worker_retries") orelse return false;
         const finalizer_retries = join_value.object.get("finalizer_retries") orelse return false;
         const attempts = join_value.object.get("finalizer_attempts") orelse return false;
         if (strategy != .string or !std.mem.eql(u8, strategy.string, "shuffle") or
             execution_mode != .string or !std.mem.eql(u8, execution_mode.string, "distributed_durable") or
             job_phase != .string or !std.mem.eql(u8, job_phase.string, "succeeded") or
-            finalizer_retries != .integer or attempts != .array)
+            worker_retries != .integer or finalizer_retries != .integer or
+            attempts != .array)
             return false;
+        if (self.join_worker_retry_enabled) {
+            if (!self.join_worker_retry_failure_injected or
+                self.join_worker_retry_job_id == 0 or
+                self.join_worker_retry_failed_group_id == 0 or
+                self.join_worker_retry_recovered_group_id == 0 or
+                worker_retries.integer != 1 or
+                worker_attempts != .array or worker_attempts.array.items.len < 2 or
+                finalizer_retries.integer != 0 or attempts.array.items.len != 1)
+                return false;
+
+            const failed_worker = worker_attempts.array.items[0];
+            const recovered_worker = worker_attempts.array.items[1];
+            if (failed_worker != .object or recovered_worker != .object) return false;
+            const failed_partition = failed_worker.object.get("partition_index") orelse return false;
+            const failed_group = failed_worker.object.get("worker_group_id") orelse return false;
+            const failed_ok = failed_worker.object.get("succeeded") orelse return false;
+            const recovered_partition = recovered_worker.object.get("partition_index") orelse return false;
+            const recovered_group = recovered_worker.object.get("worker_group_id") orelse return false;
+            const recovered_ok = recovered_worker.object.get("succeeded") orelse return false;
+            const successful_finalizer = attempts.array.items[0];
+            if (successful_finalizer != .object) return false;
+            const finalizer_group = successful_finalizer.object.get("worker_group_id") orelse return false;
+            const finalizer_ok = successful_finalizer.object.get("succeeded") orelse return false;
+            for (worker_attempts.array.items[2..]) |later_attempt| {
+                if (later_attempt != .object) return false;
+                const later_ok = later_attempt.object.get("succeeded") orelse return false;
+                if (later_ok != .bool or !later_ok.bool) return false;
+            }
+            return failed_partition == .integer and
+                failed_partition.integer >= 0 and
+                @as(usize, @intCast(failed_partition.integer)) == self.join_worker_retry_partition_index and
+                failed_group == .integer and
+                failed_group.integer == self.join_worker_retry_failed_group_id and
+                failed_ok == .bool and !failed_ok.bool and
+                recovered_partition == .integer and
+                recovered_partition.integer >= 0 and
+                @as(usize, @intCast(recovered_partition.integer)) == self.join_worker_retry_partition_index and
+                recovered_group == .integer and
+                recovered_group.integer == self.join_worker_retry_recovered_group_id and
+                recovered_group.integer != failed_group.integer and
+                recovered_ok == .bool and recovered_ok.bool and
+                finalizer_group == .integer and finalizer_group.integer != 0 and
+                finalizer_ok == .bool and finalizer_ok.bool;
+        }
         if (self.join_cancellation_enabled) {
             if (finalizer_retries.integer != 0 or attempts.array.items.len != 1) return false;
             const successful_attempt = attempts.array.items[0];
@@ -3356,6 +3448,12 @@ pub const Fixture = struct {
         durable_join_takeover_ok: bool,
         join_partition_worker_started_count: u64,
         join_partition_worker_completed_count: u64,
+        join_worker_retry_failure_injected: bool,
+        join_worker_retry_job_id: u64,
+        join_worker_retry_partition_index: usize,
+        join_worker_retry_failed_group_id: u64,
+        join_worker_retry_recovered_group_id: u64,
+        join_worker_retry_ok: bool,
         join_cancellation_boundary_observed: bool,
         join_cancellation_job_id: u64,
         join_cancellation_owner_group_id: u64,
@@ -3436,6 +3534,7 @@ pub const Fixture = struct {
                 self.tenant_sound and
                 (!self.join_enabled or self.join_sound) and
                 (!self.join_cancellation_enabled or self.join_cancellation_sound) and
+                (!self.join_worker_retry_enabled or self.join_worker_retry_sound) and
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
@@ -3452,6 +3551,12 @@ pub const Fixture = struct {
             .durable_join_takeover_ok = self.durable_join_takeover_sound,
             .join_partition_worker_started_count = self.join_partition_worker_started_count,
             .join_partition_worker_completed_count = self.join_partition_worker_completed_count,
+            .join_worker_retry_failure_injected = self.join_worker_retry_failure_injected,
+            .join_worker_retry_job_id = self.join_worker_retry_job_id,
+            .join_worker_retry_partition_index = self.join_worker_retry_partition_index,
+            .join_worker_retry_failed_group_id = self.join_worker_retry_failed_group_id,
+            .join_worker_retry_recovered_group_id = self.join_worker_retry_recovered_group_id,
+            .join_worker_retry_ok = self.join_worker_retry_sound,
             .join_cancellation_boundary_observed = self.join_cancellation_boundary_observed,
             .join_cancellation_job_id = self.join_cancellation_job_id,
             .join_cancellation_owner_group_id = self.join_cancellation_owner_group_id,
