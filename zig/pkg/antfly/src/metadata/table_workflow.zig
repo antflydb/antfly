@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const api_operation = @import("../api/operation.zig");
 const control_loop = @import("control_loop.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const placement_planner = @import("placement_planner.zig");
@@ -89,9 +90,33 @@ pub const TableWorkflow = struct {
         return try self.loop.reconcilePreparedCatalogLocked(service);
     }
 
+    pub fn createTableWithRangesCatalogLockedWithContext(
+        self: *TableWorkflow,
+        service: anytype,
+        request: api_operation.RequestContext,
+        table: table_manager.TableRecord,
+        initial_ranges: []const table_manager.RangeRecord,
+    ) !control_loop.ReconcileSummary {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().upsertTable(table);
+        for (initial_ranges) |initial_range| {
+            try self.loop.stateRef().tableManager().upsertRange(initial_range);
+        }
+        return try self.loop.reconcilePreparedCatalogLockedWithContext(service, request);
+    }
+
     pub fn ensureCatalogMutationReady(self: *TableWorkflow, service: anytype) !void {
         _ = self;
         try ensureCatalogWorkflowLease(service);
+    }
+
+    pub fn ensureCatalogMutationReadyWithContext(
+        self: *TableWorkflow,
+        service: anytype,
+        request: api_operation.RequestContext,
+    ) !void {
+        _ = self;
+        try ensureCatalogWorkflowLeaseWithContext(service, request);
     }
 
     pub fn requestSplit(
@@ -166,6 +191,17 @@ pub const TableWorkflow = struct {
         try self.bootstrapDesiredFromCommitted(service);
         _ = self.loop.stateRef().tableManager().removeTableTopology(table_id);
         return try self.loop.reconcilePreparedCatalogLocked(service);
+    }
+
+    pub fn dropTableCatalogLockedWithContext(
+        self: *TableWorkflow,
+        service: anytype,
+        request: api_operation.RequestContext,
+        table_id: u64,
+    ) !control_loop.ReconcileSummary {
+        try self.bootstrapDesiredFromCommitted(service);
+        _ = self.loop.stateRef().tableManager().removeTableTopology(table_id);
+        return try self.loop.reconcilePreparedCatalogLockedWithContext(service, request);
     }
 
     pub fn planLocalPlacementIntents(
@@ -259,6 +295,45 @@ fn ensureCatalogWorkflowLease(service: anytype) !void {
     };
     if (@hasDecl(ServiceDeclType, "ensureCatalogWorkflowLease"))
         try service.ensureCatalogWorkflowLease();
+}
+
+fn ensureCatalogWorkflowLeaseWithContext(
+    service: anytype,
+    request: api_operation.RequestContext,
+) !void {
+    const ServiceType = @TypeOf(service);
+    const ServiceDeclType = switch (@typeInfo(ServiceType)) {
+        .pointer => |pointer| pointer.child,
+        else => ServiceType,
+    };
+    try request.ensureActive();
+    if (@hasDecl(ServiceDeclType, "ensureCatalogWorkflowLeaseWithContext")) {
+        try service.ensureCatalogWorkflowLeaseWithContext(request);
+    } else if (@hasDecl(ServiceDeclType, "ensureCatalogWorkflowLease")) {
+        try service.ensureCatalogWorkflowLease();
+    }
+}
+
+test "table workflow cancellation stops before reconciliation lease work" {
+    const FakeService = struct {
+        called: bool = false,
+
+        fn ensureCatalogWorkflowLeaseWithContext(
+            self: *@This(),
+            _: api_operation.RequestContext,
+        ) !void {
+            self.called = true;
+        }
+    };
+
+    var workflow = TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    var fake: FakeService = .{};
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        workflow.ensureCatalogMutationReadyWithContext(&fake, .{ .deadline_ns = 0 }),
+    );
+    try std.testing.expect(!fake.called);
 }
 
 fn lockCatalogMutation(service: anytype) bool {

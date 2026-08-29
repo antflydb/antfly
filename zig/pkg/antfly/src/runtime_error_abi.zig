@@ -299,6 +299,9 @@ pub const Detail = enum(c_int) {
     enrichment_worker_failed,
     deadline_exceeded,
     pre_decision_deadline_exceeded,
+    /// A metadata mutation may already be committed. Callers must observe the
+    /// durable catalog state before deciding whether a retry is safe.
+    metadata_mutation_outcome_unknown,
 };
 
 pub const Status = extern struct {
@@ -453,6 +456,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.LeaderTransferInProgress => status(.retryable, .leader_transfer_in_progress),
         error.MetadataLinearizableReadTimeout => status(.timeout, .metadata_linearizable_read_timeout),
         error.ReconcileLeaseNotHeld => status(.retryable, .reconcile_lease_not_held),
+        error.MetadataMutationOutcomeUnknown => status(.conflict, .metadata_mutation_outcome_unknown),
         error.EnrichmentNotFound => status(.not_found, .enrichment_not_found),
         error.InvalidExtensionEnrichment => status(.invalid_argument, .invalid_extension_enrichment),
         error.ConflictingEnrichmentConfig => status(.invalid_argument, .conflicting_enrichment_config),
@@ -888,6 +892,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .enrichment_worker_failed => "EnrichmentWorkerFailed",
         .deadline_exceeded => "DeadlineExceeded",
         .pre_decision_deadline_exceeded => "PreDecisionDeadlineExceeded",
+        .metadata_mutation_outcome_unknown => "MetadataMutationOutcomeUnknown",
     };
 }
 
@@ -908,6 +913,7 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.EnrichmentWorkerFailed, errorFromStatus(statusFromError(error.EnrichmentWorkerFailed)));
     try std.testing.expectEqual(error.DeadlineExceeded, errorFromStatus(statusFromError(error.DeadlineExceeded)));
     try std.testing.expectEqual(error.PreDecisionDeadlineExceeded, errorFromStatus(statusFromError(error.PreDecisionDeadlineExceeded)));
+    try std.testing.expectEqual(error.MetadataMutationOutcomeUnknown, errorFromStatus(statusFromError(error.MetadataMutationOutcomeUnknown)));
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));

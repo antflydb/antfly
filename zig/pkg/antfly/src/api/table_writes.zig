@@ -45185,10 +45185,11 @@ test "provisioned table write source drop table closes schema-bearing cached wri
 
     const Catalog = struct {
         const schema = schema_json;
+        dropped: std.atomic.Value(bool) = .init(false),
 
-        fn iface() table_catalog.CatalogSource {
+        fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -45196,7 +45197,17 @@ test "provisioned table write source drop table closes schema-bearing cached wri
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.dropped.load(.acquire)) return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
@@ -45224,7 +45235,8 @@ test "provisioned table write source drop table closes schema-bearing cached wri
 
     var write_cache = ProvisionedTableWriteCache.init(alloc);
     defer write_cache.deinit();
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    var catalog = Catalog{};
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.write_cache = &write_cache;
 
     var req = tables_api.CreateTableRequest{
@@ -45239,6 +45251,7 @@ test "provisioned table write source drop table closes schema-bearing cached wri
         .writes = &.{.{ .key = "doc:1", .value = "{\"title\":\"alpha\",\"content\":\"body\"}" }},
         .sync_level = .write,
     });
+    catalog.dropped.store(true, .release);
     _ = try source.source().dropTable(alloc, "docs", .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{7001} });
     try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
@@ -45256,9 +45269,11 @@ test "provisioned table write source drop table waits for active read cache leas
     defer alloc.free(path);
 
     const Catalog = struct {
-        fn iface() table_catalog.CatalogSource {
+        dropped: std.atomic.Value(bool) = .init(false),
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .admin_snapshot = adminSnapshot,
                     .free_admin_snapshot = freeAdminSnapshot,
@@ -45266,7 +45281,17 @@ test "provisioned table write source drop table waits for active read cache leas
             };
         }
 
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.dropped.load(.acquire)) return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
                 .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
@@ -45305,9 +45330,14 @@ test "provisioned table write source drop table waits for active read cache leas
     defer read_cache.deinit();
     read_cache.lsm_cache = &lsm_cache;
 
-    var read_lease = try read_cache.getOrOpen(path, Catalog.iface(), 7001, 1, "docs");
+    var catalog = Catalog{};
+    var read_lease = try read_cache.getOrOpen(path, catalog.iface(), 7001, 1, "docs");
     var read_lease_active = true;
     defer if (read_lease_active) read_lease.release();
+    // Cleanup is admitted only after the committed catalog no longer owns the
+    // table or group. Keep the already-open read lease alive while advancing
+    // the fake projection to the post-drop state.
+    catalog.dropped.store(true, .release);
 
     const Probe = struct {
         entered: std.atomic.Value(bool) = .init(false),
@@ -45331,7 +45361,7 @@ test "provisioned table write source drop table waits for active read cache leas
         }
     };
 
-    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.read_cache = &read_cache;
 
     var probe = Probe{};
@@ -45340,17 +45370,30 @@ test "provisioned table write source drop table waits for active read cache leas
 
     var worker = DropWorker{ .source = &source };
     const thread = try std.Thread.spawn(.{}, DropWorker.run, .{&worker});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        probe.release.store(true, .release);
+        thread.join();
+    };
 
     io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
     try std.testing.expect(!probe.entered.load(.acquire));
 
     read_lease.release();
     read_lease_active = false;
-    while (!probe.entered.load(.acquire)) {
+    const entered_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
+    while (!probe.entered.load(.acquire) and platform_time.monotonicNs() < entered_deadline_ns) {
         io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    if (!probe.entered.load(.acquire)) {
+        thread.join();
+        thread_joined = true;
+        if (worker.err) |err| return err;
+        return error.TestUnexpectedResult;
     }
     probe.release.store(true, .release);
     thread.join();
+    thread_joined = true;
     if (worker.err) |err| return err;
 }
 

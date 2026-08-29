@@ -115,6 +115,196 @@ pub const TableDropAdmission = struct {
     }
 };
 
+/// Materialize a legacy reconciliation plan before admitting any part of it,
+/// then attach receipt tracking only to its final command. Raft's ordered apply
+/// rule makes that one receipt a proof for the entire batch without adding a
+/// consensus round trip per entry. This is the rolling-upgrade bridge; the
+/// steady-state topology protocol uses one atomic `apply_table_topology` entry.
+fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    plan: *const metadata_reconciler.ReconciliationPlan,
+    request: api_operation.RequestContext,
+) !void {
+    try request.ensureActive();
+    std.debug.assert(plan.placement_upserts.len == plan.placement_upsert_preconditions.len);
+
+    var commands = std.ArrayList(metadata_storage.TransitionCommand).empty;
+    defer commands.deinit(alloc);
+    const command_capacity = plan.placement_upserts.len +
+        plan.table_upserts.len +
+        plan.split_admissions.len +
+        plan.range_upserts.len +
+        plan.split_upserts.len +
+        plan.merge_upserts.len +
+        plan.placement_removals.len +
+        plan.table_removals.len +
+        plan.range_removals.len +
+        plan.split_removals.len +
+        plan.merge_removals.len +
+        @intFromBool(plan.clear_reallocation_request != null);
+    try commands.ensureTotalCapacity(alloc, command_capacity);
+
+    for (plan.placement_upserts, plan.placement_upsert_preconditions) |intent, precondition| {
+        commands.appendAssumeCapacity(.{ .upsert_replica_intent = .{
+            .expected_metadata_version = precondition.expected_metadata_version,
+            .expected_version_fence = precondition.expected_version_fence,
+            .expected_target_drain_requested = precondition.expected_target_drain_requested,
+            .replacement = intent,
+        } });
+    }
+    for (plan.table_upserts) |record|
+        commands.appendAssumeCapacity(.{ .upsert_table = record });
+    for (plan.split_admissions) |admission|
+        commands.appendAssumeCapacity(.{ .admit_split_transition = .{
+            .expected_source_epoch = admission.expected_source_epoch,
+            .record = admission.record,
+        } });
+    for (plan.range_upserts) |record|
+        commands.appendAssumeCapacity(.{ .upsert_range = record });
+    for (plan.split_upserts) |record|
+        commands.appendAssumeCapacity(.{ .upsert_split_transition = record });
+    for (plan.merge_upserts) |record|
+        commands.appendAssumeCapacity(.{ .upsert_merge_transition = record });
+    for (plan.placement_removals) |record|
+        commands.appendAssumeCapacity(.{ .remove_replica_intent = .{
+            .group_id = record.group_id,
+            .local_node_id = record.local_node_id,
+            .expected_metadata_version = record.expected_metadata_version,
+        } });
+    for (plan.table_removals) |table_id| {
+        const store = service.projectedStore() orelse return error.MissingMetadataStore;
+        const baseline_fence = try store.getTableTransitionFence(
+            service.metadata_group_id,
+            table_id,
+        );
+        if (baseline_fence.active()) return error.TableTransitionActive;
+        if (try store.getTable(alloc, service.metadata_group_id, table_id)) |current| {
+            metadata_table_manager.freeTable(alloc, current);
+        } else {
+            // The desired postcondition is already true. Do not manufacture a
+            // legacy removal entry solely to act as a barrier.
+            continue;
+        }
+        commands.appendAssumeCapacity(.{ .remove_table = .{
+            .table_id = table_id,
+            .expected_transition_generation = baseline_fence.generation,
+        } });
+    }
+    for (plan.range_removals) |group_id|
+        commands.appendAssumeCapacity(.{ .remove_range = .{ .group_id = group_id } });
+    for (plan.split_removals) |transition_id|
+        commands.appendAssumeCapacity(.{ .remove_split_transition = .{ .transition_id = transition_id } });
+    for (plan.merge_removals) |transition_id|
+        commands.appendAssumeCapacity(.{ .remove_merge_transition = .{ .transition_id = transition_id } });
+    if (plan.clear_reallocation_request) |expected_request_id|
+        commands.appendAssumeCapacity(.{ .remove_reallocation_request = .{
+            .expected_request_id = expected_request_id,
+        } });
+
+    try request.ensureActive();
+    if (commands.items.len == 0) return;
+
+    // Do not honor cancellation between entries: once the first legacy command
+    // is admitted, stopping early would turn a client disconnect into a partial
+    // catalog transaction. Cancellation remains observable while waiting for
+    // the exact terminal receipt, and is reported as an ambiguous outcome.
+    for (commands.items[0 .. commands.items.len - 1]) |command|
+        try service.proposeTransitionCommand(command);
+    const receipt = try service.proposeTransitionCommandWithReceipt(commands.items[commands.items.len - 1]);
+    try service.waitForTransitionAppliedWithContext(receipt, request);
+}
+
+test "metadata reconciliation plan uses one terminal receipt for ordered apply" {
+    const FakeStore = struct {
+        fn getTableTransitionFence(
+            _: *@This(),
+            _: u64,
+            _: u64,
+        ) !metadata_storage.raft_apply_store.TableTransitionFence {
+            return .{};
+        }
+
+        fn getTable(
+            _: *@This(),
+            _: std.mem.Allocator,
+            _: u64,
+            _: u64,
+        ) !?metadata_table_manager.TableRecord {
+            return null;
+        }
+    };
+    const CommandTag = std.meta.Tag(metadata_storage.TransitionCommand);
+    const FakeService = struct {
+        metadata_group_id: u64 = 1,
+        store: FakeStore = .{},
+        tags: [2]CommandTag = undefined,
+        command_count: usize = 0,
+        plain_count: usize = 0,
+        receipt_count: usize = 0,
+        waited: bool = false,
+
+        fn projectedStore(self: *@This()) ?*FakeStore {
+            return &self.store;
+        }
+
+        fn record(self: *@This(), command: metadata_storage.TransitionCommand) void {
+            self.tags[self.command_count] = std.meta.activeTag(command);
+            self.command_count += 1;
+        }
+
+        fn proposeTransitionCommand(self: *@This(), command: metadata_storage.TransitionCommand) !void {
+            self.record(command);
+            self.plain_count += 1;
+        }
+
+        fn proposeTransitionCommandWithReceipt(
+            self: *@This(),
+            command: metadata_storage.TransitionCommand,
+        ) !MetadataProposalReceipt {
+            self.record(command);
+            self.receipt_count += 1;
+            return .{ .term = 3, .index = 9 };
+        }
+
+        fn waitForTransitionAppliedWithContext(
+            self: *@This(),
+            receipt: MetadataProposalReceipt,
+            request: api_operation.RequestContext,
+        ) !void {
+            try request.ensureActive();
+            try std.testing.expectEqual(@as(u64, 3), receipt.term);
+            try std.testing.expectEqual(@as(u64, 9), receipt.index);
+            self.waited = true;
+        }
+    };
+
+    var fake: FakeService = .{};
+    const tables = [_]metadata_table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }};
+    const ranges = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    }};
+    var plan = metadata_reconciler.ReconciliationPlan.empty();
+    plan.table_upserts = @constCast(tables[0..]);
+    plan.range_upserts = @constCast(ranges[0..]);
+
+    try applyReconciliationPlanAndWaitAppliedWithContextImpl(
+        &fake,
+        std.testing.allocator,
+        &plan,
+        .{},
+    );
+    try std.testing.expectEqual(@as(usize, 2), fake.command_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.plain_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.receipt_count);
+    try std.testing.expectEqual(CommandTag.upsert_table, fake.tags[0]);
+    try std.testing.expectEqual(CommandTag.upsert_range, fake.tags[1]);
+    try std.testing.expect(fake.waited);
+}
+
 fn tableDropAdmissionFromProjection(
     alloc: std.mem.Allocator,
     table: *const metadata_table_manager.TableRecord,
@@ -3500,11 +3690,21 @@ pub const MetadataService = struct {
     /// lock-free prepared reconciliation primitive, avoiding both stale
     /// whole-catalog plans and recursive lock acquisition.
     pub fn ensureCatalogWorkflowLease(self: *MetadataService) !void {
+        return self.ensureCatalogWorkflowLeaseWithContext(.{});
+    }
+
+    pub fn ensureCatalogWorkflowLeaseWithContext(
+        self: *MetadataService,
+        request: api_operation.RequestContext,
+    ) !void {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
+            try request.ensureActive();
             if (try self.ensureReconcileLease()) return;
+            try request.ensureActive();
             try self.runRound();
         }
+        try request.ensureActive();
         return error.ReconcileLeaseNotHeld;
     }
 
@@ -3542,6 +3742,14 @@ pub const MetadataService = struct {
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
         for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
         if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
+    }
+
+    pub fn applyReconciliationPlanAndWaitAppliedWithContext(
+        self: *MetadataService,
+        plan: *const metadata_reconciler.ReconciliationPlan,
+        request: api_operation.RequestContext,
+    ) !void {
+        return applyReconciliationPlanAndWaitAppliedWithContextImpl(self, self.alloc, plan, request);
     }
 
     pub fn observeSplitTransition(self: *MetadataService, transition_id: u64) !?transition_state.SplitObservation {
@@ -6310,11 +6518,21 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn ensureCatalogWorkflowLease(self: *MetadataHttpService) !void {
+        return self.ensureCatalogWorkflowLeaseWithContext(.{});
+    }
+
+    pub fn ensureCatalogWorkflowLeaseWithContext(
+        self: *MetadataHttpService,
+        request: api_operation.RequestContext,
+    ) !void {
         var rounds: usize = 0;
         while (rounds < 32) : (rounds += 1) {
+            try request.ensureActive();
             if (try self.ensureReconcileLease()) return;
+            try request.ensureActive();
             try self.runRound();
         }
+        try request.ensureActive();
         return error.ReconcileLeaseNotHeld;
     }
 
@@ -6351,6 +6569,14 @@ pub const MetadataHttpService = struct {
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
         for (plan.merge_removals) |transition_id| try self.removeMergeTransition(transition_id);
         if (plan.clear_reallocation_request) |expected| try self.clearReallocationRequest(expected);
+    }
+
+    pub fn applyReconciliationPlanAndWaitAppliedWithContext(
+        self: *MetadataHttpService,
+        plan: *const metadata_reconciler.ReconciliationPlan,
+        request: api_operation.RequestContext,
+    ) !void {
+        return applyReconciliationPlanAndWaitAppliedWithContextImpl(self, self.alloc, plan, request);
     }
 
     pub fn observeSplitTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.SplitObservation {

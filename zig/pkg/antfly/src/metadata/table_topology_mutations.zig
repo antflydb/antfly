@@ -112,6 +112,7 @@ fn createCompatible(
     table_name: []const u8,
     req: tables_api.CreateTableRequest,
 ) !void {
+    try request.ensureActive();
     var normalized_req = req;
     const expanded_indexes_json = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(
         alloc,
@@ -140,12 +141,12 @@ fn createCompatible(
     // it before taking the exclusive catalog lane, then keep the exact
     // projection refresh, desired mutation, reconcile plan, and verification
     // in one critical section.
-    try workflow.ensureCatalogMutationReady(svc);
+    try workflow.ensureCatalogMutationReadyWithContext(svc, request);
     lockCatalogMutation(svc);
     defer unlockCatalogMutation(svc);
     try request.ensureActive();
     try svc.ensureLinearizableReadWithContext(request);
-    _ = workflow.createTableWithRangesCatalogLocked(svc, table, ranges) catch |err| {
+    _ = workflow.createTableWithRangesCatalogLockedWithContext(svc, request, table, ranges) catch |err| {
         svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
         svc.verifyTableCreateProjection(alloc, table, ranges) catch |verify_err| switch (verify_err) {
             error.TableAlreadyExists => return verify_err,
@@ -166,6 +167,7 @@ fn createAtomic(
     table_name: []const u8,
     req: tables_api.CreateTableRequest,
 ) !void {
+    try request.ensureActive();
     // Schema-derived algebraic definitions are a public transport shape, not a
     // durable catalog shape. Normalize at the transport-neutral admission
     // boundary so embedded, HTTP-local, and forwarded callers cannot persist
@@ -252,12 +254,13 @@ fn dropCompatible(
     request: operation.RequestContext,
     table_name: []const u8,
 ) !DropResult {
+    try request.ensureActive();
     const lane_locked = lockTableWorkflowMutation(svc, table_name);
     defer unlockTableWorkflowMutation(svc, table_name, lane_locked);
 
     var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
     defer workflow.deinit();
-    try workflow.ensureCatalogMutationReady(svc);
+    try workflow.ensureCatalogMutationReadyWithContext(svc, request);
     lockCatalogMutation(svc);
     defer unlockCatalogMutation(svc);
     try request.ensureActive();
@@ -265,7 +268,7 @@ fn dropCompatible(
     var admission = try svc.captureTableDropAdmission(alloc, table_name);
     defer admission.deinit(alloc);
 
-    if (workflow.dropTableCatalogLocked(svc, admission.table_id)) |_| {} else |err| {
+    if (workflow.dropTableCatalogLockedWithContext(svc, request, admission.table_id)) |_| {} else |err| {
         svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
         verifyCompatibleTableDropProjection(
             svc,
@@ -298,6 +301,7 @@ fn dropAtomic(
     request: operation.RequestContext,
     table_name: []const u8,
 ) !DropResult {
+    try request.ensureActive();
     const protocol_readiness = try svc.ensureTableTopologyProtocolReadyWithContext(
         request,
         topology_protocol.atomic_table_topology_version,

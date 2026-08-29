@@ -3565,6 +3565,7 @@ pub fn build(b: *std.Build) void {
     };
     const unit_progress_skip_filters = root_test_skip_filters;
     const lib_unit_default_filters = [_][]const u8{
+        "boundary dispatcher preserves local calls and maps cross-unit calls",
         "bedrock provider request helpers",
         "restore job store is idempotent and fenced",
         "restore requests without idempotency keys create independent opaque jobs",
@@ -6532,6 +6533,8 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "metadata service ",
             "metadata proposal receipt ",
+            "metadata reconciliation plan uses one terminal receipt for ordered apply",
+            "table workflow cancellation stops before reconciliation lease work",
             "table workflow can drive real metadata service topology and split setup",
             "table workflow can drive placement intents through the real metadata control loop",
             "metadata http service catalog cache is independent from volatile projection traffic",

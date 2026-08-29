@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const api_operation = @import("../api/operation.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const metadata_reconciler = @import("reconciler.zig");
 const metadata_state = @import("state.zig");
@@ -106,6 +107,26 @@ pub const MetadataControlLoop = struct {
     /// refresh, desired mutation, plan construction, and proposal admission in
     /// one critical section without recursively acquiring the lock.
     pub fn reconcilePreparedCatalogLocked(self: *MetadataControlLoop, service: anytype) !ReconcileSummary {
+        return self.reconcilePreparedCatalogLockedImpl(service, null);
+    }
+
+    /// Request-scoped catalog workflows need proof that the final command in a
+    /// legacy multi-entry plan applied before inspecting the projection. Real
+    /// services provide one terminal Raft receipt; small embedders and control
+    /// loop test doubles retain the original synchronous seam.
+    pub fn reconcilePreparedCatalogLockedWithContext(
+        self: *MetadataControlLoop,
+        service: anytype,
+        request: api_operation.RequestContext,
+    ) !ReconcileSummary {
+        return self.reconcilePreparedCatalogLockedImpl(service, request);
+    }
+
+    fn reconcilePreparedCatalogLockedImpl(
+        self: *MetadataControlLoop,
+        service: anytype,
+        request: ?api_operation.RequestContext,
+    ) !ReconcileSummary {
         self.installMedianKeyLookup(service);
         var current = try self.state.captureCurrent(service);
         defer current.deinit(self.alloc);
@@ -137,7 +158,20 @@ pub const MetadataControlLoop = struct {
             .split_steps = plan.split_steps.len,
             .merge_steps = plan.merge_steps.len,
         };
-        try service.applyReconciliationPlan(&plan);
+        if (request) |request_context| {
+            const Service = switch (@typeInfo(@TypeOf(service))) {
+                .pointer => |pointer| pointer.child,
+                else => @TypeOf(service),
+            };
+            if (@hasDecl(Service, "applyReconciliationPlanAndWaitAppliedWithContext")) {
+                try service.applyReconciliationPlanAndWaitAppliedWithContext(&plan, request_context);
+            } else {
+                try request_context.ensureActive();
+                try service.applyReconciliationPlan(&plan);
+            }
+        } else {
+            try service.applyReconciliationPlan(&plan);
+        }
         return summary;
     }
 
