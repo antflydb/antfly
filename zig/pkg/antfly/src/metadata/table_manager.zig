@@ -803,6 +803,16 @@ pub const RuntimeDocSetPlanningStatusReport = struct {
     stale_identity_generation_rejection_count: u64 = 0,
 };
 
+pub const RuntimeEmbeddingActivityStatusReport = struct {
+    epoch: u64 = 0,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    retrying: bool = false,
+    last_progress_at_ms: u64 = 0,
+};
+
 pub const RuntimeIndexStatusReport = struct {
     name: []const u8 = "",
     kind: []const u8 = "",
@@ -827,6 +837,7 @@ pub const RuntimeIndexStatusReport = struct {
     replay_applied_sequence: u64 = 0,
     replay_target_sequence: u64 = 0,
     replay_catch_up_required: bool = false,
+    embedding_activity: RuntimeEmbeddingActivityStatusReport = .{},
     repair_status: ?IndexRepairStatus = null,
     /// This proof is meaningful only while repair_status is non-null. It means
     /// the active generation is safe to query, not necessarily complete.
@@ -2149,6 +2160,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
         .replay_applied_sequence = record.replay_applied_sequence,
         .replay_target_sequence = record.replay_target_sequence,
         .replay_catch_up_required = record.replay_catch_up_required,
+        .embedding_activity = record.embedding_activity,
         .repair_status = record.repair_status,
         .repair_active_generation_serviceable = record.repair_active_generation_serviceable,
     };

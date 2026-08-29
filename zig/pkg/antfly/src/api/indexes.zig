@@ -1670,6 +1670,7 @@ const AggregatedIndexStatus = struct {
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    embedding_activity: db_mod.types.EmbeddingActivityStats = .{},
     coverage_generation: u64 = 0,
     coverage_config_hash: u64 = 0,
     coverage_identity_ready: bool = false,
@@ -2027,6 +2028,20 @@ fn aggregateIndexStatusIndexed(
         aggregate.edge_count += item.edge_count;
         aggregate.node_count += item.node_count;
         aggregate.root_node = if (materialization_count == 1) item.root_node else 0;
+        if (item.kind == .dense_vector or item.kind == .sparse_vector) {
+            var activity_hasher = std.hash.Wyhash.init(runtime.group_id);
+            activity_hasher.update(std.mem.asBytes(&item.embedding_activity.epoch));
+            aggregate.embedding_activity.epoch ^= activity_hasher.final();
+            aggregate.embedding_activity.chunks_created +|= item.embedding_activity.chunks_created;
+            aggregate.embedding_activity.embedding_batches_completed +|= item.embedding_activity.embedding_batches_completed;
+            aggregate.embedding_activity.embeddings_computed +|= item.embedding_activity.embeddings_computed;
+            aggregate.embedding_activity.active_batch_size +|= item.embedding_activity.active_batch_size;
+            aggregate.embedding_activity.retrying = aggregate.embedding_activity.retrying or item.embedding_activity.retrying;
+            aggregate.embedding_activity.last_progress_at_ms = @max(
+                aggregate.embedding_activity.last_progress_at_ms,
+                item.embedding_activity.last_progress_at_ms,
+            );
+        }
         aggregate.replay_applied_sequence += public_item.replay_applied_sequence;
         aggregate.replay_target_sequence += public_item.replay_target_sequence;
         if (public_item.replay_catch_up_required) aggregate.replay_catch_up_required = true;
@@ -4494,11 +4509,10 @@ fn appendSingleIndexRuntimeStatus(
     // without allowing a retained replacement snapshot to poison its
     // successor.
     // Coverage counters are updated incrementally as the enrichment worker
-    // advances its sequence. Until that worker catches up, the remaining
-    // source documents are represented as skipped and strict coverage can
-    // temporarily look degraded. Do not turn that transient snapshot into a
-    // terminal failure; an isolated per-index failure or a failed worker is
-    // still terminal immediately.
+    // advances its sequence. Sources without a terminal decision remain
+    // pending, so do not turn an in-flight coverage snapshot into a terminal
+    // failure; an isolated per-index failure or a failed worker is still
+    // terminal immediately.
     const enrichment_work_pending = if (visible_enrichment) |stats|
         stats.enabled and !stats.worker_failed and
             (stats.retrying or stats.applied_sequence < stats.target_sequence or
@@ -4512,6 +4526,7 @@ fn appendSingleIndexRuntimeStatus(
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
     const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
+    var source_coverage_complete_for_readiness = index_type != .embeddings;
 
     try out.append(alloc, '{');
     if (index_type != .algebraic) {
@@ -4602,11 +4617,97 @@ fn appendSingleIndexRuntimeStatus(
             observation_complete,
             replay_current,
         );
+        // Canonical source coverage describes source decisions only. Replay
+        // and publication have their own revision fields and milestone
+        // blockers; folding them into this dimension makes a settled corpus
+        // look like it still has source generation work.
+        const source_coverage = evaluateCoverage(
+            embeddings_coverage_policy,
+            table_doc_count,
+            produced_count,
+            skipped_count,
+            terminal_failed_count,
+            observation_complete,
+            true,
+        );
         const coverage_complete = coverage.complete;
+        const source_coverage_complete = source_coverage.complete;
+        source_coverage_complete_for_readiness = embeddings_coverage_policy == .external or source_coverage_complete;
         const artifact_publish_pending = !embeddings_materialization_current or
             (replay_target_sequence > 0 and
                 !embeddingsArtifactPublishComplete(item, embeddings_sparse, produced_count) and
                 !coverage_complete);
+        const embedding_activity = if (embeddings_materialization_current and @hasField(@TypeOf(item), "embedding_activity"))
+            item.embedding_activity
+        else
+            db_mod.types.EmbeddingActivityStats{};
+        const enrichment_enabled = if (visible_enrichment) |stats| stats.enabled else false;
+        const activity_phase = if (embedding_activity.retrying)
+            "retrying"
+        else if (embedding_activity.active_batch_size > 0 or !source_coverage_complete and enrichment_enabled)
+            "embedding"
+        else if (catch_up_active or replay_catch_up_required or artifact_publish_pending)
+            "publishing"
+        else if (!source_coverage_complete)
+            "preparing"
+        else
+            "idle";
+        try out.appendSlice(alloc, ",\"searchable_vectors\":");
+        try appendIntValue(alloc, out, visible_doc_count);
+        try out.appendSlice(alloc, ",\"source_coverage\":{");
+        try appendJsonString(alloc, out, "policy");
+        try out.append(alloc, ':');
+        try appendJsonString(alloc, out, embeddingsCoveragePolicyName(embeddings_coverage_policy));
+        try out.appendSlice(alloc, ",\"observation_complete\":");
+        try out.appendSlice(alloc, if (observation_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"observation_incomplete_reasons\":");
+        try appendCoverageIncompleteReasons(alloc, out, item, coverage_generation, coverage_config_hash, runtime_present, metadata, table_doc_count);
+        try out.appendSlice(alloc, ",\"config_fingerprint\":");
+        try appendCoverageFingerprint(alloc, out, coverage_config_hash);
+        try out.appendSlice(alloc, ",\"total\":");
+        try appendIntValue(alloc, out, table_doc_count);
+        try out.appendSlice(alloc, ",\"pending\":");
+        if (coverage.pending) |pending| {
+            try appendIntValue(alloc, out, pending);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
+        try out.appendSlice(alloc, ",\"covered\":");
+        try appendIntValue(alloc, out, produced_count);
+        try out.appendSlice(alloc, ",\"skipped\":");
+        try appendIntValue(alloc, out, skipped_count);
+        try out.appendSlice(alloc, ",\"failed\":");
+        try appendIntValue(alloc, out, terminal_failed_count);
+        try out.appendSlice(alloc, ",\"complete\":");
+        try out.appendSlice(alloc, if (source_coverage_complete) "true" else "false");
+        try out.appendSlice(alloc, ",\"healthy\":");
+        try out.appendSlice(alloc, if (source_coverage.healthy) "true" else "false");
+        try out.appendSlice(alloc, ",\"degraded\":");
+        try out.appendSlice(alloc, if (source_coverage.degraded) "true" else "false");
+        try out.appendSlice(alloc, "}");
+        const activity_epoch = try std.fmt.allocPrint(alloc, "a-{x:0>16}", .{embedding_activity.epoch});
+        defer alloc.free(activity_epoch);
+        try out.appendSlice(alloc, ",\"activity\":{\"epoch\":");
+        try appendJsonString(alloc, out, activity_epoch);
+        try out.appendSlice(alloc, ",\"phase\":");
+        try appendJsonString(alloc, out, activity_phase);
+        try out.appendSlice(alloc, ",\"chunks_created\":");
+        try appendIntValue(alloc, out, embedding_activity.chunks_created);
+        try out.appendSlice(alloc, ",\"embedding_batches_completed\":");
+        try appendIntValue(alloc, out, embedding_activity.embedding_batches_completed);
+        try out.appendSlice(alloc, ",\"embeddings_computed\":");
+        try appendIntValue(alloc, out, embedding_activity.embeddings_computed);
+        try out.appendSlice(alloc, ",\"active_batch_size\":");
+        try appendIntValue(alloc, out, embedding_activity.active_batch_size);
+        try out.appendSlice(alloc, ",\"last_progress_at\":");
+        if (embedding_activity.last_progress_at_ms == 0) {
+            try out.appendSlice(alloc, "null");
+        } else {
+            const last_progress_at = try formatUnixMillisTimestampOwned(alloc, embedding_activity.last_progress_at_ms);
+            defer alloc.free(last_progress_at);
+            try appendJsonString(alloc, out, last_progress_at);
+        }
+        try out.append(alloc, '}');
         try out.appendSlice(alloc, ",\"query_visible_doc_count\":");
         try appendIntValue(alloc, out, visible_doc_count);
         try out.appendSlice(alloc, ",\"published_doc_count\":");
@@ -4817,6 +4918,7 @@ fn appendSingleIndexRuntimeStatus(
         replay_catch_up_required,
         catch_up_active,
         active_generation_serviceable,
+        source_coverage_complete_for_readiness,
     );
     try out.appendSlice(alloc, ",\"async_indexing\":");
     try appendAsyncIndexingStatus(alloc, out, async_indexing);
@@ -4843,6 +4945,7 @@ fn appendIndexReadinessStatus(
     replay_catch_up_required: bool,
     catch_up_active: bool,
     active_generation_serviceable: bool,
+    source_coverage_complete: bool,
 ) !void {
     const Item = @TypeOf(item);
     const observation_fresh = authority.freshness_authoritative;
@@ -4864,7 +4967,7 @@ fn appendIndexReadinessStatus(
     const publication_pending = index_type == .embeddings and incarnation_current and
         replay_target_sequence > replay_applied_sequence;
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
-        (!incarnation_current or backfill_active);
+        !source_coverage_complete;
     const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or
         backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);
@@ -4888,13 +4991,70 @@ fn appendIndexReadinessStatus(
         "pending"
     else
         "ready";
+    const queryable = queryable_partial or !pending and !failed;
+    const complete = !pending and !failed;
+
+    if (index_type == .embeddings and coverage_generation != 0) {
+        const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
+        defer alloc.free(incarnation);
+        try out.appendSlice(alloc, ",\"incarnation\":");
+        try appendJsonString(alloc, out, incarnation);
+    }
+    try out.appendSlice(alloc, ",\"target_revision\":");
+    try appendIntValue(alloc, out, replay_target_sequence);
+    try out.appendSlice(alloc, ",\"published_revision\":");
+    try appendIntValue(alloc, out, replay_applied_sequence);
+
+    const appendBlocker = struct {
+        fn run(
+            blocker_alloc: std.mem.Allocator,
+            blocker_out: *std.ArrayListUnmanaged(u8),
+            blocker: []const u8,
+            did_emit: *bool,
+        ) !void {
+            if (did_emit.*) try blocker_out.append(blocker_alloc, ',');
+            did_emit.* = true;
+            try appendJsonString(blocker_alloc, blocker_out, blocker);
+        }
+    }.run;
+    try out.appendSlice(alloc, ",\"milestones\":{\"queryable\":{\"reached\":");
+    try out.appendSlice(alloc, if (queryable) "true" else "false");
+    try out.appendSlice(alloc, ",\"blockers\":[");
+    var queryable_blocker_emitted = false;
+    if (!queryable) {
+        if (serving_failed) try appendBlocker(alloc, out, "failure", &queryable_blocker_emitted);
+        if (!observation_fresh) try appendBlocker(alloc, out, "runtime_observation", &queryable_blocker_emitted);
+        if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &queryable_blocker_emitted);
+        if (!incarnation_current) try appendBlocker(alloc, out, "incarnation", &queryable_blocker_emitted);
+        if (repair_blocks_queryable) try appendBlocker(alloc, out, "repair", &queryable_blocker_emitted);
+        if (!active_generation_serviceable and !published_generation_has_results) {
+            if (coverage_pending) try appendBlocker(alloc, out, "source_coverage", &queryable_blocker_emitted);
+            if (publication_pending or replay_catch_up_required or catch_up_active or backfill_active)
+                try appendBlocker(alloc, out, "publication", &queryable_blocker_emitted);
+        }
+    }
+    try out.appendSlice(alloc, "]},\"complete\":{\"reached\":");
+    try out.appendSlice(alloc, if (complete) "true" else "false");
+    try out.appendSlice(alloc, ",\"blockers\":[");
+    var complete_blocker_emitted = false;
+    if (!complete) {
+        if (failed) try appendBlocker(alloc, out, "failure", &complete_blocker_emitted);
+        if (!observation_fresh) try appendBlocker(alloc, out, "runtime_observation", &complete_blocker_emitted);
+        if (!topology_complete) try appendBlocker(alloc, out, "shard_observation", &complete_blocker_emitted);
+        if (!incarnation_current) try appendBlocker(alloc, out, "incarnation", &complete_blocker_emitted);
+        if (repair_blocks_complete) try appendBlocker(alloc, out, "repair", &complete_blocker_emitted);
+        if (coverage_pending) try appendBlocker(alloc, out, "source_coverage", &complete_blocker_emitted);
+        if (replay_catch_up_required or catch_up_active) try appendBlocker(alloc, out, "replay", &complete_blocker_emitted);
+        if (publication_pending or backfill_active) try appendBlocker(alloc, out, "publication", &complete_blocker_emitted);
+    }
+    try out.appendSlice(alloc, "]}}");
 
     try out.appendSlice(alloc, ",\"readiness\":{\"state\":");
     try appendJsonString(alloc, out, readiness_state);
     try out.appendSlice(alloc, ",\"queryable\":");
-    try out.appendSlice(alloc, if (queryable_partial or !pending and !failed) "true" else "false");
+    try out.appendSlice(alloc, if (queryable) "true" else "false");
     try out.appendSlice(alloc, ",\"complete\":");
-    try out.appendSlice(alloc, if (!pending and !failed) "true" else "false");
+    try out.appendSlice(alloc, if (complete) "true" else "false");
     if (index_type == .embeddings and coverage_generation != 0) {
         const incarnation = try std.fmt.allocPrint(alloc, "g-{x:0>16}", .{coverage_generation});
         defer alloc.free(incarnation);
@@ -5375,6 +5535,21 @@ pub fn inferIndexType(index_name: []const u8, config: std.json.Value) ?ApiIndexT
     if (std.mem.startsWith(u8, index_name, "full_text_index_v")) return .full_text;
     if (std.mem.eql(u8, index_name, "default")) return .full_text;
     return null;
+}
+
+fn formatUnixMillisTimestampOwned(alloc: std.mem.Allocator, ms: u64) ![]u8 {
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = ms / std.time.ms_per_s };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    return std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    });
 }
 
 fn appendIntValue(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
@@ -6578,6 +6753,16 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
         .coverage_generation = 42,
         .coverage_config_hash = config_hash,
         .coverage_identity_ready = true,
+        .embedding_activity = .{
+            .epoch = 7,
+            .index_generation = 42,
+            .chunks_created = 9,
+            .embedding_batches_completed = 2,
+            .embeddings_computed = 8,
+            .active_batch_size = 4,
+            .retrying = true,
+            .last_progress_at_ms = 1_787_990_400_000,
+        },
         .replay_applied_sequence = 1,
         .replay_target_sequence = 5,
         .replay_catch_up_required = true,
@@ -6625,19 +6810,52 @@ test "single embeddings index encoder exposes replay and enrichment runtime stat
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
     // Coverage is complete even though replay is retrying. Keep those two
     // dimensions separate instead of presenting replay lag as missing rows.
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"enrichment_runtime\":{") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"target_sequence\":5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"applied_sequence\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending_sequence_count\":4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retryable_error_count\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retrying\":true") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        \\{
+        \\  "backfill_active": true,
+        \\  "backfill_progress": 1.0,
+        \\  "backfill_state": "retrying",
+        \\  "replay_applied_sequence": 1,
+        \\  "replay_target_sequence": 5,
+        \\  "incarnation": "g-000000000000002a",
+        \\  "milestones": {
+        \\    "queryable": { "reached": true, "blockers": [] },
+        \\    "complete": { "reached": false, "blockers": ["replay", "publication"] }
+        \\  },
+        \\  "source_coverage": {
+        \\    "policy": "strict",
+        \\    "total": 1,
+        \\    "pending": 0,
+        \\    "covered": 1,
+        \\    "skipped": 0,
+        \\    "failed": 0,
+        \\    "complete": true,
+        \\    "healthy": true,
+        \\    "degraded": false
+        \\  },
+        \\  "searchable_vectors": 1,
+        \\  "activity": {
+        \\    "phase": "retrying",
+        \\    "chunks_created": 9,
+        \\    "embedding_batches_completed": 2,
+        \\    "embeddings_computed": 8,
+        \\    "active_batch_size": 4,
+        \\    "last_progress_at": "2026-08-29T08:00:00Z"
+        \\  },
+        \\  "enrichment_runtime": {
+        \\    "target_sequence": 5,
+        \\    "applied_sequence": 1,
+        \\    "pending_sequence_count": 4,
+        \\    "retryable_error_count": 2,
+        \\    "retrying": true
+        \\  }
+        \\}
+    ,
+        encoded,
+    );
 }
 
 test "single embeddings index encoder synthesizes replay state from enrichment runtime" {
@@ -6701,16 +6919,25 @@ test "single embeddings index encoder synthesizes replay state from enrichment r
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":0.200") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"retrying\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"target_sequence\":5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"applied_sequence\":1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"pending_sequence_count\":4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"retryable_error_count\":2") != null);
+    try ant_json.testing.expectSubsetJsonText(
+        std.testing.allocator,
+        \\{
+        \\  "backfill_active": true,
+        \\  "backfill_progress": 0.2,
+        \\  "backfill_state": "retrying",
+        \\  "replay_applied_sequence": 1,
+        \\  "replay_target_sequence": 5,
+        \\  "replay_catch_up_required": true,
+        \\  "enrichment_runtime": {
+        \\    "target_sequence": 5,
+        \\    "applied_sequence": 1,
+        \\    "pending_sequence_count": 4,
+        \\    "retryable_error_count": 2
+        \\  }
+        \\}
+    ,
+        encoded,
+    );
 }
 
 test "single embeddings index encoder scopes isolated enrichment failure to one index" {

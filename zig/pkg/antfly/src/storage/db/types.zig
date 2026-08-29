@@ -2150,6 +2150,22 @@ pub const EnrichmentStats = struct {
     artifact_bytes_written: u64 = 0,
 };
 
+/// Volatile, incarnation-scoped work counters for one embeddings index. These
+/// counters never participate in readiness; they let status clients explain
+/// active generation between durable publication checkpoints. `epoch` changes
+/// whenever the owning enrichment runtime is recreated.
+pub const EmbeddingActivityStats = struct {
+    epoch: u64 = 0,
+    // Internal incarnation fence. API encoders expose only `epoch`.
+    index_generation: u64 = 0,
+    chunks_created: u64 = 0,
+    embedding_batches_completed: u64 = 0,
+    embeddings_computed: u64 = 0,
+    active_batch_size: u64 = 0,
+    retrying: bool = false,
+    last_progress_at_ms: u64 = 0,
+};
+
 pub const ReplayStageStats = struct {
     enabled: bool = false,
     target_sequence: u64 = 0,
@@ -2867,6 +2883,7 @@ pub const DBIndexStats = struct {
     coverage_produced_count: u64 = 0,
     coverage_skipped_count: u64 = 0,
     coverage_terminal_failed_count: u64 = 0,
+    embedding_activity: EmbeddingActivityStats = .{},
     // Stable across shard-local marker generations for the same stored config.
     coverage_config_hash: u64 = 0,
     coverage_summary_ready: bool = true,

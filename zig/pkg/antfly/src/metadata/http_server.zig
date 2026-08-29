@@ -2302,8 +2302,19 @@ const ParsedRuntimeIndexStatus = struct {
     replay_applied_sequence: ?u64 = null,
     replay_target_sequence: ?u64 = null,
     replay_catch_up_required: ?bool = null,
+    embedding_activity: ?ParsedRuntimeEmbeddingActivityStatus = null,
     repair_status: ?metadata_table_manager.IndexRepairStatus = null,
     repair_active_generation_serviceable: ?bool = null,
+};
+
+const ParsedRuntimeEmbeddingActivityStatus = struct {
+    epoch: ?u64 = null,
+    chunks_created: ?u64 = null,
+    embedding_batches_completed: ?u64 = null,
+    embeddings_computed: ?u64 = null,
+    active_batch_size: ?u64 = null,
+    retrying: ?bool = null,
+    last_progress_at_ms: ?u64 = null,
 };
 
 const ParsedRuntimeGroupStatus = struct {
@@ -2656,6 +2667,15 @@ fn cloneParsedRuntimeIndexStatus(
         .replay_applied_sequence = parsed.replay_applied_sequence orelse 0,
         .replay_target_sequence = parsed.replay_target_sequence orelse 0,
         .replay_catch_up_required = parsed.replay_catch_up_required orelse false,
+        .embedding_activity = if (parsed.embedding_activity) |activity| .{
+            .epoch = activity.epoch orelse 0,
+            .chunks_created = activity.chunks_created orelse 0,
+            .embedding_batches_completed = activity.embedding_batches_completed orelse 0,
+            .embeddings_computed = activity.embeddings_computed orelse 0,
+            .active_batch_size = activity.active_batch_size orelse 0,
+            .retrying = activity.retrying orelse false,
+            .last_progress_at_ms = activity.last_progress_at_ms orelse 0,
+        } else .{},
         .repair_status = parsed.repair_status,
         .repair_active_generation_serviceable = parsed.repair_status != null and
             (parsed.repair_active_generation_serviceable orelse false),
@@ -2665,7 +2685,7 @@ fn cloneParsedRuntimeIndexStatus(
 test "metadata status JSON preserves compact managed repair admission state" {
     const alloc = std.testing.allocator;
     const report = try parseStoreStatusReport(alloc,
-        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
+        \\{"store_id":20,"runtime_statuses":[{"group_id":10,"indexes":[{"name":"thumbnail","kind":"dense_vector","embedding_activity":{"epoch":7,"chunks_created":9,"embedding_batches_completed":2,"embeddings_computed":8,"active_batch_size":4,"retrying":true,"last_progress_at_ms":1787990400000},"repair_status":"waiting","repair_active_generation_serviceable":true},{"name":"legacy","kind":"full_text","repair_active_generation_serviceable":true},{"name":"mixed_version","coverage_generation":7,"coverage_config_hash":8}]}]}
     );
     defer freeStoreStatusReport(alloc, report);
 
@@ -2674,6 +2694,9 @@ test "metadata status JSON preserves compact managed repair admission state" {
     try std.testing.expectEqual(@as(usize, 3), indexes.len);
     try std.testing.expectEqual(metadata_table_manager.IndexRepairStatus.waiting, indexes[0].repair_status.?);
     try std.testing.expect(indexes[0].repair_active_generation_serviceable);
+    try std.testing.expectEqual(@as(u64, 7), indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 8), indexes[0].embedding_activity.embeddings_computed);
+    try std.testing.expect(indexes[0].embedding_activity.retrying);
     // Proof without a repair lifecycle is not actionable and must not survive
     // normalization from a malformed or mixed-version producer.
     try std.testing.expect(indexes[1].repair_status == null);

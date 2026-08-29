@@ -13,11 +13,15 @@
 // limitations.
 
 /// Runtime-status records are embedded in unframed StoreRecord transitions.
-/// A writer must continue emitting `legacy_record_version` until every
-/// metadata replica that can apply the transition advertises support for the
-/// current version.
+/// A writer must emit no newer than the highest payload version advertised by
+/// every metadata replica that can apply the transition. Feature payloads are
+/// independently downgraded to that negotiated version.
 pub const legacy_record_version: u16 = 12;
 /// V13 is the first (unreleased) format carrying both compact repair state and
 /// the store reporter-incarnation fence.
 pub const repair_status_record_version: u16 = 13;
-pub const current_record_version: u16 = repair_status_record_version;
+/// V14 carries volatile, per-index embeddings activity in owner heartbeats.
+/// The fields remain observability-only and are stripped while any metadata
+/// voter has not advertised V14 support.
+pub const embedding_activity_record_version: u16 = 14;
+pub const current_record_version: u16 = embedding_activity_record_version;

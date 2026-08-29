@@ -319,6 +319,44 @@ For an index across N expected groups:
 This preserves backward-compatible simple fields where possible while making the
 distributed reality visible.
 
+Embeddings status additionally separates lifecycle truth from work telemetry:
+
+- `incarnation`, `target_revision`, and `published_revision` identify the
+  generation and its captured/published replay boundary.
+- `milestones.queryable` and `milestones.complete` each contain `reached` plus
+  blockers specific to that milestone. Clients should wait on the requested
+  milestone instead of interpreting a generic state string.
+- `source_coverage` reports generation-scoped source outcomes. Exact coverage
+  requires a complete, fresh observation of every expected group; otherwise
+  `pending` is `null` and `observation_incomplete_reasons` says why.
+- `searchable_vectors` reports physical query-visible entries. It is not a
+  source-document counter and may be larger for chunked indexes.
+- `activity` reports volatile, incarnation-scoped work. Its counters are
+  maintained by the owning enrichment runtime and aggregated only from current
+  shard observations. A client may calculate throughput only across samples
+  whose opaque activity `epoch` is unchanged.
+
+These dimensions have a strict dependency direction:
+
+```text
+durable source outcomes + publication/repair/topology facts -> milestones
+runtime work                                                -> activity only
+```
+
+Status encoders and waiters must never derive readiness from activity counters,
+timestamps, or a worker appearing idle. Conversely, a process restart may reset
+activity and its epoch without changing durable coverage or the queryable
+publication. This keeps status useful for UX while preserving fail-closed
+admission and bounded request-path performance.
+
+Distributed publication is codec-versioned by payload capability. Repair facts
+and reporter fences require runtime-status record v13; embedding activity
+requires v14. During rolling upgrades, metadata negotiates the minimum version
+needed by each payload. A v13-capable cluster therefore continues publishing
+repair safety facts while v14 activity is omitted until every current metadata
+member proves support. Capability proofs are scoped to the metadata incarnation,
+membership fingerprint, and required version.
+
 ### Metrics
 
 Expose status-plane health separately from table/index health:

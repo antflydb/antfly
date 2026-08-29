@@ -16781,6 +16781,15 @@ fn runtimeIndexStatusReportFromLocalIndex(
         .replay_applied_sequence = index.replay_applied_sequence,
         .replay_target_sequence = index.replay_target_sequence,
         .replay_catch_up_required = index.replay_catch_up_required,
+        .embedding_activity = .{
+            .epoch = index.embedding_activity.epoch,
+            .chunks_created = index.embedding_activity.chunks_created,
+            .embedding_batches_completed = index.embedding_activity.embedding_batches_completed,
+            .embeddings_computed = index.embedding_activity.embeddings_computed,
+            .active_batch_size = index.embedding_activity.active_batch_size,
+            .retrying = index.embedding_activity.retrying,
+            .last_progress_at_ms = index.embedding_activity.last_progress_at_ms,
+        },
         .repair_status = index.index_repair_status,
         .repair_active_generation_serviceable = index.index_repair_active_generation_serviceable,
     };
@@ -16791,6 +16800,15 @@ test "data runtime report preserves compact managed repair admission state" {
     const report = try runtimeIndexStatusReportFromLocalIndex(alloc, .{
         .name = "thumbnail",
         .kind = .dense_vector,
+        .embedding_activity = .{
+            .epoch = 7,
+            .chunks_created = 9,
+            .embedding_batches_completed = 2,
+            .embeddings_computed = 8,
+            .active_batch_size = 4,
+            .retrying = true,
+            .last_progress_at_ms = 1_787_990_400_000,
+        },
         .index_repair_status = .waiting,
         .index_repair_active_generation_serviceable = false,
     });
@@ -16803,7 +16821,7 @@ test "data runtime report preserves compact managed repair admission state" {
     defer alloc.free(encoded);
     try ant_json.testing.expectSubsetJsonText(
         alloc,
-        "{\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
+        "{\"embedding_activity\":{\"epoch\":7,\"chunks_created\":9,\"embedding_batches_completed\":2,\"embeddings_computed\":8,\"active_batch_size\":4,\"retrying\":true,\"last_progress_at_ms\":1787990400000},\"repair_status\":\"waiting\",\"repair_active_generation_serviceable\":false}",
         encoded,
     );
 }

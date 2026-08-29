@@ -23873,6 +23873,9 @@ pub const DB = struct {
             if (self.async_context.enrichment_runtime) |runtime| {
                 for (runtime_stats.indexes) |*item| {
                     item.enrichment_failed = runtime.indexHasIsolatedFailure(item.name);
+                    if (item.kind == .dense_vector or item.kind == .sparse_vector) {
+                        item.embedding_activity = runtime.indexEmbeddingActivity(item.name);
+                    }
                 }
             }
         }
@@ -31920,7 +31923,7 @@ fn appendDocumentUnitChunkDenseEmbeddingWrites(
         }
         if (consumer_indexes.len == 0) continue;
 
-        const vector = try enrichment_runtime_mod.embedDenseTracked(runtime, alloc, dense_embedder, entry.name, chunk_text, entry.expected_dims);
+        const vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, dense_embedder, entry.name, chunk_text, entry.expected_dims);
         defer alloc.free(vector);
         const artifact_key = try appendEmbeddingArtifactWrite(
             alloc,
@@ -33927,7 +33930,7 @@ fn flushGeneratedDenseChunkBatch(
 ) !void {
     if (chunk_texts.items.len == 0) return;
 
-    const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, alloc, dense_embedder, embedding_name, chunk_texts.items, request.expected_dims);
+    const vectors = try enrichment_runtime_mod.embedDenseBatchTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, chunk_texts.items, request.expected_dims);
     defer embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
     if (vectors.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
@@ -34316,7 +34319,7 @@ fn computeDenseRequestImpl(
         if (source_parts) |parts| {
             defer template_mod.freeContentParts(alloc, parts);
 
-            const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, alloc, dense_embedder, embedding_name, parts, request.expected_dims);
+            const vector = try enrichment_runtime_mod.embedDensePartsTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, parts, request.expected_dims);
             defer alloc.free(vector);
             const artifact_key = try appendEmbeddingArtifactWrite(
                 alloc,
@@ -34348,7 +34351,7 @@ fn computeDenseRequestImpl(
     }
     defer alloc.free(source_text.?);
 
-    const vector = try enrichment_runtime_mod.embedDenseTracked(runtime, alloc, dense_embedder, embedding_name, source_text.?, request.expected_dims);
+    const vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, dense_embedder, embedding_name, source_text.?, request.expected_dims);
     defer alloc.free(vector);
     const artifact_key = try appendEmbeddingArtifactWrite(
         alloc,
@@ -40169,11 +40172,30 @@ fn accountDenseCoverage(
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
     defer outcomes.deinit(ctx.alloc);
     if (!external) {
+        var deferred = std.StringHashMapUnmanaged(void).empty;
+        defer deferred.deinit(ctx.alloc);
+        if (ctx.index_manager.denseEmbeddingName(index_name)) |embedding_name| {
+            for (batch.generated_enrichment_refs) |ref| {
+                if (ref.kind != .dense_embedding or
+                    !std.mem.eql(u8, enrichment_types.refEmbeddingName(ref), embedding_name)) continue;
+                try deferred.put(ctx.alloc, ref.doc_key, {});
+            }
+        }
         for (batch.documents) |doc| {
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
+            // A source write and its generated embedding are intentionally
+            // separated when the caller waits only through full-text
+            // visibility. Absence of an embedding in that source replay batch
+            // is pending enrichment, not an intentional skip. The enrichment
+            // worker owns the terminal produced/skipped/failed transition for
+            // every deferred request. Overwrites have already removed the
+            // previous terminal marker above, so omitting an outcome here is
+            // the durable pending representation and keeps status O(1).
+            const was_produced = produced.contains(doc.key);
+            if (!was_produced and deferred.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
                 .doc_key = doc.key,
-                .outcome = if (produced.contains(doc.key))
+                .outcome = if (was_produced)
                     .produced
                 else
                     try denseMissingArtifactCoverageOutcome(ctx, index_name, doc.key),
@@ -40241,11 +40263,22 @@ fn accountSparseCoverage(
     var outcomes = std.ArrayListUnmanaged(DerivedCoverageDocOutcome).empty;
     defer outcomes.deinit(ctx.alloc);
     if (!external) {
+        var deferred = std.StringHashMapUnmanaged(void).empty;
+        defer deferred.deinit(ctx.alloc);
+        if (ctx.index_manager.sparseEmbeddingName(index_name)) |embedding_name| {
+            for (batch.generated_enrichment_refs) |ref| {
+                if (ref.kind != .sparse_embedding or
+                    !std.mem.eql(u8, enrichment_types.refEmbeddingName(ref), embedding_name)) continue;
+                try deferred.put(ctx.alloc, ref.doc_key, {});
+            }
+        }
         for (batch.documents) |doc| {
             if (doc.action == .delete or internal_keys.isInternalUserKey(doc.key) or !ctx.index_manager.byte_range.contains(doc.key)) continue;
+            const was_produced = produced.contains(doc.key);
+            if (!was_produced and deferred.contains(doc.key)) continue;
             try outcomes.append(ctx.alloc, .{
                 .doc_key = doc.key,
-                .outcome = if (produced.contains(doc.key)) .produced else .skipped,
+                .outcome = if (was_produced) .produced else .skipped,
             });
         }
     } else {
@@ -65158,6 +65191,70 @@ test "db leased enrichment worker persists chunk storage when full text consumes
     }
 
     try std.testing.expect(chunk_count > 0);
+}
+
+test "db deferred generated coverage remains pending until the enrichment worker decides an outcome" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+    const config_json =
+        "{\"field\":\"embedding\",\"dims\":3,\"coverage_policy\":\"partial\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"image_url\",\"source_template\":\"{{#if image_url}}{{image_url}}{{/if}}\"}}";
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = deterministic.interface(),
+            },
+            .start_index_workers = false,
+        });
+        defer db.close();
+        try db.addIndex(.{ .name = "visual", .kind = .dense_vector, .config_json = config_json });
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = "doc:image", .value = "{\"image_url\":\"https://example.invalid/image.png\"}" },
+                .{ .key = "doc:text", .value = "{\"body\":\"not embeddable by this index\"}" },
+            },
+            .sync_level = .full_text,
+        });
+
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 2), stats.source_doc_count);
+        for (stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, "visual")) continue;
+            try std.testing.expect(index_stats.coverage_summary_ready);
+            try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_produced_count);
+            try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_skipped_count);
+            try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            break;
+        } else return error.IndexNotFound;
+    }
+
+    {
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var reopened = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-b",
+                .dense_embedder = deterministic.interface(),
+            },
+        });
+        defer reopened.close();
+        try reopened.runUntilIdle();
+
+        const stats = try reopened.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        for (stats.indexes) |index_stats| {
+            if (!std.mem.eql(u8, index_stats.name, "visual")) continue;
+            try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_produced_count);
+            try std.testing.expectEqual(@as(u64, 1), index_stats.coverage_skipped_count);
+            try std.testing.expectEqual(@as(u64, 0), index_stats.coverage_terminal_failed_count);
+            break;
+        } else return error.IndexNotFound;
+    }
 }
 
 test "db managed conditional embeddings persist exact mixed corpus coverage across reopen" {

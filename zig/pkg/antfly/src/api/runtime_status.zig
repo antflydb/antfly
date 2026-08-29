@@ -1202,6 +1202,9 @@ fn preserveIndexProjectionLifecycle(dst: *db_mod.types.DBIndexStats, cached: db_
     dst.coverage_summary_ready = cached.coverage_summary_ready;
     dst.coverage_generation = cached.coverage_generation;
     dst.coverage_identity_ready = cached.coverage_identity_ready;
+    // Activity is intentionally not preserved across a stale projection
+    // handoff. Motion must come from the current runtime owner, never from the
+    // retained serving snapshot.
     dst.backfill_active = cached.backfill_active;
     dst.backfill_progress = cached.backfill_progress;
     dst.enrichment_failed = cached.enrichment_failed;
@@ -1801,6 +1804,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .coverage_summary_ready = item.coverage_summary_ready,
             .coverage_generation = item.coverage_generation,
             .coverage_identity_ready = item.coverage_identity_ready,
+            .embedding_activity = item.embedding_activity,
             .backfill_active = item.backfill_active,
             .backfill_progress = item.backfill_progress,
             .enrichment_failed = item.enrichment_failed,
@@ -2114,6 +2118,7 @@ test "table runtime snapshot cache clones stored status" {
         .coverage_summary_ready = false,
         .coverage_generation = 0x5678,
         .coverage_identity_ready = true,
+        .embedding_activity = .{ .epoch = 13, .embeddings_computed = 17, .active_batch_size = 3 },
         .backfill_active = true,
         .backfill_progress = 0.5,
         .enrichment_failed = true,
@@ -2242,6 +2247,9 @@ test "table runtime snapshot cache clones stored status" {
     try std.testing.expect(!cloned.items[0].stats.indexes[0].coverage_summary_ready);
     try std.testing.expectEqual(@as(u64, 0x5678), cloned.items[0].stats.indexes[0].coverage_generation);
     try std.testing.expect(cloned.items[0].stats.indexes[0].coverage_identity_ready);
+    try std.testing.expectEqual(@as(u64, 13), cloned.items[0].stats.indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 17), cloned.items[0].stats.indexes[0].embedding_activity.embeddings_computed);
+    try std.testing.expectEqual(@as(u64, 3), cloned.items[0].stats.indexes[0].embedding_activity.active_batch_size);
     try std.testing.expect(cloned.items[0].stats.indexes[0].backfill_active);
     try std.testing.expectEqual(@as(f64, 0.5), cloned.items[0].stats.indexes[0].backfill_progress);
     try std.testing.expect(cloned.items[0].stats.indexes[0].enrichment_failed);

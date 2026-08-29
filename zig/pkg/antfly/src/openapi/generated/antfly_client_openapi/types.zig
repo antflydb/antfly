@@ -401,7 +401,11 @@ pub const AlgebraicIndexStatsIndexType = enum {
 pub const AlgebraicIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: AlgebraicIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents reflected in the algebraic sidecar
@@ -2987,6 +2991,79 @@ pub const EmbedderProvider = enum {
 
 pub const Embedding = std.json.Value;
 
+/// Volatile index-incarnation activity. It explains motion but never participates in readiness.
+pub const EmbeddingIndexActivity = struct {
+    /// Opaque worker-and-index-incarnation identity. Rates are valid only between samples with the same epoch.
+    epoch: []const u8,
+    phase: EmbeddingIndexActivityPhase,
+    /// Chunks created for this index during the activity epoch.
+    chunks_created: i64,
+    embedding_batches_completed: i64,
+    /// Embedding vectors successfully computed for this index during the activity epoch.
+    embeddings_computed: i64,
+    /// Items currently submitted to an embedding provider for this index.
+    active_batch_size: i64,
+    /// Completion time of the latest successful embedding batch, or null before the first batch.
+    last_progress_at: ?[]const u8,
+};
+
+pub const EmbeddingIndexActivityPhase = enum {
+    preparing,
+    embedding,
+    publishing,
+    retrying,
+    idle,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .preparing => "preparing",
+            .embedding => "embedding",
+            .publishing => "publishing",
+            .retrying => "retrying",
+            .idle => "idle",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "preparing", .preparing },
+            .{ "embedding", .embedding },
+            .{ "publishing", .publishing },
+            .{ "retrying", .retrying },
+            .{ "idle", .idle },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const EmbeddingSourceCoverageStatus = struct {
+    policy: DerivedCoverageStatusPolicy,
+    /// Whether total and all outcome counts are exact across the expected shards.
+    observation_complete: bool,
+    observation_incomplete_reasons: []const DerivedCoverageObservationIncompleteReason,
+    /// Semantic configuration fingerprint for the observed index incarnation.
+    config_fingerprint: []const u8,
+    /// Source documents in scope. This is a lower bound when observation_complete is false.
+    total: i64,
+    /// Sources awaiting a terminal generation decision; null when the observation is incomplete.
+    pending: ?i64,
+    /// Sources that durably produced material for this index incarnation.
+    covered: i64,
+    /// Sources intentionally producing no material after generation evaluated them.
+    skipped: i64,
+    /// Sources whose generation reached a non-retryable failure.
+    failed: i64,
+    /// Whether source outcomes satisfy the configured coverage policy. Replay and publication are reported independently by revisions and milestones.
+    complete: bool,
+    healthy: bool,
+    degraded: bool,
+};
+
 /// Unified configuration for embeddings indexes. When sparse is true, creates a sparse vector index (SPLADE inverted index). When sparse is false (default), creates a dense vector index (HNSW). For dense indexes, dimension can be omitted if an embedder is configured — it will be auto-detected.
 pub const EmbeddingsIndexConfig = struct {
     publication_policy: ?IndexPublicationPolicy = null,
@@ -3052,7 +3129,17 @@ pub const EmbeddingsIndexStatsIndexType = enum {
 pub const EmbeddingsIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: EmbeddingsIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and the explicit status dimensions.
     readiness: ?IndexReadinessStatus = null,
+    /// Opaque identity of the desired embeddings index incarnation.
+    incarnation: ?[]const u8 = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
+    source_coverage: ?EmbeddingSourceCoverageStatus = null,
+    /// Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage.
+    searchable_vectors: ?i64 = null,
+    activity: ?EmbeddingIndexActivity = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of vectors/documents in the index
@@ -4004,7 +4091,11 @@ pub const FullTextIndexStatsIndexType = enum {
 pub const FullTextIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: FullTextIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Number of documents in the index
@@ -4377,7 +4468,11 @@ pub const GraphIndexStatsIndexType = enum {
 pub const GraphIndexStats = struct {
     /// Discriminator for the index stats variant.
     index_type: GraphIndexStatsIndexType,
+    /// Deprecated compatibility projection. Use milestones and revision fields.
     readiness: ?IndexReadinessStatus = null,
+    target_revision: ?i64 = null,
+    published_revision: ?i64 = null,
+    milestones: ?IndexMilestones = null,
     /// Error message if stats could not be retrieved
     @"error": ?[]const u8 = null,
     /// Total number of edges in the graph
@@ -4958,6 +5053,18 @@ pub const IndexExecutionConfig = struct {
     chunking: ?ExecutionPolicy = null,
     /// Embedding producer batching for shorthand-created embedding enrichments.
     embedding: ?ExecutionPolicy = null,
+};
+
+pub const IndexMilestoneStatus = struct {
+    /// Whether this milestone is satisfied by the observed index incarnation.
+    reached: bool,
+    /// Milestone-specific, machine-readable blockers. Empty whenever reached is true.
+    blockers: []const []const u8,
+};
+
+pub const IndexMilestones = struct {
+    queryable: IndexMilestoneStatus,
+    complete: IndexMilestoneStatus,
 };
 
 /// Publication behavior for a managed embeddings index. `progressive` makes a safely checkpointed active generation queryable before initial source coverage is complete. `atomic` keeps a new generation unavailable until complete validation and activation.

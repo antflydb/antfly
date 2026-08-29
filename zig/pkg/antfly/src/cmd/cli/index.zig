@@ -434,7 +434,7 @@ fn listIndexesMode(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cli
     cli.expectHttpSuccess(resp);
     if (resp.data) |parsed| {
         if (output == .json) return cli.writeJson(allocator, io, parsed.value);
-        cli.writeStdout(io, "NAME\tTYPE\tSTATE\tPROGRESS\tSOURCE_COVERAGE\tINDEXED_ENTRIES\tVISIBLE_ENTRIES\n");
+        cli.writeStdout(io, "NAME\tTYPE\tSTATE\tSOURCE_PROGRESS\tSOURCE_COVERAGE\tINDEXED\tSEARCHABLE\n");
         for (parsed.value) |index| try writeIndexSummary(allocator, io, index);
     }
 }
@@ -472,13 +472,23 @@ const IndexSummary = struct {
     progress: ?f64,
     source_covered: ?i64 = null,
     source_total: ?i64 = null,
+    source_pending: ?i64 = null,
+    source_skipped: ?i64 = null,
+    source_failed: ?i64 = null,
     indexed: ?i64,
     visible: ?i64,
     complete: bool,
     queryable: bool = false,
     failed: bool,
     pending_reasons: []const []const u8 = &.{},
+    queryable_blockers: []const []const u8 = &.{},
+    complete_blockers: []const []const u8 = &.{},
     incarnation: ?[]const u8 = null,
+    activity_epoch: ?[]const u8 = null,
+    activity_phase: ?[]const u8 = null,
+    chunks_created: ?i64 = null,
+    embeddings_computed: ?i64 = null,
+    active_batch_size: ?i64 = null,
     error_text: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
     repair_action_required: ?bool = null,
@@ -491,6 +501,11 @@ fn summarizeIndex(index: antfly_client.types.IndexStatus) IndexSummary {
     return switch (index.status) {
         inline else => |stats| summarizeStats(stats),
     };
+}
+
+fn containsBlocker(blockers: []const []const u8, expected: []const u8) bool {
+    for (blockers) |blocker| if (std.mem.eql(u8, blocker, expected)) return true;
+    return false;
 }
 
 fn summarizeStats(stats: anytype) IndexSummary {
@@ -531,14 +546,28 @@ fn summarizeStats(stats: anytype) IndexSummary {
         if (value) "running" else "ready"
     else
         "unknown";
-    const progress: ?f64 = if (@hasField(Stats, "backfill_progress")) stats.backfill_progress else null;
-    const source_covered: ?i64 = if (@hasField(Stats, "coverage")) blk: {
+    const source_coverage = if (@hasField(Stats, "source_coverage")) stats.source_coverage else null;
+    const legacy_coverage = if (@hasField(Stats, "coverage")) stats.coverage else null;
+    const source_pending: ?i64 = if (source_coverage) |coverage| coverage.pending else null;
+    const source_total: ?i64 = if (source_coverage) |coverage|
+        coverage.total
+    else if (legacy_coverage) |coverage|
+        coverage.source_total
+    else
+        null;
+    const progress: ?f64 = if (source_total) |total|
+        if (source_pending) |pending|
+            if (total == 0) 1.0 else @as(f64, @floatFromInt(total -| pending)) / @as(f64, @floatFromInt(total))
+        else if (@hasField(Stats, "backfill_progress")) stats.backfill_progress else null
+    else if (@hasField(Stats, "backfill_progress"))
+        stats.backfill_progress
+    else
+        null;
+    const source_covered: ?i64 = if (source_coverage) |coverage|
+        coverage.covered
+    else if (@hasField(Stats, "coverage")) blk: {
         const coverage = stats.coverage orelse break :blk null;
-        break :blk coverage.covered;
-    } else null;
-    const source_total: ?i64 = if (@hasField(Stats, "coverage")) blk: {
-        const coverage = stats.coverage orelse break :blk null;
-        break :blk coverage.source_total;
+        break :blk coverage.produced;
     } else null;
     const indexed: ?i64 = if (@hasField(Stats, "total_indexed"))
         stats.total_indexed
@@ -546,38 +575,71 @@ fn summarizeStats(stats: anytype) IndexSummary {
         stats.doc_count
     else
         null;
-    const visible: ?i64 = if (@hasField(Stats, "query_visible_doc_count"))
+    const visible: ?i64 = if (@hasField(Stats, "searchable_vectors"))
+        if (stats.searchable_vectors != null) stats.searchable_vectors else if (@hasField(Stats, "query_visible_doc_count")) stats.query_visible_doc_count else stats.doc_count
+    else if (@hasField(Stats, "query_visible_doc_count"))
         stats.query_visible_doc_count
     else if (@hasField(Stats, "doc_count"))
         stats.doc_count
     else
         indexed;
     const readiness = if (@hasField(Stats, "readiness")) stats.readiness else null;
+    const milestones = if (@hasField(Stats, "milestones")) stats.milestones else null;
+    const activity = if (@hasField(Stats, "activity")) stats.activity else null;
     const repair = if (@hasField(Stats, "repair")) stats.repair else null;
     const state = if (readiness) |value| @tagName(value.state) else legacy_state;
-    const complete = if (readiness) |value|
+    const complete = if (milestones) |value|
+        value.complete.reached
+    else if (readiness) |value|
         value.complete
     else
         !readiness_pending and !coverage_incomplete and (std.mem.eql(u8, state, "ready") or
             (reported_state == null and rebuilding == false and error_text == null and !config_mismatch));
-    const queryable = if (readiness) |value| value.queryable else complete;
-    const failed = if (readiness) |value|
+    const queryable = if (milestones) |value| value.queryable.reached else if (readiness) |value| value.queryable else complete;
+    const failed = if (milestones) |value|
+        containsBlocker(value.queryable.blockers, "failure") or containsBlocker(value.complete.blockers, "failure")
+    else if (readiness) |value|
         value.state == .failed
     else
         error_text != null or std.mem.eql(u8, state, "failed") or std.mem.eql(u8, state, "degraded");
     return .{
         .index_type = @tagName(stats.index_type),
-        .state = state,
+        .state = if (milestones != null)
+            if (failed)
+                "failed"
+            else if (complete)
+                "ready"
+            else if (queryable)
+                "queryable_partial"
+            else
+                "pending"
+        else
+            state,
         .progress = progress,
         .source_covered = source_covered,
         .source_total = source_total,
+        .source_pending = source_pending,
+        .source_skipped = if (source_coverage) |coverage| coverage.skipped else null,
+        .source_failed = if (source_coverage) |coverage| coverage.failed else null,
         .indexed = indexed,
         .visible = visible,
         .complete = complete,
         .queryable = queryable,
         .failed = failed,
         .pending_reasons = if (readiness) |value| value.pending_reasons else &.{},
-        .incarnation = if (readiness) |value| value.incarnation else null,
+        .queryable_blockers = if (milestones) |value| value.queryable.blockers else if (readiness) |value| value.pending_reasons else &.{},
+        .complete_blockers = if (milestones) |value| value.complete.blockers else if (readiness) |value| value.pending_reasons else &.{},
+        .incarnation = if (@hasField(Stats, "incarnation"))
+            if (stats.incarnation != null) stats.incarnation else if (readiness) |value| value.incarnation else null
+        else if (readiness) |value|
+            value.incarnation
+        else
+            null,
+        .activity_epoch = if (activity) |value| value.epoch else null,
+        .activity_phase = if (activity) |value| @tagName(value.phase) else null,
+        .chunks_created = if (activity) |value| value.chunks_created else null,
+        .embeddings_computed = if (activity) |value| value.embeddings_computed else null,
+        .active_batch_size = if (activity) |value| value.active_batch_size else null,
         .error_text = error_text,
         .repair_state = if (repair) |value| value.state else null,
         .repair_action_required = if (repair) |value| value.action_required else null,
@@ -590,6 +652,9 @@ fn summarizeStats(stats: anytype) IndexSummary {
 const WaitProgressReporter = struct {
     last_state: ?[]const u8 = null,
     last_report_ns: ?u64 = null,
+    activity_epoch_hash: ?u64 = null,
+    embeddings_computed: i64 = 0,
+    activity_sample_ns: ?u64 = null,
 
     fn shouldReport(self: *@This(), state: []const u8, now_ns: u64) bool {
         const stable_state = canonicalWaitState(state);
@@ -599,6 +664,22 @@ const WaitProgressReporter = struct {
         self.last_state = stable_state;
         self.last_report_ns = now_ns;
         return true;
+    }
+
+    fn observeEmbeddingRate(self: *@This(), summary: IndexSummary, now_ns: u64) ?f64 {
+        const epoch = summary.activity_epoch orelse return null;
+        const computed = summary.embeddings_computed orelse return null;
+        const epoch_hash = std.hash.Wyhash.hash(0, epoch);
+        defer {
+            self.activity_epoch_hash = epoch_hash;
+            self.embeddings_computed = computed;
+            self.activity_sample_ns = now_ns;
+        }
+        if (self.activity_epoch_hash != epoch_hash or self.activity_sample_ns == null or computed < self.embeddings_computed) return null;
+        const elapsed_ns = now_ns -| self.activity_sample_ns.?;
+        if (elapsed_ns == 0) return null;
+        return @as(f64, @floatFromInt(computed - self.embeddings_computed)) *
+            @as(f64, std.time.ns_per_s) / @as(f64, @floatFromInt(elapsed_ns));
     }
 };
 
@@ -612,6 +693,15 @@ fn writePendingReasons(writer: anytype, pending_reasons: []const []const u8) !vo
 }
 
 fn writeSourceCoverage(writer: anytype, summary: IndexSummary) !void {
+    if (summary.source_pending != null or summary.source_skipped != null or summary.source_failed != null) {
+        try writer.writeAll(" sources=");
+        if (summary.source_covered) |covered| try writer.print("{d} covered", .{covered}) else try writer.writeAll("? covered");
+        if (summary.source_pending) |pending| try writer.print(", {d} pending", .{pending});
+        if (summary.source_skipped) |skipped| try writer.print(", {d} skipped", .{skipped});
+        if (summary.source_failed) |failed| try writer.print(", {d} failed", .{failed});
+        if (summary.source_total) |total| try writer.print(" / {d}", .{total});
+        return;
+    }
     try writer.writeAll(" source_coverage=");
     if (summary.source_covered) |covered| {
         if (summary.source_total) |total| {
@@ -622,6 +712,22 @@ fn writeSourceCoverage(writer: anytype, summary: IndexSummary) !void {
     } else {
         try writer.writeAll("-");
     }
+}
+
+fn blockersForTarget(summary: IndexSummary, target: WaitTarget) []const []const u8 {
+    return switch (target) {
+        .queryable => summary.queryable_blockers,
+        .complete => summary.complete_blockers,
+    };
+}
+
+fn writeBlockers(writer: anytype, blockers: []const []const u8) !void {
+    try writer.writeAll(" blockers=[");
+    for (blockers, 0..) |blocker, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.writeAll(blocker);
+    }
+    try writer.writeAll("]");
 }
 
 fn writeIndexFailureDiagnostic(
@@ -646,7 +752,7 @@ fn writeIndexFailureDiagnostic(
     if (summary.repair_blocks_queryable) |blocks| try writer.print(" blocks_queryable={any}", .{blocks});
     if (summary.repair_blocks_complete) |blocks| try writer.print(" blocks_complete={any}", .{blocks});
     if (summary.repair_reason) |reason| try writer.print(" repair_reason={s}", .{reason});
-    try writePendingReasons(writer, summary.pending_reasons);
+    try writeBlockers(writer, blockersForTarget(summary, target));
     try writer.writeAll("; run index list --output json for full diagnostics");
 }
 
@@ -667,7 +773,7 @@ fn fatalIndexFailure(
     cli.fatal("{s}", .{out.written()});
 }
 
-fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexSummary) void {
+fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexSummary, embeddings_per_second: ?f64) void {
     var buffer: [2048]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     writer.print("Waiting for {s} index {s} until {s}: {s}", .{
@@ -680,9 +786,18 @@ fn printWaitProgress(index_name: []const u8, target: WaitTarget, summary: IndexS
         writer.print(" {d:.1}%", .{@max(0.0, @min(1.0, progress)) * 100.0}) catch return;
     }
     writeSourceCoverage(&writer, summary) catch return;
-    if (summary.indexed) |indexed| writer.print(" indexed_entries={d}", .{indexed}) catch return;
-    if (summary.visible) |visible| writer.print(" visible_entries={d}", .{visible}) catch return;
-    writePendingReasons(&writer, summary.pending_reasons) catch return;
+    if (std.mem.eql(u8, summary.index_type, "embeddings")) {
+        if (summary.visible) |visible| writer.print(" searchable_vectors={d}", .{visible}) catch return;
+        if (summary.activity_phase) |phase| writer.print(" activity={s}", .{phase}) catch return;
+        if (summary.chunks_created) |chunks| writer.print(" chunks_created={d}", .{chunks}) catch return;
+        if (summary.embeddings_computed) |computed| writer.print(" embeddings_computed={d}", .{computed}) catch return;
+        if (embeddings_per_second) |rate| writer.print(" rate={d:.1}/s", .{rate}) catch return;
+        if (summary.active_batch_size) |batch| writer.print(" active_batch_size={d}", .{batch}) catch return;
+    } else {
+        if (summary.indexed) |indexed| writer.print(" indexed={d}", .{indexed}) catch return;
+        if (summary.visible) |visible| writer.print(" searchable={d}", .{visible}) catch return;
+    }
+    writeBlockers(&writer, blockersForTarget(summary, target)) catch return;
     writer.writeByte('\n') catch return;
     std.debug.print("{s}", .{writer.buffered()});
 }
@@ -730,6 +845,7 @@ fn writeWaitSuccess(
     io: std.Io,
     index: antfly_client.types.IndexStatus,
     target: WaitTarget,
+    embeddings_per_second: ?f64,
 ) !void {
     const summary = summarizeIndex(index);
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -747,9 +863,17 @@ fn writeWaitSuccess(
         try writer.writeAll("-");
     }
     try writeSourceCoverage(writer, summary);
-    if (summary.indexed) |indexed| try writer.print(" indexed_entries={d}", .{indexed});
-    if (summary.visible) |visible| try writer.print(" visible_entries={d}", .{visible});
-    try writePendingReasons(writer, summary.pending_reasons);
+    if (std.mem.eql(u8, summary.index_type, "embeddings")) {
+        if (summary.visible) |visible| try writer.print(" searchable_vectors={d}", .{visible});
+        if (summary.activity_phase) |phase| try writer.print(" activity={s}", .{phase});
+        if (summary.chunks_created) |chunks| try writer.print(" chunks_created={d}", .{chunks});
+        if (summary.embeddings_computed) |computed| try writer.print(" embeddings_computed={d}", .{computed});
+        if (embeddings_per_second) |rate| try writer.print(" rate={d:.1}/s", .{rate});
+    } else {
+        if (summary.indexed) |indexed| try writer.print(" indexed={d}", .{indexed});
+        if (summary.visible) |visible| try writer.print(" searchable={d}", .{visible});
+    }
+    try writeBlockers(writer, blockersForTarget(summary, target));
     if (summary.repair_action_required orelse false) {
         try writer.writeAll(" warning=repair_action_required");
         if (summary.repair_state) |state| try writer.print(" repair_state={s}", .{state});
@@ -936,11 +1060,12 @@ fn waitForIndexWithFetcher(
         consecutive_failures = 0;
         if (resp.data) |parsed| {
             const summary = summarizeIndex(parsed.value);
+            const embeddings_per_second = progress_reporter.observeEmbeddingRate(summary, response_ns);
             switch (waitDisposition(summary, target)) {
                 .ready => {
                     consecutive_ready +|= 1;
                     if (consecutive_ready >= ready_confirmation_observations) {
-                        try writeWaitSuccess(allocator, io, parsed.value, target);
+                        try writeWaitSuccess(allocator, io, parsed.value, target, embeddings_per_second);
                         resp.deinit();
                         return .{ .ready = {} };
                     }
@@ -949,7 +1074,7 @@ fn waitForIndexWithFetcher(
                 .waiting => consecutive_ready = 0,
             }
             if (progress_reporter.shouldReport(summary.state, response_ns)) {
-                printWaitProgress(name, target, summary);
+                printWaitProgress(name, target, summary, embeddings_per_second);
             }
         } else {
             cli.fatal("index {s} returned an unreadable HTTP {d} response", .{ name, resp.status_code });
@@ -1363,7 +1488,7 @@ test "index wait prefers authoritative readiness contract" {
     var failure_writer = std.Io.Writer.fixed(&failure_buffer);
     try writeIndexFailureDiagnostic(&failure_writer, "dense", .queryable, summary);
     try std.testing.expectEqualStrings(
-        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing pending_reasons=[repair]; run index list --output json for full diagnostics",
+        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing blockers=[repair]; run index list --output json for full diagnostics",
         failure_writer.buffered(),
     );
 
@@ -1406,6 +1531,56 @@ test "index wait progress reporting is immediate periodic and state sensitive" {
     try std.testing.expect(reporter.shouldReport("retrying", wait_progress_report_interval_ns - 1));
     try std.testing.expect(!reporter.shouldReport("retrying", wait_progress_report_interval_ns));
     try std.testing.expect(reporter.shouldReport("retrying", 2 * wait_progress_report_interval_ns));
+}
+
+test "index summary prefers typed embedding milestones coverage and activity" {
+    const summary = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .incarnation = "g-current",
+        .milestones = .{
+            .queryable = .{ .reached = true, .blockers = &.{} },
+            .complete = .{ .reached = false, .blockers = &.{"source_coverage"} },
+        },
+        .source_coverage = .{
+            .policy = .partial,
+            .observation_complete = true,
+            .observation_incomplete_reasons = &.{},
+            .config_fingerprint = "0123456789abcdef",
+            .total = 100,
+            .pending = 75,
+            .covered = 20,
+            .skipped = 5,
+            .failed = 0,
+            .complete = false,
+            .healthy = false,
+            .degraded = false,
+        },
+        .searchable_vectors = 44,
+        .activity = .{
+            .epoch = "a-current",
+            .phase = .embedding,
+            .chunks_created = 80,
+            .embedding_batches_completed = 4,
+            .embeddings_computed = 32,
+            .active_batch_size = 8,
+            .last_progress_at = "2026-08-29T12:00:00Z",
+        },
+    });
+    try std.testing.expectEqualStrings("queryable_partial", summary.state);
+    try std.testing.expect(summary.queryable);
+    try std.testing.expect(!summary.complete);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), summary.progress.?, 0.0001);
+    try std.testing.expectEqual(@as(?i64, 20), summary.source_covered);
+    try std.testing.expectEqual(@as(?i64, 75), summary.source_pending);
+    try std.testing.expectEqual(@as(?i64, 44), summary.visible);
+    try std.testing.expectEqualStrings("source_coverage", summary.complete_blockers[0]);
+    try std.testing.expectEqualStrings("embedding", summary.activity_phase.?);
+
+    var reporter = WaitProgressReporter{};
+    try std.testing.expect(reporter.observeEmbeddingRate(summary, 0) == null);
+    var advanced = summary;
+    advanced.embeddings_computed = 42;
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), reporter.observeEmbeddingRate(advanced, std.time.ns_per_s).?, 0.0001);
 }
 
 test "index wait disposition retries mismatch and fails only terminal states" {

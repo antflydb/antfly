@@ -132,6 +132,44 @@ notification but still wake full-text, sparse, graph, and enrichment-derived
 workers. `.full_text` remains target-specific and does not wait behind dense
 bulk work.
 
+### Embeddings Lifecycle Status
+
+Managed embeddings expose three independent status dimensions. They must not be
+collapsed into one generic progress percentage:
+
+- `source_coverage` is generation-scoped durable outcome accounting. `total` is
+  the source-document population; every source is exactly one of `pending`,
+  `covered`, `skipped`, or `failed` once the observation is complete. A missing
+  generated artifact remains `pending` until the enrichment worker records a
+  terminal produced, intentional-skip, or non-retryable-failure decision.
+- `searchable_vectors` is the number of physical dense or sparse entries in the
+  query-visible publication. It can exceed source coverage when one source
+  produces multiple chunks, and it may lag generated work until publication.
+- `activity` is volatile, per-index and per-incarnation work telemetry:
+  `chunks_created`, `embedding_batches_completed`, `embeddings_computed`,
+  `active_batch_size`, and `last_progress_at`. Its opaque `epoch` changes when
+  the worker process or index incarnation changes. Rates are meaningful only
+  between samples carrying the same epoch.
+
+Readiness is expressed as explicit `queryable` and `complete` milestones with
+milestone-specific blockers. Only durable coverage, publication, repair,
+incarnation, topology, and failure facts participate in those milestones.
+Activity explains why counters are moving; it never proves readiness or
+failure, and losing volatile activity state on restart must not make an index
+less queryable.
+
+The runtime maintains activity counters while doing work, so operational status
+publication remains bounded and scan-free. Shared enrichment producers may fan
+one completed batch out to every exact consumer index, but activity from an
+unrelated index, table, or stale incarnation must never be attributed to the
+requested index.
+
+Activity is carried in runtime-status record v14. Mixed-version metadata groups
+omit this volatile telemetry until v14 support is proven by every current
+member; v13 repair and reporter-fence facts continue to publish independently.
+This downgrade is safe because activity is explanatory only and is never an
+input to admission or lifecycle milestones.
+
 ## Full-Text Routing From Enrichments
 
 Generated lexical content is configured at the enrichment level. Full-text

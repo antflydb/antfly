@@ -66,6 +66,19 @@ else
     @import("antfly_scraping");
 const mapper = @import("../document_mapper.zig");
 
+var activity_epoch_salt = std.atomic.Value(u64).init(1);
+
+fn newActivityEpoch(config: Config) u64 {
+    var hasher = std.hash.Wyhash.init(0x414e54464c594143);
+    hasher.update(config.owner_id);
+    var value_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &value_buf, config.clock.nowRealtimeNs(), .little);
+    hasher.update(&value_buf);
+    std.mem.writeInt(u64, &value_buf, activity_epoch_salt.fetchAdd(1, .monotonic), .little);
+    hasher.update(&value_buf);
+    return hasher.final() | 1;
+}
+
 fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
 }
@@ -498,7 +511,98 @@ fn elapsedNsSince(runtime: *EnrichmentRuntime, start_ns: u64) u64 {
     return end_ns - start_ns;
 }
 
-fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize) void {
+fn embeddingActivityEpoch(runtime_epoch: u64, index_generation: u64, index_name: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(runtime_epoch);
+    hasher.update(std.mem.asBytes(&index_generation));
+    hasher.update(index_name);
+    const epoch = hasher.final();
+    return if (epoch == 0) 1 else epoch;
+}
+
+fn indexEmbeddingActivityPtrAssumeLocked(runtime: *EnrichmentRuntime, index_name: []const u8) ?*types.EmbeddingActivityStats {
+    const index_generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse 0;
+    if (runtime.index_embedding_activity.getPtr(index_name)) |activity| {
+        if (activity.index_generation != index_generation) {
+            activity.* = .{
+                .epoch = embeddingActivityEpoch(runtime.activity_epoch, index_generation, index_name),
+                .index_generation = index_generation,
+            };
+        }
+        return activity;
+    }
+    const owned_name = runtime.alloc.dupe(u8, index_name) catch return null;
+    const result = runtime.index_embedding_activity.getOrPut(runtime.alloc, owned_name) catch {
+        runtime.alloc.free(owned_name);
+        return null;
+    };
+    if (result.found_existing) {
+        runtime.alloc.free(owned_name);
+    } else {
+        result.value_ptr.* = .{
+            .epoch = embeddingActivityEpoch(runtime.activity_epoch, index_generation, index_name),
+            .index_generation = index_generation,
+        };
+    }
+    return result.value_ptr;
+}
+
+fn noteIndexEmbedBatchStartedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.active_batch_size +|= @intCast(items);
+        activity.retrying = false;
+    }
+}
+
+fn noteIndexEmbedBatchFinishedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, success: bool) void {
+    const completed_at_ms = runtime.config.clock.nowRealtimeMs();
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.active_batch_size -|= @intCast(items);
+        activity.retrying = !success;
+        if (!success) continue;
+        activity.embedding_batches_completed +|= 1;
+        activity.embeddings_computed +|= @intCast(items);
+        activity.last_progress_at_ms = @max(activity.last_progress_at_ms, completed_at_ms);
+    }
+}
+
+fn noteIndexChunksCreatedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+    for (index_names) |index_name| {
+        const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
+        activity.chunks_created +|= @intCast(count);
+    }
+}
+
+fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+    if (count == 0) return;
+    if (comptime builtin.os.tag == .freestanding) {
+        noteIndexChunksCreatedAssumeLocked(runtime, index_names, count);
+        return;
+    }
+    if (runtime.io_impl) |io_impl| {
+        const io = io_impl.io();
+        runtime.mutex.lockUncancelable(io);
+        defer runtime.mutex.unlock(io);
+        noteIndexChunksCreatedAssumeLocked(runtime, index_names, count);
+    } else {
+        noteIndexChunksCreatedAssumeLocked(runtime, index_names, count);
+    }
+}
+
+fn freeOwnedIndexNames(alloc: Allocator, names: [][]u8) void {
+    for (names) |name| alloc.free(name);
+    alloc.free(names);
+}
+
+fn clearIndexEmbeddingActivity(runtime: *EnrichmentRuntime) void {
+    var iter = runtime.index_embedding_activity.keyIterator();
+    while (iter.next()) |key| runtime.alloc.free(@constCast(key.*));
+    runtime.index_embedding_activity.deinit(runtime.alloc);
+    runtime.index_embedding_activity = .empty;
+}
+
+fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, bytes: usize, max_bytes: usize) void {
     const now_ms = runtime.config.clock.nowRealtimeMs();
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
@@ -507,6 +611,7 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
         return;
     }
 
@@ -520,6 +625,7 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -527,10 +633,11 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize, bytes: usize
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
     }
 }
 
-fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usize, max_bytes: usize, elapsed_ns: u64, success: bool) void {
+fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, bytes: usize, max_bytes: usize, elapsed_ns: u64, success: bool) void {
     if (comptime builtin.os.tag == .freestanding) {
         if (success) {
             runtime.embed_batches_completed += 1;
@@ -546,6 +653,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success);
         return;
     }
 
@@ -567,6 +675,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success);
     } else {
         if (success) {
             runtime.embed_batches_completed += 1;
@@ -582,6 +691,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success);
     }
 }
 
@@ -590,10 +700,11 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, items: usize, bytes: usiz
 // deliberately do not overwrite the replay worker's single active-batch
 // snapshot. Treating concurrent request batches as that one slot lets the
 // first completion clear another still-running batch from runtime status.
-fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize) void {
+fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
         return;
     }
 
@@ -603,21 +714,36 @@ fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, items: usize
         defer runtime.mutex.unlock(io);
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
     }
 }
 
 fn noteTrackedRequestEmbedBatchFinished(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     items: usize,
     bytes: usize,
     max_bytes: usize,
     elapsed_ns: u64,
     success: bool,
 ) void {
-    if (!success) return;
+    if (!success) {
+        if (comptime builtin.os.tag == .freestanding) {
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false);
+        } else if (runtime.io_impl) |io_impl| {
+            const io = io_impl.io();
+            runtime.mutex.lockUncancelable(io);
+            defer runtime.mutex.unlock(io);
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false);
+        } else {
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false);
+        }
+        return;
+    }
 
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_completed += 1;
@@ -628,6 +754,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true);
         return;
     }
 
@@ -643,6 +770,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true);
     } else {
         runtime.embed_batches_completed += 1;
         runtime.embed_items_completed += @intCast(items);
@@ -652,6 +780,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true);
     }
 }
 
@@ -675,24 +804,26 @@ fn textBatchByteStats(texts: []const []const u8) TextBatchByteStats {
 /// policy, while runtime status must still reflect all provider work.
 pub fn embedDenseTracked(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     alloc: Allocator,
     dense_embedder: embedder_mod.DenseEmbedder,
     embedding_name: []const u8,
     text: []const u8,
     dims: u32,
 ) ![]f32 {
-    noteTrackedRequestEmbedBatchStarted(runtime, 1);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, 1);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDense(alloc, embedding_name, text, dims) catch |err| {
-        noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
-    noteTrackedRequestEmbedBatchFinished(runtime, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
     return vector;
 }
 
 pub fn embedDenseBatchTracked(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     alloc: Allocator,
     dense_embedder: embedder_mod.DenseEmbedder,
     embedding_name: []const u8,
@@ -700,23 +831,24 @@ pub fn embedDenseBatchTracked(
     dims: u32,
 ) ![]const []const f32 {
     const stats = textBatchByteStats(texts);
-    noteTrackedRequestEmbedBatchStarted(runtime, texts.len);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, texts.len);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = dense_embedder.embedDenseBatch(alloc, embedding_name, texts, dims) catch |err| {
-        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
     if (vectors.len != texts.len) {
         embedder_mod.freeDenseEmbeddingBatch(alloc, vectors);
-        noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
         return error.InvalidEmbeddingResponse;
     }
-    noteTrackedRequestEmbedBatchFinished(runtime, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
     return vectors;
 }
 
 pub fn embedDensePartsTracked(
     runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
     alloc: Allocator,
     dense_embedder: embedder_mod.DenseEmbedder,
     embedding_name: []const u8,
@@ -734,13 +866,13 @@ pub fn embedDensePartsTracked(
         total_bytes +|= bytes;
         max_bytes = @max(max_bytes, bytes);
     }
-    noteTrackedRequestEmbedBatchStarted(runtime, 1);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, 1);
     const started_ns = runtime.config.clock.nowRealtimeNs();
     const vector = dense_embedder.embedDenseParts(alloc, embedding_name, parts, dims) catch |err| {
-        noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), false);
         return err;
     };
-    noteTrackedRequestEmbedBatchFinished(runtime, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, total_bytes, max_bytes, elapsedNsSince(runtime, started_ns), true);
     return vector;
 }
 
@@ -760,19 +892,69 @@ test "request embedding telemetry preserves an overlapping replay batch snapshot
         .config = .{},
         .ownership = undefined,
     };
-    noteEmbedBatchStarted(&runtime, 4, 400, 125);
-    noteTrackedRequestEmbedBatchStarted(&runtime, 2);
-    noteTrackedRequestEmbedBatchFinished(&runtime, 2, 80, 40, 10, true);
+    noteEmbedBatchStarted(&runtime, &.{}, 4, 400, 125);
+    noteTrackedRequestEmbedBatchStarted(&runtime, &.{}, 2);
+    noteTrackedRequestEmbedBatchFinished(&runtime, &.{}, 2, 80, 40, 10, true);
     try std.testing.expectEqual(@as(u64, 4), runtime.active_embed_batch_items);
     try std.testing.expectEqual(@as(u64, 400), runtime.active_embed_batch_bytes);
     try std.testing.expectEqual(@as(u64, 125), runtime.active_embed_batch_max_bytes);
 
-    noteEmbedBatchFinished(&runtime, 4, 400, 125, 20, true);
+    noteEmbedBatchFinished(&runtime, &.{}, 4, 400, 125, 20, true);
     try std.testing.expectEqual(@as(u64, 0), runtime.active_embed_batch_items);
     try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_started);
     try std.testing.expectEqual(@as(u64, 2), runtime.embed_batches_completed);
     try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_started);
     try std.testing.expectEqual(@as(u64, 6), runtime.embed_items_completed);
+}
+
+test "enrichment runtime status scopes embedding activity to exact consumer indexes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/activity-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .activity_epoch = 17,
+        .config = .{},
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+
+    noteEmbedBatchStarted(&runtime, &.{"semantic"}, 4, 400, 125);
+    noteEmbedBatchFinished(&runtime, &.{"semantic"}, 4, 400, 125, 20, true);
+    noteIndexChunksCreated(&runtime, &.{"semantic"}, 9);
+    noteEmbedBatchStarted(&runtime, &.{"visual"}, 3, 300, 100);
+    noteEmbedBatchFinished(&runtime, &.{"visual"}, 3, 300, 100, 15, false);
+
+    const semantic = runtime.indexEmbeddingActivity("semantic");
+    try std.testing.expect(semantic.epoch != 0);
+    try std.testing.expectEqual(@as(u64, 9), semantic.chunks_created);
+    try std.testing.expectEqual(@as(u64, 1), semantic.embedding_batches_completed);
+    try std.testing.expectEqual(@as(u64, 4), semantic.embeddings_computed);
+    try std.testing.expectEqual(@as(u64, 0), semantic.active_batch_size);
+    try std.testing.expect(!semantic.retrying);
+
+    const visual = runtime.indexEmbeddingActivity("visual");
+    try std.testing.expect(visual.epoch != 0);
+    try std.testing.expectEqual(@as(u64, 0), visual.chunks_created);
+    try std.testing.expectEqual(@as(u64, 0), visual.embedding_batches_completed);
+    try std.testing.expectEqual(@as(u64, 0), visual.embeddings_computed);
+    try std.testing.expectEqual(@as(u64, 0), visual.active_batch_size);
+    try std.testing.expect(visual.retrying);
 }
 
 fn boundedTextBatchEnd(texts: []const []const u8, start: usize, max_items: usize, max_bytes: usize) usize {
@@ -2124,6 +2306,9 @@ fn getOrCreateRequestChunks(
         try chunker_mod.chunkTextWithConfigJson(runtime.alloc, source_text, request.chunker_json)
     else
         try chunker_mod.chunkText(runtime.alloc, source_text, request.chunk_size, request.chunk_overlap);
+    const activity_indexes = runtime.index_manager.vectorIndexesForChunk(runtime.alloc, requestArtifactName(request)) catch null;
+    defer if (activity_indexes) |names| freeOwnedIndexNames(runtime.alloc, names);
+    if (activity_indexes) |names| noteIndexChunksCreated(runtime, names, chunks.len);
 
     try cache.append(runtime.alloc, .{
         .key = cache_key,
@@ -2152,6 +2337,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     config: Config,
     applied_sequence: u64 = 0,
     target_sequence: u64 = 0,
+    activity_epoch: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
     retryable_error_count: u64 = 0,
@@ -2187,6 +2373,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
+    index_embedding_activity: std.StringHashMapUnmanaged(types.EmbeddingActivityStats) = .empty,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -2227,6 +2414,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .activity_epoch = newActivityEpoch(config),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -2259,6 +2447,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         if (self.owns_store) self.store.deinit();
@@ -2519,6 +2708,19 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     pub fn indexHasIsolatedFailure(self: *@This(), index_name: []const u8) bool {
         return self.isolated_failed_indexes.contains(index_name);
     }
+
+    pub fn indexEmbeddingActivity(self: *@This(), index_name: []const u8) types.EmbeddingActivityStats {
+        const index_generation = self.index_manager.coverageGenerationForIndex(index_name) orelse 0;
+        const activity = self.index_embedding_activity.get(index_name) orelse return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .index_generation = index_generation,
+        };
+        if (activity.index_generation != index_generation) return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .index_generation = index_generation,
+        };
+        return activity;
+    }
 } else struct {
     alloc: Allocator,
     io_impl: ?*Io.Threaded,
@@ -2546,6 +2748,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     replay_pass_active: bool = false,
     shutdown: bool = false,
     target_sequence: u64 = 0,
+    activity_epoch: u64 = 0,
     applied_sequence: u64 = 0,
     processed_requests: u64 = 0,
     error_count: u64 = 0,
@@ -2582,6 +2785,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
+    index_embedding_activity: std.StringHashMapUnmanaged(types.EmbeddingActivityStats) = .empty,
     last_error_name: ?[]const u8 = null,
     published_generated_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     isolated_failed_indexes: std.StringHashMapUnmanaged(void) = .empty,
@@ -2629,6 +2833,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .failure_pending_fence = failure_pending_fence,
             .notify_ctx = notify_ctx,
             .notify_fn = notify_fn,
+            .activity_epoch = newActivityEpoch(config),
             .config = .{
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -2668,6 +2873,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn deinit(self: *EnrichmentRuntime) void {
         self.stop();
+        clearIndexEmbeddingActivity(self);
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
@@ -3098,6 +3304,22 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         if (maybe_io) |io| self.mutex.lockUncancelable(io);
         defer if (maybe_io) |io| self.mutex.unlock(io);
         return self.isolated_failed_indexes.contains(index_name);
+    }
+
+    pub fn indexEmbeddingActivity(self: *EnrichmentRuntime, index_name: []const u8) types.EmbeddingActivityStats {
+        const maybe_io = if (self.io_impl) |io_impl| io_impl.io() else null;
+        if (maybe_io) |io| self.mutex.lockUncancelable(io);
+        defer if (maybe_io) |io| self.mutex.unlock(io);
+        const index_generation = self.index_manager.coverageGenerationForIndex(index_name) orelse 0;
+        const activity = self.index_embedding_activity.get(index_name) orelse return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .index_generation = index_generation,
+        };
+        if (activity.index_generation != index_generation) return .{
+            .epoch = embeddingActivityEpoch(self.activity_epoch, index_generation, index_name),
+            .index_generation = index_generation,
+        };
+        return activity;
     }
 
     fn recordError(self: *EnrichmentRuntime, io: Io, err: anyerror) void {
@@ -8097,10 +8319,10 @@ fn flushChunkedDenseItems(
     setActiveFailureFingerprint(runtime, chunkedDenseBatchFailureFingerprint(batch_items));
     const batch_stats = textBatchByteStats(batch_texts);
     yieldToInteractiveEmbeds(runtime);
-    noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
+    noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, batch_texts, expected_dims) catch |err| {
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         if (shouldYieldRequestError(runtime, err)) return err;
         try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, err);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
@@ -8108,12 +8330,12 @@ fn flushChunkedDenseItems(
     };
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != batch_items.len) {
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         try recordUniqueChunkedDenseRequestErrors(runtime, window, batch_items, error.InvalidEmbeddingResponse);
         clearChunkedDenseBatch(runtime.alloc, chunk_texts, chunk_items, owns_texts);
         return false;
     }
-    noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+    noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
     var embeddings = try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, batch_items.len);
     var initialized_embeddings: usize = 0;
@@ -8386,7 +8608,7 @@ fn flushMaterializedSparseChunkSources(
     if (sources.items.len == 0) return;
     defer clearChunkEmbeddingSourceList(runtime.alloc, sources);
 
-    const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, sources.items);
+    const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, sources.items);
     defer {
         for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
         if (chunk_embeddings.len > 0) runtime.alloc.free(chunk_embeddings);
@@ -8658,18 +8880,18 @@ fn flushPlainDenseItems(
     }
 
     yieldToInteractiveEmbeds(runtime);
-    noteEmbedBatchStarted(runtime, items.len, total_source_bytes, max_source_bytes);
+    noteEmbedBatchStarted(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes);
     const embed_started_ns = runtime.config.clock.nowRealtimeNs();
     const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, embedding_artifact_name, texts, expected_dims) catch |err| {
-        noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return err;
     };
     defer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
     if (vectors.len != items.len) {
-        noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+        noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), false);
         return error.InvalidEmbeddingResponse;
     }
-    noteEmbedBatchFinished(runtime, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+    noteEmbedBatchFinished(runtime, consumer_indexes, items.len, total_source_bytes, max_source_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
     for (items, vectors) |item, vector| {
         try writeEmbeddingArtifact(runtime, .{
@@ -9283,7 +9505,7 @@ fn processDenseEmbedding(
             return;
         }
 
-        const chunk_embeddings = try buildChunkDenseEmbeddingsFromSources(runtime, request, dense_embedder, source_set.sources);
+        const chunk_embeddings = try buildChunkDenseEmbeddingsFromSources(runtime, request, dense_embedder, consumer_indexes, source_set.sources);
         defer {
             for (chunk_embeddings) |embedding| freeDerivedDenseEmbedding(runtime.alloc, embedding);
             runtime.alloc.free(chunk_embeddings);
@@ -9427,7 +9649,7 @@ fn processSparseEmbedding(
             return;
         }
 
-        const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, source_set.sources);
+        const chunk_embeddings = try buildChunkSparseEmbeddingsFromSources(runtime, request, sparse_embedder, consumer_indexes, source_set.sources);
         defer {
             for (chunk_embeddings) |embedding| freeDerivedSparseEmbedding(runtime.alloc, embedding);
             runtime.alloc.free(chunk_embeddings);
@@ -9474,7 +9696,13 @@ fn processSparseEmbedding(
         return;
     }
 
-    var sparse = try embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text);
+    noteEmbedBatchStarted(runtime, consumer_indexes, 1, source_text.len, source_text.len);
+    const embed_started_ns = runtime.config.clock.nowRealtimeNs();
+    var sparse = embedSparseWithRetry(sparse_embedder, runtime, embedding_artifact_name, source_text) catch |err| {
+        noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), false);
+        return err;
+    };
+    noteEmbedBatchFinished(runtime, consumer_indexes, 1, source_text.len, source_text.len, elapsedNsSince(runtime, embed_started_ns), true);
     defer sparse.deinit(runtime.alloc);
     try writeSparseEmbeddingArtifact(runtime, request.doc_key, embedding_artifact_name, source_hash, sparse.indices, sparse.values);
     try queueDerivedCoverageProduced(runtime, window, request, consumer_indexes);
@@ -9491,6 +9719,7 @@ fn buildChunkDenseEmbeddingsFromSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     dense_embedder: embedder_mod.DenseEmbedder,
+    consumer_indexes: []const []const u8,
     sources: []const ChunkEmbeddingSource,
 ) ![]derived_types.DerivedDenseEmbeddingWrite {
     if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, 0);
@@ -9548,18 +9777,18 @@ fn buildChunkDenseEmbeddingsFromSources(
         const batch_texts = chunk_texts.items[start..end];
         const batch_keys = chunk_keys.items[start..end];
         const batch_stats = textBatchByteStats(batch_texts);
-        noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
+        noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
         const embed_started_ns = runtime.config.clock.nowRealtimeNs();
         const vectors = embedDenseBatchWithRetry(dense_embedder, runtime, requestEmbeddingName(request), batch_texts, request.expected_dims) catch |err| {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };
         errdefer embedder_mod.freeDenseEmbeddingBatch(runtime.alloc, vectors);
         if (vectors.len != batch_keys.len) {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return error.InvalidEmbeddingResponse;
         }
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
         for (batch_keys, vectors) |chunk_key, vector| {
             try embeddings.append(runtime.alloc, .{
@@ -9615,6 +9844,7 @@ fn buildChunkSparseEmbeddingsFromSources(
     runtime: *EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     sparse_embedder: embedder_mod.SparseEmbedder,
+    consumer_indexes: []const []const u8,
     sources: []const ChunkEmbeddingSource,
 ) ![]derived_types.DerivedSparseEmbeddingWrite {
     if (sources.len == 0) return try runtime.alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, 0);
@@ -9676,18 +9906,18 @@ fn buildChunkSparseEmbeddingsFromSources(
         const batch_keys = chunk_keys.items[start..end];
         const batch_hashes = chunk_hashes.items[start..end];
         const batch_stats = textBatchByteStats(batch_texts);
-        noteEmbedBatchStarted(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
+        noteEmbedBatchStarted(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes);
         const embed_started_ns = runtime.config.clock.nowRealtimeNs();
         const sparse_batch = embedSparseBatchWithRetry(sparse_embedder, runtime, requestEmbeddingName(request), batch_texts) catch |err| {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return err;
         };
         errdefer embedder_mod.freeSparseEmbeddingBatch(runtime.alloc, sparse_batch);
         if (sparse_batch.len != batch_keys.len) {
-            noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
+            noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), false);
             return error.InvalidEmbeddingResponse;
         }
-        noteEmbedBatchFinished(runtime, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
+        noteEmbedBatchFinished(runtime, consumer_indexes, batch_texts.len, batch_stats.total_bytes, batch_stats.max_bytes, elapsedNsSince(runtime, embed_started_ns), true);
 
         for (batch_keys, batch_hashes, sparse_batch) |chunk_key, source_hash, sparse| {
             try writeSparseEmbeddingArtifact(runtime, chunk_key, requestEmbeddingName(request), source_hash, sparse.indices, sparse.values);

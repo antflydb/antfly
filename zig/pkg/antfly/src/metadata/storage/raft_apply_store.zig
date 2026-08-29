@@ -4361,10 +4361,26 @@ fn storeHasRuntimeRepairStatus(record: metadata.StoreRecord) bool {
     return false;
 }
 
+fn embeddingActivityPresent(activity: metadata.RuntimeEmbeddingActivityStatusReport) bool {
+    return activity.epoch != 0 or activity.chunks_created != 0 or
+        activity.embedding_batches_completed != 0 or activity.embeddings_computed != 0 or
+        activity.active_batch_size != 0 or activity.retrying or activity.last_progress_at_ms != 0;
+}
+
+fn storeHasRuntimeEmbeddingActivity(record: metadata.StoreRecord) bool {
+    for (record.runtime_statuses) |runtime_status| {
+        for (runtime_status.indexes) |index_status| {
+            if (embeddingActivityPresent(index_status.embedding_activity)) return true;
+        }
+    }
+    return false;
+}
+
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
-    if (record.reporter_incarnation != 0 or record.status_generation != 0)
-        return runtime_status_protocol.current_record_version;
-    if (storeHasRuntimeRepairStatus(record)) return runtime_status_protocol.repair_status_record_version;
+    if (storeHasRuntimeEmbeddingActivity(record)) return runtime_status_protocol.embedding_activity_record_version;
+    if (storeHasRuntimeRepairStatus(record) or
+        record.reporter_incarnation != 0 or record.status_generation != 0)
+        return runtime_status_protocol.repair_status_record_version;
     return null;
 }
 
@@ -5357,6 +5373,7 @@ fn appendRuntimeGroupStatusRecord(
 
 fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u16 {
     for (record.indexes) |index| {
+        if (embeddingActivityPresent(index.embedding_activity)) return runtime_status_protocol.embedding_activity_record_version;
         if (index.repair_status != null) return runtime_status_protocol.repair_status_record_version;
     }
     return runtime_status_protocol.legacy_record_version;
@@ -5788,6 +5805,15 @@ fn appendRuntimeIndexStatusRecord(
             if (record.repair_status != null and record.repair_active_generation_serviceable) 1 else 0,
         );
     }
+    if (version >= runtime_status_protocol.embedding_activity_record_version) {
+        try appendInt(alloc, out, u64, record.embedding_activity.epoch);
+        try appendInt(alloc, out, u64, record.embedding_activity.chunks_created);
+        try appendInt(alloc, out, u64, record.embedding_activity.embedding_batches_completed);
+        try appendInt(alloc, out, u64, record.embedding_activity.embeddings_computed);
+        try appendInt(alloc, out, u64, record.embedding_activity.active_batch_size);
+        try out.append(alloc, if (record.embedding_activity.retrying) 1 else 0);
+        try appendInt(alloc, out, u64, record.embedding_activity.last_progress_at_ms);
+    }
 }
 
 fn readRuntimeIndexStatusRecord(
@@ -5853,6 +5879,26 @@ fn readRuntimeIndexStatusRecord(
         if (value > 1 or (value == 1 and repair_status == null)) return error.InvalidMetadataTransitionEncoding;
         break :blk value == 1;
     } else false;
+    const embedding_activity: metadata.RuntimeEmbeddingActivityStatusReport = if (version >= runtime_status_protocol.embedding_activity_record_version) blk: {
+        const epoch = try readInt(encoded, pos, u64);
+        const chunks_created = try readInt(encoded, pos, u64);
+        const embedding_batches_completed = try readInt(encoded, pos, u64);
+        const embeddings_computed = try readInt(encoded, pos, u64);
+        const active_batch_size = try readInt(encoded, pos, u64);
+        if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+        const retrying_byte = encoded[pos.*];
+        pos.* += 1;
+        if (retrying_byte > 1) return error.InvalidMetadataTransitionEncoding;
+        break :blk .{
+            .epoch = epoch,
+            .chunks_created = chunks_created,
+            .embedding_batches_completed = embedding_batches_completed,
+            .embeddings_computed = embeddings_computed,
+            .active_batch_size = active_batch_size,
+            .retrying = retrying_byte == 1,
+            .last_progress_at_ms = try readInt(encoded, pos, u64),
+        };
+    } else .{};
     return .{
         .name = name,
         .kind = kind,
@@ -5874,6 +5920,7 @@ fn readRuntimeIndexStatusRecord(
         .replay_applied_sequence = replay_applied_sequence,
         .replay_target_sequence = replay_target_sequence,
         .replay_catch_up_required = replay_catch_up_required,
+        .embedding_activity = embedding_activity,
         .repair_status = repair_status,
         .repair_active_generation_serviceable = repair_active_generation_serviceable,
     };
@@ -11146,6 +11193,15 @@ test "metadata raft apply store runtime status codec preserves document identity
             .coverage_config_hash = 0x1234,
             .coverage_identity_ready = true,
             .coverage_summary_ready = true,
+            .embedding_activity = .{
+                .epoch = 7,
+                .chunks_created = 9,
+                .embedding_batches_completed = 2,
+                .embeddings_computed = 8,
+                .active_batch_size = 4,
+                .retrying = true,
+                .last_progress_at_ms = 1_787_990_400_000,
+            },
             .repair_status = .rebuilding,
             .repair_active_generation_serviceable = true,
         }})[0..]),
@@ -11195,6 +11251,13 @@ test "metadata raft apply store runtime status codec preserves document identity
     try std.testing.expectEqual(@as(u64, 0x1234), status.indexes[0].coverage_config_hash);
     try std.testing.expect(status.indexes[0].coverage_identity_ready);
     try std.testing.expect(status.indexes[0].coverage_summary_ready);
+    try std.testing.expectEqual(@as(u64, 7), status.indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 9), status.indexes[0].embedding_activity.chunks_created);
+    try std.testing.expectEqual(@as(u64, 2), status.indexes[0].embedding_activity.embedding_batches_completed);
+    try std.testing.expectEqual(@as(u64, 8), status.indexes[0].embedding_activity.embeddings_computed);
+    try std.testing.expectEqual(@as(u64, 4), status.indexes[0].embedding_activity.active_batch_size);
+    try std.testing.expect(status.indexes[0].embedding_activity.retrying);
+    try std.testing.expectEqual(@as(u64, 1_787_990_400_000), status.indexes[0].embedding_activity.last_progress_at_ms);
     try std.testing.expectEqual(metadata.IndexRepairStatus.rebuilding, status.indexes[0].repair_status.?);
     try std.testing.expect(status.indexes[0].repair_active_generation_serviceable);
 }
@@ -11211,7 +11274,7 @@ test "metadata runtime index status decoder accepts version ten records" {
         .replay_applied_sequence = 9,
         .replay_target_sequence = 11,
         .replay_catch_up_required = true,
-    }, runtime_status_protocol.current_record_version);
+    }, runtime_status_protocol.repair_status_record_version);
 
     // Version 10 ended immediately after replay_catch_up_required. Remove the
     // version-11 optional load-error tag and the two version-13 repair bytes.
@@ -11259,6 +11322,18 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
         runtime_status_protocol.legacy_record_version,
         try readInt(encoded.items, &version_pos, u16),
     );
+    var runtime_statuses = [_]metadata.RuntimeGroupStatusReport{status};
+    const store = metadata.StoreRecord{
+        .store_id = 3,
+        .node_id = 4,
+        .reporter_incarnation = 11,
+        .status_generation = 1,
+        .runtime_statuses = runtime_statuses[0..],
+    };
+    try std.testing.expectEqual(
+        runtime_status_protocol.repair_status_record_version,
+        storeRuntimeStatusRecordVersion(store).?,
+    );
     var legacy_pos: usize = 0;
     const legacy_decoded = try readRuntimeGroupStatusRecordWithMaxVersion(
         alloc,
@@ -11288,6 +11363,30 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
             runtime_status_protocol.legacy_record_version,
         ),
     );
+
+    encoded.clearRetainingCapacity();
+    indexes[0].embedding_activity = .{ .epoch = 17, .embeddings_computed = 23 };
+    try std.testing.expectEqual(
+        runtime_status_protocol.embedding_activity_record_version,
+        storeRuntimeStatusRecordVersion(store).?,
+    );
+    try appendRuntimeGroupStatusRecord(alloc, &encoded, status);
+    version_pos = 0;
+    try std.testing.expectEqual(
+        runtime_status_protocol.embedding_activity_record_version,
+        try readInt(encoded.items, &version_pos, u16),
+    );
+    var current_pos: usize = 0;
+    const current_decoded = try readRuntimeGroupStatusRecordWithMaxVersion(
+        alloc,
+        encoded.items,
+        &current_pos,
+        runtime_status_protocol.current_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeGroupStatusReport(alloc, current_decoded);
+    try std.testing.expectEqual(encoded.items.len, current_pos);
+    try std.testing.expectEqual(@as(u64, 17), current_decoded.indexes[0].embedding_activity.epoch);
+    try std.testing.expectEqual(@as(u64, 23), current_decoded.indexes[0].embedding_activity.embeddings_computed);
 }
 
 test "metadata raft apply store group status decoder accepts version one records" {
