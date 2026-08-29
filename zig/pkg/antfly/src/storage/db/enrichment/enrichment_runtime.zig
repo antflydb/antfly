@@ -5895,6 +5895,11 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
             return err;
         };
         defer rendered_page.deinit();
+        // Parsing and rasterization are independently bounded. A complex xref
+        // or resource graph must not consume the page's complete render budget
+        // before the rasterizer and PNG encoder get a chance to run.
+        pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+        rendered_page.setCancellationProbe(pdf_render_deadline.probe());
         const page = rendered_page.renderPagePngAdaptiveAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
             try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
             return err;
@@ -13247,9 +13252,13 @@ test "synchronous document extraction OCR batches honor request execution item c
 }
 
 test "PDF render deadline installs an active monotonic cancellation probe" {
-    const expired = document_extraction_mod.PdfRenderDeadline{ .deadline_ns = 0 };
-    const probe = expired.probe();
-    try std.testing.expect(probe.is_cancelled_fn.?(probe.context));
+    var deadline = document_extraction_mod.PdfRenderDeadline{ .deadline_ns = 0 };
+    const parse_probe = deadline.probe();
+    try std.testing.expect(parse_probe.is_cancelled_fn.?(parse_probe.context));
+
+    deadline = document_extraction_mod.PdfRenderDeadline.init(60_000);
+    const render_probe = deadline.probe();
+    try std.testing.expect(!render_probe.is_cancelled_fn.?(render_probe.context));
 }
 
 test "document-wide OCR resource failure preserves units and marks pending pages" {

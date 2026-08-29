@@ -115,7 +115,13 @@ pub fn renderPageContentPngInBoxRotatedCancelable(
     try cancellation.check();
     try rotateRawPageCanvasAlloc(alloc, &raw, rotation, cancellation);
     try cancellation.check();
-    return try image.png.encodeRgba(alloc, @intCast(raw.width), @intCast(raw.height), raw.rgba);
+    return try image.png.encodeRgbaWithCancellation(
+        alloc,
+        @intCast(raw.width),
+        @intCast(raw.height),
+        raw.rgba,
+        .{ .context = cancellation.context, .is_cancelled_fn = cancellation.is_cancelled_fn },
+    );
 }
 
 const RawPageCanvas = struct {
