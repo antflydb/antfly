@@ -1082,6 +1082,24 @@ pub const HttpHost = struct {
             null;
         const transport_io = if (deps.backend_runtime) |runtime| runtime.raftOutboundIo() else null;
         var transport_config = cfg.transport;
+        // V1 snapshots are one HTTP body in both directions. Bound publication
+        // by the stricter listener/executor ceiling so a default-compatible
+        // host cannot accept an artifact that another host cannot fetch.
+        transport_config.snapshot.legacy_fallback_max_request_bytes = @min(
+            transport_config.snapshot.legacy_fallback_max_request_bytes,
+            @min(cfg.listener.max_request_bytes, cfg.executor.max_response_bytes),
+        );
+        if (transport_config.snapshot.legacy_fallback_max_request_bytes == 0)
+            return error.InvalidSnapshotTransferLimits;
+        // V2 chunks cross the same request/response boundary. Preserve the
+        // operator's requested size when valid and otherwise reduce it to the
+        // largest end-to-end safe chunk instead of failing only during fetch.
+        transport_config.snapshot.chunk_size = @min(
+            transport_config.snapshot.chunk_size,
+            @min(cfg.listener.max_request_bytes, cfg.executor.max_response_bytes),
+        );
+        if (transport_config.snapshot.chunk_size == 0)
+            return error.InvalidSnapshotTransferLimits;
         // The std Threaded timeout path uses process signals for cancellation.
         // Keep each asynchronous peer lane on an independent I/O pool so one
         // canceled request cannot interrupt another lane's connect syscall.

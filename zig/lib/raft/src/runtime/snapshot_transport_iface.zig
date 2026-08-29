@@ -15,9 +15,20 @@
 const std = @import("std");
 const core = @import("../core/mod.zig");
 
+/// Durable representation used to select the artifact decoder. `unknown` is
+/// reserved for catalogs written before the format was persisted; transports
+/// must use a compatibility-safe discovery order for those records rather than
+/// infer the artifact format from the peer's current capabilities.
+pub const SnapshotArtifactFormat = enum(u8) {
+    unknown = 0,
+    legacy_envelope_v1 = 1,
+    chunked_manifest_v2 = 2,
+};
+
 pub const SnapshotLocator = struct {
     snapshot_id: []const u8,
     uri: []const u8 = &.{},
+    format: SnapshotArtifactFormat = .unknown,
 };
 
 pub const SnapshotSendRequest = struct {
@@ -89,6 +100,7 @@ pub const SnapshotTransport = struct {
 
 test "snapshot transport iface compiles" {
     _ = SnapshotLocator;
+    _ = SnapshotArtifactFormat;
     _ = SnapshotSendRequest;
     _ = SnapshotFetchRequest;
     _ = SnapshotReceiver;

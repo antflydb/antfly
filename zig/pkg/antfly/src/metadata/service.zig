@@ -11172,6 +11172,11 @@ fn projectedProvisioningFingerprint(alloc: std.mem.Allocator, service: anytype) 
             hasher.update(&.{1});
             hasher.update(std.mem.asBytes(&snapshot.from_node_id));
             hasher.update(std.mem.asBytes(&snapshot.term));
+            // Keep the legacy fingerprint stable while making an explicitly
+            // versioned locator a distinct provisioning input.
+            if (snapshot.format != .unknown) {
+                hasher.update(std.mem.asBytes(&@intFromEnum(snapshot.format)));
+            }
             hashProjectedProvisioningBytes(&hasher, snapshot.snapshot_id);
             hashProjectedProvisioningBytes(&hasher, snapshot.uri);
         } else {

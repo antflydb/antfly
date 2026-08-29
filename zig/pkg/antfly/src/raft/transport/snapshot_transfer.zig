@@ -15,6 +15,22 @@ pub const max_manifest_bytes: usize = 256 * 1024;
 pub const max_members_per_set: usize = 16 * 1024;
 const magic = "AFSNAP2\x00";
 
+/// The v2 wire format keeps its original scalar identity fields for rolling
+/// compatibility. Their meaning is explicit here: `from == 0` is an artifact
+/// publication and `to` is the node that owns the artifact; a non-zero `from`
+/// is a live Raft snapshot delivery. New code must branch on this purpose
+/// instead of treating the zero sentinel as a live Raft node id.
+pub const Purpose = union(enum) {
+    live_install: struct {
+        from: u64,
+        to: u64,
+        term: u64,
+    },
+    bootstrap_artifact: struct {
+        owner_node_id: u64,
+    },
+};
+
 pub const Manifest = struct {
     group_id: u64,
     from: u64,
@@ -23,6 +39,17 @@ pub const Manifest = struct {
     metadata: raft_engine.core.types.SnapshotMetadata,
     data_len: u64,
     digest: [digest_len]u8,
+
+    pub fn purpose(self: @This()) Purpose {
+        if (self.from == 0) {
+            return .{ .bootstrap_artifact = .{ .owner_node_id = self.to } };
+        }
+        return .{ .live_install = .{
+            .from = self.from,
+            .to = self.to,
+            .term = self.request_term,
+        } };
+    }
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.metadata.deinit(alloc);
@@ -174,4 +201,33 @@ test "snapshot transfer manifest round trips with integrity metadata" {
         error.SnapshotManifestChecksumMismatch,
         decode(std.testing.allocator, corrupt),
     );
+}
+
+test "snapshot transfer purpose distinguishes durable artifacts from live delivery" {
+    const artifact: Manifest = .{
+        .group_id = 9,
+        .from = 0,
+        .to = 7,
+        .request_term = 0,
+        .metadata = .{},
+        .data_len = 0,
+        .digest = digest(""),
+    };
+    switch (artifact.purpose()) {
+        .bootstrap_artifact => |purpose| try std.testing.expectEqual(@as(u64, 7), purpose.owner_node_id),
+        .live_install => return error.TestUnexpectedResult,
+    }
+
+    var live = artifact;
+    live.from = 3;
+    live.to = 4;
+    live.request_term = 11;
+    switch (live.purpose()) {
+        .live_install => |purpose| {
+            try std.testing.expectEqual(@as(u64, 3), purpose.from);
+            try std.testing.expectEqual(@as(u64, 4), purpose.to);
+            try std.testing.expectEqual(@as(u64, 11), purpose.term);
+        },
+        .bootstrap_artifact => return error.TestUnexpectedResult,
+    }
 }

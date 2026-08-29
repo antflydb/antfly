@@ -116,6 +116,7 @@ pub const SnapshotBootstrap = struct {
             .locator = .{
                 .snapshot_id = try alloc.dupe(u8, self.locator.snapshot_id),
                 .uri = try alloc.dupe(u8, self.locator.uri),
+                .format = self.locator.format,
             },
             .fetch_immediately = self.fetch_immediately,
         };

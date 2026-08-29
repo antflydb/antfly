@@ -87,6 +87,7 @@ pub const SnapshotBootstrapRecord = struct {
     term: u64 = 0,
     snapshot_id: []const u8,
     uri: []const u8 = "",
+    format: raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat = .unknown,
 
     pub fn clone(self: SnapshotBootstrapRecord, alloc: std.mem.Allocator) !SnapshotBootstrapRecord {
         var cloned = SnapshotBootstrapRecord{
@@ -94,6 +95,7 @@ pub const SnapshotBootstrapRecord = struct {
             .term = self.term,
             .snapshot_id = try alloc.dupe(u8, self.snapshot_id),
             .uri = "",
+            .format = self.format,
         };
         errdefer alloc.free(cloned.snapshot_id);
         cloned.uri = try alloc.dupe(u8, self.uri);
@@ -113,6 +115,7 @@ pub const SnapshotBootstrapRecord = struct {
             .locator = .{
                 .snapshot_id = try alloc.dupe(u8, self.snapshot_id),
                 .uri = "",
+                .format = self.format,
             },
             .fetch_immediately = true,
         };
@@ -276,6 +279,7 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         const other = right.snapshot_bootstrap.?;
         if (snapshot.from_node_id != other.from_node_id) return false;
         if (snapshot.term != other.term) return false;
+        if (snapshot.format != other.format) return false;
         if (!std.mem.eql(u8, snapshot.snapshot_id, other.snapshot_id)) return false;
         if (!std.mem.eql(u8, snapshot.uri, other.uri)) return false;
     }
@@ -1089,7 +1093,8 @@ test "file replica catalog persists records across reopen" {
                 .from_node_id = 4,
                 .term = 7,
                 .snapshot_id = "snap-21",
-                .uri = "http://127.0.0.1:7777/raft/v1/snapshot/fetch/snap-21",
+                .uri = "http://127.0.0.1:7777/raft/v2/snapshot/fetch/snap-21",
+                .format = .chunked_manifest_v2,
             },
         });
     }
@@ -1107,6 +1112,10 @@ test "file replica catalog persists records across reopen" {
         try std.testing.expectEqual(@as(u64, 4), records[0].snapshot_bootstrap.?.from_node_id);
         try std.testing.expectEqual(@as(u64, 7), records[0].snapshot_bootstrap.?.term);
         try std.testing.expectEqualStrings("snap-21", records[0].snapshot_bootstrap.?.snapshot_id);
+        try std.testing.expectEqual(
+            raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2,
+            records[0].snapshot_bootstrap.?.format,
+        );
     }
 }
 

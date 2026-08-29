@@ -16,11 +16,13 @@ const std = @import("std");
 const core = @import("../core/mod.zig");
 const replica = @import("replica.zig");
 const catalog_iface = @import("replica_catalog_iface.zig");
+const snapshot_transport_iface = @import("snapshot_transport_iface.zig");
 
 const file_magic = "RPLC1";
 const bootstrap_empty: u8 = 0;
 const bootstrap_persisted: u8 = 1;
 const bootstrap_fetch_snapshot: u8 = 2;
+const bootstrap_fetch_snapshot_versioned: u8 = 3;
 
 pub const FileReplicaCatalog = struct {
     alloc: std.mem.Allocator,
@@ -191,12 +193,20 @@ fn encodeRecord(alloc: std.mem.Allocator, buffer: *std.ArrayList(u8), record: re
         .empty => try buffer.append(alloc, bootstrap_empty),
         .persisted => try buffer.append(alloc, bootstrap_persisted),
         .fetch_snapshot => |snapshot| {
-            try buffer.append(alloc, bootstrap_fetch_snapshot);
+            try buffer.append(
+                alloc,
+                if (snapshot.locator.format == .unknown)
+                    bootstrap_fetch_snapshot
+                else
+                    bootstrap_fetch_snapshot_versioned,
+            );
             try appendInt(alloc, buffer, u64, snapshot.from);
             try appendInt(alloc, buffer, u64, snapshot.term);
             try buffer.append(alloc, if (snapshot.fetch_immediately) 1 else 0);
             try writeBytes(alloc, buffer, snapshot.locator.snapshot_id);
             try writeBytes(alloc, buffer, snapshot.locator.uri);
+            if (snapshot.locator.format != .unknown)
+                try buffer.append(alloc, @intFromEnum(snapshot.locator.format));
         },
     }
 }
@@ -245,13 +255,21 @@ fn decodeRecord(alloc: std.mem.Allocator, reader: *std.Io.Reader) !replica.Repli
     record.bootstrap = switch (bootstrap_kind) {
         bootstrap_empty => .empty,
         bootstrap_persisted => .persisted,
-        bootstrap_fetch_snapshot => .{ .fetch_snapshot = .{
+        bootstrap_fetch_snapshot, bootstrap_fetch_snapshot_versioned => .{ .fetch_snapshot = .{
             .from = try reader.takeInt(u64, .little),
             .term = try reader.takeInt(u64, .little),
             .fetch_immediately = (try reader.takeByte()) != 0,
             .locator = .{
                 .snapshot_id = try readBytes(alloc, reader),
                 .uri = try readBytes(alloc, reader),
+                .format = if (bootstrap_kind == bootstrap_fetch_snapshot_versioned) blk: {
+                    const format = std.enums.fromInt(
+                        snapshot_transport_iface.SnapshotArtifactFormat,
+                        try reader.takeByte(),
+                    ) orelse return error.InvalidReplicaCatalogBootstrap;
+                    if (format == .unknown) return error.InvalidReplicaCatalogBootstrap;
+                    break :blk format;
+                } else .unknown,
             },
         } },
         else => return error.InvalidReplicaCatalogBootstrap,
@@ -321,6 +339,7 @@ test "file replica catalog persists and reloads replica records" {
                     .locator = .{
                         .snapshot_id = "file-catalog",
                         .uri = "file:///tmp/snapshot",
+                        .format = .chunked_manifest_v2,
                     },
                 },
             },
@@ -341,4 +360,8 @@ test "file replica catalog persists and reloads replica records" {
     try std.testing.expectEqual(@as(core.types.NodeId, 2), records[0].local_node_id);
     try std.testing.expectEqual(core.types.ReadOnlyOption.lease_based, records[0].raft.read_only_option);
     try std.testing.expectEqualStrings("file-catalog", records[0].bootstrap.fetch_snapshot.locator.snapshot_id);
+    try std.testing.expectEqual(
+        snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2,
+        records[0].bootstrap.fetch_snapshot.locator.format,
+    );
 }

@@ -7897,15 +7897,15 @@ fn appendPlacementIntent(
     try appendInt(alloc, out, u32, @intCast(intent.peer_node_ids.len));
     for (intent.peer_node_ids) |node_id| try appendInt(alloc, out, u64, node_id);
     try appendInt(alloc, out, u64, intent.store_id);
-    const source_tag: u8 = if (intent.record.snapshot_bootstrap != null)
-        1
+    const source_tag: u8 = if (intent.record.snapshot_bootstrap) |snapshot|
+        if (snapshot.format == .unknown) 1 else 3
     else if (intent.record.backup_restore_bootstrap != null)
         2
     else
         0;
     try out.append(alloc, source_tag);
     switch (source_tag) {
-        1 => {
+        1, 3 => {
             const snapshot = intent.record.snapshot_bootstrap.?;
             try appendInt(alloc, out, u64, snapshot.from_node_id);
             try appendInt(alloc, out, u64, snapshot.term);
@@ -7913,6 +7913,7 @@ fn appendPlacementIntent(
             try out.appendSlice(alloc, snapshot.snapshot_id);
             try appendInt(alloc, out, u32, @intCast(snapshot.uri.len));
             try out.appendSlice(alloc, snapshot.uri);
+            if (source_tag == 3) try out.append(alloc, @intFromEnum(snapshot.format));
         },
         2 => {
             const backup = intent.record.backup_restore_bootstrap.?;
@@ -8837,18 +8838,29 @@ fn readPlacementIntent(
         pos.* += 1;
         switch (source_tag) {
             0 => {},
-            1 => {
+            1, 3 => {
                 const from_node_id = try readInt(encoded, pos, u64);
                 const term = try readInt(encoded, pos, u64);
                 const snapshot_id = try readRequiredString(alloc, encoded, pos);
                 errdefer alloc.free(snapshot_id);
                 const uri = try readRequiredString(alloc, encoded, pos);
                 errdefer alloc.free(uri);
+                const format: raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat = if (source_tag == 3) blk: {
+                    if (pos.* >= encoded.len) return error.InvalidMetadataTransitionEncoding;
+                    const decoded = std.enums.fromInt(
+                        raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat,
+                        encoded[pos.*],
+                    ) orelse return error.InvalidMetadataTransitionEncoding;
+                    pos.* += 1;
+                    if (decoded == .unknown) return error.InvalidMetadataTransitionEncoding;
+                    break :blk decoded;
+                } else .unknown;
                 snapshot_bootstrap = .{
                     .from_node_id = from_node_id,
                     .term = term,
                     .snapshot_id = snapshot_id,
                     .uri = uri,
+                    .format = format,
                 };
             },
             2 => {
@@ -13037,7 +13049,8 @@ test "metadata raft apply store projects placement intents from committed entrie
                         .from_node_id = 3,
                         .term = 8,
                         .snapshot_id = "snap-5101",
-                        .uri = "http://127.0.0.1:7777/raft/v1/snapshot/fetch/snap-5101",
+                        .uri = "http://127.0.0.1:7777/raft/v2/snapshot/fetch/snap-5101",
+                        .format = .chunked_manifest_v2,
                     },
                 },
                 .store_id = 44,
@@ -13081,6 +13094,10 @@ test "metadata raft apply store projects placement intents from committed entrie
         try std.testing.expectEqual(@as(u64, 3), intents[0].record.snapshot_bootstrap.?.from_node_id);
         try std.testing.expectEqual(@as(u64, 8), intents[0].record.snapshot_bootstrap.?.term);
         try std.testing.expectEqualStrings("snap-5101", intents[0].record.snapshot_bootstrap.?.snapshot_id);
+        try std.testing.expectEqual(
+            raft_engine.runtime.snapshot_transport_iface.SnapshotArtifactFormat.chunked_manifest_v2,
+            intents[0].record.snapshot_bootstrap.?.format,
+        );
     }
 }
 

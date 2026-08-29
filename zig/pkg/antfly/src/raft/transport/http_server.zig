@@ -264,7 +264,11 @@ pub const HttpServer = struct {
         if (req.method == .GET) {
             if (routes.Routes.matchSnapshotFetch(req.uri)) |snapshot_id| {
                 const store = self.snapshot_store orelse return error.MissingSnapshotStore;
-                const body = try store.getSnapshot(self.alloc, snapshot_id);
+                const body = store.getSnapshot(self.alloc, snapshot_id) catch |err| switch (err) {
+                    error.FileNotFound => return try self.textResponse(404, "snapshot artifact not found"),
+                    else => return err,
+                };
+                errdefer self.alloc.free(body);
                 return .{
                     .status = 200,
                     .content_type = try self.alloc.dupe(u8, "application/x-antflydb-raft-snapshot"),
@@ -300,17 +304,27 @@ pub const HttpServer = struct {
             if (std.mem.eql(u8, operation, "chunk") and req.method == .PUT) {
                 if (req.body.len > self.cfg.max_request_bytes) return error.RequestTooLarge;
                 const offset = try parseRequiredU64Header(req, snapshot_offset_header);
-                var manifest = try store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id);
+                var manifest = store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id) catch |err| switch (err) {
+                    error.FileNotFound => return try self.textResponse(409, "snapshot upload not initialized"),
+                    else => return err,
+                };
                 defer manifest.deinit(self.alloc);
                 try validateManifestRequest(req, manifest);
                 try store.vtable.put_snapshot_chunk.?(store.ptr, snapshot_id, offset, req.body);
                 return try self.textResponse(202, "snapshot chunk accepted");
             }
             if (std.mem.eql(u8, operation, "commit") and req.method == .POST) {
-                var manifest = try store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id);
+                var manifest = store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id) catch |err| switch (err) {
+                    error.FileNotFound => return try self.textResponse(409, "snapshot upload not initialized"),
+                    else => return err,
+                };
                 defer manifest.deinit(self.alloc);
                 try validateManifestRequest(req, manifest);
-                const handler = self.snapshot_upload_handler;
+                // Artifact publication and live Raft delivery share the v2
+                // upload machinery but have different commit semantics. An
+                // artifact must remain committed for a later bootstrap fetch;
+                // only a live delivery is materialized into the local host.
+                const handler = self.commitHandlerForManifest(manifest);
                 const admission: SnapshotUploadAdmission = .{
                     .group_id = manifest.group_id,
                     .to = manifest.to,
@@ -355,7 +369,10 @@ pub const HttpServer = struct {
                 return try self.textResponse(201, "snapshot committed");
             }
             if (std.mem.eql(u8, operation, "abort") and req.method == .DELETE) {
-                var manifest = try store.vtable.get_snapshot_manifest.?(store.ptr, self.alloc, snapshot_id);
+                var manifest = store.vtable.get_snapshot_upload_manifest.?(store.ptr, self.alloc, snapshot_id) catch |err| switch (err) {
+                    error.FileNotFound => return try self.textResponse(204, ""),
+                    else => return err,
+                };
                 defer manifest.deinit(self.alloc);
                 try validateManifestRequest(req, manifest);
                 if (store.vtable.abort_chunked_snapshot) |abort| try abort(store.ptr, snapshot_id);
@@ -366,9 +383,13 @@ pub const HttpServer = struct {
 
         if (routes.Routes.matchSnapshotFetchV2(req.uri)) |snapshot_id| {
             if (std.mem.eql(u8, operation, "manifest") and req.method == .GET) {
-                var manifest = try store.vtable.get_snapshot_manifest.?(store.ptr, self.alloc, snapshot_id);
+                var manifest = store.vtable.get_snapshot_manifest.?(store.ptr, self.alloc, snapshot_id) catch |err| switch (err) {
+                    error.FileNotFound => return try self.textResponse(404, "snapshot artifact not found"),
+                    else => return err,
+                };
                 defer manifest.deinit(self.alloc);
                 const body = try snapshot_transfer.encode(self.alloc, manifest);
+                errdefer self.alloc.free(body);
                 return .{
                     .status = 200,
                     .content_type = try self.alloc.dupe(u8, "application/x-antflydb-raft-snapshot-manifest-v2"),
@@ -381,14 +402,22 @@ pub const HttpServer = struct {
                 const max_len = std.math.cast(usize, requested_len) orelse return error.InvalidSnapshotChunkLength;
                 if (max_len == 0 or max_len > common_http.default_max_request_bytes)
                     return error.InvalidSnapshotChunkLength;
+                const body = store.vtable.get_snapshot_chunk.?(store.ptr, self.alloc, snapshot_id, offset, max_len) catch |err| switch (err) {
+                    error.FileNotFound => return try self.textResponse(404, "snapshot artifact not found"),
+                    else => return err,
+                };
+                errdefer self.alloc.free(body);
                 return .{
                     .status = 200,
                     .content_type = try self.alloc.dupe(u8, "application/x-antflydb-raft-snapshot-chunk-v2"),
-                    .body = try store.vtable.get_snapshot_chunk.?(store.ptr, self.alloc, snapshot_id, offset, max_len),
+                    .body = body,
                 };
             }
             if (std.mem.eql(u8, operation, "release") and req.method == .DELETE) {
-                try store.vtable.release_chunked_snapshot.?(store.ptr, snapshot_id);
+                store.vtable.release_chunked_snapshot.?(store.ptr, snapshot_id) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
                 return try self.textResponse(204, "");
             }
             return error.InvalidSnapshotTransferOperation;
@@ -397,10 +426,22 @@ pub const HttpServer = struct {
     }
 
     fn textResponse(self: *HttpServer, status: u16, body: []const u8) !common.HttpResponse {
+        const content_type = try self.alloc.dupe(u8, "text/plain");
+        errdefer self.alloc.free(content_type);
         return .{
             .status = status,
-            .content_type = try self.alloc.dupe(u8, "text/plain"),
+            .content_type = content_type,
             .body = try self.alloc.dupe(u8, body),
+        };
+    }
+
+    fn commitHandlerForManifest(
+        self: *const HttpServer,
+        manifest: snapshot_transfer.Manifest,
+    ) ?SnapshotUploadHandler {
+        return switch (manifest.purpose()) {
+            .bootstrap_artifact => null,
+            .live_install => self.snapshot_upload_handler,
         };
     }
 
@@ -590,6 +631,27 @@ test "http server advertises isolated snapshot routes only for complete stores" 
         snapshot_transfer.http_route_version,
         parsed.value.snapshot_transfer_route_version,
     );
+
+    const UploadHandler = struct {
+        fn handle(_: *anyopaque, _: SnapshotUpload) !void {}
+    };
+    server.snapshot_upload_handler = .{
+        .ptr = &handler_context,
+        .vtable = &.{ .handle_snapshot_upload = UploadHandler.handle },
+    };
+    const artifact_manifest: snapshot_transfer.Manifest = .{
+        .group_id = 1,
+        .from = 0,
+        .to = 7,
+        .request_term = 0,
+        .metadata = .{},
+        .data_len = 0,
+        .digest = snapshot_transfer.digest(""),
+    };
+    try std.testing.expect(server.commitHandlerForManifest(artifact_manifest) == null);
+    var live_manifest = artifact_manifest;
+    live_manifest.from = 6;
+    try std.testing.expect(server.commitHandlerForManifest(live_manifest) != null);
 }
 
 test "http server decodes raft batch requests and dispatches them" {
@@ -667,7 +729,7 @@ test "http server stores and fetches snapshot bodies by route" {
         fn getSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8) ![]u8 {
             _ = snapshot_id;
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try alloc.dupe(u8, self.body.?);
+            return try alloc.dupe(u8, self.body orelse return error.FileNotFound);
         }
     };
 
@@ -690,6 +752,12 @@ test "http server stores and fetches snapshot bodies by route" {
     defer if (store.body) |body| std.testing.allocator.free(body);
     var noop = Noop{};
     var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), store.iface(), null);
+
+    const missing_path = try routes.Routes.snapshotFetchPath(std.testing.allocator, "missing");
+    defer std.testing.allocator.free(missing_path);
+    var missing = try server.handle(.{ .method = .GET, .uri = missing_path });
+    defer missing.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 404), missing.status);
 
     const upload_path = try routes.Routes.snapshotUploadPath(std.testing.allocator, "snap-7");
     defer std.testing.allocator.free(upload_path);

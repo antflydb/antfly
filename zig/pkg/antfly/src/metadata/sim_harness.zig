@@ -4005,6 +4005,11 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
         hashPlacementU64(hasher, 1);
         hashPlacementU64(hasher, snapshot.from_node_id);
         hashPlacementU64(hasher, snapshot.term);
+        // Preserve the historical hash for pre-versioned records so rolling
+        // upgrades do not perturb otherwise unchanged placement intents.
+        if (snapshot.format != .unknown) {
+            hashPlacementU64(hasher, @intFromEnum(snapshot.format));
+        }
         hasher.update(snapshot.snapshot_id);
         hasher.update(snapshot.uri);
     } else {
@@ -4041,6 +4046,7 @@ fn placementIntentEquals(
         const other = right.record.snapshot_bootstrap.?;
         if (snapshot.from_node_id != other.from_node_id) return false;
         if (snapshot.term != other.term) return false;
+        if (snapshot.format != other.format) return false;
         if (!std.mem.eql(u8, snapshot.snapshot_id, other.snapshot_id)) return false;
         if (!std.mem.eql(u8, snapshot.uri, other.uri)) return false;
     }

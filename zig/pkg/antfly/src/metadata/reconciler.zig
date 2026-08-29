@@ -1272,6 +1272,7 @@ fn snapshotBootstrapEqual(
     if (a == null or b == null) return false;
     return a.?.from_node_id == b.?.from_node_id and
         a.?.term == b.?.term and
+        a.?.format == b.?.format and
         std.mem.eql(u8, a.?.snapshot_id, b.?.snapshot_id) and
         std.mem.eql(u8, a.?.uri, b.?.uri);
 }
