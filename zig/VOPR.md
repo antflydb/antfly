@@ -1935,6 +1935,23 @@ VOPR work has found concrete production and harness defects:
   and awake time come from the borrowed `std.Io`, and typed worker boundaries
   install the effective context before durable state access. V20 exact replay
   exposed and closes both clock-domain defects.
+- The focused three-owner merge/split history configured routed production
+  HTTP without the internal-service credentials required by its own middleware.
+  Every cross-owner write was therefore rejected before the handler as an
+  unauthenticated 503, which the forwarding client correctly classified as an
+  ambiguous outcome because it had no not-proposed proof. The fixture now
+  gives every owner and the hosted router one shared test identity, retains
+  stable public/Raft ports across restart, and uses the runtime's bounded
+  synchronous delivery mode for this topology-transition composition. The
+  deployment-shaped production-cluster fixture independently keeps the async
+  Raft sender and retry queue under VOPR control.
+- That same history represented restart with independent `initialized` and
+  `paused` booleans. Budget and router diagnostics could consequently enter a
+  partially deinitialized Raft host and dereference poisoned hash-map state.
+  Nodes now publish one explicit `starting`/`running`/`quiescing`/`stopped`
+  lifecycle; drivers, routing, convergence checks, diagnostics, restart, and
+  final teardown all use it. The repaired history passes record, clean-world
+  exact replay, cleanup, and leak checks.
 
 The bounded independent-domain model campaigns completed without an additional
 semantic product-property failure or replay divergence. Reports should keep

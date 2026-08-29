@@ -30916,6 +30916,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     recorded_trace: *std.ArrayListUnmanaged(MultiOwnerReplayStep),
 ) !void {
     const vopr = @import("vopr");
+    const internal_service_secret = "data-runtime-vopr-internal-service-secret";
+    const internal_service_issuer = "data-runtime-vopr";
+    const public_port_base: u16 = 24_100;
+    const raft_port_base: u16 = 24_200;
     var alloc_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
@@ -30983,9 +30987,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     };
     for (&servers, 0..) |*server, i| {
         server.* = try DataServer.initFromMetadataApiUrls(alloc, .{
+            .bind_port = public_port_base + @as(u16, @intCast(i)),
+            .raft_bind_port = raft_port_base + @as(u16, @intCast(i)),
             .replica_root_dir = roots[i],
             .replica_catalog_path = null,
             .data_raft_state_backend = .file_image,
+            .data_raft_async_send_worker_count = 0,
             .store_registration = .{
                 .node_id = i + 1,
                 .store_id = i + 1,
@@ -30993,6 +31000,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             },
             .backend_runtime = runtime.ptr(),
             .metadata_request_executors = &.{metadata_executor},
+            .api_server_cfg = .{
+                .internal_service_secret = internal_service_secret,
+                .internal_service_issuer = internal_service_issuer,
+            },
         }, &.{"http://metadata.vopr"});
         initialized[i] = true;
     }
@@ -31178,10 +31189,23 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         return error.VoprIoCapabilityViolation;
     }
 
+    const NodeLifecycle = enum {
+        starting,
+        running,
+        quiescing,
+        stopped,
+    };
+    var node_lifecycle = [_]NodeLifecycle{.running} ** 3;
+
     const ClusterRouter = struct {
         servers: *[3]DataServer,
         api_uris: *[3][]u8,
+        node_lifecycle: *[3]NodeLifecycle,
         local_node_id: u64,
+
+        fn isRunning(self: *@This(), index: usize) bool {
+            return self.node_lifecycle[index] == .running;
+        }
 
         fn iface(self: *@This()) antfly.public_api.table_router.HostedGroupRouter {
             return .{
@@ -31211,6 +31235,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         fn groupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             for (self.servers, 0..) |*server, i| {
+                if (!self.isRunning(i)) continue;
                 const raft = server.data_raft orelse continue;
                 const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
                 if (status.soft.role == .leader) return i + 1;
@@ -31230,6 +31255,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         fn nodeBaseUri(ptr: *anyopaque, uri_alloc: std.mem.Allocator, node_id: u64) !?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (node_id == 0 or node_id > self.api_uris.len) return null;
+            if (!self.isRunning(node_id - 1)) return null;
             return try uri_alloc.dupe(u8, self.api_uris[node_id - 1]);
         }
 
@@ -31239,6 +31265,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
 
         fn statusAt(self: *@This(), node_id: u64, group_id: u64) antfly.raft.HostedReplicaStatus {
             if (node_id == 0 or node_id > self.servers.len) return .absent;
+            if (!self.isRunning(node_id - 1)) return .absent;
             const raft = self.servers[node_id - 1].data_raft orelse return .absent;
             return raft.host.http_host.host.status(group_id);
         }
@@ -31246,6 +31273,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     var router = ClusterRouter{
         .servers = &servers,
         .api_uris = &api_uris,
+        .node_lifecycle = &node_lifecycle,
         // Make the coordinator remote from the initial donor leader so the
         // first command necessarily crosses the production public transport.
         .local_node_id = 3,
@@ -31265,16 +31293,19 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         .{ .ptr = undefined, .readiness = Readiness.get },
         servers[2].localShardOperationAdapter(),
     );
+    _ = hosted.withInternalServiceAuth(internal_service_secret, internal_service_issuer);
 
     const Shared = struct {
         alloc: std.mem.Allocator,
         io: std.Io,
         runtime: *backend_runtime_mod.BackendRuntime,
         metadata_executor: antfly.common.http.RequestExecutor,
+        internal_service_secret: []const u8,
+        internal_service_issuer: []const u8,
         roots: *[3][:0]u8,
         servers: *[3]DataServer,
         initialized: *[3]bool,
-        paused: [3]bool = .{ false, false, false },
+        node_lifecycle: *[3]NodeLifecycle,
         api_uris: *[3][]u8,
         raft_uris: *[3][]u8,
         stores: *[3]antfly.metadata.table_manager.StoreRecord,
@@ -31297,10 +31328,14 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         split_observation: ?antfly.metadata.transition_state.SplitObservation = null,
         stage: u8 = 0,
 
+        fn nodeIsRunning(self: *@This(), index: usize) bool {
+            return self.node_lifecycle[index] == .running;
+        }
+
         fn drive(self: *@This(), index: usize) void {
             defer self.driver_done[index] = true;
             while (!self.stop_driver) {
-                if (self.paused[index] or !self.initialized[index]) {
+                if (!self.nodeIsRunning(index)) {
                     self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
                         self.driver_failure = err;
                         self.stop_driver = true;
@@ -31338,8 +31373,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             }
             for (self.servers, 0..) |*server, i| {
                 if (!self.initialized[i]) continue;
-                server.deinit();
+                self.node_lifecycle[i] = .quiescing;
                 self.initialized[i] = false;
+                server.deinit();
+                self.node_lifecycle[i] = .stopped;
             }
             self.done = true;
         }
@@ -31532,7 +31569,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
 
         fn leader(self: *@This(), group_id: u64) ?u64 {
             for (self.servers, 0..) |*server, i| {
-                if (self.paused[i] or !self.initialized[i]) continue;
+                if (!self.nodeIsRunning(i)) continue;
                 const raft = server.data_raft orelse continue;
                 const status = raft.host.http_host.host.raftStatus(group_id) orelse continue;
                 if (status.soft.role == .leader) return i + 1;
@@ -31547,6 +31584,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 try self.io.sleep(.fromMilliseconds(1), .awake);
             }
             for (self.servers, 0..) |*server, i| {
+                if (!self.nodeIsRunning(i)) continue;
                 const raft = server.data_raft orelse continue;
                 const status = raft.host.http_host.host.raftStatus(group_id);
                 std.log.err(
@@ -31576,7 +31614,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             for (0..30_000) |_| {
                 var converged = true;
                 for (self.servers, 0..) |*server, i| {
-                    if (self.paused[i] or !self.initialized[i]) {
+                    if (!self.nodeIsRunning(i)) {
                         converged = false;
                         break;
                     }
@@ -31732,7 +31770,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             for (0..5_000) |_| {
                 var converged = true;
                 for (self.servers, 0..) |*server, i| {
-                    if (self.paused[i] or !self.initialized[i]) {
+                    if (!self.nodeIsRunning(i)) {
                         converged = false;
                         break;
                     }
@@ -31769,6 +31807,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 try self.io.sleep(.fromMilliseconds(1), .awake);
             }
             for (self.servers, 0..) |*server, i| {
+                if (!self.nodeIsRunning(i)) continue;
                 const store = server.localTransitionApplyStore() orelse continue;
                 const terminal = try store.currentSplitTerminal(self.alloc, self.split_record.source_group_id);
                 defer if (terminal) |value| antfly.data.storage.shard_state_store.freeSplitTerminal(self.alloc, value);
@@ -31847,21 +31886,30 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         }
 
         fn restartNode(self: *@This(), index: usize) !void {
-            self.paused[index] = true;
+            self.node_lifecycle[index] = .quiescing;
             while (self.driver_active[index]) {
                 if (self.driver_failure) |err| return err;
                 try self.io.sleep(.fromMilliseconds(1), .awake);
             }
             self.servers[index].quiesceBackgroundWork();
-            self.servers[index].deinit();
             self.initialized[index] = false;
+            self.servers[index].deinit();
+            self.node_lifecycle[index] = .stopped;
             self.alloc.free(self.api_uris[index]);
             self.alloc.free(self.raft_uris[index]);
 
+            self.node_lifecycle[index] = .starting;
             self.servers[index] = try DataServer.initFromMetadataApiUrls(self.alloc, .{
+                // A process restart retains its production service identity.
+                // Reusing the virtual ports also lets already-queued Raft
+                // frames reach the new incarnation instead of retrying a
+                // permanently stale endpoint.
+                .bind_port = public_port_base + @as(u16, @intCast(index)),
+                .raft_bind_port = raft_port_base + @as(u16, @intCast(index)),
                 .replica_root_dir = self.roots[index],
                 .replica_catalog_path = null,
                 .data_raft_state_backend = .file_image,
+                .data_raft_async_send_worker_count = 0,
                 .store_registration = .{
                     .node_id = index + 1,
                     .store_id = index + 1,
@@ -31869,6 +31917,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 },
                 .backend_runtime = self.runtime,
                 .metadata_request_executors = &.{self.metadata_executor},
+                .api_server_cfg = .{
+                    .internal_service_secret = self.internal_service_secret,
+                    .internal_service_issuer = self.internal_service_issuer,
+                },
             }, &.{"http://metadata.vopr"});
             self.initialized[index] = true;
             const raft = self.servers[index].data_raft orelse return error.MissingDataRaft;
@@ -31879,7 +31931,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             self.stores[index].api_url = self.api_uris[index];
             self.stores[index].raft_url = self.raft_uris[index];
             try self.publishAndSyncSnapshot();
-            self.paused[index] = false;
+            self.node_lifecycle[index] = .running;
         }
     };
     var shared = Shared{
@@ -31887,9 +31939,12 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         .io = io,
         .runtime = runtime.ptr(),
         .metadata_executor = metadata_executor,
+        .internal_service_secret = internal_service_secret,
+        .internal_service_issuer = internal_service_issuer,
         .roots = &roots,
         .servers = &servers,
         .initialized = &initialized,
+        .node_lifecycle = &node_lifecycle,
         .api_uris = &api_uris,
         .raft_uris = &raft_uris,
         .stores = &stores,
@@ -32038,7 +32093,17 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 },
             );
             for (&servers, 0..) |*server, i| {
-                const raft = server.data_raft.?;
+                if (!shared.nodeIsRunning(i)) {
+                    std.log.err("multi-owner node={} lifecycle={s}", .{
+                        i + 1,
+                        @tagName(node_lifecycle[i]),
+                    });
+                    continue;
+                }
+                const raft = server.data_raft orelse {
+                    std.log.err("multi-owner node={} running without data raft", .{i + 1});
+                    continue;
+                };
                 const raw_donor = raft.host.http_host.host.raftStatus(171);
                 const raw_receiver = raft.host.http_host.host.raftStatus(172);
                 std.log.err(
@@ -32046,9 +32111,9 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                     .{
                         i + 1,
                         if (raw_donor) |status| status.applied_index else 0,
-                        server.data_raft_apply.?.appliedIndex(171),
+                        if (server.data_raft_apply) |apply| apply.appliedIndex(171) else 0,
                         if (raw_receiver) |status| status.applied_index else 0,
-                        server.data_raft_apply.?.appliedIndex(172),
+                        if (server.data_raft_apply) |apply| apply.appliedIndex(172) else 0,
                     },
                 );
             }

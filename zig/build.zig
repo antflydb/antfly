@@ -4434,7 +4434,6 @@ pub fn build(b: *std.Build) void {
         "data raft draining leader remains stable through membership expansion",
         "data raft removed leader handoff campaigns preferred serving survivor",
         "data raft source lifecycle commands bypass document db apply while receiver checkpoints apply",
-        "data raft source split lifecycle commands bypass document db apply",
         "data raft retry checkpoints survive changed ready windows and publication failure",
         "data raft document apply identity prevents non-idempotent restart replay",
         "data raft replica retirement removes only retired group apply state",
