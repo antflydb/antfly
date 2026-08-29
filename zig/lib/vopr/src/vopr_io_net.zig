@@ -508,9 +508,12 @@ pub const Network = struct {
         try self.wait_port.?.wake(socket_state.readResource(), std.math.maxInt(u32));
     }
 
-    pub fn peerHardDisconnected(self: *const Network, handle: std.Io.net.Socket.Handle) bool {
+    /// True after an ordered peer FIN has been delivered or the peer has
+    /// aborted the connection. The FIN remains a scheduled packet, so all
+    /// preceding request bytes become readable before this flips true.
+    pub fn peerDisconnected(self: *const Network, handle: std.Io.net.Socket.Handle) bool {
         const socket_state = self.getSocket(handle) orelse return true;
-        return socket_state.peer_hard_disconnected;
+        return socket_state.peer_hard_disconnected or !socket_state.peer_write_open;
     }
 
     pub fn enumerateReady(self: *const Network, list: *transition.List, allocator: std.mem.Allocator) !void {
@@ -1373,6 +1376,7 @@ test "stream FIN never overtakes earlier payload when reordering is enabled" {
     );
     try network.shutdown(pair[0].handle, .send);
     network.faults.reorder = true;
+    try std.testing.expect(!network.peerDisconnected(pair[1].handle));
 
     var ready: transition.List = .{};
     defer ready.deinit(std.testing.allocator);
@@ -1383,12 +1387,14 @@ test "stream FIN never overtakes earlier payload when reordering is enabled" {
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
     try std.testing.expectEqualStrings("vopr-io.packet_deliver", ready.items.items[0].name);
     try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+    try std.testing.expect(!network.peerDisconnected(pair[1].handle));
 
     ready.items.clearRetainingCapacity();
     try network.enumerateReady(&ready, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), ready.items.items.len);
     try std.testing.expectEqualStrings("vopr-io.stream_fin", ready.items.items[0].name);
     try std.testing.expect(try network.executeReady(ready.items.items[0].id, &sink, std.testing.allocator));
+    try std.testing.expect(network.peerDisconnected(pair[1].handle));
 
     var bytes: [16]u8 = undefined;
     var buffers = [_][]u8{bytes[0..]};

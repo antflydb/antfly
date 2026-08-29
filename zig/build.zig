@@ -7264,6 +7264,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_graph_hydration_vopr_test_step.dependOn(&run_production_cluster_graph_hydration_vopr_tests.step);
 
+    const production_cluster_graph_cancellation_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production public graph cancellation exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_graph_cancellation_vopr_tests = b.addRunArtifact(production_cluster_graph_cancellation_vopr_tests);
+    const production_cluster_graph_cancellation_vopr_test_step = b.step(
+        "production-cluster-graph-cancellation-vopr-test",
+        "Run public production-owner graph cancellation, recovery, and exact replay",
+    );
+    production_cluster_graph_cancellation_vopr_test_step.dependOn(&run_production_cluster_graph_cancellation_vopr_tests.step);
+
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},

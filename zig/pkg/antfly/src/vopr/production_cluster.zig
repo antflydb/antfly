@@ -31,6 +31,7 @@ const resource_manager = @import("../storage/resource_manager.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
+const http_disconnect = @import("http_disconnect.zig");
 
 // The composed deployment uses the same service identity as the metadata
 // quorum fixture. Leaving this unset does not model an unauthenticated legacy
@@ -195,6 +196,7 @@ pub const Fixture = struct {
     raft_executor_live: bool = false,
     public_executor: io_http_executor.IoHttpExecutor = undefined,
     public_executor_live: bool = false,
+    http_disconnect_probe: http_disconnect.Probe = undefined,
     transition_executor: io_http_executor.IoHttpExecutor = undefined,
     transition_executor_live: bool = false,
     backend_runtimes: [node_count]background_runtime.BackendRuntimeHandle = undefined,
@@ -270,7 +272,12 @@ pub const Fixture = struct {
     graph_sound: bool = false,
     graph_hydration_sound: bool = false,
     graph_hydration_started_count: u64 = 0,
+    graph_hydration_fanout_started_count: u64 = 0,
     graph_hydration_completed_count: u64 = 0,
+    graph_cancellation_requested: bool = false,
+    graph_cancellation_observed: bool = false,
+    graph_cancellation_recovered: bool = false,
+    graph_cancellation_sound: bool = false,
     split_graph_inflight_started: bool = false,
     split_graph_inflight_complete: bool = false,
     split_graph_inflight_rejected: bool = false,
@@ -340,6 +347,7 @@ pub const Fixture = struct {
     active_split_enabled: bool = true,
     graph_enabled: bool = false,
     graph_hydration_enabled: bool = false,
+    graph_cancellation_enabled: bool = false,
     join_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
@@ -347,6 +355,7 @@ pub const Fixture = struct {
     pub fn create(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
         const self = try alloc.create(Fixture);
         self.* = .{ .alloc = alloc, .sim = sim };
+        self.http_disconnect_probe = .{ .vopr_io = sim };
         return self;
     }
 
@@ -370,6 +379,11 @@ pub const Fixture = struct {
     pub fn setGraphHydrationEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.graph_hydration_enabled = enabled;
+    }
+
+    pub fn setGraphCancellationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.graph_cancellation_enabled = enabled;
     }
 
     pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
@@ -447,6 +461,8 @@ pub const Fixture = struct {
         if (self.phase != .created) return error.ProductionFixtureAlreadyBootstrapped;
         if (self.graph_hydration_enabled and !self.graph_enabled)
             return error.InvalidProductionClusterGraphHydrationMode;
+        if (self.graph_cancellation_enabled and !self.graph_enabled)
+            return error.InvalidProductionClusterGraphCancellationMode;
         switch (self.fault_mode) {
             .clean => {},
             .join_finalizer_ack_failure => if (!self.join_enabled or self.active_split_enabled)
@@ -608,6 +624,7 @@ pub const Fixture = struct {
             .process_memory_limit_bytes = 512 * 1024 * 1024,
             .capacity_source = self.capacity_sources[index].source(),
             .backend_runtime = self.backend_runtimes[index].ptr(),
+            .h1_disconnect_probe = self.http_disconnect_probe.iface(),
             .api_server_cfg = .{
                 .internal_service_secret = internal_service_secret,
                 .internal_service_issuer = internal_service_issuer,
@@ -747,6 +764,23 @@ pub const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         switch (event.phase) {
             .hydration_started => self.graph_hydration_started_count +|= 1,
+            .hydration_fanout_started => {
+                self.graph_hydration_fanout_started_count +|= 1;
+                if (self.graph_cancellation_enabled and
+                    self.graph_hydration_fanout_started_count == 1)
+                {
+                    const cancellation = event.cancellation orelse {
+                        self.failure = error.ProductionGraphCancellationTokenMissing;
+                        return;
+                    };
+                    for (0..250) |_| {
+                        if (cancellation.isCancelled()) break;
+                        self.sim.io().sleep(.fromMilliseconds(1), .awake) catch return;
+                    } else {
+                        self.failure = error.ProductionGraphCancellationNotObserved;
+                    }
+                }
+            },
             .hydration_completed => self.graph_hydration_completed_count +|= 1,
             else => {},
         }
@@ -1435,7 +1469,11 @@ pub const Fixture = struct {
             self.graph_sound = right_hop_sound and round_trip_sound;
             self.phase = .graph_query_complete;
             if (!self.graph_sound) return error.ProductionDataGraphQueryFailed;
-            if (self.graph_hydration_enabled) {
+            if (self.graph_cancellation_enabled) {
+                self.graph_cancellation_sound = try self.runGraphCancellationQuery();
+                if (!self.graph_cancellation_sound)
+                    return error.ProductionDataGraphCancellationQueryFailed;
+            } else if (self.graph_hydration_enabled) {
                 self.graph_hydration_sound = try self.runGraphHydrationQuery();
                 if (!self.graph_hydration_sound)
                     return error.ProductionDataGraphHydrationQueryFailed;
@@ -1811,6 +1849,72 @@ pub const Fixture = struct {
                 try self.graphHydrationResponseComplete(response.body);
         }
         return false;
+    }
+
+    fn runGraphCancellationQuery(self: *Fixture) !bool {
+        const query_body = try test_contract_helpers.encodeGraphTraverseQueryWithDocumentsRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{"doc:c"},
+            &.{"links"},
+            2,
+            10,
+        );
+        defer self.alloc.free(query_body);
+
+        const started_before = self.graph_hydration_started_count;
+        const fanout_before = self.graph_hydration_fanout_started_count;
+        const completed_before = self.graph_hydration_completed_count;
+        var in_flight = self.sim.io().async(fetchGraphQuery, .{
+            self,
+            self.data_api_uris[self.graph_probe_route_index],
+            query_body,
+        });
+        defer if (in_flight.any_future != null) {
+            const canceled_response: ?common_http.HttpResponse = in_flight.cancel(self.sim.io()) catch null;
+            if (canceled_response) |response_value| {
+                var response = response_value;
+                response.deinit(self.alloc);
+            }
+        };
+
+        for (0..1_000) |_| {
+            if (self.graph_hydration_fanout_started_count > fanout_before) break;
+            try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+        } else return false;
+        if (self.graph_hydration_started_count != started_before + 1 or
+            self.graph_hydration_fanout_started_count != fanout_before + 1 or
+            self.graph_hydration_completed_count != completed_before)
+            return false;
+
+        self.graph_cancellation_requested = true;
+        const cancelled_request = blk: {
+            var response = in_flight.cancel(self.sim.io()) catch |err| switch (err) {
+                error.Canceled, error.Cancelled => break :blk true,
+                else => break :blk false,
+            };
+            defer response.deinit(self.alloc);
+            break :blk false;
+        };
+        self.graph_cancellation_observed = cancelled_request and
+            self.graph_hydration_completed_count == completed_before;
+        if (!self.graph_cancellation_observed) return false;
+
+        self.graph_hydration_sound = try self.runGraphHydrationQuery();
+        self.graph_cancellation_recovered = self.graph_hydration_sound and
+            self.graph_hydration_started_count == started_before + 2 and
+            self.graph_hydration_fanout_started_count == fanout_before + 2 and
+            self.graph_hydration_completed_count == completed_before + 1;
+        return self.graph_cancellation_recovered;
+    }
+
+    fn fetchGraphQuery(
+        self: *Fixture,
+        uri: []const u8,
+        body: []const u8,
+    ) !common_http.HttpResponse {
+        return self.client.fetchQueryRaw(uri, "docs", body);
     }
 
     fn runSplitGraphProbe(self: *Fixture) !bool {
@@ -2723,7 +2827,12 @@ pub const Fixture = struct {
         graph_query_ok: bool,
         graph_hydration_ok: bool,
         graph_hydration_started_count: u64,
+        graph_hydration_fanout_started_count: u64,
         graph_hydration_completed_count: u64,
+        graph_cancellation_requested: bool,
+        graph_cancellation_observed: bool,
+        graph_cancellation_recovered: bool,
+        graph_cancellation_ok: bool,
         split_graph_inflight_started: bool,
         split_graph_inflight_complete: bool,
         split_graph_inflight_rejected: bool,
@@ -2770,6 +2879,7 @@ pub const Fixture = struct {
                 (!self.join_enabled or self.join_sound) and
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
+                (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
@@ -2782,7 +2892,12 @@ pub const Fixture = struct {
             .graph_query_ok = self.graph_sound,
             .graph_hydration_ok = self.graph_hydration_sound,
             .graph_hydration_started_count = self.graph_hydration_started_count,
+            .graph_hydration_fanout_started_count = self.graph_hydration_fanout_started_count,
             .graph_hydration_completed_count = self.graph_hydration_completed_count,
+            .graph_cancellation_requested = self.graph_cancellation_requested,
+            .graph_cancellation_observed = self.graph_cancellation_observed,
+            .graph_cancellation_recovered = self.graph_cancellation_recovered,
+            .graph_cancellation_ok = self.graph_cancellation_sound,
             .split_graph_inflight_started = self.split_graph_inflight_started,
             .split_graph_inflight_complete = self.split_graph_inflight_complete,
             .split_graph_inflight_rejected = self.split_graph_inflight_rejected,

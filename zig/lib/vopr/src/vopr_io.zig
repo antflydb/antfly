@@ -672,8 +672,8 @@ pub const VoprIo = struct {
         try self.network.abort(handle);
     }
 
-    pub fn socketPeerHardDisconnected(self: *const VoprIo, handle: std.Io.net.Socket.Handle) bool {
-        return self.network.peerHardDisconnected(handle);
+    pub fn socketPeerDisconnected(self: *const VoprIo, handle: std.Io.net.Socket.Handle) bool {
+        return self.network.peerDisconnected(handle);
     }
 
     pub fn setCpuTime(self: *VoprIo, process_ns: i64, thread_ns: i64) void {

@@ -53,6 +53,7 @@ pub const LifecyclePhase = enum {
     snapshot_validated,
     expand_round_completed,
     hydration_started,
+    hydration_fanout_started,
     hydration_completed,
     attempt_failed,
 };
@@ -65,6 +66,10 @@ pub const LifecycleEvent = struct {
     result_count: usize = 0,
     attempt: u32 = 0,
     error_code: u16 = 0,
+    /// Borrowed for the synchronous hook call only. Lifecycle hooks may use
+    /// it to park at a lease-free boundary until request cancellation is
+    /// visible, but must not retain it.
+    cancellation: ?CancellationToken = null,
 };
 
 pub const LifecycleHook = struct {
@@ -3095,6 +3100,11 @@ fn hydrateHitsForKeys(
             for (entries[start..end], start..end) |entry, i| {
                 group.async(io, Fiber.run, .{ worker, &slots[i], table_name, entry, topology_epoch, filter_query_json, exclusion_query_json, resolved_doc_filter, resolved_doc_filter_wire_context, include_stored, consistency });
             }
+            worker.reachLifecycle(.{
+                .phase = .hydration_fanout_started,
+                .group_count = end - start,
+                .cancellation = worker.cancellation,
+            });
             group.await(io) catch {};
         }
         recordGraphParallelFanout(.hydrate, @intCast(platform_time.monotonicNs() - fanout_start_ns));
@@ -8347,6 +8357,7 @@ test "distributed graph retries once on topology change and succeeds" {
                         event.depth == 1 and event.result_count == 1;
                 },
                 .hydration_started, .hydration_completed => state.lifecycle_valid = state.lifecycle_valid and std.mem.eql(u8, "walk", event.query_name),
+                .hydration_fanout_started => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 1,
                 .attempt_failed => {
                     state.lifecycle_valid = state.lifecycle_valid and event.attempt == 0 and
                         event.error_code == @intFromError(error.TopologyChanged);
