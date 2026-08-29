@@ -13182,9 +13182,11 @@ pub const ProvisionedTableWriteSource = struct {
         group_id: u64,
         table_name: []const u8,
         indexes_json: []const u8,
-        staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration,
+        prepared_restore: ?*const backup_restore.PreparedRestore,
     ) !db_mod.DB {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
+        const staged_generation = if (prepared_restore) |prepared| prepared.stagedGeneration() else null;
+        const native_restore_open_plan = if (prepared_restore) |prepared| prepared.nativeOpenPlan() else null;
         var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
             path,
@@ -13199,7 +13201,10 @@ pub const ProvisionedTableWriteSource = struct {
             self.secret_store,
             self.remote_content,
             identity_namespace,
-            .{ .staged_generation = staged_generation },
+            .{
+                .staged_generation = staged_generation,
+                .native_restore_open_plan = native_restore_open_plan,
+            },
         );
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
@@ -13243,12 +13248,12 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         indexes_json_override: ?[]const u8,
         schema_json_override: ?[]const u8,
-        staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration,
+        prepared_restore: ?*const backup_restore.PreparedRestore,
         cancellation: db_mod.types.CancellationToken,
     ) !void {
         var open_attempts: usize = 0;
         var logged_open_wait = false;
-        var raft_apply_marker_reset = staged_generation == null;
+        var raft_apply_marker_reset = prepared_restore == null;
         while (true) {
             try cancellation.check();
             const runtime_repair_needed = try db_mod.DB.restoreRuntimeRepairNeededForPathWithIo(
@@ -13272,7 +13277,7 @@ pub const ProvisionedTableWriteSource = struct {
                 group_id,
                 table_name,
                 indexes_json,
-                staged_generation,
+                prepared_restore,
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err)) {
                     if (!logged_open_wait) {
@@ -16045,7 +16050,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         var preparation: ?db_mod.generation_lifecycle.PreparationTransition = null;
         defer if (preparation) |*value| value.deinit();
-        var prepared_generation: ?db_mod.generation_lifecycle.StagedGeneration = null;
+        var prepared_generation: ?backup_restore.PreparedRestore = null;
         defer if (prepared_generation) |*generation| generation.deinit();
 
         if (!plan.reconcile_only) {
@@ -22463,6 +22468,66 @@ test "managed db open modes never drain resolver backfill on raft apply" {
     try std.testing.expect(managedDbOpenModeDrainsResolverBackfill(.status_only));
 }
 
+test "managed native restore repair retains target backend admission for staged open" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-native-restore-plan", .{tmp.sub_path});
+    defer alloc.free(path);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, path) catch {};
+
+    const ConfiguratorContext = struct {
+        expected_path: []const u8,
+        calls: usize = 0,
+
+        fn configure(ptr: *anyopaque, configured_path: []const u8, opaque_options: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const opts: *db_mod.OpenOptions = @ptrCast(@alignCast(opaque_options));
+            if (!std.mem.eql(u8, configured_path, self.expected_path)) return error.UnexpectedConfiguredPath;
+            self.calls += 1;
+            opts.start_index_workers = false;
+            opts.start_optional_runtimes = false;
+            opts.ttl_cleanup = .{ .enabled = false };
+        }
+    };
+    var context = ConfiguratorContext{ .expected_path = path };
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    runtime.ptr().db_open_configurator = .{
+        .ptr = &context,
+        .configure_fn = ConfiguratorContext.configure,
+    };
+
+    const native_plan = try db_mod.DB.resolveNativeRestoreOpenPlan(path, .{ .backend_runtime = runtime.ptr() });
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    var transition = try db_mod.generation_lifecycle.beginProcessExclusiveWithRuntime(path, runtime.ptr());
+    defer transition.deinit();
+    var staged = try transition.beginStaging();
+    defer staged.deinit();
+
+    var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
+        alloc,
+        staged.path(),
+        "{}",
+        null,
+        null,
+        0,
+        null,
+        .restore_repair,
+        runtime.ptr(),
+        null,
+        null,
+        null,
+        null,
+        .{
+            .staged_generation = &staged,
+            .native_restore_open_plan = &native_plan,
+        },
+    );
+    defer db.close();
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+}
+
 fn haMirrorForManagedDbOpenMode(mode: ManagedDbOpenMode, mirror: ?db_mod.HAAsyncEffectMirror) ?db_mod.HAAsyncEffectMirror {
     return switch (mode) {
         .default, .default_async, .writer_no_replay => mirror,
@@ -22631,6 +22696,11 @@ const ManagedDbOpenOptions = struct {
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
     ha_async_metadata_mirror: ?db_mod.HAAsyncMetadataMirror = null,
     staged_generation: ?*const db_mod.generation_lifecycle.StagedGeneration = null,
+    /// Immutable native backend decision retained by PreparedRestore. Only
+    /// repair execution policy and owned enrichment providers may be layered
+    /// over this plan; storage topology remains the one admitted at the live
+    /// target path.
+    native_restore_open_plan: ?*const db_mod.NativeRestoreOpenPlan = null,
     identity_validation: StartupCatchUpMetadata.IdentityValidation = .exact,
     transaction_recovery: db_mod.transaction_runtime.Config = .{},
     /// Restrict metadata reconciliation during a cold open to one index. The
@@ -22848,6 +22918,34 @@ fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityW
                 break :blk try tables_api.deriveRuntimeTableSchema(allocator, parsed_schema);
             } else null;
             defer if (schema_before_index_load) |schema| storage_schema.freeSchema(allocator, schema);
+
+            if (open_options.native_restore_open_plan) |native_plan| {
+                if (open_mode != .restore_repair) return error.InvalidNativeRestoreOpenMode;
+                const staged_generation = open_options.staged_generation orelse
+                    return error.InvalidGenerationTransition;
+                var resolved = try native_plan.optionsForStagedGeneration(staged_generation);
+                // The plan owns every storage/root decision. These overlays
+                // are request-scoped runtime policy or move-only providers and
+                // cannot redirect candidate I/O outside the staged generation.
+                resolved.secret_store = store;
+                resolved.remote_content = remote;
+                resolved.identity_namespace = namespace;
+                resolved.prefer_existing_identity_namespace = namespace != null;
+                resolved.enrichment = enrichment_cfg;
+                resolved.ha_write_gate = open_options.ha_write_gate;
+                resolved.ha_async_effect_mirror = null;
+                resolved.ha_async_batch_mirror = null;
+                resolved.ha_async_metadata_mirror = null;
+                resolved.schema_before_index_load = schema_before_index_load;
+                resolved.open_mode = .writer_no_replay;
+                resolved.start_index_workers = false;
+                resolved.start_optional_runtimes = enrichment_cfg != null;
+                resolved.start_optional_runtime_workers = false;
+                resolved.ttl_cleanup = .{ .enabled = false };
+                resolved.transaction_recovery = .{ .enabled = false };
+                resolved.text_merge = .{ .enabled = false };
+                return try db_mod.DB.open(allocator, db_path, resolved);
+            }
 
             const base: db_mod.OpenOptions = .{
                 .lsm_cache = cache,

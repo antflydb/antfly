@@ -478,7 +478,12 @@ pub const NativeRestoreOpenPlan = struct {
     pub fn optionsForTarget(self: @This(), target_path: []const u8) !OpenOptions {
         if (backendConfigurationPathFingerprint(target_path) != self._target_path_fingerprint)
             return error.NativeRestoreTargetPathMismatch;
-        return self.resolvedOptionsForPath(target_path);
+        var opts = self.resolvedOptionsForPath(target_path);
+        // A configurator is not allowed to retain or manufacture lifecycle
+        // authority. Target opens always acquire the published-generation read
+        // lease for themselves.
+        opts.staged_generation = null;
+        return opts;
     }
 
     /// Reuses the target's path-independent backend policy only for the
@@ -492,7 +497,12 @@ pub const NativeRestoreOpenPlan = struct {
         if (backendConfigurationPathFingerprint(live_path) != self._target_path_fingerprint)
             return error.NativeRestoreTargetPathMismatch;
         try staged_generation.validateLivePath(live_path);
-        return self.resolvedOptionsForPath(staged_generation.path());
+        var opts = self.resolvedOptionsForPath(staged_generation.path());
+        // Keep the lifecycle capability attached until DB.open. Validation at
+        // option construction alone is racy: the stage may be closed or
+        // superseded before the candidate is actually opened.
+        opts.staged_generation = staged_generation;
+        return opts;
     }
 
     pub fn physicalRootMode(self: @This()) OpenOptions.PhysicalRootMode {
@@ -93061,13 +93071,23 @@ test "native restore backend configuration is resolved exactly once" {
 
     var transition = try generation_lifecycle.beginProcessExclusiveWithRuntime(path, runtime.ptr());
     var staged = try transition.beginStaging();
-    var candidate = try DB.open(alloc, staged.path(), try resolved.optionsForStagedGeneration(&staged));
+    const staged_path = try alloc.dupe(u8, staged.path());
+    defer alloc.free(staged_path);
+    const staged_options = try resolved.optionsForStagedGeneration(&staged);
+    try std.testing.expectEqual(&staged, staged_options.staged_generation.?);
+    var candidate = try DB.open(alloc, staged.path(), staged_options);
     candidate.close();
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     staged.deinit();
     transition.deinit();
+    try std.testing.expectError(
+        error.InvalidGenerationTransition,
+        DB.open(alloc, staged_path, staged_options),
+    );
 
-    var db = try DB.open(alloc, path, try resolved.optionsForTarget(path));
+    const target_options = try resolved.optionsForTarget(path);
+    try std.testing.expectEqual(@as(?*const generation_lifecycle.StagedGeneration, null), target_options.staged_generation);
+    var db = try DB.open(alloc, path, target_options);
     defer db.close();
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     try std.testing.expectError(

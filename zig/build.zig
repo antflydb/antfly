@@ -4078,6 +4078,7 @@ pub fn build(b: *std.Build) void {
             "file replica catalog persists backup restore bootstrap records across reopen",
             "replica catalog rejects invalid backup restore authority and integrity bindings",
             "restore binding pins the authenticated native generation manifest",
+            "prepared native restore repair reuses target backend admission",
             "backup restore bootstrap deduplicates exact content across source aliases while a reader is resident",
         },
         .test_runner = .{
@@ -6382,6 +6383,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "provisioned native backup restore repeats through shared read and write owners",
             "provisioned table restore retry repairs exact incomplete restore state through active writer",
+            "managed native restore repair retains target backend admission for staged open",
             "native backup reclaims crash-left snapshot attempts from durable markers",
             "native backup reclaims a crash marker before snapshot root creation",
             "native backup never reclaims an old attempt with a live lease",
