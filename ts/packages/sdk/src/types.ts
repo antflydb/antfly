@@ -52,6 +52,13 @@ export type QueryRequest = Omit<
   /** Named graph queries with non-scoring, stored-document node filters. */
   graph_queries?: Record<string, GraphQuery>;
 };
+/**
+ * Query body for a table-scoped endpoint. The table is selected exclusively by
+ * the route argument so one request cannot carry two competing table names.
+ */
+export type TableQueryRequest = Omit<QueryRequest, "table"> & {
+  readonly table?: never;
+};
 export type QueryResult = components["schemas"]["QueryResult"];
 export type QueryHit = components["schemas"]["QueryHit"];
 export type QueryHitsTotal = components["schemas"]["QueryHitsTotal"];

@@ -50,6 +50,7 @@ import type {
   RetrievalAgentStreamCallbacks,
   ScanKeysRequest,
   TableArtifactEnrichmentList,
+  TableQueryRequest,
   TableSchema,
   User,
   WriteOptions,
@@ -62,6 +63,14 @@ export interface RestoreOptions {
 
 export interface QueryExecutionOptions {
   signal?: AbortSignal;
+}
+
+function validateTableQueryRequest(request: QueryRequest, tableName: string, index?: number): void {
+  if (request.table === undefined) return;
+  const requestLabel = index === undefined ? "request" : `requests[${index}]`;
+  throw new Error(
+    `Table query ${requestLabel}.table must be omitted; the route already selects table ${JSON.stringify(tableName)}`
+  );
 }
 
 export interface RestoreJobListOptions {
@@ -533,8 +542,11 @@ export class AntflyClient {
     tableName?: string,
     options?: QueryExecutionOptions
   ): Promise<QueryResponses | undefined> {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName !== undefined) {
+      validateTableQueryRequest(request, tableName);
+    }
     validateGraphQueryIdentifiers(request.graph_queries);
-    if (path === "/db/v1/tables/{tableName}/query" && tableName) {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName !== undefined) {
       const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: request,
@@ -562,10 +574,15 @@ export class AntflyClient {
     requests: QueryRequest[],
     tableName?: string
   ): Promise<QueryResponses | undefined> {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName !== undefined) {
+      for (const [index, request] of requests.entries()) {
+        validateTableQueryRequest(request, tableName, index);
+      }
+    }
     for (const request of requests) validateGraphQueryIdentifiers(request.graph_queries);
     const ndjson = `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`;
 
-    if (path === "/db/v1/tables/{tableName}/query" && tableName) {
+    if (path === "/db/v1/tables/{tableName}/query" && tableName !== undefined) {
       const { data, error, response } = await this.client.POST("/db/v1/tables/{tableName}/query", {
         params: { path: { tableName } },
         body: ndjson,
@@ -1024,14 +1041,18 @@ export class AntflyClient {
     /**
      * Query a specific table
      */
-    query: async (tableName: string, request: QueryRequest, options?: QueryExecutionOptions) => {
+    query: async (
+      tableName: string,
+      request: TableQueryRequest,
+      options?: QueryExecutionOptions
+    ) => {
       return this.performQuery("/db/v1/tables/{tableName}/query", request, tableName, options);
     },
 
     /**
      * Execute multiple queries on a specific table
      */
-    multiquery: async (tableName: string, requests: QueryRequest[]) => {
+    multiquery: async (tableName: string, requests: TableQueryRequest[]) => {
       return this.performMultiquery("/db/v1/tables/{tableName}/query", requests, tableName);
     },
 

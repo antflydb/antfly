@@ -344,6 +344,7 @@ export type {
   // Table types
   Table,
   TableMigration,
+  TableQueryRequest,
   TableSchema,
   TableStatus,
   TemplateFieldMapping,

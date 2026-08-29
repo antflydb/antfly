@@ -3937,6 +3937,7 @@ pub fn build(b: *std.Build) void {
         "distributed graph path materialization preserves table provenance",
         "distributed canonical path weight is the checked raw edge sum",
         "distributed K path identity preserves parallel typed edges",
+        "distributed Yen edge exclusions preserve table-qualified path identity",
         "distributed graph supports legacy pattern step reverse directions exactly",
         "pattern hit shaping is lazy but preserves graph dependencies",
         "graph result refs select one MATCH binding without duplicate seeds",

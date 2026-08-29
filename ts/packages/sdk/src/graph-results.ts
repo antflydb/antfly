@@ -693,7 +693,10 @@ function canonicalOperationContract(
 function requestDialect(request: QueryRequest, fallbackQueryTable?: string): RequestGraphContract {
   const canonical = request.graph_queries;
   if (canonical !== undefined && canonical !== null) {
-    const queryTable = request.table ?? fallbackQueryTable;
+    // The path parameter is authoritative for table-scoped endpoints. Their
+    // public client rejects a redundant body table, but keep validation correct
+    // for direct callers and dynamically typed JavaScript too.
+    const queryTable = fallbackQueryTable ?? request.table;
     const operations = new Map<string, CanonicalResultContract>();
     for (const [name, operation] of Object.entries(canonical)) {
       operations.set(

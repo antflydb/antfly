@@ -397,6 +397,13 @@ describe("graph result admission", () => {
     ).not.toThrow();
     expect(() =>
       validateGraphQueryResponses(
+        responses(result(validPath)),
+        [{ ...constrained, table: "other" }],
+        "docs"
+      )
+    ).not.toThrow();
+    expect(() =>
+      validateGraphQueryResponses(
         responses(
           result({
             ...validPath,

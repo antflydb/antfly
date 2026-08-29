@@ -3477,9 +3477,15 @@ fn executeDistributedKShortestPaths(
                     &excluded_edges,
                     &excluded_edges_lease,
                     request_work_budget,
-                    graphPathNodeTable(result_path, spur_idx) orelse table_name,
-                    result_path.nodes[spur_idx],
-                    result_path.nodes[spur_idx + 1],
+                    .{
+                        .table = graphPathNodeTable(result_path, spur_idx) orelse table_name,
+                        .key = result_path.nodes[spur_idx],
+                    },
+                    .{
+                        .table = graphPathNodeTable(result_path, spur_idx + 1) orelse table_name,
+                        .key = result_path.nodes[spur_idx + 1],
+                    },
+                    if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].traversal_direction else null,
                     if (result_path.edges.len > spur_idx) result_path.edges[spur_idx].edge_type else "",
                 );
             }
@@ -3492,7 +3498,7 @@ fn executeDistributedKShortestPaths(
                     &excluded_nodes_lease,
                     request_work_budget,
                     .{
-                        .table = graphPathNodeTable(prev_path.*, i),
+                        .table = graphPathNodeTable(prev_path.*, i) orelse table_name,
                         .key = node_key,
                     },
                 );
@@ -3831,13 +3837,12 @@ fn insertExcludedEdgeIdentity(
     set: *std.StringHashMapUnmanaged(void),
     lease: *graph_work_budget.RetainedLease,
     budget: *graph_pattern_mod.WorkBudget,
-    table: []const u8,
-    src: []const u8,
-    tgt: []const u8,
+    from: graph_node_identity.Ref,
+    to: graph_node_identity.Ref,
+    direction: ?graph_mod.EdgeDirection,
     edge_type: []const u8,
 ) !bool {
-    const parts = [_][]const u8{ table, src, tgt, edge_type };
-    const key_len = try compositeIdentityEncodedLen(&parts);
+    const key_len = try edgeExclusionIdentityEncodedLen(from, to, direction, edge_type);
     const next_count = std.math.add(usize, set.count(), 1) catch
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const growth = retainedHashGrowth(
@@ -3852,7 +3857,7 @@ fn insertExcludedEdgeIdentity(
         growth.bytes,
     ) catch return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     const previous = try growRetainedLease(lease, retained_bytes, budget);
-    const key = compositeIdentityAlloc(alloc, &parts) catch |err| {
+    const key = allocEdgeExclusionKey(alloc, from, to, direction, edge_type) catch |err| {
         restoreRetainedLease(lease, previous);
         return err;
     };
@@ -3968,15 +3973,19 @@ test "Yen scratch reservations fail before allocation and release exactly" {
             &excluded_edges,
             &excluded_edges_lease,
             &budget,
-            "docs",
-            "a",
-            "b",
+            .{ .table = "docs", .key = "a" },
+            .{ .table = "docs", .key = "b" },
+            .out,
             "links",
         ));
-        const edge_parts = [_][]const u8{ "docs", "a", "b", "links" };
         const expected_edge_bytes = try std.math.add(
             usize,
-            try compositeIdentityEncodedLen(&edge_parts),
+            try edgeExclusionIdentityEncodedLen(
+                .{ .table = "docs", .key = "a" },
+                .{ .table = "docs", .key = "b" },
+                .out,
+                "links",
+            ),
             try graph_work_budget.hashMapRetainedBytes([]const u8, void, excluded_edges.capacity()),
         );
         try std.testing.expectEqual(expected_edge_bytes, excluded_edges_lease.bytes);
@@ -3986,9 +3995,9 @@ test "Yen scratch reservations fail before allocation and release exactly" {
             &excluded_edges,
             &excluded_edges_lease,
             &budget,
-            "docs",
-            "a",
-            "b",
+            .{ .table = "docs", .key = "a" },
+            .{ .table = "docs", .key = "b" },
+            .out,
             "links",
         ));
         try std.testing.expectEqual(edge_bytes, budget.retained_state_bytes);
@@ -4051,7 +4060,7 @@ fn findDistributedShortestPath(
     for (roots, admitted_roots) |item, allowed| {
         if (!allowed) continue;
         if (excluded_nodes) |set| {
-            if (set.contains(.{ .table = item.table, .key = item.key })) continue;
+            if (set.contains(.{ .table = item.table orelse table_name, .key = item.key })) continue;
         }
         var owned_item = try initFrontierState(
             alloc,
@@ -4082,7 +4091,7 @@ fn findDistributedShortestPath(
         const item_ref = graph_node_identity.Ref{ .table = item.table, .key = item.key };
         if (!best_cost.isCurrentPareto(item_ref, item.depth, item.cost)) continue;
         if (excluded_nodes) |set| {
-            if (set.contains(item_ref) and item.depth > 0) continue;
+            if (set.contains(.{ .table = item.table orelse table_name, .key = item.key }) and item.depth > 0) continue;
         }
 
         if (target_set.contains(item.table, item.key) and item.depth > 0) {
@@ -6022,12 +6031,43 @@ test "distributed canonical path weight is the checked raw edge sum" {
 
 fn allocEdgeExclusionKey(
     alloc: std.mem.Allocator,
-    table: []const u8,
-    src: []const u8,
-    tgt: []const u8,
+    from: graph_node_identity.Ref,
+    to: graph_node_identity.Ref,
+    direction: ?graph_mod.EdgeDirection,
     edge_type: []const u8,
 ) ![]u8 {
-    return try compositeIdentityAlloc(alloc, &.{ table, src, tgt, edge_type });
+    const from_table = from.table orelse return error.InvalidGraphPath;
+    const to_table = to.table orelse return error.InvalidGraphPath;
+    const direction_tag = [_]u8{graphPathTraversalDirectionTag(direction)};
+    return try compositeIdentityAlloc(alloc, &.{
+        "path-edge-v1",
+        from_table,
+        from.key,
+        to_table,
+        to.key,
+        direction_tag[0..],
+        edge_type,
+    });
+}
+
+fn edgeExclusionIdentityEncodedLen(
+    from: graph_node_identity.Ref,
+    to: graph_node_identity.Ref,
+    direction: ?graph_mod.EdgeDirection,
+    edge_type: []const u8,
+) !usize {
+    const from_table = from.table orelse return error.InvalidGraphPath;
+    const to_table = to.table orelse return error.InvalidGraphPath;
+    const direction_tag = [_]u8{graphPathTraversalDirectionTag(direction)};
+    return try compositeIdentityEncodedLen(&.{
+        "path-edge-v1",
+        from_table,
+        from.key,
+        to_table,
+        to.key,
+        direction_tag[0..],
+        edge_type,
+    });
 }
 
 fn compositeIdentityAlloc(
@@ -8012,11 +8052,11 @@ pub fn filterGraphSearchResult(
 
     var exclude = graph_node_identity.Map(void){};
     defer exclude.deinit(alloc);
-    var source_exclude = std.StringHashMapUnmanaged(void).empty;
-    defer source_exclude.deinit(alloc);
     for (exclude_nodes) |identity| {
-        _ = try exclude.putIfAbsent(alloc, identity.ref(), {});
-        if (identity.table == null) try source_exclude.put(alloc, identity.key, {});
+        _ = try exclude.putIfAbsent(alloc, .{
+            .table = identity.table orelse source_table,
+            .key = identity.key,
+        }, {});
     }
 
     var exclude_edge_set = std.StringHashMapUnmanaged(void).empty;
@@ -8030,23 +8070,11 @@ pub fn filterGraphSearchResult(
     }
     for (src.nodes) |node| {
         if (exclude.contains(.{
-            .table = canonicalGraphNodeTable(source_table, node.table),
+            .table = canonicalGraphNodeTable(source_table, node.table) orelse source_table,
             .key = node.key,
         })) continue;
         if (exclude_edge_set.count() > 0) {
-            if (node.path_edges) |path_edges| {
-                if (path_edges.len > 0) {
-                    const edge_key = try allocEdgeExclusionKey(
-                        alloc,
-                        source_table,
-                        path_edges[0].source,
-                        path_edges[0].target,
-                        path_edges[0].edge_type,
-                    );
-                    defer alloc.free(edge_key);
-                    if (exclude_edge_set.contains(edge_key)) continue;
-                }
-            }
+            if (try graphResultNodeHasExcludedEdge(alloc, source_table, node, &exclude_edge_set)) continue;
         }
         var owned_node = try cloneGraphNode(alloc, node);
         nodes.append(alloc, owned_node) catch |err| {
@@ -8061,7 +8089,7 @@ pub fn filterGraphSearchResult(
         hits.deinit(alloc);
     }
     for (src.hits) |hit| {
-        if (exclude.contains(.{ .table = hit.source_table, .key = hit.id })) continue;
+        if (exclude.contains(.{ .table = hit.source_table orelse source_table, .key = hit.id })) continue;
         var owned_hit = try hit.clone(alloc);
         hits.append(alloc, owned_hit) catch |err| {
             owned_hit.deinit(alloc);
@@ -8100,7 +8128,6 @@ pub fn filterGraphSearchResult(
             source_table,
             match,
             &exclude,
-            &source_exclude,
             &exclude_edge_set,
         )) continue;
         var owned_match = try cloneGraphPatternMatch(alloc, match);
@@ -9306,9 +9333,11 @@ fn graphPathIsExcluded(
     exclude: *graph_node_identity.Map(void),
     exclude_edge_set: *std.StringHashMapUnmanaged(void),
 ) !bool {
+    if (path.nodes.len == 0 or path.edges.len != path.nodes.len - 1)
+        return error.InvalidGraphPath;
     for (path.nodes, 0..) |node, i| {
         if (exclude.contains(.{
-            .table = graphPathNodeTable(path, i),
+            .table = graphPathNodeTable(path, i) orelse source_table,
             .key = node,
         })) return true;
     }
@@ -9316,9 +9345,77 @@ fn graphPathIsExcluded(
     for (path.edges, 0..) |edge, i| {
         const edge_key = try allocEdgeExclusionKey(
             alloc,
-            graphPathNodeTable(path, i) orelse source_table,
-            edge.source,
-            edge.target,
+            .{
+                .table = graphPathNodeTable(path, i) orelse source_table,
+                .key = path.nodes[i],
+            },
+            .{
+                .table = graphPathNodeTable(path, i + 1) orelse source_table,
+                .key = path.nodes[i + 1],
+            },
+            edge.traversal_direction,
+            edge.edge_type,
+        );
+        defer alloc.free(edge_key);
+        if (exclude_edge_set.contains(edge_key)) return true;
+    }
+    return false;
+}
+
+fn graphResultNodePathTable(
+    source_table: []const u8,
+    node: graph_query_mod.GraphResultNode,
+    index: usize,
+) []const u8 {
+    if (node.path_tables) |tables| {
+        if (index < tables.len) return tables[index] orelse source_table;
+    }
+    return source_table;
+}
+
+fn graphResultNodeTouchesExcludedNode(
+    source_table: []const u8,
+    node: graph_query_mod.GraphResultNode,
+    exclude: *graph_node_identity.Map(void),
+) !bool {
+    const path = node.path orelse return false;
+    if (node.path_tables) |tables| {
+        if (tables.len != path.len) return error.InvalidGraphPath;
+    }
+    for (path, 0..) |key, index| {
+        if (exclude.contains(.{
+            .table = graphResultNodePathTable(source_table, node, index),
+            .key = key,
+        })) return true;
+    }
+    return false;
+}
+
+fn graphResultNodeHasExcludedEdge(
+    alloc: std.mem.Allocator,
+    source_table: []const u8,
+    node: graph_query_mod.GraphResultNode,
+    exclude_edge_set: *std.StringHashMapUnmanaged(void),
+) !bool {
+    const edges = node.path_edges orelse return false;
+    if (edges.len == 0) return false;
+    const path = node.path orelse return error.InvalidGraphPath;
+    if (path.len != edges.len + 1) return error.InvalidGraphPath;
+    if (node.path_tables) |tables| {
+        if (tables.len != path.len) return error.InvalidGraphPath;
+    }
+    for (edges, 0..) |edge, index| {
+        const edge_key = try allocEdgeExclusionKey(
+            alloc,
+            .{
+                .table = graphResultNodePathTable(source_table, node, index),
+                .key = path[index],
+            },
+            .{
+                .table = graphResultNodePathTable(source_table, node, index + 1),
+                .key = path[index + 1],
+            },
+            edge.traversal_direction,
             edge.edge_type,
         );
         defer alloc.free(edge_key);
@@ -9332,46 +9429,16 @@ fn graphPatternMatchIsExcluded(
     source_table: []const u8,
     match: db_mod.types.GraphPatternMatch,
     exclude: *graph_node_identity.Map(void),
-    source_exclude: *std.StringHashMapUnmanaged(void),
     exclude_edge_set: *std.StringHashMapUnmanaged(void),
 ) !bool {
     for (match.bindings) |binding| {
         if (exclude.contains(.{
-            .table = canonicalGraphNodeTable(source_table, binding.node.table),
+            .table = canonicalGraphNodeTable(source_table, binding.node.table) orelse source_table,
             .key = binding.node.key,
         })) return true;
-        if (binding.node.path) |path| {
-            for (path) |node| {
-                if (source_exclude.contains(node)) return true;
-            }
-        }
-        if (exclude_edge_set.count() > 0) {
-            if (binding.node.path_edges) |edges| {
-                for (edges) |edge| {
-                    const edge_key = try allocEdgeExclusionKey(
-                        alloc,
-                        source_table,
-                        edge.source,
-                        edge.target,
-                        edge.edge_type,
-                    );
-                    defer alloc.free(edge_key);
-                    if (exclude_edge_set.contains(edge_key)) return true;
-                }
-            }
-        }
-    }
-    if (exclude_edge_set.count() == 0) return false;
-    for (match.path) |edge| {
-        const edge_key = try allocEdgeExclusionKey(
-            alloc,
-            source_table,
-            edge.source,
-            edge.target,
-            edge.edge_type,
-        );
-        defer alloc.free(edge_key);
-        if (exclude_edge_set.contains(edge_key)) return true;
+        if (try graphResultNodeTouchesExcludedNode(source_table, binding.node, exclude)) return true;
+        if (exclude_edge_set.count() > 0 and
+            try graphResultNodeHasExcludedEdge(alloc, source_table, binding.node, exclude_edge_set)) return true;
     }
     return false;
 }
@@ -10410,9 +10477,9 @@ test "distributed graph filtering preserves non-excluded paths matches and prove
 
     const excluded_edge = try allocEdgeExclusionKey(
         alloc,
-        "docs",
-        "doc:a",
-        "doc:b",
+        .{ .table = "docs", .key = "doc:a" },
+        .{ .table = "docs", .key = "doc:b" },
+        null,
         "links",
     );
     defer alloc.free(excluded_edge);
@@ -10492,6 +10559,86 @@ test "distributed graph filtering scopes equal keys by table" {
     try std.testing.expect(external_excluded.nodes[0].table == null);
     try std.testing.expectEqual(@as(usize, 1), external_excluded.hits.len);
     try std.testing.expect(external_excluded.hits[0].source_table == null);
+}
+
+test "distributed Yen edge exclusions preserve table-qualified path identity" {
+    const alloc = std.testing.allocator;
+    var entity_nodes = [_][]const u8{ "a", "shared" };
+    var company_nodes = [_][]const u8{ "a", "shared" };
+    var entity_tables = [_]?[]const u8{ null, "entities" };
+    var company_tables = [_]?[]const u8{ null, "companies" };
+    var entity_edges = [_]graph_paths_mod.PathEdge{.{
+        .source = "a",
+        .target = "shared",
+        .edge_type = "links",
+        .weight = 1,
+        .traversal_direction = .out,
+    }};
+    var company_edges = [_]graph_paths_mod.PathEdge{entity_edges[0]};
+    var paths = [_]db_mod.types.GraphPath{
+        .{
+            .nodes = entity_nodes[0..],
+            .node_tables = entity_tables[0..],
+            .edges = entity_edges[0..],
+            .total_weight = 1,
+            .length = 1,
+        },
+        .{
+            .nodes = company_nodes[0..],
+            .node_tables = company_tables[0..],
+            .edges = company_edges[0..],
+            .total_weight = 1,
+            .length = 1,
+        },
+    };
+    const src = db_mod.types.GraphSearchResult{
+        .name = @constCast("paths"),
+        .nodes = &.{},
+        .paths = paths[0..],
+        .matches = &.{},
+        .hits = &.{},
+        .total_hits = 2,
+    };
+
+    const excluded_entity_edge = try allocEdgeExclusionKey(
+        alloc,
+        .{ .table = "docs", .key = "a" },
+        .{ .table = "entities", .key = "shared" },
+        .out,
+        "links",
+    );
+    defer alloc.free(excluded_entity_edge);
+    const company_edge = try allocEdgeExclusionKey(
+        alloc,
+        .{ .table = "docs", .key = "a" },
+        .{ .table = "companies", .key = "shared" },
+        .out,
+        "links",
+    );
+    defer alloc.free(company_edge);
+    try std.testing.expect(!std.mem.eql(u8, excluded_entity_edge, company_edge));
+
+    var filtered = try filterGraphSearchResult(
+        alloc,
+        "docs",
+        src,
+        &.{},
+        &.{excluded_entity_edge},
+    );
+    defer filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), filtered.paths.len);
+    try std.testing.expectEqualStrings("companies", filtered.paths[0].node_tables[1].?);
+
+    var node_filtered = try filterGraphSearchResult(
+        alloc,
+        "docs",
+        src,
+        &.{.{ .table = @constCast("entities"), .key = @constCast("shared") }},
+        &.{},
+    );
+    defer node_filtered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), node_filtered.paths.len);
+    try std.testing.expectEqualStrings("companies", node_filtered.paths[0].node_tables[1].?);
 }
 
 test "distributed graph result_ref fails closed for unbounded paged base results" {
