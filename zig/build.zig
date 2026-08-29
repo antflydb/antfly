@@ -6820,6 +6820,7 @@ pub fn build(b: *std.Build) void {
             "db restart reconciles activated dense repair without rebuilding",
             "db restart clears stale dense generation intent after clean checkpoint",
             "db root generation rollover preserves activated repair debt fail closed",
+            "rollback action required atomically retires activation certification",
             "db repair capacity converts materialized shadow bytes into consumed reservation",
             "db automatic dense repair bootstraps missing coverage metadata",
             "db dense artifact rebuild bootstraps missing counter metadata",

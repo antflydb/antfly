@@ -11883,6 +11883,22 @@ pub const DB = struct {
         };
     }
 
+    /// Resolve the phase produced by the complete update transaction. Failure
+    /// accounting can move an intent to `terminal` without populating the
+    /// explicit phase field, while an explicit phase retains the historical
+    /// last-writer precedence of the mutation block below. Safety invariants
+    /// must reason about this effective phase, not the update's encoding.
+    fn indexRepairIntentEffectivePhase(
+        current: index_repair_state.Phase,
+        update: IndexRepairIntentUpdate,
+    ) index_repair_state.Phase {
+        if (update.phase) |phase| return phase;
+        if (update.attempt_failure) |failure| {
+            if (failure.terminal) return .terminal;
+        }
+        return current;
+    }
+
     fn indexRepairRetryDelayMs(repair_id: u128, attempt_count: u32) u64 {
         const exponent: u6 = @intCast(@min(attempt_count -| 1, 5));
         const base_ms: u64 = 30 * std.time.ms_per_s;
@@ -11974,9 +11990,10 @@ pub const DB = struct {
         };
         var entry = try state.entries.items[i].clone(alloc);
         defer entry.deinit(alloc);
+        const effective_phase = indexRepairIntentEffectivePhase(entry.intent.phase, update);
         if (update.candidate_applied_sequence) |candidate_sequence| {
             const remains_activation_certified = indexRepairPhaseHasActivationCertification(entry.intent.phase) and
-                (update.phase == null or indexRepairPhaseHasActivationCertification(update.phase.?));
+                indexRepairPhaseHasActivationCertification(effective_phase);
             if (remains_activation_certified and candidate_sequence != entry.intent.candidate_applied_sequence) {
                 return error.InvalidIndexRepairState;
             }
@@ -12035,7 +12052,6 @@ pub const DB = struct {
 
         const now_ms = currentTimeNs() / std.time.ns_per_ms;
         if (update.attempt_failure) |failure| {
-            entry.intent.phase = if (failure.terminal) .terminal else entry.intent.phase;
             entry.intent.attempt_count = @max(entry.intent.attempt_count, 1);
             entry.intent.failure_streak +|= 1;
             entry.intent.next_retry_at_ms = if (failure.terminal)
@@ -12046,7 +12062,7 @@ pub const DB = struct {
         if (update.trigger) |value| entry.intent.trigger = value;
         if (update.operator_job_id) |value| entry.intent.operator_job_id = value;
         if (update.operator_job_created_at_ms) |value| entry.intent.operator_job_created_at_ms = value;
-        if (update.phase) |value| entry.intent.phase = value;
+        if (update.phase != null or update.attempt_failure != null) entry.intent.phase = effective_phase;
         if (update.replace_candidate_path) {
             if (entry.intent.candidate_relative_path) |value| alloc.free(value);
             entry.intent.candidate_relative_path = replacement_candidate_path;
@@ -13112,6 +13128,79 @@ pub const DB = struct {
             ActivatedIndexRepairRollback.action_required,
             activatedIndexRepairRollbackFailureDisposition(.manual_intervention),
         );
+    }
+
+    test "rollback action required atomically retires activation certification" {
+        const alloc = std.testing.allocator;
+        var path_buf: [256]u8 = undefined;
+        const path = tempPath(&path_buf);
+        defer cleanupTempDir(path);
+
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .open_mode = .writer_no_replay,
+            .start_index_workers = false,
+            .ttl_cleanup = .{ .enabled = false },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "dense_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+        });
+        const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+        const repair_id = try db.createGenerationRepairIntent(
+            alloc,
+            cfg.*,
+            .operator_generation_validation,
+            0,
+            0,
+            null,
+        );
+        try db.updateIndexRepairIntent(alloc, repair_id, .{ .phase = .preflight });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .building,
+            .candidate_relative_path = ".repair-shadow-terminal/indexes/dense_idx",
+            .replace_candidate_path = true,
+        });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .catching_up,
+            .candidate_applied_sequence = 17,
+        });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .ready,
+            .candidate_applied_sequence = 17,
+        });
+        try db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .activating,
+            .candidate_applied_sequence = 17,
+            .target_sequence = 17,
+        });
+        try std.testing.expectError(error.InvalidIndexRepairState, db.updateIndexRepairIntent(alloc, repair_id, .{
+            .phase = .validating,
+            .candidate_applied_sequence = 18,
+        }));
+        try db.updateIndexRepairIntent(alloc, repair_id, .{ .phase = .rolling_back });
+
+        // The real manual-predecessor-failure disposition deletes the inactive
+        // candidate and combines its reset with a terminal failure update. The
+        // terminal phase leaves the certified family, so clearing the obsolete
+        // manifest sequence is both safe and required for coherent status.
+        try db.discardInactiveIndexRepairCandidateWithTerminal(
+            alloc,
+            repair_id,
+            "rollback_predecessor_manual_intervention",
+        );
+
+        var terminal = try db.loadIndexRepairEntryById(alloc, repair_id);
+        defer terminal.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.terminal, terminal.intent.phase);
+        try std.testing.expect(terminal.intent.candidate_relative_path == null);
+        try std.testing.expectEqual(@as(u64, 0), terminal.intent.candidate_applied_sequence);
+        try std.testing.expectEqualStrings(
+            "rollback_predecessor_manual_intervention",
+            terminal.intent.last_error.?,
+        );
+        try std.testing.expect(indexRepairActionRequired(terminal.intent));
     }
 
     fn removeIndexRepairIntentAndPin(self: *DB, alloc: Allocator, repair_id: u128) !void {
@@ -14810,7 +14899,7 @@ pub const DB = struct {
     /// Private recursion boundary. Public callers always enter with
     /// `.acquire`; only the full-quantum durable owner can supply
     /// `.already_held`, so the public options struct cannot forge lease
-    /// ownership by toggling its internal recursion flag.
+    /// ownership.
     fn repairArtifactIssuesWithRequestOptionsInternal(
         self: *DB,
         alloc: Allocator,
