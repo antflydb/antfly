@@ -46,6 +46,7 @@ const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 const portable_backup = @import("../storage/portable_backup.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const ha_primary_mod = @import("../storage/ha/primary.zig");
+const ha_mutation_barrier_mod = @import("../storage/ha/mutation_barrier.zig");
 const ha_public_gate_state_mod = @import("../storage/ha/public_gate_state.zig");
 const storage_schema = @import("../storage/schema.zig");
 const table_catalog = @import("table_catalog.zig");
@@ -11132,6 +11133,12 @@ pub const ProvisionedTableWriteSource = struct {
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
+        var io_impl = Io.Threaded.init(alloc, .{});
+        defer io_impl.deinit();
+        _ = Io.Dir.cwd().statFile(io_impl.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => return error.HASeedSnapshotReplicaMissing,
+            else => return err,
+        };
 
         // Promotion retires the standby-era writer cache before publishing the
         // new primary mirror. A lease that drains after that transition queues
@@ -11141,42 +11148,46 @@ pub const ProvisionedTableWriteSource = struct {
         // LSM single-writer guard correctly rejects every operator retry, but
         // no cache operation remains to perform the close.
         //
-        // Reopen through the serving cache after synchronously draining both
-        // serving and startup retirement queues. This preserves one writer,
-        // installs the current HA gate/mirror on the captured DB, and leaves a
-        // normal resident primary writer behind for subsequent traffic.
-        if (self.write_cache) |cache| {
-            self.drainWriteCachePendingClosesForGroups(table_name, &.{group_id});
-            var cached = self.getOrOpenCachedDbMode(
+        // Serialize the cold open with both serving and startup caches, then
+        // synchronously drain their exact retirement queues. Keep the open
+        // locks through the snapshot so no cache path can publish a competing
+        // owner or expose a temporary mirror-free DB to background work. The
+        // capture already owns the exclusive HA mutation barrier, so the cold
+        // DB intentionally retains the original null mirror; attaching the
+        // primary mirror would recursively wait on that barrier.
+        if (self.write_cache != null or self.startup_write_cache != null) {
+            var locks = WriteCacheTransitionLocks.init(self, true, true);
+            defer locks.deinit();
+            locks.releaseStateLocks();
+            if (locks.first) |cache|
+                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+            if (locks.second) |cache|
+                cache.drainPendingClosesForGroupTableAssumeOpenMutexHeld(group_id, table_name);
+
+            var db = openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
                 alloc,
-                cache,
                 path,
-                group_id,
+                self.catalog,
                 table_name,
-                .default_async,
-                null,
+                group_id,
+                self.backend_runtime,
+                self.ha_write_gate,
                 null,
             ) catch |err| {
                 if (isTransientWriterOpenConflict(err))
                     return error.HASeedSnapshotRuntimeBusy;
                 return err;
             };
-            defer cached.deinit(cache.alloc);
+            defer db.close();
             return try captureHASeedDbSnapshot(
                 alloc,
-                cached.db,
-                cached.db.core.path,
+                &db,
+                path,
                 snapshot_token,
                 destination_root,
             );
         }
 
-        var io_impl = Io.Threaded.init(alloc, .{});
-        defer io_impl.deinit();
-        _ = Io.Dir.cwd().statFile(io_impl.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => return error.HASeedSnapshotReplicaMissing,
-            else => return err,
-        };
         var db = try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(
             alloc,
             path,
@@ -46073,6 +46084,32 @@ test "HA seed capture drains writer released after promotion cache clear" {
     try std.testing.expectEqual(@as(usize, 1), write_cache.closing_entries.items.len);
     try std.testing.expectEqual(@as(usize, 1), startup_write_cache.closing_entries.items.len);
 
+    const primary_log_path_raw = try std.fmt.allocPrint(alloc, "{s}/primary-log", .{replica_root_dir});
+    defer alloc.free(primary_log_path_raw);
+    const primary_log_path = try alloc.dupeZ(u8, primary_log_path_raw);
+    defer alloc.free(primary_log_path);
+    const primary_slots_path_raw = try std.fmt.allocPrint(alloc, "{s}/primary-slots", .{replica_root_dir});
+    defer alloc.free(primary_slots_path_raw);
+    const primary_slots_path = try alloc.dupeZ(u8, primary_slots_path_raw);
+    defer alloc.free(primary_slots_path);
+    var primary = try ha_primary_mod.Primary.open(alloc, primary_log_path.ptr, primary_slots_path.ptr, .{
+        .cluster_id = 700,
+        .shard_id = 1,
+        .table_id = 7,
+        .timeline_id = 2,
+        .epoch = 2,
+    }, .{});
+    defer primary.close();
+    var mutation_barrier: ha_mutation_barrier_mod.MutationBarrier = .{};
+    source.ha_async_mirror = .{
+        .primary = &primary,
+        .mutation_barrier = &mutation_barrier,
+    };
+    write_cache.ha_async_mirror = source.ha_async_mirror;
+    startup_write_cache.ha_async_mirror = source.ha_async_mirror;
+    var capture_lease = mutation_barrier.acquireExclusive();
+    defer capture_lease.release();
+
     try source.captureHASeedReplicaSnapshot(
         alloc,
         "docs",
@@ -46092,7 +46129,7 @@ test "HA seed capture drains writer released after promotion cache clear" {
     try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), startup_write_cache.retired_entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);
-    try std.testing.expectEqual(@as(usize, 2), write_cache.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
     try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
     var io_impl = Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
