@@ -122,7 +122,6 @@ func mockGraphQueryNodes(name string, hits []rawHit, nodes []client.GraphResultN
 	if err := graphResult.FromGraphNodesResult(client.GraphNodesResult{
 		Kind:  client.GraphNodesResultKindNodes,
 		Nodes: nodes,
-		Paths: []client.GraphPath{},
 		Stats: client.GraphQueryStats{ReturnedItems: uint64(len(nodes))},
 	}); err != nil {
 		panic(err)
