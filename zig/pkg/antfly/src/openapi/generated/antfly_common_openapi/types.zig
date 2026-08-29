@@ -954,15 +954,23 @@ pub const GcsExternalIoConfig = struct {
     }
 };
 
-/// Operator-owned ceilings shared by all named graph operations in one admitted query. Public requests cannot raise these values.
+/// Operator-owned ceilings shared by all named graph operations in one admitted query. Public requests cannot raise these values. Explored work, scanned anchors, and exact-distinct capacity are request-consumptive; intermediate and retained-state ceilings bound simultaneously live state.
 pub const GraphExecutionConfig = struct {
+    /// Cumulative node expansions across every named operation and path spur in one request.
     max_explored_nodes: ?i64 = null,
+    /// Cumulative edge expansions across every named operation and path spur in one request.
     max_explored_edges: ?i64 = null,
+    /// Cumulative owned bytes of materialized edges read while executing one request.
     max_explored_edge_bytes: ?i64 = null,
+    /// Cumulative source anchors scanned by exact MATCH operations in one request.
     max_scanned_anchors: ?i64 = null,
+    /// Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
     max_intermediate_states: ?i64 = null,
+    /// Maximum simultaneously retained bytes of admitted graph execution state.
     max_retained_state_bytes: ?i64 = null,
+    /// Cumulative exact-distinct identities admitted across all named aggregates in one request.
     max_distinct_identities: ?i64 = null,
+    /// Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
     max_distinct_state_bytes: ?i64 = null,
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {

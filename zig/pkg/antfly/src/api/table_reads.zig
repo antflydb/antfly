@@ -19236,10 +19236,10 @@ test "remote canonical graph result stats and aggregate exactness fail closed" {
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"counted":{"kind":"aggregates","aggregates":{"count":{"value":"1","exact":true}},"stats":{"returned_items":1,"truncated":true}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","depth":0},{"key":"extra","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}}],"stats":{"returned_items":2,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"a","table":"entities","depth":0}],"paths":[{"nodes":[{"key":"a"}],"edges":[],"objective":"min_hops","weight_sum":0,"objective_value":0,"length":0}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b","table":"entities"}],"edges":[{"from":{"key":"a"},"to":{"key":"wrong","table":"entities"},"direction":"out","type":"related","weight":1}],"objective":"min_hops","weight_sum":1,"objective_value":1,"length":1}}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
 }
 

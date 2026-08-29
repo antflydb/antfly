@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import re
 import unittest
 
 import yaml
@@ -44,10 +45,6 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
         indexes = yaml.safe_load(
             (generator.ROOT / "specs/openapi/antfly/indexes.yaml").read_text(encoding="utf-8")
         )["components"]["schemas"]
-        metadata = yaml.safe_load(
-            (generator.ROOT / "specs/openapi/antfly/metadata.yaml").read_text(encoding="utf-8")
-        )["components"]["schemas"]
-
         identifier_ref = {
             "$ref": "generated/graph_identifier.yaml#/components/schemas/GraphIdentifier"
         }
@@ -86,6 +83,32 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
             identifier_ref,
             indexes["GraphQueries"]["x-antfly-property-name-schema"],
         )
+
+    def test_graph_execution_defaults_match_runtime_limits(self) -> None:
+        config = yaml.safe_load(
+            (generator.ROOT / "specs/openapi/antfly/config.yaml").read_text(encoding="utf-8")
+        )["components"]["schemas"]["GraphExecutionConfig"]["properties"]
+        runtime = (
+            generator.ROOT / "zig/pkg/antfly/src/graph/work_budget.zig"
+        ).read_text(encoding="utf-8")
+
+        for name, schema in config.items():
+            constant = f"default_{name}"
+            match = re.search(
+                rf"pub const {re.escape(constant)}: usize = ([^;]+);",
+                runtime,
+            )
+            self.assertIsNotNone(match, f"missing runtime default {constant}")
+            expression = match.group(1).replace("_", "").strip()
+            factors = [int(factor.strip()) for factor in expression.split("*")]
+            runtime_default = 1
+            for factor in factors:
+                runtime_default *= factor
+            self.assertEqual(
+                schema["default"],
+                runtime_default,
+                f"OpenAPI default for {name} drifted from {constant}",
+            )
 
 
 if __name__ == "__main__":

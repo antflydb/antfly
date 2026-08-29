@@ -46,6 +46,7 @@ pub fn parseCanonicalGraphQueriesAlloc(
             return error.InvalidQueryRequest;
     }
     const query_count = if (request.graph_queries) |queries| queries.map.count() else 0;
+    if (request.graph_queries != null and query_count == 0) return error.InvalidQueryRequest;
     if (query_count > graph_query_mod.max_named_queries) return error.InvalidQueryRequest;
 
     var items = std.ArrayListUnmanaged(db_mod.types.NamedGraphQuery).empty;
@@ -67,6 +68,23 @@ pub fn parseCanonicalGraphQueriesAlloc(
         }
     }
     return try items.toOwnedSlice(alloc);
+}
+
+test "canonical graph query parser distinguishes omission from an explicit empty map" {
+    const alloc = std.testing.allocator;
+
+    var omitted = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, "{}", .{});
+    defer omitted.deinit();
+    const no_queries = try parseCanonicalGraphQueriesAlloc(alloc, omitted.value);
+    defer freeNamedGraphQueries(alloc, no_queries);
+    try std.testing.expectEqual(@as(usize, 0), no_queries.len);
+
+    var empty = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, "{\"graph_queries\":{}}", .{});
+    defer empty.deinit();
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        parseCanonicalGraphQueriesAlloc(alloc, empty.value),
+    );
 }
 
 test "canonical graph queries reject the legacy expand strategy" {

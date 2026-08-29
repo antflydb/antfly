@@ -5560,7 +5560,7 @@ pub const GraphKShortestPaths = struct {
     objective: ?GraphPathObjective = null,
     /// Non-scoring structured stored-document predicate for path nodes.
     filter: ?GraphDocumentFilter = null,
-    /// Include stored documents on terminal result nodes returned alongside each path when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
+    /// Attach each terminal stored document as paths[].document when it exists at the pinned snapshot. A dangling terminal identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,
@@ -6778,7 +6778,7 @@ pub const GraphShortestPath = struct {
     objective: ?GraphPathObjective = null,
     /// Non-scoring structured stored-document predicate for path nodes.
     filter: ?GraphDocumentFilter = null,
-    /// Include stored documents on terminal result nodes returned alongside the path when they exist at the pinned snapshot. A dangling graph identity omits document. When false, document is always omitted.
+    /// Attach the terminal stored document as paths[].document when it exists at the pinned snapshot. A dangling terminal identity omits document. When false, document is always omitted.
     include_documents: ?bool = null,
     /// Requires include_documents=true. Omit to include all document fields.
     fields: ?[]const []const u8 = null,

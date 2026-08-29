@@ -3180,9 +3180,9 @@ components:
           type: boolean
           default: false
           description: >-
-            Include stored documents on terminal result nodes returned alongside
-            the path when they exist at the pinned snapshot. A dangling graph
-            identity omits document. When false, document is always omitted.
+            Attach the terminal stored document as paths[].document when it
+            exists at the pinned snapshot. A dangling terminal identity omits
+            document. When false, document is always omitted.
         fields:
           type: array
           items: { type: string }
@@ -3226,9 +3226,9 @@ components:
           type: boolean
           default: false
           description: >-
-            Include stored documents on terminal result nodes returned alongside
-            each path when they exist at the pinned snapshot. A dangling graph
-            identity omits document. When false, document is always omitted.
+            Attach each terminal stored document as paths[].document when it
+            exists at the pinned snapshot. A dangling terminal identity omits
+            document. When false, document is always omitted.
         fields:
           type: array
           items: { type: string }

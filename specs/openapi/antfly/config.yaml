@@ -799,16 +799,50 @@ components:
       additionalProperties: false
       description: >-
         Operator-owned ceilings shared by all named graph operations in one
-        admitted query. Public requests cannot raise these values.
+        admitted query. Public requests cannot raise these values. Explored
+        work, scanned anchors, and exact-distinct capacity are request-consumptive;
+        intermediate and retained-state ceilings bound simultaneously live state.
       properties:
-        max_explored_nodes: { type: integer, minimum: 1, default: 100000 }
-        max_explored_edges: { type: integer, minimum: 1, default: 1000000 }
-        max_explored_edge_bytes: { type: integer, minimum: 1, default: 67108864 }
-        max_scanned_anchors: { type: integer, minimum: 1, default: 1000000 }
-        max_intermediate_states: { type: integer, minimum: 1, default: 100000 }
-        max_retained_state_bytes: { type: integer, minimum: 1, default: 67108864 }
-        max_distinct_identities: { type: integer, minimum: 1, default: 100000 }
-        max_distinct_state_bytes: { type: integer, minimum: 1, default: 16777216 }
+        max_explored_nodes:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Cumulative node expansions across every named operation and path spur in one request.
+        max_explored_edges:
+          type: integer
+          minimum: 1
+          default: 1000000
+          description: Cumulative edge expansions across every named operation and path spur in one request.
+        max_explored_edge_bytes:
+          type: integer
+          minimum: 1
+          default: 67108864
+          description: Cumulative owned bytes of materialized edges read while executing one request.
+        max_scanned_anchors:
+          type: integer
+          minimum: 1
+          default: 1000000
+          description: Cumulative source anchors scanned by exact MATCH operations in one request.
+        max_intermediate_states:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Maximum simultaneously live traversal, pathfinding, or MATCH frontier states.
+        max_retained_state_bytes:
+          type: integer
+          minimum: 1
+          default: 67108864
+          description: Maximum simultaneously retained bytes of admitted graph execution state.
+        max_distinct_identities:
+          type: integer
+          minimum: 1
+          default: 100000
+          description: Cumulative exact-distinct identities admitted across all named aggregates in one request.
+        max_distinct_state_bytes:
+          type: integer
+          minimum: 1
+          default: 16777216
+          description: Request-consumptive bytes for exact-distinct identities, indexes, and ownership transfer.
 
     McpConfig:
       type: object
