@@ -3993,11 +3993,6 @@ pub const DB = struct {
         }
     }
 
-    fn mirrorHASchemaMetadataCommit(self: *DB, table_schema: schema_mod.TableSchema) !void {
-        var ctx = self.batchContext();
-        try mirrorHASchemaMetadataCommitContext(&ctx, table_schema);
-    }
-
     fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
         const owner_id = try self.backend_runtime.allocOwnerId();
         self.algebraic_hll_owner_id = owner_id;
@@ -7609,6 +7604,7 @@ pub const DB = struct {
         self.core.unlockApply();
         apply_mutex_held = false;
         snapshot_mutation.release();
+        releaseHAMutationShared(&ha_mutation);
         if (!opts.bypass_ha_write_gate) {
             const ha_ctx = self.batchContext();
             try deferred_ha_gates.waitForDurabilityAndAuthority(ha_ctx.ha_write_gate);
@@ -18966,36 +18962,41 @@ pub const DB = struct {
         self.core.index_manager.clearDenseHbcCaches();
     }
 
-    fn setSchemaGuarded(self: *DB, table_schema: schema_mod.TableSchema) !void {
-        try self.enforceHAWriteGate();
-        try self.preflightHAMetadataSyncCommit();
-        try self.core.setSchema(table_schema);
-        try self.mirrorHASchemaMetadataCommit(table_schema);
-    }
-
     pub fn setSchema(self: *DB, table_schema: schema_mod.TableSchema) !void {
         var ha_mutation = self.acquireHAMutationShared();
         defer if (ha_mutation) |*lease| lease.release();
-        try self.setSchemaGuarded(table_schema);
+        try self.enforceHAWriteGate();
+        try self.preflightHAMetadataSyncCommit();
+        try self.core.setSchema(table_schema);
+        var ctx = self.batchContext();
+        var deferred_ha_gates = HADeferredCommitGates.begin(&ctx);
+        defer deferred_ha_gates.releaseTransition();
+        deferred_ha_gates.append(try appendHASchemaMetadataCommitLockedContext(&ctx, table_schema));
+        releaseHAMutationShared(&ha_mutation);
+        try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     }
 
-    fn setSchemaJsonGuarded(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
         var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
         defer parsed_schema.deinit(alloc);
         const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
         defer schema_mod.freeSchema(alloc, runtime_schema);
 
-        try self.setSchemaGuarded(runtime_schema);
+        var ha_mutation = self.acquireHAMutationShared();
+        defer if (ha_mutation) |*lease| lease.release();
+        try self.enforceHAWriteGate();
+        try self.preflightHAMetadataSyncCommit();
+        try self.core.setSchema(runtime_schema);
+        var ctx = self.batchContext();
+        var deferred_ha_gates = HADeferredCommitGates.begin(&ctx);
+        defer deferred_ha_gates.releaseTransition();
+        deferred_ha_gates.append(try appendHASchemaMetadataCommitLockedContext(&ctx, runtime_schema));
         try self.core.putStoreBatch(&.{.{
             .key = public_schema_json_key,
             .value = schema_json,
         }}, &.{});
-    }
-
-    pub fn setSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
-        var ha_mutation = self.acquireHAMutationShared();
-        defer if (ha_mutation) |*lease| lease.release();
-        try self.setSchemaJsonGuarded(alloc, schema_json);
+        releaseHAMutationShared(&ha_mutation);
+        try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     }
 
     pub fn getSchemaJson(self: *DB, alloc: Allocator) !?[]u8 {
@@ -38256,10 +38257,15 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, keys: []const []
             }
         }
     }
+    var deferred_ha_gates = HADeferredCommitGates.begin(ctx);
+    defer deferred_ha_gates.releaseTransition();
+    deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(ctx, replay_payload));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
-    try mirrorHAReplayPayloadCommitContext(ctx, replay_payload);
+    snapshot_mutation = null;
+    releaseHAMutationShared(&ha_mutation);
+    try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     var sync_targets = try collectManagedSyncTargets(ctx.alloc, ctx.index_manager, derived_batch);
     defer sync_targets.deinit(ctx.alloc);
     ctx.executor.trackBacklogBytes(sequence, @intCast(replay_payload.len)) catch {};
@@ -38329,9 +38335,15 @@ fn appendDerivedBatchRecordContext(ctx: *const BatchExecutionContext, batch: der
     const payload = try encodeChangeRecordPayload(ctx, batch, sequence);
     defer ctx.alloc.free(payload);
     try ctx.store.appendReplayOpaque(ctx.alloc, sequence, payload);
+    var deferred_ha_gates = HADeferredCommitGates.begin(ctx);
+    defer deferred_ha_gates.releaseTransition();
+    deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(ctx, payload));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
-    try mirrorHAReplayPayloadCommitContext(ctx, payload);
+    if (snapshot_replay) |*lease| lease.release();
+    snapshot_replay = null;
+    releaseHAMutationShared(&ha_mutation);
+    try deferred_ha_gates.waitForDurabilityAndAuthority(ctx.ha_write_gate);
     ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
     return sequence;
 }
@@ -38401,6 +38413,11 @@ fn haMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*HAMutationB
 fn acquireHAMutationSharedContext(ctx: *const BatchExecutionContext) ?HAMutationBarrier.SharedLease {
     const barrier = haMutationBarrierFromContext(ctx) orelse return null;
     return barrier.acquireShared();
+}
+
+fn releaseHAMutationShared(lease: *?HAMutationBarrier.SharedLease) void {
+    if (lease.*) |*held| held.release();
+    lease.* = null;
 }
 
 fn acquireSnapshotMutationContext(ctx: *const BatchExecutionContext) ?snapshot_admission_mod.SnapshotAdmission.MutationLease {
@@ -38586,12 +38603,8 @@ fn mirrorHASchemaMetadataBestEffortContext(ctx: *const BatchExecutionContext, ta
     if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
 }
 
-fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) !void {
-    const mirror = ctx.ha_async_metadata_mirror orelse return;
-    const transition_mutex = mirror.transition_mutex;
-    if (transition_mutex) |mutex| lockAtomic(mutex);
-    var transition_locked = transition_mutex != null;
-    defer if (transition_locked) transition_mutex.?.unlock();
+fn appendHASchemaMetadataCommitLockedContext(ctx: *const BatchExecutionContext, table_schema: schema_mod.TableSchema) !?HADeferredCommitGate {
+    const mirror = ctx.ha_async_metadata_mirror orelse return null;
     // As with document batches, committed metadata must remain represented in
     // the HA tail even when authority expires before acknowledgement.
     const lsn = blk: {
@@ -38603,21 +38616,12 @@ fn mirrorHASchemaMetadataCommitContext(ctx: *const BatchExecutionContext, table_
         }) catch |err| {
             noteHAMirrorFailure(mirror, "metadata mutation", err);
             if (haMirrorSyncEnabled(mirror)) return err;
-            return;
+            return null;
         };
         if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
         break :blk lsn;
     };
-    if (transition_mutex) |mutex| {
-        mutex.unlock();
-        transition_locked = false;
-    }
-    try evaluateHAMirrorCommitGate(mirror, lsn);
-    if (transition_mutex) |mutex| {
-        lockAtomic(mutex);
-        transition_locked = true;
-    }
-    try enforceHAWriteGateOptional(ctx.ha_write_gate);
+    return .{ .mirror = mirror, .lsn = lsn };
 }
 
 fn preflightHAMirrorSyncCommitContext(ctx: *const BatchExecutionContext, mirror: ?HAAsyncEffectMirror) !void {
@@ -39851,8 +39855,11 @@ test "storage.ha resolution handoff fence rejects completion after durable HA re
     defer alloc.free(artifact);
     try std.testing.expectEqualStrings("{\"entities\":[\"durable\"]}", artifact);
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker_key));
-    // The hook runs inside appendResolutionRecord's shared mutation lease.
-    try std.testing.expect(barrier.tryAcquireExclusive() == null);
+    // Remote durability no longer retains the mutation lease. Capture can
+    // select the exact local-commit/HA-tail boundary before the unacknowledged
+    // handoff marker is published.
+    var capture_before_fence = barrier.tryAcquireExclusive() orelse return error.TestExpectedEqual;
+    capture_before_fence.release();
 
     lockAtomic(&transition_mutex);
     public_gate.publishPrimaryFence(true);
@@ -39925,12 +39932,16 @@ fn appendResolutionRecordWithHook(
     if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
         try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), store_writes, write.artifact_deletes);
     }
+    var deferred_ha_gates = HADeferredCommitGates.begin(&batch_ctx);
+    defer deferred_ha_gates.releaseTransition();
+    deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&batch_ctx, payload));
     batch_ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
+    releaseHAMutationShared(&ha_mutation);
 
-    try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
+    try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
     before_handoff_publish.run();
     try publishResolutionHandoffContext(&batch_ctx, write);
     batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
@@ -40647,11 +40658,15 @@ fn appendGeneratedBatchFromEnrichment(ctx_ptr: *anyopaque, batch: derived_types.
     if (shouldAppendSplitDeltaForContext(&batch_ctx)) {
         try batch_ctx.shard_manager.appendSplitDelta(currentTimeNs(), &.{}, artifact_delete_keys);
     }
+    var deferred_ha_gates = HADeferredCommitGates.begin(&batch_ctx);
+    defer deferred_ha_gates.releaseTransition();
+    deferred_ha_gates.append(try appendHAReplayPayloadCommitLockedContext(&batch_ctx, payload));
     batch_ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     snapshot_replay.?.release();
     snapshot_replay = null;
-    try mirrorHAReplayPayloadCommitContext(&batch_ctx, payload);
+    releaseHAMutationShared(&ha_mutation);
+    try deferred_ha_gates.waitForDurabilityAndAuthority(batch_ctx.ha_write_gate);
     batch_ctx.executor.trackBacklogBytes(sequence, @intCast(payload.len)) catch {};
 
     notifyResolverReplayRuntimesForCatalog(ctx.index_manager, ctx.resolution_runtime, ctx.promotion_runtime, sequence);
@@ -71078,7 +71093,7 @@ test "storage.ha schema json mutation does not reacquire shared barrier behind q
     const schema_json =
         \\{"version":1,"default_type":"doc","enforce_types":false,"document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
     ;
-    try db.setSchemaJsonGuarded(alloc, schema_json);
+    try db.setSchemaJson(alloc, schema_json);
     outer.release();
     try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
     probe.release.store(1, .release);
@@ -71363,9 +71378,11 @@ test "storage.ha db allows progress but rejects acknowledgement when fenced duri
     public_gate.configurePrimary(&primary, false);
 
     var transition_mutex: std.atomic.Mutex = .unlocked;
+    var mutation_barrier: HAMutationBarrier = .{};
     const FencingRemoteApplyWait = struct {
         session: HASessionSyncWait,
         transition_mutex: *std.atomic.Mutex,
+        mutation_barrier: *HAMutationBarrier,
         public_gate: *ha_public_gate_state_mod.State,
         primary_db: ?*DB = null,
         calls: u64 = 0,
@@ -71383,6 +71400,13 @@ test "storage.ha db allows progress but rejects acknowledgement when fenced duri
             // here starves every reader behind an unavailable standby.
             try std.testing.expect(db.core.apply_mutex.tryLockShared());
             db.core.apply_mutex.unlockShared();
+            // A replacement seed capture must be able to freeze the exact
+            // local commit/HA-tail pair while this client waits for the missing
+            // standby. Holding the mutation lease here deadlocks the operation
+            // that can restore remote durability.
+            var capture = self.mutation_barrier.tryAcquireExclusive() orelse
+                return error.HASeedCaptureBlockedByRemoteDurabilityWait;
+            capture.release();
             try HASessionSyncWait.wait(&self.session, primary_arg, target_lsn, policy);
             // Fence only after remote apply. The final client gate must observe
             // this transition after reacquiring the same mutex.
@@ -71400,6 +71424,7 @@ test "storage.ha db allows progress but rejects acknowledgement when fenced duri
             .apply_fn = DB.applyHAReplicationRecordCallback,
         },
         .transition_mutex = &transition_mutex,
+        .mutation_barrier = &mutation_barrier,
         .public_gate = &public_gate,
     };
     const standby_names = [_][]const u8{"standby-a"};
@@ -71408,6 +71433,7 @@ test "storage.ha db allows progress but rejects acknowledgement when fenced duri
         .ha_async_batch_mirror = .{
             .primary = &primary,
             .transition_mutex = &transition_mutex,
+            .mutation_barrier = &mutation_barrier,
             .sync_policy = .{
                 .mode = .remote_apply,
                 .standby_names = &standby_names,
