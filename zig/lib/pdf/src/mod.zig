@@ -151,83 +151,29 @@ fn renderParsedPagePngNativeAlloc(
     const shading_runs = render_runs.shading_runs;
     const pattern_runs = render_runs.pattern_runs;
     const shape_runs = render_runs.shape_runs;
-    var text_pattern_runs: []reader.PatternRun = &.{};
-    var text_shape_runs: []reader.ShapeRun = &.{};
-    defer {
-        for (text_pattern_runs) |*run| run.deinit(reader_alloc);
-        if (text_pattern_runs.len > 0) reader_alloc.free(text_pattern_runs);
-        for (text_shape_runs) |*run| run.deinit(reader_alloc);
-        if (text_shape_runs.len > 0) reader_alloc.free(text_shape_runs);
-    }
     var plain_runs = std.ArrayList(reader.TextRun).empty;
     defer plain_runs.deinit(alloc);
-    var needs_vector_text_patterns = false;
-    var needs_vector_text_shapes = false;
     for (runs) |run| {
         const has_pattern = run.fill_pattern_name != null or run.stroke_pattern_name != null;
-        if (has_pattern) {
-            needs_vector_text_patterns = true;
-        }
-        if (run.vectorizable) {
-            needs_vector_text_shapes = true;
-        }
         if (has_pattern or run.vectorizable) continue;
         try plain_runs.append(alloc, run);
-    }
-    if (needs_vector_text_patterns) {
-        text_pattern_runs = try parsed.extractPageVectorTextPatternRunsAlloc(page_number);
-        scalePatternRuns(text_pattern_runs, scale);
-    }
-    if (needs_vector_text_shapes) {
-        text_shape_runs = try parsed.extractPageVectorTextShapeRunsAlloc(page_number);
-        scaleShapeRuns(text_shape_runs, scale);
-    }
-    var all_shape_runs = std.ArrayList(reader.ShapeRun).empty;
-    defer {
-        for (all_shape_runs.items) |*run| run.deinit(alloc);
-        all_shape_runs.deinit(alloc);
-    }
-    for (shape_runs) |run| {
-        var cloned = try dupShapeRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_shape_runs.append(alloc, cloned);
-    }
-    for (text_shape_runs) |run| {
-        var cloned = try dupShapeRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_shape_runs.append(alloc, cloned);
-    }
-    var all_pattern_runs = std.ArrayList(reader.PatternRun).empty;
-    defer {
-        for (all_pattern_runs.items) |*run| run.deinit(alloc);
-        all_pattern_runs.deinit(alloc);
-    }
-    for (pattern_runs) |run| {
-        var cloned = try dupPatternRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_pattern_runs.append(alloc, cloned);
-    }
-    for (text_pattern_runs) |run| {
-        var cloned = try dupPatternRunAlloc(alloc, run);
-        errdefer cloned.deinit(alloc);
-        try all_pattern_runs.append(alloc, cloned);
     }
     std.mem.sort(reader.TextRun, plain_runs.items, {}, struct {
         fn lessThan(_: void, a: reader.TextRun, b: reader.TextRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    std.mem.sort(reader.ShapeRun, all_shape_runs.items, {}, struct {
+    std.mem.sort(reader.ShapeRun, shape_runs, {}, struct {
         fn lessThan(_: void, a: reader.ShapeRun, b: reader.ShapeRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    std.mem.sort(reader.PatternRun, all_pattern_runs.items, {}, struct {
+    std.mem.sort(reader.PatternRun, pattern_runs, {}, struct {
         fn lessThan(_: void, a: reader.PatternRun, b: reader.PatternRun) bool {
             return a.paint_order < b.paint_order;
         }
     }.lessThan);
-    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, all_pattern_runs.items, all_shape_runs.items, rotation);
+    return try render.renderPageContentPngInBoxRotated(alloc, page_box, plain_runs.items, image_runs, shading_runs, pattern_runs, shape_runs, rotation);
 }
 
 fn normalizedPageRotation(rotation: ?i32) !render.PageRotation {
@@ -404,14 +350,12 @@ fn scalePageRenderRuns(runs: *reader.PageRenderRuns, scale: f64) void {
 }
 
 fn rasterAxisExtent(min_value: f64, max_value: f64, scale: f64) f64 {
-    return @max(1.0, @ceil(max_value * scale) - @floor(min_value * scale));
+    return @max(1.0, @ceil((max_value - min_value) * scale));
 }
 
 fn alignPageBoxToPixelGrid(box: *reader.PageBox) void {
-    box.min_x = @floor(box.min_x);
-    box.min_y = @floor(box.min_y);
-    box.max_x = @max(box.min_x + 1.0, @ceil(box.max_x));
-    box.max_y = @max(box.min_y + 1.0, @ceil(box.max_y));
+    box.max_x = box.min_x + @max(1.0, @ceil(box.max_x - box.min_x));
+    box.max_y = box.min_y + @max(1.0, @ceil(box.max_y - box.min_y));
 }
 
 test "raster extents include fractional crop-box edges" {
@@ -422,16 +366,16 @@ test "raster extents include fractional crop-box edges" {
         .max_y = 842.16,
     };
     const scale = 150.0 / 72.0;
-    try std.testing.expectEqual(@as(f64, 1241), rasterAxisExtent(box.min_x, box.max_x, scale));
-    try std.testing.expectEqual(@as(f64, 1755), rasterAxisExtent(box.min_y, box.max_y, scale));
+    try std.testing.expectEqual(@as(f64, 1240), rasterAxisExtent(box.min_x, box.max_x, scale));
+    try std.testing.expectEqual(@as(f64, 1754), rasterAxisExtent(box.min_y, box.max_y, scale));
 
     var scaled = box;
     scaleBox(&scaled, scale);
     alignPageBoxToPixelGrid(&scaled);
-    try std.testing.expectEqual(@as(f64, 1), scaled.min_x);
-    try std.testing.expectEqual(@as(f64, 0), scaled.min_y);
-    try std.testing.expectEqual(@as(f64, 1242), scaled.max_x);
-    try std.testing.expectEqual(@as(f64, 1755), scaled.max_y);
+    try std.testing.expectApproxEqAbs(1.500002083, scaled.min_x, 0.000001);
+    try std.testing.expectApproxEqAbs(0.999991667, scaled.min_y, 0.000001);
+    try std.testing.expectApproxEqAbs(1241.500002083, scaled.max_x, 0.000001);
+    try std.testing.expectApproxEqAbs(1754.999991667, scaled.max_y, 0.000001);
 }
 
 fn dupTextRunAlloc(alloc: Allocator, run: reader.TextRun) !reader.TextRun {
@@ -476,11 +420,13 @@ fn dupShapeRunAlloc(alloc: Allocator, run: reader.ShapeRun) !reader.ShapeRun {
     out.dash_array = null;
     out.clip_points = null;
     out.points = &.{};
+    out.subpath_starts = null;
     errdefer out.deinit(alloc);
 
     if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
     if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
     out.points = try alloc.dupe([2]f64, run.points);
+    if (run.subpath_starts) |starts| out.subpath_starts = try alloc.dupe(usize, starts);
     return out;
 }
 
@@ -489,6 +435,7 @@ fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternR
     out.dash_array = null;
     out.clip_points = null;
     out.points = &.{};
+    out.subpath_starts = null;
     out.shading = null;
     out.tile_text_runs = &.{};
     out.tile_image_runs = &.{};
@@ -500,6 +447,7 @@ fn dupPatternRunAlloc(alloc: Allocator, run: reader.PatternRun) !reader.PatternR
     if (run.dash_array) |dash| out.dash_array = try alloc.dupe(f64, dash);
     if (run.clip_points) |points| out.clip_points = try alloc.dupe([2]f64, points);
     out.points = try alloc.dupe([2]f64, run.points);
+    if (run.subpath_starts) |starts| out.subpath_starts = try alloc.dupe(usize, starts);
     if (run.shading) |shading| out.shading = try dupShadingRunAlloc(alloc, shading);
 
     if (run.tile_text_runs.len > 0) {
@@ -2360,8 +2308,8 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
         "/CharStrings 4 dict dup begin\n" ++
         "/.notdef <8B8B150E> def\n" ++
         "/A <8B8B15F77C8B05FB7CFA7C05FB7CFB7C050E> def\n" ++
-        "/period <8B8B15938B058B93058D8B058B8D050E> def\n" ++
-        "/Aperiod <8BF75CF7C0CCB90C060E> def\n" ++
+        "/acute <8B8B15938B058B93058D8B058B8D050E> def\n" ++
+        "/Aacute <8BF75CF7C0CCF7560C060E> def\n" ++
         "end readonly def\n";
 
     const content = "BT\n/F1 20 Tf\n10 10 Td\n(A) Tj\nET\n";
@@ -2370,7 +2318,7 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
     const obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n";
     const obj4 = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
     defer alloc.free(obj4);
-    const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /TestT1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /Aperiod] >> /FontDescriptor 6 0 R >>\nendobj\n";
+    const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /TestT1 /FirstChar 65 /LastChar 65 /Widths [1000] /Encoding << /Differences [65 /Aacute] >> /FontDescriptor 6 0 R >>\nendobj\n";
     const obj6 = "6 0 obj\n<< /Type /FontDescriptor /FontName /TestT1 /FontFile 7 0 R >>\nendobj\n";
 
     var out = std.ArrayList(u8).empty;
@@ -2411,6 +2359,9 @@ test "reader extracts vector text shapes for embedded FontFile type1 seac glyph"
 
     var parsed = try reader.Reader.init(alloc, out.items);
     defer parsed.deinit();
+    const extracted = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(extracted);
+    try std.testing.expectEqualStrings("Á\n", extracted);
     const runs = try parsed.extractPageVectorTextShapeRunsAlloc(1);
     defer {
         for (runs) |*run| run.deinit(alloc);
@@ -2501,16 +2452,20 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     const font_bytes = try buildSimpleOpenTypeCffFontAlloc(alloc);
     defer alloc.free(font_bytes);
 
-    const content = "BT\n/F1 20 Tf\n10 10 Td\n<0041> Tj\nET\n";
+    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00010001> Tj\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
         "begincmap\n" ++
         "1 begincodespacerange\n" ++
-        "<0000> <FFFF>\n" ++
+        // Extraction consumes the whole string as one four-byte code while
+        // Identity-H painting must still consume two fixed-width CIDs.
+        "<00000000> <FFFFFFFF>\n" ++
         "endcodespacerange\n" ++
         "1 beginbfchar\n" ++
-        "<0041> <0041>\n" ++
+        // Extraction deliberately disagrees with both the raw CID and the
+        // font's only cmap entry. Painting must still select both CFF CID 1s.
+        "<00010001> <0042>\n" ++
         "endbfchar\n" ++
         "endcmap\n" ++
         "end\n" ++
@@ -2522,7 +2477,7 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     const obj4 = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ content.len, content });
     defer alloc.free(obj4);
     const obj5 = "5 0 obj\n<< /Type /Font /Subtype /Type0 /BaseFont /TestCID /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>\nendobj\n";
-    const obj6 = "6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /TestCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /FontDescriptor 7 0 R >>\nendobj\n";
+    const obj6 = "6 0 obj\n<< /Type /Font /Subtype /CIDFontType0 /BaseFont /TestCID /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> /DW 700 /W [1 [250]] /FontDescriptor 7 0 R >>\nendobj\n";
     const obj7 = "7 0 obj\n<< /Type /FontDescriptor /FontName /TestCID /FontFile3 9 0 R >>\nendobj\n";
     const obj8 = try std.fmt.allocPrint(alloc, "8 0 obj\n<< /Length {d} >>\nstream\n{s}endstream\nendobj\n", .{ cmap.len, cmap });
     defer alloc.free(obj8);
@@ -2567,6 +2522,21 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF glyph pdf 
     try out.appendSlice(alloc, startxref);
     try out.appendSlice(alloc, "%%EOF\n");
 
+    var parsed = try reader.Reader.init(alloc, out.items);
+    defer parsed.deinit();
+    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    try std.testing.expectEqualStrings("B\n", analysis.text);
+    try std.testing.expectEqual(@as(usize, 1), analysis.runs.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), analysis.runs[0].advance_width, 0.001);
+    try std.testing.expect(!analysis.outline_fallback);
+    const native_shapes = try parsed.extractPageVectorTextShapeRunsAlloc(1);
+    defer {
+        for (native_shapes) |*shape| shape.deinit(alloc);
+        if (native_shapes.len > 0) alloc.free(native_shapes);
+    }
+    try std.testing.expect(native_shapes.len > 0);
+
     const backend = Backend.native();
     const png = try backend.renderFirstPagePng(alloc, out.items);
     defer alloc.free(png);
@@ -2578,7 +2548,7 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF fdselect g
     const font_bytes = try buildFdSelectOpenTypeCffFontAlloc(alloc);
     defer alloc.free(font_bytes);
 
-    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00410042> Tj\nET\n";
+    const content = "BT\n/F1 20 Tf\n10 10 Td\n<00010002> Tj\nET\n";
     const cmap =
         "/CIDInit /ProcSet findresource begin\n" ++
         "12 dict begin\n" ++
@@ -2587,8 +2557,8 @@ test "native backend renders embedded Type0 CIDFontType0 OpenType CFF fdselect g
         "<0000> <FFFF>\n" ++
         "endcodespacerange\n" ++
         "2 beginbfchar\n" ++
-        "<0041> <0041>\n" ++
-        "<0042> <0042>\n" ++
+        "<0001> <0041>\n" ++
+        "<0002> <0042>\n" ++
         "endbfchar\n" ++
         "endcmap\n" ++
         "end\n" ++

@@ -19,9 +19,14 @@ pub const Error = error{
     MissingTable,
     TruncatedSfnt,
     InvalidGlyphIndex,
+    GlyphOutlineTooComplex,
 };
 
 const ParseError = Error || std.mem.Allocator.Error;
+
+pub const OutlineLimits = struct {
+    max_points: usize = std.math.maxInt(usize),
+};
 
 pub const GlyphPoint = struct {
     x: f64,
@@ -279,11 +284,44 @@ pub const Font = struct {
         return null;
     }
 
-    pub fn glyphOutlineAlloc(self: Font, alloc: std.mem.Allocator, glyph_index: u16) ParseError!?GlyphOutline {
-        return try self.glyphOutlineAllocDepth(alloc, glyph_index, 0);
+    /// Look up a codepoint in one exact cmap platform/encoding pair. PDF
+    /// symbolic TrueType fonts must prefer the Windows symbol cmap (3, 0)
+    /// even when the SFNT also contains a Unicode cmap.
+    pub fn cmapGlyphIndexForPlatform(self: Font, platform: u16, encoding: u16, codepoint: u21) Error!?u16 {
+        const cmap = self.findTable(.{ 'c', 'm', 'a', 'p' }) orelse return error.MissingTable;
+        const data = try self.tableBytes(cmap);
+        if (data.len < 4) return error.TruncatedSfnt;
+        const num_tables = readU16(data, 2);
+        var i: usize = 0;
+        while (i < num_tables) : (i += 1) {
+            const base = 4 + i * 8;
+            if (base + 8 > data.len) return error.TruncatedSfnt;
+            if (readU16(data, base) != platform or readU16(data, base + 2) != encoding) continue;
+            const sub_offset = readU32(data, base + 4);
+            if (sub_offset >= data.len) return error.TruncatedSfnt;
+            const sub = data[sub_offset..];
+            if (sub.len < 2) return error.TruncatedSfnt;
+            const glyph = switch (readU16(sub, 0)) {
+                0 => try cmapFormat0Glyph(sub, codepoint),
+                4 => try cmapFormat4Glyph(sub, codepoint),
+                12 => try cmapFormat12Glyph(sub, codepoint),
+                else => null,
+            };
+            if (glyph != null) return glyph;
+        }
+        return null;
     }
 
-    fn glyphOutlineAllocDepth(self: Font, alloc: std.mem.Allocator, glyph_index: u16, depth: u8) ParseError!?GlyphOutline {
+    pub fn glyphOutlineAlloc(self: Font, alloc: std.mem.Allocator, glyph_index: u16) ParseError!?GlyphOutline {
+        return self.glyphOutlineAllocLimited(alloc, glyph_index, .{});
+    }
+
+    pub fn glyphOutlineAllocLimited(self: Font, alloc: std.mem.Allocator, glyph_index: u16, limits: OutlineLimits) ParseError!?GlyphOutline {
+        var remaining_points = limits.max_points;
+        return self.glyphOutlineAllocDepth(alloc, glyph_index, &remaining_points, 0);
+    }
+
+    fn glyphOutlineAllocDepth(self: Font, alloc: std.mem.Allocator, glyph_index: u16, remaining_points: *usize, depth: u8) ParseError!?GlyphOutline {
         if (depth > 8) return error.InvalidSfnt;
         const range = try self.glyphRange(glyph_index);
         if (range.length == 0) return null;
@@ -295,7 +333,7 @@ pub const Font = struct {
         if (data.len < 10) return error.TruncatedSfnt;
 
         const num_contours = readI16(data, 0);
-        if (num_contours < 0) return try self.parseCompositeGlyphOutlineAlloc(alloc, data, depth);
+        if (num_contours < 0) return try self.parseCompositeGlyphOutlineAlloc(alloc, data, remaining_points, depth);
         if (num_contours == 0) {
             return GlyphOutline{
                 .contours = try alloc.alloc(GlyphContour, 0),
@@ -308,6 +346,7 @@ pub const Font = struct {
 
         var cursor: usize = 10;
         const contour_count: usize = @intCast(num_contours);
+        if (contour_count > remaining_points.*) return error.GlyphOutlineTooComplex;
         if (cursor + contour_count * 2 > data.len) return error.TruncatedSfnt;
         const end_pts = try alloc.alloc(u16, contour_count);
         defer alloc.free(end_pts);
@@ -316,6 +355,8 @@ pub const Font = struct {
         }
         cursor += contour_count * 2;
         const point_count = @as(usize, end_pts[contour_count - 1]) + 1;
+        if (point_count > remaining_points.*) return error.GlyphOutlineTooComplex;
+        remaining_points.* -= point_count;
 
         if (cursor + 2 > data.len) return error.TruncatedSfnt;
         const instruction_len = readU16(data, cursor);
@@ -388,6 +429,7 @@ pub const Font = struct {
         var start_index: usize = 0;
         for (contours, 0..) |*contour, contour_index| {
             const end_index = @as(usize, end_pts[contour_index]);
+            if (end_index < start_index or end_index >= point_count) return error.InvalidSfnt;
             const count = end_index - start_index + 1;
             contour.* = .{ .points = try alloc.alloc(GlyphPoint, count) };
             for (contour.points, 0..) |*point, i| {
@@ -410,7 +452,7 @@ pub const Font = struct {
         };
     }
 
-    fn parseCompositeGlyphOutlineAlloc(self: Font, alloc: std.mem.Allocator, data: []const u8, depth: u8) ParseError!?GlyphOutline {
+    fn parseCompositeGlyphOutlineAlloc(self: Font, alloc: std.mem.Allocator, data: []const u8, remaining_points: *usize, depth: u8) ParseError!?GlyphOutline {
         var cursor: usize = 10;
         var last_flags: u16 = 0;
         var contours = std.ArrayList(GlyphContour).empty;
@@ -466,7 +508,7 @@ pub const Font = struct {
                 cursor += 8;
             }
 
-            if (try self.glyphOutlineAllocDepth(alloc, component_glyph, depth + 1)) |child_value| {
+            if (try self.glyphOutlineAllocDepth(alloc, component_glyph, remaining_points, depth + 1)) |child_value| {
                 var child = child_value;
                 defer child.deinit(alloc);
                 for (child.contours) |contour| {
@@ -878,6 +920,8 @@ test "sfnt reader maps cmap and extracts simple glyph outline" {
     defer font.deinit(alloc);
 
     try std.testing.expectEqual(@as(?u16, 1), try font.cmapGlyphIndex('A'));
+    try std.testing.expectEqual(@as(?u16, 1), try font.cmapGlyphIndexForPlatform(3, 1, 'A'));
+    try std.testing.expectEqual(@as(?u16, null), try font.cmapGlyphIndexForPlatform(3, 0, 'A'));
     try std.testing.expectEqual(@as(u16, 1000), try font.advanceWidth(1));
 
     var outline = (try font.glyphOutlineAlloc(alloc, 1)).?;
@@ -888,6 +932,61 @@ test "sfnt reader maps cmap and extracts simple glyph outline" {
     try std.testing.expectApproxEqAbs(@as(f64, 1000), outline.contours[0].points[1].x, 0.001);
     try std.testing.expectApproxEqAbs(@as(f64, 1000), outline.contours[0].points[2].y, 0.001);
     try std.testing.expect(outline.contours[0].points[0].on_curve);
+}
+
+test "exact cmap lookup continues across matching encoding records" {
+    const alloc = std.testing.allocator;
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(alloc);
+
+    // One cmap table with two Windows symbol encoding records. The first
+    // valid subtable has no mapping for A; the second maps A to GID 7.
+    const cmap_offset: u32 = 28;
+    const cmap_header_len: usize = 4 + 2 * 8;
+    const format0_len: usize = 262;
+    const cmap_len: u32 = @intCast(cmap_header_len + 2 * format0_len);
+    try appendU32(alloc, &bytes, 0x00010000);
+    try appendU16(alloc, &bytes, 1);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, 0);
+    try appendTag(alloc, &bytes, .{ 'c', 'm', 'a', 'p' });
+    try appendU32(alloc, &bytes, 0);
+    try appendU32(alloc, &bytes, cmap_offset);
+    try appendU32(alloc, &bytes, cmap_len);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, 2);
+    try appendU16(alloc, &bytes, 3);
+    try appendU16(alloc, &bytes, 0);
+    try appendU32(alloc, &bytes, cmap_header_len);
+    try appendU16(alloc, &bytes, 3);
+    try appendU16(alloc, &bytes, 0);
+    try appendU32(alloc, &bytes, cmap_header_len + format0_len);
+
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, format0_len);
+    try appendU16(alloc, &bytes, 0);
+    try bytes.appendNTimes(alloc, 0, 256);
+    try appendU16(alloc, &bytes, 0);
+    try appendU16(alloc, &bytes, format0_len);
+    try appendU16(alloc, &bytes, 0);
+    var glyphs = [_]u8{0} ** 256;
+    glyphs['A'] = 7;
+    try bytes.appendSlice(alloc, &glyphs);
+
+    var font = try Font.init(alloc, bytes.items);
+    defer font.deinit(alloc);
+    try std.testing.expectEqual(@as(?u16, 7), try font.cmapGlyphIndexForPlatform(3, 0, 'A'));
+}
+
+test "sfnt reader rejects an outline before exceeding its point limit" {
+    const alloc = std.testing.allocator;
+    const bytes = try buildSimpleTrueTypeFontAlloc(alloc);
+    defer alloc.free(bytes);
+
+    var font = try Font.init(alloc, bytes);
+    defer font.deinit(alloc);
+    try std.testing.expectError(error.GlyphOutlineTooComplex, font.glyphOutlineAllocLimited(alloc, 1, .{ .max_points = 2 }));
 }
 
 test "sfnt reader extracts composite glyph outline" {
