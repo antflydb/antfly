@@ -30,6 +30,18 @@ pub const atomic_table_topology_version: u16 = 3;
 /// preconditions.
 pub const extension_lifecycle_table_cas_version: u16 = 4;
 
+/// Atomic topology entries introduce a new Raft command tag. Capability
+/// probes cannot make a same-release rolling upgrade safe: a peer can restart
+/// into an older binary after a successful probe and still retain the same
+/// Raft membership identity. Ship the decoder first, then change this
+/// compile-time release stage only after every supported predecessor can
+/// decode the command. There is deliberately no runtime override.
+pub const AtomicTableTopologyRollout = enum {
+    decoder_only,
+    enabled,
+};
+pub const atomic_table_topology_rollout: AtomicTableTopologyRollout = .decoder_only;
+
 /// Creating thousands of Raft groups is an operational workflow, not one
 /// catalog request. Keep one create bounded in CPU, memory, and log growth.
 pub const max_initial_ranges: u32 = 1024;

@@ -2839,6 +2839,16 @@ pub const MetadataService = struct {
         }
     }
 
+    pub fn verifyTableDropRangesProjection(self: *MetadataService, alloc: std.mem.Allocator, range_group_ids: []const u64) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        for (range_group_ids) |group_id| {
+            if (try store.getRange(alloc, self.metadata_group_id, group_id)) |projected| {
+                metadata_table_manager.freeRange(alloc, projected);
+                return error.TableTransitionActive;
+            }
+        }
+    }
+
     pub fn verifyExtensionLifecycleProjection(
         self: *MetadataService,
         delta: metadata_storage.ExtensionLifecycleDelta,
@@ -2868,6 +2878,17 @@ pub const MetadataService = struct {
 
     pub fn unlockTableCatalogMutation(self: *MetadataService, table_name: []const u8) void {
         self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
+        self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
+    }
+
+    /// Decoder-only topology rollout uses the legacy control loop, which
+    /// takes the exclusive catalog lock itself. Hold only the same-table lane
+    /// here to avoid recursively upgrading a shared catalog lock.
+    pub fn lockTableWorkflowMutation(self: *MetadataService, table_name: []const u8) void {
+        self.tableCatalogMutationLane(table_name).lockUncancelable(std.Options.debug_io);
+    }
+
+    pub fn unlockTableWorkflowMutation(self: *MetadataService, table_name: []const u8) void {
         self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
     }
 
@@ -7011,6 +7032,16 @@ pub const MetadataHttpService = struct {
         }
     }
 
+    pub fn verifyTableDropRangesProjection(self: *MetadataHttpService, alloc: std.mem.Allocator, range_group_ids: []const u64) !void {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        for (range_group_ids) |group_id| {
+            if (try store.getRange(alloc, self.metadata_group_id, group_id)) |projected| {
+                metadata_table_manager.freeRange(alloc, projected);
+                return error.TableTransitionActive;
+            }
+        }
+    }
+
     pub fn verifyExtensionLifecycleProjection(
         self: *MetadataHttpService,
         delta: metadata_storage.ExtensionLifecycleDelta,
@@ -7403,6 +7434,14 @@ pub const MetadataHttpService = struct {
 
     pub fn unlockTableCatalogMutation(self: *MetadataHttpService, table_name: []const u8) void {
         self.catalog_mutation_mutex.unlockShared(std.Options.debug_io);
+        self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
+    }
+
+    pub fn lockTableWorkflowMutation(self: *MetadataHttpService, table_name: []const u8) void {
+        self.tableCatalogMutationLane(table_name).lockUncancelable(std.Options.debug_io);
+    }
+
+    pub fn unlockTableWorkflowMutation(self: *MetadataHttpService, table_name: []const u8) void {
         self.tableCatalogMutationLane(table_name).unlock(std.Options.debug_io);
     }
 

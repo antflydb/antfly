@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const platform_time = @import("antfly_platform").time;
 const fs_paths = @import("../../common/fs_paths.zig");
 const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const http_server = @import("../transport/http_server.zig");
@@ -41,7 +42,13 @@ pub const FileSnapshotStore = struct {
     const artifact_maintenance_interval_ns: u64 = std.time.ns_per_min;
     const FetchLease = struct {
         generation: snapshot_transfer.Generation,
-        deadline_ns: i128,
+        deadline_ns: u64,
+    };
+
+    const ArtifactHeader = struct {
+        generation: snapshot_transfer.Generation,
+        data_offset: u64,
+        data_len: u64,
     };
 
     alloc: std.mem.Allocator,
@@ -262,16 +269,13 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2.part");
         defer self.alloc.free(path);
-        var identified = try self.readManifestWithGeneration(self.alloc, path);
-        defer identified.manifest.deinit(self.alloc);
-        try requireGeneration(generation, identified.generation);
-        const manifest = identified.manifest;
-        if (offset > manifest.data_len or body.len > manifest.data_len - offset)
-            return error.InvalidSnapshotChunkRange;
-        const data_offset = try self.dataOffset(path);
         var file = try std.Io.Dir.cwd().openFile(io(self), path, .{ .mode = .read_write });
         defer file.close(io(self));
-        try file.writePositionalAll(io(self), body, data_offset + offset);
+        const header = try self.readArtifactHeader(&file);
+        try requireGeneration(generation, header.generation);
+        if (offset > header.data_len or body.len > header.data_len - offset)
+            return error.InvalidSnapshotChunkRange;
+        try file.writePositionalAll(io(self), body, header.data_offset + offset);
     }
 
     fn commitChunkedSnapshot(
@@ -410,18 +414,16 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2");
         defer self.alloc.free(path);
-        var identified = try self.readManifestWithGeneration(alloc, path);
-        defer identified.manifest.deinit(alloc);
-        try requireGeneration(generation, identified.generation);
-        const manifest = identified.manifest;
-        try self.renewFetchLease(snapshot_id, generation);
-        if (offset >= manifest.data_len) return try alloc.dupe(u8, &.{});
-        const len: usize = @intCast(@min(max_len, manifest.data_len - offset));
-        const chunk = try alloc.alloc(u8, len);
-        errdefer alloc.free(chunk);
         var file = try std.Io.Dir.cwd().openFile(io(self), path, .{});
         defer file.close(io(self));
-        const read = try file.readPositionalAll(io(self), chunk, try self.dataOffset(path) + offset);
+        const header = try self.readArtifactHeader(&file);
+        try requireGeneration(generation, header.generation);
+        try self.renewFetchLease(snapshot_id, generation);
+        if (offset >= header.data_len) return try alloc.dupe(u8, &.{});
+        const len: usize = @intCast(@min(max_len, header.data_len - offset));
+        const chunk = try alloc.alloc(u8, len);
+        errdefer alloc.free(chunk);
+        const read = try file.readPositionalAll(io(self), chunk, header.data_offset + offset);
         if (read != len) return error.SnapshotArtifactTruncated;
         return chunk;
     }
@@ -438,7 +440,13 @@ pub const FileSnapshotStore = struct {
         defer lock.unlock();
         const path = try self.transferPath(snapshot_id, ".v2.part");
         defer self.alloc.free(path);
-        const current_generation = try self.readGeneration(self.alloc, path);
+        const current_generation = self.readGeneration(self.alloc, path) catch |err| switch (err) {
+            // Abort owns staging only. A retry after commit (or after a
+            // successful earlier abort) must not inspect or remove the
+            // committed artifact with the same snapshot id.
+            error.FileNotFound => return,
+            else => return err,
+        };
         try requireGeneration(generation, current_generation);
         const deleted = if (std.Io.Dir.cwd().deleteFile(io(self), path))
             true
@@ -525,7 +533,8 @@ pub const FileSnapshotStore = struct {
             else => return err,
         };
         defer dir.close(io(self));
-        const now_ns = std.Io.Timestamp.now(io(self), .real).toNanoseconds();
+        const realtime_now_ns = std.Io.Timestamp.now(io(self), .real).toNanoseconds();
+        const monotonic_now_ns = platform_time.monotonicNs();
         var deleted = false;
         var iter = dir.iterateAssumeFirstIteration();
         while (try iter.next(io(self))) |entry| {
@@ -539,7 +548,7 @@ pub const FileSnapshotStore = struct {
                 self.cfg.artifact_policy.staging_ttl_ns
             else
                 self.cfg.artifact_policy.committed_ttl_ns;
-            if (ttl_ns <= 0 or now_ns -| stat.mtime.toNanoseconds() < ttl_ns) continue;
+            if (ttl_ns <= 0 or realtime_now_ns -| stat.mtime.toNanoseconds() < ttl_ns) continue;
             const lock = self.uploadLock(artifact.snapshot_id);
             if (!lock.tryLock()) continue;
             const removed = removed: {
@@ -552,7 +561,7 @@ pub const FileSnapshotStore = struct {
                         else => return err,
                     };
                     if (generation) |value| {
-                        if (self.fetchLeaseActive(artifact.snapshot_id, value, now_ns))
+                        if (self.fetchLeaseActive(artifact.snapshot_id, value, monotonic_now_ns))
                             break :removed false;
                     }
                 }
@@ -560,7 +569,7 @@ pub const FileSnapshotStore = struct {
                     error.FileNotFound => break :removed false,
                     else => return err,
                 };
-                if (now_ns -| current.mtime.toNanoseconds() < ttl_ns) break :removed false;
+                if (realtime_now_ns -| current.mtime.toNanoseconds() < ttl_ns) break :removed false;
                 dir.deleteFile(io(self), entry.name) catch |err| switch (err) {
                     error.FileNotFound => break :removed false,
                     else => return err,
@@ -577,8 +586,9 @@ pub const FileSnapshotStore = struct {
         snapshot_id: []const u8,
         generation: snapshot_transfer.Generation,
     ) !void {
-        const deadline = std.Io.Timestamp.now(io(self), .real).toNanoseconds() +|
-            self.cfg.artifact_policy.active_fetch_lease_ns;
+        const lease_ns = std.math.cast(u64, self.cfg.artifact_policy.active_fetch_lease_ns) orelse
+            std.math.maxInt(u64);
+        const deadline = platform_time.monotonicNs() +| lease_ns;
         platform_sync.lockYielding(&self.fetch_lease_mutex);
         defer self.fetch_lease_mutex.unlock();
         if (self.fetch_leases.getPtr(snapshot_id)) |existing| {
@@ -609,7 +619,7 @@ pub const FileSnapshotStore = struct {
         self: *FileSnapshotStore,
         snapshot_id: []const u8,
         generation: snapshot_transfer.Generation,
-        now_ns: i128,
+        now_ns: u64,
     ) bool {
         platform_sync.lockYielding(&self.fetch_lease_mutex);
         defer self.fetch_lease_mutex.unlock();
@@ -621,7 +631,7 @@ pub const FileSnapshotStore = struct {
     }
 
     fn deferArtifactMaintenance(self: *FileSnapshotStore) void {
-        const now_ns: u64 = @intCast(std.Io.Timestamp.now(io(self), .real).toNanoseconds());
+        const now_ns = platform_time.monotonicNs();
         self.next_artifact_maintenance_ns.store(now_ns +| artifact_maintenance_interval_ns, .release);
     }
 
@@ -630,7 +640,7 @@ pub const FileSnapshotStore = struct {
     /// reclaims expired artifacts. Only one request performs the directory
     /// scan; chunk traffic remains on its O(1) striped-lock path.
     fn maybeRunArtifactMaintenance(self: *FileSnapshotStore) void {
-        const now_ns: u64 = @intCast(std.Io.Timestamp.now(io(self), .real).toNanoseconds());
+        const now_ns = platform_time.monotonicNs();
         const previous = self.next_artifact_maintenance_ns.load(.acquire);
         if (previous != 0 and now_ns < previous) return;
         if (self.next_artifact_maintenance_ns.cmpxchgStrong(
@@ -705,6 +715,33 @@ pub const FileSnapshotStore = struct {
         var manifest = try snapshot_transfer.decode(alloc, encoded);
         defer manifest.deinit(alloc);
         return try snapshot_transfer.generationFromEncodedManifest(encoded);
+    }
+
+    /// Read the immutable artifact framing and generation with one file open
+    /// and a fixed amount of I/O. Chunk requests do not need to allocate or
+    /// decode the full manifest; begin/commit remain the validation points for
+    /// its checksum and semantic fields.
+    fn readArtifactHeader(self: *FileSnapshotStore, file: *std.Io.File) !ArtifactHeader {
+        var encoded_len: [@sizeOf(u32)]u8 = undefined;
+        if (try file.readPositionalAll(io(self), &encoded_len, 0) != encoded_len.len)
+            return error.InvalidSnapshotManifest;
+        const manifest_len: u64 = std.mem.readInt(u32, &encoded_len, .little);
+        if (manifest_len < snapshot_transfer.digest_len or
+            manifest_len > snapshot_transfer.max_manifest_bytes)
+            return error.InvalidSnapshotManifest;
+        const data_offset = std.math.add(u64, encoded_len.len, manifest_len) catch
+            return error.InvalidSnapshotManifest;
+        const file_len = try file.length(io(self));
+        if (file_len < data_offset) return error.InvalidSnapshotManifest;
+        var generation: snapshot_transfer.Generation = undefined;
+        const generation_offset = data_offset - snapshot_transfer.digest_len;
+        if (try file.readPositionalAll(io(self), &generation, generation_offset) != generation.len)
+            return error.InvalidSnapshotManifest;
+        return .{
+            .generation = generation,
+            .data_offset = data_offset,
+            .data_len = file_len - data_offset,
+        };
     }
 
     fn requireGeneration(
@@ -926,6 +963,10 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
         replacement_generation,
         false,
     )) == null);
+    // Abort is scoped to the unpublished staging generation. Retrying it
+    // after commit is a no-op and must leave the committed artifact intact.
+    try iface.vtable.abort_chunked_snapshot.?(iface.ptr, "snap-v2", replacement_generation);
+    try iface.vtable.abort_chunked_snapshot.?(iface.ptr, "snap-v2", replacement_generation);
     const tail = try iface.vtable.get_snapshot_chunk.?(iface.ptr, std.testing.allocator, "snap-v2", replacement_generation, 5, 4);
     defer std.testing.allocator.free(tail);
     try std.testing.expectEqualStrings(body[5..9], tail);
