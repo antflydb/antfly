@@ -7686,6 +7686,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "db restore snapshot replays managed chunked dense embeddings",
             "native restore backend configuration is resolved exactly once",
+            "native restore filesystem publication rejects non-publishable storage capabilities",
         },
     });
     const run_db_restore_managed_tests = addFilteredTestRunArtifact(b, db_restore_managed_tests);

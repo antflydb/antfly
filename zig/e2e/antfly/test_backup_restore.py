@@ -685,11 +685,12 @@ def test_table_backup_restore_round_trip(backup_api):
         )
 
 
+@pytest.mark.parametrize("backup_format", ["portable", "native"])
 def test_table_backup_restore_round_trip_managed_chunked_semantic(
-    backup_api, rate_limited_openai_embedder
+    backup_api, rate_limited_openai_embedder, backup_format: str
 ):
-    table_name = f"backup_chunked_semantic_{time.time_ns()}"
-    backup_id = f"backup-chunked-semantic-{time.time_ns()}"
+    table_name = f"backup_{backup_format}_chunked_semantic_{time.time_ns()}"
+    backup_id = f"backup-{backup_format}-chunked-semantic-{time.time_ns()}"
 
     created = backup_api.create_table(
         table_name, num_shards=1, description="chunked semantic backup docs"
@@ -800,10 +801,11 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
             table_name,
             backup_id=backup_id,
             location=location,
-            backup_format="native",
+            backup_format=backup_format,
         )
         assert backup["backup"] == "successful"
-        rate_limited_openai_embedder.deny_requests()
+        if backup_format == "native":
+            rate_limited_openai_embedder.deny_requests()
         embedder_before_restore = rate_limited_openai_embedder.stats()
 
         deleted = backup_api.delete_table(table_name)
@@ -837,24 +839,56 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(
         after_status = backup_api.get_index(table_name, "semantic_chunked_idx")[
             "status"
         ]
-        assert after_status["readiness"]["incarnation"] == before_readiness_incarnation
-        assert {
-            key: after_status["coverage"].get(key) for key in before_coverage
-        } == before_coverage
-        assert {key: after_status.get(key) for key in before_counts} == before_counts
+        if backup_format == "native":
+            assert (
+                after_status["readiness"]["incarnation"] == before_readiness_incarnation
+            )
+            assert {
+                key: after_status["coverage"].get(key) for key in before_coverage
+            } == before_coverage
+            assert {
+                key: after_status.get(key) for key in before_counts
+            } == before_counts
 
-        semantic_after = _dense_top_hit(
-            backup_api,
-            table_name,
-            [1.0, 0.0, 0.0],
-            "semantic_chunked_idx",
-            "doc:a",
-        )
-        assert semantic_after is not None, {
-            "status": after_status,
-            "logs": backup_api.debug_logs(),
-        }
-        assert rate_limited_openai_embedder.stats() == embedder_before_restore
+            semantic_after = _dense_top_hit(
+                backup_api,
+                table_name,
+                [1.0, 0.0, 0.0],
+                "semantic_chunked_idx",
+                "doc:a",
+            )
+            assert semantic_after is not None, {
+                "status": after_status,
+                "logs": backup_api.debug_logs(),
+            }
+            assert rate_limited_openai_embedder.stats() == embedder_before_restore
+        else:
+            semantic_after = wait_until(
+                lambda: _semantic_top_hit(
+                    backup_api,
+                    table_name,
+                    "alpha concept",
+                    "semantic_chunked_idx",
+                    "doc:a",
+                ),
+                timeout_s=120.0,
+                interval_s=1.0,
+            )
+            if semantic_after is None:
+                after_query = backup_api.query_table(
+                    table_name,
+                    {
+                        "semantic_search": "alpha concept",
+                        "indexes": ["semantic_chunked_idx"],
+                        "limit": 5,
+                        "fields": ["title", "_chunks", "_embeddings"],
+                    },
+                )
+                raise AssertionError(
+                    "portable semantic restore query did not recover; "
+                    f"status={after_status}, query={after_query}, "
+                    f"logs={backup_api.debug_logs()}"
+                )
 
         after_scan = wait_until(
             lambda: _chunked_doc(

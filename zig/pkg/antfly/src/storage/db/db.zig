@@ -393,7 +393,7 @@ pub const OpenOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     executor: derived_executor_mod.Config = .{},
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
-    /// Private proof installed only by `NativeRestoreOpenPlan.optionsForPath`.
+    /// Private proof installed only by a validated `NativeRestoreOpenPlan`.
     /// A path-bound proof prevents a copied option set from silently skipping
     /// configuration for a different DB namespace.
     _backend_configuration_resolution: ?BackendConfigurationResolution = null,
@@ -464,11 +464,11 @@ pub const OpenOptions = struct {
 /// identity; candidate opens receive an explicit path-bound proof and never
 /// invoke it again.
 pub const NativeRestoreOpenPlan = struct {
-    options: OpenOptions,
-    target_path_fingerprint: u64,
+    _options: OpenOptions,
+    _target_path_fingerprint: u64,
 
-    pub fn optionsForPath(self: @This(), path: []const u8) OpenOptions {
-        var opts = self.options;
+    fn resolvedOptionsForPath(self: @This(), path: []const u8) OpenOptions {
+        var opts = self._options;
         opts._backend_configuration_resolution = .{
             .path_fingerprint = backendConfigurationPathFingerprint(path),
         };
@@ -476,13 +476,27 @@ pub const NativeRestoreOpenPlan = struct {
     }
 
     pub fn optionsForTarget(self: @This(), target_path: []const u8) !OpenOptions {
-        if (backendConfigurationPathFingerprint(target_path) != self.target_path_fingerprint)
+        if (backendConfigurationPathFingerprint(target_path) != self._target_path_fingerprint)
             return error.NativeRestoreTargetPathMismatch;
-        return self.optionsForPath(target_path);
+        return self.resolvedOptionsForPath(target_path);
+    }
+
+    /// Reuses the target's path-independent backend policy only for the
+    /// lifecycle-owned candidate attached to that exact target. Callers cannot
+    /// mint configuration proofs for unrelated paths.
+    pub fn optionsForStagedGeneration(
+        self: @This(),
+        staged_generation: *const generation_lifecycle.StagedGeneration,
+    ) !OpenOptions {
+        const live_path = staged_generation.livePath();
+        if (backendConfigurationPathFingerprint(live_path) != self._target_path_fingerprint)
+            return error.NativeRestoreTargetPathMismatch;
+        try staged_generation.validateLivePath(live_path);
+        return self.resolvedOptionsForPath(staged_generation.path());
     }
 
     pub fn physicalRootMode(self: @This()) OpenOptions.PhysicalRootMode {
-        return self.options.physical_root_mode;
+        return self._options.physical_root_mode;
     }
 };
 
@@ -3856,15 +3870,45 @@ pub const DB = struct {
         // borrowed backend capabilities, but may not smuggle move-only
         // enrichment ownership into it.
         if (opts.enrichment != null) return error.NativeRestoreConfiguratorOwnedStateUnsupported;
-        // Host-directory publication cannot safely rebase a separate index
-        // namespace selected by a path-sensitive configurator. Such providers
-        // must implement backend-owned stage/promote before advertising native
-        // restore support.
-        if (opts.physical_root_mode == .filesystem_managed and opts.index_base_path != null)
+        // Host-directory publication may reuse only path-independent policy
+        // and storage capabilities which explicitly operate on the host paths
+        // supplied by each open. A target-bound store or derived namespace
+        // would make candidate validation touch storage outside the
+        // lifecycle-owned sibling. Such providers must implement backend-owned
+        // stage/promote and advertise `external_backend` instead.
+        if (opts.physical_root_mode == .filesystem_managed and
+            (opts.primary_runtime_store != null or
+                !nativeRestorePrimaryStoragePublicationCompatible(opts.primary_backend) or
+                !nativeRestoreStoragePublicationCompatible(opts.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.change_journal_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.text_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.dense_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.sparse_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.graph_lsm_storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.text_main_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.text_wal_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.dense_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.sparse_lsm_options.storage) or
+                !nativeRestoreStoragePublicationCompatible(opts.index_backends.graph_reverse_lsm_options.storage) or
+                opts.index_base_path != null or
+                !nativeRestoreStoragePublicationCompatible(opts.index_repair_checkpoint_storage)))
+        {
             return error.NativeBackupStorageBackendUnsupported;
+        }
         return .{
-            .options = opts,
-            .target_path_fingerprint = backendConfigurationPathFingerprint(target_path),
+            ._options = opts,
+            ._target_path_fingerprint = backendConfigurationPathFingerprint(target_path),
+        };
+    }
+
+    fn nativeRestoreStoragePublicationCompatible(storage: ?lsm_backend_mod.Storage) bool {
+        return storage == null or storage.?.supportsHostPathGenerationPublication();
+    }
+
+    fn nativeRestorePrimaryStoragePublicationCompatible(primary_backend: PrimaryBackend) bool {
+        return switch (primary_backend) {
+            .lsm, .lsm_memory => |options| nativeRestoreStoragePublicationCompatible(options.storage),
+            .lmdb, .mem => true,
         };
     }
 
@@ -93007,15 +93051,68 @@ test "native restore backend configuration is resolved exactly once" {
 
     const resolved = try DB.resolveNativeRestoreOpenPlan(path, .{ .backend_runtime = runtime.ptr() });
     try std.testing.expectEqual(@as(usize, 1), context.calls);
-    var candidate = try DB.open(alloc, candidate_path, resolved.optionsForPath(candidate_path));
+
+    var transition = try generation_lifecycle.beginProcessExclusiveWithRuntime(path, runtime.ptr());
+    var staged = try transition.beginStaging();
+    var candidate = try DB.open(alloc, staged.path(), try resolved.optionsForStagedGeneration(&staged));
     candidate.close();
     try std.testing.expectEqual(@as(usize, 1), context.calls);
+    staged.deinit();
+    transition.deinit();
+
     var db = try DB.open(alloc, path, try resolved.optionsForTarget(path));
     defer db.close();
     try std.testing.expectEqual(@as(usize, 1), context.calls);
     try std.testing.expectError(
         error.NativeRestoreTargetPathMismatch,
         resolved.optionsForTarget(candidate_path),
+    );
+
+    var unrelated_transition = try generation_lifecycle.beginProcessExclusiveWithRuntime(candidate_path, runtime.ptr());
+    defer unrelated_transition.deinit();
+    var unrelated_staged = try unrelated_transition.beginStaging();
+    defer unrelated_staged.deinit();
+    try std.testing.expectError(
+        error.NativeRestoreTargetPathMismatch,
+        resolved.optionsForStagedGeneration(&unrelated_staged),
+    );
+}
+
+test "native restore filesystem publication rejects non-publishable storage capabilities" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = std.mem.span(tempPath(&path_buf));
+    defer cleanupTempDir(path);
+
+    var memory_storage = lsm_backend_mod.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .storage = memory_storage.storage(),
+        }),
+    );
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .primary_backend = .{ .lsm = .{ .storage = memory_storage.storage() } },
+        }),
+    );
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .index_backends = .{
+                .dense_lsm_storage = memory_storage.storage(),
+            },
+        }),
+    );
+    try std.testing.expectError(
+        error.NativeBackupStorageBackendUnsupported,
+        DB.resolveNativeRestoreOpenPlan(path, .{
+            .index_backends = .{
+                .dense_lsm_options = .{ .storage = memory_storage.storage() },
+            },
+        }),
     );
 }
 

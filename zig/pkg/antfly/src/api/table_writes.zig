@@ -5661,7 +5661,7 @@ pub const BoundTableWriteSource = struct {
         var staged = try transition.beginStaging();
         defer staged.deinit();
         const candidate_open_options = if (native_restore_plan) |resolved|
-            resolved.optionsForPath(staged.path())
+            try resolved.optionsForStagedGeneration(&staged)
         else
             open_options;
 

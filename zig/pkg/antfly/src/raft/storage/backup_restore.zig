@@ -570,7 +570,7 @@ fn prepareRestoreSnapshot(
     );
     if (legacy_restore_plan.physicalRootMode() != .filesystem_managed)
         return error.NativeBackupStorageBackendUnsupported;
-    const legacy_restore_open_options = legacy_restore_plan.optionsForPath(staged_path);
+    const legacy_restore_open_options = try legacy_restore_plan.optionsForStagedGeneration(&staged_generation);
     const snapshot_root = try stageRestoreSnapshot(alloc, io, path, &location, snapshot_path, restore.cancellation);
     defer {
         destroyPathIfExistsWithIo(io, snapshot_root);
@@ -653,7 +653,7 @@ fn applyManifestNativeRestore(
     // source-portable fallback for these backends.
     if (restore_plan.physicalRootMode() != .filesystem_managed)
         return error.NativeBackupStorageBackendUnsupported;
-    const restore_open_options = restore_plan.optionsForPath(staged_path);
+    const restore_open_options = try restore_plan.optionsForStagedGeneration(staged_generation);
     const logical_primary_root = try std.fmt.allocPrint(alloc, "{s}/.native-primary-import", .{staged_path});
     defer alloc.free(logical_primary_root);
     defer destroyPathIfExistsWithIo(io, logical_primary_root);
