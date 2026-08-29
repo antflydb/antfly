@@ -574,7 +574,7 @@ pub const Index = struct {
         };
         const Wire = struct {
             format: []const u8,
-            run_id: ?[]const u8 = null,
+            run_id: []const u8,
             scenario: []const u8,
             source_revision: []const u8 = "unknown",
             target: []const u8 = "native",
@@ -589,14 +589,8 @@ pub const Index = struct {
         var parsed = try std.json.parseFromSlice(Wire, self.allocator, encoded, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const value = parsed.value;
-        var derived_run_id_buffer: [32]u8 = undefined;
-        const run_id = value.run_id orelse try std.fmt.bufPrint(
-            &derived_run_id_buffer,
-            "legacy-{x:0>16}",
-            .{ids.digest(encoded)},
-        );
         try self.appendRun(.{
-            .run_id = run_id,
+            .run_id = value.run_id,
             .aggregate = true,
             .system = "antfly",
             .scenario = value.scenario,
@@ -615,7 +609,7 @@ pub const Index = struct {
             .quarantined_entries = value.corpus.quarantined,
         });
         for (value.properties) |item| try self.appendProperty(.{
-            .run_id = run_id,
+            .run_id = value.run_id,
             .property_id = item.property_id,
             .name = item.name,
             .status = if (std.mem.eql(u8, item.status, "fail")) .fail else if (std.mem.eql(u8, item.status, "not-reached")) .not_reached else .pass,
@@ -625,17 +619,17 @@ pub const Index = struct {
         });
         for (value.failures) |item| {
             try self.appendFingerprint(.{
-                .run_id = run_id,
+                .run_id = value.run_id,
                 .fingerprint = item.fingerprint,
                 .first_history = item.first_history,
                 .smallest_transitions = item.smallest_transitions,
             });
-            try self.appendArtifact(.{ .run_id = run_id, .path = item.first_artifact, .kind = .corpus_entry });
+            try self.appendArtifact(.{ .run_id = value.run_id, .path = item.first_artifact, .kind = .corpus_entry });
             if (!std.mem.eql(u8, item.first_artifact, item.smallest_artifact))
-                try self.appendArtifact(.{ .run_id = run_id, .path = item.smallest_artifact, .kind = .reduced_trace });
+                try self.appendArtifact(.{ .run_id = value.run_id, .path = item.smallest_artifact, .kind = .reduced_trace });
         }
         for (value.artifacts) |path| try self.appendArtifact(.{
-            .run_id = run_id,
+            .run_id = value.run_id,
             .path = path,
             .kind = inferAggregateArtifactKind(path),
             .quarantined = std.mem.indexOf(u8, path, "quarantine") != null,
@@ -888,7 +882,7 @@ test "run index merges results transactionally and queries every relation" {
     try std.testing.expect(std.mem.startsWith(u8, html, "<!doctype html>"));
 }
 
-test "run index ingests aggregate campaign results and legacy aggregate identities" {
+test "run index requires canonical aggregate campaign identities" {
     const aggregate_properties = [_]report.AggregateProperty{.{
         .property_id = 19,
         .name = "campaign.safe",
@@ -946,11 +940,10 @@ test "run index ingests aggregate campaign results and legacy aggregate identiti
     try std.testing.expectEqual(@as(usize, 1), index.fingerprints.items.len);
     try std.testing.expectEqual(@as(usize, 4), index.artifacts.items.len);
 
-    const legacy =
+    const missing_run_id =
         \\{"format":"vopr-run-results-v1","scenario":"legacy","base_seed":1,"budget":{"histories_limit":1,"histories_consumed":1,"transition_limit_per_history":1,"transitions_consumed":1},"histories":{"clean":1,"failed":0,"replay_divergences":0,"harness_errors":0,"exact_replays":1},"corpus":{"entries":1,"quarantined":0,"retained":1},"properties":[],"failures":[],"artifacts":[]}
     ;
-    try std.testing.expectEqual(@as(u64, 1), try index.ingestJson(legacy));
-    try std.testing.expect(std.mem.startsWith(u8, index.runs.items[1].run_id, "legacy-"));
+    try std.testing.expectError(error.MissingField, index.ingestJson(missing_run_id));
 }
 
 test "run index ingest merge and query are allocation-failure safe" {

@@ -18,8 +18,8 @@ pub const Transition = struct {
     /// scalar parameter do not fully describe the operation (for example,
     /// equal-length network packets with different bytes).
     semantic_digest: u64 = 0,
-    /// Required for explicit lifecycle transitions. Legacy fault transitions
-    /// default to a pulse when this is null.
+    /// Required for explicit lifecycle transitions. A one-shot fault action
+    /// is represented canonically as a pulse when this is null.
     fault_phase: ?FaultPhase = null,
     /// Generation-only relative weight. It is deliberately not part of the
     /// stable transition identity or replay payload: exact replay consumes the
@@ -45,11 +45,11 @@ pub const Transition = struct {
 
     pub fn payloadDigest(self: Transition) u64 {
         const actors = ids.derive("transition.payload.actors", self.actor_id orelse 0, self.resource_id orelse 0);
-        const legacy = ids.derive("transition.payload", actors, @bitCast(self.parameter));
+        const base = ids.derive("transition.payload", actors, @bitCast(self.parameter));
         const phased = if (self.fault_phase) |phase|
-            ids.derive("transition.payload.fault-phase", legacy, @as(u64, @intFromEnum(phase)) + 1)
+            ids.derive("transition.payload.fault-phase", base, @as(u64, @intFromEnum(phase)) + 1)
         else
-            legacy;
+            base;
         return if (self.semantic_digest == 0)
             phased
         else

@@ -117,8 +117,8 @@ pub const Check = struct {
 
 pub const check_count = 11;
 
-/// Backward-compatible one-snapshot evaluation for callers that do not run a
-/// scenario through the automatic runner adapter.
+/// Evaluate an explicitly supplied final snapshot when no sampled evidence is
+/// available. This is a canonical input mode, not a legacy format adapter.
 pub fn evaluate(history: anytype, snapshot: ?Snapshot) [check_count]Check {
     var evidence = Evidence{ .final_snapshot = snapshot };
     if (snapshot) |state| {
