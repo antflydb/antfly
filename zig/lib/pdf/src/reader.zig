@@ -190,6 +190,7 @@ const DecodeBudgetAllocator = struct {
     backing: Allocator,
     live_bytes: usize,
     max_live_bytes: usize,
+    cumulative_growth_bytes: usize = 0,
     limit_exceeded: bool = false,
 
     fn init(backing: Allocator, initial_live_bytes: usize, max_live_bytes: usize) DecodeBudgetAllocator {
@@ -218,11 +219,24 @@ const DecodeBudgetAllocator = struct {
         return false;
     }
 
+    fn recordSuccessfulGrowth(self: *DecodeBudgetAllocator, growth: usize) void {
+        self.cumulative_growth_bytes +|= growth;
+    }
+
+    /// Charges allocation churn, not only retained bytes. A capped attempt is
+    /// charged at least its complete allowance even when the rejected growth
+    /// itself was never handed to the backing allocator.
+    fn materializationCharge(self: *const DecodeBudgetAllocator) usize {
+        if (self.limit_exceeded) return @max(self.max_live_bytes, self.cumulative_growth_bytes);
+        return self.cumulative_growth_bytes;
+    }
+
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *DecodeBudgetAllocator = @ptrCast(@alignCast(ctx));
         if (!self.permitsGrowth(len)) return null;
         const ptr = self.backing.rawAlloc(len, alignment, ret_addr) orelse return null;
         self.live_bytes += len;
+        self.recordSuccessfulGrowth(len);
         return ptr;
     }
 
@@ -232,6 +246,7 @@ const DecodeBudgetAllocator = struct {
         if (growth > 0 and !self.permitsGrowth(growth)) return false;
         if (!self.backing.rawResize(memory, alignment, new_len, ret_addr)) return false;
         self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        self.recordSuccessfulGrowth(growth);
         return true;
     }
 
@@ -241,6 +256,7 @@ const DecodeBudgetAllocator = struct {
         if (growth > 0 and !self.permitsGrowth(growth)) return null;
         const ptr = self.backing.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
         self.live_bytes = self.live_bytes -| memory.len +| new_len;
+        self.recordSuccessfulGrowth(growth);
         return ptr;
     }
 
@@ -1100,6 +1116,8 @@ const max_flattened_glyph_points: usize = 4096;
 const max_glyph_charstring_operations: usize = 16_384;
 const min_text_materialization_bytes: usize = 256 * 1024;
 const max_text_materialization_bytes: usize = 64 * 1024 * 1024;
+const min_page_text_materialization_bytes: u64 = 4 * 1024 * 1024;
+const max_page_text_materialization_bytes: u64 = 512 * 1024 * 1024;
 
 /// Caps native outline work in units that track the renderer's dominant
 /// operation: point-in-path edge tests. The allowance scales with the final
@@ -1111,6 +1129,7 @@ const VectorTextWorkBudget = struct {
     remaining_edge_tests: u64,
     remaining_points: u64,
     remaining_resource_bytes: u64,
+    remaining_materialization_bytes: u64,
     raster_pixels: u64,
     scale_x: f64,
     scale_y: f64,
@@ -1121,6 +1140,7 @@ const VectorTextWorkBudget = struct {
             .remaining_edge_tests = std.math.maxInt(u64),
             .remaining_points = std.math.maxInt(u64),
             .remaining_resource_bytes = std.math.maxInt(u64),
+            .remaining_materialization_bytes = max_page_text_materialization_bytes,
             .raster_pixels = 0,
             .scale_x = 1,
             .scale_y = 1,
@@ -1128,14 +1148,22 @@ const VectorTextWorkBudget = struct {
         const page_width = @max(1.0, @abs(page_box.max_x - page_box.min_x));
         const page_height = @max(1.0, @abs(page_box.max_y - page_box.min_y));
         const pixels = saturatedMulU64(resolved.width, resolved.height);
+        const point_budget = saturatedAddU64(saturatedMulU64(pixels, 4), 65_536);
         return .{
             // Allow an average of sixteen edges across the four antialiasing
             // samples below. Dense, valid text routinely crosses the former
             // eight-edge allowance; the budget remains finite and scales
             // linearly with the requested raster.
             .remaining_edge_tests = saturatedMulU64(pixels, 64),
-            .remaining_points = saturatedAddU64(saturatedMulU64(pixels, 4), 65_536),
+            .remaining_points = point_budget,
             .remaining_resource_bytes = @min(saturatedMulU64(pixels, 16), 256 * 1024 * 1024),
+            // Construction can temporarily retain source, flattened, and
+            // destination paths. Bound cumulative allocation churn as well as
+            // the live bytes of each individual paint operator.
+            .remaining_materialization_bytes = @min(
+                @max(saturatedMulU64(point_budget, 32), min_page_text_materialization_bytes),
+                max_page_text_materialization_bytes,
+            ),
             .raster_pixels = pixels,
             .scale_x = @as(f64, @floatFromInt(resolved.width)) / page_width,
             .scale_y = @as(f64, @floatFromInt(resolved.height)) / page_height,
@@ -1189,14 +1217,26 @@ const VectorTextWorkBudget = struct {
     /// flattened size here: that turns ordinary dense text into a page-wide
     /// bitmap fallback even when its actual outlines are small.
     fn textMaterializationByteLimit(self: *const VectorTextWorkBudget) ?usize {
-        if (self.exhausted) return null;
+        if (self.exhausted or self.remaining_materialization_bytes == 0) return null;
         // A source/flattened point can temporarily coexist with contour, path,
         // and destination metadata. Resource-bearing Type3 glyphs also need
         // room for their remaining independently owned samples. Both routes
         // retain a fixed process-safe ceiling per PDF paint operator.
         const point_bytes = saturatedMulU64(self.remaining_points, 32);
         const requested = @max(point_bytes, self.remaining_resource_bytes);
-        return @intCast(@min(@max(requested, min_text_materialization_bytes), max_text_materialization_bytes));
+        const operator_limit = @min(@max(requested, min_text_materialization_bytes), max_text_materialization_bytes);
+        return @intCast(@min(operator_limit, self.remaining_materialization_bytes));
+    }
+
+    fn chargeTextMaterialization(self: *VectorTextWorkBudget, bytes: usize) void {
+        if (bytes == 0 or self.exhausted) return;
+        const charge: u64 = @intCast(bytes);
+        if (charge >= self.remaining_materialization_bytes) {
+            self.remaining_materialization_bytes = 0;
+            self.exhausted = true;
+            return;
+        }
+        self.remaining_materialization_bytes -= charge;
     }
 };
 
@@ -3024,8 +3064,10 @@ pub const Reader = struct {
         var budget_committed = false;
         defer if (!budget_committed) if (work_budget) |budget| {
             const exhausted = budget.exhausted;
+            const remaining_materialization_bytes = budget.remaining_materialization_bytes;
             budget.* = budget_checkpoint.?;
             budget.exhausted = exhausted;
+            budget.remaining_materialization_bytes = remaining_materialization_bytes;
         };
         var group_images = std.ArrayList(ImageRun).empty;
         defer {
@@ -3069,6 +3111,7 @@ pub const Reader = struct {
         // TJ positioning adjustments). Share one allocator so those fragments
         // cannot each claim the full per-operator materialization allowance.
         var materialization_allocator = DecodeBudgetAllocator.init(alloc, 0, materialization_limit);
+        defer if (work_budget) |budget| budget.chargeTextMaterialization(materialization_allocator.materializationCharge());
         const bounded_alloc = materialization_allocator.allocator();
         for (text_runs) |run| {
             if (!run.vectorizable) return false;
@@ -20627,11 +20670,58 @@ test "dense low complexity Type1 text remains native within measured budget" {
     var pattern_out = std.ArrayList(PatternRun).empty;
     defer pattern_out.deinit(alloc);
     var budget = VectorTextWorkBudget.init(.{ .width = 100, .height = 100 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+    const initial_materialization_bytes = budget.remaining_materialization_bytes;
 
     try Reader.appendVectorTextRenderRunsAlloc(alloc, null, null, &shape_out, &pattern_out, &fonts, &.{}, (&run)[0..1], &budget);
     try std.testing.expect(run.vectorizable);
     try std.testing.expectEqual(@as(usize, text.len), shape_out.items.len);
     try std.testing.expect(!budget.exhausted);
+    try std.testing.expect(budget.remaining_materialization_bytes < initial_materialization_bytes);
+}
+
+test "capped vector text attempt consumes the page materialization budget" {
+    const alloc = std.testing.allocator;
+    var glyph_name = [_]u8{'A'};
+    var outline_program = [_]u8{
+        139, 139, 21,
+        189, 139, 5,
+        139, 189, 5,
+        89,  139, 5,
+        14,
+    };
+    var glyphs = [_]Type1Glyph{.{
+        .code = 'A',
+        .name = &glyph_name,
+        .charstring = &outline_program,
+        .advance = 600,
+    }};
+    var font_name = [_]u8{'F'};
+    var fonts = [_]PageFont{.{
+        .name = &font_name,
+        .decoder = .{},
+        .type1 = .{ .glyphs = &glyphs },
+    }};
+    var one_glyph = [_]u8{'A'};
+    var fallback_runs = [_]TextRun{
+        .{ .text = &one_glyph, .raw_text = &one_glyph, .font_index = 0, .vectorizable = true, .x = 0, .y = 50, .font_size = 1, .paint_order = 1 },
+        .{ .text = &one_glyph, .raw_text = &one_glyph, .font_index = 0, .vectorizable = true, .x = 1, .y = 50, .font_size = 1, .paint_order = 2 },
+    };
+    var shape_out = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (shape_out.items) |*shape| shape.deinit(alloc);
+        shape_out.deinit(alloc);
+    }
+    var pattern_out = std.ArrayList(PatternRun).empty;
+    defer pattern_out.deinit(alloc);
+    var constrained = VectorTextWorkBudget.init(.{ .width = 100, .height = 100 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+    constrained.remaining_materialization_bytes = 1;
+
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, null, null, &shape_out, &pattern_out, &fonts, &.{}, &fallback_runs, &constrained);
+    try std.testing.expect(constrained.exhausted);
+    try std.testing.expectEqual(@as(u64, 0), constrained.remaining_materialization_bytes);
+    try std.testing.expect(!fallback_runs[0].vectorizable);
+    try std.testing.expect(!fallback_runs[1].vectorizable);
+    try std.testing.expectEqual(@as(usize, 0), shape_out.items.len);
 }
 
 test "image XObject occurrences retain one decoded sample buffer" {
