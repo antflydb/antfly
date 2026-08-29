@@ -1535,6 +1535,19 @@ fn repairActiveGenerationServiceable(item: anytype) bool {
     return false;
 }
 
+fn publicIndexRepairLifecycle(item: anytype) index_repair_status.LifecycleProjection {
+    const state = publicIndexRepairState(item);
+    const status = if (state) |value|
+        std.meta.stringToEnum(index_repair_status.IndexRepairStatus, value)
+    else
+        null;
+    return index_repair_status.projectLifecycle(
+        status,
+        publicIndexRepairActionRequired(item),
+        state != null and repairActiveGenerationServiceable(item),
+    );
+}
+
 fn publicIndexRuntimeView(item: anytype) @TypeOf(item) {
     var view = item;
     // Aggregation projects each shard independently so a serviceable repair
@@ -1627,6 +1640,11 @@ const AggregatedIndexStatus = struct {
     load_error: ?[]const u8 = null,
     load_error_matches_desired_incarnation: bool = false,
     load_error_action_required: bool = false,
+    // Failure provenance must survive aggregation. A serviceability proof on
+    // one shard may hide only that shard's candidate/load failure; it cannot
+    // make a different shard queryable.
+    load_error_blocks_queryable: bool = false,
+    query_blocking_group_count: u64 = 0,
     repair_state: ?[]const u8 = null,
     repair_action_required: bool = false,
     repair_reason: ?[]const u8 = null,
@@ -1884,25 +1902,38 @@ fn aggregateIndexStatusIndexed(
         if (!runtime_present) continue;
         aggregate.reported_group_count += 1;
         aggregate.runtime_present = true;
+        const matches_desired_incarnation = coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
+        const shard_repair_lifecycle = publicIndexRepairLifecycle(item);
+        const shard_load_failure_blocks = matches_desired_incarnation and item.load_error != null and
+            !shard_repair_lifecycle.active_generation_serviceable;
+        const shard_enrichment_failure_blocks = matches_desired_incarnation and item.enrichment_failed and
+            !shard_repair_lifecycle.active_generation_serviceable;
+        if (shard_load_failure_blocks or shard_enrichment_failure_blocks or
+            (matches_desired_incarnation and shard_repair_lifecycle.blocks_queryable))
+        {
+            aggregate.query_blocking_group_count +|= 1;
+        }
         // Integrity failures are current index-scoped facts even when the
         // surrounding runtime snapshot is stale or failed. Preserve an old
         // incarnation's diagnostic, but prefer and separately identify a
         // failure that belongs to the desired incarnation so readiness never
         // conflates the two.
         if (item.load_error) |load_error| {
-            const matches_desired_incarnation = coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
             if (matches_desired_incarnation) {
                 const actionable = publicIndexRepairState(item) != null and
                     publicIndexRepairActionRequired(item);
-                const prefer_actionable = actionable and !aggregate.load_error_action_required;
-                const same_actionability = actionable == aggregate.load_error_action_required;
+                const prefer_blocking = shard_load_failure_blocks and !aggregate.load_error_blocks_queryable;
+                const same_blocking = shard_load_failure_blocks == aggregate.load_error_blocks_queryable;
+                const prefer_actionable = same_blocking and actionable and !aggregate.load_error_action_required;
+                const same_actionability = same_blocking and actionable == aggregate.load_error_action_required;
                 const prefer_deterministic = aggregate.load_error == null or
                     std.mem.order(u8, load_error, aggregate.load_error.?) == .lt;
-                if (!aggregate.load_error_matches_desired_incarnation or prefer_actionable or
+                if (!aggregate.load_error_matches_desired_incarnation or prefer_blocking or prefer_actionable or
                     (same_actionability and prefer_deterministic))
                 {
                     aggregate.load_error = load_error;
                     aggregate.load_error_action_required = actionable;
+                    aggregate.load_error_blocks_queryable = shard_load_failure_blocks;
                 }
                 aggregate.load_error_matches_desired_incarnation = true;
             } else if (aggregate.load_error == null) {
@@ -3557,6 +3588,128 @@ test "serviceable repair preserves sibling shard dense catch-up fallback" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false,\"blocks_queryable\":false,\"blocks_complete\":false}") != null);
 }
 
+test "serviceable repair cannot mask sibling shard serving failures" {
+    var repair_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_produced_count = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+        .backfill_active = true,
+        .backfill_progress = 0.5,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
+    }};
+    var failed_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .load_error = "CorruptMetadata",
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .coverage_summary_ready = true,
+    }};
+    var runtimes = [_]runtime_status.LocalTableRuntimeStatus{
+        .{
+            .group_id = 7,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{
+                .source_doc_count = 1,
+                .doc_count = 1,
+                .index_count = 1,
+                .indexes = repair_indexes[0..],
+            },
+        },
+        .{
+            .group_id = 8,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{
+                .source_doc_count = 1,
+                .doc_count = 1,
+                .index_count = 1,
+                .indexes = failed_indexes[0..],
+            },
+        },
+    };
+
+    const load_failed = aggregateIndexStatusIndexed(
+        &runtimes,
+        "thumbnail",
+        &.{ 7, 8 },
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(load_failed.repair_active_generation_serviceable);
+    try std.testing.expectEqual(@as(u64, 1), load_failed.query_blocking_group_count);
+    try std.testing.expect(load_failed.load_error_blocks_queryable);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        load_failed,
+        load_failed.table_doc_count,
+        .partial,
+        false,
+        42,
+        99,
+        null,
+        load_failed.async_indexing,
+        load_failed.enrichment,
+        load_failed.resolution,
+        load_failed.promotion,
+        load_failed.resolver_replay,
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: CorruptMetadata\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false,\"blocks_queryable\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"readiness\":{\"state\":\"failed\",\"queryable\":false,\"complete\":false") != null);
+
+    failed_indexes[0].load_error = null;
+    failed_indexes[0].enrichment_failed = true;
+    const enrichment_failed = aggregateIndexStatusIndexed(
+        &runtimes,
+        "thumbnail",
+        &.{ 7, 8 },
+        42,
+        99,
+        null,
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(enrichment_failed.repair_active_generation_serviceable);
+    try std.testing.expectEqual(@as(u64, 1), enrichment_failed.query_blocking_group_count);
+    try std.testing.expect(enrichment_failed.load_error == null);
+    encoded.clearRetainingCapacity();
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        enrichment_failed,
+        enrichment_failed.table_doc_count,
+        .partial,
+        false,
+        42,
+        99,
+        null,
+        enrichment_failed.async_indexing,
+        enrichment_failed.enrichment,
+        enrichment_failed.resolution,
+        enrichment_failed.promotion,
+        enrichment_failed.resolver_replay,
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"readiness\":{\"state\":\"failed\",\"queryable\":false,\"complete\":false") != null);
+}
+
 test "derived coverage aggregation rejects stale index incarnations" {
     var indexes = [_]db_mod.types.DBIndexStats{.{
         .name = "visual",
@@ -4316,7 +4469,11 @@ fn appendSingleIndexRuntimeStatus(
         item.load_error_matches_desired_incarnation
     else
         index_type != .embeddings or coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
-    const load_error: ?[]const u8 = if (repair_state == null or
+    const raw_load_error_blocks_queryable = if (@hasField(@TypeOf(item), "load_error_blocks_queryable"))
+        item.load_error_blocks_queryable
+    else
+        false;
+    const load_error: ?[]const u8 = if (raw_load_error_blocks_queryable or repair_state == null or
         (repair_action_required and raw_load_error_matches_desired_incarnation))
         raw_load_error
     else
@@ -4697,8 +4854,13 @@ fn appendIndexReadinessStatus(
         (coverage_generation != 0 and authority.incarnation_current);
     const repair_failed = repair_state != null and repair_action_required;
     const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
-    const serving_failed = (terminal_load_failure or terminal_enrichment_failure or repair_failed) and
-        (!active_generation_serviceable or repair_blocks_queryable);
+    const aggregate_query_blocked = if (@hasField(Item, "query_blocking_group_count"))
+        item.query_blocking_group_count != 0
+    else
+        false;
+    const serving_failed = aggregate_query_blocked or
+        ((terminal_load_failure or terminal_enrichment_failure or repair_failed) and
+            (!active_generation_serviceable or repair_blocks_queryable));
     const publication_pending = index_type == .embeddings and incarnation_current and
         replay_target_sequence > replay_applied_sequence;
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and

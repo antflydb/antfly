@@ -6233,6 +6233,7 @@ pub fn build(b: *std.Build) void {
             "managed embeddings skipped terminal sources complete backfill without fabricating replay debt",
             "repair-free embeddings aggregate retains live dense catch-up",
             "serviceable repair preserves sibling shard dense catch-up fallback",
+            "serviceable repair cannot mask sibling shard serving failures",
             "index encoders preserve sibling replay debt during serviceable repair",
             "enrichment aggregation preserves telemetry and fences mixed checkpoint identity",
             "table storage status indexes one distributed snapshot by table and owner",
@@ -6896,6 +6897,7 @@ pub fn build(b: *std.Build) void {
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "actionable repair remains visible while retained generation stays queryable",
             "serviceable full text replacement remains queryable while rebuilding",
+            "serviceable repair cannot mask sibling shard serving failures",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
