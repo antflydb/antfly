@@ -4486,6 +4486,7 @@ pub fn build(b: *std.Build) void {
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
         "data raft retry clock and sleep borrow VoprIo",
+        "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo",
         "production DataServer replicated merge actions run on VoprIo",
         "three production DataServers compose replicated merge and split across public writes failover and restart on VoprIo",
         "inline replicated split action failure releases its transition lane exactly once",
@@ -7015,6 +7016,10 @@ pub fn build(b: *std.Build) void {
         .root_module = vopr_cli_mod,
         .filters = &.{"Antfly injected bug is discovered replayed reduced and promoted"},
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
     });
     const run_vopr_cli_meta_tests = b.addRunArtifact(vopr_cli_meta_tests);
     const vopr_meta_test_step = b.step("vopr-meta-test", "Prove Antfly VOPR discovery, replay, reduction, and promotion end to end");
@@ -7111,6 +7116,7 @@ pub fn build(b: *std.Build) void {
             "production DataServer public HTTP",
             "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo",
             "DataServer LSM maintenance owner runs on borrowed VoprIo",
+            "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo",
             "DataServer VOPR background owner executes and cancels maintenance on VoprIo",
             "production DataServer replicated merge actions run on VoprIo",
         },

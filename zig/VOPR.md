@@ -379,7 +379,7 @@ following boundaries:
 
 | Claim family | Audit result | Important exclusion |
 | --- | --- | --- |
-| Reusable VOPR engine, `VoprIo`, replay, reduction, properties, saved cross-run event-set queries, bounded live event streaming, flight recording, local reports, debug recipes, fault/service-rate algebra, and search-quality fixtures | Implemented and exercised by the focused engine/meta gates named below; production query-cache operations, DataServer Raft rounds, and distributed graph fanout are reviewed service-rate charge seams | Nightly sharding, retention, review, notifications, and broader production adoption of service-rate charging are operational or ongoing work |
+| Reusable VOPR engine, `VoprIo`, replay, reduction, properties, saved cross-run event-set queries, bounded live event streaming, flight recording, local reports, debug recipes, fault/service-rate algebra, and search-quality fixtures | Implemented and exercised by the focused engine/meta gates named below; production query-cache operations, DataServer Raft and LSM-maintenance turns, and distributed graph fanout are reviewed service-rate charge seams | Nightly sharding, retention, review, notifications, and broader production adoption of service-rate charging are operational or ongoing work |
 | Metadata, Raft, HA, transaction, data-plane, storage, backfill, supervision, authentication, serverless, cache, provider, generation/reranking, and query suites | Implemented at each row's named production seam and fault vocabulary | The suites are not all co-resident in one deployment history |
 | Distributed graph | Focused production coordinator paths, the public hosted-source composition, v13's static production-owner graph, v14's production-owner graph during active split, v15's fail-closed owner-transport cut, v16's fail-closed remote-owner restart, v17's exactly observed recoverable next-owner short write, v18's three-owner memory denial/recovery, v21's simultaneous selected-link/all-owner-memory failure, and v22's selected-listener socket denial/recovery during that split are implemented | V9's remaining topology breadth, disk-capacity pressure, broader socket-pressure overlaps, broader partial-write surfaces, and storage/process/restart overlaps are not yet on the production owners; public cancellation/auth/hydration composition and global query are not complete. V19's narrow distributed join is audited separately below |
 | Distributed join | V19 implements one public inner `_id` join with two left rows and two independently owned right ranges, exact no-partial response validation, typed ownership retry, and before/active-split/post-publication observations. V20 forces a 64-row durable shuffle, fails the first finalizer after result persistence, and proves another owner imports the cached result and completes with an exact two-attempt ledger | Partition-worker recovery, cancellation, authorization mutation, right/nested/foreign joins, multi-range left inputs, overlapping owner faults, and global-query composition are not complete |
@@ -407,7 +407,7 @@ state machine, or follower recovery participated.
 | Properties, observations, semantic coverage, cross-revision corpus quarantine, property history, and guided search | `property.zig`, `observation.zig`, `coverage.zig`, `corpus.zig`, `explorer.zig` | `zig build vopr-engine-test vopr-benchmark` |
 | Integrated retroactive flight recording and fielded temporal event queries | `flight_recorder.zig`, `event_query.zig`, `debug_recipe.zig`; bounded recordings own structured fields and verbose text outside canonical bytes, support conjunctive field/text filters and before/after windows, and are populated directly by runner-backed and custom metadata/domain replay paths. Every retained/failing campaign writes `.flight.json`, while every debug recipe packages a filtered reduced-replay window | `zig build vopr-engine-test vopr-meta-test`; `vopr events` and `vopr recipe` are argument-taking commands, not standalone test gates |
 | Saved cross-run event sets, validation, counting, and live streams | `event_set.zig` validates a versioned forward-only query DAG and evaluates selection, union/intersection/difference/complement, distinct/first/last moment, previous/next, and bounded sequence operations across canonical histories. Its tests execute every operator and reject forward references, malformed operators, duplicate names, v0 formats, and the former ad-hoc selector shape. `vopr events` accepts only this saved-plan format and exact-replayed traces, with repeated `--trace`, `--validate`, and `--count`; `event_stream.zig` and `runner.Config.event_observer` publish allocation-free bounded NDJSON whose built-in observer converts encoding overflow and sink failure into diagnostic counters. A runner-level test injects a sink failure and proves byte-identical canonical output against an unobserved run. Custom observers are synchronous and must not block or panic | `zig build vopr-engine-test vopr-meta-test` |
-| Reversible node and operation service rates | `service_rate.zig` registers stable node/operation identities, composes checked node-wide and operation-specific parts-per-million costs, charges logical time through borrowed `std.Io`, accounts usage, and heals individual effects by stable fault ID. `fault.zig` and `deployment.zig` expose compatible service-rate fault identities and process/resource domains. Three production-neutral adapters are integrated: query-cache request/hit/wait/producer work, DataServer Raft rounds, and distributed graph expand/hydrate/get-edges fanout by target group. Their VOPR histories prove overlapping node/operation slowdown and deadline expiry in the cache, node-3 slowdown during leader transfer, group-22 slowdown during parallel graph fanout, exact usage, explicit healing, resumed production execution, and cleanup | `zig build vopr-engine-test query-embedding-cache-vopr-test lib-data-runtime-test distributed-query-vopr-test`; bounded maintenance adoption remains roadmap work |
+| Reversible node and operation service rates | `service_rate.zig` registers stable node/operation identities, composes checked node-wide and operation-specific parts-per-million costs, charges logical time through borrowed `std.Io`, accounts usage, and heals individual effects by stable fault ID. `fault.zig` and `deployment.zig` expose compatible service-rate fault identities and process/resource domains. Four production-neutral boundaries are integrated: query-cache request/hit/wait/producer work, DataServer Raft rounds, DataServer LSM-maintenance steps, and distributed graph expand/hydrate/get-edges fanout by target group. Their VOPR histories prove overlapping node/operation slowdown and deadline expiry in the cache, node-3 slowdown during leader transfer, group-22 slowdown during parallel graph fanout, a three-times slowed then healed real LSM turn, exact usage, explicit healing, resumed production execution, and cleanup | `zig build vopr-engine-test query-embedding-cache-vopr-test lib-data-runtime-test data-server-vopr-test distributed-query-vopr-test`; full-cluster and additional workflow adoption remains roadmap work |
 | Integrated per-history and aggregate run/results API with phased health evidence | `runner.zig`, `report.zig`, `health.zig`, `vopr_io.zig`, `vopr-results`; every runner history samples continuous/recovery/final health without changing canonical trace bytes, exact replay rematerializes the evidence, `VoprIo.healthSnapshot` supplies task/descriptor/storage data, and mature P0/P1 adapters add domain progress, recovery, consistency, allocator/crash classification, and cleanup | `zig build vopr-engine-test vopr-contract-test vopr-registry-test vopr-results` |
 | Integrated persistent local run/results index and usage query API | `run_index.zig`, `vopr-index`; atomically persisted `vopr-run-index-v1` projects per-history and aggregate results into canonical run, revision, property, fingerprint, corpus/quarantine, artifact, and budget records. CLI predicates and `vopr-run-index-query-v1` cover every dimension, and the same query renders a static local HTML summary | `zig build vopr-engine-test vopr-meta-test vopr-index` |
 | Automatic debug recipes and deterministic corpus merging | `debug_recipe.zig`, callback-based `reducer.zig`, `corpus.zig`; `vopr-recipe`, `vopr-corpus-merge` | `zig build vopr-engine-test vopr-meta-test` |
@@ -1524,6 +1524,15 @@ VOPR work has found concrete production and harness defects:
   handles. Closing a connection therefore never restored capacity and could
   prevent the listener's shutdown wake connection. `VoprIo` now accounts live
   descriptors and proves reuse after close.
+- The production DataServer HTTP scenario performed its joining teardown from
+  a task owned by the borrowed VOPR scheduler. Under minimum socket capacity,
+  the join could park behind listener cleanup while the external driver saw no
+  ready transition and incorrectly declared the history complete; subsequent
+  backend teardown then waited forever on the still-live API-lane lease. The
+  scenario now follows the required two-phase lifecycle: publish
+  `beginTeardown`, drive the scheduler to quiescence, then join. It also
+  requires zero outstanding API-lane leases. This was a harness lifecycle
+  defect, not a product-property failure.
 - Closing a virtual listener released the listening handle but retained
   completed server-side connections still waiting in its accept queue. A
   shutdown-wakeup connection therefore leaked one live socket and could leave
@@ -1657,6 +1666,11 @@ VOPR work has found concrete production and harness defects:
   uninitialized fixture state, disabled auth safepoints, a replication fake-
   source cursor bug, and a composed-query progress-counter overflow. These are
   harness defects, not product-property failures.
+- The long end-to-end VOPR meta test completed its artifact and indexing work
+  but the default test-server protocol surfaced only an opaque failed-command
+  line, with no test attribution, assertion, or leak result. The gate now uses
+  Antfly's simple runner, which reports the selected test and its allocator/I/O
+  cleanup explicitly; the same history passes 1/1 with zero leaks.
 - The shared audio-provider `ActiveRuntime` published pointers to client and
   provider fields inside a wrapper returned by value. The pointers could become
   stale immediately after initialization, and block-scoped `errdefer` cleanup
@@ -2399,7 +2413,7 @@ implements the analogous application-level fault domains inside a registered
 | HA, data-plane, metadata, public API, and serverless owners all co-resident | **Ongoing.** Each domain has an integrated exact-replay suite; they do not yet all coexist in one history | Build one bounded deployment composition and cluster-wide recovery oracle without duplicating business logic |
 | Public distributed graph request from HTTP planning through fanout/hydration | **Partially integrated, with static, active-split, transport-fault, owner-restart, recoverable short-write, three-owner memory-pressure, one overlapping link-plus-memory path, and selected-listener socket pressure promoted.** Full-cluster v9 executes a public depth-two graph across hosted ranges. V13 executes it across real `DataServer`/data-Raft owners with current-owner routing and matching ReadState/derived-index visibility; v14 composes active split; v15 adds a next-owner transport cut; v16 adds owner reconstruction; v17 adds a one-byte request write; v18 adds all-owner memory denial/recovery; v21 overlaps that pressure with the selected graph link cut; and v22 denies then heals new connections at one exact public listener while preserving complete graph/split semantics. The focused distributed suite separately covers optional hydration, topology retry/exhaustion, cancellation, stale generations, and authorization | Add broader restart/topology and request/response/Raft short-write faults, disk-capacity pressure, broader socket-pressure and storage/process/restart overlaps, public cancellation, authorization changes, and hydration to the production-owner history. Add global queries with the same fail-closed publication rule; v19/v20's join seams are audited separately |
 | Distributed joins and global-query orchestration | **Partially integrated.** V19 executes one public inner `_id` join with two left rows and two independently owned right groups before, during, and after an active split, requiring exact no-partial results and typed ownership retry. V20 forces durable shuffle and proves a second finalizer imports the first owner's persisted result after an acknowledgement failure. Focused composed-query tests cover additional result assembly. No global-query production-owner claim is made | Add partition-worker recovery, cancellation, retry exhaustion, auth and stale-generation changes, right/nested/foreign and multi-range-left joins, overlapping owner faults, and fail-closed global-query recovery histories |
-| Query-embedding cache and service rates | **Integrated focused seams.** Cache coalescing, cancellation, deadlines, admission, TTL, byte/LRU/pinned eviction, and cleanup exact replay. Cache v2 charges four real production work boundaries and proves reversible overlapping node/operation slowdown, slowdown-induced timeout, resumed success, exact accounting, and pin cleanup. The three-owner DataServer history charges every Raft progress round and composes a reversible node-3 slowdown with leadership transfer and its full recovery suffix. Distributed-query v3 charges expand/hydrate/get-edges by target group and proves exact slowed/healed parallel fanout passes | Compose cache and fanout service rates with public full-cluster requests; add production-neutral charging at bounded maintenance work boundaries |
+| Query-embedding cache and service rates | **Integrated focused seams.** Cache coalescing, cancellation, deadlines, admission, TTL, byte/LRU/pinned eviction, and cleanup exact replay. Cache v2 charges four real production work boundaries and proves reversible overlapping node/operation slowdown, slowdown-induced timeout, resumed success, exact accounting, and pin cleanup. The three-owner DataServer history charges every Raft progress round and composes a reversible node-3 slowdown with leadership transfer and its full recovery suffix. Distributed-query v3 charges expand/hydrate/get-edges by target group and proves exact slowed/healed parallel fanout passes. A focused DataServer history charges a real LSM-maintenance attempt at three-times cost, heals, repeats at baseline, and verifies exact usage | Compose cache, Raft, fanout, and maintenance service rates with public full-cluster requests; adopt reviewed work classes in backfill/serverless workflows where latency changes ownership or recovery behavior |
 | Generation/reranking provider replacement and fallback | **Integrated local/focused seam.** Production chain and validation paths exact replay | Add remote HTTP provider replacement, malformed/truncated response, and local/remote routing in one trace |
 | Multi-table/tenant/resource/mixed-version breadth | **Partial/conditional.** Two-table cross-node isolation, in-cluster node-memory interference, one selected production-listener socket-denial history, and separate focused disk/socket quota and upgrade-artifact suites are integrated | Add authenticated tenants plus in-cluster disk-capacity interference and broader socket interference/overlap; live mixed-version nodes remain conditional on runnable compatible binaries |
 
@@ -2883,7 +2897,9 @@ local replacement are integrated:
     leader transfer, exact accounting, healing, and a full recovery suffix.
     The distributed graph coordinator supplies a third adapter keyed by target
     group and expand/hydrate/get-edges operation, with slowed and healed
-    parallel-fanout passes and exact per-owner accounting.
+    parallel-fanout passes and exact per-owner accounting. DataServer LSM
+    maintenance supplies a fourth reviewed operation class with a slowed real
+    attempt, explicit healing, a baseline retry, and exact logical usage.
 
 These capabilities are local libraries, commands, reports, and CI gates. They
 do not require an Antithesis account or hosted runtime. This is not a claim of
@@ -2896,9 +2912,10 @@ The remaining Antithesis-class opportunities are narrower than the engine
 work already completed:
 
 - extend production `service_rate.Port` adoption beyond the query-embedding
-  cache, DataServer Raft progress, and distributed graph fanout, and add search
-  policies that overlap node-wide and operation-class slowdowns with bounded
-  maintenance, public full-cluster deadlines, and quiet recovery. The reusable
+  cache, DataServer Raft/LSM progress, and distributed graph fanout, and add
+  search policies that overlap node-wide and operation-class slowdowns with
+  public full-cluster deadlines, backfill/serverless ownership, and quiet
+  recovery. The reusable
   effect is complete; arbitrary instruction-level native-thread throttling is
   still a federated/native instrumentation concern rather than an in-process
   completion claim;
@@ -3208,10 +3225,10 @@ The detailed backlog behind that summary is:
    directional link, storage-crash, restart, serverless lease/object-store,
    and pressure faults. Apply the implemented reversible per-node and
    operation-class service-rate ports beyond the integrated query-cache,
-   DataServer Raft-progress, and distributed-graph fanout seams as
+   DataServer Raft/LSM-progress, and distributed-graph fanout seams as
    a distinct fault from the current
-   CPU-work exhaustion budget, then overlap them with bounded maintenance,
-   public full-cluster deadlines, and quiet-suffix recovery. The real
+   CPU-work exhaustion budget, then overlap them with backfill/serverless
+   ownership, public full-cluster deadlines, and quiet-suffix recovery. The real
    metadata/placement Raft wire hop, serverless public catalog path, memory-
    pressure recovery, and quiet cluster-wide suffix are complete at their
    named seams; broaden their fault combinations after item 1 instead of

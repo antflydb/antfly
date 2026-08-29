@@ -3483,6 +3483,7 @@ pub const DataRequestLifecycleHook = struct {
 /// native runtimes leave the port unset and retain their ordinary pacing.
 pub const DataServerWorkKind = enum {
     raft_round,
+    lsm_maintenance_step,
 };
 
 pub const DataServerWorkCostPort = struct {
@@ -7211,6 +7212,7 @@ pub const DataServer = struct {
 
     fn runLsmMaintenanceForegroundRound(self: *DataServer) !void {
         if (!self.haOwnerJobCanRun(.compaction_publish)) return;
+        if (self.work_cost_port) |port| try port.charge(.lsm_maintenance_step, 1);
         _ = self.liveRuntimeWriteSource().runLsmMaintenanceRound() catch |err| switch (err) {
             error.LsmRootWriterAlreadyOpen,
             error.PersistentDescriptorAdmissionExhausted,
@@ -7434,6 +7436,11 @@ pub const DataServer = struct {
             var maintenance_progressed_unscoped = false;
             var steps: usize = 0;
             while (steps < lsm_maintenance_worker_max_steps_per_wake and !self.lsm_maintenance_stop.load(.acquire)) : (steps += 1) {
+                if (self.work_cost_port) |port| port.charge(.lsm_maintenance_step, 1) catch |err| {
+                    std.log.warn("lsm maintenance work-cost charge failed: {}", .{err});
+                    _ = self.lsm_maintenance_failed.fetchAdd(1, .monotonic);
+                    break;
+                };
                 const observed_score = live_write_source.lsmMaintenanceScoreBestEffort();
                 const force_fair_turn = observed_score >= lsm_maintenance_fair_turn_score and
                     consecutive_lock_deferrals >= lsm_maintenance_fair_turn_deferrals;
@@ -20793,6 +20800,128 @@ test "DataServer LSM maintenance owner runs on borrowed VoprIo" {
     try sim.ensureNoCapabilityViolation();
 }
 
+test "DataServer LSM maintenance cost port composes and heals on borrowed VoprIo" {
+    const vopr = @import("vopr");
+    const alloc = std.testing.allocator;
+    var sim = try vopr.vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    const io = sim.io();
+
+    var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{
+            .general = io,
+            .raft_inbound = io,
+            .raft_outbound = io,
+            .api = io,
+            .inference = io,
+            .control = io,
+        },
+    });
+    defer backend_runtime.deinit();
+
+    const node = vopr.service_rate.Node{
+        .id = vopr.id.stable("data-runtime-maintenance-vopr", "node.1"),
+        .name = "data-runtime-maintenance-vopr.node.1",
+    };
+    const operation = vopr.service_rate.Operation.named(
+        "data-runtime-maintenance-vopr.lsm-step",
+        50,
+    );
+    const fault_id = vopr.id.stable("data-runtime-maintenance-vopr", "fault.slow");
+    var model = try vopr.service_rate.Model.init(alloc, &.{node}, &.{operation});
+    defer model.deinit();
+    try model.activate(.{
+        .fault_id = fault_id,
+        .node_id = node.id,
+        .operation_id = operation.id,
+        .multiplier_ppm = 3 * vopr.service_rate.parts_per_million,
+    });
+    const Adapter = struct {
+        port: vopr.service_rate.Port,
+        operation_id: vopr.id.StableId,
+
+        fn iface(self: *@This()) DataServerWorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, kind: DataServerWorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (kind) {
+                .raft_round => return,
+                .lsm_maintenance_step => _ = try self.port.charge(self.operation_id, units),
+            }
+        }
+    };
+    var adapter = Adapter{
+        .port = try model.port(io, node.id),
+        .operation_id = operation.id,
+    };
+    var server: DataServer = .{
+        .alloc = alloc,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(alloc),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            "/vopr/data-server-maintenance-cost",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            "/vopr/data-server-maintenance-cost",
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .work_cost_port = adapter.iface(),
+        .listener_cfg = undefined,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer server.deinit();
+
+    var done = false;
+    var failure: ?anyerror = null;
+    const Task = struct {
+        fn run(target: *DataServer, service_model: *vopr.service_rate.Model, service_fault_id: vopr.id.StableId, completed: *bool, task_failure: *?anyerror) void {
+            target.runLsmMaintenanceForegroundRound() catch |err| {
+                task_failure.* = err;
+                completed.* = true;
+                return;
+            };
+            service_model.heal(service_fault_id) catch |err| {
+                task_failure.* = err;
+                completed.* = true;
+                return;
+            };
+            target.runLsmMaintenanceForegroundRound() catch |err| {
+                task_failure.* = err;
+            };
+            completed.* = true;
+        }
+    };
+    _ = io.async(Task.run, .{ &server, &model, fault_id, &done, &failure });
+
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    var transitions: usize = 0;
+    while (!sim.scheduler().quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try sim.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprLsmMaintenanceCostDeadlock;
+        try sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+        transitions += 1;
+        if (transitions > 1_000) return error.VoprLsmMaintenanceCostTransitionBudgetExceeded;
+    }
+    try std.testing.expect(done);
+    if (failure) |err| return err;
+    const usage = try model.nodeUsage(node.id);
+    try std.testing.expectEqual(@as(u64, 2), usage.operations);
+    try std.testing.expectEqual(@as(u64, 200), usage.charged_ns);
+    try sim.ensureNoCapabilityViolation();
+}
+
 test "DataServer VOPR background owner executes and cancels maintenance on VoprIo" {
     const vopr = @import("vopr");
     const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
@@ -31010,6 +31139,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const operation_id = switch (kind) {
                 .raft_round => self.operation_id,
+                .lsm_maintenance_step => return,
             };
             _ = try self.port.charge(operation_id, units);
         }
