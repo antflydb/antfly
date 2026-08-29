@@ -205,8 +205,10 @@ type QueryRequest struct {
 // It converts the strongly-typed *query.Query fields to json.RawMessage
 // for compatibility with the OAPI layer.
 func (q QueryRequest) MarshalJSON() ([]byte, error) {
-	if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
-		return nil, err
+	if q.GraphQueries != nil {
+		if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
+			return nil, err
+		}
 	}
 	// Convert SDK QueryRequest to oapi.QueryRequest
 	oapiReq := oapi.QueryRequest{
@@ -314,6 +316,11 @@ func (q *QueryRequest) UnmarshalJSON(data []byte) error {
 	q.SemanticSearch = oapiReq.SemanticSearch
 	q.DocumentRenderer = oapiReq.DocumentRenderer
 	q.GraphQueries = oapiReq.GraphQueries
+	if q.GraphQueries != nil {
+		if err := validateNamedGraphQueries(q.GraphQueries); err != nil {
+			return err
+		}
+	}
 	q.Hierarchy = oapiReq.Hierarchy
 	q.Join = oapiReq.Join
 	q.ForeignSources = oapiReq.ForeignSources

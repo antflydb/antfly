@@ -146,15 +146,14 @@ const traversalResult: GraphResult = {
       ],
     },
   ],
-  paths: [],
   stats: { returned_items: 4, truncated: false },
 };
 
 const shortestPathResult: GraphResult = {
-  kind: "nodes",
-  nodes: [],
+  kind: "paths",
   paths: [
     {
+      path: {
       nodes: [
         { key: "paper:graph-rag" },
         { key: "paper:agent-memory" },
@@ -180,6 +179,7 @@ const shortestPathResult: GraphResult = {
       objective: "min_hops",
       weight_sum: 1.6,
       objective_value: 2,
+      },
     },
   ],
   stats: { returned_items: 1, truncated: false },

@@ -239,7 +239,6 @@ describe("Antfly Query Type Integration", () => {
       const nodes: GraphNodesResult = {
         kind: "nodes",
         nodes: [],
-        paths: [],
         stats: { returned_items: 0, truncated: false },
         took: 0,
       };

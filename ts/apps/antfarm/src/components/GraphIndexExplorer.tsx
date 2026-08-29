@@ -25,6 +25,7 @@ import { ForceGraph, type GraphData, type GraphEdge, type GraphNode } from "@ant
 import type {
   EdgeTypeConfig,
   GraphNodesResult,
+  GraphPathsResult,
   GraphPathEdge,
   GraphPathEndpoint,
   GraphPathObjective,
@@ -172,8 +173,8 @@ function addNode(
   });
 }
 
-function graphVisualizationResult(result: GraphResult | null): GraphNodesResult | null {
-  return result?.kind === "nodes" ? result : null;
+function graphVisualizationResult(result: GraphResult | null): GraphNodesResult | GraphPathsResult | null {
+  return result?.kind === "nodes" || result?.kind === "paths" ? result : null;
 }
 
 function buildGraph(result: GraphResult | null, startKey: string): ExplorerGraph {
@@ -186,7 +187,7 @@ function buildGraph(result: GraphResult | null, startKey: string): ExplorerGraph
   // valid graph-query results, but do not have a node/path visualization.
   const graphResult = graphVisualizationResult(result);
 
-  for (const node of graphResult?.nodes ?? []) {
+  for (const node of graphResult?.kind === "nodes" ? graphResult.nodes : []) {
     if (!node.key) continue;
     const nodeIdentity = { key: node.key, table: node.table };
     const pathNodes = node.path ?? [];
@@ -208,7 +209,8 @@ function buildGraph(result: GraphResult | null, startKey: string): ExplorerGraph
     }
   }
 
-  for (const path of graphResult?.paths ?? []) {
+  for (const item of graphResult?.kind === "paths" ? graphResult.paths : []) {
+    const path = item.path;
     const pathNodes = path.nodes ?? [];
     for (const identity of pathNodes) addNode(nodes, identity, { resultCount: 1 });
     for (const edge of path.edges ?? []) {
@@ -237,6 +239,8 @@ function resultSummary(result: GraphResult | null) {
   if (!result) return { total: 0, paths: 0 };
   switch (result.kind) {
     case "nodes":
+      return { total: result.stats.returned_items, paths: 0 };
+    case "paths":
       return { total: result.stats.returned_items, paths: result.paths.length };
     case "bindings":
       return { total: result.rows.length, paths: 0 };

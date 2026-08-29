@@ -26,6 +26,8 @@ components:
           example: 4200
         admission:
           $ref: "#/components/schemas/AdmissionConfig"
+        graph_execution:
+          $ref: "#/components/schemas/GraphExecutionConfig"
         mcp:
           $ref: "#/components/schemas/McpConfig"
         storage:
@@ -791,6 +793,22 @@ components:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    GraphExecutionConfig:
+      type: object
+      additionalProperties: false
+      description: >-
+        Operator-owned ceilings shared by all named graph operations in one
+        admitted query. Public requests cannot raise these values.
+      properties:
+        max_explored_nodes: { type: integer, minimum: 1, default: 100000 }
+        max_explored_edges: { type: integer, minimum: 1, default: 1000000 }
+        max_explored_edge_bytes: { type: integer, minimum: 1, default: 67108864 }
+        max_scanned_anchors: { type: integer, minimum: 1, default: 1000000 }
+        max_intermediate_states: { type: integer, minimum: 1, default: 100000 }
+        max_retained_state_bytes: { type: integer, minimum: 1, default: 67108864 }
+        max_distinct_identities: { type: integer, minimum: 1, default: 100000 }
+        max_distinct_state_bytes: { type: integer, minimum: 1, default: 16777216 }
 
     McpConfig:
       type: object

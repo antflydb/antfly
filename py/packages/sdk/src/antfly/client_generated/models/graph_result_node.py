@@ -19,9 +19,8 @@ T = TypeVar("T", bound="GraphResultNode")
 
 @_attrs_define
 class GraphResultNode:
-    """A traversal result node or the terminal node paired with a pathfinding result. Traversal paths, when requested, are
-    carried by path and path_edges. Shortest-path operations keep the complete path only in the enclosing
-    GraphNodesResult.paths entry to avoid duplicate wire data.
+    """A traversal result node. Traversal paths, when requested, are carried by path and path_edges. Pathfinding results
+    use GraphPathResult instead.
 
         Attributes:
             key (str): Document key
@@ -30,10 +29,9 @@ class GraphResultNode:
             document (GraphResultNodeDocument | Unset): Stored document when include_documents=true and the identity exists
                 at the pinned snapshot; otherwise omitted.
             path (list[GraphPathEndpoint] | Unset): Exact ordered traversal identities from the start node, terminating at
-                this node's fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding
-                uses GraphNodesResult.paths.
+                this node's fully qualified identity. Present only for traversal queries with include_paths=true.
             path_edges (list[GraphPathEdge] | Unset): Ordered typed traversal edges from the start node. Present only with
-                path for traversal queries; pathfinding uses GraphNodesResult.paths.
+                path for traversal queries.
             provenance (list[str] | Unset): Algebraic provenance labels folded into this result, when requested by an
                 algebraic graph executor
             evidence (GraphResultNodeEvidence | Unset): Parsed evidence envelope for provenance labels and edge metadata

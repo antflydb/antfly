@@ -279,6 +279,7 @@ pub const Config = struct {
     /// Port for the health/metrics server. Defaults to 4200.
     health_port: ?i64 = null,
     admission: ?AdmissionConfig = null,
+    graph_execution: ?GraphExecutionConfig = null,
     mcp: ?McpConfig = null,
     storage: ?StorageConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
@@ -333,6 +334,7 @@ pub const Config = struct {
             .{ .json_name = "health_enabled", .zig_name = "health_enabled", .rejects_null = true },
             .{ .json_name = "health_port", .zig_name = "health_port", .rejects_null = true },
             .{ .json_name = "admission", .zig_name = "admission", .rejects_null = true },
+            .{ .json_name = "graph_execution", .zig_name = "graph_execution", .rejects_null = true },
             .{ .json_name = "mcp", .zig_name = "mcp", .rejects_null = true },
             .{ .json_name = "storage", .zig_name = "storage", .rejects_null = true },
             .{ .json_name = "transaction_sessions", .zig_name = "transaction_sessions", .rejects_null = true },
@@ -370,6 +372,7 @@ pub const Config = struct {
             .{ .json_name = "health_enabled", .zig_name = "health_enabled", .rejects_null = true },
             .{ .json_name = "health_port", .zig_name = "health_port", .rejects_null = true },
             .{ .json_name = "admission", .zig_name = "admission", .rejects_null = true },
+            .{ .json_name = "graph_execution", .zig_name = "graph_execution", .rejects_null = true },
             .{ .json_name = "mcp", .zig_name = "mcp", .rejects_null = true },
             .{ .json_name = "storage", .zig_name = "storage", .rejects_null = true },
             .{ .json_name = "transaction_sessions", .zig_name = "transaction_sessions", .rejects_null = true },
@@ -423,6 +426,10 @@ pub const Config = struct {
         }
         if (self.admission) |value| {
             try jw.objectField("admission");
+            try jw.write(value);
+        }
+        if (self.graph_execution) |value| {
+            try jw.objectField("graph_execution");
             try jw.write(value);
         }
         if (self.mcp) |value| {
@@ -941,6 +948,81 @@ pub const GcsExternalIoConfig = struct {
         }
         if (self.credentials) |value| {
             try jw.objectField("credentials");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Operator-owned ceilings shared by all named graph operations in one admitted query. Public requests cannot raise these values.
+pub const GraphExecutionConfig = struct {
+    max_explored_nodes: ?i64 = null,
+    max_explored_edges: ?i64 = null,
+    max_explored_edge_bytes: ?i64 = null,
+    max_scanned_anchors: ?i64 = null,
+    max_intermediate_states: ?i64 = null,
+    max_retained_state_bytes: ?i64 = null,
+    max_distinct_identities: ?i64 = null,
+    max_distinct_state_bytes: ?i64 = null,
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), &.{
+            .{ .json_name = "max_explored_nodes", .zig_name = "max_explored_nodes", .rejects_null = true },
+            .{ .json_name = "max_explored_edges", .zig_name = "max_explored_edges", .rejects_null = true },
+            .{ .json_name = "max_explored_edge_bytes", .zig_name = "max_explored_edge_bytes", .rejects_null = true },
+            .{ .json_name = "max_scanned_anchors", .zig_name = "max_scanned_anchors", .rejects_null = true },
+            .{ .json_name = "max_intermediate_states", .zig_name = "max_intermediate_states", .rejects_null = true },
+            .{ .json_name = "max_retained_state_bytes", .zig_name = "max_retained_state_bytes", .rejects_null = true },
+            .{ .json_name = "max_distinct_identities", .zig_name = "max_distinct_identities", .rejects_null = true },
+            .{ .json_name = "max_distinct_state_bytes", .zig_name = "max_distinct_state_bytes", .rejects_null = true },
+        }, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), &.{
+            .{ .json_name = "max_explored_nodes", .zig_name = "max_explored_nodes", .rejects_null = true },
+            .{ .json_name = "max_explored_edges", .zig_name = "max_explored_edges", .rejects_null = true },
+            .{ .json_name = "max_explored_edge_bytes", .zig_name = "max_explored_edge_bytes", .rejects_null = true },
+            .{ .json_name = "max_scanned_anchors", .zig_name = "max_scanned_anchors", .rejects_null = true },
+            .{ .json_name = "max_intermediate_states", .zig_name = "max_intermediate_states", .rejects_null = true },
+            .{ .json_name = "max_retained_state_bytes", .zig_name = "max_retained_state_bytes", .rejects_null = true },
+            .{ .json_name = "max_distinct_identities", .zig_name = "max_distinct_identities", .rejects_null = true },
+            .{ .json_name = "max_distinct_state_bytes", .zig_name = "max_distinct_state_bytes", .rejects_null = true },
+        }, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_explored_nodes) |value| {
+            try jw.objectField("max_explored_nodes");
+            try jw.write(value);
+        }
+        if (self.max_explored_edges) |value| {
+            try jw.objectField("max_explored_edges");
+            try jw.write(value);
+        }
+        if (self.max_explored_edge_bytes) |value| {
+            try jw.objectField("max_explored_edge_bytes");
+            try jw.write(value);
+        }
+        if (self.max_scanned_anchors) |value| {
+            try jw.objectField("max_scanned_anchors");
+            try jw.write(value);
+        }
+        if (self.max_intermediate_states) |value| {
+            try jw.objectField("max_intermediate_states");
+            try jw.write(value);
+        }
+        if (self.max_retained_state_bytes) |value| {
+            try jw.objectField("max_retained_state_bytes");
+            try jw.write(value);
+        }
+        if (self.max_distinct_identities) |value| {
+            try jw.objectField("max_distinct_identities");
+            try jw.write(value);
+        }
+        if (self.max_distinct_state_bytes) |value| {
+            try jw.objectField("max_distinct_state_bytes");
             try jw.write(value);
         }
         try jw.endObject();

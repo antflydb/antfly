@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from ..models.graph_aggregates_result import GraphAggregatesResult
     from ..models.graph_bindings_result import GraphBindingsResult
     from ..models.graph_nodes_result import GraphNodesResult
+    from ..models.graph_paths_result import GraphPathsResult
     from ..models.legacy_graph_search_result import LegacyGraphSearchResult
 
 
@@ -24,13 +25,14 @@ class StatefulGraphQueryResults:
     """
 
     additional_properties: dict[
-        str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult
+        str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | GraphPathsResult | LegacyGraphSearchResult
     ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.graph_aggregates_result import GraphAggregatesResult
         from ..models.graph_bindings_result import GraphBindingsResult
         from ..models.graph_nodes_result import GraphNodesResult
+        from ..models.graph_paths_result import GraphPathsResult
 
         field_dict: dict[str, Any] = {}
         for prop_name, prop in self.additional_properties.items():
@@ -39,6 +41,8 @@ class StatefulGraphQueryResults:
             elif isinstance(prop, GraphAggregatesResult):
                 field_dict[prop_name] = prop.to_dict()
             elif isinstance(prop, GraphNodesResult):
+                field_dict[prop_name] = prop.to_dict()
+            elif isinstance(prop, GraphPathsResult):
                 field_dict[prop_name] = prop.to_dict()
             else:
                 field_dict[prop_name] = prop.to_dict()
@@ -50,6 +54,7 @@ class StatefulGraphQueryResults:
         from ..models.graph_aggregates_result import GraphAggregatesResult
         from ..models.graph_bindings_result import GraphBindingsResult
         from ..models.graph_nodes_result import GraphNodesResult
+        from ..models.graph_paths_result import GraphPathsResult
         from ..models.legacy_graph_search_result import LegacyGraphSearchResult
 
         d = dict(src_dict)
@@ -60,7 +65,13 @@ class StatefulGraphQueryResults:
 
             def _parse_additional_property(
                 data: object,
-            ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult:
+            ) -> (
+                GraphAggregatesResult
+                | GraphBindingsResult
+                | GraphNodesResult
+                | GraphPathsResult
+                | LegacyGraphSearchResult
+            ):
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
@@ -85,6 +96,14 @@ class StatefulGraphQueryResults:
                     return componentsschemas_graph_result_type_2
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_graph_result_type_3 = GraphPathsResult.from_dict(data)
+
+                    return componentsschemas_graph_result_type_3
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    pass
                 if not isinstance(data, dict):
                     raise TypeError()
                 componentsschemas_stateful_graph_result_type_1 = LegacyGraphSearchResult.from_dict(data)
@@ -104,11 +123,17 @@ class StatefulGraphQueryResults:
 
     def __getitem__(
         self, key: str
-    ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult:
+    ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | GraphPathsResult | LegacyGraphSearchResult:
         return self.additional_properties[key]
 
     def __setitem__(
-        self, key: str, value: GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | LegacyGraphSearchResult
+        self,
+        key: str,
+        value: GraphAggregatesResult
+        | GraphBindingsResult
+        | GraphNodesResult
+        | GraphPathsResult
+        | LegacyGraphSearchResult,
     ) -> None:
         self.additional_properties[key] = value
 

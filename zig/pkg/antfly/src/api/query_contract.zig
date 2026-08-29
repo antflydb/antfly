@@ -2408,7 +2408,7 @@ pub fn validateRawGraphQueriesValueAlloc(
     if (root != .object) return error.InvalidQueryRequest;
     const graph_queries = root.object.get("graph_queries") orelse return;
     if (graph_queries == .null) return;
-    if (graph_queries != .object or graph_queries.object.count() > graph_query_mod.max_named_queries)
+    if (graph_queries != .object or graph_queries.object.count() == 0 or graph_queries.object.count() > graph_query_mod.max_named_queries)
         return error.InvalidQueryRequest;
 
     var pending = std.ArrayListUnmanaged(RawGraphValueEntry).empty;
@@ -2453,6 +2453,13 @@ pub fn validateRawGraphQueriesValueAlloc(
             else => {},
         }
     }
+}
+
+test "public query envelope rejects an explicitly empty graph_queries object" {
+    try std.testing.expectError(
+        error.InvalidQueryRequest,
+        queryBodyContractFields(std.testing.allocator, "{\"graph_queries\":{}}"),
+    );
 }
 
 /// Validate controls that must be rejected at every public query boundary.
@@ -5533,9 +5540,10 @@ fn toOpenApiGraphQueryResult(
 ) !indexes_openapi.GraphResult {
     const result = try toOpenApiStatefulGraphResultWithFormat(alloc, query, meta, graph_result, .canonical);
     return switch (result) {
-        .graph_nodes_result => |value| .{ .graph_nodes_result = value },
-        .graph_aggregates_result => |value| .{ .graph_aggregates_result = value },
-        .graph_bindings_result => |value| .{ .graph_bindings_result = value },
+        .graph_nodes_result => |value| .{ .graph_nodes_result = value.* },
+        .graph_paths_result => |value| .{ .graph_paths_result = value.* },
+        .graph_aggregates_result => |value| .{ .graph_aggregates_result = value.* },
+        .graph_bindings_result => |value| .{ .graph_bindings_result = value.* },
         .legacy_graph_search_result => unreachable,
     };
 }
@@ -5629,33 +5637,46 @@ fn toOpenApiStatefulGraphResultWithFormat(
     if (path_operation and graph_result.truncated)
         return error.QueryCandidateBudgetExceeded;
 
-    // Traversals optionally materialize their path on each node. Pathfinding
-    // instead has one authoritative top-level path and a lightweight terminal
-    // node, avoiding a second allocation and a duplicated wire representation.
-    const nodes = try toOpenApiGraphNodes(
-        alloc,
-        graph_result,
-        &document_lookup,
-        !path_operation and query.params.include_paths,
-    );
-    const paths = try toOpenApiGraphPaths(alloc, graph_result.paths, query.params.weight_mode);
     if (path_operation) {
-        if (nodes.len != paths.len) return error.InvalidRemoteResponse;
-        for (nodes, paths) |node, path| {
+        const paths = try toOpenApiGraphPaths(alloc, graph_result.paths, query.params.weight_mode);
+        if (graph_result.nodes.len != paths.len) return error.InvalidRemoteResponse;
+        const path_results = try alloc.alloc(indexes_openapi.GraphPathResult, paths.len);
+        for (graph_result.nodes, paths, 0..) |node, path, i| {
+            try validateCanonicalGraphResultNode(node);
             if (node.depth != path.length) return error.InvalidRemoteResponse;
             const terminal = path.nodes[path.nodes.len - 1];
             if (!GraphNodeIdentityContext.eql(.{}, .{ .key = node.key, .table = node.table }, .{ .key = terminal.key, .table = terminal.table }))
                 return error.InvalidRemoteResponse;
+            path_results[i] = .{
+                .path = path,
+                .document = try document_lookup.document(node.key, node.table),
+            };
         }
+        const response = try alloc.create(indexes_openapi.GraphPathsResult);
+        errdefer alloc.destroy(response);
+        response.* = .{
+            .kind = "paths",
+            .paths = path_results,
+            .stats = .{
+                .returned_items = @intCast(path_results.len),
+                .truncated = false,
+            },
+        };
+        return .{ .graph_paths_result = response };
     }
+    const nodes = try toOpenApiGraphNodes(
+        alloc,
+        graph_result,
+        &document_lookup,
+        query.params.include_paths,
+    );
     const response = try alloc.create(indexes_openapi.GraphNodesResult);
     errdefer alloc.destroy(response);
     response.* = .{
         .kind = "nodes",
         .nodes = nodes,
-        .paths = paths,
         .stats = .{
-            .returned_items = @intCast(if (paths.len > 0) paths.len else nodes.len),
+            .returned_items = @intCast(nodes.len),
             .truncated = graph_result.truncated,
         },
     };
@@ -6196,7 +6217,6 @@ test "canonical traversal responses keep paths on bounded result nodes" {
         },
     );
     try std.testing.expect(response.graph_nodes_result.nodes[0].path == null);
-    try std.testing.expectEqual(@as(usize, 0), response.graph_nodes_result.paths.len);
 
     var query_with_paths = query;
     query_with_paths.params.include_paths = true;
@@ -6387,17 +6407,16 @@ test "canonical graph paths preserve table-qualified node identities" {
     };
 
     const canonical = try toOpenApiGraphQueryResult(alloc, query, .{}, graph_result);
-    try std.testing.expect(canonical == .graph_nodes_result);
-    try std.testing.expect(canonical.graph_nodes_result.nodes[0].path == null);
-    try std.testing.expect(canonical.graph_nodes_result.nodes[0].path_edges == null);
-    try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].nodes[1].key);
-    try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].nodes[1].table.?);
-    try std.testing.expectEqualStrings("doc:a", canonical.graph_nodes_result.paths[0].edges[0].from.key);
-    try std.testing.expectEqualStrings("shared", canonical.graph_nodes_result.paths[0].edges[0].to.key);
-    try std.testing.expectEqualStrings("entities", canonical.graph_nodes_result.paths[0].edges[0].to.table.?);
-    try std.testing.expectEqual(indexes_openapi.GraphPathObjective.min_hops, canonical.graph_nodes_result.paths[0].objective);
-    try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].weight_sum);
-    try std.testing.expectEqual(@as(f64, 1), canonical.graph_nodes_result.paths[0].objective_value);
+    try std.testing.expect(canonical == .graph_paths_result);
+    const canonical_path = canonical.graph_paths_result.paths[0].path;
+    try std.testing.expectEqualStrings("shared", canonical_path.nodes[1].key);
+    try std.testing.expectEqualStrings("entities", canonical_path.nodes[1].table.?);
+    try std.testing.expectEqualStrings("doc:a", canonical_path.edges[0].from.key);
+    try std.testing.expectEqualStrings("shared", canonical_path.edges[0].to.key);
+    try std.testing.expectEqualStrings("entities", canonical_path.edges[0].to.table.?);
+    try std.testing.expectEqual(indexes_openapi.GraphPathObjective.min_hops, canonical_path.objective);
+    try std.testing.expectEqual(@as(f64, 1), canonical_path.weight_sum);
+    try std.testing.expectEqual(@as(f64, 1), canonical_path.objective_value);
 
     const legacy = try toOpenApiStatefulGraphResultWithFormat(alloc, query, .{}, graph_result, .legacy);
     try std.testing.expect(legacy == .legacy_graph_search_result);

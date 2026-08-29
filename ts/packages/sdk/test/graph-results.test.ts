@@ -28,24 +28,25 @@ describe("graph result admission", () => {
     expect(() =>
       validateGraphQueryResponses(
         responses({
-          kind: "nodes",
-          nodes: [{ key: "b", depth: 1 }],
+          kind: "paths",
           paths: [
             {
-              nodes: [{ key: "a" }, { key: "b" }],
-              edges: [
-                {
-                  from: { key: "a" },
-                  to: { key: "b" },
-                  direction: "in",
-                  type: "related",
-                  weight: 1,
-                },
-              ],
-              length: 1,
-              objective: "min_hops",
-              weight_sum: 1,
-              objective_value: 1,
+              path: {
+                nodes: [{ key: "a" }, { key: "b" }],
+                edges: [
+                  {
+                    from: { key: "a" },
+                    to: { key: "b" },
+                    direction: "in",
+                    type: "related",
+                    weight: 1,
+                  },
+                ],
+                length: 1,
+                objective: "min_hops",
+                weight_sum: 1,
+                objective_value: 1,
+              },
             },
           ],
           stats: { returned_items: 1, truncated: false },
@@ -59,31 +60,32 @@ describe("graph result admission", () => {
     expect(() =>
       validateGraphQueryResponses(
         responses({
-          kind: "nodes",
-          nodes: [{ key: "c", depth: 2 }],
+          kind: "paths",
           paths: [
             {
-              nodes: [{ key: "a" }, { key: "b" }, { key: "c" }],
-              edges: [
-                {
-                  from: { key: "a" },
-                  to: { key: "b" },
-                  direction: "out",
-                  type: "related",
-                  weight: 1e200,
-                },
-                {
-                  from: { key: "b" },
-                  to: { key: "c" },
-                  direction: "out",
-                  type: "related",
-                  weight: 1e200,
-                },
-              ],
-              length: 2,
-              objective: "min_hops",
-              weight_sum: 2e200,
-              objective_value: 2,
+              path: {
+                nodes: [{ key: "a" }, { key: "b" }, { key: "c" }],
+                edges: [
+                  {
+                    from: { key: "a" },
+                    to: { key: "b" },
+                    direction: "out",
+                    type: "related",
+                    weight: 1e200,
+                  },
+                  {
+                    from: { key: "b" },
+                    to: { key: "c" },
+                    direction: "out",
+                    type: "related",
+                    weight: 1e200,
+                  },
+                ],
+                length: 2,
+                objective: "min_hops",
+                weight_sum: 2e200,
+                objective_value: 2,
+              },
             },
           ],
           stats: { returned_items: 1, truncated: false },
@@ -96,7 +98,7 @@ describe("graph result admission", () => {
   it("rejects a legacy downgrade for a canonical request", () => {
     expect(() =>
       validateGraphQueryResponses(responses({ type: "neighbors", total: 1 }), [canonicalRequest])
-    ).toThrow('must be "nodes" for the requested operation');
+    ).toThrow('must be "paths" for the requested operation');
   });
 
   it("rejects mismatched operation names and missing edge orientation", () => {
@@ -108,8 +110,7 @@ describe("graph result admission", () => {
       validateGraphQueryResponses(
         responses(
           {
-            kind: "nodes",
-            nodes: [],
+            kind: "paths",
             paths: [],
             stats: { returned_items: 0, truncated: false },
           },
@@ -120,16 +121,17 @@ describe("graph result admission", () => {
     ).toThrow("operation names do not match the request");
 
     const malformed = responses({
-      kind: "nodes",
-      nodes: [{ key: "b", depth: 1 }],
+      kind: "paths",
       paths: [
         {
-          nodes: [{ key: "a" }, { key: "b" }],
-          edges: [{ from: { key: "a" }, to: { key: "b" }, type: "related", weight: 1 }],
-          length: 1,
-          objective: "min_hops",
-          weight_sum: 1,
-          objective_value: 1,
+          path: {
+            nodes: [{ key: "a" }, { key: "b" }],
+            edges: [{ from: { key: "a" }, to: { key: "b" }, type: "related", weight: 1 }],
+            length: 1,
+            objective: "min_hops",
+            weight_sum: 1,
+            objective_value: 1,
+          },
         },
       ],
       stats: { returned_items: 1, truncated: false },
@@ -149,7 +151,7 @@ describe("graph result admission", () => {
         }),
         [canonicalRequest]
       )
-    ).toThrow('must be "nodes" for the requested operation');
+    ).toThrow('must be "paths" for the requested operation');
 
     const bindingsRequest = {
       graph_queries: {
@@ -204,24 +206,26 @@ describe("graph result admission", () => {
 
   it("rejects unrequested documents while allowing sparse requested hydration", () => {
     const nodeResult = (document?: Record<string, unknown>) => ({
-      kind: "nodes",
-      nodes: [{ key: "b", depth: 1, ...(document === undefined ? {} : { document }) }],
+      kind: "paths",
       paths: [
         {
-          nodes: [{ key: "a" }, { key: "b" }],
-          edges: [
-            {
-              from: { key: "a" },
-              to: { key: "b" },
-              direction: "out",
-              type: "related",
-              weight: 1,
-            },
-          ],
-          length: 1,
-          objective: "min_hops",
-          weight_sum: 1,
-          objective_value: 1,
+          ...(document === undefined ? {} : { document }),
+          path: {
+            nodes: [{ key: "a" }, { key: "b" }],
+            edges: [
+              {
+                from: { key: "a" },
+                to: { key: "b" },
+                direction: "out",
+                type: "related",
+                weight: 1,
+              },
+            ],
+            length: 1,
+            objective: "min_hops",
+            weight_sum: 1,
+            objective_value: 1,
+          },
         },
       ],
       stats: { returned_items: 1, truncated: false },
@@ -281,38 +285,31 @@ describe("graph result admission", () => {
       weight_sum: 0,
       objective_value: 0,
     };
-    const pathResult = (nodes: unknown[], paths: unknown[], truncated = false) => ({
-      kind: "nodes",
-      nodes,
-      paths,
+    const pathResult = (paths: unknown[], truncated = false) => ({
+      kind: "paths",
+      paths: paths.map((path) => ({ path })),
       stats: { returned_items: paths.length, truncated },
     });
 
     expect(() =>
-      validateGraphQueryResponses(
-        responses(
-          pathResult(
-            [
-              { key: "a", depth: 0 },
-              { key: "a", depth: 0 },
-            ],
-            [zeroHopPath, zeroHopPath]
-          )
-        ),
-        [canonicalRequest]
-      )
+      validateGraphQueryResponses(responses(pathResult([zeroHopPath, zeroHopPath])), [
+        canonicalRequest,
+      ])
     ).toThrow("exceeds the requested result limit");
 
     expect(() =>
-      validateGraphQueryResponses(responses(pathResult([], [], true)), [canonicalRequest])
+      validateGraphQueryResponses(responses(pathResult([], true)), [canonicalRequest])
     ).toThrow("must be false for an exact result");
 
     expect(() =>
       validateGraphQueryResponses(
-        responses(pathResult([{ key: "a", depth: 0, path: [{ key: "a" }] }], [zeroHopPath])),
+        responses({
+          ...pathResult([zeroHopPath]),
+          paths: [{ path: zeroHopPath, unexpected: true }],
+        }),
         [canonicalRequest]
       )
-    ).toThrow("duplicates its authoritative top-level path");
+    ).toThrow("contains unknown member");
 
     const traversalRequest = {
       graph_queries: {
@@ -325,7 +322,6 @@ describe("graph result admission", () => {
           {
             kind: "nodes",
             nodes: [{ key: "a", depth: 0, path: [{ key: "a" }] }],
-            paths: [],
             stats: { returned_items: 1, truncated: false },
           },
           "walk"
@@ -348,7 +344,6 @@ describe("graph result admission", () => {
           {
             kind: "nodes",
             nodes: [{ key: "a", depth: 0 }],
-            paths: [],
             stats: { returned_items: 1, truncated: false },
           },
           "walk"

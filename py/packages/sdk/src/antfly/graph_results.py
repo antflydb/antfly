@@ -20,7 +20,7 @@ _MAX_GRAPH_EDGES = 64
 _MAX_GRAPH_ITEMS = 10_000
 _MISSING = object()
 GraphResultDialect = Literal["auto", "canonical", "none"]
-GraphResultKind = Literal["bindings", "aggregates", "nodes"]
+GraphResultKind = Literal["bindings", "aggregates", "nodes", "paths"]
 GraphNodeResultMode = Literal["traversal", "shortest_path", "k_shortest_paths"]
 
 
@@ -266,7 +266,7 @@ def _validate_stats(value: object, path: str, expected_items: int, *, allow_trun
     if type(stats["truncated"]) is not bool:
         _invalid(f"{path}.truncated", "must be a boolean")
     if not allow_truncated and stats["truncated"]:
-        _invalid(f"{path}.truncated", "must be false for exact aggregates")
+        _invalid(f"{path}.truncated", "must be false for an exact result")
 
 
 def _validate_bindings_result(value: Mapping[str, Any], path: str) -> None:
@@ -320,20 +320,27 @@ def _validate_aggregates_result(value: Mapping[str, Any], path: str) -> None:
 
 
 def _validate_nodes_result(value: Mapping[str, Any], path: str) -> None:
-    _exact_keys(value, path, required=frozenset({"kind", "nodes", "paths", "stats"}))
+    _exact_keys(value, path, required=frozenset({"kind", "nodes", "stats"}))
     raw_nodes = _array(value["nodes"], f"{path}.nodes")
+    if len(raw_nodes) > _MAX_GRAPH_ITEMS:
+        _invalid(path, f"nodes must contain at most {_MAX_GRAPH_ITEMS} items")
+    [_validate_result_node(node, f"{path}.nodes[{index}]") for index, node in enumerate(raw_nodes)]
+    _validate_stats(value["stats"], f"{path}.stats", len(raw_nodes), allow_truncated=True)
+
+
+def _validate_paths_result(value: Mapping[str, Any], path: str) -> None:
+    _exact_keys(value, path, required=frozenset({"kind", "paths", "stats"}))
     raw_paths = _array(value["paths"], f"{path}.paths")
-    if len(raw_nodes) > _MAX_GRAPH_ITEMS or len(raw_paths) > _MAX_GRAPH_ITEMS:
-        _invalid(path, f"nodes and paths must each contain at most {_MAX_GRAPH_ITEMS} items")
-    nodes = [_validate_result_node(node, f"{path}.nodes[{index}]") for index, node in enumerate(raw_nodes)]
-    paths = [_validate_path(graph_path, f"{path}.paths[{index}]") for index, graph_path in enumerate(raw_paths)]
-    if paths:
-        if len(nodes) != len(paths):
-            _invalid(path, "path results require one terminal node per path")
-        for index, graph_path in enumerate(paths):
-            if not _same_endpoint(graph_path["nodes"][-1], nodes[index]):
-                _invalid(f"{path}.nodes[{index}]", "does not match its path terminal")
-    _validate_stats(value["stats"], f"{path}.stats", len(paths) if paths else len(nodes), allow_truncated=True)
+    if len(raw_paths) > _MAX_GRAPH_ITEMS:
+        _invalid(path, f"paths must contain at most {_MAX_GRAPH_ITEMS} items")
+    for index, raw_item in enumerate(raw_paths):
+        item_path = f"{path}.paths[{index}]"
+        item = _object(raw_item, item_path)
+        _exact_keys(item, item_path, required=frozenset({"path"}), optional=frozenset({"document"}))
+        _validate_path(item["path"], f"{item_path}.path")
+        if "document" in item:
+            _object(item["document"], f"{item_path}.document")
+    _validate_stats(value["stats"], f"{path}.stats", len(raw_paths), allow_truncated=False)
 
 
 def _canonical_result_contract(value: object, path: str) -> _CanonicalResultContract:
@@ -372,7 +379,7 @@ def _canonical_result_contract(value: object, path: str) -> _CanonicalResultCont
     if "shortest_path" in operation:
         shortest_path = _object(operation["shortest_path"], f"{path}.shortest_path")
         return _CanonicalResultContract(
-            "nodes",
+            "paths",
             max_items=1,
             node_mode="shortest_path",
             include_documents=shortest_path.get("include_documents") is True,
@@ -381,7 +388,7 @@ def _canonical_result_contract(value: object, path: str) -> _CanonicalResultCont
         k_shortest_paths = _object(operation["k_shortest_paths"], f"{path}.k_shortest_paths")
         k = _bounded_integer(k_shortest_paths.get("k", _MISSING), f"{path}.k_shortest_paths.k", 1, 100)
         return _CanonicalResultContract(
-            "nodes",
+            "paths",
             max_items=k,
             node_mode="k_shortest_paths",
             include_documents=k_shortest_paths.get("include_documents") is True,
@@ -436,18 +443,15 @@ def _validate_graph_result(
         _validate_nodes_result(result, path)
         if contract is not None:
             raw_nodes = _array(result["nodes"], f"{path}.nodes")
-            raw_paths = _array(result["paths"], f"{path}.paths")
-            if contract.max_items is None or contract.node_mode is None:
+            if contract.max_items is None or contract.node_mode != "traversal":
                 _invalid(path, "has no node operation contract")
-            if len(raw_nodes) > contract.max_items or len(raw_paths) > contract.max_items:
+            if len(raw_nodes) > contract.max_items:
                 _invalid(path, "exceeds the requested result limit")
             if not contract.include_documents:
                 for index, raw_node in enumerate(raw_nodes):
                     if "document" in _object(raw_node, f"{path}.nodes[{index}]"):
                         _invalid(f"{path}.nodes[{index}].document", "was returned without being requested")
             if contract.node_mode == "traversal":
-                if raw_paths:
-                    _invalid(f"{path}.paths", "traversal paths belong on result nodes")
                 for index, raw_node in enumerate(raw_nodes):
                     node = _object(raw_node, f"{path}.nodes[{index}]")
                     if contract.include_paths:
@@ -456,22 +460,18 @@ def _validate_graph_result(
                     else:
                         if "path" in node or "path_edges" in node:
                             _invalid(f"{path}.nodes[{index}]", "contains a path that was not requested")
-            else:
-                if len(raw_nodes) != len(raw_paths):
-                    _invalid(path, "path results require one terminal node per path")
-                stats = _object(result["stats"], f"{path}.stats")
-                if stats["truncated"]:
-                    _invalid(f"{path}.stats.truncated", "must be false for an exact path result")
-                for index, (raw_node, raw_path) in enumerate(zip(raw_nodes, raw_paths, strict=True)):
-                    node = _object(raw_node, f"{path}.nodes[{index}]")
-                    graph_path = _object(raw_path, f"{path}.paths[{index}]")
-                    if "path" in node or "path_edges" in node:
-                        _invalid(
-                            f"{path}.nodes[{index}]",
-                            "duplicates its authoritative top-level path",
-                        )
-                    if node["depth"] != graph_path["length"]:
-                        _invalid(f"{path}.nodes[{index}].depth", "does not match its path length")
+    elif kind == "paths":
+        _validate_paths_result(result, path)
+        if contract is not None:
+            if contract.node_mode not in {"shortest_path", "k_shortest_paths"} or contract.max_items is None:
+                _invalid(path, "has no path operation contract")
+            raw_paths = _array(result["paths"], f"{path}.paths")
+            if len(raw_paths) > contract.max_items:
+                _invalid(path, "exceeds the requested result limit")
+            if not contract.include_documents:
+                for index, raw_item in enumerate(raw_paths):
+                    if "document" in _object(raw_item, f"{path}.paths[{index}]"):
+                        _invalid(f"{path}.paths[{index}].document", "was returned without being requested")
     else:
         _invalid(f"{path}.kind", f"has unknown canonical discriminator {kind!r}")
 

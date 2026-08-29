@@ -15,6 +15,28 @@ pub const default_max_explored_edge_bytes: usize = 64 * 1024 * 1024;
 pub const default_max_scanned_anchors: usize = 1_000_000;
 pub const default_max_intermediate_states: usize = 100_000;
 pub const default_max_retained_state_bytes: usize = 64 * 1024 * 1024;
+pub const default_max_distinct_identities: usize = 100_000;
+pub const default_max_distinct_state_bytes: usize = 16 * 1024 * 1024;
+
+/// Operator-owned ceilings applied to one admitted graph request. These values
+/// are deliberately absent from the public query DSL: callers may shape result
+/// size, but cannot raise server CPU or retained-memory admission.
+pub const Limits = struct {
+    max_explored_nodes: usize = default_max_explored_nodes,
+    max_explored_edges: usize = default_max_explored_edges,
+    max_explored_edge_bytes: usize = default_max_explored_edge_bytes,
+    max_scanned_anchors: usize = default_max_scanned_anchors,
+    max_intermediate_states: usize = default_max_intermediate_states,
+    max_retained_state_bytes: usize = default_max_retained_state_bytes,
+    max_distinct_identities: usize = default_max_distinct_identities,
+    max_distinct_state_bytes: usize = default_max_distinct_state_bytes,
+
+    pub fn validate(self: Limits) !void {
+        inline for (std.meta.fields(Limits)) |field| {
+            if (@field(self, field.name) == 0) return error.InvalidGraphExecutionLimits;
+        }
+    }
+};
 
 /// `std.HashMapUnmanaged` uses an eight-slot minimum allocation and power-of-two
 /// capacity at its configured load percentage. These helpers mirror that
@@ -78,6 +100,7 @@ pub const WorkBudget = struct {
     max_edges: usize,
     max_edge_bytes: usize,
     max_anchors: usize,
+    max_intermediate_states: usize,
     max_retained_state_bytes: usize,
     remaining_nodes: usize,
     remaining_edges: usize,
@@ -87,16 +110,24 @@ pub const WorkBudget = struct {
     last_exhaustion: ?Exhaustion = null,
 
     pub fn init(max_nodes: usize, max_edges: usize) WorkBudget {
+        return initWithLimits(.{
+            .max_explored_nodes = max_nodes,
+            .max_explored_edges = max_edges,
+        });
+    }
+
+    pub fn initWithLimits(limits: Limits) WorkBudget {
         return .{
-            .max_nodes = max_nodes,
-            .max_edges = max_edges,
-            .max_edge_bytes = default_max_explored_edge_bytes,
-            .max_anchors = default_max_scanned_anchors,
-            .max_retained_state_bytes = default_max_retained_state_bytes,
-            .remaining_nodes = max_nodes,
-            .remaining_edges = max_edges,
-            .remaining_edge_bytes = default_max_explored_edge_bytes,
-            .remaining_anchors = default_max_scanned_anchors,
+            .max_nodes = limits.max_explored_nodes,
+            .max_edges = limits.max_explored_edges,
+            .max_edge_bytes = limits.max_explored_edge_bytes,
+            .max_anchors = limits.max_scanned_anchors,
+            .max_intermediate_states = limits.max_intermediate_states,
+            .max_retained_state_bytes = limits.max_retained_state_bytes,
+            .remaining_nodes = limits.max_explored_nodes,
+            .remaining_edges = limits.max_explored_edges,
+            .remaining_edge_bytes = limits.max_explored_edge_bytes,
+            .remaining_anchors = limits.max_scanned_anchors,
         };
     }
 
@@ -148,7 +179,8 @@ pub const WorkBudget = struct {
     }
 
     pub fn checkIntermediateStates(self: *WorkBudget, count: usize, maximum: usize) !void {
-        if (count > maximum) return self.exhaust(.intermediate_states, maximum);
+        const effective_maximum = @min(maximum, self.max_intermediate_states);
+        if (count > effective_maximum) return self.exhaust(.intermediate_states, effective_maximum);
     }
 
     pub fn retainStateBytes(self: *WorkBudget, bytes: usize) !void {

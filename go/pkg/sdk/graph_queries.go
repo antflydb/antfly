@@ -50,6 +50,9 @@ const (
 )
 
 func validateNamedGraphQueries(queries map[string]GraphQuery) error {
+	if len(queries) == 0 {
+		return fmt.Errorf("antfly: graph_queries must contain at least one named operation")
+	}
 	if len(queries) > maxNamedGraphQueries {
 		return fmt.Errorf("antfly: graph_queries accepts at most %d named operations", maxNamedGraphQueries)
 	}
@@ -249,7 +252,7 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 	case oapi.GraphQueryVariantShortestPath:
 		value := decoded.ShortestPath
 		return canonicalGraphResultContract{
-			kind:             string(GraphNodesResultKindNodes),
+			kind:             string(GraphPathsResultKindPaths),
 			maxItems:         1,
 			nodeMode:         canonicalGraphNodeModeShortestPath,
 			includeDocuments: value.ShortestPath.IncludeDocuments,
@@ -257,7 +260,7 @@ func canonicalGraphResultContractForQuery(query GraphQuery) (canonicalGraphResul
 	case oapi.GraphQueryVariantKShortestPaths:
 		value := decoded.KShortestPaths
 		return canonicalGraphResultContract{
-			kind:             string(GraphNodesResultKindNodes),
+			kind:             string(GraphPathsResultKindPaths),
 			maxItems:         value.KShortestPaths.K,
 			nodeMode:         canonicalGraphNodeModeKShortestPaths,
 			includeDocuments: value.KShortestPaths.IncludeDocuments,
@@ -398,7 +401,17 @@ type graphResultNodeValidation struct {
 type graphNodesResultValidation struct {
 	Kind  GraphNodesResultKind        `json:"kind"`
 	Nodes []graphResultNodeValidation `json:"nodes"`
-	Paths []graphPathValidation       `json:"paths"`
+	Stats GraphQueryStats             `json:"stats"`
+}
+
+type graphPathResultValidation struct {
+	Path     graphPathValidation   `json:"path"`
+	Document graphOpaqueJSONObject `json:"document,omitempty"`
+}
+
+type graphPathsResultValidation struct {
+	Kind  GraphPathsResultKind        `json:"kind"`
+	Paths []graphPathResultValidation `json:"paths"`
 	Stats GraphQueryStats             `json:"stats"`
 }
 
@@ -414,6 +427,8 @@ func validateCanonicalGraphResultPayload(
 		return validateAggregatesResultPayload(contract, result, envelope)
 	case string(GraphNodesResultKindNodes):
 		return validateNodesResultPayload(contract, result, envelope)
+	case string(GraphPathsResultKindPaths):
+		return validatePathsResultPayload(contract, result, envelope)
 	default:
 		return fmt.Errorf("antfly: unknown canonical graph result discriminator %q", contract.kind)
 	}
@@ -491,10 +506,13 @@ func validateNodesResultPayload(contract canonicalGraphResultContract, result st
 	if err := result.DecodeStrictInto(&value); err != nil {
 		return fmt.Errorf("antfly: invalid nodes graph result: %w", err)
 	}
-	if value.Kind != GraphNodesResultKindNodes || value.Nodes == nil || value.Paths == nil {
-		return fmt.Errorf("antfly: nodes graph result requires kind, nodes, and paths")
+	if value.Kind != GraphNodesResultKindNodes || value.Nodes == nil {
+		return fmt.Errorf("antfly: nodes graph result requires kind and nodes")
 	}
-	if len(value.Nodes) > contract.maxItems || len(value.Paths) > contract.maxItems {
+	if contract.nodeMode != canonicalGraphNodeModeTraversal {
+		return fmt.Errorf("antfly: nodes graph result requires a traversal operation")
+	}
+	if len(value.Nodes) > contract.maxItems {
 		return fmt.Errorf("antfly: nodes graph result exceeds the requested limit of %d items", contract.maxItems)
 	}
 	for i := range value.Nodes {
@@ -505,52 +523,41 @@ func validateNodesResultPayload(contract canonicalGraphResultContract, result st
 			return fmt.Errorf("antfly: nodes graph result node %d contains a document that was not requested", i)
 		}
 	}
+	for i := range value.Nodes {
+		if contract.includePaths {
+			if value.Nodes[i].Path == nil {
+				return fmt.Errorf("antfly: traversal graph result node %d is missing its requested path", i)
+			}
+		} else if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
+			return fmt.Errorf("antfly: traversal graph result node %d contains a path that was not requested", i)
+		}
+	}
+	return validateDecodedGraphStats(envelope, len(value.Nodes), true)
+}
+
+func validatePathsResultPayload(contract canonicalGraphResultContract, result strictGraphResultDecoder, envelope graphQueryResultEnvelope) error {
+	var value graphPathsResultValidation
+	if err := result.DecodeStrictInto(&value); err != nil {
+		return fmt.Errorf("antfly: invalid paths graph result: %w", err)
+	}
+	if value.Kind != GraphPathsResultKindPaths || value.Paths == nil {
+		return fmt.Errorf("antfly: paths graph result requires kind and paths")
+	}
+	if contract.nodeMode != canonicalGraphNodeModeShortestPath && contract.nodeMode != canonicalGraphNodeModeKShortestPaths {
+		return fmt.Errorf("antfly: paths graph result requires a path operation")
+	}
+	if len(value.Paths) > contract.maxItems {
+		return fmt.Errorf("antfly: paths graph result exceeds the requested limit of %d items", contract.maxItems)
+	}
 	for i := range value.Paths {
-		if err := validateGraphPathPayload(&value.Paths[i]); err != nil {
-			return fmt.Errorf("antfly: nodes graph result path %d: %w", i, err)
+		if err := validateGraphPathPayload(&value.Paths[i].Path); err != nil {
+			return fmt.Errorf("antfly: paths graph result path %d: %w", i, err)
+		}
+		if !contract.includeDocuments && value.Paths[i].Document.present {
+			return fmt.Errorf("antfly: paths graph result path %d contains a document that was not requested", i)
 		}
 	}
-	allowTruncated := true
-	primaryItems := len(value.Nodes)
-	switch contract.nodeMode {
-	case canonicalGraphNodeModeTraversal:
-		if len(value.Paths) != 0 {
-			return fmt.Errorf("antfly: traversal graph result must expose paths on nodes, not in the top-level paths array")
-		}
-		for i := range value.Nodes {
-			if contract.includePaths {
-				if value.Nodes[i].Path == nil {
-					return fmt.Errorf("antfly: traversal graph result node %d is missing its requested path", i)
-				}
-			} else {
-				if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
-					return fmt.Errorf("antfly: traversal graph result node %d contains a path that was not requested", i)
-				}
-			}
-		}
-	case canonicalGraphNodeModeShortestPath, canonicalGraphNodeModeKShortestPaths:
-		allowTruncated = false
-		primaryItems = len(value.Paths)
-		if len(value.Nodes) != len(value.Paths) {
-			return fmt.Errorf("antfly: path graph result requires one terminal node per path")
-		}
-		for i := range value.Paths {
-			if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
-				return fmt.Errorf("antfly: path graph result node %d duplicates its authoritative top-level path", i)
-			}
-			if value.Nodes[i].Depth != value.Paths[i].Length {
-				return fmt.Errorf("antfly: path graph result node %d depth does not match its path length", i)
-			}
-			terminal := value.Paths[i].Nodes[len(value.Paths[i].Nodes)-1]
-			node := &value.Nodes[i]
-			if !sameDecodedGraphEndpoint(terminal, GraphPathEndpoint{Key: node.Key, Table: node.Table.pointer()}) {
-				return fmt.Errorf("antfly: path graph result node %d does not match its path terminal", i)
-			}
-		}
-	default:
-		return fmt.Errorf("antfly: nodes graph result has no operation contract")
-	}
-	return validateDecodedGraphStats(envelope, primaryItems, allowTruncated)
+	return validateDecodedGraphStats(envelope, len(value.Paths), false)
 }
 
 func validateGraphResultNodePayload(node *graphResultNodeValidation) error {
@@ -738,7 +745,7 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 		if contract.kind != string(GraphNodesResultKindNodes) {
 			return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, GraphNodesResultKindNodes)
 		}
-		if len(value.Nodes) > contract.maxItems || len(value.Paths) > contract.maxItems {
+		if contract.nodeMode != canonicalGraphNodeModeTraversal || len(value.Nodes) > contract.maxItems {
 			return fmt.Errorf("antfly: nodes graph result exceeds the requested limit of %d items", contract.maxItems)
 		}
 		if !contract.includeDocuments {
@@ -748,42 +755,33 @@ func validateDecodedGraphResultContract(contract canonicalGraphResultContract, d
 				}
 			}
 		}
-		switch contract.nodeMode {
-		case canonicalGraphNodeModeTraversal:
-			if len(value.Paths) != 0 {
-				return fmt.Errorf("antfly: traversal graph result must expose paths on nodes, not in the top-level paths array")
-			}
-			for i := range value.Nodes {
-				if contract.includePaths {
-					if value.Nodes[i].Path == nil {
-						return fmt.Errorf("antfly: traversal graph result node %d is missing its requested path", i)
-					}
-				} else {
-					if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
-						return fmt.Errorf("antfly: traversal graph result node %d contains a path that was not requested", i)
-					}
+		for i := range value.Nodes {
+			if contract.includePaths {
+				if value.Nodes[i].Path == nil {
+					return fmt.Errorf("antfly: traversal graph result node %d is missing its requested path", i)
 				}
-			}
-			return nil
-		case canonicalGraphNodeModeShortestPath, canonicalGraphNodeModeKShortestPaths:
-			if value.Stats.Truncated {
-				return fmt.Errorf("antfly: exact graph results cannot be truncated")
-			}
-			if len(value.Nodes) != len(value.Paths) {
-				return fmt.Errorf("antfly: path graph result requires one terminal node per path")
-			}
-			for i := range value.Paths {
+			} else {
 				if value.Nodes[i].Path != nil || value.Nodes[i].PathEdges != nil {
-					return fmt.Errorf("antfly: path graph result node %d duplicates its authoritative top-level path", i)
-				}
-				if value.Nodes[i].Depth != value.Paths[i].Length {
-					return fmt.Errorf("antfly: path graph result node %d depth does not match its path length", i)
+					return fmt.Errorf("antfly: traversal graph result node %d contains a path that was not requested", i)
 				}
 			}
-			return nil
-		default:
-			return fmt.Errorf("antfly: nodes graph result has no operation contract")
 		}
+		return nil
+	case GraphPathsResult:
+		if contract.kind != string(GraphPathsResultKindPaths) || (contract.nodeMode != canonicalGraphNodeModeShortestPath && contract.nodeMode != canonicalGraphNodeModeKShortestPaths) {
+			return fmt.Errorf("antfly: graph operation requires result kind %q, got %q", contract.kind, GraphPathsResultKindPaths)
+		}
+		if len(value.Paths) > contract.maxItems {
+			return fmt.Errorf("antfly: paths graph result exceeds the requested limit of %d items", contract.maxItems)
+		}
+		if !contract.includeDocuments {
+			for i := range value.Paths {
+				if value.Paths[i].Document != nil {
+					return fmt.Errorf("antfly: paths graph result path %d contains a document that was not requested", i)
+				}
+			}
+		}
+		return nil
 	default:
 		return fmt.Errorf("antfly: unsupported decoded graph result type %T", decoded)
 	}
@@ -864,10 +862,10 @@ func decodeCanonicalGraphResult(
 		if err := result.DecodeStrictInto(&value); err != nil {
 			return nil, fmt.Errorf("antfly: invalid nodes graph result: %w", err)
 		}
-		if value.Kind != GraphNodesResultKindNodes || value.Nodes == nil || value.Paths == nil {
-			return nil, fmt.Errorf("antfly: nodes graph result requires kind, nodes, and paths")
+		if value.Kind != GraphNodesResultKindNodes || value.Nodes == nil {
+			return nil, fmt.Errorf("antfly: nodes graph result requires kind and nodes")
 		}
-		if len(value.Nodes) > maxGraphHydratedBindings || len(value.Paths) > maxGraphHydratedBindings {
+		if len(value.Nodes) > maxGraphHydratedBindings {
 			return nil, fmt.Errorf("antfly: nodes graph result exceeds %d items", maxGraphHydratedBindings)
 		}
 		for i, node := range value.Nodes {
@@ -875,28 +873,27 @@ func decodeCanonicalGraphResult(
 				return nil, fmt.Errorf("antfly: nodes graph result node %d: %w", i, err)
 			}
 		}
-		for i, path := range value.Paths {
-			if err := validateDecodedGraphPath(path); err != nil {
-				return nil, fmt.Errorf("antfly: nodes graph result path %d: %w", i, err)
+		if err := validateDecodedGraphStats(envelope, len(value.Nodes), true); err != nil {
+			return nil, err
+		}
+		return value, nil
+	case string(GraphPathsResultKindPaths):
+		var value GraphPathsResult
+		if err := result.DecodeStrictInto(&value); err != nil {
+			return nil, fmt.Errorf("antfly: invalid paths graph result: %w", err)
+		}
+		if value.Kind != GraphPathsResultKindPaths || value.Paths == nil {
+			return nil, fmt.Errorf("antfly: paths graph result requires kind and paths")
+		}
+		if len(value.Paths) > maxGraphHydratedBindings {
+			return nil, fmt.Errorf("antfly: paths graph result exceeds %d items", maxGraphHydratedBindings)
+		}
+		for i := range value.Paths {
+			if err := validateDecodedGraphPath(value.Paths[i].Path); err != nil {
+				return nil, fmt.Errorf("antfly: paths graph result path %d: %w", i, err)
 			}
 		}
-		if len(value.Paths) > 0 {
-			if len(value.Nodes) != len(value.Paths) {
-				return nil, fmt.Errorf("antfly: path graph result requires one terminal node per path")
-			}
-			for i, path := range value.Paths {
-				terminal := path.Nodes[len(path.Nodes)-1]
-				node := value.Nodes[i]
-				if !sameDecodedGraphEndpoint(terminal, GraphPathEndpoint{Key: node.Key, Table: node.Table}) {
-					return nil, fmt.Errorf("antfly: path graph result node %d does not match its path terminal", i)
-				}
-			}
-		}
-		primaryItems := len(value.Nodes)
-		if len(value.Paths) > 0 {
-			primaryItems = len(value.Paths)
-		}
-		if err := validateDecodedGraphStats(envelope, primaryItems, true); err != nil {
+		if err := validateDecodedGraphStats(envelope, len(value.Paths), false); err != nil {
 			return nil, err
 		}
 		return value, nil

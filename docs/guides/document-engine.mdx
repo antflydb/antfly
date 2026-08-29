@@ -191,6 +191,12 @@ stored-edge `direction`: `out` by default, `in` for reverse expansion, and
 creates a second physical relationship and can therefore create a second
 binding or path.
 
+Every canonical result is self-describing through `kind`: MATCH returns
+`bindings` or `aggregates`, traversal returns `nodes`, and shortest-path
+operations return `paths`. Each `paths[]` item owns one authoritative `path`
+and, when requested, its terminal `document`; clients never need to align a
+parallel terminal-node array with the path array.
+
 Use `$query_results` to seed a graph operation from the final ranked result page,
 regardless of whether retrieval was lexical, vector, or fused:
 

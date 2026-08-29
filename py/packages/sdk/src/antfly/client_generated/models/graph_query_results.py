@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from ..models.graph_aggregates_result import GraphAggregatesResult
     from ..models.graph_bindings_result import GraphBindingsResult
     from ..models.graph_nodes_result import GraphNodesResult
+    from ..models.graph_paths_result import GraphPathsResult
 
 
 T = TypeVar("T", bound="GraphQueryResults")
@@ -19,19 +20,22 @@ T = TypeVar("T", bound="GraphQueryResults")
 class GraphQueryResults:
     """Canonical graph results keyed by graph_queries operation name."""
 
-    additional_properties: dict[str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult] = _attrs_field(
-        init=False, factory=dict
-    )
+    additional_properties: dict[
+        str, GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | GraphPathsResult
+    ] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.graph_aggregates_result import GraphAggregatesResult
         from ..models.graph_bindings_result import GraphBindingsResult
+        from ..models.graph_nodes_result import GraphNodesResult
 
         field_dict: dict[str, Any] = {}
         for prop_name, prop in self.additional_properties.items():
             if isinstance(prop, GraphBindingsResult):
                 field_dict[prop_name] = prop.to_dict()
             elif isinstance(prop, GraphAggregatesResult):
+                field_dict[prop_name] = prop.to_dict()
+            elif isinstance(prop, GraphNodesResult):
                 field_dict[prop_name] = prop.to_dict()
             else:
                 field_dict[prop_name] = prop.to_dict()
@@ -43,6 +47,7 @@ class GraphQueryResults:
         from ..models.graph_aggregates_result import GraphAggregatesResult
         from ..models.graph_bindings_result import GraphBindingsResult
         from ..models.graph_nodes_result import GraphNodesResult
+        from ..models.graph_paths_result import GraphPathsResult
 
         d = dict(src_dict)
         graph_query_results = cls()
@@ -52,7 +57,7 @@ class GraphQueryResults:
 
             def _parse_additional_property(
                 data: object,
-            ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult:
+            ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | GraphPathsResult:
                 try:
                     if not isinstance(data, dict):
                         raise TypeError()
@@ -69,11 +74,19 @@ class GraphQueryResults:
                     return componentsschemas_graph_result_type_1
                 except (TypeError, ValueError, AttributeError, KeyError):
                     pass
+                try:
+                    if not isinstance(data, dict):
+                        raise TypeError()
+                    componentsschemas_graph_result_type_2 = GraphNodesResult.from_dict(data)
+
+                    return componentsschemas_graph_result_type_2
+                except (TypeError, ValueError, AttributeError, KeyError):
+                    pass
                 if not isinstance(data, dict):
                     raise TypeError()
-                componentsschemas_graph_result_type_2 = GraphNodesResult.from_dict(data)
+                componentsschemas_graph_result_type_3 = GraphPathsResult.from_dict(data)
 
-                return componentsschemas_graph_result_type_2
+                return componentsschemas_graph_result_type_3
 
             additional_property = _parse_additional_property(prop_dict)
 
@@ -86,10 +99,14 @@ class GraphQueryResults:
     def additional_keys(self) -> list[str]:
         return list(self.additional_properties.keys())
 
-    def __getitem__(self, key: str) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult:
+    def __getitem__(
+        self, key: str
+    ) -> GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | GraphPathsResult:
         return self.additional_properties[key]
 
-    def __setitem__(self, key: str, value: GraphAggregatesResult | GraphBindingsResult | GraphNodesResult) -> None:
+    def __setitem__(
+        self, key: str, value: GraphAggregatesResult | GraphBindingsResult | GraphNodesResult | GraphPathsResult
+    ) -> None:
         self.additional_properties[key] = value
 
     def __delitem__(self, key: str) -> None:

@@ -867,6 +867,9 @@ pub const ApiHttpServerConfig = struct {
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// Node-local inference request admission capacity. Zero is unlimited.
     inference_max_concurrent_requests: u32 = common_config.default_inference_max_concurrent_requests,
+    /// Per-request graph execution ceilings owned by the operator. These are
+    /// never populated from the public graph-query DSL.
+    graph_execution_limits: @import("../graph/work_budget.zig").Limits = .{},
     /// Shared owner used when inference runs in this process. When present it
     /// supersedes the local fallback so every inference endpoint shares one cap.
     inference_request_admission_source: ?InferenceRequestAdmissionSource = null,
@@ -4960,6 +4963,7 @@ pub const ApiHttpServer = struct {
                 .route_query_to_read_schema = routeInternalGroupQueryToReadSchema,
             },
             .query_planning = self.internalQueryPlanningContext(),
+            .graph_execution_limits = self.cfg.graph_execution_limits,
         };
     }
 

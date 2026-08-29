@@ -6089,7 +6089,7 @@ fn extractTreeHits(
             };
             for (node_result.nodes) |node| {
                 const source = if (node.document) |document|
-                    try annotateTreeDocument(alloc, document, entry.key_ptr.*, node, node_result.paths, fallback_root_key)
+                    try annotateTreeDocument(alloc, document, entry.key_ptr.*, node, &.{}, fallback_root_key)
                 else
                     null;
                 try hits.append(alloc, .{
@@ -6427,7 +6427,7 @@ test "retrieval agent ignores empty map-valued tool fields for policy and strate
     try std.testing.expectEqual(RetrievalStrategy.bm25, empty_aggregations_result.value.strategy_used.?);
 
     const empty_graph_body =
-        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"graph_queries":{},"limit":5}]}
+        \\{"query":"find alpha","stream":false,"tools":{"enabled_tools":["semantic_search"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
     ;
     const empty_graph_encoded = try executeJson(std.testing.allocator, runner.ifaceWithState(), null, empty_graph_body);
     defer std.testing.allocator.free(empty_graph_encoded);
@@ -6518,7 +6518,7 @@ test "retrieval agent supports inline tree search" {
             try std.testing.expectEqual(true, tree_query.graph_traverse_query.traverse.include_paths.?);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }
@@ -6565,7 +6565,7 @@ test "retrieval agent supports pipeline tree search from previous hits" {
             try std.testing.expectEqualStrings("doc:a", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:b","depth":1,"document":{"title":"beta"}}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }
@@ -6647,7 +6647,7 @@ test "retrieval agent supports roots tree search" {
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child"}}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }
@@ -7930,7 +7930,7 @@ test "retrieval agent streaming emits go-shaped tree search progress" {
         fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"}}],"paths":[{"nodes":["doc:root","doc:child"]}],"stats":{"returned_items":1,"truncated":false}}}}]}
+                    \\{"responses":[{"status":200,"took":1,"graph_results":{"tree_search":{"kind":"nodes","nodes":[{"key":"doc:child","depth":1,"document":{"title":"child","body":"details about the architecture"},"path":[{"key":"doc:root"},{"key":"doc:child"}]}],"stats":{"returned_items":1,"truncated":false}}}}]}
                 ),
             };
         }

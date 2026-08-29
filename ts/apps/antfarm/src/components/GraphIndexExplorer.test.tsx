@@ -134,10 +134,10 @@ describe("GraphIndexExplorer", () => {
         indexes={[graphIndex]}
         onRefreshIndexes={() => undefined}
         initialResult={{
-          kind: "nodes",
-          nodes: [],
+          kind: "paths",
           paths: [
             {
+              path: {
               nodes: [{ key: "shared" }, { key: "shared", table: "entities" }],
               edges: [
                 {
@@ -152,6 +152,7 @@ describe("GraphIndexExplorer", () => {
               objective: "min_hops",
               weight_sum: 1,
               objective_value: 1,
+              },
             },
           ],
           stats: { returned_items: 1, truncated: false },
@@ -200,7 +201,6 @@ describe("GraphIndexExplorer", () => {
               ],
             },
           ],
-          paths: [],
           stats: { returned_items: 1, truncated: false },
         }}
       />

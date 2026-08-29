@@ -40,8 +40,8 @@ pub const default_max_explored_edge_bytes = work_budget_mod.default_max_explored
 pub const default_max_scanned_anchors = work_budget_mod.default_max_scanned_anchors;
 pub const default_max_intermediate_states = work_budget_mod.default_max_intermediate_states;
 pub const default_max_retained_state_bytes = work_budget_mod.default_max_retained_state_bytes;
-pub const default_max_distinct_identities: usize = 100_000;
-pub const default_max_distinct_state_bytes: usize = 16 * 1024 * 1024;
+pub const default_max_distinct_identities = work_budget_mod.default_max_distinct_identities;
+pub const default_max_distinct_state_bytes = work_budget_mod.default_max_distinct_state_bytes;
 
 pub const NodeFilter = struct {
     filter_prefix: []const u8 = "",

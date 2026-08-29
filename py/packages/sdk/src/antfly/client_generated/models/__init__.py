@@ -395,10 +395,14 @@ from .graph_path_edge_direction import GraphPathEdgeDirection
 from .graph_path_edge_metadata import GraphPathEdgeMetadata
 from .graph_path_endpoint import GraphPathEndpoint
 from .graph_path_objective import GraphPathObjective
+from .graph_path_result import GraphPathResult
+from .graph_path_result_document import GraphPathResultDocument
 from .graph_path_weight_domain_error import GraphPathWeightDomainError
 from .graph_path_weight_domain_error_error import GraphPathWeightDomainErrorError
 from .graph_path_weight_domain_error_mode import GraphPathWeightDomainErrorMode
 from .graph_path_weight_domain_error_status import GraphPathWeightDomainErrorStatus
+from .graph_paths_result import GraphPathsResult
+from .graph_paths_result_kind import GraphPathsResultKind
 from .graph_queries import GraphQueries
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
@@ -1335,6 +1339,10 @@ __all__ = (
     "GraphPathEdgeMetadata",
     "GraphPathEndpoint",
     "GraphPathObjective",
+    "GraphPathResult",
+    "GraphPathResultDocument",
+    "GraphPathsResult",
+    "GraphPathsResultKind",
     "GraphPathWeightDomainError",
     "GraphPathWeightDomainErrorError",
     "GraphPathWeightDomainErrorMode",

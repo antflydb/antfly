@@ -84,6 +84,10 @@ describe("graph identifier policy", () => {
     );
   });
 
+  it("rejects an explicitly empty graph_queries object", () => {
+    expect(() => validateGraphQueryIdentifiers({})).toThrow("at least one named operation");
+  });
+
   it.each([
     [["bad\ud800"], "valid UTF-8"],
     [["links", "links"], "duplicate edge types"],

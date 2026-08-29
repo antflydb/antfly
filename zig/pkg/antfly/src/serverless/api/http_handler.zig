@@ -213,6 +213,7 @@ pub const HttpHandler = struct {
     published_search_sources: search_sources.PublishedSearchSources = .{},
     runtime_status: *const api_types.RuntimeStatusResult,
     runtime_metrics: ?*runtime_manager.ManagedRuntime = null,
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     query_admission: RequestAdmission = RequestAdmission.init(common_config.default_query_max_concurrent_requests),
     write_admission: RequestAdmission = RequestAdmission.init(common_config.default_write_max_concurrent_requests),
 
@@ -238,6 +239,13 @@ pub const HttpHandler = struct {
 
     pub fn setIo(self: *HttpHandler, io: ?std.Io) void {
         self.io = io;
+    }
+
+    /// Install operator-owned graph ceilings. Public query bodies cannot
+    /// override these values.
+    pub fn setGraphExecutionLimits(self: *HttpHandler, limits: @import("../../graph/work_budget.zig").Limits) !void {
+        try limits.validate();
+        self.graph_execution_limits = limits;
     }
 
     pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
@@ -3179,13 +3187,10 @@ pub const HttpHandler = struct {
         // MATCH work and exact-distinct state are request resources, not
         // operation resources. Sharing these counters prevents a batch of
         // named MATCH operations from multiplying the documented bounds.
-        var request_work_budget = graph_pattern_mod.WorkBudget.init(
-            graph_pattern_mod.default_max_explored_nodes,
-            graph_pattern_mod.default_max_explored_edges,
-        );
+        var request_work_budget = graph_pattern_mod.WorkBudget.initWithLimits(self.graph_execution_limits);
         var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
-            graph_pattern_mod.default_max_distinct_identities,
-            graph_pattern_mod.default_max_distinct_state_bytes,
+            self.graph_execution_limits.max_distinct_identities,
+            self.graph_execution_limits.max_distinct_state_bytes,
         );
         var request_graph_read_budget = ServerlessGraphReadBudget{
             .cancellation = session.cancellation,

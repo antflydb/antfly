@@ -996,13 +996,11 @@ fn executeCrossRangeOnce(
     // These are HTTP-query budgets, not per-operation budgets. A request may
     // contain many named graph operations, but it must not multiply expansion
     // work or retained distinct-identity memory by that operation count.
-    var request_work_budget = graph_pattern_mod.WorkBudget.init(
-        graph_pattern_mod.default_max_explored_nodes,
-        graph_pattern_mod.default_max_explored_edges,
-    );
+    try req.graph_execution_limits.validate();
+    var request_work_budget = graph_pattern_mod.WorkBudget.initWithLimits(req.graph_execution_limits);
     var request_distinct_budget = graph_pattern_mod.DistinctBudget.init(
-        graph_pattern_mod.default_max_distinct_identities,
-        graph_pattern_mod.default_max_distinct_state_bytes,
+        req.graph_execution_limits.max_distinct_identities,
+        req.graph_execution_limits.max_distinct_state_bytes,
     );
     var initialized: usize = 0;
     errdefer {

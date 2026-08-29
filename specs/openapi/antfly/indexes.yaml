@@ -3545,13 +3545,15 @@ components:
         - $ref: '#/components/schemas/GraphKShortestPathsQuery'
     GraphQueries:
       type: object
+      minProperties: 1
       maxProperties: 64
       additionalProperties:
         $ref: '#/components/schemas/GraphQuery'
       x-antfly-property-name-schema:
         $ref: 'generated/graph_identifier.yaml#/components/schemas/GraphIdentifier'
       description: >-
-        Named canonical graph operations. A request may contain at most 64
+        Named canonical graph operations. When graph_queries is present it must
+        contain at least one operation. A request may contain at most 64
         operations, of which at most eight may be MATCH operations. Keys use
         the versioned GraphIdentifier policy.
     GraphResultNode:
@@ -3559,10 +3561,8 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        A traversal result node or the terminal node paired with a pathfinding
-        result. Traversal paths, when requested, are carried by path and
-        path_edges. Shortest-path operations keep the complete path only in the
-        enclosing GraphNodesResult.paths entry to avoid duplicate wire data.
+        A traversal result node. Traversal paths, when requested, are carried by
+        path and path_edges. Pathfinding results use GraphPathResult instead.
       required:
         - key
         - depth
@@ -3601,7 +3601,7 @@ components:
           description: >-
             Exact ordered traversal identities from the start node, terminating
             at this node's fully qualified identity. Present only for traversal
-            queries with include_paths=true; pathfinding uses GraphNodesResult.paths.
+            queries with include_paths=true.
         path_edges:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3610,7 +3610,7 @@ components:
             $ref: '#/components/schemas/GraphPathEdge'
           description: >-
             Ordered typed traversal edges from the start node. Present only with
-            path for traversal queries; pathfinding uses GraphNodesResult.paths.
+            path for traversal queries.
         provenance:
           x-go-type-skip-optional-pointer: true
           type: array
@@ -3762,11 +3762,8 @@ components:
       x-go-type-skip-optional-pointer: true
       type: object
       additionalProperties: false
-      required: [kind, nodes, paths, stats]
-      description: >-
-        Composable results from a canonical traversal or path query. Traversals
-        return nodes and keep the top-level paths array empty. Pathfinding
-        returns one lightweight terminal node per authoritative top-level path.
+      required: [kind, nodes, stats]
+      description: Composable results from a canonical traversal query.
       properties:
         kind:
           type: string
@@ -3776,18 +3773,40 @@ components:
           type: array
           maxItems: 10000
           items: { $ref: '#/components/schemas/GraphResultNode' }
-          description: >-
-            Traversal result nodes. Path operations emit one terminal result node
-            per returned path; inspect paths[].nodes for complete path membership.
-        paths:
+          description: Traversal result nodes; requested paths are stored on each node.
+        stats: { $ref: '#/components/schemas/GraphQueryStats' }
+    GraphPathResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      required: [path]
+      description: >-
+        One authoritative pathfinding result. The terminal identity is the last
+        element of path.nodes, so it is never duplicated in a parallel node array.
+      properties:
+        path: { $ref: '#/components/schemas/GraphPath' }
+        document:
           x-go-type-skip-optional-pointer: true
+          type: object
+          additionalProperties: true
+          description: >-
+            Stored terminal document when include_documents=true and the terminal
+            identity exists at the pinned snapshot; otherwise omitted.
+    GraphPathsResult:
+      x-go-type-skip-optional-pointer: true
+      type: object
+      additionalProperties: false
+      required: [kind, paths, stats]
+      description: Composable results from canonical shortest_path or k_shortest_paths queries.
+      properties:
+        kind:
+          type: string
+          enum: [paths]
+          description: Stable discriminator for the graph result shape.
+        paths:
           type: array
           maxItems: 10000
-          items: { $ref: '#/components/schemas/GraphPath' }
-          description: >-
-            Authoritative paths for shortest_path and k_shortest_paths, ordered
-            in lockstep with nodes. Always empty for traversal results; requested
-            traversal paths are stored on each result node.
+          items: { $ref: '#/components/schemas/GraphPathResult' }
         stats: { $ref: '#/components/schemas/GraphQueryStats' }
     LegacyGraphSearchResult:
       x-go-type-skip-optional-pointer: true
@@ -3844,6 +3863,14 @@ components:
         - $ref: '#/components/schemas/GraphBindingsResult'
         - $ref: '#/components/schemas/GraphAggregatesResult'
         - $ref: '#/components/schemas/GraphNodesResult'
+        - $ref: '#/components/schemas/GraphPathsResult'
+      discriminator:
+        propertyName: kind
+        mapping:
+          bindings: '#/components/schemas/GraphBindingsResult'
+          aggregates: '#/components/schemas/GraphAggregatesResult'
+          nodes: '#/components/schemas/GraphNodesResult'
+          paths: '#/components/schemas/GraphPathsResult'
     StatefulGraphResult:
       description: >-
         Graph result emitted by the stateful compatibility transport. Canonical

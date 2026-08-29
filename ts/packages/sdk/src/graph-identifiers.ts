@@ -503,6 +503,9 @@ export function validateGraphQueryIdentifiers(graphQueries: unknown): void {
   const operations = object(graphQueries);
   if (!operations) return;
   const entries = Object.entries(operations);
+  if (entries.length === 0) {
+    throw new TypeError("graph_queries must contain at least one named operation");
+  }
   if (entries.length > 64) {
     throw new TypeError("graph_queries accepts at most 64 named operations");
   }

@@ -12290,7 +12290,7 @@ export interface components {
             k_shortest_paths: components["schemas"]["GraphKShortestPaths"];
         };
         GraphQuery: components["schemas"]["GraphMatchQuery"] | components["schemas"]["GraphTraverseQuery"] | components["schemas"]["GraphShortestPathQuery"] | components["schemas"]["GraphKShortestPathsQuery"];
-        /** @description Named canonical graph operations. A request may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy. */
+        /** @description Named canonical graph operations. When graph_queries is present it must contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy. */
         GraphQueries: {
             [key: string]: components["schemas"]["GraphQuery"];
         };
@@ -12479,7 +12479,7 @@ export interface components {
         /** @description A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive. */
         GraphBindingsResult: {
             /**
-             * @description Stable discriminator for the graph result shape.
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
              * @enum {string}
              */
             kind: "bindings";
@@ -12498,7 +12498,7 @@ export interface components {
         /** @description Complete exact aggregates from a canonical graph MATCH query. */
         GraphAggregatesResult: {
             /**
-             * @description Stable discriminator for the graph result shape.
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
              * @enum {string}
              */
             kind: "aggregates";
@@ -12527,7 +12527,7 @@ export interface components {
                 [key: string]: unknown;
             };
         };
-        /** @description A traversal result node or the terminal node paired with a pathfinding result. Traversal paths, when requested, are carried by path and path_edges. Shortest-path operations keep the complete path only in the enclosing GraphNodesResult.paths entry to avoid duplicate wire data. */
+        /** @description A traversal result node. Traversal paths, when requested, are carried by path and path_edges. Pathfinding results use GraphPathResult instead. */
         GraphResultNode: {
             /** @description Document key */
             key: string;
@@ -12539,9 +12539,9 @@ export interface components {
             document?: {
                 [key: string]: unknown;
             };
-            /** @description Exact ordered traversal identities from the start node, terminating at this node's fully qualified identity. Present only for traversal queries with include_paths=true; pathfinding uses GraphNodesResult.paths. */
+            /** @description Exact ordered traversal identities from the start node, terminating at this node's fully qualified identity. Present only for traversal queries with include_paths=true. */
             path?: components["schemas"]["GraphPathEndpoint"][];
-            /** @description Ordered typed traversal edges from the start node. Present only with path for traversal queries; pathfinding uses GraphNodesResult.paths. */
+            /** @description Ordered typed traversal edges from the start node. Present only with path for traversal queries. */
             path_edges?: components["schemas"]["GraphPathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
@@ -12549,6 +12549,17 @@ export interface components {
             evidence?: {
                 [key: string]: unknown;
             };
+        };
+        /** @description Composable results from a canonical traversal query. */
+        GraphNodesResult: {
+            /**
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
+             * @enum {string}
+             */
+            kind: "nodes";
+            /** @description Traversal result nodes; requested paths are stored on each node. */
+            nodes: components["schemas"]["GraphResultNode"][];
+            stats: components["schemas"]["GraphQueryStats"];
         };
         /** @description An ordered canonical graph path with table-qualified node identities and a self-describing ranking score. */
         GraphPath: {
@@ -12569,21 +12580,26 @@ export interface components {
             objective_value: number;
             length: number;
         };
-        /** @description Composable results from a canonical traversal or path query. Traversals return nodes and keep the top-level paths array empty. Pathfinding returns one lightweight terminal node per authoritative top-level path. */
-        GraphNodesResult: {
+        /** @description One authoritative pathfinding result. The terminal identity is the last element of path.nodes, so it is never duplicated in a parallel node array. */
+        GraphPathResult: {
+            path: components["schemas"]["GraphPath"];
+            /** @description Stored terminal document when include_documents=true and the terminal identity exists at the pinned snapshot; otherwise omitted. */
+            document?: {
+                [key: string]: unknown;
+            };
+        };
+        /** @description Composable results from canonical shortest_path or k_shortest_paths queries. */
+        GraphPathsResult: {
             /**
-             * @description Stable discriminator for the graph result shape.
+             * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
              * @enum {string}
              */
-            kind: "nodes";
-            /** @description Traversal result nodes. Path operations emit one terminal result node per returned path; inspect paths[].nodes for complete path membership. */
-            nodes: components["schemas"]["GraphResultNode"][];
-            /** @description Authoritative paths for shortest_path and k_shortest_paths, ordered in lockstep with nodes. Always empty for traversal results; requested traversal paths are stored on each result node. */
-            paths: components["schemas"]["GraphPath"][];
+            kind: "paths";
+            paths: components["schemas"]["GraphPathResult"][];
             stats: components["schemas"]["GraphQueryStats"];
         };
         /** @description A canonical result produced by graph_queries. Bindings, exact aggregates, and node/path results use required stable discriminators. */
-        GraphResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"];
+        GraphResult: components["schemas"]["GraphBindingsResult"] | components["schemas"]["GraphAggregatesResult"] | components["schemas"]["GraphNodesResult"] | components["schemas"]["GraphPathsResult"];
         /** @description Canonical graph results keyed by graph_queries operation name. */
         GraphQueryResults: {
             [key: string]: components["schemas"]["GraphResult"];

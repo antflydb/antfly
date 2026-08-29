@@ -150,6 +150,9 @@ func TestGraphSelectorAndProjectionConstructors(t *testing.T) {
 }
 
 func TestGraphConstructorsRejectSemanticErrors(t *testing.T) {
+	if err := validateNamedGraphQueries(map[string]GraphQuery{}); err == nil || !strings.Contains(err.Error(), "at least one") {
+		t.Fatalf("expected an empty graph_queries object to fail, got %v", err)
+	}
 	if _, err := NewGraphDocumentFilter(querydsl.NewMatch("beta", "title")); err == nil {
 		t.Fatal("expected analyzer-backed graph filter to fail")
 	}
@@ -615,7 +618,7 @@ func TestGraphIdentifiersReserveControlTokens(t *testing.T) {
 
 func TestGraphResultUsesStableDiscriminator(t *testing.T) {
 	var canonical GraphResult
-	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &canonical); err != nil {
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"stats":{"returned_items":0,"truncated":false}}`), &canonical); err != nil {
 		t.Fatal(err)
 	}
 
@@ -632,7 +635,7 @@ func TestGraphResultUsesStableDiscriminator(t *testing.T) {
 	}
 
 	var result GraphResult
-	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false}}`), &result); err != nil {
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[],"stats":{"returned_items":0,"truncated":false}}`), &result); err != nil {
 		t.Fatal(err)
 	}
 	value, err = DecodeGraphResult(result)
@@ -668,7 +671,7 @@ func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 		}
 		return result
 	}
-	canonical := decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"application_field":{"nested":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
+	canonical := decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"application_field":{"nested":[1,true,null]}},"evidence":{"source":"edge"}}],"stats":{"returned_items":1,"truncated":false}}`)
 	var traversal GraphQuery
 	if err := json.Unmarshal([]byte(`{"index":"graph","traverse":{"start":{"keys":["a"]},"include_documents":true}}`), &traversal); err != nil {
 		t.Fatal(err)
@@ -742,15 +745,15 @@ func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 			name:     "canonical payload requires all structural fields",
 			requests: canonicalRequest,
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"stats":{"returned_items":0,"truncated":false}}`)},
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","stats":{"returned_items":0,"truncated":false}}`)},
 			}}},
-			contains: "requires kind, nodes, and paths",
+			contains: "requires kind and nodes",
 		},
 		{
 			name:     "canonical payload rejects unknown protocol fields",
 			requests: canonicalRequest,
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":false},"unexpected":true}`)},
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"stats":{"returned_items":0,"truncated":false},"unexpected":true}`)},
 			}}},
 			contains: "unknown field",
 		},
@@ -758,17 +761,17 @@ func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 			name:     "canonical payload validates stats against items",
 			requests: canonicalRequest,
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)},
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[],"stats":{"returned_items":1,"truncated":false}}`)},
 			}}},
 			contains: "returned_items does not match",
 		},
 		{
-			name:     "canonical payload validates path invariants",
+			name:     "canonical payload validates node invariants",
 			requests: canonicalRequest,
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"b","depth":0}],"paths":[{"nodes":[{"key":"a"},{"key":"b"}],"edges":[],"length":0,"objective":"min_hops","weight_sum":0,"objective_value":0}],"stats":{"returned_items":1,"truncated":false}}`)},
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"b","depth":65}],"stats":{"returned_items":1,"truncated":false}}`)},
 			}}},
-			contains: "length, nodes, and edges do not align",
+			contains: "depth must be between",
 		},
 		{
 			name:     "canonical payload binds aliases to projection",
@@ -790,7 +793,7 @@ func TestQueryGraphResponsesHonorRequestedOperations(t *testing.T) {
 			name:     "hydrated fields remain opaque objects",
 			requests: canonicalRequest,
 			responses: QueryResponses{Responses: []QueryResult{{
-				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":"not-an-object"}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)},
+				GraphResults: map[string]GraphResult{"walk": decode(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":"not-an-object"}],"stats":{"returned_items":1,"truncated":false}}`)},
 			}}},
 			contains: "expected an object",
 		},
@@ -861,7 +864,7 @@ func TestDecodeGraphResultForQueryValidatesRequestedProjection(t *testing.T) {
 	}
 
 	traversalQuery := decodeQuery(`{"index":"graph","traverse":{"start":{"keys":["a"]}}}`)
-	traversalWithDocument := decodeResult(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"private":true}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
+	traversalWithDocument := decodeResult(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"private":true}}],"stats":{"returned_items":1,"truncated":false}}`)
 	if _, err := DecodeGraphResultForQuery(traversalQuery, traversalWithDocument); err == nil || !strings.Contains(err.Error(), "document that was not requested") {
 		t.Fatalf("expected unrequested traversal document to fail, got %v", err)
 	}
@@ -869,7 +872,7 @@ func TestDecodeGraphResultForQueryValidatesRequestedProjection(t *testing.T) {
 	if _, err := DecodeGraphResultForQuery(hydratedTraversalQuery, traversalWithDocument); err != nil {
 		t.Fatalf("requested traversal document: %v", err)
 	}
-	sparseTraversal := decodeResult(`{"kind":"nodes","nodes":[{"key":"a","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`)
+	sparseTraversal := decodeResult(`{"kind":"nodes","nodes":[{"key":"a","depth":0}],"stats":{"returned_items":1,"truncated":false}}`)
 	if _, err := DecodeGraphResultForQuery(hydratedTraversalQuery, sparseTraversal); err != nil {
 		t.Fatalf("requested sparse traversal hydration: %v", err)
 	}
@@ -914,43 +917,43 @@ func TestDecodeGraphResultForQueryEnforcesOperationCardinalityAndPathOwnership(t
 		{
 			name:     "shortest path returns at most one path",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
-			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0},{"key":"a","depth":0}],"paths":[` + zeroHopPath + `,` + zeroHopPath + `],"stats":{"returned_items":2,"truncated":false}}`,
+			result:   `{"kind":"paths","paths":[{"path":` + zeroHopPath + `},{"path":` + zeroHopPath + `}],"stats":{"returned_items":2,"truncated":false}}`,
 			contains: "requested limit of 1 items",
 		},
 		{
 			name:     "exact paths cannot be truncated",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
-			result:   `{"kind":"nodes","nodes":[],"paths":[],"stats":{"returned_items":0,"truncated":true}}`,
+			result:   `{"kind":"paths","paths":[],"stats":{"returned_items":0,"truncated":true}}`,
 			contains: "exact graph results cannot be truncated",
 		},
 		{
-			name:     "path terminal does not duplicate path",
+			name:     "path item rejects unknown fields",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
-			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0,"path":[{"key":"a"}]}],"paths":[` + zeroHopPath + `],"stats":{"returned_items":1,"truncated":false}}`,
-			contains: "duplicates its authoritative top-level path",
+			result:   `{"kind":"paths","paths":[{"path":` + zeroHopPath + `,"unexpected":true}],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "unknown field",
 		},
 		{
-			name:     "path terminal depth matches path",
+			name:     "path shape is validated",
 			query:    `{"index":"graph","shortest_path":{"from":{"key":"a"},"to":{"key":"a"}}}`,
-			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":1}],"paths":[` + zeroHopPath + `],"stats":{"returned_items":1,"truncated":false}}`,
-			contains: "depth does not match",
+			result:   `{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"}],"edges":[],"length":1,"objective":"min_hops","weight_sum":0,"objective_value":1}}],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "length, nodes, and edges do not align",
 		},
 		{
-			name:     "traversal paths stay on nodes",
+			name:     "traversal rejects top-level paths",
 			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]}}}`,
-			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0}],"paths":[` + zeroHopPath + `],"stats":{"returned_items":1,"truncated":false}}`,
-			contains: "top-level paths array",
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+			contains: "unknown field",
 		},
 		{
 			name:     "traversal omits unrequested node paths",
 			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]}}}`,
-			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0,"path":[{"key":"a"}]}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0,"path":[{"key":"a"}]}],"stats":{"returned_items":1,"truncated":false}}`,
 			contains: "path that was not requested",
 		},
 		{
 			name:     "traversal returns requested node paths",
 			query:    `{"index":"graph","traverse":{"start":{"keys":["a"]},"include_paths":true}}`,
-			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`,
+			result:   `{"kind":"nodes","nodes":[{"key":"a","depth":0}],"stats":{"returned_items":1,"truncated":false}}`,
 			contains: "missing its requested path",
 		},
 	}
@@ -973,7 +976,7 @@ func TestDecodeGraphResultForQueryEnforcesOperationCardinalityAndPathOwnership(t
 
 func TestCanonicalGraphResultPreservesOpaqueHydratedJSON(t *testing.T) {
 	var canonical GraphResult
-	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"title":"alpha","nested":{"values":[1,true,null]}},"evidence":{"source":"edge"}}],"paths":[],"stats":{"returned_items":1,"truncated":false}}`), &canonical); err != nil {
+	if err := json.Unmarshal([]byte(`{"kind":"nodes","nodes":[{"key":"a","depth":0,"document":{"title":"alpha","nested":{"values":[1,true,null]}},"evidence":{"source":"edge"}}],"stats":{"returned_items":1,"truncated":false}}`), &canonical); err != nil {
 		t.Fatal(err)
 	}
 	value, err := DecodeCanonicalGraphResult(canonical)

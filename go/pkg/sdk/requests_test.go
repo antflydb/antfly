@@ -29,6 +29,16 @@ func TestQueryRequestMarshalValidatesCanonicalGraphOperationNames(t *testing.T) 
 	}
 }
 
+func TestQueryRequestRejectsExplicitlyEmptyGraphQueries(t *testing.T) {
+	if _, err := json.Marshal(QueryRequest{GraphQueries: map[string]GraphQuery{}}); err == nil {
+		t.Fatal("expected explicitly empty graph_queries to fail")
+	}
+	var request QueryRequest
+	if err := json.Unmarshal([]byte(`{"graph_queries":{}}`), &request); err == nil {
+		t.Fatal("expected explicitly empty graph_queries to fail during unmarshal")
+	}
+}
+
 func TestQueryRequestMarshalEnforcesCanonicalGraphOperationLimit(t *testing.T) {
 	queries := make(map[string]GraphQuery, maxNamedGraphQueries+1)
 	for i := 0; i <= maxNamedGraphQueries; i++ {

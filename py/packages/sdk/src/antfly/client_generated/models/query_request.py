@@ -276,8 +276,9 @@ class QueryRequest:
         reranker (RerankerConfig | Unset): A unified configuration for a reranking provider. Example: {'provider':
             'ollama', 'model': 'dengcao/Qwen3-Reranker-0.6B:F16', 'field': 'content'}.
         analyses (Analyses | Unset):
-        graph_queries (GraphQueries | Unset): Named canonical graph operations. A request may contain at most 64
-            operations, of which at most eight may be MATCH operations. Keys use the versioned GraphIdentifier policy.
+        graph_queries (GraphQueries | Unset): Named canonical graph operations. When graph_queries is present it must
+            contain at least one operation. A request may contain at most 64 operations, of which at most eight may be MATCH
+            operations. Keys use the versioned GraphIdentifier policy.
         document_renderer (str | Unset): Optional Handlebars template string for rendering document content in RAG
             queries.
             Template has access to document fields via `{{this.fields.fieldName}}`.

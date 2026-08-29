@@ -18227,18 +18227,14 @@ test "parseRemoteSearchResult preserves typed graph rows and hydrated documents"
 test "parseRemoteSearchResult preserves canonical graph path table identities" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"nodes","nodes":[{"key":"shared","table":"entities","depth":1,"path":[{"key":"shared"},{"key":"shared","table":"entities"}],"path_edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}]}],"paths":[{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"shared"},{"key":"shared","table":"entities"}],"edges":[{"from":{"key":"shared"},"to":{"key":"shared","table":"entities"},"direction":"in","type":"external","weight":1}],"length":1,"objective":"min_hops","weight_sum":1,"objective_value":1}}],"stats":{"returned_items":1,"truncated":false}}},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
     try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].nodes.len);
-    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path.?[0]);
-    try std.testing.expect(result.graph_results[0].nodes[0].path_tables.?[0] == null);
-    try std.testing.expectEqualStrings("entities", result.graph_results[0].nodes[0].path_tables.?[1].?);
-    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path_edges.?[0].source);
-    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].path_edges.?[0].target);
-    try std.testing.expectEqual(graph_mod.EdgeDirection.in, result.graph_results[0].nodes[0].path_edges.?[0].traversal_direction.?);
+    try std.testing.expectEqualStrings("shared", result.graph_results[0].nodes[0].key);
+    try std.testing.expectEqualStrings("entities", result.graph_results[0].nodes[0].table.?);
     try std.testing.expectEqual(@as(usize, 1), result.graph_results[0].paths.len);
     try std.testing.expectEqualStrings("shared", result.graph_results[0].paths[0].nodes[1]);
     try std.testing.expectEqualStrings("entities", result.graph_results[0].paths[0].node_tables[1].?);
@@ -18268,36 +18264,27 @@ fn parseRemoteGraphResults(
             return error.InvalidRemoteResponse;
         const ResultView = struct {
             canonical_nodes: ?[]const indexes_openapi.GraphResultNode = null,
-            canonical_paths: ?[]const indexes_openapi.GraphPath = null,
+            canonical_path_results: ?[]const indexes_openapi.GraphPathResult = null,
             rows: ?[]const indexes_openapi.GraphResultRow = null,
             aggregates: ?std.json.ArrayHashMap(indexes_openapi.GraphAggregateValue) = null,
             truncated: bool = false,
         };
         const view: ResultView = switch (result_value) {
             .graph_nodes_result => |result| blk: {
-                if (result.nodes.len > public_limits.max_graph_result_items or
-                    result.paths.len > public_limits.max_graph_result_items)
+                if (result.nodes.len > public_limits.max_graph_result_items)
                     return error.InvalidRemoteResponse;
-                if (result.paths.len > 0) {
-                    if (result.nodes.len != result.paths.len)
-                        return error.InvalidRemoteResponse;
-                    for (result.nodes, result.paths) |node, path| {
-                        if (path.nodes.len == 0) return error.InvalidRemoteResponse;
-                        const terminal = path.nodes[path.nodes.len - 1];
-                        if (!graphPathEndpointEql(
-                            .{ .key = node.key, .table = node.table },
-                            terminal,
-                        )) return error.InvalidRemoteResponse;
-                    }
-                }
-                const returned_items = if (result.paths.len > 0) result.paths.len else result.nodes.len;
-                if (!remoteGraphReturnedItemsMatch(result.stats.returned_items, returned_items))
+                if (!remoteGraphReturnedItemsMatch(result.stats.returned_items, result.nodes.len))
                     return error.InvalidRemoteResponse;
                 break :blk .{
                     .canonical_nodes = result.nodes,
-                    .canonical_paths = result.paths,
                     .truncated = result.stats.truncated,
                 };
+            },
+            .graph_paths_result => |result| blk: {
+                if (result.paths.len > public_limits.max_graph_result_items or result.stats.truncated or
+                    !remoteGraphReturnedItemsMatch(result.stats.returned_items, result.paths.len))
+                    return error.InvalidRemoteResponse;
+                break :blk .{ .canonical_path_results = result.paths };
             },
             .graph_bindings_result => |result| blk: {
                 if (result.rows.len > public_limits.max_graph_result_items or
@@ -18322,6 +18309,8 @@ fn parseRemoteGraphResults(
         };
         var parsed_nodes = if (view.canonical_nodes) |nodes_value|
             try parseRemoteGraphNodes(alloc, nodes_value)
+        else if (view.canonical_path_results) |path_results|
+            try parseRemoteGraphPathResultNodes(alloc, path_results)
         else
             ParsedRemoteGraphNodes{};
         errdefer parsed_nodes.deinit(alloc);
@@ -18330,8 +18319,8 @@ fn parseRemoteGraphResults(
         else
             ParsedRemoteGraphMatches{};
         errdefer parsed_matches.deinit(alloc);
-        const paths: []graph_paths.Path = if (view.canonical_paths) |paths_value|
-            try parseRemoteCanonicalGraphPaths(alloc, paths_value)
+        const paths: []graph_paths.Path = if (view.canonical_path_results) |path_results|
+            try parseRemoteCanonicalGraphPathResults(alloc, path_results)
         else
             @constCast((&[_]graph_paths.Path{})[0..]);
         errdefer {
@@ -18458,6 +18447,37 @@ fn parseRemoteGraphNodes(
         .nodes = nodes,
         .hits = try hits.toOwnedSlice(alloc),
     };
+}
+
+fn parseRemoteGraphPathResultNodes(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathResult,
+) !ParsedRemoteGraphNodes {
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (nodes[0..initialized]) |*node| node.deinit(alloc);
+        if (nodes.len > 0) alloc.free(nodes);
+    }
+    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
+    errdefer {
+        for (hits.items) |*hit| hit.deinit(alloc);
+        hits.deinit(alloc);
+    }
+    for (value, 0..) |item, i| {
+        if (item.path.nodes.len == 0) return error.InvalidRemoteResponse;
+        const terminal = item.path.nodes[item.path.nodes.len - 1];
+        nodes[i] = try parseRemoteGraphNodeWithKey(alloc, terminal.key, .{
+            .key = terminal.key,
+            .table = terminal.table,
+            .depth = item.path.length,
+            .document = item.document,
+        });
+        initialized += 1;
+        if (item.document) |document|
+            try appendRemoteGraphDocumentHit(alloc, &hits, terminal.key, terminal.table, document);
+    }
+    return .{ .nodes = nodes, .hits = try hits.toOwnedSlice(alloc) };
 }
 
 fn parseRemoteLegacyGraphNodes(
@@ -18920,6 +18940,23 @@ fn parseRemoteCanonicalGraphPaths(
     }
     for (value, 0..) |item, i| {
         paths[i] = try parseRemoteCanonicalGraphPath(alloc, item);
+        initialized += 1;
+    }
+    return paths;
+}
+
+fn parseRemoteCanonicalGraphPathResults(
+    alloc: std.mem.Allocator,
+    value: []const indexes_openapi.GraphPathResult,
+) ![]graph_paths.Path {
+    const paths = try alloc.alloc(graph_paths.Path, value.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (paths[0..initialized]) |path| graph_paths.freePath(alloc, path);
+        if (paths.len > 0) alloc.free(paths);
+    }
+    for (value, 0..) |item, i| {
+        paths[i] = try parseRemoteCanonicalGraphPath(alloc, item.path);
         initialized += 1;
     }
     return paths;

@@ -18,8 +18,9 @@ T = TypeVar("T", bound="GraphQueries")
 
 @_attrs_define
 class GraphQueries:
-    """Named canonical graph operations. A request may contain at most 64 operations, of which at most eight may be MATCH
-    operations. Keys use the versioned GraphIdentifier policy.
+    """Named canonical graph operations. When graph_queries is present it must contain at least one operation. A request
+    may contain at most 64 operations, of which at most eight may be MATCH operations. Keys use the versioned
+    GraphIdentifier policy.
 
     """
 

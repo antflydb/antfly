@@ -3859,6 +3859,7 @@ pub const AntflyApiHandler = struct {
                     return err;
                 };
                 defer query_req.deinit(a);
+                query_req.req.graph_execution_limits = runner.server.cfg.graph_execution_limits;
                 runner.server.maybeRouteQueryToReadSchema(table_name, &query_req.req) catch |err| switch (err) {
                     error.TableNotFound => return err,
                     error.InvalidSchemaUpdateRequest, error.InvalidTableIndexMetadata => return error.InvalidRetrievalAgentRequest,

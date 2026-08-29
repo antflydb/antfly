@@ -1361,6 +1361,9 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    /// Trusted operator-owned graph admission ceilings. Public request parsing
+    /// never reads these from JSON, and shard transport must not serialize them.
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     /// Owned, validated API wire sidecar. Execution never inspects it; it is
     /// retained only for allocation-light owner proxying and response shaping.
     graph_query_transport: ?GraphQueryTransport = null,
@@ -1470,6 +1473,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "identity_read_generation",
     "execution_deadline_ns",
     "cancellation",
+    "graph_execution_limits",
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{

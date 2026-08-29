@@ -535,6 +535,12 @@ class TestAntflyClient:
         with pytest.raises(AntflyException, match="generated graph query model or mapping"):
             client.query(table="docs", graph_queries={"bad": 1})  # type: ignore[dict-item]
 
+    def test_query_rejects_empty_graph_queries(self) -> None:
+        client = AntflyClient(base_url="http://localhost:8080")
+
+        with pytest.raises(AntflyException, match="at least one named operation"):
+            client.query(table="docs", graph_queries={})
+
     @pytest.mark.parametrize("name", [" bad", "bad\u00a0name", "bad\u200bname", "bad\u202ename", "*"])
     def test_query_rejects_unsafe_graph_operation_names(self, name: str) -> None:
         client = AntflyClient(base_url="http://localhost:8080")
@@ -677,9 +683,8 @@ class TestAntflyClient:
                             "status": 200,
                             "graph_results": {
                                 "walk": {
-                                    "kind": "nodes",
-                                    "nodes": [],
-                                    "paths": [],
+                                    "kind": "nodes" if operation == "traverse" else "paths",
+                                    **({"nodes": []} if operation == "traverse" else {"paths": []}),
                                     "stats": {"returned_items": 0, "truncated": False},
                                 }
                             },

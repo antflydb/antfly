@@ -70,6 +70,7 @@ pub const BootstrapConfig = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
+    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
 };
 
@@ -466,6 +467,7 @@ pub const OwnedStack = struct {
         self.sparse_query_index_name = try alloc.dupe(u8, cfg.sparse_embedding_index_name);
         self.runtime.setEnricher(enricher);
         self.handler = api_mod.HttpHandler.init(alloc, &self.api, &self.catalog, &self.manifests, &self.progress, &self.query, &self.status);
+        try self.handler.setGraphExecutionLimits(cfg.graph_execution_limits);
         self.handler.setIo(io);
         self.handler.configureAdmission(cfg.query_max_concurrent_requests, cfg.write_max_concurrent_requests);
         self.handler.setRemoteContent(cfg.remote_content);

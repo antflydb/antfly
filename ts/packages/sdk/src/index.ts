@@ -259,6 +259,8 @@ export type {
   GraphMatchQuery,
   GraphNodeSelector,
   GraphNodesResult,
+  GraphPathResult,
+  GraphPathsResult,
   GraphNotEqualPredicate,
   GraphNotExistsPattern,
   GraphOptionalMatch,

@@ -5,7 +5,7 @@ import pytest
 from antfly.client import AntflyClient
 from antfly.client_generated.models.graph_aggregates_result import GraphAggregatesResult
 from antfly.client_generated.models.graph_bindings_result import GraphBindingsResult
-from antfly.client_generated.models.graph_nodes_result import GraphNodesResult
+from antfly.client_generated.models.graph_paths_result import GraphPathsResult
 from antfly.client_generated.models.graph_query_unsupported_error import (
     GraphQueryUnsupportedError,
 )
@@ -72,7 +72,6 @@ def test_canonical_query_decoder_rejects_legacy_or_missing_discriminator() -> No
                 {
                     "kind": "nodes",
                     "nodes": [],
-                    "paths": [],
                     "stats": {"returned_items": 0, "truncated": False},
                 },
                 operation="unexpected",
@@ -92,31 +91,32 @@ def test_canonical_path_does_not_compute_unused_overflowing_product() -> None:
     decode_query_responses(
         _query_response(
             {
-                "kind": "nodes",
-                "nodes": [{"key": "c", "depth": 2}],
+                "kind": "paths",
                 "paths": [
                     {
-                        "nodes": [{"key": "a"}, {"key": "b"}, {"key": "c"}],
-                        "edges": [
-                            {
-                                "from": {"key": "a"},
-                                "to": {"key": "b"},
-                                "direction": "out",
-                                "type": "related",
-                                "weight": 1e200,
-                            },
-                            {
-                                "from": {"key": "b"},
-                                "to": {"key": "c"},
-                                "direction": "out",
-                                "type": "related",
-                                "weight": 1e200,
-                            },
-                        ],
-                        "length": 2,
-                        "objective": "min_hops",
-                        "weight_sum": 2e200,
-                        "objective_value": 2,
+                        "path": {
+                            "nodes": [{"key": "a"}, {"key": "b"}, {"key": "c"}],
+                            "edges": [
+                                {
+                                    "from": {"key": "a"},
+                                    "to": {"key": "b"},
+                                    "direction": "out",
+                                    "type": "related",
+                                    "weight": 1e200,
+                                },
+                                {
+                                    "from": {"key": "b"},
+                                    "to": {"key": "c"},
+                                    "direction": "out",
+                                    "type": "related",
+                                    "weight": 1e200,
+                                },
+                            ],
+                            "length": 2,
+                            "objective": "min_hops",
+                            "weight_sum": 2e200,
+                            "objective_value": 2,
+                        },
                     }
                 ],
                 "stats": {"returned_items": 1, "truncated": False},
@@ -153,7 +153,7 @@ def test_canonical_query_decoder_binds_result_shape_to_request() -> None:
             expected_graph_queries=path_query,
         )
 
-    with pytest.raises(AntflyException, match="must be 'nodes' for the requested operation"):
+    with pytest.raises(AntflyException, match="must be 'paths' for the requested operation"):
         decode_query_responses(
             _query_response(
                 {
@@ -231,30 +231,27 @@ def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> No
     malformed_path_results = [
         (
             {
-                "kind": "nodes",
-                "nodes": [{"key": "a", "depth": 0}, {"key": "a", "depth": 0}],
-                "paths": [zero_hop_path, zero_hop_path],
+                "kind": "paths",
+                "paths": [{"path": zero_hop_path}, {"path": zero_hop_path}],
                 "stats": {"returned_items": 2, "truncated": False},
             },
             "exceeds the requested result limit",
         ),
         (
             {
-                "kind": "nodes",
-                "nodes": [],
+                "kind": "paths",
                 "paths": [],
                 "stats": {"returned_items": 0, "truncated": True},
             },
-            "must be false for an exact path result",
+            "must be false for an exact result",
         ),
         (
             {
-                "kind": "nodes",
-                "nodes": [{"key": "a", "depth": 0, "path": [{"key": "a"}]}],
-                "paths": [zero_hop_path],
+                "kind": "paths",
+                "paths": [{"path": zero_hop_path, "unexpected": True}],
                 "stats": {"returned_items": 1, "truncated": False},
             },
-            "duplicates its authoritative top-level path",
+            "contains unknown member",
         ),
     ]
     for result, message in malformed_path_results:
@@ -276,7 +273,6 @@ def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> No
                 {
                     "kind": "nodes",
                     "nodes": [{"key": "a", "depth": 0, "path": [{"key": "a"}]}],
-                    "paths": [],
                     "stats": {"returned_items": 1, "truncated": False},
                 },
                 operation="walk",
@@ -291,7 +287,6 @@ def test_canonical_query_decoder_enforces_cardinality_and_path_ownership() -> No
                 {
                     "kind": "nodes",
                     "nodes": [{"key": "a", "depth": 0}],
-                    "paths": [],
                     "stats": {"returned_items": 1, "truncated": False},
                 },
                 operation="walk",
@@ -330,24 +325,25 @@ def test_public_query_decoder_accepts_valid_canonical_results() -> None:
     nodes = decode_query_responses(
         _query_response(
             {
-                "kind": "nodes",
-                "nodes": [{"key": "b", "depth": 1}],
+                "kind": "paths",
                 "paths": [
                     {
-                        "nodes": [{"key": "a"}, {"key": "b"}],
-                        "edges": [
-                            {
-                                "from": {"key": "a"},
-                                "to": {"key": "b"},
-                                "direction": "out",
-                                "type": "edge",
-                                "weight": 0.5,
-                            }
-                        ],
-                        "length": 1,
-                        "objective": "min_weight_sum",
-                        "weight_sum": 0.5,
-                        "objective_value": 0.5,
+                        "path": {
+                            "nodes": [{"key": "a"}, {"key": "b"}],
+                            "edges": [
+                                {
+                                    "from": {"key": "a"},
+                                    "to": {"key": "b"},
+                                    "direction": "out",
+                                    "type": "edge",
+                                    "weight": 0.5,
+                                }
+                            ],
+                            "length": 1,
+                            "objective": "min_weight_sum",
+                            "weight_sum": 0.5,
+                            "objective_value": 0.5,
+                        },
                     }
                 ],
                 "stats": {"returned_items": 1, "truncated": False},
@@ -356,7 +352,7 @@ def test_public_query_decoder_accepts_valid_canonical_results() -> None:
     )
     assert not isinstance(nodes.responses, Unset)
     assert not isinstance(nodes.responses[0].graph_results, Unset)
-    assert isinstance(nodes.responses[0].graph_results["result"], GraphNodesResult)
+    assert isinstance(nodes.responses[0].graph_results["result"], GraphPathsResult)
 
 
 def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse_hydration() -> None:
@@ -368,28 +364,30 @@ def test_canonical_query_decoder_rejects_unrequested_documents_but_allows_sparse
     }
 
     def node_result(*, include_document: bool) -> dict[str, object]:
-        node: dict[str, object] = {"key": "b", "depth": 1}
+        item: dict[str, object] = {}
         if include_document:
-            node["document"] = {"private": True}
+            item["document"] = {"private": True}
         return {
-            "kind": "nodes",
-            "nodes": [node],
+            "kind": "paths",
             "paths": [
                 {
-                    "nodes": [{"key": "a"}, {"key": "b"}],
-                    "edges": [
-                        {
-                            "from": {"key": "a"},
-                            "to": {"key": "b"},
-                            "direction": "out",
-                            "type": "related",
-                            "weight": 1,
-                        }
-                    ],
-                    "length": 1,
-                    "objective": "min_hops",
-                    "weight_sum": 1,
-                    "objective_value": 1,
+                    **item,
+                    "path": {
+                        "nodes": [{"key": "a"}, {"key": "b"}],
+                        "edges": [
+                            {
+                                "from": {"key": "a"},
+                                "to": {"key": "b"},
+                                "direction": "out",
+                                "type": "related",
+                                "weight": 1,
+                            }
+                        ],
+                        "length": 1,
+                        "objective": "min_hops",
+                        "weight_sum": 1,
+                        "objective_value": 1,
+                    },
                 }
             ],
             "stats": {"returned_items": 1, "truncated": False},

@@ -224,6 +224,8 @@ def _validate_graph_match_identifiers(match: Mapping[str, Any], result: object, 
 def _serialize_graph_queries(graph_queries: GraphQueriesInput) -> dict[str, Any]:
     """Serialize typed canonical graph operations while preserving raw-map compatibility."""
     operations = graph_queries.to_dict() if isinstance(graph_queries, GraphQueries) else graph_queries
+    if not operations:
+        raise AntflyException("graph_queries must contain at least one named operation")
     if len(operations) > 64:
         raise AntflyException("graph_queries accepts at most 64 named operations")
 

@@ -10,7 +10,7 @@ const utf8 = new TextEncoder();
 type JsonObject = Record<string, unknown>;
 type GraphDialect = "canonical" | "none";
 type CanonicalResultContract = {
-  kind: "bindings" | "aggregates" | "nodes";
+  kind: "bindings" | "aggregates" | "nodes" | "paths";
   names?: Set<string>;
   maxItems?: number;
   nodeMode?: "traversal" | "shortest_path" | "k_shortest_paths";
@@ -87,13 +87,6 @@ function finiteNonnegative(value: unknown, path: string, atMostOne = false): num
       path,
       atMostOne ? "must be finite and between 0 and 1" : "must be finite and non-negative"
     );
-  }
-  return value;
-}
-
-function finiteNumber(value: unknown, path: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    return invalid(path, "must be a finite number");
   }
   return value;
 }
@@ -319,14 +312,11 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
     return;
   }
   if (result.kind === "nodes") {
-    exactKeys(result, path, ["kind", "nodes", "paths", "stats"]);
+    exactKeys(result, path, ["kind", "nodes", "stats"]);
     const rawNodes = array(result.nodes, `${path}.nodes`);
-    const rawPaths = array(result.paths, `${path}.paths`);
     const maxItems = contract.maxItems ?? MAX_ITEMS;
-    if (rawNodes.length > maxItems || rawPaths.length > maxItems)
-      invalid(path, "exceeds the requested result limit");
+    if (rawNodes.length > maxItems) invalid(path, "exceeds the requested result limit");
     const nodes = rawNodes.map((node, index) => resultNode(node, `${path}.nodes[${index}]`));
-    const paths = rawPaths.map((item, index) => graphPath(item, `${path}.paths[${index}]`));
     if (!contract.includeDocuments) {
       nodes.forEach((node, index) => {
         if (node.document !== undefined)
@@ -334,7 +324,6 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
       });
     }
     if (contract.nodeMode === "traversal") {
-      if (paths.length !== 0) invalid(`${path}.paths`, "traversal paths belong on result nodes");
       nodes.forEach((node, index) => {
         if (contract.includePaths) {
           if (node.path === undefined)
@@ -347,30 +336,28 @@ function canonicalResult(value: unknown, path: string, contract: CanonicalResult
       stats(result.stats, `${path}.stats`, nodes.length, true);
       return;
     }
-    if (contract.nodeMode === "shortest_path" || contract.nodeMode === "k_shortest_paths") {
-      if (nodes.length !== paths.length) invalid(path, "requires one terminal node per path");
-      paths.forEach((graphPathValue, index) => {
-        const node = item(nodes, index, `${path}.nodes[${index}]`);
-        if (node.path !== undefined || node.path_edges !== undefined)
-          invalid(`${path}.nodes[${index}]`, "duplicates its authoritative top-level path");
-        if (node.depth !== graphPathValue.length)
-          invalid(`${path}.nodes[${index}].depth`, "does not match its path length");
-        const endpoints = graphPathValue.nodes as unknown[];
-        if (
-          !sameEndpoint(
-            object(endpoints[endpoints.length - 1], `${path}.paths[${index}].nodes`),
-            node
-          )
-        ) {
-          invalid(`${path}.nodes[${index}]`, "does not match its path terminal");
-        }
-      });
-      stats(result.stats, `${path}.stats`, paths.length, false);
-      return;
-    }
     invalid(path, "has no node operation contract");
   }
-  invalid(`${path}.kind`, "canonical graph results require bindings, aggregates, or nodes");
+  if (result.kind === "paths") {
+    exactKeys(result, path, ["kind", "paths", "stats"]);
+    if (contract.nodeMode !== "shortest_path" && contract.nodeMode !== "k_shortest_paths")
+      invalid(path, "requires a path operation contract");
+    const rawPaths = array(result.paths, `${path}.paths`);
+    if (rawPaths.length > (contract.maxItems ?? MAX_ITEMS))
+      invalid(path, "exceeds the requested result limit");
+    rawPaths.forEach((rawItem, index) => {
+      const pathItem = object(rawItem, `${path}.paths[${index}]`);
+      exactKeys(pathItem, `${path}.paths[${index}]`, ["path"], ["document"]);
+      graphPath(pathItem.path, `${path}.paths[${index}].path`);
+      if (!contract.includeDocuments && pathItem.document !== undefined)
+        invalid(`${path}.paths[${index}].document`, "was returned without being requested");
+      if (pathItem.document !== undefined)
+        object(pathItem.document, `${path}.paths[${index}].document`);
+    });
+    stats(result.stats, `${path}.stats`, rawPaths.length, false);
+    return;
+  }
+  invalid(`${path}.kind`, "canonical graph results require bindings, aggregates, nodes, or paths");
 }
 
 function canonicalOperationContract(value: unknown, path: string): CanonicalResultContract {
@@ -423,7 +410,7 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
   if (operation.shortest_path !== undefined) {
     const shortestPath = object(operation.shortest_path, `${path}.shortest_path`);
     return {
-      kind: "nodes",
+      kind: "paths",
       maxItems: 1,
       nodeMode: "shortest_path",
       includeDocuments: shortestPath.include_documents === true,
@@ -432,7 +419,7 @@ function canonicalOperationContract(value: unknown, path: string): CanonicalResu
   if (operation.k_shortest_paths !== undefined) {
     const kShortestPaths = object(operation.k_shortest_paths, `${path}.k_shortest_paths`);
     return {
-      kind: "nodes",
+      kind: "paths",
       maxItems: boundedInteger(kShortestPaths.k, `${path}.k_shortest_paths.k`, 1, 100),
       nodeMode: "k_shortest_paths",
       includeDocuments: kShortestPaths.include_documents === true,
