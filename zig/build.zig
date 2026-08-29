@@ -6135,6 +6135,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "storage-kernel search result preserves sort and hierarchy identity",
             "storage-kernel query request encodes singleton vector index identity",
+            "storage-kernel query request preserves exact singleton and primary text identities",
             "encode query request includes named vector embeddings for routed semantic search",
             "storage-kernel query wire round trips graph-only requests",
             "provisioned reads advertise owner-backed physical sort evidence",

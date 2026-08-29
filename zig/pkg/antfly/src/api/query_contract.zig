@@ -3068,6 +3068,7 @@ fn fastDensePublicQueryMayApply(body: []const u8) bool {
         "\"hierarchy\"",
         "\"_filter_query_json\"",
         "\"_exclusion_query_json\"",
+        "\"_index_name\"",
         "\"_primary_text_index_name\"",
         db_mod.doc_filter_wire.field_name,
     };
@@ -9543,6 +9544,7 @@ fn isInternalShardFieldName(name: []const u8) bool {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_index_name",
         "_primary_text_index_name",
         "_defer_hierarchy_child_hydration",
         db_mod.doc_filter_wire.field_name,
@@ -9873,6 +9875,7 @@ fn removeInternalShardFields(object: *std.json.ObjectMap) void {
         "_filter_query_json",
         "_exclusion_query_json",
         "_identity_read_generation",
+        "_index_name",
         "_primary_text_index_name",
         "_defer_hierarchy_child_hydration",
         db_mod.doc_filter_wire.field_name,
@@ -10275,6 +10278,12 @@ fn parseInternalDocIdConstraintsAlloc(
             if (generation == null or generation.? != ctx.identity_read_generation) return error.InvalidQueryRequest;
         }
         req.identity_read_generation = generation;
+    }
+    if (parsed.value.object.get("_index_name")) |value| {
+        if (value != .string or value.string.len == 0 or req.index_name != null) {
+            return error.InvalidQueryRequest;
+        }
+        req.index_name = try alloc.dupe(u8, value.string);
     }
     if (parsed.value.object.get("_primary_text_index_name")) |value| {
         if (value != .string or value.string.len == 0 or req.primary_text_index_name != null) {

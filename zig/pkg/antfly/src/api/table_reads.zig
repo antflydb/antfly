@@ -17119,6 +17119,10 @@ fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest)
         try appendJsonFieldBool(alloc, &out, &first, "profile", true);
     }
     if (req.index_name) |index_name| {
+        // The public `indexes` selector does not reconstruct the legacy
+        // singleton binding for every query family. Carry the exact resolved
+        // identity separately; a hybrid query's primary text index may differ.
+        try appendJsonFieldString(alloc, &out, &first, "_index_name", index_name);
         if (!has_named_embeddings and (req.full_text != null or req.dense != null or req.sparse != null)) {
             const index_names = [_][]const u8{index_name};
             try appendJsonFieldNames(alloc, &out, &first, "indexes", &index_names);
@@ -22548,6 +22552,23 @@ test "storage-kernel query request encodes singleton vector index identity" {
     try std.testing.expectEqual(@as(usize, 1), parsed.req.dense_queries.len);
     try std.testing.expectEqualStrings("dense_idx", parsed.req.dense_queries[0].index_name);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0, 0 }, parsed.req.dense_queries[0].query.vector);
+}
+
+test "storage-kernel query request preserves exact singleton and primary text identities" {
+    const alloc = std.testing.allocator;
+    const encoded = try encodeStorageKernelQueryRequest(alloc, .{
+        .index_name = "document_text",
+        .primary_text_index_name = "document_text",
+        .full_text = .{ .match = .{ .field = "text", .text = "qualification" } },
+        .limit = 5,
+    });
+    defer alloc.free(encoded);
+
+    var parsed = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqualStrings("document_text", parsed.req.index_name.?);
+    try std.testing.expectEqualStrings("document_text", parsed.req.primary_text_index_name.?);
+    try std.testing.expectEqualStrings("text", parsed.req.full_text.?.match.field);
 }
 
 test "storage-kernel query wire round trips graph-only requests" {
