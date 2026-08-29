@@ -52,6 +52,7 @@ const tables_api = @import("tables.zig");
 pub const LifecyclePhase = enum {
     snapshot_validated,
     expand_round_completed,
+    target_authorization_started,
     hydration_started,
     hydration_fanout_started,
     hydration_completed,
@@ -66,6 +67,8 @@ pub const LifecycleEvent = struct {
     result_count: usize = 0,
     attempt: u32 = 0,
     error_code: u16 = 0,
+    /// Borrowed for the synchronous hook call only.
+    table_name: []const u8 = "",
     /// Borrowed for the synchronous hook call only. Lifecycle hooks may use
     /// it to park at a lease-free boundary until request cancellation is
     /// visible, but must not retain it.
@@ -1187,6 +1190,10 @@ const GraphNodeAdmissionContext = struct {
                 exclusion_query_json_live = true;
             }
         } else {
+            self.worker.reachLifecycle(.{
+                .phase = .target_authorization_started,
+                .table_name = table_name,
+            });
             var authorization = if (self.table_authorizer) |authorizer|
                 try authorizer.authorize(self.alloc, table_name)
             else
@@ -8351,6 +8358,7 @@ test "distributed graph retries once on topology change and succeeds" {
             state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
             switch (event.phase) {
                 .snapshot_validated => {},
+                .target_authorization_started => state.lifecycle_valid = state.lifecycle_valid and event.table_name.len > 0,
                 .expand_round_completed => {
                     state.lifecycle_valid = state.lifecycle_valid and
                         std.mem.eql(u8, "walk", event.query_name) and

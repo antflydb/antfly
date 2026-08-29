@@ -1018,6 +1018,10 @@ pub const TableVisibility = enum {
 
 pub const AuthenticatedIdentity = struct {
     username: []u8,
+    /// Borrowed from the serving ApiHttpServer. Target-table operations
+    /// intersect the request's admitted permission snapshot with this live
+    /// policy source so revocation can take effect within a long request.
+    live_user_manager: ?*usermgr.UserManager = null,
     /// Stable identity of the credential that authenticated this request.
     /// Multiple API keys owned by one user must not become interchangeable
     /// transaction-session capabilities.
@@ -4283,7 +4287,9 @@ pub const ApiHttpServer = struct {
             defer freeOwnedStrings(manager.alloc, manager_roles);
             const credential_principal = try std.fmt.allocPrint(self.alloc, "basic:{s}", .{user.username});
             defer self.alloc.free(credential_principal);
-            return try cloneAuthenticatedIdentity(self.alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
+            var identity = try cloneAuthenticatedIdentity(self.alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
+            identity.live_user_manager = manager;
+            return identity;
         }
 
         if (std.mem.startsWith(u8, value, "ApiKey ") or std.mem.startsWith(u8, value, "Bearer ")) {
@@ -4297,7 +4303,9 @@ pub const ApiHttpServer = struct {
             defer validated.deinit(manager.alloc);
             const credential_principal = try std.fmt.allocPrint(self.alloc, "api-key:{s}", .{raw[0..colon_pos]});
             defer self.alloc.free(credential_principal);
-            return try cloneAuthenticatedIdentity(self.alloc, validated.username, credential_principal, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
+            var identity = try cloneAuthenticatedIdentity(self.alloc, validated.username, credential_principal, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
+            identity.live_user_manager = manager;
+            return identity;
         }
 
         return error.Unauthorized;
@@ -9479,6 +9487,11 @@ pub const ApiHttpServer = struct {
         }));
         if (!permissionsAllow(identity.permissions, .table, table_name, .read)) {
             return .{ .allowed = false };
+        }
+        if (identity.live_user_manager) |manager| {
+            if (!try manager.permissionCurrentlyAllowed(identity.username, .table, table_name, .read)) {
+                return .{ .allowed = false };
+            }
         }
         return .{
             .allowed = true,

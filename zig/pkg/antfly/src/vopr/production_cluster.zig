@@ -326,6 +326,8 @@ pub const Fixture = struct {
     graph_cancellation_recovered: bool = false,
     graph_cancellation_sound: bool = false,
     graph_authorization_revoked: bool = false,
+    graph_authorization_boundary_observed: bool = false,
+    graph_authorization_revocation_armed: bool = false,
     graph_authorization_denied_without_leak: bool = false,
     graph_authorization_restored: bool = false,
     graph_authorization_recovered: bool = false,
@@ -402,7 +404,7 @@ pub const Fixture = struct {
     graph_enabled: bool = false,
     graph_hydration_enabled: bool = false,
     graph_cancellation_enabled: bool = false,
-    graph_authorization_mutation_enabled: bool = false,
+    graph_inflight_authorization_revocation_enabled: bool = false,
     join_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
@@ -441,9 +443,9 @@ pub const Fixture = struct {
         self.graph_cancellation_enabled = enabled;
     }
 
-    pub fn setGraphAuthorizationMutationEnabled(self: *Fixture, enabled: bool) void {
+    pub fn setGraphInflightAuthorizationRevocationEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
-        self.graph_authorization_mutation_enabled = enabled;
+        self.graph_inflight_authorization_revocation_enabled = enabled;
     }
 
     pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
@@ -523,7 +525,7 @@ pub const Fixture = struct {
             return error.InvalidProductionClusterGraphHydrationMode;
         if (self.graph_cancellation_enabled and !self.graph_enabled)
             return error.InvalidProductionClusterGraphCancellationMode;
-        if (self.graph_authorization_mutation_enabled and !self.graph_enabled)
+        if (self.graph_inflight_authorization_revocation_enabled and !self.graph_enabled)
             return error.InvalidProductionClusterGraphAuthorizationMode;
         switch (self.fault_mode) {
             .clean => {},
@@ -585,7 +587,7 @@ pub const Fixture = struct {
             .pool_max_per_host = 8,
         });
         self.public_executor_live = true;
-        if (self.graph_authorization_mutation_enabled) {
+        if (self.graph_inflight_authorization_revocation_enabled) {
             self.auth_store = usermgr.MemoryStore.init(alloc);
             self.auth_store_live = true;
             self.auth_policy_store = casbin.MemoryAdapter.init(alloc);
@@ -698,7 +700,7 @@ pub const Fixture = struct {
         try self.installExternalTransitionRouting();
         self.client = api_http_client.ApiHttpClient.init(
             alloc,
-            if (self.graph_authorization_mutation_enabled)
+            if (self.graph_inflight_authorization_revocation_enabled)
                 self.public_authorization_executor.iface()
             else
                 self.public_executor.executor(),
@@ -731,8 +733,8 @@ pub const Fixture = struct {
             .backend_runtime = self.backend_runtimes[index].ptr(),
             .h1_disconnect_probe = self.http_disconnect_probe.iface(),
             .api_server_cfg = .{
-                .auth_enabled = self.graph_authorization_mutation_enabled,
-                .user_manager = if (self.graph_authorization_mutation_enabled) &self.auth_manager else null,
+                .auth_enabled = self.graph_inflight_authorization_revocation_enabled,
+                .user_manager = if (self.graph_inflight_authorization_revocation_enabled) &self.auth_manager else null,
                 .internal_service_secret = internal_service_secret,
                 .internal_service_issuer = internal_service_issuer,
                 .distributed_join_lifecycle_hook = .{
@@ -870,6 +872,24 @@ pub const Fixture = struct {
     ) void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         switch (event.phase) {
+            .target_authorization_started => {
+                if (self.graph_inflight_authorization_revocation_enabled and
+                    self.graph_authorization_revocation_armed and
+                    std.mem.eql(u8, event.table_name, "tenant_b_docs"))
+                {
+                    self.graph_authorization_boundary_observed = true;
+                    self.graph_authorization_revocation_armed = false;
+                    self.auth_manager.removePermissionFromUser(
+                        graph_authorization_username,
+                        "tenant_b_docs",
+                        .table,
+                    ) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    self.graph_authorization_revoked = true;
+                }
+            },
             .hydration_started => self.graph_hydration_started_count +|= 1,
             .hydration_fanout_started => {
                 self.graph_hydration_fanout_started_count +|= 1;
@@ -1445,7 +1465,7 @@ pub const Fixture = struct {
     }
 
     fn runWorkloadInner(self: *Fixture) !void {
-        const left_body = if (self.graph_authorization_mutation_enabled)
+        const left_body = if (self.graph_inflight_authorization_revocation_enabled)
             graph_authorization_left_batch_body
         else if (self.graph_enabled)
             left_batch_body
@@ -1582,8 +1602,8 @@ pub const Fixture = struct {
                 self.graph_cancellation_sound = try self.runGraphCancellationQuery();
                 if (!self.graph_cancellation_sound)
                     return error.ProductionDataGraphCancellationQueryFailed;
-            } else if (self.graph_authorization_mutation_enabled) {
-                self.graph_authorization_sound = try self.runGraphAuthorizationMutationQuery();
+            } else if (self.graph_inflight_authorization_revocation_enabled) {
+                self.graph_authorization_sound = try self.runGraphInflightAuthorizationRevocationQuery();
                 if (!self.graph_authorization_sound)
                     return error.ProductionDataGraphAuthorizationMutationFailed;
             } else if (self.graph_hydration_enabled) {
@@ -2030,7 +2050,7 @@ pub const Fixture = struct {
         return self.client.fetchQueryRaw(uri, "docs", body);
     }
 
-    fn runGraphAuthorizationMutationQuery(self: *Fixture) !bool {
+    fn runGraphInflightAuthorizationRevocationQuery(self: *Fixture) !bool {
         if (!self.auth_manager_live) return error.ProductionGraphAuthorizationManagerMissing;
 
         const query_body = try test_contract_helpers.encodeGraphTraverseQueryWithDocumentsRequest(
@@ -2044,12 +2064,7 @@ pub const Fixture = struct {
         );
         defer self.alloc.free(query_body);
 
-        try self.auth_manager.removePermissionFromUser(
-            graph_authorization_username,
-            "tenant_b_docs",
-            .table,
-        );
-        self.graph_authorization_revoked = true;
+        self.graph_authorization_revocation_armed = true;
 
         var denied = try self.client.fetchQueryRaw(
             self.data_api_uris[self.graph_probe_route_index],
@@ -2058,7 +2073,10 @@ pub const Fixture = struct {
         );
         defer denied.deinit(self.alloc);
         self.graph_authorization_denied_status = denied.status;
-        self.graph_authorization_denied_without_leak = denied.status == 200 and
+        self.graph_authorization_denied_without_leak =
+            self.graph_authorization_boundary_observed and
+            self.graph_authorization_revoked and
+            denied.status == 200 and
             try self.graphAuthorizationResponseSound(denied.body, false);
         if (!self.graph_authorization_denied_without_leak) return false;
 
@@ -3048,6 +3066,7 @@ pub const Fixture = struct {
         graph_cancellation_observed: bool,
         graph_cancellation_recovered: bool,
         graph_cancellation_ok: bool,
+        graph_authorization_boundary_observed: bool,
         graph_authorization_revoked: bool,
         graph_authorization_denied_without_leak: bool,
         graph_authorization_restored: bool,
@@ -3102,7 +3121,7 @@ pub const Fixture = struct {
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
-                (!self.graph_authorization_mutation_enabled or self.graph_authorization_sound) and
+                (!self.graph_inflight_authorization_revocation_enabled or self.graph_authorization_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
@@ -3121,6 +3140,7 @@ pub const Fixture = struct {
             .graph_cancellation_observed = self.graph_cancellation_observed,
             .graph_cancellation_recovered = self.graph_cancellation_recovered,
             .graph_cancellation_ok = self.graph_cancellation_sound,
+            .graph_authorization_boundary_observed = self.graph_authorization_boundary_observed,
             .graph_authorization_revoked = self.graph_authorization_revoked,
             .graph_authorization_denied_without_leak = self.graph_authorization_denied_without_leak,
             .graph_authorization_restored = self.graph_authorization_restored,

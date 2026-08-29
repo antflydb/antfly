@@ -819,6 +819,38 @@ pub const UserManager = struct {
         return try out.toOwnedSlice(self.alloc);
     }
 
+    /// Re-check one permission against the current policy under the same
+    /// mutation lock used by policy updates. Long-running request paths use
+    /// this to intersect their admitted credential scope with live revocation:
+    /// a later grant cannot broaden the request, while a later revoke takes
+    /// effect before the next protected operation.
+    pub fn permissionCurrentlyAllowed(
+        self: *UserManager,
+        username: []const u8,
+        resource_type: ResourceType,
+        resource: []const u8,
+        permission_type: PermissionType,
+    ) !bool {
+        self.mutation_mutex.lockUncancelable(self.io);
+        defer self.mutation_mutex.unlock(self.io);
+        if (!self.users.contains(username)) return false;
+        const permissions = try self.getPermissionsForUser(username);
+        defer {
+            for (permissions) |*permission| permission.deinit(self.alloc);
+            self.alloc.free(permissions);
+        }
+        for (permissions) |permission| {
+            const resource_type_matches = permission.resource_type == .@"*" or
+                permission.resource_type == resource_type;
+            const resource_matches = std.mem.eql(u8, permission.resource, "*") or
+                std.mem.eql(u8, permission.resource, resource);
+            const permission_matches = permission.type == .admin or
+                permission.type == permission_type;
+            if (resource_type_matches and resource_matches and permission_matches) return true;
+        }
+        return false;
+    }
+
     pub fn addRoleToSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
         self.mutation_mutex.lockUncancelable(self.io);
         defer self.mutation_mutex.unlock(self.io);
@@ -1704,6 +1736,30 @@ test "usermgr create authenticate and persist users through store" {
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("alice", loaded.username);
     try std.testing.expectEqualStrings("{\"tenant_id\":\"acme\"}", loaded.metadata_json);
+}
+
+test "usermgr current permission check observes revocation" {
+    const alloc = std.testing.allocator;
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var table_read = try Permission.initOwned(alloc, .table, "tenant_docs", .read);
+    defer table_read.deinit(alloc);
+    var created = try manager.createUser("alice", "secret", &.{table_read});
+    defer created.deinit(alloc);
+
+    try std.testing.expect(try manager.permissionCurrentlyAllowed("alice", .table, "tenant_docs", .read));
+    try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "other_docs", .read));
+    try manager.removePermissionFromUser("alice", "tenant_docs", .table);
+    try std.testing.expect(!try manager.permissionCurrentlyAllowed("alice", .table, "tenant_docs", .read));
 }
 
 test "usermgr HA seed lease excludes auth mutations until capture completes" {
