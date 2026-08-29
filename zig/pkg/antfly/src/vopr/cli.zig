@@ -22,7 +22,6 @@ pub fn dispatch(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u8) 
     if (std.mem.eql(u8, argv[1], "campaign")) return campaignCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "reduce")) return reduceCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "promote")) return promoteCommand(alloc, io, argv[2..]);
-    if (std.mem.eql(u8, argv[1], "migrate")) return migrateCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "tla")) return tlaCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "explain")) return explainCommand(alloc, io, argv[2..]);
     if (std.mem.eql(u8, argv[1], "debug")) return debugCommand(alloc, io, argv[2..]);
@@ -1618,63 +1617,6 @@ fn promoteCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8
     std.debug.print("VOPR promoted fingerprint={x} fixture={s}\n", .{ recorded.failures.items[0].fingerprint, output });
 }
 
-fn migrateCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-    var trace_path: ?[]const u8 = null;
-    var output_path: ?[]const u8 = null;
-    var force = false;
-    var index: usize = 0;
-    while (index < args.len) {
-        if (std.mem.eql(u8, args[index], "--trace")) {
-            trace_path = try nextValue(args, &index);
-        } else if (std.mem.eql(u8, args[index], "--out")) {
-            output_path = try nextValue(args, &index);
-        } else if (std.mem.eql(u8, args[index], "--force")) {
-            force = true;
-        } else return error.UnknownArgument;
-        index += 1;
-    }
-    const input = trace_path orelse return error.TracePathRequired;
-    const output = output_path orelse return error.TraceOutputRequired;
-    if (std.mem.eql(u8, input, output)) return error.InPlaceFixtureMigrationForbidden;
-    const encoded = try std.Io.Dir.cwd().readFileAlloc(io, input, alloc, .limited(max_trace_bytes));
-    defer alloc.free(encoded);
-    var recorded = try vopr.trace.parseAlloc(alloc, encoded);
-    defer recorded.deinit();
-    var migration = try vopr.fixture.migrate(
-        alloc,
-        &recorded,
-        replayKnownScenario,
-        vopr.fixture.canonicalClone,
-        replayKnownScenario,
-        .{},
-    );
-    defer migration.deinit();
-    if (!force) {
-        if (std.Io.Dir.cwd().statFile(io, output, .{})) |_| {
-            return error.MigrationOutputAlreadyExists;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
-    }
-    const migrated_bytes = try migration.artifact.renderAlloc(alloc);
-    defer alloc.free(migrated_bytes);
-    if (std.fs.path.dirname(output)) |parent| try ensureDir(io, parent);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output, .data = migrated_bytes });
-    std.debug.print(
-        "VOPR migrated scenario={s} version={d}->{d} trace={x}->{x} outcome={x} out={s}\n",
-        .{
-            migration.artifact.header.scenario,
-            migration.report.source_scenario_version,
-            migration.report.migrated_scenario_version,
-            migration.report.source_trace_digest,
-            migration.report.migrated_trace_digest,
-            migration.report.migrated_outcome_digest,
-            output,
-        },
-    );
-}
-
 fn fixtureDirForScenario(recorded: *const vopr.trace.Trace) ![]const u8 {
     if (std.mem.eql(u8, recorded.header.scenario, "metadata-vopr"))
         return "pkg/antfly/src/vopr/fixtures/metadata";
@@ -2494,7 +2436,6 @@ fn usage() error{InvalidUsage} {
         \\  vopr campaign --scenario metadata|transaction|distributed-data|distributed-transaction|data-plane|derived-workflow|backup-restore|clock-fault|wal|persistent|index-manager|db-split|raft|lmdb|lsm|ha --histories <n> [--transitions <n>] --workers <n> --artifact-dir <path>
         \\  vopr reduce --trace <path> --out <path> [--attempts <n>]
         \\  vopr promote --trace <path> --name <fixture-name> [--force]
-        \\  vopr migrate --trace <path> --out <path> [--force]
         \\  vopr tla --trace <path> --domain raft|transaction --out <path.ndjson>
         \\  vopr explain --trace <path> [--failure <ordinal>] --out <path.json>
         \\  vopr debug --trace <path> [--prefix <choice-index>] [--out <path.json>] [--commands <path>] [--interactive]

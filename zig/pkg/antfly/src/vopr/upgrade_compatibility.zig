@@ -1,10 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Differential compatibility and migration histories. The suite opens real
-//! golden storage bytes and serverless artifacts, exercises VOPR's canonical
-//! trace/fixture/checkpoint contracts, and crashes the production atomic
-//! data-directory admission path before retrying from durable state.
+//! Differential product-format compatibility histories. The suite opens real
+//! golden storage bytes and serverless artifacts and crashes the production
+//! atomic data-directory admission path before retrying from durable state.
+//! VOPR's own artifacts are deliberately forward-only and do not belong here.
 
 const std = @import("std");
 const vopr = @import("vopr");
@@ -16,99 +16,6 @@ const external_codec = @import("../serverless/external_source/codec.zig");
 const external_types = @import("../serverless/external_source/types.zig");
 const manifest_codec = @import("../serverless/manifest/codec.zig");
 const manifest_types = @import("../serverless/manifest/types.zig");
-
-fn CompatibilityScenario(comptime scenario_version: u32, comptime changed_semantics: bool) type {
-    return struct {
-        pub const name: []const u8 = "upgrade-compatibility-fixture";
-        pub const version: u32 = scenario_version;
-        const transition_id = vopr.id.stable(name, "advance");
-        const bounded_id = vopr.id.stable(name, "bounded");
-        pub const properties = &[_]vopr.property.Declaration{
-            .{ .id = bounded_id, .name = name ++ ".bounded", .kind = .always },
-        };
-        pub const World = struct { value: u64 = 0 };
-
-        pub fn init(_: std.mem.Allocator) !World {
-            return .{};
-        }
-        pub fn deinit(_: *World, _: std.mem.Allocator) void {}
-        pub fn enumerate(world: *World, list: *vopr.transition.List, allocator: std.mem.Allocator) !void {
-            if (world.value < 2) try list.append(allocator, .{ .id = transition_id, .name = name ++ ".advance", .kind = .workload });
-        }
-        pub fn execute(world: *World, _: vopr.transition.Transition, events: *vopr.event.Sink, allocator: std.mem.Allocator) !vopr.outcome.TransitionOutcome {
-            world.value += 1;
-            try events.emitNamed(allocator, .state_change, name ++ ".advanced", world.value + @intFromBool(changed_semantics));
-            return .applied();
-        }
-        pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
-            try builder.addNamed(allocator, name ++ ".value", @intCast(world.value + @intFromBool(changed_semantics)));
-        }
-        pub fn evaluate(world: *World, sink: *vopr.property.Sink, allocator: std.mem.Allocator) !void {
-            try sink.check(allocator, bounded_id, world.value <= 2);
-        }
-        pub fn done(world: *World) bool {
-            return world.value == 2;
-        }
-        pub fn snapshotAlloc(world: *const World, allocator: std.mem.Allocator) ![]u8 {
-            const bytes = try allocator.alloc(u8, @sizeOf(u64));
-            std.mem.writeInt(u64, bytes[0..8], world.value, .little);
-            return bytes;
-        }
-        pub fn restoreSnapshot(world: *World, bytes: []const u8, _: std.mem.Allocator) !void {
-            if (bytes.len != @sizeOf(u64)) return error.InvalidCompatibilitySnapshot;
-            world.value = std.mem.readInt(u64, bytes[0..@sizeOf(u64)], .little);
-        }
-    };
-}
-
-const FixtureV1 = CompatibilityScenario(1, false);
-const FixtureV2 = CompatibilityScenario(2, false);
-const FixtureV2Changed = CompatibilityScenario(2, true);
-
-fn runFromChoices(comptime ScenarioType: type, allocator: std.mem.Allocator, source: *const vopr.trace.Trace) !vopr.trace.Trace {
-    var replay_source = vopr.choice.Replay{ .records = source.choices.items };
-    return vopr.runner.run(ScenarioType, allocator, replay_source.source(), .{
-        .system = source.header.system,
-        .seed = source.config.seed,
-        .transition_budget = source.config.transition_budget,
-        .resource_budget = source.config.resource_budget,
-        .fixture_hashes = source.config.fixture_hashes,
-        .feature_flags = source.config.feature_flags,
-        .backend_ids = source.config.backend_ids,
-        .scenario_parameters = source.config.scenario_parameters,
-        .source_revision = source.header.source_revision,
-        .target = source.header.target,
-        .optimize = source.header.optimize,
-    });
-}
-
-const FixtureMigration = struct {
-    fn replayV1(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
-        return vopr.replay.exact(FixtureV1, allocator, artifact);
-    }
-    fn replayV2(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
-        return vopr.replay.exact(FixtureV2, allocator, artifact);
-    }
-    fn replayV2Changed(allocator: std.mem.Allocator, artifact: *const vopr.trace.Trace) !vopr.trace.Trace {
-        return vopr.replay.exact(FixtureV2Changed, allocator, artifact);
-    }
-    fn transformV2(allocator: std.mem.Allocator, source: *const vopr.trace.Trace) !vopr.trace.Trace {
-        return runFromChoices(FixtureV2, allocator, source);
-    }
-    fn transformV2Changed(allocator: std.mem.Allocator, source: *const vopr.trace.Trace) !vopr.trace.Trace {
-        return runFromChoices(FixtureV2Changed, allocator, source);
-    }
-};
-
-fn newFixtureTrace(allocator: std.mem.Allocator) !vopr.trace.Trace {
-    var seeded = vopr.choice.Seeded.init(0xc0a7_0001);
-    return vopr.runner.run(FixtureV1, allocator, seeded.source(), .{
-        .system = "antfly",
-        .seed = 0xc0a7_0001,
-        .transition_budget = 2,
-        .source_revision = "upgrade-compatibility",
-    });
-}
 
 fn minimalInventory(allocator: std.mem.Allocator) !external_types.Inventory {
     return .{
@@ -151,7 +58,7 @@ fn manifestV12FixtureAlloc(allocator: std.mem.Allocator) ![]u8 {
 
 pub const Scenario = struct {
     pub const name: []const u8 = "upgrade-compatibility";
-    pub const version: u32 = 1;
+    pub const version: u32 = 2;
 
     const sound_id = vopr.id.stable(name, "safe-compatible-outcome");
     const complete_id = vopr.id.stable(name, "mode-completes");
@@ -165,14 +72,6 @@ pub const Scenario = struct {
         data_dir_legacy_rejected,
         data_dir_future_rejected,
         data_dir_crash_then_forward,
-        trace_v1_roundtrip,
-        trace_future_format_rejected,
-        trace_scenario_version_rejected,
-        fixture_v1_to_v2_equivalent,
-        fixture_semantic_change_rejected,
-        checkpoint_restore,
-        checkpoint_old_version_rejected,
-        checkpoint_corruption_rejected,
         serverless_legacy_head_forward,
         serverless_future_head_rejected,
         serverless_inventory_v14_forward,
@@ -209,14 +108,6 @@ pub const Scenario = struct {
                 .data_dir_legacy_rejected => try self.legacyDataDirRejected(),
                 .data_dir_future_rejected => try self.futureDataDirRejected(),
                 .data_dir_crash_then_forward => try self.crashDataDirMigration(),
-                .trace_v1_roundtrip => try self.traceRoundtrip(),
-                .trace_future_format_rejected => try self.traceFutureRejected(),
-                .trace_scenario_version_rejected => try self.traceScenarioRejected(),
-                .fixture_v1_to_v2_equivalent => try self.fixtureMigrates(),
-                .fixture_semantic_change_rejected => try self.fixtureChangeRejected(),
-                .checkpoint_restore => try self.checkpointRestores(),
-                .checkpoint_old_version_rejected => try self.checkpointVersionRejected(),
-                .checkpoint_corruption_rejected => try self.checkpointCorruptionRejected(),
                 .serverless_legacy_head_forward => try self.legacyHeadForwards(),
                 .serverless_future_head_rejected => try self.futureHeadRejected(),
                 .serverless_inventory_v14_forward => try self.inventoryV14Forwards(),
@@ -263,108 +154,6 @@ pub const Scenario = struct {
             try self.sim.crashFileSystem();
             try data_format.ensureCompatible(self.allocator, self.sim.io(), "/upgrade");
             try data_format.ensureCompatible(self.allocator, self.sim.io(), "/upgrade");
-        }
-
-        fn traceRoundtrip(self: *State) !void {
-            var source = try newFixtureTrace(self.allocator);
-            defer source.deinit();
-            const bytes = try source.renderAlloc(self.allocator);
-            defer self.allocator.free(bytes);
-            var parsed = try vopr.trace.parseAlloc(self.allocator, bytes);
-            defer parsed.deinit();
-            const canonical = try parsed.renderAlloc(self.allocator);
-            defer self.allocator.free(canonical);
-            self.sound = std.mem.eql(u8, bytes, canonical);
-        }
-
-        fn traceFutureRejected(self: *State) !void {
-            var source = try newFixtureTrace(self.allocator);
-            defer source.deinit();
-            const bytes = try source.renderAlloc(self.allocator);
-            defer self.allocator.free(bytes);
-            const incompatible = try self.allocator.dupe(u8, bytes);
-            defer self.allocator.free(incompatible);
-            const marker = std.mem.indexOf(u8, incompatible, vopr.trace.format) orelse return error.MissingTraceFormat;
-            incompatible[marker + vopr.trace.format.len - 1] = '9';
-            if (vopr.trace.parseAlloc(self.allocator, incompatible)) |unexpected_value| {
-                var unexpected = unexpected_value;
-                unexpected.deinit();
-                self.sound = false;
-            } else |err| self.sound = err == error.IncompatibleTrace;
-        }
-
-        fn traceScenarioRejected(self: *State) !void {
-            var source = try newFixtureTrace(self.allocator);
-            defer source.deinit();
-            source.header.scenario_version = 99;
-            if (vopr.replay.exact(FixtureV1, self.allocator, &source)) |unexpected_value| {
-                var unexpected = unexpected_value;
-                unexpected.deinit();
-                self.sound = false;
-            } else |err| self.sound = err == error.IncompatibleScenarioVersion;
-        }
-
-        fn fixtureMigrates(self: *State) !void {
-            var source = try newFixtureTrace(self.allocator);
-            defer source.deinit();
-            var migration = try vopr.fixture.migrate(
-                self.allocator,
-                &source,
-                FixtureMigration.replayV1,
-                FixtureMigration.transformV2,
-                FixtureMigration.replayV2,
-                .{},
-            );
-            defer migration.deinit();
-            self.sound = migration.report.source_scenario_version == 1 and
-                migration.report.migrated_scenario_version == 2 and
-                migration.report.source_outcome_digest == migration.report.migrated_outcome_digest;
-        }
-
-        fn fixtureChangeRejected(self: *State) !void {
-            var source = try newFixtureTrace(self.allocator);
-            defer source.deinit();
-            if (vopr.fixture.migrate(
-                self.allocator,
-                &source,
-                FixtureMigration.replayV1,
-                FixtureMigration.transformV2Changed,
-                FixtureMigration.replayV2Changed,
-                .{},
-            )) |unexpected_value| {
-                var unexpected = unexpected_value;
-                unexpected.deinit();
-                self.sound = false;
-            } else |err| self.sound = err == error.FixtureMigrationFinalObservationChanged;
-        }
-
-        fn checkpointRestores(self: *State) !void {
-            var world = FixtureV1.World{ .value = 2 };
-            var checkpoint = try vopr.snapshot.capture(FixtureV1, self.allocator, &world, 2, 17);
-            defer checkpoint.deinit(self.allocator);
-            world.value = 0;
-            try vopr.snapshot.restore(FixtureV1, &world, checkpoint, self.allocator);
-            self.sound = world.value == 2;
-        }
-
-        fn checkpointVersionRejected(self: *State) !void {
-            var world = FixtureV1.World{ .value = 2 };
-            var checkpoint = try vopr.snapshot.capture(FixtureV1, self.allocator, &world, 2, 17);
-            defer checkpoint.deinit(self.allocator);
-            checkpoint.scenario_version = 0;
-            if (vopr.snapshot.restore(FixtureV1, &world, checkpoint, self.allocator)) {
-                self.sound = false;
-            } else |err| self.sound = err == error.IncompatibleLogicalSnapshot;
-        }
-
-        fn checkpointCorruptionRejected(self: *State) !void {
-            var world = FixtureV1.World{ .value = 2 };
-            var checkpoint = try vopr.snapshot.capture(FixtureV1, self.allocator, &world, 2, 17);
-            defer checkpoint.deinit(self.allocator);
-            checkpoint.bytes[0] ^= 1;
-            if (vopr.snapshot.restore(FixtureV1, &world, checkpoint, self.allocator)) {
-                self.sound = false;
-            } else |err| self.sound = err == error.CorruptLogicalSnapshot;
         }
 
         fn legacyHeadForwards(self: *State) !void {
@@ -464,7 +253,7 @@ pub const Scenario = struct {
             .id = id,
             .name = mode_name,
             .kind = switch (mode) {
-                .storage_ha_v1_golden, .trace_v1_roundtrip, .fixture_v1_to_v2_equivalent, .checkpoint_restore, .serverless_legacy_head_forward, .serverless_inventory_v14_forward, .serverless_manifest_v12_forward => .maintenance,
+                .storage_ha_v1_golden, .serverless_legacy_head_forward, .serverless_inventory_v14_forward, .serverless_manifest_v12_forward => .maintenance,
                 else => .fault,
             },
         });
@@ -505,7 +294,7 @@ pub const Scenario = struct {
     }
 };
 
-test "upgrade compatibility VOPR exact replays formats migrations and rejection" {
+test "upgrade compatibility VOPR exact replays product formats and rejection" {
     const backend_ids = vopr.vopr_io.artifactBackendIds();
     for (Scenario.mode_ids) |mode_id| {
         var scripted = vopr.choice.Scripted{ .selections = &.{mode_id} };

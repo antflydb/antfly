@@ -7653,12 +7653,6 @@ pub fn build(b: *std.Build) void {
     const vopr_promote_step = b.step("vopr-promote", "Promote a reviewed reduced VOPR failure fixture");
     vopr_promote_step.dependOn(&promote_vopr_cli.step);
 
-    const migrate_vopr_cli = b.addRunArtifact(vopr_cli);
-    migrate_vopr_cli.addArg("migrate");
-    if (b.args) |args| migrate_vopr_cli.addArgs(args);
-    const vopr_migrate_step = b.step("vopr-migrate", "Migrate a VOPR artifact after proving equivalent replay outcomes");
-    vopr_migrate_step.dependOn(&migrate_vopr_cli.step);
-
     const tla_vopr_cli = b.addRunArtifact(vopr_cli);
     tla_vopr_cli.addArg("tla");
     if (b.args) |args| tla_vopr_cli.addArgs(args);

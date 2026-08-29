@@ -132,7 +132,8 @@ pub const Corpus = struct {
 
     /// Import a retained artifact without silently discarding histories that
     /// no longer match the active replay ABI. Structural and compatibility
-    /// failures are copied to an explicit quarantine for inspection/migration.
+    /// failures are copied to an explicit quarantine for inspection and
+    /// deliberate deletion; they are never translated into the current ABI.
     pub fn importBytes(
         self: *Corpus,
         bytes: []const u8,

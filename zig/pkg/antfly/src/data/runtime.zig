@@ -1251,16 +1251,6 @@ const RaftTableApplyStateMachine = struct {
         outcome: ApplyOutcome = .pending,
     };
 
-    const ReadLeaseKey = struct {
-        group_id: u64,
-        request_id: u64,
-    };
-
-    const ReadLeaseWaiter = struct {
-        target_index: ?u64 = null,
-        complete: bool = false,
-    };
-
     alloc: std.mem.Allocator,
     write_source: antfly.public_api.ProvisionedTableWriteSource,
     applied_mutex: std.atomic.Mutex = .unlocked,
@@ -1273,11 +1263,10 @@ const RaftTableApplyStateMachine = struct {
     // The map is therefore bounded by live synchronous proposals rather than
     // by Raft history or an eviction policy that could lose an outcome.
     apply_outcomes: std.AutoHashMapUnmanaged(ApplyFailureKey, ApplyOutcomeWaiter) = .empty,
-    // ReadIndex is asynchronous: enqueuing it is not a read barrier. A caller
-    // registers before issuing the request and waits until the corresponding
+    // ReadIndex is asynchronous: enqueuing it is not a read barrier. This
+    // shared tracker owns the request identity and waits until the matching
     // ReadState has crossed this exact replica's state-machine apply boundary.
-    // Only live requests are retained, so this map is request-bounded.
-    read_lease_waiters: std.AutoHashMapUnmanaged(ReadLeaseKey, ReadLeaseWaiter) = .empty,
+    read_barriers: antfly.raft.read_gate.AppliedReadTracker,
     test_faults: TestFaults = .{},
 
     fn init(
@@ -1291,6 +1280,7 @@ const RaftTableApplyStateMachine = struct {
         return .{
             .alloc = alloc,
             .write_source = write_source,
+            .read_barriers = .init(alloc),
         };
     }
 
@@ -1299,7 +1289,7 @@ const RaftTableApplyStateMachine = struct {
         self.applied_indexes.deinit(self.alloc);
         self.retry_apply_checkpoints.deinit(self.alloc);
         self.apply_outcomes.deinit(self.alloc);
-        self.read_lease_waiters.deinit(self.alloc);
+        self.read_barriers.deinit();
         self.* = undefined;
     }
 
@@ -1474,7 +1464,6 @@ const RaftTableApplyStateMachine = struct {
         applied_index: u64,
     ) !void {
         lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
 
         // A snapshot proves state convergence through its index, but not the
         // typed outcome of a command this process did not execute. Never turn
@@ -1504,70 +1493,17 @@ const RaftTableApplyStateMachine = struct {
         if (applied_index > existing) {
             if (@import("builtin").is_test and self.test_faults.applied_index_publication_failure_once) {
                 self.test_faults.applied_index_publication_failure_once = false;
+                self.applied_mutex.unlock();
                 return error.TestAppliedIndexPublicationFailure;
             }
-            try self.applied_indexes.put(self.alloc, group_id, applied_index);
+            self.applied_indexes.put(self.alloc, group_id, applied_index) catch |err| {
+                self.applied_mutex.unlock();
+                return err;
+            };
         }
         const visible_applied_index = @max(existing, applied_index);
-        var read_waiters = self.read_lease_waiters.iterator();
-        while (read_waiters.next()) |entry| {
-            if (entry.key_ptr.group_id != group_id) continue;
-            const target_index = entry.value_ptr.target_index orelse continue;
-            if (visible_applied_index >= target_index) entry.value_ptr.complete = true;
-        }
-    }
-
-    fn registerReadLease(self: *RaftTableApplyStateMachine, group_id: u64, request_id: u64) !void {
-        lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
-        const result = try self.read_lease_waiters.getOrPut(self.alloc, .{
-            .group_id = group_id,
-            .request_id = request_id,
-        });
-        if (result.found_existing) return error.DuplicateRaftReadLeaseWaiter;
-        result.value_ptr.* = .{};
-    }
-
-    fn cancelReadLease(self: *RaftTableApplyStateMachine, group_id: u64, request_id: u64) void {
-        lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
-        _ = self.read_lease_waiters.remove(.{ .group_id = group_id, .request_id = request_id });
-    }
-
-    fn takeCompletedReadLease(self: *RaftTableApplyStateMachine, group_id: u64, request_id: u64) bool {
-        lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
-        const key = ReadLeaseKey{ .group_id = group_id, .request_id = request_id };
-        const waiter = self.read_lease_waiters.get(key) orelse return false;
-        if (!waiter.complete) return false;
-        _ = self.read_lease_waiters.remove(key);
-        return true;
-    }
-
-    fn observeReadStates(
-        self: *RaftTableApplyStateMachine,
-        group_id: u64,
-        read_states: []const raft_engine.core.ReadState,
-    ) void {
-        if (read_states.len == 0) return;
-        lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
-        const applied_index = self.applied_indexes.get(group_id) orelse 0;
-        for (read_states) |read_state| {
-            const separator = std.mem.lastIndexOfScalar(u8, read_state.request_ctx, ':') orelse continue;
-            if (separator + 1 >= read_state.request_ctx.len) continue;
-            const request_id = std.fmt.parseUnsigned(
-                u64,
-                read_state.request_ctx[separator + 1 ..],
-                16,
-            ) catch continue;
-            const waiter = self.read_lease_waiters.getPtr(.{
-                .group_id = group_id,
-                .request_id = request_id,
-            }) orelse continue;
-            waiter.target_index = read_state.index;
-            waiter.complete = applied_index >= read_state.index;
-        }
+        self.applied_mutex.unlock();
+        try self.read_barriers.noteApplied(group_id, visible_applied_index);
     }
 
     fn registerApplyOutcomeWaiter(
@@ -1619,7 +1555,6 @@ const RaftTableApplyStateMachine = struct {
     fn retireGroup(ptr: *anyopaque, group_id: raft_engine.core.types.GroupId) void {
         const self: *RaftTableApplyStateMachine = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.applied_mutex);
-        defer self.applied_mutex.unlock();
 
         _ = self.applied_indexes.remove(group_id);
         _ = self.retry_apply_checkpoints.remove(group_id);
@@ -1627,6 +1562,8 @@ const RaftTableApplyStateMachine = struct {
         while (outcomes.next()) |entry| {
             if (entry.key_ptr.group_id == group_id) self.apply_outcomes.removeByPtr(entry.key_ptr);
         }
+        self.applied_mutex.unlock();
+        self.read_barriers.retireGroup(group_id);
     }
 
     fn stateMachine(self: *RaftTableApplyStateMachine) raft_engine.runtime.storage_iface.StateMachine {
@@ -1653,7 +1590,7 @@ const RaftTableApplyStateMachine = struct {
         // separate from retry checkpoint bookkeeping, which is only needed for
         // durable snapshot/entry application.
         if (snapshot == null and committed_entries.len == 0) {
-            self.observeReadStates(group_id, read_states);
+            self.read_barriers.observeReadStates(group_id, read_states);
             return;
         }
         const snapshot_index: u64 = if (snapshot) |value| value.metadata.index else 0;
@@ -1743,7 +1680,7 @@ const RaftTableApplyStateMachine = struct {
             try self.publishAppliedReady(group_id, snapshot_index, committed_entries, last_index);
             if (last_index >= completed_index) self.clearRetryApplyCheckpoint(group_id);
         }
-        self.observeReadStates(group_id, read_states);
+        self.read_barriers.observeReadStates(group_id, read_states);
     }
 };
 
@@ -4965,7 +4902,6 @@ pub const DataServer = struct {
     data_raft_factory: ?*DataDescriptorFactory = null,
     data_raft_store: ?*raft_engine.core.MemoryStorage = null,
     data_raft_apply: ?*RaftTableApplyStateMachine = null,
-    data_read_lease_sequence: std.atomic.Value(u64) = .init(1),
     data_raft_base_uri: ?[]u8 = null,
     metadata_local_providers_registered: bool = false,
     store_registration: ?StoreRegistrationConfig = null,
@@ -7777,24 +7713,17 @@ pub const DataServer = struct {
     ) anyerror!void {
         const raft = self.data_raft orelse return error.NotLeader;
         const apply_sm = self.data_raft_apply orelse return error.NotLeader;
-        var request_id = self.data_read_lease_sequence.fetchAdd(1, .monotonic);
-        if (request_id == 0) request_id = self.data_read_lease_sequence.fetchAdd(1, .monotonic);
-        try apply_sm.registerReadLease(group_id, request_id);
-        var waiter_live = true;
-        defer if (waiter_live) apply_sm.cancelReadLease(group_id, request_id);
-
+        _ = request_ctx;
         var context_buffer: [160]u8 = undefined;
-        const unique_context = std.fmt.bufPrint(
-            &context_buffer,
-            "{s}:vopr-read-v1:{x}",
-            .{ request_ctx, request_id },
-        ) catch return error.ReadIndexContextTooLong;
+        const registration = try apply_sm.read_barriers.register(group_id, &context_buffer);
+        var waiter_live = true;
+        defer if (waiter_live) apply_sm.read_barriers.cancel(registration.token);
 
         // RawNode mutation and Ready processing share this owner lock. Release
         // it before waiting so the Raft driver can deliver the quorum response
         // and apply the resulting ReadState.
         lockAtomic(&self.data_raft_mutex);
-        raft.requestReadableLease(group_id, unique_context) catch |err| {
+        raft.requestReadableLease(group_id, registration.request_ctx) catch |err| {
             self.data_raft_mutex.unlock();
             return err;
         };
@@ -7810,7 +7739,7 @@ pub const DataServer = struct {
         if (cancellation.isCancelled()) return error.Cancelled;
         while (self.dataRaftMonotonicNs() -| started_ns < timeout_ns) {
             if (cancellation.isCancelled()) return error.Cancelled;
-            if (apply_sm.takeCompletedReadLease(group_id, request_id)) {
+            if (apply_sm.read_barriers.takeCompleted(registration.token)) {
                 waiter_live = false;
                 return;
             }
@@ -20914,34 +20843,37 @@ test "data raft read lease completes only after matching ReadState apply" {
     );
     defer apply_sm.deinit();
 
-    try apply_sm.registerReadLease(7001, 0x2a);
+    var first_context: [96]u8 = undefined;
+    const first = try apply_sm.read_barriers.register(7001, &first_context);
     try apply_sm.publishAppliedReady(7001, 0, &.{}, 7);
-    try std.testing.expect(!apply_sm.takeCompletedReadLease(7001, 0x2a));
-    apply_sm.observeReadStates(7001, &.{.{
+    try std.testing.expect(!apply_sm.read_barriers.takeCompleted(first.token));
+    apply_sm.read_barriers.observeReadStates(7001, &.{.{
         .index = 7,
-        .request_ctx = @constCast("lookup:read_index:vopr-read-v1:2a"),
+        .request_ctx = @constCast(first.request_ctx),
     }});
-    try std.testing.expect(apply_sm.takeCompletedReadLease(7001, 0x2a));
-    try std.testing.expect(!apply_sm.takeCompletedReadLease(7001, 0x2a));
+    try std.testing.expect(apply_sm.read_barriers.takeCompleted(first.token));
+    try std.testing.expect(!apply_sm.read_barriers.takeCompleted(first.token));
 
-    try apply_sm.registerReadLease(7001, 0x2b);
-    apply_sm.observeReadStates(7001, &.{.{
+    var second_context: [96]u8 = undefined;
+    const second = try apply_sm.read_barriers.register(7001, &second_context);
+    apply_sm.read_barriers.observeReadStates(7001, &.{.{
         .index = 9,
-        .request_ctx = @constCast("search:read_index:vopr-read-v1:2b"),
+        .request_ctx = @constCast(second.request_ctx),
     }});
-    try std.testing.expect(!apply_sm.takeCompletedReadLease(7001, 0x2b));
+    try std.testing.expect(!apply_sm.read_barriers.takeCompleted(second.token));
     try apply_sm.publishAppliedReady(7001, 0, &.{}, 9);
-    try std.testing.expect(apply_sm.takeCompletedReadLease(7001, 0x2b));
+    try std.testing.expect(apply_sm.read_barriers.takeCompleted(second.token));
 
     // A quorum read commonly arrives as ReadState-only Ready work. Exercise
     // the state-machine boundary rather than calling observeReadStates
     // directly so an empty-apply optimization cannot discard the completion.
-    try apply_sm.registerReadLease(7001, 0x2c);
+    var third_context: [96]u8 = undefined;
+    const third = try apply_sm.read_barriers.register(7001, &third_context);
     try apply_sm.stateMachine().applyReady(7001, null, &.{}, &.{.{
         .index = 9,
-        .request_ctx = @constCast("lookup:read_index:vopr-read-v1:2c"),
+        .request_ctx = @constCast(third.request_ctx),
     }});
-    try std.testing.expect(apply_sm.takeCompletedReadLease(7001, 0x2c));
+    try std.testing.expect(apply_sm.read_barriers.takeCompleted(third.token));
 
     var server: DataServer = undefined;
     server.backend_runtime = null;

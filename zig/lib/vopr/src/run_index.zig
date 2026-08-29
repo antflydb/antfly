@@ -941,7 +941,7 @@ test "run index requires canonical aggregate campaign identities" {
     try std.testing.expectEqual(@as(usize, 4), index.artifacts.items.len);
 
     const missing_run_id =
-        \\{"format":"vopr-run-results-v1","scenario":"legacy","base_seed":1,"budget":{"histories_limit":1,"histories_consumed":1,"transition_limit_per_history":1,"transitions_consumed":1},"histories":{"clean":1,"failed":0,"replay_divergences":0,"harness_errors":0,"exact_replays":1},"corpus":{"entries":1,"quarantined":0,"retained":1},"properties":[],"failures":[],"artifacts":[]}
+        \\{"format":"vopr-run-results-v1","scenario":"missing-run-id","base_seed":1,"budget":{"histories_limit":1,"histories_consumed":1,"transition_limit_per_history":1,"transitions_consumed":1},"histories":{"clean":1,"failed":0,"replay_divergences":0,"harness_errors":0,"exact_replays":1},"corpus":{"entries":1,"quarantined":0,"retained":1},"properties":[],"failures":[],"artifacts":[]}
     ;
     try std.testing.expectError(error.MissingField, index.ingestJson(missing_run_id));
 }

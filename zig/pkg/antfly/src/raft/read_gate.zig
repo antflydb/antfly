@@ -13,7 +13,167 @@
 // limitations.
 
 const std = @import("std");
+const raft_engine = @import("raft_engine");
 const db_types = @import("../storage/db/types.zig");
+const read_state_observer_mod = @import("state_machine/read_state_observer.zig");
+
+/// Tracks quorum ReadIndex requests until the matching ReadState has crossed
+/// this replica's state-machine apply boundary. Registration is request
+/// bounded, cancellation removes ownership immediately, and context identity
+/// is canonical rather than delegated to caller string conventions.
+pub const AppliedReadTracker = struct {
+    pub const context_prefix = "antfly-read-safe-v1:";
+
+    pub const Token = struct {
+        group_id: u64,
+        request_id: u64,
+    };
+
+    pub const Registration = struct {
+        token: Token,
+        request_ctx: []const u8,
+    };
+
+    const Waiter = struct {
+        target_index: ?u64 = null,
+        complete: bool = false,
+    };
+
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    next_request_id: std.atomic.Value(u64) = .init(1),
+    applied_indexes: std.AutoHashMapUnmanaged(u64, u64) = .empty,
+    waiters: std.AutoHashMapUnmanaged(Token, Waiter) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) AppliedReadTracker {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *AppliedReadTracker) void {
+        self.applied_indexes.deinit(self.allocator);
+        self.waiters.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn register(
+        self: *AppliedReadTracker,
+        group_id: u64,
+        context_buffer: []u8,
+    ) !Registration {
+        var request_id = self.next_request_id.fetchAdd(1, .monotonic);
+        if (request_id == 0) request_id = self.next_request_id.fetchAdd(1, .monotonic);
+        const token = Token{ .group_id = group_id, .request_id = request_id };
+
+        lock(&self.mutex);
+        const result = self.waiters.getOrPut(self.allocator, token) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        if (result.found_existing) {
+            self.mutex.unlock();
+            return error.DuplicateAppliedReadToken;
+        }
+        result.value_ptr.* = .{};
+        self.mutex.unlock();
+        errdefer self.cancel(token);
+
+        const request_ctx = std.fmt.bufPrint(
+            context_buffer,
+            context_prefix ++ "{x}",
+            .{request_id},
+        ) catch return error.ReadIndexContextTooLong;
+        return .{ .token = token, .request_ctx = request_ctx };
+    }
+
+    pub fn cancel(self: *AppliedReadTracker, token: Token) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        _ = self.waiters.remove(token);
+    }
+
+    pub fn takeCompleted(self: *AppliedReadTracker, token: Token) bool {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const waiter = self.waiters.get(token) orelse return false;
+        if (!waiter.complete) return false;
+        _ = self.waiters.remove(token);
+        return true;
+    }
+
+    pub fn noteApplied(self: *AppliedReadTracker, group_id: u64, applied_index: u64) !void {
+        if (applied_index == 0) return;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = try self.applied_indexes.getOrPut(self.allocator, group_id);
+        if (!entry.found_existing or applied_index > entry.value_ptr.*) entry.value_ptr.* = applied_index;
+        const visible_index = entry.value_ptr.*;
+        var waiters = self.waiters.iterator();
+        while (waiters.next()) |waiter| {
+            if (waiter.key_ptr.group_id != group_id) continue;
+            const target_index = waiter.value_ptr.target_index orelse continue;
+            if (visible_index >= target_index) waiter.value_ptr.complete = true;
+        }
+    }
+
+    pub fn observeReadStates(
+        self: *AppliedReadTracker,
+        group_id: u64,
+        read_states: []const raft_engine.core.ReadState,
+    ) void {
+        if (read_states.len == 0) return;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const applied_index = self.applied_indexes.get(group_id) orelse 0;
+        for (read_states) |read_state| {
+            if (!std.mem.startsWith(u8, read_state.request_ctx, context_prefix)) continue;
+            const encoded_id = read_state.request_ctx[context_prefix.len..];
+            if (encoded_id.len == 0) continue;
+            const request_id = std.fmt.parseUnsigned(u64, encoded_id, 16) catch continue;
+            const waiter = self.waiters.getPtr(.{
+                .group_id = group_id,
+                .request_id = request_id,
+            }) orelse continue;
+            waiter.target_index = read_state.index;
+            waiter.complete = applied_index >= read_state.index;
+        }
+    }
+
+    pub fn retireGroup(self: *AppliedReadTracker, group_id: u64) void {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        _ = self.applied_indexes.remove(group_id);
+        var waiters = self.waiters.iterator();
+        while (waiters.next()) |waiter| {
+            if (waiter.key_ptr.group_id == group_id) self.waiters.removeByPtr(waiter.key_ptr);
+        }
+    }
+
+    pub fn pendingCount(self: *AppliedReadTracker) usize {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return self.waiters.count();
+    }
+
+    pub fn observer(self: *AppliedReadTracker) read_state_observer_mod.ReadStateObserver {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .on_read_states = onReadStates },
+        };
+    }
+
+    fn onReadStates(
+        ptr: *anyopaque,
+        group_id: raft_engine.core.types.GroupId,
+        read_states: []const raft_engine.core.ReadState,
+    ) !void {
+        const self: *AppliedReadTracker = @ptrCast(@alignCast(ptr));
+        self.observeReadStates(group_id, read_states);
+    }
+
+    fn lock(mutex: *std.atomic.Mutex) void {
+        while (!mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+};
 
 pub const EnrichmentReadKind = enum {
     search,
@@ -209,4 +369,77 @@ test "callback readable lease requester forwards calls" {
 
     try std.testing.expectEqual(@as(u64, 91), recorder.group_id);
     try std.testing.expectEqualStrings("enrichment:lookup", recorder.request_ctx[0..recorder.request_ctx_len]);
+}
+
+test "applied read tracker completes only after matching ReadState and applied index" {
+    var tracker = AppliedReadTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    var first_context: [96]u8 = undefined;
+    const first = try tracker.register(7001, &first_context);
+    try std.testing.expect(std.mem.startsWith(u8, first.request_ctx, AppliedReadTracker.context_prefix));
+    try std.testing.expectEqual(@as(usize, 1), tracker.pendingCount());
+
+    try tracker.noteApplied(7001, 7);
+    tracker.observeReadStates(7002, &.{.{
+        .index = 7,
+        .request_ctx = @constCast(first.request_ctx),
+    }});
+    try std.testing.expect(!tracker.takeCompleted(first.token));
+    tracker.observeReadStates(7001, &.{.{
+        .index = 7,
+        .request_ctx = @constCast("unrelated-read-context"),
+    }});
+    try std.testing.expect(!tracker.takeCompleted(first.token));
+    var removed_context_buffer: [96]u8 = undefined;
+    const removed_context = try std.fmt.bufPrint(
+        &removed_context_buffer,
+        "lookup:read_index:vopr-read-v1:{x}",
+        .{first.token.request_id},
+    );
+    tracker.observeReadStates(7001, &.{.{
+        .index = 7,
+        .request_ctx = @constCast(removed_context),
+    }});
+    try std.testing.expect(!tracker.takeCompleted(first.token));
+    try tracker.observer().onReadStates(7001, &.{.{
+        .index = 7,
+        .request_ctx = @constCast(first.request_ctx),
+    }});
+    try std.testing.expect(tracker.takeCompleted(first.token));
+    try std.testing.expect(!tracker.takeCompleted(first.token));
+
+    var second_context: [96]u8 = undefined;
+    const second = try tracker.register(7001, &second_context);
+    tracker.observeReadStates(7001, &.{.{
+        .index = 9,
+        .request_ctx = @constCast(second.request_ctx),
+    }});
+    try std.testing.expect(!tracker.takeCompleted(second.token));
+    try tracker.noteApplied(7001, 8);
+    try std.testing.expect(!tracker.takeCompleted(second.token));
+    try tracker.noteApplied(7001, 9);
+    try std.testing.expect(tracker.takeCompleted(second.token));
+}
+
+test "applied read tracker cancellation retirement and context errors release ownership" {
+    var tracker = AppliedReadTracker.init(std.testing.allocator);
+    defer tracker.deinit();
+
+    var canceled_context: [96]u8 = undefined;
+    const canceled = try tracker.register(91, &canceled_context);
+    tracker.cancel(canceled.token);
+    try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
+
+    var retired_context: [96]u8 = undefined;
+    _ = try tracker.register(92, &retired_context);
+    tracker.retireGroup(92);
+    try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
+
+    var too_short: [1]u8 = undefined;
+    try std.testing.expectError(
+        error.ReadIndexContextTooLong,
+        tracker.register(93, &too_short),
+    );
+    try std.testing.expectEqual(@as(usize, 0), tracker.pendingCount());
 }
