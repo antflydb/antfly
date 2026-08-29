@@ -261,9 +261,9 @@ pub const IncomingSourceGroupsResponse = struct {
 /// Exact, generation-fenced coordinator directory for incoming graph routes.
 /// Source-owned reverse adjacency remains authoritative; a miss falls back to
 /// bounded exact probes and records their result. The bounded in-memory L1 may
-/// be backed by an engine-owned durable L2. Its fixed hash-slot keyspace bounds
-/// disk cardinality under adversarial high-cardinality negative lookups; each
-/// value carries the full logical-key digest and topology/read-generation
+/// be backed by an engine-owned durable L2. Its fixed set-associative keyspace
+/// bounds disk cardinality under adversarial high-cardinality negative lookups;
+/// each value carries the full logical-key digest and topology/read-generation
 /// fence, so collisions, stale observations, and corrupt records are misses.
 /// Eviction, restart, or persistence failures likewise degrade to exact probes
 /// rather than affecting query correctness.
@@ -277,10 +277,11 @@ pub const IncomingSourceGroupCache = struct {
     durable_job_owner_id: u64 = 0,
     entries: std.StringHashMapUnmanaged([]u64) = .empty,
     resident_bytes: usize = 0,
-    pending_durable: std.AutoHashMapUnmanaged(u32, PendingDurableWrite) = .empty,
+    pending_durable: std.AutoHashMapUnmanaged([std.crypto.hash.sha2.Sha256.digest_length]u8, PendingDurableWrite) = .empty,
     pending_durable_bytes: usize = 0,
     durable_flush_scheduled: bool = false,
-    closing: bool = false,
+    durable_retry_round: u8 = 0,
+    closing: std.atomic.Value(bool) = .init(false),
     durable_hits: std.atomic.Value(u64) = .init(0),
     durable_misses: std.atomic.Value(u64) = .init(0),
     durable_read_failures: std.atomic.Value(u64) = .init(0),
@@ -289,22 +290,25 @@ pub const IncomingSourceGroupCache = struct {
     durable_writes_coalesced: std.atomic.Value(u64) = .init(0),
     durable_writes_dropped: std.atomic.Value(u64) = .init(0),
     durable_batches_committed: std.atomic.Value(u64) = .init(0),
+    durable_collision_evictions: std.atomic.Value(u64) = .init(0),
 
     const max_resident_bytes: usize = 16 * 1024 * 1024;
     const max_entries: usize = 65_536;
     const max_source_groups_per_key: usize = 65_536;
-    const durable_key_prefix = "\x00\x00__incoming_graph_route_v1__:";
+    const durable_key_prefix = "\x00\x00__incoming_graph_route_v2__:";
     const durable_value_magic = "IGR1";
     const route_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
     const durable_slot_count: u32 = 1 << 20;
+    const durable_candidate_count: usize = 4;
     const DurableKey = [durable_key_prefix.len + @sizeOf(u32)]u8;
     const durable_value_header_len = durable_value_magic.len + route_digest_len + route_digest_len + @sizeOf(u32);
     const max_pending_durable_entries: usize = 16_384;
     const max_pending_durable_bytes: usize = 8 * 1024 * 1024;
     const max_durable_flush_entries: usize = 512;
     const max_durable_flush_bytes: usize = 4 * 1024 * 1024;
-    const durable_flush_max_attempts: usize = 4;
-    const durable_flush_retry_base_ns: u64 = std.time.ns_per_ms;
+    const durable_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
+    const durable_retry_max_ns: u64 = 5 * std.time.ns_per_s;
+    const durable_retry_poll_ns: u64 = 10 * std.time.ns_per_ms;
 
     pub const Stats = struct {
         durable_hits: u64 = 0,
@@ -315,12 +319,13 @@ pub const IncomingSourceGroupCache = struct {
         durable_writes_coalesced: u64 = 0,
         durable_writes_dropped: u64 = 0,
         durable_batches_committed: u64 = 0,
+        durable_collision_evictions: u64 = 0,
         pending_durable_entries: usize = 0,
         pending_durable_bytes: usize = 0,
     };
 
     const PendingDurableWrite = struct {
-        durable_key: DurableKey,
+        identity: [route_digest_len]u8,
         encoded: []u8,
     };
 
@@ -375,15 +380,14 @@ pub const IncomingSourceGroupCache = struct {
             .durable_writes_coalesced = self.durable_writes_coalesced.load(.monotonic),
             .durable_writes_dropped = self.durable_writes_dropped.load(.monotonic),
             .durable_batches_committed = self.durable_batches_committed.load(.monotonic),
+            .durable_collision_evictions = self.durable_collision_evictions.load(.monotonic),
             .pending_durable_entries = pending_entries,
             .pending_durable_bytes = pending_bytes,
         };
     }
 
     pub fn deinit(self: *@This()) void {
-        platform_sync.lockYielding(&self.pending_mutex);
-        self.closing = true;
-        self.pending_mutex.unlock();
+        self.closing.store(true, .release);
         if (self.durable_jobs) |lane| lane.closeOwner(self.durable_job_owner_id);
         // A submission can fail before the lane owns a job. Once producers are
         // fenced and all owned jobs have stopped, make one bounded synchronous
@@ -423,10 +427,6 @@ pub const IncomingSourceGroupCache = struct {
         table_name: []const u8,
         req: IncomingSourceGroupsRequest,
     ) !IncomingSourceGroupsResponse {
-        // Re-kick a queue retained after a transient allocation/submission or
-        // storage failure. This is intentionally best-effort and never blocks
-        // the lookup path on durable persistence.
-        defer self.scheduleDurableFlush();
         const entries = try out_alloc.alloc(IncomingSourceGroupEntry, req.keys.len);
         var initialized: usize = 0;
         errdefer {
@@ -584,25 +584,59 @@ pub const IncomingSourceGroupCache = struct {
         missing: []const usize,
     ) ![]?[]u64 {
         const store = self.durable_store orelse return error.GraphIncomingRouteDirectoryUnavailable;
+        const DurableLookup = struct {
+            durable_key: DurableKey,
+            missing_index: usize,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                const order = std.mem.order(u8, &lhs.durable_key, &rhs.durable_key);
+                if (order != .eq) return order == .lt;
+                return lhs.missing_index < rhs.missing_index;
+            }
+        };
         const decoded = try out_alloc.alloc(?[]u64, missing.len);
         errdefer {
             for (decoded) |groups| if (groups) |owned| if (owned.len > 0) out_alloc.free(owned);
             out_alloc.free(decoded);
         }
         @memset(decoded, null);
-        platform_sync.lockYielding(&self.durable_mutex);
-        defer self.durable_mutex.unlock();
-        var txn = try store.beginRead();
-        defer txn.abort();
-        for (missing, 0..) |key_index, i| {
+
+        const lookups = try out_alloc.alloc(DurableLookup, try std.math.mul(usize, missing.len, durable_candidate_count));
+        defer out_alloc.free(lookups);
+        var lookup_count: usize = 0;
+        for (missing, 0..) |key_index, missing_index| {
             if (key_index >= keys.len) return error.InvalidGraphIncomingRouteResult;
             const identity = incomingRouteDurableIdentity(table_name, index_name, keys[key_index]);
-            const durable_key = incomingRouteDurableKey(identity);
-            const encoded = txn.get(&durable_key) catch |err| switch (err) {
-                error.NotFound => continue,
-                else => return err,
-            };
-            decoded[i] = decodeIncomingRouteDurableValueAlloc(out_alloc, identity, fence, encoded) catch {
+            for (incomingRouteDurableKeys(identity)) |durable_key| {
+                lookups[lookup_count] = .{ .durable_key = durable_key, .missing_index = missing_index };
+                lookup_count += 1;
+            }
+        }
+        std.mem.sort(DurableLookup, lookups[0..lookup_count], {}, DurableLookup.lessThan);
+
+        const read_keys = try out_alloc.alloc([]const u8, lookup_count);
+        defer out_alloc.free(read_keys);
+        var unique_count: usize = 0;
+        for (lookups[0..lookup_count]) |*lookup| {
+            if (unique_count > 0 and std.mem.eql(u8, read_keys[unique_count - 1], &lookup.durable_key)) continue;
+            read_keys[unique_count] = &lookup.durable_key;
+            unique_count += 1;
+        }
+        const read_values = try out_alloc.alloc(?[]const u8, unique_count);
+        defer out_alloc.free(read_values);
+        @memset(read_values, null);
+        var txn = try store.beginRead();
+        defer txn.abort();
+        try txn.getManySorted(read_keys[0..unique_count], read_values);
+
+        var read_index: usize = 0;
+        for (lookups[0..lookup_count], 0..) |lookup, lookup_index| {
+            if (lookup_index > 0 and !std.mem.eql(u8, &lookups[lookup_index - 1].durable_key, &lookup.durable_key)) read_index += 1;
+            if (decoded[lookup.missing_index] != null) continue;
+            const encoded = read_values[read_index] orelse continue;
+            const key_index = missing[lookup.missing_index];
+            const identity = incomingRouteDurableIdentity(table_name, index_name, keys[key_index]);
+            decoded[lookup.missing_index] = decodeIncomingRouteDurableValueAlloc(out_alloc, identity, fence, encoded) catch {
                 _ = self.durable_read_failures.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -651,19 +685,20 @@ pub const IncomingSourceGroupCache = struct {
         normalized: []const NormalizedEntry,
     ) !void {
         if (keys.len != normalized.len) return error.InvalidGraphIncomingRouteResult;
-        const store = self.durable_store orelse return;
-        platform_sync.lockYielding(&self.durable_mutex);
-        defer self.durable_mutex.unlock();
-        var batch = try store.beginBatch();
-        errdefer batch.abort();
-        for (keys, normalized) |key, entry| {
-            const identity = incomingRouteDurableIdentity(table_name, index_name, key);
-            const durable_key = incomingRouteDurableKey(identity);
-            const encoded = try encodeIncomingRouteDurableValueAlloc(self.alloc, identity, fence, entry.groups);
-            defer self.alloc.free(encoded);
-            try batch.put(&durable_key, encoded);
+        if (self.durable_store == null) return;
+        const writes = try self.alloc.alloc(PendingDurableWrite, keys.len);
+        var initialized: usize = 0;
+        defer {
+            for (writes[0..initialized]) |write| self.alloc.free(write.encoded);
+            self.alloc.free(writes);
         }
-        try batch.commit();
+        for (keys, normalized, 0..) |key, entry, i| {
+            const identity = incomingRouteDurableIdentity(table_name, index_name, key);
+            const encoded = try encodeIncomingRouteDurableValueAlloc(self.alloc, identity, fence, entry.groups);
+            writes[i] = .{ .identity = identity, .encoded = encoded };
+            initialized += 1;
+        }
+        try self.persistEncodedDurableBatch(writes);
         _ = self.durable_batches_committed.fetchAdd(1, .monotonic);
     }
 
@@ -700,24 +735,22 @@ pub const IncomingSourceGroupCache = struct {
         defer self.scheduleDurableFlush();
         for (keys, normalized) |key, entry| {
             const identity = incomingRouteDurableIdentity(table_name, index_name, key);
-            const durable_key = incomingRouteDurableKey(identity);
             const encoded_len = try std.math.add(usize, durable_value_header_len, try std.math.mul(usize, entry.groups.len, @sizeOf(u64)));
-            if (!self.durableWriteMayFit(durable_key, encoded_len)) {
+            if (!self.durableWriteMayFit(identity, encoded_len)) {
                 _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
                 continue;
             }
             const encoded = try encodeIncomingRouteDurableValueAlloc(self.alloc, identity, fence, entry.groups);
-            try self.enqueueEncodedDurableWrite(durable_key, encoded);
+            try self.enqueueEncodedDurableWrite(identity, encoded);
         }
     }
 
-    fn durableWriteMayFit(self: *@This(), durable_key: DurableKey, encoded_len: usize) bool {
+    fn durableWriteMayFit(self: *@This(), identity: [route_digest_len]u8, encoded_len: usize) bool {
         if (encoded_len > max_pending_durable_bytes) return false;
-        const slot = std.mem.readInt(u32, durable_key[durable_key_prefix.len..][0..@sizeOf(u32)], .big);
         platform_sync.lockYielding(&self.pending_mutex);
         defer self.pending_mutex.unlock();
-        if (self.closing) return false;
-        if (self.pending_durable.get(slot)) |existing| {
+        if (self.closing.load(.acquire)) return false;
+        if (self.pending_durable.get(identity)) |existing| {
             const retained_bytes = self.pending_durable_bytes - existing.encoded.len;
             return retained_bytes <= max_pending_durable_bytes - encoded_len;
         }
@@ -725,16 +758,15 @@ pub const IncomingSourceGroupCache = struct {
             self.pending_durable_bytes <= max_pending_durable_bytes - encoded_len;
     }
 
-    fn enqueueEncodedDurableWrite(self: *@This(), durable_key: DurableKey, encoded: []u8) !void {
-        const slot = std.mem.readInt(u32, durable_key[durable_key_prefix.len..][0..@sizeOf(u32)], .big);
+    fn enqueueEncodedDurableWrite(self: *@This(), identity: [route_digest_len]u8, encoded: []u8) !void {
         platform_sync.lockYielding(&self.pending_mutex);
         defer self.pending_mutex.unlock();
-        if (self.closing) {
+        if (self.closing.load(.acquire)) {
             self.alloc.free(encoded);
             _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
             return;
         }
-        if (self.pending_durable.getPtr(slot)) |existing| {
+        if (self.pending_durable.getPtr(identity)) |existing| {
             const retained_bytes = self.pending_durable_bytes - existing.encoded.len;
             if (encoded.len > max_pending_durable_bytes or
                 retained_bytes > max_pending_durable_bytes - encoded.len)
@@ -745,7 +777,7 @@ pub const IncomingSourceGroupCache = struct {
             }
             self.pending_durable_bytes -= existing.encoded.len;
             self.alloc.free(existing.encoded);
-            existing.* = .{ .durable_key = durable_key, .encoded = encoded };
+            existing.* = .{ .identity = identity, .encoded = encoded };
             self.pending_durable_bytes += encoded.len;
             _ = self.durable_writes_coalesced.fetchAdd(1, .monotonic);
             return;
@@ -758,8 +790,8 @@ pub const IncomingSourceGroupCache = struct {
             _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
             return;
         }
-        self.pending_durable.putNoClobber(self.alloc, slot, .{
-            .durable_key = durable_key,
+        self.pending_durable.putNoClobber(self.alloc, identity, .{
+            .identity = identity,
             .encoded = encoded,
         }) catch |err| {
             self.alloc.free(encoded);
@@ -770,9 +802,11 @@ pub const IncomingSourceGroupCache = struct {
 
     const DurableFlushJob = struct {
         cache: *IncomingSourceGroupCache,
+        not_before_ns: u64 = 0,
 
         fn run(ptr: *anyopaque) anyerror!void {
             const job: *@This() = @ptrCast(@alignCast(ptr));
+            if (!job.cache.waitForDurableRetry(job.not_before_ns)) return;
             job.cache.flushPendingDurableWrites();
         }
 
@@ -783,10 +817,14 @@ pub const IncomingSourceGroupCache = struct {
     };
 
     fn scheduleDurableFlush(self: *@This()) void {
+        self.scheduleDurableFlushAt(0);
+    }
+
+    fn scheduleDurableFlushAt(self: *@This(), not_before_ns: u64) void {
         const lane = self.durable_jobs orelse return;
         if (lane.executesInline()) return;
         platform_sync.lockYielding(&self.pending_mutex);
-        if (self.closing or self.durable_flush_scheduled or self.pending_durable.count() == 0) {
+        if (self.closing.load(.acquire) or self.durable_flush_scheduled or self.pending_durable.count() == 0) {
             self.pending_mutex.unlock();
             return;
         }
@@ -800,25 +838,44 @@ pub const IncomingSourceGroupCache = struct {
             _ = self.durable_write_failures.fetchAdd(1, .monotonic);
             return;
         };
-        job.* = .{ .cache = self };
-        lane.submit(.{
+        job.* = .{ .cache = self, .not_before_ns = not_before_ns };
+        const submitted_job: background_runtime.Job = .{
             .owner_id = self.durable_job_owner_id,
             .class = .commit_durable,
             .ptr = job,
             .run = DurableFlushJob.run,
             .deinit = DurableFlushJob.deinit,
-        }) catch {
-            self.alloc.destroy(job);
-            platform_sync.lockYielding(&self.pending_mutex);
-            self.durable_flush_scheduled = false;
-            self.pending_mutex.unlock();
-            _ = self.durable_write_failures.fetchAdd(1, .monotonic);
         };
+        for (0..3) |attempt| {
+            lane.submit(submitted_job) catch {
+                if (attempt + 1 < 3) {
+                    _ = self.durable_write_retries.fetchAdd(1, .monotonic);
+                    continue;
+                }
+                self.alloc.destroy(job);
+                platform_sync.lockYielding(&self.pending_mutex);
+                self.durable_flush_scheduled = false;
+                self.pending_mutex.unlock();
+                _ = self.durable_write_failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            return;
+        }
+    }
+
+    fn waitForDurableRetry(self: *@This(), not_before_ns: u64) bool {
+        while (not_before_ns > 0) {
+            if (self.closing.load(.acquire)) return false;
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= not_before_ns) break;
+            platform_time.sleepNs(@min(not_before_ns - now_ns, durable_retry_poll_ns));
+        }
+        return !self.closing.load(.acquire);
     }
 
     fn flushPendingDurableWrites(self: *@This()) void {
         while (true) {
-            var slots: [max_durable_flush_entries]u32 = undefined;
+            var identities: [max_durable_flush_entries][route_digest_len]u8 = undefined;
             var writes: [max_durable_flush_entries]PendingDurableWrite = undefined;
             var count: usize = 0;
             var bytes: usize = 0;
@@ -828,7 +885,7 @@ pub const IncomingSourceGroupCache = struct {
             while (it.next()) |entry| {
                 const next_bytes = bytes +| entry.value_ptr.encoded.len;
                 if (count > 0 and next_bytes > max_durable_flush_bytes) break;
-                slots[count] = entry.key_ptr.*;
+                identities[count] = entry.key_ptr.*;
                 bytes = next_bytes;
                 count += 1;
                 if (count == max_durable_flush_entries) break;
@@ -839,54 +896,43 @@ pub const IncomingSourceGroupCache = struct {
                 // observes the current worker or schedules its successor;
                 // no write can be stranded in the handoff window.
                 self.durable_flush_scheduled = false;
+                self.durable_retry_round = 0;
                 self.pending_mutex.unlock();
                 return;
             }
-            for (slots[0..count], 0..) |slot, i| {
-                const removed = self.pending_durable.fetchRemove(slot) orelse unreachable;
+            for (identities[0..count], 0..) |identity, i| {
+                const removed = self.pending_durable.fetchRemove(identity) orelse unreachable;
                 writes[i] = removed.value;
                 self.pending_durable_bytes -= removed.value.encoded.len;
             }
             self.pending_mutex.unlock();
-            if (!self.persistEncodedDurableBatchWithRetry(writes[0..count])) {
-                self.requeueFailedDurableWrites(writes[0..count]);
+            self.persistEncodedDurableBatch(writes[0..count]) catch {
+                _ = self.durable_write_failures.fetchAdd(1, .monotonic);
+                const retry_at = self.requeueFailedDurableWrites(writes[0..count]);
+                if (retry_at) |deadline_ns| self.scheduleDurableFlushAt(deadline_ns);
                 return;
-            }
+            };
             for (writes[0..count]) |write| self.alloc.free(write.encoded);
             _ = self.durable_batches_committed.fetchAdd(1, .monotonic);
+            platform_sync.lockYielding(&self.pending_mutex);
+            self.durable_retry_round = 0;
+            self.pending_mutex.unlock();
         }
-    }
-
-    fn persistEncodedDurableBatchWithRetry(self: *@This(), writes: []const PendingDurableWrite) bool {
-        for (0..durable_flush_max_attempts) |attempt| {
-            self.persistEncodedDurableBatch(writes) catch {
-                if (attempt + 1 == durable_flush_max_attempts) {
-                    _ = self.durable_write_failures.fetchAdd(1, .monotonic);
-                    return false;
-                }
-                _ = self.durable_write_retries.fetchAdd(1, .monotonic);
-                platform_time.sleepNs(durable_flush_retry_base_ns << @intCast(attempt));
-                continue;
-            };
-            return true;
-        }
-        unreachable;
     }
 
     /// Return a failed batch to the bounded coalescer. A newer write for the
-    /// same slot wins, and queue limits remain hard even if producers filled
+    /// same logical identity wins, and queue limits remain hard if producers filled
     /// the capacity while persistence was in flight.
-    fn requeueFailedDurableWrites(self: *@This(), writes: []const PendingDurableWrite) void {
+    fn requeueFailedDurableWrites(self: *@This(), writes: []const PendingDurableWrite) ?u64 {
         platform_sync.lockYielding(&self.pending_mutex);
         defer self.pending_mutex.unlock();
         for (writes) |write| {
-            if (self.closing) {
+            if (self.closing.load(.acquire)) {
                 self.alloc.free(write.encoded);
                 _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
                 continue;
             }
-            const slot = std.mem.readInt(u32, write.durable_key[durable_key_prefix.len..][0..@sizeOf(u32)], .big);
-            if (self.pending_durable.contains(slot)) {
+            if (self.pending_durable.contains(write.identity)) {
                 self.alloc.free(write.encoded);
                 _ = self.durable_writes_coalesced.fetchAdd(1, .monotonic);
                 continue;
@@ -899,26 +945,123 @@ pub const IncomingSourceGroupCache = struct {
                 _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
                 continue;
             }
-            self.pending_durable.putNoClobber(self.alloc, slot, write) catch {
+            self.pending_durable.putNoClobber(self.alloc, write.identity, write) catch {
                 self.alloc.free(write.encoded);
                 _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
                 continue;
             };
             self.pending_durable_bytes += write.encoded.len;
         }
-        // Do not spin forever against a persistently unavailable store. The
-        // next read/write re-kicks this retained queue; deinit drains it once.
         self.durable_flush_scheduled = false;
+        if (self.closing.load(.acquire) or self.pending_durable.count() == 0) return null;
+        const shift: u6 = @intCast(@min(self.durable_retry_round, 9));
+        const exponential = @min(durable_retry_base_ns << shift, durable_retry_max_ns);
+        self.durable_retry_round +|= 1;
+        const jitter_span = @max(@as(u64, 1), exponential / 2);
+        const now_ns = platform_time.monotonicNs();
+        const delay_ns = exponential - exponential / 4 + (now_ns % jitter_span);
+        _ = self.durable_write_retries.fetchAdd(1, .monotonic);
+        return std.math.add(u64, now_ns, delay_ns) catch std.math.maxInt(u64);
     }
 
     fn persistEncodedDurableBatch(self: *@This(), writes: []const PendingDurableWrite) !void {
         const store = self.durable_store orelse return error.GraphIncomingRouteDirectoryUnavailable;
+        if (writes.len == 0) return;
+        const CandidateLookup = struct {
+            durable_key: DurableKey,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                return std.mem.order(u8, &lhs.durable_key, &rhs.durable_key) == .lt;
+            }
+        };
         platform_sync.lockYielding(&self.durable_mutex);
         defer self.durable_mutex.unlock();
         var batch = try store.beginBatch();
         errdefer batch.abort();
-        for (writes) |write| try batch.put(&write.durable_key, write.encoded);
+
+        const candidate_count = try std.math.mul(usize, writes.len, durable_candidate_count);
+        const lookups = try self.alloc.alloc(CandidateLookup, candidate_count);
+        defer self.alloc.free(lookups);
+        var lookup_count: usize = 0;
+        for (writes) |write| {
+            for (incomingRouteDurableKeys(write.identity)) |durable_key| {
+                lookups[lookup_count] = .{ .durable_key = durable_key };
+                lookup_count += 1;
+            }
+        }
+        std.mem.sort(CandidateLookup, lookups[0..lookup_count], {}, CandidateLookup.lessThan);
+
+        const read_keys = try self.alloc.alloc([]const u8, lookup_count);
+        defer self.alloc.free(read_keys);
+        var unique_count: usize = 0;
+        for (lookups[0..lookup_count]) |*lookup| {
+            if (unique_count > 0 and std.mem.eql(u8, read_keys[unique_count - 1], &lookup.durable_key)) continue;
+            read_keys[unique_count] = &lookup.durable_key;
+            unique_count += 1;
+        }
+        const read_values = try self.alloc.alloc(?[]const u8, unique_count);
+        defer self.alloc.free(read_values);
+        @memset(read_values, null);
+        try batch.getManySorted(read_keys[0..unique_count], read_values);
+
+        var existing_by_key = std.AutoHashMapUnmanaged(DurableKey, ?[]const u8).empty;
+        defer existing_by_key.deinit(self.alloc);
+        try existing_by_key.ensureTotalCapacity(self.alloc, @intCast(unique_count));
+        for (read_keys[0..unique_count], read_values) |read_key, read_value| {
+            var durable_key: DurableKey = undefined;
+            @memcpy(&durable_key, read_key);
+            existing_by_key.putAssumeCapacityNoClobber(durable_key, read_value);
+        }
+
+        var staged = std.AutoHashMapUnmanaged(DurableKey, []const u8).empty;
+        defer staged.deinit(self.alloc);
+        try staged.ensureTotalCapacity(self.alloc, @intCast(@min(candidate_count, durable_slot_count)));
+        var collision_evictions: u64 = 0;
+        for (writes) |write| {
+            const candidates = incomingRouteDurableKeys(write.identity);
+            var matching: ?usize = null;
+            var empty: ?usize = null;
+            for (candidates, 0..) |durable_key, candidate| {
+                const existing: ?[]const u8 = if (staged.get(durable_key)) |value|
+                    value
+                else
+                    existing_by_key.get(durable_key) orelse null;
+                const encoded = existing orelse {
+                    if (empty == null) empty = candidate;
+                    continue;
+                };
+                const stored_identity = durableValueIdentity(encoded) catch {
+                    _ = self.durable_read_failures.fetchAdd(1, .monotonic);
+                    if (empty == null) empty = candidate;
+                    continue;
+                };
+                if (std.mem.eql(u8, &stored_identity, &write.identity)) {
+                    matching = candidate;
+                    break;
+                }
+            }
+            const selected = matching orelse empty orelse blk: {
+                const raw = std.mem.readInt(u32, write.identity[16..20], .big);
+                collision_evictions += 1;
+                break :blk @as(usize, @intCast(raw % @as(u32, durable_candidate_count)));
+            };
+            try staged.put(self.alloc, candidates[selected], write.encoded);
+        }
+        var staged_it = staged.iterator();
+        while (staged_it.next()) |entry| try batch.put(entry.key_ptr, entry.value_ptr.*);
         try batch.commit();
+        if (collision_evictions > 0) _ = self.durable_collision_evictions.fetchAdd(collision_evictions, .monotonic);
+    }
+
+    fn durableValueIdentity(encoded: []const u8) ![route_digest_len]u8 {
+        if (encoded.len < durable_value_header_len or
+            !std.mem.eql(u8, encoded[0..durable_value_magic.len], durable_value_magic))
+        {
+            return error.CorruptGraphIncomingRouteDirectory;
+        }
+        var identity: [route_digest_len]u8 = undefined;
+        @memcpy(&identity, encoded[durable_value_magic.len..][0..route_digest_len]);
+        return identity;
     }
 
     fn clearLocked(self: *@This()) void {
@@ -981,12 +1124,15 @@ fn incomingRouteDurableIdentity(
     return digest;
 }
 
-fn incomingRouteDurableKey(identity: [std.crypto.hash.sha2.Sha256.digest_length]u8) IncomingSourceGroupCache.DurableKey {
-    const raw_slot = std.mem.readInt(u32, identity[0..@sizeOf(u32)], .big);
-    const slot = raw_slot & (IncomingSourceGroupCache.durable_slot_count - 1);
-    var out: IncomingSourceGroupCache.DurableKey = undefined;
-    @memcpy(out[0..IncomingSourceGroupCache.durable_key_prefix.len], IncomingSourceGroupCache.durable_key_prefix);
-    std.mem.writeInt(u32, out[IncomingSourceGroupCache.durable_key_prefix.len..][0..@sizeOf(u32)], slot, .big);
+fn incomingRouteDurableKeys(identity: [std.crypto.hash.sha2.Sha256.digest_length]u8) [IncomingSourceGroupCache.durable_candidate_count]IncomingSourceGroupCache.DurableKey {
+    var out: [IncomingSourceGroupCache.durable_candidate_count]IncomingSourceGroupCache.DurableKey = undefined;
+    for (&out, 0..) |*durable_key, candidate| {
+        const offset = candidate * @sizeOf(u32);
+        const raw_slot = std.mem.readInt(u32, identity[offset..][0..@sizeOf(u32)], .big);
+        const slot = raw_slot & (IncomingSourceGroupCache.durable_slot_count - 1);
+        @memcpy(durable_key[0..IncomingSourceGroupCache.durable_key_prefix.len], IncomingSourceGroupCache.durable_key_prefix);
+        std.mem.writeInt(u32, durable_key[IncomingSourceGroupCache.durable_key_prefix.len..][0..@sizeOf(u32)], slot, .big);
+    }
     return out;
 }
 
@@ -4024,6 +4170,7 @@ test "incoming graph route durable writes leave the query path" {
     const DeferredLane = struct {
         job: ?background_runtime.Job = null,
         fail_submissions: usize = 1,
+        submissions: usize = 0,
 
         fn lane(self: *@This()) background_runtime.DurableJobLane {
             return .{ .ptr = self, .vtable = &vtable };
@@ -4031,6 +4178,7 @@ test "incoming graph route durable writes leave the query path" {
 
         fn submit(ptr: *anyopaque, job: background_runtime.Job) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.submissions += 1;
             if (self.fail_submissions > 0) {
                 self.fail_submissions -= 1;
                 return error.TestTransientSubmissionFailure;
@@ -4083,15 +4231,17 @@ test "incoming graph route durable writes leave the query path" {
         }),
         .complete = true,
     });
-    try std.testing.expect(deferred.job == null);
+    try std.testing.expect(deferred.job != null);
+    try std.testing.expectEqual(@as(usize, 2), deferred.submissions);
     try std.testing.expectEqual(@as(usize, 1), cache.stats().pending_durable_entries);
-    try std.testing.expectEqual(@as(u64, 1), cache.stats().durable_write_failures);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats().durable_write_retries);
 
     var l1_hit = try cache.resolveAlloc(alloc, "docs", req);
     defer l1_hit.deinit(alloc);
     try std.testing.expect(l1_hit.complete);
     try std.testing.expectEqualSlices(u64, &.{22}, l1_hit.entries[0].source_group_ids);
     try std.testing.expect(deferred.job != null);
+    try std.testing.expectEqual(@as(usize, 2), deferred.submissions);
 
     try deferred.runPending();
     try std.testing.expectEqual(@as(usize, 0), cache.stats().pending_durable_entries);
@@ -4103,19 +4253,77 @@ test "incoming graph route durable writes leave the query path" {
     try std.testing.expectEqualSlices(u64, &.{22}, durable_hit.entries[0].source_group_ids);
 }
 
+test "incoming graph route durable persistence retries without request traffic" {
+    const alloc = std.testing.allocator;
+    const DeferredLane = struct {
+        job: ?background_runtime.Job = null,
+
+        fn lane(self: *@This()) background_runtime.DurableJobLane {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn submit(ptr: *anyopaque, job: background_runtime.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.job != null) return error.TestUnexpectedResult;
+            self.job = job;
+        }
+
+        fn drainOwner(_: *anyopaque, _: u64) void {}
+
+        fn closeOwner(ptr: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.runPending() catch @panic("deferred route job failed");
+        }
+
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+
+        fn runPending(self: *@This()) !void {
+            const job = self.job orelse return;
+            self.job = null;
+            defer job.deinit(job.ptr);
+            try job.run(job.ptr);
+        }
+
+        const vtable = background_runtime.DurableJobLane.VTable{
+            .submit = submit,
+            .drain_owner = drainOwner,
+            .close_owner = closeOwner,
+            .poll = poll,
+            .executes_inline = false,
+        };
+    };
+
+    var deferred = DeferredLane{};
+    var cache = IncomingSourceGroupCache.init(alloc);
+    defer cache.deinit();
+    cache.attachDurableJobLane(deferred.lane(), 1);
+    const identity = incomingRouteDurableIdentity("docs", "relations", "doc:a");
+    const encoded = try alloc.dupe(u8, "accepted-route-hint");
+    try cache.enqueueEncodedDurableWrite(identity, encoded);
+    cache.scheduleDurableFlush();
+    try deferred.runPending();
+
+    try std.testing.expect(deferred.job != null);
+    const snapshot = cache.stats();
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending_durable_entries);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.durable_write_failures);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.durable_write_retries);
+}
+
 test "incoming graph route durable failures retry boundedly and retain accepted hints" {
     const alloc = std.testing.allocator;
     var cache = IncomingSourceGroupCache.init(alloc);
     defer cache.deinit();
 
     const identity = incomingRouteDurableIdentity("docs", "relations", "doc:a");
-    const durable_key = incomingRouteDurableKey(identity);
     const encoded = try alloc.dupe(u8, "accepted-route-hint");
-    try cache.enqueueEncodedDurableWrite(durable_key, encoded);
+    try cache.enqueueEncodedDurableWrite(identity, encoded);
 
     cache.flushPendingDurableWrites();
     const snapshot = cache.stats();
-    try std.testing.expectEqual(@as(u64, IncomingSourceGroupCache.durable_flush_max_attempts - 1), snapshot.durable_write_retries);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.durable_write_retries);
     try std.testing.expectEqual(@as(u64, 1), snapshot.durable_write_failures);
     try std.testing.expectEqual(@as(u64, 0), snapshot.durable_writes_dropped);
     try std.testing.expectEqual(@as(usize, 1), snapshot.pending_durable_entries);
@@ -4225,10 +4433,9 @@ test "incoming graph route directory survives cache restart and replaces stale f
     try std.testing.expect(recreated_hit.complete);
     try std.testing.expectEqualSlices(u64, &.{33}, recreated_hit.entries[0].source_group_ids);
 
-    // These logical keys intentionally share the same 20-bit durable slot.
-    // The later observation may evict the earlier hint, but the full identity
-    // digest prevents a collision from ever becoming a false authoritative
-    // route.
+    // These logical keys intentionally share their primary durable candidate.
+    // Four independent bounded candidates preserve both hints without allowing
+    // a collision to become a false authoritative route.
     const collision_a_keys = [_][]const u8{"collision:724"};
     const collision_b_keys = [_][]const u8{"collision:1548"};
     var collision_a_req = newer_req;
@@ -4236,8 +4443,8 @@ test "incoming graph route directory survives cache restart and replaces stale f
     var collision_b_req = newer_req;
     collision_b_req.keys = &collision_b_keys;
     try std.testing.expectEqual(
-        incomingRouteDurableKey(incomingRouteDurableIdentity("docs", "relations", collision_a_keys[0])),
-        incomingRouteDurableKey(incomingRouteDurableIdentity("docs", "relations", collision_b_keys[0])),
+        incomingRouteDurableKeys(incomingRouteDurableIdentity("docs", "relations", collision_a_keys[0]))[0],
+        incomingRouteDurableKeys(incomingRouteDurableIdentity("docs", "relations", collision_b_keys[0]))[0],
     );
     try restarted.record("docs", collision_a_req, .{
         .entries = @constCast(&[_]IncomingSourceGroupEntry{
@@ -4252,9 +4459,10 @@ test "incoming graph route directory survives cache restart and replaces stale f
         .complete = true,
     });
     restarted.clear();
-    var collision_miss = try restarted.resolveAlloc(alloc, "docs", collision_a_req);
-    defer collision_miss.deinit(alloc);
-    try std.testing.expect(!collision_miss.complete);
+    var collision_a_hit = try restarted.resolveAlloc(alloc, "docs", collision_a_req);
+    defer collision_a_hit.deinit(alloc);
+    try std.testing.expect(collision_a_hit.complete);
+    try std.testing.expectEqualSlices(u64, &.{11}, collision_a_hit.entries[0].source_group_ids);
     var collision_hit = try restarted.resolveAlloc(alloc, "docs", collision_b_req);
     defer collision_hit.deinit(alloc);
     try std.testing.expect(collision_hit.complete);

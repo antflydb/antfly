@@ -2921,6 +2921,86 @@ test "multi-source sparse replay retains each artifact member" {
     try replay_batcher_mod.testSparseReplayPreservesMultipleArtifactMembers();
 }
 
+test "stale multi-source vector replay writes are source fenced" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "dense_source_v1",
+        .kind = .embedding,
+        .field = "body",
+        .expected_dims = 2,
+        .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"dense-test\",\"dimensions\":2}",
+    });
+    try db.addEnrichment(.{
+        .name = "sparse_source_v1",
+        .kind = .embedding,
+        .field = "body",
+        .producer_json = "{\"version\":1,\"provider\":\"antfly\",\"model\":\"sparse-test\"}",
+    });
+    try db.addIndex(.{
+        .name = "dense_union",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"sources\":[{\"artifact\":\"dense_source_v1\"}]}",
+    });
+    try db.addIndex(.{
+        .name = "sparse_union",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse_embedding\",\"sources\":[{\"artifact\":\"sparse_source_v1\"}]}",
+    });
+
+    const dense_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:authoritative", "dense_source_v1");
+    defer alloc.free(dense_artifact);
+    const sparse_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:authoritative", "sparse_source_v1");
+    defer alloc.free(sparse_artifact);
+    const foreign_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:stale", "retired_source_v1");
+    defer alloc.free(foreign_artifact);
+
+    const dense_stale = [_]derived_types.DerivedDenseEmbeddingWrite{
+        .{ .index_name = "dense_union", .doc_key = "doc:stale", .vector = &.{ 1, 0 } },
+        .{ .index_name = "dense_union", .doc_key = "doc:stale", .artifact_key = foreign_artifact, .vector = &.{ 1, 0 } },
+    };
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexBatchApplicability(
+        db.core.index_manager,
+        .{ .dense_embeddings = &dense_stale },
+        .{ .name = "dense_union", .kind = .dense_vector },
+    ));
+    const dense_writes = [_]derived_types.DerivedDenseEmbeddingWrite{
+        dense_stale[0],
+        dense_stale[1],
+        .{ .index_name = "dense_union", .doc_key = "doc:untrusted", .artifact_key = dense_artifact, .vector = &.{ 0, 1 } },
+    };
+    var collected_dense = try collectDenseEmbeddingWritesForBatch(alloc, db.core.index_manager, &dense_writes, &.{}, "dense_union");
+    defer collected_dense.deinit();
+    try std.testing.expectEqual(@as(usize, 1), collected_dense.writes.len);
+    try std.testing.expectEqualStrings("doc:authoritative", collected_dense.writes[0].doc_key);
+    try std.testing.expectEqual(@as(usize, 0), collected_dense.writes[0].vector.len);
+
+    const sparse_stale = [_]derived_types.DerivedSparseEmbeddingWrite{
+        .{ .index_name = "sparse_union", .doc_key = "doc:stale", .indices = &.{1}, .values = &.{1} },
+        .{ .index_name = "sparse_union", .doc_key = "doc:stale", .artifact_key = foreign_artifact, .indices = &.{1}, .values = &.{1} },
+    };
+    try std.testing.expectEqual(ManagedIndexBatchApplicability.irrelevant, managedIndexBatchApplicability(
+        db.core.index_manager,
+        .{ .sparse_embeddings = &sparse_stale },
+        .{ .name = "sparse_union", .kind = .sparse_vector },
+    ));
+    const sparse_writes = [_]derived_types.DerivedSparseEmbeddingWrite{
+        sparse_stale[0],
+        sparse_stale[1],
+        .{ .index_name = "sparse_union", .doc_key = "doc:untrusted", .artifact_key = sparse_artifact, .indices = &.{1}, .values = &.{1} },
+    };
+    var collected_sparse = try collectSparseEmbeddingWritesForBatch(alloc, db.core.index_manager, &sparse_writes, &.{}, "sparse_union");
+    defer collected_sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 1), collected_sparse.writes.len);
+    try std.testing.expectEqualStrings("doc:authoritative", collected_sparse.writes[0].doc_key);
+    try std.testing.expectEqual(@as(usize, 0), collected_sparse.writes[0].indices.len);
+}
+
 fn denseLsmWriteStatsSnapshot(ctx: *AsyncContext, index_name: []const u8) ?hbc_mod.LsmWriteStats {
     const entry = ctx.index_manager.denseIndex(index_name) orelse return null;
     return entry.index.snapshotLsmWriteStats();
@@ -41118,22 +41198,34 @@ fn managedIndexBatchApplicability(
         },
         .dense_vector => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
-            for (batch.documents) |doc| {
-                if (doc.action == .upsert) return .relevant;
+            const uses_artifact_members = index_manager.denseIndexUsesArtifactMembers(index_ref.name);
+            if (!uses_artifact_members) {
+                for (batch.documents) |doc| {
+                    if (doc.action == .upsert) return .relevant;
+                }
             }
             for (batch.dense_embeddings) |embedding| {
-                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return .relevant;
+                if (!std.mem.eql(u8, embedding.index_name, index_ref.name)) continue;
+                if (!uses_artifact_members) return .relevant;
+                const artifact_key = embedding.artifact_key orelse continue;
+                if (index_manager.denseIndexAcceptsArtifactKey(index_ref.name, artifact_key)) return .relevant;
             }
             if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
             return .irrelevant;
         },
         .sparse_vector => {
             if (batch.deleted_keys.len > 0 or batch.overwritten_doc_keys.len > 0) return .relevant;
-            for (batch.documents) |doc| {
-                if (doc.action == .upsert) return .relevant;
+            const uses_artifact_members = index_manager.sparseIndexUsesArtifactMembers(index_ref.name);
+            if (!uses_artifact_members) {
+                for (batch.documents) |doc| {
+                    if (doc.action == .upsert) return .relevant;
+                }
             }
             for (batch.sparse_embeddings) |embedding| {
-                if (std.mem.eql(u8, embedding.index_name, index_ref.name)) return .relevant;
+                if (!std.mem.eql(u8, embedding.index_name, index_ref.name)) continue;
+                if (!uses_artifact_members) return .relevant;
+                const artifact_key = embedding.artifact_key orelse continue;
+                if (index_manager.sparseIndexAcceptsArtifactKey(index_ref.name, artifact_key)) return .relevant;
             }
             if (batchHasEmbeddingArtifactForManagedIndex(index_manager, index_ref, batch.changed_artifact_keys)) return .relevant;
             return .irrelevant;
@@ -42142,8 +42234,25 @@ fn collectDenseEmbeddingWritesForBatch(
         filtered.deinit(alloc);
     }
 
+    const uses_artifact_members = index_manager.denseIndexUsesArtifactMembers(index_name);
+    const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .dense_vector };
     for (embeddings) |embedding| {
         if (!std.mem.eql(u8, embedding.index_name, index_name)) continue;
+        if (uses_artifact_members) {
+            const artifact_key = embedding.artifact_key orelse continue;
+            var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
+            var identity_transferred = false;
+            errdefer if (!identity_transferred) identity.deinit(alloc);
+            try filtered.append(alloc, .{
+                .index_name = @constCast(embedding.index_name),
+                .doc_key = identity.doc_key,
+                .parent_doc_key = identity.parent_doc_key,
+                .artifact_key = @constCast(artifact_key),
+                .vector = &.{},
+            });
+            identity_transferred = true;
+            continue;
+        }
         const doc_key = try alloc.dupe(u8, embedding.doc_key);
         errdefer alloc.free(doc_key);
         var parent_doc_key = if (embedding.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
@@ -42269,8 +42378,27 @@ fn collectSparseEmbeddingWritesForBatch(
         filtered.deinit(alloc);
     }
 
+    const uses_artifact_members = index_manager.sparseIndexUsesArtifactMembers(index_name);
+    const index_ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .sparse_vector };
     for (embeddings) |embedding| {
         if (!std.mem.eql(u8, embedding.index_name, index_name)) continue;
+        if (uses_artifact_members) {
+            const artifact_key = embedding.artifact_key orelse continue;
+            var identity = (try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, index_manager, index_ref, artifact_key)) orelse continue;
+            defer identity.deinit(alloc);
+            var doc_key = identity.doc_key;
+            try filtered.append(alloc, .{
+                .index_name = @constCast(embedding.index_name),
+                .doc_key = doc_key,
+                .artifact_key = @constCast(artifact_key),
+                .indices = &.{},
+                .values = &.{},
+            });
+            try owned_doc_keys.append(alloc, doc_key);
+            identity.doc_key = identity.doc_key[0..0];
+            doc_key = doc_key[0..0];
+            continue;
+        }
         try filtered.append(alloc, .{
             .index_name = @constCast(embedding.index_name),
             .doc_key = @constCast(embedding.doc_key),

@@ -8873,6 +8873,24 @@ pub const IndexManager = struct {
         return false;
     }
 
+    fn embeddingArtifactKeyMatchesAnySource(artifact_key: []const u8, embedding_names: []const []const u8) bool {
+        for (embedding_names) |embedding_name| {
+            if ((internal_keys.isEmbeddingArtifactKey(artifact_key) and internal_keys.matchesEmbeddingArtifactName(artifact_key, embedding_name)) or
+                (internal_keys.isDerivedEmbeddingArtifactKey(artifact_key) and internal_keys.matchesDerivedEmbeddingArtifactName(artifact_key, embedding_name))) return true;
+        }
+        return false;
+    }
+
+    pub fn denseIndexUsesArtifactMembers(self: *IndexManager, index_name: []const u8) bool {
+        const entry = self.denseIndex(index_name) orelse return false;
+        return entry.embedding_names.len > 0;
+    }
+
+    pub fn denseIndexAcceptsArtifactKey(self: *IndexManager, index_name: []const u8, artifact_key: []const u8) bool {
+        const entry = self.denseIndex(index_name) orelse return false;
+        return entry.embedding_names.len > 0 and embeddingArtifactKeyMatchesAnySource(artifact_key, entry.embedding_names);
+    }
+
     pub fn denseIndexConsumesEmbedding(self: *const IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
         for (self.dense_indexes.items) |*entry| {
             if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
@@ -9112,6 +9130,16 @@ pub const IndexManager = struct {
             if (std.mem.eql(u8, configured, embedding_name)) return true;
         }
         return false;
+    }
+
+    pub fn sparseIndexUsesArtifactMembers(self: *IndexManager, index_name: []const u8) bool {
+        const entry = self.sparseIndex(index_name) orelse return false;
+        return entry.embedding_names.len > 0;
+    }
+
+    pub fn sparseIndexAcceptsArtifactKey(self: *IndexManager, index_name: []const u8, artifact_key: []const u8) bool {
+        const entry = self.sparseIndex(index_name) orelse return false;
+        return entry.embedding_names.len > 0 and embeddingArtifactKeyMatchesAnySource(artifact_key, entry.embedding_names);
     }
 
     pub fn sparseIndexConsumesEmbedding(self: *const IndexManager, index_name: []const u8, embedding_name: []const u8) bool {
@@ -10350,9 +10378,28 @@ pub const IndexManager = struct {
         try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options);
     }
 
+    fn validateDenseEmbeddingWriteSources(entry: *const DenseIndex, writes: []const mapper.DenseEmbeddingWrite) !void {
+        if (entry.embedding_names.len == 0) return;
+        for (writes) |write| {
+            if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
+            const artifact_key = write.artifact_key orelse return error.InvalidEmbeddingArtifactSource;
+            if (!embeddingArtifactKeyMatchesAnySource(artifact_key, entry.embedding_names)) return error.InvalidEmbeddingArtifactSource;
+        }
+    }
+
+    fn validateSparseEmbeddingWriteSources(entry: *const SparseIndex, writes: []const mapper.SparseEmbeddingWrite) !void {
+        if (entry.embedding_names.len == 0) return;
+        for (writes) |write| {
+            if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
+            const artifact_key = write.artifact_key orelse return error.InvalidEmbeddingArtifactSource;
+            if (!embeddingArtifactKeyMatchesAnySource(artifact_key, entry.embedding_names)) return error.InvalidEmbeddingArtifactSource;
+        }
+    }
+
     pub fn validateDenseEmbeddingArtifactsByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const mapper.DenseEmbeddingWrite) !void {
         if (writes.len == 0) return;
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
+        try validateDenseEmbeddingWriteSources(entry, writes);
 
         const keep_write = try self.alloc.alloc(bool, writes.len);
         defer self.alloc.free(keep_write);
@@ -10401,6 +10448,8 @@ pub const IndexManager = struct {
 
     pub fn validateSparseEmbeddingArtifactsByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const mapper.SparseEmbeddingWrite) !void {
         if (writes.len == 0) return;
+        const entry = self.sparseIndex(index_name) orelse return error.IndexNotFound;
+        try validateSparseEmbeddingWriteSources(entry, writes);
 
         const PendingSparseArtifactValidationLoad = struct {
             doc_key: []const u8,
@@ -13876,7 +13925,7 @@ pub const IndexManager = struct {
             if (!keep_write[write_index]) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             if (write.vector.len == 0 and write.artifact_key == null) continue;
-            const member_key = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
+            const member_key = if (entry.embedding_names.len > 0) write.artifact_key.? else write.doc_key;
             if (prefetched_mapped_vector_ids) |mapped_vector_ids| {
                 if (mapped_vector_ids[write_index]) |mapped_vector_id| {
                     vector_ids_storage[filled] = mapped_vector_id;
@@ -15655,6 +15704,7 @@ pub const IndexManager = struct {
         writes: []const mapper.DenseEmbeddingWrite,
         batch_options: StoreBatchOptions,
     ) !void {
+        try validateDenseEmbeddingWriteSources(entry, writes);
         const keep_write = try self.alloc.alloc(bool, writes.len);
         defer self.alloc.free(keep_write);
         try computeDenseReplayKeepMask(self.alloc, writes, keep_write, entry.embedding_names.len > 0);
@@ -15735,7 +15785,10 @@ pub const IndexManager = struct {
         const ordinal_doc_keys = try self.alloc.alloc([]const u8, writes.len);
         defer self.alloc.free(ordinal_doc_keys);
         for (writes, 0..) |write, write_index| {
-            mapping_doc_keys[write_index] = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
+            mapping_doc_keys[write_index] = if (entry.embedding_names.len > 0 and std.mem.eql(u8, write.index_name, entry.config.name))
+                write.artifact_key.?
+            else
+                write.doc_key;
             ordinal_doc_keys[write_index] = write.parent_doc_key orelse write.doc_key;
         }
         const prefetched_ordinals = try doc_identity.lookupOrdinalsTxnAlloc(self.alloc, store_txn, ordinal_doc_keys);
@@ -15759,7 +15812,7 @@ pub const IndexManager = struct {
             for (writes, 0..) |write, write_index| {
                 if (!keep_write[write_index]) continue;
                 if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
-                const member_key = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
+                const member_key = if (entry.embedding_names.len > 0) write.artifact_key.? else write.doc_key;
 
                 if (write.vector.len > 0) {
                     if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
@@ -17872,6 +17925,7 @@ pub const IndexManager = struct {
     }
 
     fn applySparseEmbeddingWritesEntry(self: *IndexManager, store: *docstore_mod.DocStore, entry: *SparseIndex, writes: []const mapper.SparseEmbeddingWrite, batch_options: StoreBatchOptions) !void {
+        try validateSparseEmbeddingWriteSources(entry, writes);
         const PendingSparseArtifactLoad = struct {
             doc_key: []const u8,
             artifact_key: []const u8,
@@ -17911,7 +17965,7 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             const indices = write.indices;
             const values = write.values;
-            const member_key = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
+            const member_key = if (entry.embedding_names.len > 0) write.artifact_key.? else write.doc_key;
             if (write.artifact_key != null and indices.len == 0) {
                 try pending_artifact_loads.append(self.alloc, .{
                     .doc_key = member_key,
@@ -23374,6 +23428,20 @@ test "dense index unions multiple embedding artifact sources without overwriting
     try store.put(title_artifact, title_payload);
     try store.put(body_artifact, body_payload);
 
+    const foreign_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, doc_key, "foreign_dense_v1");
+    defer alloc.free(foreign_artifact);
+    try std.testing.expectError(error.InvalidEmbeddingArtifactSource, manager.applyDenseEmbeddingWritesByName(&store, "document_vectors", &.{.{
+        .index_name = @constCast("document_vectors"),
+        .doc_key = @constCast(doc_key),
+        .vector = @constCast(&[_]f32{ 1, 0, 0 }),
+    }}));
+    try std.testing.expectError(error.InvalidEmbeddingArtifactSource, manager.applyDenseEmbeddingWritesByName(&store, "document_vectors", &.{.{
+        .index_name = @constCast("document_vectors"),
+        .doc_key = @constCast(doc_key),
+        .artifact_key = foreign_artifact,
+        .vector = @constCast(&[_]f32{ 1, 0, 0 }),
+    }}));
+
     const writes = [_]mapper.DenseEmbeddingWrite{
         .{ .index_name = @constCast("document_vectors"), .doc_key = @constCast(doc_key), .artifact_key = @constCast(title_artifact), .vector = &.{} },
         .{ .index_name = @constCast("document_vectors"), .doc_key = @constCast(doc_key), .artifact_key = @constCast(body_artifact), .vector = &.{} },
@@ -23442,6 +23510,22 @@ test "sparse multi-source requests carry semantic producer identity" {
         try std.testing.expect(request.kind == .sparse_embedding);
         try std.testing.expectEqualStrings(producer_json, request.producer_json);
     }
+
+    const foreign_artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:multi", "foreign_sparse_v1");
+    defer alloc.free(foreign_artifact);
+    try std.testing.expectError(error.InvalidEmbeddingArtifactSource, manager.applySparseEmbeddingWritesByName(&store, "document_sparse", &.{.{
+        .index_name = @constCast("document_sparse"),
+        .doc_key = @constCast("doc:multi"),
+        .indices = @constCast(&[_]u32{1}),
+        .values = @constCast(&[_]f32{1}),
+    }}));
+    try std.testing.expectError(error.InvalidEmbeddingArtifactSource, manager.applySparseEmbeddingWritesByName(&store, "document_sparse", &.{.{
+        .index_name = @constCast("document_sparse"),
+        .doc_key = @constCast("doc:multi"),
+        .artifact_key = foreign_artifact,
+        .indices = @constCast(&[_]u32{1}),
+        .values = @constCast(&[_]f32{1}),
+    }}));
 }
 
 test "parseSparseConfig accepts external embedding indexes" {
