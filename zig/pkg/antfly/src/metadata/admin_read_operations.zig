@@ -58,8 +58,8 @@ pub const ActiveTransitions = struct {
     merge: []metadata_transition_state.MergeTransitionRecord,
 
     pub fn deinit(self: *ActiveTransitions, alloc: std.mem.Allocator) void {
-        alloc.free(self.split);
-        alloc.free(self.merge);
+        freeSplitTransitions(alloc, self.split);
+        freeMergeTransitions(alloc, self.merge);
         self.* = undefined;
     }
 };
@@ -137,11 +137,11 @@ pub const Operations = struct {
         defer self.source.freeSnapshot(&snapshot_value);
         var active = try metadata_admin.listActiveTransitions(alloc, &snapshot_value);
         defer metadata_admin.freeActiveTransitions(alloc, &active);
-        const split = try cloneValues(alloc, metadata_transition_state.SplitTransitionRecord, active.split);
-        errdefer alloc.free(split);
+        const split = try cloneSplitTransitionsOwned(alloc, active.split);
+        errdefer freeSplitTransitions(alloc, split);
         return .{
             .split = split,
-            .merge = try cloneValues(alloc, metadata_transition_state.MergeTransitionRecord, active.merge),
+            .merge = try cloneMergeTransitionsOwned(alloc, active.merge),
         };
     }
 
@@ -156,7 +156,7 @@ pub const Operations = struct {
         defer self.source.freeSnapshot(&snapshot_value);
         const refs = try metadata_admin.listTableRanges(alloc, &snapshot_value, table_id);
         defer metadata_admin.freeRangeRefs(alloc, refs);
-        return cloneValues(alloc, metadata_table_manager.RangeRecord, refs);
+        return cloneRangesOwned(alloc, refs);
     }
 
     pub fn groupPlacement(
@@ -170,7 +170,7 @@ pub const Operations = struct {
         defer self.source.freeSnapshot(&snapshot_value);
         const refs = try metadata_admin.listGroupPlacement(alloc, &snapshot_value, group_id);
         defer metadata_admin.freePlacementRefs(alloc, refs);
-        return cloneValues(alloc, raft_reconciler.PlacementIntent, refs);
+        return clonePlacementIntentsOwned(alloc, refs);
     }
 
     pub fn nodeShutdownStatus(
@@ -187,10 +187,92 @@ pub const Operations = struct {
     }
 };
 
-fn cloneValues(alloc: std.mem.Allocator, comptime T: type, refs: anytype) ![]T {
-    const out = try alloc.alloc(T, refs.len);
-    for (refs, 0..) |record, i| out[i] = record.*;
+fn cloneSplitTransitionsOwned(
+    alloc: std.mem.Allocator,
+    refs: []const *const metadata_transition_state.SplitTransitionRecord,
+) ![]metadata_transition_state.SplitTransitionRecord {
+    const out = try alloc.alloc(metadata_transition_state.SplitTransitionRecord, refs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| metadata_table_manager.freeSplitTransitionRecord(alloc, record);
+        alloc.free(out);
+    }
+    for (refs, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneSplitTransitionRecord(alloc, record.*);
+        initialized += 1;
+    }
     return out;
+}
+
+fn freeSplitTransitions(alloc: std.mem.Allocator, records: []metadata_transition_state.SplitTransitionRecord) void {
+    for (records) |record| metadata_table_manager.freeSplitTransitionRecord(alloc, record);
+    alloc.free(records);
+}
+
+fn cloneMergeTransitionsOwned(
+    alloc: std.mem.Allocator,
+    refs: []const *const metadata_transition_state.MergeTransitionRecord,
+) ![]metadata_transition_state.MergeTransitionRecord {
+    const out = try alloc.alloc(metadata_transition_state.MergeTransitionRecord, refs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| metadata_table_manager.freeMergeTransitionRecord(alloc, record);
+        alloc.free(out);
+    }
+    for (refs, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneMergeTransitionRecord(alloc, record.*);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeMergeTransitions(alloc: std.mem.Allocator, records: []metadata_transition_state.MergeTransitionRecord) void {
+    for (records) |record| metadata_table_manager.freeMergeTransitionRecord(alloc, record);
+    alloc.free(records);
+}
+
+fn cloneRangesOwned(
+    alloc: std.mem.Allocator,
+    refs: []const *const metadata_table_manager.RangeRecord,
+) ![]metadata_table_manager.RangeRecord {
+    const out = try alloc.alloc(metadata_table_manager.RangeRecord, refs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(out);
+    }
+    for (refs, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneRange(alloc, record.*);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn freeRanges(alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
+    for (records) |record| metadata_table_manager.freeRange(alloc, record);
+    alloc.free(records);
+}
+
+fn clonePlacementIntentsOwned(
+    alloc: std.mem.Allocator,
+    refs: []const *const raft_reconciler.PlacementIntent,
+) ![]raft_reconciler.PlacementIntent {
+    const out = try alloc.alloc(raft_reconciler.PlacementIntent, refs.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
+        alloc.free(out);
+    }
+    for (refs, 0..) |intent, i| {
+        out[i] = try raft_reconciler.cloneIntentOwned(alloc, intent.*);
+        initialized += 1;
+    }
+    return out;
+}
+
+pub fn freePlacementIntents(alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+    for (intents) |intent| raft_reconciler.freeIntentOwned(alloc, intent);
+    alloc.free(intents);
 }
 
 fn buildNodeShutdownStatus(
@@ -365,6 +447,367 @@ test "metadata admin read operations enforce cancellation and own aggregate resu
     try std.testing.expect(shutdown.safe_to_terminate);
     try std.testing.expectEqual(@as(usize, 1), source.snapshot_calls);
     try std.testing.expectEqual(@as(usize, 1), source.free_calls);
+}
+
+test "metadata admin active transitions own nested snapshot values" {
+    const FakeSource = struct {
+        const expected_split_key = "split-key";
+        const expected_source_range_end = "source-end";
+        const expected_split_rollback = "split-retry";
+        const expected_split_table_name = "split-docs";
+        const expected_split_schema = "{\"split\":true}";
+        const expected_split_indexes = "{\"split_index\":{}}";
+        const expected_merge_rollback = "merge-retry";
+        const expected_merge_table_name = "merge-docs";
+        const expected_merge_schema = "{\"merge\":true}";
+        const expected_merge_indexes = "{\"merge_index\":{}}";
+
+        split_key: [64]u8 = undefined,
+        source_range_end: [64]u8 = undefined,
+        split_rollback: [64]u8 = undefined,
+        split_table_name: [64]u8 = undefined,
+        split_schema: [64]u8 = undefined,
+        split_indexes: [64]u8 = undefined,
+        merge_rollback: [64]u8 = undefined,
+        merge_table_name: [64]u8 = undefined,
+        merge_schema: [64]u8 = undefined,
+        merge_indexes: [64]u8 = undefined,
+        split_transitions: [1]metadata_transition_state.SplitTransitionRecord = undefined,
+        merge_transitions: [1]metadata_transition_state.MergeTransitionRecord = undefined,
+        free_calls: usize = 0,
+
+        fn iface(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .head = head,
+                    .status = status,
+                    .admin_snapshot = snapshot,
+                    .free_admin_snapshot = freeSnapshot,
+                },
+            };
+        }
+
+        fn head(_: *anyopaque) !metadata_api.MetadataHead {
+            return .{ .metadata_group_id = 1 };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            @memcpy(self.split_key[0..expected_split_key.len], expected_split_key);
+            @memcpy(self.source_range_end[0..expected_source_range_end.len], expected_source_range_end);
+            @memcpy(self.split_rollback[0..expected_split_rollback.len], expected_split_rollback);
+            @memcpy(self.split_table_name[0..expected_split_table_name.len], expected_split_table_name);
+            @memcpy(self.split_schema[0..expected_split_schema.len], expected_split_schema);
+            @memcpy(self.split_indexes[0..expected_split_indexes.len], expected_split_indexes);
+            @memcpy(self.merge_rollback[0..expected_merge_rollback.len], expected_merge_rollback);
+            @memcpy(self.merge_table_name[0..expected_merge_table_name.len], expected_merge_table_name);
+            @memcpy(self.merge_schema[0..expected_merge_schema.len], expected_merge_schema);
+            @memcpy(self.merge_indexes[0..expected_merge_indexes.len], expected_merge_indexes);
+            self.split_transitions[0] = .{
+                .transition_id = 101,
+                .attempt_epoch = 3,
+                .source_group_id = 52,
+                .destination_group_id = 53,
+                .phase = .replay_deltas,
+                .split_key = self.split_key[0..expected_split_key.len],
+                .source_range_end = self.source_range_end[0..expected_source_range_end.len],
+                .rollback_reason = self.split_rollback[0..expected_split_rollback.len],
+                .table_contract = .{
+                    .table_id = 51,
+                    .table_name = self.split_table_name[0..expected_split_table_name.len],
+                    .schema_json = self.split_schema[0..expected_split_schema.len],
+                    .indexes_json = self.split_indexes[0..expected_split_indexes.len],
+                    .source_identity = .{ .shard_id = 52, .range_id = 52 },
+                    .target_identity = .{ .shard_id = 52, .range_id = 52 },
+                },
+            };
+            self.merge_transitions[0] = .{
+                .transition_id = 201,
+                .donor_group_id = 61,
+                .receiver_group_id = 62,
+                .phase = .finalizing,
+                .rollback_reason = self.merge_rollback[0..expected_merge_rollback.len],
+                .allow_doc_identity_reassignment = true,
+                .table_contract = .{
+                    .table_id = 60,
+                    .table_name = self.merge_table_name[0..expected_merge_table_name.len],
+                    .schema_json = self.merge_schema[0..expected_merge_schema.len],
+                    .indexes_json = self.merge_indexes[0..expected_merge_indexes.len],
+                    .source_identity = .{ .shard_id = 61, .range_id = 61 },
+                    .target_identity = .{ .shard_id = 62, .range_id = 62 },
+                },
+            };
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &self.split_transitions,
+                .merge_transitions = &self.merge_transitions,
+            };
+        }
+
+        fn freeSnapshot(ptr: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.free_calls += 1;
+            @memset(&self.split_key, '!');
+            @memset(&self.source_range_end, '!');
+            @memset(&self.split_rollback, '!');
+            @memset(&self.split_table_name, '!');
+            @memset(&self.split_schema, '!');
+            @memset(&self.split_indexes, '!');
+            @memset(&self.merge_rollback, '!');
+            @memset(&self.merge_table_name, '!');
+            @memset(&self.merge_schema, '!');
+            @memset(&self.merge_indexes, '!');
+        }
+    };
+
+    var source = FakeSource{};
+    const operations = Operations{ .source = source.iface() };
+    var active = try operations.activeTransitions(std.testing.allocator, .{});
+    defer active.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), source.free_calls);
+    try std.testing.expectEqual(@as(usize, 1), active.split.len);
+    try std.testing.expectEqual(@as(usize, 1), active.merge.len);
+    try std.testing.expectEqualStrings(FakeSource.expected_split_key, active.split[0].split_key orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings(FakeSource.expected_source_range_end, active.split[0].source_range_end orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings(FakeSource.expected_split_rollback, active.split[0].rollback_reason orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings(FakeSource.expected_split_table_name, active.split[0].table_contract.table_name);
+    try std.testing.expectEqualStrings(FakeSource.expected_split_schema, active.split[0].table_contract.schema_json);
+    try std.testing.expectEqualStrings(FakeSource.expected_split_indexes, active.split[0].table_contract.indexes_json);
+    try std.testing.expectEqualStrings(FakeSource.expected_merge_rollback, active.merge[0].rollback_reason orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings(FakeSource.expected_merge_table_name, active.merge[0].table_contract.table_name);
+    try std.testing.expectEqualStrings(FakeSource.expected_merge_schema, active.merge[0].table_contract.schema_json);
+    try std.testing.expectEqualStrings(FakeSource.expected_merge_indexes, active.merge[0].table_contract.indexes_json);
+}
+
+test "metadata admin table ranges own nested snapshot values" {
+    const FakeSource = struct {
+        const expected_start_key = "range-a";
+        const expected_end_key = "range-z";
+        const expected_backup_id = "restore-table-52";
+        const expected_artifact_backup_id = "restore-artifact-52";
+        const expected_location = "s3://backups/restore-52";
+        const expected_snapshot_path = "restore-52/group-52.afb";
+        const expected_connection = "backup-store";
+        const expected_artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        start_key: [64]u8 = undefined,
+        end_key: [64]u8 = undefined,
+        backup_id: [64]u8 = undefined,
+        artifact_backup_id: [64]u8 = undefined,
+        location: [64]u8 = undefined,
+        snapshot_path: [64]u8 = undefined,
+        connection: [64]u8 = undefined,
+        artifact_sha256: [64]u8 = undefined,
+        ranges: [1]metadata_table_manager.RangeRecord = undefined,
+        free_calls: usize = 0,
+
+        fn iface(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .head = head,
+                    .status = status,
+                    .admin_snapshot = snapshot,
+                    .free_admin_snapshot = freeSnapshot,
+                },
+            };
+        }
+
+        fn head(_: *anyopaque) !metadata_api.MetadataHead {
+            return .{ .metadata_group_id = 1 };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            @memcpy(self.start_key[0..expected_start_key.len], expected_start_key);
+            @memcpy(self.end_key[0..expected_end_key.len], expected_end_key);
+            @memcpy(self.backup_id[0..expected_backup_id.len], expected_backup_id);
+            @memcpy(self.artifact_backup_id[0..expected_artifact_backup_id.len], expected_artifact_backup_id);
+            @memcpy(self.location[0..expected_location.len], expected_location);
+            @memcpy(self.snapshot_path[0..expected_snapshot_path.len], expected_snapshot_path);
+            @memcpy(self.connection[0..expected_connection.len], expected_connection);
+            @memcpy(self.artifact_sha256[0..expected_artifact_sha256.len], expected_artifact_sha256);
+            self.ranges[0] = .{
+                .group_id = 52,
+                .range_id = 53,
+                .table_id = 51,
+                .start_key = self.start_key[0..expected_start_key.len],
+                .end_key = self.end_key[0..expected_end_key.len],
+                .restore_backup_id = self.backup_id[0..expected_backup_id.len],
+                .restore_artifact_backup_id = self.artifact_backup_id[0..expected_artifact_backup_id.len],
+                .restore_location = self.location[0..expected_location.len],
+                .restore_snapshot_path = self.snapshot_path[0..expected_snapshot_path.len],
+                .restore_connection = self.connection[0..expected_connection.len],
+                .restore_artifact_size_bytes = 1924,
+                .restore_artifact_sha256 = self.artifact_sha256[0..expected_artifact_sha256.len],
+            };
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &self.ranges,
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeSnapshot(ptr: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.free_calls += 1;
+            @memset(&self.start_key, '!');
+            @memset(&self.end_key, '!');
+            @memset(&self.backup_id, '!');
+            @memset(&self.artifact_backup_id, '!');
+            @memset(&self.location, '!');
+            @memset(&self.snapshot_path, '!');
+            @memset(&self.connection, '!');
+            @memset(&self.artifact_sha256, '!');
+        }
+    };
+
+    var source = FakeSource{};
+    const operations = Operations{ .source = source.iface() };
+    const ranges = try operations.tableRanges(std.testing.allocator, .{}, 51);
+    defer freeRanges(std.testing.allocator, ranges);
+
+    try std.testing.expectEqual(@as(usize, 1), source.free_calls);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqualStrings(FakeSource.expected_start_key, ranges[0].start_key);
+    try std.testing.expectEqualStrings(FakeSource.expected_end_key, ranges[0].end_key orelse return error.TestExpectedEqual);
+    try std.testing.expectEqualStrings(FakeSource.expected_backup_id, ranges[0].restore_backup_id);
+    try std.testing.expectEqualStrings(FakeSource.expected_artifact_backup_id, ranges[0].restore_artifact_backup_id);
+    try std.testing.expectEqualStrings(FakeSource.expected_location, ranges[0].restore_location);
+    try std.testing.expectEqualStrings(FakeSource.expected_snapshot_path, ranges[0].restore_snapshot_path);
+    try std.testing.expectEqualStrings(FakeSource.expected_connection, ranges[0].restore_connection);
+    try std.testing.expectEqualStrings(FakeSource.expected_artifact_sha256, ranges[0].restore_artifact_sha256);
+}
+
+test "metadata admin group placement owns nested snapshot values" {
+    const FakeSource = struct {
+        const expected_backup_id = "restore-table-52";
+        const expected_artifact_backup_id = "restore-artifact-52";
+        const expected_location = "s3://backups/restore-52";
+        const expected_snapshot_path = "restore-52/group-52.afb";
+        const expected_connection = "backup-store";
+        const expected_artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        backup_id: [64]u8 = undefined,
+        artifact_backup_id: [64]u8 = undefined,
+        location: [64]u8 = undefined,
+        snapshot_path: [64]u8 = undefined,
+        connection: [64]u8 = undefined,
+        artifact_sha256: [64]u8 = undefined,
+        peer_node_ids: [3]u64 = .{ 3, 1, 2 },
+        learner_node_ids: [1]u64 = .{4},
+        placement_intents: [1]raft_reconciler.PlacementIntent = undefined,
+        free_calls: usize = 0,
+
+        fn iface(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .head = head,
+                    .status = status,
+                    .admin_snapshot = snapshot,
+                    .free_admin_snapshot = freeSnapshot,
+                },
+            };
+        }
+
+        fn head(_: *anyopaque) !metadata_api.MetadataHead {
+            return .{ .metadata_group_id = 1 };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            @memcpy(self.backup_id[0..expected_backup_id.len], expected_backup_id);
+            @memcpy(self.artifact_backup_id[0..expected_artifact_backup_id.len], expected_artifact_backup_id);
+            @memcpy(self.location[0..expected_location.len], expected_location);
+            @memcpy(self.snapshot_path[0..expected_snapshot_path.len], expected_snapshot_path);
+            @memcpy(self.connection[0..expected_connection.len], expected_connection);
+            @memcpy(self.artifact_sha256[0..expected_artifact_sha256.len], expected_artifact_sha256);
+            self.peer_node_ids = .{ 3, 1, 2 };
+            self.learner_node_ids = .{4};
+            self.placement_intents[0] = .{
+                .record = .{
+                    .group_id = 52,
+                    .replica_id = 2,
+                    .local_node_id = 1,
+                    .metadata_version = 19,
+                    .backup_restore_bootstrap = .{
+                        .backup_id = self.backup_id[0..expected_backup_id.len],
+                        .artifact_backup_id = self.artifact_backup_id[0..expected_artifact_backup_id.len],
+                        .location = self.location[0..expected_location.len],
+                        .snapshot_path = self.snapshot_path[0..expected_snapshot_path.len],
+                        .connection = self.connection[0..expected_connection.len],
+                        .artifact_size_bytes = 1924,
+                        .artifact_sha256 = self.artifact_sha256[0..expected_artifact_sha256.len],
+                    },
+                },
+                .store_id = 1,
+                .peer_node_ids = &self.peer_node_ids,
+                .learner_node_ids = &self.learner_node_ids,
+            };
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &self.placement_intents,
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeSnapshot(ptr: *anyopaque, _: *metadata_api.AdminSnapshot) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.free_calls += 1;
+            @memset(&self.backup_id, '!');
+            @memset(&self.artifact_backup_id, '!');
+            @memset(&self.location, '!');
+            @memset(&self.snapshot_path, '!');
+            @memset(&self.connection, '!');
+            @memset(&self.artifact_sha256, '!');
+            @memset(&self.peer_node_ids, 99);
+            @memset(&self.learner_node_ids, 99);
+        }
+    };
+
+    var source = FakeSource{};
+    const operations = Operations{ .source = source.iface() };
+    const placements = try operations.groupPlacement(std.testing.allocator, .{}, 52);
+    defer freePlacementIntents(std.testing.allocator, placements);
+
+    try std.testing.expectEqual(@as(usize, 1), source.free_calls);
+    try std.testing.expectEqual(@as(usize, 1), placements.len);
+    const restore = placements[0].record.backup_restore_bootstrap orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings(FakeSource.expected_backup_id, restore.backup_id);
+    try std.testing.expectEqualStrings(FakeSource.expected_artifact_backup_id, restore.artifact_backup_id);
+    try std.testing.expectEqualStrings(FakeSource.expected_location, restore.location);
+    try std.testing.expectEqualStrings(FakeSource.expected_snapshot_path, restore.snapshot_path);
+    try std.testing.expectEqualStrings(FakeSource.expected_connection, restore.connection);
+    try std.testing.expectEqualStrings(FakeSource.expected_artifact_sha256, restore.artifact_sha256);
+    try std.testing.expectEqualSlices(u64, &.{ 3, 1, 2 }, placements[0].peer_node_ids);
+    try std.testing.expectEqualSlices(u64, &.{4}, placements[0].learner_node_ids);
 }
 
 test "metadata admin linearizable snapshot propagates request context" {

@@ -1393,14 +1393,14 @@ pub const MetadataHttpServer = struct {
     fn metadataTableRanges(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const table_id = numericParam(ctx, "table_id", true) catch |err| return metadataReadError(ctx, err);
         const records = self.readOperations().tableRanges(ctx.allocator, requestContext(ctx), table_id) catch |err| return metadataReadError(ctx, err);
-        defer ctx.allocator.free(records);
+        defer admin_read_operations.freeRanges(ctx.allocator, records);
         return self.trackedJson(ctx, records);
     }
 
     fn metadataGroupPlacement(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
         const group_id = numericParam(ctx, "group_id", true) catch |err| return metadataReadError(ctx, err);
         const records = self.readOperations().groupPlacement(ctx.allocator, requestContext(ctx), group_id) catch |err| return metadataReadError(ctx, err);
-        defer ctx.allocator.free(records);
+        defer admin_read_operations.freePlacementIntents(ctx.allocator, records);
         return self.trackedJson(ctx, records);
     }
 
