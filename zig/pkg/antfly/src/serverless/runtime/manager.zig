@@ -56,6 +56,25 @@ pub const RuntimeRunStats = struct {
     work_lease_takeovers: usize = 0,
 };
 
+pub const RuntimeWorkKind = enum {
+    publish_round,
+    enrichment_round,
+    compaction_round,
+    prune_round,
+};
+
+/// Optional production-neutral operation-cost boundary. Native runtimes leave
+/// it unset; deterministic embedders can charge logical service time through
+/// the same borrowed `std.Io` that owns the workflow.
+pub const RuntimeWorkCostPort = struct {
+    ptr: *anyopaque,
+    charge_fn: *const fn (ptr: *anyopaque, kind: RuntimeWorkKind, units: u64) anyerror!void,
+
+    pub fn charge(self: @This(), kind: RuntimeWorkKind, units: u64) !void {
+        try self.charge_fn(self.ptr, kind, units);
+    }
+};
+
 pub const ManagedRuntime = struct {
     alloc: Allocator,
     io: std.Io,
@@ -77,6 +96,7 @@ pub const ManagedRuntime = struct {
     work_lease_provider: ?build_mod.work_lease.Provider = null,
     work_lease_owner_id: ?[]u8 = null,
     work_lease_ttl_ns: u64 = 30 * std.time.ns_per_s,
+    work_cost_port: ?RuntimeWorkCostPort = null,
 
     pub fn init(
         alloc: Allocator,
@@ -175,6 +195,7 @@ pub const ManagedRuntime = struct {
 
         var stats = RuntimeRunStats{};
         if (self.cfg.publish_enabled) {
+            try self.chargeWork(.publish_round, 1);
             const publish_stats = try self.publisher.runOnceUntil(&self.stop_requested);
             stats.published_namespaces = publish_stats.published_namespaces;
             stats.publish_head_conflicts = publish_stats.head_conflicts;
@@ -258,6 +279,7 @@ pub const ManagedRuntime = struct {
                     };
 
                     if (can_enrich) {
+                        try self.chargeWork(.enrichment_round, 1);
                         const enrichment_cancellation = if (held_enrichment_lease) |*lease|
                             lease.cancellation(self.cancellationToken())
                         else
@@ -326,6 +348,7 @@ pub const ManagedRuntime = struct {
                             lease.cancellation(self.cancellationToken())
                         else
                             self.cancellationToken();
+                        try self.chargeWork(.compaction_round, 1);
                         var compacted = compactor.compactHeadGuardedUntil(
                             namespace.name,
                             publication_guard,
@@ -350,6 +373,7 @@ pub const ManagedRuntime = struct {
 
             if (self.cfg.prune_enabled) {
                 try self.cancellationCheckpoint();
+                try self.chargeWork(.prune_round, 1);
                 var result = self.pruner.pruneNamespaceUntil(
                     namespace.name,
                     policy.keep_latest_versions,
@@ -383,6 +407,14 @@ pub const ManagedRuntime = struct {
 
     pub fn setEnricher(self: *ManagedRuntime, enricher: enrichment_mod.SparseEnricher) void {
         self.enricher = enricher;
+    }
+
+    pub fn setWorkCostPort(self: *ManagedRuntime, port: ?RuntimeWorkCostPort) void {
+        self.work_cost_port = port;
+    }
+
+    fn chargeWork(self: *ManagedRuntime, kind: RuntimeWorkKind, units: u64) !void {
+        if (self.work_cost_port) |port| try port.charge(kind, units);
     }
 
     pub fn configureWorkLease(

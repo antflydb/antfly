@@ -30,6 +30,7 @@ const search_sources = @import("../serverless/search_sources.zig");
 const serverless_http_server = @import("../serverless_http_server.zig");
 const serverless_http_client = @import("../serverless_http_client.zig");
 const io_http_executor = @import("../common/http/io_http_executor.zig");
+const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "serverless-workflow-production-recovery";
@@ -890,6 +891,129 @@ pub const Scenario = struct {
         return world.state.complete;
     }
 };
+
+test "serverless workflow service rates compose and heal across publish and compaction" {
+    var alloc_state: VoprTestAllocator = .init;
+    defer _ = alloc_state.deinit();
+    const alloc = alloc_state.allocator();
+    const fixture = try Scenario.Fixture.init(alloc);
+    defer fixture.deinit();
+
+    const node = vopr.service_rate.Node{
+        .id = vopr.id.stable(Scenario.name, "service-node.worker-primary"),
+        .name = Scenario.name ++ ".service-node.worker-primary",
+    };
+    const operations = [_]vopr.service_rate.Operation{
+        vopr.service_rate.Operation.named(Scenario.name ++ ".publish-round", 10),
+        vopr.service_rate.Operation.named(Scenario.name ++ ".enrichment-round", 30),
+        vopr.service_rate.Operation.named(Scenario.name ++ ".compaction-round", 20),
+        vopr.service_rate.Operation.named(Scenario.name ++ ".prune-round", 40),
+    };
+    const node_fault_id = vopr.id.stable(Scenario.name, "service-rate.node-slowdown");
+    const publish_fault_id = vopr.id.stable(Scenario.name, "service-rate.publish-slowdown");
+    var model = try vopr.service_rate.Model.init(alloc, &.{node}, &operations);
+    defer model.deinit();
+    try model.activate(.{
+        .fault_id = node_fault_id,
+        .node_id = node.id,
+        .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+    });
+    try model.activate(.{
+        .fault_id = publish_fault_id,
+        .node_id = node.id,
+        .operation_id = operations[0].id,
+        .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+    });
+
+    const Adapter = struct {
+        model: *vopr.service_rate.Model,
+        port: vopr.service_rate.Port,
+        operation_ids: [4]vopr.id.StableId,
+        node_fault_id: vopr.id.StableId,
+        publish_fault_id: vopr.id.StableId,
+        heal_stage: u8 = 0,
+        charges: [4]u64 = .{ 0, 0, 0, 0 },
+
+        fn iface(self: *@This()) runtime_manager.RuntimeWorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, kind: runtime_manager.RuntimeWorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const index: usize = switch (kind) {
+                .publish_round => 0,
+                .enrichment_round => 1,
+                .compaction_round => 2,
+                .prune_round => 3,
+            };
+            _ = try self.port.charge(self.operation_ids[index], units);
+            self.charges[index] += units;
+            if (kind != .publish_round) return;
+            switch (self.heal_stage) {
+                0 => {
+                    try self.model.heal(self.publish_fault_id);
+                    self.heal_stage = 1;
+                },
+                1 => {
+                    try self.model.heal(self.node_fault_id);
+                    self.heal_stage = 2;
+                },
+                else => {},
+            }
+        }
+    };
+    var adapter = Adapter{
+        .model = &model,
+        .port = try model.port(fixture.sim.io(), node.id),
+        .operation_ids = .{ operations[0].id, operations[1].id, operations[2].id, operations[3].id },
+        .node_fault_id = node_fault_id,
+        .publish_fault_id = publish_fault_id,
+    };
+    fixture.runtime.setWorkCostPort(adapter.iface());
+    defer fixture.runtime.setWorkCostPort(null);
+
+    var done = false;
+    var failure: ?anyerror = null;
+    const Task = struct {
+        fn run(target: *Scenario.Fixture, completed: *bool, task_failure: *?anyerror) void {
+            target.runMode(.clean) catch |err| {
+                task_failure.* = err;
+            };
+            completed.* = true;
+        }
+    };
+    const io = fixture.sim.io();
+    _ = io.async(Task.run, .{ fixture, &done, &failure });
+
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    var transitions: usize = 0;
+    while (!fixture.sim.scheduler().quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try fixture.sim.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprServerlessServiceRateDeadlock;
+        try fixture.sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+        transitions += 1;
+        if (transitions > 10_000) return error.VoprServerlessServiceRateTransitionBudgetExceeded;
+    }
+
+    try std.testing.expect(done);
+    if (failure) |err| return err;
+    try std.testing.expect(fixture.cleanWorkflowVisible());
+    try std.testing.expectEqual(@as(u8, 2), adapter.heal_stage);
+    try std.testing.expectEqual(@as(u64, 2), adapter.charges[0]);
+    try std.testing.expectEqual(@as(u64, 0), adapter.charges[1]);
+    try std.testing.expectEqual(@as(u64, 1), adapter.charges[2]);
+    try std.testing.expectEqual(@as(u64, 0), adapter.charges[3]);
+    const usage = try model.nodeUsage(node.id);
+    try std.testing.expectEqual(@as(u64, 3), usage.operations);
+    try std.testing.expectEqual(@as(u64, 80), usage.charged_ns);
+    try std.testing.expectEqual(@as(usize, 0), model.active.items.len);
+    try fixture.sim.ensureNoCapabilityViolation();
+}
 
 test "complete serverless workflow VOPR exact replays claim build compact publish and recovery" {
     const backend_ids = vopr.vopr_io.artifactBackendIds();

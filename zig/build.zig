@@ -7158,7 +7158,10 @@ pub fn build(b: *std.Build) void {
 
     const serverless_workflow_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"complete serverless workflow VOPR exact replays"},
+        .filters = &.{
+            "serverless workflow service rates compose and heal across publish and compaction",
+            "complete serverless workflow VOPR exact replays",
+        },
     });
     const run_serverless_workflow_vopr_tests = b.addRunArtifact(serverless_workflow_vopr_tests);
     const serverless_workflow_vopr_test_step = b.step(
