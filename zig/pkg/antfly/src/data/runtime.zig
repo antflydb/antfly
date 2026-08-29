@@ -3478,6 +3478,25 @@ pub const DataRequestLifecycleHook = struct {
     }
 };
 
+/// Production-neutral logical work boundary. Deterministic runtimes can model
+/// reversible per-node service rates without making DataServer depend on VOPR;
+/// native runtimes leave the port unset and retain their ordinary pacing.
+pub const DataServerWorkKind = enum {
+    raft_round,
+};
+
+pub const DataServerWorkCostPort = struct {
+    ptr: *anyopaque,
+    charge_fn: *const fn (ptr: *anyopaque, kind: DataServerWorkKind, units: u64) anyerror!void,
+
+    /// DataServer may call this from a concurrent production progress owner;
+    /// implementations that are not scheduler-confined must synchronize their
+    /// own accounting and effect state.
+    pub fn charge(self: DataServerWorkCostPort, kind: DataServerWorkKind, units: u64) !void {
+        try self.charge_fn(self.ptr, kind, units);
+    }
+};
+
 pub const DataServerConfig = struct {
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 0,
@@ -3508,6 +3527,9 @@ pub const DataServerConfig = struct {
     /// host filesystem containing their backing image.
     capacity_source: ?resource_manager_mod.CapacitySource = null,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
+    /// Optional caller-owned logical work model. The port must outlive the
+    /// DataServer and may suspend on the server's borrowed `std.Io`.
+    work_cost_port: ?DataServerWorkCostPort = null,
     /// Optional transport-neutral metadata executors. Supplying these lets a
     /// deterministic runtime drive the real DataServer without constructing a
     /// host-backed StdHttpExecutor. Executor contexts must outlive DataServer.
@@ -5107,6 +5129,7 @@ pub const DataServer = struct {
     ha_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     ha_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
     query_async_limit: std.Io.Limit,
+    work_cost_port: ?DataServerWorkCostPort = null,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -5335,6 +5358,7 @@ pub const DataServer = struct {
             .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
+            .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
@@ -5379,6 +5403,7 @@ pub const DataServer = struct {
             .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
+            .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
@@ -5423,6 +5448,7 @@ pub const DataServer = struct {
             .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .ha_primary_sync_wait = haPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
+            .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
         };
@@ -6833,6 +6859,7 @@ pub const DataServer = struct {
     /// in the control round cannot starve elections, heartbeats, or apply.
     pub fn runRaftRoundOnly(self: *DataServer) !void {
         if (self.data_raft) |raft| {
+            if (self.work_cost_port) |port| try port.charge(.raft_round, 1);
             lockAtomic(&self.data_raft_mutex);
             defer self.data_raft_mutex.unlock();
             try raft.runRound();
@@ -16494,6 +16521,7 @@ pub const DataServer = struct {
             .ha_cfg = cfg.ha,
             .ha_ingress_started_as_standby = if (cfg.ha.admin_context) |ctx| ctx.standby != null else false,
             .query_async_limit = cfg.query_async_limit,
+            .work_cost_port = cfg.work_cost_port,
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .listener_cfg = publicApiListenerConfig(cfg.bind_host, cfg.bind_port),
@@ -30953,6 +30981,47 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     defer sim.deinit();
     const io = sim.io();
 
+    const raft_round_operation = vopr.service_rate.Operation.named(
+        "data-runtime-vopr.raft-round",
+        100 * std.time.ns_per_us,
+    );
+    const service_nodes = [_]vopr.service_rate.Node{
+        .{ .id = vopr.id.stable("data-runtime-vopr", "node.1"), .name = "data-runtime-vopr.node.1" },
+        .{ .id = vopr.id.stable("data-runtime-vopr", "node.2"), .name = "data-runtime-vopr.node.2" },
+        .{ .id = vopr.id.stable("data-runtime-vopr", "node.3"), .name = "data-runtime-vopr.node.3" },
+    };
+    const service_operations = [_]vopr.service_rate.Operation{raft_round_operation};
+    const node_three_slow_fault_id = vopr.id.stable("data-runtime-vopr", "fault.node-3-raft-slow");
+    var service_rate_model = try vopr.service_rate.Model.init(
+        alloc,
+        &service_nodes,
+        &service_operations,
+    );
+    defer service_rate_model.deinit();
+    const ServiceRateAdapter = struct {
+        port: vopr.service_rate.Port,
+        operation_id: vopr.id.StableId,
+
+        fn iface(self: *@This()) DataServerWorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, kind: DataServerWorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const operation_id = switch (kind) {
+                .raft_round => self.operation_id,
+            };
+            _ = try self.port.charge(operation_id, units);
+        }
+    };
+    var service_rate_adapters: [3]ServiceRateAdapter = undefined;
+    for (&service_rate_adapters, service_nodes) |*adapter, node| {
+        adapter.* = .{
+            .port = try service_rate_model.port(io, node.id),
+            .operation_id = raft_round_operation.id,
+        };
+    }
+
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
         .borrowed_io = .{
@@ -30993,6 +31062,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             .replica_catalog_path = null,
             .data_raft_state_backend = .file_image,
             .data_raft_async_send_worker_count = 0,
+            .work_cost_port = service_rate_adapters[i].iface(),
             .store_registration = .{
                 .node_id = i + 1,
                 .store_id = i + 1,
@@ -31302,6 +31372,11 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         metadata_executor: antfly.common.http.RequestExecutor,
         internal_service_secret: []const u8,
         internal_service_issuer: []const u8,
+        service_rate_model: *vopr.service_rate.Model,
+        work_cost_adapters: *[3]ServiceRateAdapter,
+        slowed_node_id: vopr.id.StableId,
+        raft_round_operation_id: vopr.id.StableId,
+        node_slow_fault_id: vopr.id.StableId,
         roots: *[3][:0]u8,
         servers: *[3]DataServer,
         initialized: *[3]bool,
@@ -31579,6 +31654,14 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             @memset(&self.driver_paused, false);
         }
 
+        fn waitForRaftDriversIdle(self: *@This()) !void {
+            for (0..1_000) |_| {
+                if (std.mem.allEqual(bool, &self.driver_active, false)) return;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerRaftDriverQuiesceTimeout;
+        }
+
         fn exerciseReadSafetyBarriers(self: *@This()) !void {
             // Group 172 is led by node 2. Once node 1 has learned that leader,
             // follower initiation can forward and complete through node 1's
@@ -31618,6 +31701,20 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // replacement leader must complete through that owner's apply.
             self.stage = 20;
             self.pauseAllRaftDrivers();
+            try self.waitForRaftDriversIdle();
+            const usage_before = try self.service_rate_model.nodeUsage(self.slowed_node_id);
+            try self.service_rate_model.activate(.{
+                .fault_id = self.node_slow_fault_id,
+                .node_id = self.slowed_node_id,
+                .operation_id = self.raft_round_operation_id,
+                .multiplier_ppm = 5_000_000,
+            });
+            var slowdown_active = true;
+            defer if (slowdown_active) self.service_rate_model.heal(self.node_slow_fault_id) catch {};
+            // Charge and execute one actual DataServer Raft round while the
+            // reversible node/operation effect is active. This prevents the
+            // history from passing on a registered-but-never-consumed fault.
+            try self.servers[2].runRaftRoundOnly();
             var leader_change = self.io.async(waitReadSafeTask, .{
                 &self.servers[1], 172, @as(?u32, 1_000), antfly.db.types.CancellationToken.none,
             });
@@ -31636,6 +31733,16 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 "data-runtime-vopr:replacement-leader",
                 1_000,
                 .none,
+            );
+            try self.service_rate_model.heal(self.node_slow_fault_id);
+            slowdown_active = false;
+            const usage_after = try self.service_rate_model.nodeUsage(self.slowed_node_id);
+            const charged_operations = usage_after.operations - usage_before.operations;
+            const charged_ns = usage_after.charged_ns - usage_before.charged_ns;
+            try std.testing.expect(charged_operations > 0);
+            try std.testing.expectEqual(
+                charged_operations * 500 * std.time.ns_per_us,
+                charged_ns,
             );
 
             // With every Ready owner paused, the same production barrier must
@@ -32083,6 +32190,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
                 .replica_catalog_path = null,
                 .data_raft_state_backend = .file_image,
                 .data_raft_async_send_worker_count = 0,
+                .work_cost_port = self.work_cost_adapters[index].iface(),
                 .store_registration = .{
                     .node_id = index + 1,
                     .store_id = index + 1,
@@ -32114,6 +32222,11 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         .metadata_executor = metadata_executor,
         .internal_service_secret = internal_service_secret,
         .internal_service_issuer = internal_service_issuer,
+        .service_rate_model = &service_rate_model,
+        .work_cost_adapters = &service_rate_adapters,
+        .slowed_node_id = service_nodes[2].id,
+        .raft_round_operation_id = raft_round_operation.id,
+        .node_slow_fault_id = node_three_slow_fault_id,
         .roots = &roots,
         .servers = &servers,
         .initialized = &initialized,
