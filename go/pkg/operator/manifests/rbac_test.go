@@ -36,6 +36,23 @@ func TestClusterRoleAvoidsOptionalHighRiskPermissions(t *testing.T) {
 	}
 }
 
+func TestClusterRoleGrantsStructuredEventPermissions(t *testing.T) {
+	role := ClusterRole()
+	for _, rule := range role.Rules {
+		if !containsString(rule.APIGroups, "events.k8s.io") || !containsString(rule.Resources, "events") {
+			continue
+		}
+		for _, verb := range []string{"create", "patch"} {
+			if !containsString(rule.Verbs, verb) {
+				t.Fatalf("ClusterRole events.k8s.io events rule missing verb %q: %#v", verb, rule.Verbs)
+			}
+		}
+		return
+	}
+
+	t.Fatal("ClusterRole must grant structured Event permissions used by the event recorder")
+}
+
 func TestClusterRoleGrantsLeasePermissionsForHAFencing(t *testing.T) {
 	role := ClusterRole()
 	requiredVerbs := []string{"get", "list", "watch", "create", "update", "patch", "delete"}

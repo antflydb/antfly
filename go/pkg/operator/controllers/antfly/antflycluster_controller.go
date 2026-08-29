@@ -181,6 +181,7 @@ const (
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 //+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 //+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+//+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
 //+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update
@@ -12272,16 +12273,16 @@ func haSeedArtifactPVCStorage(name string, pvc *antflyv1.HASeedArtifactPVCSpec, 
 		return nil, nil
 	}
 	return []corev1.VolumeMount{{
-			Name:      name,
-			MountPath: pvc.MountPath,
+		Name:      name,
+		MountPath: pvc.MountPath,
+		ReadOnly:  readOnly,
+	}}, []corev1.Volume{{
+		Name: name,
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+			ClaimName: pvc.ClaimName,
 			ReadOnly:  readOnly,
-		}}, []corev1.Volume{{
-			Name: name,
-			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: pvc.ClaimName,
-				ReadOnly:  readOnly,
-			}},
-		}}
+		}},
+	}}
 }
 
 func haSeedArtifactForAction(cluster *antflyv1.AntflyCluster, action antflyv1.HAPlannedActionStatus) *antflyv1.HASeedArtifactSpec {
