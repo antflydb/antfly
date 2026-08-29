@@ -3084,7 +3084,7 @@ test "data server repair owner cancels and drains through backend runtime" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             ".",
             catalog,
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
@@ -3135,7 +3135,7 @@ test "data server rejects replicated transition admission after owner shutdown" 
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             ".",
             catalog,
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
@@ -4230,7 +4230,7 @@ test "runtime status disk usage cache is scoped to one root generation and group
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             ".",
             catalog,
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
@@ -4300,7 +4300,7 @@ test "runtime status disk scan retries across a reallocation fence and group inv
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             ".",
             catalog,
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(".", catalog),
         .status_source = undefined,
@@ -5316,7 +5316,7 @@ pub const DataServer = struct {
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 catalog,
-                antfly.raft.read_gate.noopReadableLeaseRequester(),
+                antfly.raft.read_gate.unavailableReadSafetyBarrier(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
@@ -5360,7 +5360,7 @@ pub const DataServer = struct {
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataService(svc),
-                antfly.raft.read_gate.noopReadableLeaseRequester(),
+                antfly.raft.read_gate.unavailableReadSafetyBarrier(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
@@ -5404,7 +5404,7 @@ pub const DataServer = struct {
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 antfly.public_api.table_catalog.CatalogSource.fromMetadataHttpService(svc),
-                antfly.raft.read_gate.noopReadableLeaseRequester(),
+                antfly.raft.read_gate.unavailableReadSafetyBarrier(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
@@ -5498,7 +5498,7 @@ pub const DataServer = struct {
             // leader for each group. The former no-op requester plus local
             // follower fallback could publish a partial graph while the
             // acknowledged leader had already reached `full_index`.
-            self.read_source.requester = self.dataReadableLeaseRequester();
+            self.read_source.read_safety_barrier = self.dataReadSafetyBarrier();
             _ = self.read_source.withGraphReadBarrier(self.dataGraphReadBarrier());
             _ = self.read_source.withDistributedRouting(
                 self.dataReadGroupRouter(),
@@ -5506,6 +5506,10 @@ pub const DataServer = struct {
                 api_server_cfg.internal_service_secret,
                 api_server_cfg.internal_service_issuer,
             );
+        } else {
+            // A non-Raft data server owns its local state directly. Make that
+            // proof explicit only after startup has selected this mode.
+            self.read_source.read_safety_barrier = antfly.raft.read_gate.alreadyReadSafeBarrier();
         }
         _ = self.read_source.withHAReadGate(self.haReadGate());
         const ha_write_gate = self.haWriteGate();
@@ -7610,10 +7614,10 @@ pub const DataServer = struct {
         };
     }
 
-    fn dataReadableLeaseRequester(self: *DataServer) antfly.raft.ReadableLeaseRequester {
+    fn dataReadSafetyBarrier(self: *DataServer) antfly.raft.ReadSafetyBarrier {
         return .{
             .ptr = self,
-            .vtable = &.{ .request_readable_lease = requestDataReadableLease },
+            .vtable = &.{ .wait_read_safe = waitDataReadSafe },
         };
     }
 
@@ -7679,7 +7683,7 @@ pub const DataServer = struct {
         // ReadIndex is the base-state quorum barrier. Derived indexes are
         // maintained outside Raft apply, so a newly elected leader must also
         // catch its local graph/full-text state up before serving the phase.
-        self.requestDataReadableLeaseWithCancellation(
+        self.waitDataReadSafeWithCancellation(
             group_id,
             "distributed-graph:read-index",
             timeout_ms,
@@ -7695,16 +7699,16 @@ pub const DataServer = struct {
         ) catch |err| return deadline.classify(err);
     }
 
-    fn requestDataReadableLease(
+    fn waitDataReadSafe(
         ptr: *anyopaque,
         group_id: u64,
         request_ctx: []const u8,
     ) anyerror!void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        try self.requestDataReadableLeaseWithCancellation(group_id, request_ctx, null, .none);
+        try self.waitDataReadSafeWithCancellation(group_id, request_ctx, null, .none);
     }
 
-    fn requestDataReadableLeaseWithCancellation(
+    fn waitDataReadSafeWithCancellation(
         self: *DataServer,
         group_id: u64,
         request_ctx: []const u8,
@@ -7723,7 +7727,7 @@ pub const DataServer = struct {
         // it before waiting so the Raft driver can deliver the quorum response
         // and apply the resulting ReadState.
         lockAtomic(&self.data_raft_mutex);
-        raft.requestReadableLease(group_id, registration.request_ctx) catch |err| {
+        raft.requestReadIndex(group_id, registration.request_ctx) catch |err| {
             self.data_raft_mutex.unlock();
             return err;
         };
@@ -16473,7 +16477,7 @@ pub const DataServer = struct {
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 cfg.replica_root_dir,
                 remote_metadata.catalogSource(),
-                antfly.raft.read_gate.noopReadableLeaseRequester(),
+                antfly.raft.read_gate.unavailableReadSafetyBarrier(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 cfg.replica_root_dir,
@@ -20794,7 +20798,7 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             "/vopr/data-server-background-owner",
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             "/vopr/data-server-background-owner",
@@ -20833,11 +20837,11 @@ test "DataServer VOPR background owner executes and cancels maintenance on VoprI
     try std.testing.expect(sim.scheduler().quiescent());
 }
 
-test "data raft read lease completes only after matching ReadState apply" {
+test "data raft read safety barrier completes only after matching ReadState apply" {
     const alloc = std.testing.allocator;
     var apply_sm = RaftTableApplyStateMachine.init(
         alloc,
-        "/tmp/unused-antfly-read-lease-state",
+        "/tmp/unused-antfly-read-safety-state",
         antfly.public_api.table_catalog.emptyCatalogSource(),
         null,
     );
@@ -22625,7 +22629,7 @@ test "data runtime local group status provider collects and caches group statuse
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
@@ -22725,7 +22729,7 @@ test "data runtime raft status changes force immediate store status publication"
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -22768,7 +22772,7 @@ test "data runtime reallocation request refreshes group status once per request"
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -23003,7 +23007,7 @@ test "data runtime local split fallback preserves source identity namespace" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
@@ -23169,7 +23173,7 @@ test "data runtime split apply store seeding reuses cached source writer" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
@@ -23377,7 +23381,7 @@ test "data runtime local merge fallback uses its durable table contract" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(replica_root_dir, FakeCatalog.iface()),
         .status_source = undefined,
@@ -23549,7 +23553,7 @@ test "data runtime store status reuses stale cache while refreshing local group 
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -23652,7 +23656,7 @@ test "data runtime store status keeps stale cache and skips local group refresh 
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -23765,7 +23769,7 @@ test "data runtime live local group status skips the active startup group on a c
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -23844,7 +23848,7 @@ test "data runtime local group status does not open roots owned by transitions" 
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -23964,7 +23968,7 @@ test "data runtime store status cold miss schedules a nonblocking refresh" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -24043,7 +24047,7 @@ test "data runtime metadata local group status provider does not cold-open inlin
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -24117,7 +24121,7 @@ test "data runtime local group refresh prefers runtime status snapshot over DB o
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -24300,7 +24304,7 @@ test "data runtime background refresh publishes a cold placeholder without DB op
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -24438,7 +24442,7 @@ test "data runtime provisioned cache warmup populates runtime status without pin
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -24598,7 +24602,7 @@ test "data runtime provisioned cache warmup defers while startup catch-up is act
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -24739,7 +24743,7 @@ test "data runtime status refresh preserves only the active catch-up group while
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -24935,7 +24939,7 @@ test "data runtime status refresh skips opening the active startup group when no
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -25052,7 +25056,7 @@ test "data runtime status refresh publishes synthetic missing status for absent 
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -25172,7 +25176,7 @@ test "data runtime status refresh budget preserves fresh cached group status for
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -25316,7 +25320,7 @@ test "data runtime status refresh reuses managed writer snapshot instead of reop
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             fake_replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             fake_replica_root_dir,
@@ -25458,7 +25462,7 @@ test "data runtime status refresh falls back to live managed writer status when 
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -25593,7 +25597,7 @@ test "data runtime status refresh publishes placeholder when live managed writer
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -25660,7 +25664,7 @@ test "data local group status refresh skips active group when cache entry is mis
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -25817,7 +25821,7 @@ test "data runtime status refresh publishes sibling placeholder when only one gr
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -26106,7 +26110,7 @@ test "data runtime provisioned startup catch-up clears replay debt for local gro
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             fake_catalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -26277,7 +26281,7 @@ test "data runtime startup catch-up clears dirty bit for terminal degraded index
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -26426,7 +26430,7 @@ test "data runtime startup catch-up clears no-debt busy writer groups" {
             .read_source = antfly.public_api.ProvisionedTableReadSource.init(
                 replica_root_dir,
                 FakeCatalog.iface(),
-                antfly.raft.read_gate.noopReadableLeaseRequester(),
+                antfly.raft.read_gate.alreadyReadSafeBarrier(),
             ),
             .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
                 replica_root_dir,
@@ -26665,7 +26669,7 @@ test "data runtime startup catch-up retries unresolved leadership and observes l
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -26793,7 +26797,7 @@ test "data runtime startup catch-up stays dirty when metadata snapshot is unavai
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             EmptyCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27366,7 +27370,7 @@ test "data runtime startup catch-up prefers cached admin snapshot" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27414,7 +27418,7 @@ test "data runtime runRound does not refresh provisioned replica root inline whi
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27474,7 +27478,7 @@ test "data runtime runRound backs off retryable provision metadata failures" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27545,7 +27549,7 @@ test "data runtime provisioned root refresh worker backs off retryable metadata 
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27603,7 +27607,7 @@ test "data runtime provisioned root refresh spawn failure preserves retry bookke
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27726,7 +27730,7 @@ test "data runtime startup catch-up stays dirty when local groups are not visibl
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27875,7 +27879,7 @@ test "data runtime startup catch-up stays dirty when local leadership is unresol
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -27914,7 +27918,7 @@ test "data runtime startup catch-up spawn failure preserves retry bookkeeping" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             replica_root_dir,
             antfly.public_api.table_catalog.emptyCatalogSource(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             replica_root_dir,
@@ -28974,7 +28978,7 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             ".",
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
             ".",
@@ -34303,7 +34307,7 @@ test "data runtime lsm maintenance scheduler defers under resource pressure" {
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             "/tmp/unused-antfly-data-runtime-maintenance",
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-data-runtime-maintenance", FakeCatalog.iface()),
         .status_source = undefined,
@@ -34354,7 +34358,7 @@ test "data runtime background maintenance is due for dense posting cadence witho
         .read_source = antfly.public_api.ProvisionedTableReadSource.init(
             "/tmp/unused-antfly-data-runtime-dense-posting-maintenance",
             FakeCatalog.iface(),
-            antfly.raft.read_gate.noopReadableLeaseRequester(),
+            antfly.raft.read_gate.alreadyReadSafeBarrier(),
         ),
         .write_source = antfly.public_api.ProvisionedTableWriteSource.init("/tmp/unused-antfly-data-runtime-dense-posting-maintenance", FakeCatalog.iface()),
         .status_source = undefined,

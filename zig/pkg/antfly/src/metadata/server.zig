@@ -179,7 +179,7 @@ pub const MetadataServer = struct {
             public_read_source.* = api_table_reads.HostedProvisionedTableReadSource.init(
                 replica_root_dir,
                 catalog,
-                raft.read_gate.noopReadableLeaseRequester(),
+                raft.read_gate.alreadyReadSafeBarrier(),
                 data_router,
                 svc.raft.host.http_host.request_executor,
             );

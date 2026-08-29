@@ -3107,7 +3107,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
         fake_catalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var lookup = (try read_source.source().lookup(std.testing.allocator, "docs", "doc:a", .{}, .read_index)).?;
     defer lookup.deinit(std.testing.allocator);

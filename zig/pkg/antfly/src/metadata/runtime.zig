@@ -268,7 +268,7 @@ pub const HealthSource = struct {
         try append(writer, "antfly_service_queued_updates", "gauge", "Pending metadata updates waiting to apply", @intCast(svc_metrics.queued_updates));
         try append(writer, "antfly_service_applied_updates_total", "counter", "Total applied metadata updates", @intCast(svc_metrics.applied_updates));
         try append(writer, "antfly_service_sync_rounds_total", "counter", "Total metadata sync rounds", @intCast(svc_metrics.sync_rounds));
-        try append(writer, "antfly_service_read_lease_requests_total", "counter", "Total readable-lease requests", @intCast(svc_metrics.read_lease_requests));
+        try append(writer, "antfly_service_read_index_requests_total", "counter", "Total Raft ReadIndex requests", @intCast(svc_metrics.read_index_requests));
         try append(writer, "antfly_service_split_transitions_queued", "gauge", "Queued split transitions", @intCast(svc_metrics.queued_split_transitions));
         try append(writer, "antfly_service_split_transitions_completed_total", "counter", "Completed split transitions", @intCast(svc_metrics.completed_split_transitions));
         try append(writer, "antfly_service_merge_transitions_queued", "gauge", "Queued merge transitions", @intCast(svc_metrics.queued_merge_transitions));

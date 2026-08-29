@@ -23818,7 +23818,7 @@ test "api http server document scan requires table read permission" {
     defer secrets_reader.deinit(alloc);
     try auth.manager.setRowFilter("secrets-reader", "secrets", "{\"term\":{\"tenant_id\":\"t1\"}}");
 
-    var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("secrets", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = FakeSource{};
     const trusted_principal_secret = "gateway-trusted-principal-secret";
     const internal_secret = "dedicated-internal-service-secret";
@@ -25299,7 +25299,7 @@ test "api http server serves table lookup with version header" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -25451,7 +25451,7 @@ test "api http server decodes percent-encoded lookup keys" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -25520,7 +25520,7 @@ test "api http server serves document lookup through mcp tool" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -25644,7 +25644,7 @@ test "api http server serves fielded full-text search through mcp tools" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var table_write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -26192,7 +26192,7 @@ test "api http server serves table scan as ndjson" {
         },
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -26275,7 +26275,7 @@ test "api http server serves table query response envelope" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -26350,7 +26350,7 @@ test "api http server executes public Query filter roots and compositions" {
         "files",
         77,
         &db,
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -26496,7 +26496,7 @@ test "api http server serves table query with SearchAF-shaped terms aggregations
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("files", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("files", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -26569,7 +26569,7 @@ test "api http server serves retrieval agent response envelope" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -26823,7 +26823,7 @@ test "api http server serves retrieval agent event stream" {
         .sync_level = .full_index,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -28400,7 +28400,7 @@ test "api http server serves public transaction commit route" {
         .timestamp_ns = 7,
     });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var table_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {
@@ -29059,7 +29059,7 @@ test "api http server serves long-lived public transaction session routes" {
         }
     };
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = FakeSource{};
     var server = ApiHttpServer.init(std.testing.allocator, .{}, source.iface(), read_source.source(), table_source.source());
     defer server.deinit();
@@ -29306,7 +29306,7 @@ test "api transaction sessions enforce principal permissions and row filters" {
         }
     };
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = FakeSource{};
     const secret = "transaction-principal-secret";
     var server = ApiHttpServer.init(alloc, .{
@@ -31404,7 +31404,7 @@ test "api http server reports table storage empty from read visibility" {
     }
     try db.updateRange(.{ .start = "", .end = "" });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -31772,7 +31772,7 @@ test "api http server serves local index runtime backfill status" {
     const rebuild_state = db_mod.backfill_state.RebuildState.init(index_root);
     try rebuild_state.update("doc:a");
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     const FakeSource = struct {
         fn iface(_: *@This()) StatusSource {
@@ -32795,7 +32795,7 @@ test "api http server serves provisioned index runtime backfill status across sh
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var read_source = table_reads.ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.ProvisionedTableReadSource.init(path, FakeCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
     var server = ApiHttpServer.init(std.testing.allocator, .{}, FakeSource.iface(), read_source.source(), null);
 
     var detail_resp = try executeHttpxTestRequest(&server, .{
@@ -37099,7 +37099,7 @@ test "api http server backs up and restores a table through public routes" {
         .timestamp_ns = 1,
     });
 
-    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = table_writes.BoundTableWriteSource.init("docs", &db);
 
     const FakeSource = struct {

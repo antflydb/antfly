@@ -1242,7 +1242,7 @@ fn runHandlerBench(
     var db = try openAndSeedDb(alloc, path[0..path.len], cfg, dataset);
     defer db.close();
 
-    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = api.BoundTableWriteSource.init(table_name, &db);
     var status_source = try FakeStatusSource.init(cfg);
     defer status_source.deinit();
@@ -1422,7 +1422,7 @@ fn runLocalBench(
     var db = try openAndSeedDb(alloc, path[0..path.len], cfg, dataset);
     defer db.close();
 
-    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = api.BoundTableReadSource.init(table_name, 1, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = api.BoundTableWriteSource.init(table_name, &db);
     var status_source = try FakeStatusSource.init(cfg);
     defer status_source.deinit();

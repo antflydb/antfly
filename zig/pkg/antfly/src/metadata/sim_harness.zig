@@ -47,6 +47,7 @@ const raft_host = @import("../raft/host.zig");
 const raft_metadata_apply = @import("../raft/metadata_apply.zig");
 const raft_metadata_view = @import("../raft/metadata_view.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const read_gate = @import("../raft/read_gate.zig");
 const raft_shard_ops = @import("../raft/shard_ops.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const peer_resolver = @import("../raft/peer_resolver.zig");
@@ -5721,7 +5722,7 @@ const PublicApiLinearizableReadDriver = struct {
             .{ self.node_index, self.request_sequence },
         );
         self.active_request_context_len = context.len;
-        cluster.cluster.node(self.node_index).runtime.svc.requestReadableLease(
+        cluster.cluster.node(self.node_index).runtime.svc.requestReadIndex(
             cluster.metadata_group_id,
             self.activeRequestContext(),
         ) catch |err| switch (err) {
@@ -6170,7 +6171,7 @@ fn startPublicApiServers(
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor,
         );
@@ -7478,7 +7479,7 @@ pub const VoprPublicClusterFixture = struct {
             self.cluster.cluster.node(node_index).serverRequestExecutor(),
         );
         self.read_sources[node_index].requester =
-            self.cluster.cluster.node(node_index).runtime.svc.readableLeaseRequester();
+            read_gate.alreadyReadSafeBarrier();
         const restarted_node_id = self.cluster.cluster.configs[node_index].host.http.host.local_node_id;
         try self.cluster.virtual_network.registerNode(
             restarted_node_id,
@@ -13992,7 +13993,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor.executor(),
         );
@@ -14278,7 +14279,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor.executor(),
         );
@@ -14564,7 +14565,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor.executor(),
         );
@@ -15477,7 +15478,7 @@ test "metadata http cluster simulation recovers from a ready persistence stall w
         if (rounds % 8 == 0) {
             const read_index = rounds / 8;
             if (read_index > 0) try std.testing.expect(read_barriers[recovered_leader].completed(read_index - 1));
-            try cluster.cluster.node(recovered_leader).runtime.svc.requestReadableLease(
+            try cluster.cluster.node(recovered_leader).runtime.svc.requestReadIndex(
                 4972,
                 ReadBarrierRecorder.contexts[read_index],
             );

@@ -4474,7 +4474,7 @@ pub fn build(b: *std.Build) void {
         "data public API listener uses public API request body limit",
         "data server can register a store without enabling data raft",
         "data server registered data raft uses wal state backend by default",
-        "data raft read lease completes only after matching ReadState apply",
+        "data raft read safety barrier completes only after matching ReadState apply",
         "data raft ticker advances consensus independently of control rounds",
         "raft batch round trips table batch payload",
         "raft batch round trips deterministic transaction begin",

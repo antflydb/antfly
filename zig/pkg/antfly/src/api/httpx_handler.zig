@@ -8169,7 +8169,7 @@ test "httpx antfly lookup route preserves projection and headers" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 
@@ -8296,7 +8296,7 @@ test "httpx antfly scan honors optional body and documented bad requests" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 
@@ -8367,7 +8367,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 
@@ -8507,7 +8507,7 @@ test "httpx query endpoints accept ndjson multiquery bodies" {
         .timestamp_ns = 4321,
     });
 
-    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var table_source = table_reads.BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var source = LookupStatusSource{};
     var api_server = ApiHttpServer.init(alloc, .{}, source.iface(), table_source.source(), null);
 

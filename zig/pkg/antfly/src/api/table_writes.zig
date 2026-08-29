@@ -25742,7 +25742,7 @@ test "bound table sources inspect and reprocess document artifact manifests" {
     });
 
     var write_source = BoundTableWriteSource.init("docs", &db);
-    var read_source = table_reads.BoundTableReadSource.init("docs", 11, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.BoundTableReadSource.init("docs", 11, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
 
     _ = try write_source.source().batch(alloc, "docs", .{
         .writes = &.{.{
@@ -27691,7 +27691,7 @@ test "provisioned table write source backs up and restores full_text writes from
     var read_source = table_reads.ProvisionedTableReadSource.init(
         path,
         FakeCatalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     var read_cache = table_reads.ProvisionedTableReadCache.init(alloc);
     defer read_cache.deinit();
@@ -27867,7 +27867,7 @@ test "provisioned native backup restore repeats through shared read and write ow
     var read_source = table_reads.ProvisionedTableReadSource.init(
         root,
         FakeCatalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     read_source.backend_runtime = backend_runtime.ptr();
     read_source.cache = &read_cache;
@@ -39270,7 +39270,7 @@ test "provisioned table read source serves profiled dense query without runtime 
     });
     try write_source.syncReplicatedBatchGroupLocal(alloc, 7001, "docs", .full_index);
 
-    var read_source = table_reads.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.noopReadableLeaseRequester());
+    var read_source = table_reads.ProvisionedTableReadSource.init(replica_root_dir, Catalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
     read_source.cache = &read_cache;
 
     var owned = try query_api.parseQueryRequest(alloc, null, "docs",
@@ -39390,7 +39390,7 @@ test "hosted provisioned table read source serves profiled dense query after ext
     var hosted = table_reads.HostedProvisionedTableReadSource.init(
         replica_root_dir,
         Catalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
         FakeRouter.iface(),
         executor_state.iface(),
     );
@@ -39521,7 +39521,7 @@ test "provisioned table read source survives many external write-sync batches be
         var cold_read_source = table_reads.ProvisionedTableReadSource.init(
             replica_root_dir,
             Catalog.iface(),
-            raft_mod.read_gate.noopReadableLeaseRequester(),
+            raft_mod.read_gate.alreadyReadSafeBarrier(),
         );
         cold_read_source.cache = &read_cache;
 
@@ -39555,7 +39555,7 @@ test "provisioned table read source survives many external write-sync batches be
     var read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root_dir,
         Catalog.iface(),
-        raft_mod.read_gate.noopReadableLeaseRequester(),
+        raft_mod.read_gate.alreadyReadSafeBarrier(),
     );
     read_source.cache = &read_cache;
 

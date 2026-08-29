@@ -187,63 +187,128 @@ pub const ReadConsistency = enum {
     read_index,
 };
 
-pub const ReadableLeaseRequester = struct {
+/// Starts a Raft ReadIndex operation and returns as soon as it has been
+/// admitted to the local RawNode. This is deliberately not a read barrier:
+/// callers that will inspect state must separately wait for a ReadSafetyBarrier.
+pub const ReadIndexRequester = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        request_readable_lease: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
+        request_read_index: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
     };
 
-    pub fn requestReadableLease(self: ReadableLeaseRequester, group_id: u64, request_ctx: []const u8) !void {
-        try self.vtable.request_readable_lease(self.ptr, group_id, request_ctx);
+    pub fn requestReadIndex(self: ReadIndexRequester, group_id: u64, request_ctx: []const u8) !void {
+        try self.vtable.request_read_index(self.ptr, group_id, request_ctx);
     }
 };
 
-pub const ReadableLeaseCallback = *const fn (ctx: ?*anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void;
+pub const ReadSafetyBarrier = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
 
-pub const CallbackReadableLeaseRequester = struct {
+    pub const VTable = struct {
+        wait_read_safe: *const fn (ptr: *anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void,
+    };
+
+    pub fn waitReadSafe(self: ReadSafetyBarrier, group_id: u64, request_ctx: []const u8) !void {
+        try self.vtable.wait_read_safe(self.ptr, group_id, request_ctx);
+    }
+};
+
+pub const ReadSafetyCallback = *const fn (ctx: ?*anyopaque, group_id: u64, request_ctx: []const u8) anyerror!void;
+
+pub const CallbackReadSafetyBarrier = struct {
     ctx: ?*anyopaque,
-    callback: ReadableLeaseCallback,
+    callback: ReadSafetyCallback,
 
-    pub fn init(ctx: ?*anyopaque, callback: ReadableLeaseCallback) CallbackReadableLeaseRequester {
+    pub fn init(ctx: ?*anyopaque, callback: ReadSafetyCallback) CallbackReadSafetyBarrier {
         return .{
             .ctx = ctx,
             .callback = callback,
         };
     }
 
-    pub fn requester(self: *const CallbackReadableLeaseRequester) ReadableLeaseRequester {
+    pub fn barrier(self: *const CallbackReadSafetyBarrier) ReadSafetyBarrier {
         return .{
             .ptr = @constCast(self),
             .vtable = &.{
-                .request_readable_lease = requestReadableLease,
+                .wait_read_safe = waitReadSafe,
             },
         };
     }
 
-    fn requestReadableLease(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
-        const self: *const CallbackReadableLeaseRequester = @ptrCast(@alignCast(ptr));
+    fn waitReadSafe(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+        const self: *const CallbackReadSafetyBarrier = @ptrCast(@alignCast(ptr));
         try self.callback(self.ctx, group_id, request_ctx);
     }
 };
 
-pub fn noopReadableLeaseRequester() ReadableLeaseRequester {
+/// Use only when the caller owns non-replicated or otherwise already-fenced
+/// state. The explicit name makes this proof obligation visible at call sites.
+pub fn alreadyReadSafeBarrier() ReadSafetyBarrier {
     return .{
         .ptr = undefined,
         .vtable = &.{
-            .request_readable_lease = requestReadableLeaseNoop,
+            .wait_read_safe = waitReadSafeNoop,
         },
     };
 }
 
-fn requestReadableLeaseNoop(_: *anyopaque, _: u64, _: []const u8) !void {}
+fn waitReadSafeNoop(_: *anyopaque, _: u64, _: []const u8) !void {}
+
+/// Fail-closed placeholder for a replicated read source whose owner has not
+/// installed its applied-state barrier yet.
+pub fn unavailableReadSafetyBarrier() ReadSafetyBarrier {
+    return .{
+        .ptr = undefined,
+        .vtable = &.{
+            .wait_read_safe = waitReadSafeUnavailable,
+        },
+    };
+}
+
+fn waitReadSafeUnavailable(_: *anyopaque, _: u64, _: []const u8) !void {
+    return error.ReadSafetyBarrierUnavailable;
+}
+
+pub const EnrichmentReadIndexRequester = struct {
+    requester: ReadIndexRequester,
+
+    pub fn init(requester: ReadIndexRequester) EnrichmentReadIndexRequester {
+        return .{ .requester = requester };
+    }
+
+    pub fn request(
+        self: EnrichmentReadIndexRequester,
+        group_id: u64,
+        kind: EnrichmentReadKind,
+        consistency: ReadConsistency,
+    ) !void {
+        if (consistency == .stale) return;
+        var buf: [96]u8 = undefined;
+        const request_ctx = try enrichmentRequestContext(&buf, kind, consistency);
+        try self.requester.requestReadIndex(group_id, request_ctx);
+    }
+
+    pub fn requestSearch(self: EnrichmentReadIndexRequester, group_id: u64, consistency: ReadConsistency) !void {
+        try self.request(group_id, .search, consistency);
+    }
+
+    pub fn requestLookup(self: EnrichmentReadIndexRequester, group_id: u64, consistency: ReadConsistency) !void {
+        try self.request(group_id, .lookup, consistency);
+    }
+
+    pub fn requestScan(self: EnrichmentReadIndexRequester, group_id: u64, consistency: ReadConsistency) !void {
+        try self.request(group_id, .scan, consistency);
+    }
+};
 
 pub const EnrichmentReadGate = struct {
-    requester: ReadableLeaseRequester,
+    barrier: ReadSafetyBarrier,
 
-    pub fn init(requester: ReadableLeaseRequester) EnrichmentReadGate {
-        return .{ .requester = requester };
+    pub fn init(barrier: ReadSafetyBarrier) EnrichmentReadGate {
+        return .{ .barrier = barrier };
     }
 
     pub fn prepare(
@@ -255,12 +320,8 @@ pub const EnrichmentReadGate = struct {
         if (consistency == .stale) return;
 
         var buf: [96]u8 = undefined;
-        const request_ctx = try std.fmt.bufPrint(
-            &buf,
-            "enrichment:{s}:{s}",
-            .{ @tagName(kind), @tagName(consistency) },
-        );
-        try self.requester.requestReadableLease(group_id, request_ctx);
+        const request_ctx = try enrichmentRequestContext(&buf, kind, consistency);
+        try self.barrier.waitReadSafe(group_id, request_ctx);
     }
 
     pub fn prepareSearch(
@@ -300,6 +361,18 @@ pub const EnrichmentReadGate = struct {
     }
 };
 
+fn enrichmentRequestContext(
+    buf: []u8,
+    kind: EnrichmentReadKind,
+    consistency: ReadConsistency,
+) ![]const u8 {
+    return try std.fmt.bufPrint(
+        buf,
+        "enrichment:{s}:{s}",
+        .{ @tagName(kind), @tagName(consistency) },
+    );
+}
+
 test "enrichment read gate supports explicit consistency modes" {
     const Recorder = struct {
         group_id: u64 = 0,
@@ -307,16 +380,16 @@ test "enrichment read gate supports explicit consistency modes" {
         request_ctx_len: usize = 0,
         request_count: usize = 0,
 
-        fn requester(self: *@This()) ReadableLeaseRequester {
+        fn requester(self: *@This()) ReadSafetyBarrier {
             return .{
                 .ptr = self,
                 .vtable = &.{
-                    .request_readable_lease = requestReadableLease,
+                    .wait_read_safe = waitReadSafe,
                 },
             };
         }
 
-        fn requestReadableLease(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+        fn waitReadSafe(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.group_id = group_id;
             @memcpy(self.request_ctx[0..request_ctx.len], request_ctx);
@@ -349,7 +422,7 @@ test "enrichment read gate supports explicit consistency modes" {
     try std.testing.expectEqualStrings("enrichment:scan:read_index", recorder.request_ctx[0..recorder.request_ctx_len]);
 }
 
-test "callback readable lease requester forwards calls" {
+test "callback read safety barrier forwards calls" {
     const Recorder = struct {
         group_id: u64 = 0,
         request_ctx: [64]u8 = undefined,
@@ -364,11 +437,45 @@ test "callback readable lease requester forwards calls" {
     };
 
     var recorder = Recorder{};
-    const callback_requester = CallbackReadableLeaseRequester.init(&recorder, Recorder.callback);
-    try callback_requester.requester().requestReadableLease(91, "enrichment:lookup");
+    const callback_barrier = CallbackReadSafetyBarrier.init(&recorder, Recorder.callback);
+    try callback_barrier.barrier().waitReadSafe(91, "enrichment:lookup");
 
     try std.testing.expectEqual(@as(u64, 91), recorder.group_id);
     try std.testing.expectEqualStrings("enrichment:lookup", recorder.request_ctx[0..recorder.request_ctx_len]);
+}
+
+test "unavailable read safety barrier fails closed" {
+    try std.testing.expectError(
+        error.ReadSafetyBarrierUnavailable,
+        unavailableReadSafetyBarrier().waitReadSafe(91, "read-before-runtime-wiring"),
+    );
+}
+
+test "enrichment ReadIndex requester is initiation only" {
+    const Recorder = struct {
+        calls: usize = 0,
+        context: [64]u8 = undefined,
+        context_len: usize = 0,
+
+        fn requester(self: *@This()) ReadIndexRequester {
+            return .{ .ptr = self, .vtable = &.{ .request_read_index = requestReadIndex } };
+        }
+
+        fn requestReadIndex(ptr: *anyopaque, _: u64, context: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            @memcpy(self.context[0..context.len], context);
+            self.context_len = context.len;
+        }
+    };
+
+    var recorder = Recorder{};
+    const requests = EnrichmentReadIndexRequester.init(recorder.requester());
+    try requests.requestSearch(7, .read_index);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqualStrings("enrichment:search:read_index", recorder.context[0..recorder.context_len]);
+    try requests.requestLookup(7, .stale);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
 }
 
 test "applied read tracker completes only after matching ReadState and applied index" {

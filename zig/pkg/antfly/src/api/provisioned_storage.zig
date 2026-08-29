@@ -624,7 +624,7 @@ test "provisioned group storage wires remote content to writer caches" {
     var read_source = table_reads.ProvisionedTableReadSource.init("/tmp/unused-antfly-read", table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,
-    }, raft_mod.read_gate.noopReadableLeaseRequester());
+    }, raft_mod.read_gate.alreadyReadSafeBarrier());
     var write_source = table_writes.ProvisionedTableWriteSource.init(".", table_catalog.CatalogSource{
         .ptr = undefined,
         .vtable = undefined,

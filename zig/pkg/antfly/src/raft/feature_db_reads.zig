@@ -28,18 +28,18 @@ pub const FeatureDBReads = struct {
     group_id: u64,
     reads: feature_reads.FeatureReads,
 
-    pub fn init(group_id: u64, requester: read_gate.ReadableLeaseRequester) FeatureDBReads {
+    pub fn init(group_id: u64, read_safety_barrier: read_gate.ReadSafetyBarrier) FeatureDBReads {
         return .{
             .group_id = group_id,
-            .reads = feature_reads.FeatureReads.init(requester),
+            .reads = feature_reads.FeatureReads.init(read_safety_barrier),
         };
     }
 
     pub fn initCallback(
         group_id: u64,
-        callback_requester: *const read_gate.CallbackReadableLeaseRequester,
+        callback_requester: *const read_gate.CallbackReadSafetyBarrier,
     ) FeatureDBReads {
-        return init(group_id, callback_requester.requester());
+        return init(group_id, callback_requester.barrier());
     }
 
     pub fn lookup(
@@ -151,16 +151,16 @@ test "feature db reads honor per-read consistency" {
         context_lens: [3]usize = .{ 0, 0, 0 },
         count: usize = 0,
 
-        fn requester(self: *@This()) read_gate.ReadableLeaseRequester {
+        fn barrier(self: *@This()) read_gate.ReadSafetyBarrier {
             return .{
                 .ptr = self,
                 .vtable = &.{
-                    .request_readable_lease = requestReadableLease,
+                    .wait_read_safe = waitReadSafe,
                 },
             };
         }
 
-        fn requestReadableLease(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+        fn waitReadSafe(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.count >= self.contexts.len or request_ctx.len > self.contexts[self.count].len) return error.TestUnexpectedResult;
             self.group_ids[self.count] = group_id;
@@ -191,7 +191,7 @@ test "feature db reads honor per-read consistency" {
     });
 
     var recorder = Recorder{};
-    const reads = FeatureDBReads.init(77, recorder.requester());
+    const reads = FeatureDBReads.init(77, recorder.barrier());
 
     var lookup = (try reads.lookupWithConsistency(alloc, &db, "doc:a", .{}, .leader_lease)).?;
     defer lookup.deinit(alloc);
@@ -216,7 +216,7 @@ test "feature db reads honor per-read consistency" {
     try std.testing.expectEqualStrings("enrichment:search:read_index", recorder.contexts[1][0..recorder.context_lens[1]]);
 }
 
-test "feature db reads can use callback requester wrapper" {
+test "feature db reads can use callback read safety barrier" {
     const Recorder = struct {
         count: usize = 0,
 
@@ -227,8 +227,8 @@ test "feature db reads can use callback requester wrapper" {
     };
 
     var recorder = Recorder{};
-    const callback_requester = read_gate.CallbackReadableLeaseRequester.init(&recorder, Recorder.callback);
-    const reads = FeatureDBReads.initCallback(9, &callback_requester);
+    const callback_barrier = read_gate.CallbackReadSafetyBarrier.init(&recorder, Recorder.callback);
+    const reads = FeatureDBReads.initCallback(9, &callback_barrier);
     try reads.reads.prepareLookup(9, "doc:a", .{});
     try std.testing.expectEqual(@as(usize, 1), recorder.count);
 }

@@ -27,7 +27,6 @@ const db_enrichment_runtime_factory = @import("db_enrichment_runtime_factory.zig
 const enrichment_runtime = @import("enrichment_runtime.zig");
 const db_types = @import("../storage/db/types.zig");
 const doc_identity = @import("../storage/db/doc_identity.zig");
-const feature_reads = @import("feature_reads.zig");
 const transport = @import("transport/mod.zig");
 const transition_checker = @import("transition_checker.zig");
 const transition_runtime_mod = @import("transition_runtime.zig");
@@ -1287,50 +1286,50 @@ pub const ManagedHostSimulation = struct {
         try self.runtime.svc.host.host.transferLeader(group_id, transferee);
     }
 
-    pub fn requestReadableLease(self: *ManagedHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.runtime.svc.requestReadableLease(group_id, request_ctx);
+    pub fn requestReadIndex(self: *ManagedHostSimulation, group_id: u64, request_ctx: []const u8) !void {
+        try self.runtime.svc.requestReadIndex(group_id, request_ctx);
     }
 
-    pub fn prepareEnrichmentRead(self: *ManagedHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
-        try self.runtime.svc.prepareEnrichmentRead(group_id, kind);
+    pub fn requestEnrichmentReadIndex(self: *ManagedHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
+        try self.runtime.svc.requestEnrichmentReadIndex(group_id, kind, .read_index);
     }
 
-    pub fn prepareSearchRead(self: *ManagedHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareSearchRead(group_id);
+    pub fn requestSearchReadIndex(self: *ManagedHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestSearchReadIndex(group_id);
     }
 
-    pub fn prepareSearchRequest(self: *ManagedHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
-        try self.runtime.svc.prepareSearchRequest(group_id, req);
+    pub fn requestSearchReadIndexForRequest(self: *ManagedHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
+        try self.runtime.svc.requestSearchReadIndexForRequest(group_id, req);
     }
 
-    pub fn featureReads(self: *ManagedHostSimulation) feature_reads.FeatureReads {
-        return self.runtime.svc.featureReads();
+    pub fn enrichmentReadIndexes(self: *ManagedHostSimulation) read_gate.EnrichmentReadIndexRequester {
+        return self.runtime.svc.enrichmentReadIndexes();
     }
 
-    pub fn prepareLookupRead(self: *ManagedHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareLookupRead(group_id);
+    pub fn requestLookupReadIndex(self: *ManagedHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestLookupReadIndex(group_id);
     }
 
-    pub fn prepareLookupRequest(self: *ManagedHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
-        try self.runtime.svc.prepareLookupRequest(group_id, key, opts);
+    pub fn requestLookupReadIndexForRequest(self: *ManagedHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
+        try self.runtime.svc.requestLookupReadIndexForRequest(group_id, key, opts);
     }
 
-    pub fn prepareScanRead(self: *ManagedHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareScanRead(group_id);
+    pub fn requestScanReadIndex(self: *ManagedHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestScanReadIndex(group_id);
     }
 
-    pub fn prepareScanRequest(
+    pub fn requestScanReadIndexForRequest(
         self: *ManagedHostSimulation,
         group_id: u64,
         from_key: []const u8,
         to_key: []const u8,
         opts: db_types.ScanOptions,
     ) !void {
-        try self.runtime.svc.prepareScanRequest(group_id, from_key, to_key, opts);
+        try self.runtime.svc.requestScanReadIndexForRequest(group_id, from_key, to_key, opts);
     }
 
     pub fn readIndex(self: *ManagedHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.requestReadableLease(group_id, request_ctx);
+        try self.requestReadIndex(group_id, request_ctx);
     }
 
     pub fn proposeConfChangeV2(self: *ManagedHostSimulation, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
@@ -1593,50 +1592,50 @@ pub const ManagedHttpHostSimulation = struct {
         try self.runtime.svc.host.http_host.transferLeader(group_id, transferee);
     }
 
-    pub fn requestReadableLease(self: *ManagedHttpHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.runtime.svc.requestReadableLease(group_id, request_ctx);
+    pub fn requestReadIndex(self: *ManagedHttpHostSimulation, group_id: u64, request_ctx: []const u8) !void {
+        try self.runtime.svc.requestReadIndex(group_id, request_ctx);
     }
 
-    pub fn prepareEnrichmentRead(self: *ManagedHttpHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
-        try self.runtime.svc.prepareEnrichmentRead(group_id, kind);
+    pub fn requestEnrichmentReadIndex(self: *ManagedHttpHostSimulation, group_id: u64, kind: read_gate.EnrichmentReadKind) !void {
+        try self.runtime.svc.requestEnrichmentReadIndex(group_id, kind, .read_index);
     }
 
-    pub fn prepareSearchRead(self: *ManagedHttpHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareSearchRead(group_id);
+    pub fn requestSearchReadIndex(self: *ManagedHttpHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestSearchReadIndex(group_id);
     }
 
-    pub fn prepareSearchRequest(self: *ManagedHttpHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
-        try self.runtime.svc.prepareSearchRequest(group_id, req);
+    pub fn requestSearchReadIndexForRequest(self: *ManagedHttpHostSimulation, group_id: u64, req: db_types.SearchRequest) !void {
+        try self.runtime.svc.requestSearchReadIndexForRequest(group_id, req);
     }
 
-    pub fn featureReads(self: *ManagedHttpHostSimulation) feature_reads.FeatureReads {
-        return self.runtime.svc.featureReads();
+    pub fn enrichmentReadIndexes(self: *ManagedHttpHostSimulation) read_gate.EnrichmentReadIndexRequester {
+        return self.runtime.svc.enrichmentReadIndexes();
     }
 
-    pub fn prepareLookupRead(self: *ManagedHttpHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareLookupRead(group_id);
+    pub fn requestLookupReadIndex(self: *ManagedHttpHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestLookupReadIndex(group_id);
     }
 
-    pub fn prepareLookupRequest(self: *ManagedHttpHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
-        try self.runtime.svc.prepareLookupRequest(group_id, key, opts);
+    pub fn requestLookupReadIndexForRequest(self: *ManagedHttpHostSimulation, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
+        try self.runtime.svc.requestLookupReadIndexForRequest(group_id, key, opts);
     }
 
-    pub fn prepareScanRead(self: *ManagedHttpHostSimulation, group_id: u64) !void {
-        try self.runtime.svc.prepareScanRead(group_id);
+    pub fn requestScanReadIndex(self: *ManagedHttpHostSimulation, group_id: u64) !void {
+        try self.runtime.svc.requestScanReadIndex(group_id);
     }
 
-    pub fn prepareScanRequest(
+    pub fn requestScanReadIndexForRequest(
         self: *ManagedHttpHostSimulation,
         group_id: u64,
         from_key: []const u8,
         to_key: []const u8,
         opts: db_types.ScanOptions,
     ) !void {
-        try self.runtime.svc.prepareScanRequest(group_id, from_key, to_key, opts);
+        try self.runtime.svc.requestScanReadIndexForRequest(group_id, from_key, to_key, opts);
     }
 
     pub fn readIndex(self: *ManagedHttpHostSimulation, group_id: u64, request_ctx: []const u8) !void {
-        try self.requestReadableLease(group_id, request_ctx);
+        try self.requestReadIndex(group_id, request_ctx);
     }
 
     pub fn proposeConfChangeV2(self: *ManagedHttpHostSimulation, group_id: u64, conf_change: raft_engine.core.ConfChangeV2) !void {
@@ -9818,13 +9817,13 @@ test "managed http cluster simulation gates enrichment on explicit readable leas
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_a.state(3014));
     try std.testing.expect(!lease_runtime_a.isActive(3014));
 
-    try cluster.node(0).featureReads().prepareSearch(3014, .{});
+    try cluster.node(0).enrichmentReadIndexes().requestSearch(3014, .read_index);
     var readable_settle: usize = 0;
     while (readable_settle < 64 and !lease_runtime_a.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_a.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_index_requests);
 
     try cluster.node(0).propose(3014, "lease-gated-transfer");
     try std.testing.expect(try waitForLastIndexInCluster(&cluster, &store_b, 2, 64));
@@ -9841,37 +9840,37 @@ test "managed http cluster simulation gates enrichment on explicit readable leas
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3014));
     try std.testing.expect(!lease_runtime_b.isActive(3014));
 
-    try cluster.node(1).featureReads().prepareSearch(3014, .{});
+    try cluster.node(1).enrichmentReadIndexes().requestSearch(3014, .read_index);
     readable_settle = 0;
     while (readable_settle < 64 and !lease_runtime_b.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3014));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3014));
     try std.testing.expect(!lease_runtime_b.isActive(3014));
 
-    try cluster.node(1).featureReads().prepareLookup(3014, "doc:a", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestLookup(3014, .read_index);
     readable_settle = 0;
     while (readable_settle < 64 and !lease_runtime_b.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3014));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3014));
     try std.testing.expect(!lease_runtime_b.isActive(3014));
 
-    try cluster.node(1).featureReads().prepareScan(3014, "doc:a", "doc:z", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestScan(3014, .read_index);
     readable_settle = 0;
     while (readable_settle < 64 and !lease_runtime_b.isActive(3014)) : (readable_settle += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3014));
-    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_index_requests);
 }
 
 test "managed http cluster simulation gates real db enrichment runtimes on read index" {
@@ -10045,13 +10044,13 @@ test "managed http cluster simulation gates real db enrichment runtimes on read 
     try std.testing.expect(!lease_runtime_a.isActive(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(0).featureReads().prepareSearch(3015, .{});
+    try cluster.node(0).enrichmentReadIndexes().requestSearch(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_a.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_a.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(0).serviceMetrics().read_index_requests);
 
     try cluster.node(0).transferLeader(3015, 2);
     try std.testing.expect(try cluster.waitForLeaderId(3015, 2, 64));
@@ -10065,37 +10064,37 @@ test "managed http cluster simulation gates real db enrichment runtimes on read 
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(1).featureReads().prepareSearch(3015, .{});
+    try cluster.node(1).enrichmentReadIndexes().requestSearch(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_b.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 1), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3015));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(1).featureReads().prepareLookup(3015, "doc:a", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestLookup(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_b.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 2), cluster.node(1).serviceMetrics().read_index_requests);
 
     try std.testing.expect(try lease_runtime_b.revokeReadable(3015));
     try std.testing.expectEqual(enrichment_runtime.LeaseReadState.awaiting_readable, lease_runtime_b.state(3015));
     try std.testing.expect(!lease_runtime_b.isActive(3015));
 
-    try cluster.node(1).featureReads().prepareScan(3015, "doc:a", "doc:z", .{});
+    try cluster.node(1).enrichmentReadIndexes().requestScan(3015, .read_index);
     settle_rounds = 0;
     while (settle_rounds < 64 and !lease_runtime_b.isActive(3015)) : (settle_rounds += 1) {
         try cluster.stepAll();
     }
     try std.testing.expect(lease_runtime_b.isActive(3015));
-    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_lease_requests);
+    try std.testing.expectEqual(@as(usize, 3), cluster.node(1).serviceMetrics().read_index_requests);
 }
 
 test "managed http cluster simulation starts real db enrichment runtimes across leader transfer" {

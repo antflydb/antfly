@@ -18,7 +18,6 @@ const data = @import("../data/domain.zig");
 const metadata = @import("../metadata/domain.zig");
 const db_types = @import("../storage/db/types.zig");
 const catalog = @import("catalog.zig");
-const feature_reads = @import("feature_reads.zig");
 const host_mod = @import("host.zig");
 const managed_host = @import("managed_host.zig");
 const metadata_view = @import("metadata_view.zig");
@@ -58,7 +57,7 @@ pub const ManagedServiceMetrics = struct {
     queued_updates: usize = 0,
     applied_updates: usize = 0,
     sync_rounds: usize = 0,
-    read_lease_requests: usize = 0,
+    read_index_requests: usize = 0,
     queued_split_transitions: usize = 0,
     queued_merge_transitions: usize = 0,
     stepped_split_transitions: usize = 0,
@@ -234,22 +233,22 @@ pub const ManagedHostService = struct {
         }
     }
 
-    pub fn requestReadableLease(self: *ManagedHostService, group_id: u64, request_ctx: []const u8) !void {
+    pub fn requestReadIndex(self: *ManagedHostService, group_id: u64, request_ctx: []const u8) !void {
         try self.host.host.readIndex(group_id, request_ctx);
-        self.metrics.read_lease_requests += 1;
+        self.metrics.read_index_requests += 1;
     }
 
-    pub fn readableLeaseRequester(self: *ManagedHostService) read_gate.ReadableLeaseRequester {
+    pub fn readIndexRequester(self: *ManagedHostService) read_gate.ReadIndexRequester {
         return .{
             .ptr = self,
             .vtable = &.{
-                .request_readable_lease = requestReadableLeaseViaRequester,
+                .request_read_index = requestReadIndexViaRequester,
             },
         };
     }
 
-    pub fn featureReads(self: *ManagedHostService) feature_reads.FeatureReads {
-        return feature_reads.FeatureReads.init(self.readableLeaseRequester());
+    pub fn enrichmentReadIndexes(self: *ManagedHostService) read_gate.EnrichmentReadIndexRequester {
+        return read_gate.EnrichmentReadIndexRequester.init(self.readIndexRequester());
     }
 
     pub fn shardOperationAdapter(self: *ManagedHostService) ?shard_ops.ShardOperationAdapter {
@@ -292,56 +291,58 @@ pub const ManagedHostService = struct {
         self.syncTransitionMetrics();
     }
 
-    pub fn prepareEnrichmentRead(
+    pub fn requestEnrichmentReadIndex(
         self: *ManagedHostService,
         group_id: u64,
         kind: read_gate.EnrichmentReadKind,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        const gate = read_gate.EnrichmentReadGate.init(self.readableLeaseRequester());
-        try gate.prepare(group_id, kind, consistency);
+        try self.enrichmentReadIndexes().request(group_id, kind, consistency);
     }
 
-    pub fn prepareSearchRead(self: *ManagedHostService, group_id: u64) !void {
-        try self.prepareEnrichmentRead(group_id, .search, .read_index);
+    pub fn requestSearchReadIndex(self: *ManagedHostService, group_id: u64) !void {
+        try self.requestEnrichmentReadIndex(group_id, .search, .read_index);
     }
 
-    pub fn prepareSearchRequestWithConsistency(
+    pub fn requestSearchReadIndexForRequestWithConsistency(
         self: *ManagedHostService,
         group_id: u64,
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        try self.featureReads().prepareSearchWithConsistency(group_id, req, consistency);
+        _ = req;
+        try self.enrichmentReadIndexes().requestSearch(group_id, consistency);
     }
 
-    pub fn prepareSearchRequest(self: *ManagedHostService, group_id: u64, req: db_types.SearchRequest) !void {
-        try self.prepareSearchRequestWithConsistency(group_id, req, .read_index);
+    pub fn requestSearchReadIndexForRequest(self: *ManagedHostService, group_id: u64, req: db_types.SearchRequest) !void {
+        try self.requestSearchReadIndexForRequestWithConsistency(group_id, req, .read_index);
     }
 
-    pub fn prepareLookupRead(self: *ManagedHostService, group_id: u64) !void {
-        try self.prepareEnrichmentRead(group_id, .lookup, .read_index);
+    pub fn requestLookupReadIndex(self: *ManagedHostService, group_id: u64) !void {
+        try self.requestEnrichmentReadIndex(group_id, .lookup, .read_index);
     }
 
-    pub fn prepareLookupRequestWithConsistency(
+    pub fn requestLookupReadIndexForRequestWithConsistency(
         self: *ManagedHostService,
         group_id: u64,
         key: []const u8,
         opts: db_types.LookupOptions,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        try self.featureReads().prepareLookupWithConsistency(group_id, key, opts, consistency);
+        _ = key;
+        _ = opts;
+        try self.enrichmentReadIndexes().requestLookup(group_id, consistency);
     }
 
-    pub fn prepareLookupRequest(self: *ManagedHostService, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
-        try self.prepareLookupRequestWithConsistency(group_id, key, opts, .read_index);
+    pub fn requestLookupReadIndexForRequest(self: *ManagedHostService, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
+        try self.requestLookupReadIndexForRequestWithConsistency(group_id, key, opts, .read_index);
     }
 
-    pub fn prepareScanRead(self: *ManagedHostService, group_id: u64) !void {
-        try self.prepareEnrichmentRead(group_id, .scan, .read_index);
+    pub fn requestScanReadIndex(self: *ManagedHostService, group_id: u64) !void {
+        try self.requestEnrichmentReadIndex(group_id, .scan, .read_index);
     }
 
-    pub fn prepareScanRequestWithConsistency(
+    pub fn requestScanReadIndexForRequestWithConsistency(
         self: *ManagedHostService,
         group_id: u64,
         from_key: []const u8,
@@ -349,17 +350,20 @@ pub const ManagedHostService = struct {
         opts: db_types.ScanOptions,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        try self.featureReads().prepareScanWithConsistency(group_id, from_key, to_key, opts, consistency);
+        _ = from_key;
+        _ = to_key;
+        _ = opts;
+        try self.enrichmentReadIndexes().requestScan(group_id, consistency);
     }
 
-    pub fn prepareScanRequest(
+    pub fn requestScanReadIndexForRequest(
         self: *ManagedHostService,
         group_id: u64,
         from_key: []const u8,
         to_key: []const u8,
         opts: db_types.ScanOptions,
     ) !void {
-        try self.prepareScanRequestWithConsistency(group_id, from_key, to_key, opts, .read_index);
+        try self.requestScanReadIndexForRequestWithConsistency(group_id, from_key, to_key, opts, .read_index);
     }
 
     pub fn syncPending(self: *ManagedHostService) !managed_host.ManagedSyncResult {
@@ -472,9 +476,9 @@ pub const ManagedHostService = struct {
         self.pending_updates.clearRetainingCapacity();
     }
 
-    fn requestReadableLeaseViaRequester(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+    fn requestReadIndexViaRequester(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
         const self: *ManagedHostService = @ptrCast(@alignCast(ptr));
-        try self.requestReadableLease(group_id, request_ctx);
+        try self.requestReadIndex(group_id, request_ctx);
     }
 
     fn enqueueTransitionUpdates(self: *ManagedHostService, updates: []const metadata_view.MetadataUpdate) !void {
@@ -685,22 +689,22 @@ pub const ManagedHttpHostService = struct {
         }
     }
 
-    pub fn requestReadableLease(self: *ManagedHttpHostService, group_id: u64, request_ctx: []const u8) !void {
+    pub fn requestReadIndex(self: *ManagedHttpHostService, group_id: u64, request_ctx: []const u8) !void {
         try self.host.http_host.readIndex(group_id, request_ctx);
-        self.metrics.read_lease_requests += 1;
+        self.metrics.read_index_requests += 1;
     }
 
-    pub fn readableLeaseRequester(self: *ManagedHttpHostService) read_gate.ReadableLeaseRequester {
+    pub fn readIndexRequester(self: *ManagedHttpHostService) read_gate.ReadIndexRequester {
         return .{
             .ptr = self,
             .vtable = &.{
-                .request_readable_lease = requestReadableLeaseViaRequester,
+                .request_read_index = requestReadIndexViaRequester,
             },
         };
     }
 
-    pub fn featureReads(self: *ManagedHttpHostService) feature_reads.FeatureReads {
-        return feature_reads.FeatureReads.init(self.readableLeaseRequester());
+    pub fn enrichmentReadIndexes(self: *ManagedHttpHostService) read_gate.EnrichmentReadIndexRequester {
+        return read_gate.EnrichmentReadIndexRequester.init(self.readIndexRequester());
     }
 
     pub fn shardOperationAdapter(self: *ManagedHttpHostService) ?shard_ops.ShardOperationAdapter {
@@ -709,56 +713,58 @@ pub const ManagedHttpHostService = struct {
         return null;
     }
 
-    pub fn prepareEnrichmentRead(
+    pub fn requestEnrichmentReadIndex(
         self: *ManagedHttpHostService,
         group_id: u64,
         kind: read_gate.EnrichmentReadKind,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        const gate = read_gate.EnrichmentReadGate.init(self.readableLeaseRequester());
-        try gate.prepare(group_id, kind, consistency);
+        try self.enrichmentReadIndexes().request(group_id, kind, consistency);
     }
 
-    pub fn prepareSearchRead(self: *ManagedHttpHostService, group_id: u64) !void {
-        try self.prepareEnrichmentRead(group_id, .search, .read_index);
+    pub fn requestSearchReadIndex(self: *ManagedHttpHostService, group_id: u64) !void {
+        try self.requestEnrichmentReadIndex(group_id, .search, .read_index);
     }
 
-    pub fn prepareSearchRequestWithConsistency(
+    pub fn requestSearchReadIndexForRequestWithConsistency(
         self: *ManagedHttpHostService,
         group_id: u64,
         req: db_types.SearchRequest,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        try self.featureReads().prepareSearchWithConsistency(group_id, req, consistency);
+        _ = req;
+        try self.enrichmentReadIndexes().requestSearch(group_id, consistency);
     }
 
-    pub fn prepareSearchRequest(self: *ManagedHttpHostService, group_id: u64, req: db_types.SearchRequest) !void {
-        try self.prepareSearchRequestWithConsistency(group_id, req, .read_index);
+    pub fn requestSearchReadIndexForRequest(self: *ManagedHttpHostService, group_id: u64, req: db_types.SearchRequest) !void {
+        try self.requestSearchReadIndexForRequestWithConsistency(group_id, req, .read_index);
     }
 
-    pub fn prepareLookupRead(self: *ManagedHttpHostService, group_id: u64) !void {
-        try self.prepareEnrichmentRead(group_id, .lookup, .read_index);
+    pub fn requestLookupReadIndex(self: *ManagedHttpHostService, group_id: u64) !void {
+        try self.requestEnrichmentReadIndex(group_id, .lookup, .read_index);
     }
 
-    pub fn prepareLookupRequestWithConsistency(
+    pub fn requestLookupReadIndexForRequestWithConsistency(
         self: *ManagedHttpHostService,
         group_id: u64,
         key: []const u8,
         opts: db_types.LookupOptions,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        try self.featureReads().prepareLookupWithConsistency(group_id, key, opts, consistency);
+        _ = key;
+        _ = opts;
+        try self.enrichmentReadIndexes().requestLookup(group_id, consistency);
     }
 
-    pub fn prepareLookupRequest(self: *ManagedHttpHostService, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
-        try self.prepareLookupRequestWithConsistency(group_id, key, opts, .read_index);
+    pub fn requestLookupReadIndexForRequest(self: *ManagedHttpHostService, group_id: u64, key: []const u8, opts: db_types.LookupOptions) !void {
+        try self.requestLookupReadIndexForRequestWithConsistency(group_id, key, opts, .read_index);
     }
 
-    pub fn prepareScanRead(self: *ManagedHttpHostService, group_id: u64) !void {
-        try self.prepareEnrichmentRead(group_id, .scan, .read_index);
+    pub fn requestScanReadIndex(self: *ManagedHttpHostService, group_id: u64) !void {
+        try self.requestEnrichmentReadIndex(group_id, .scan, .read_index);
     }
 
-    pub fn prepareScanRequestWithConsistency(
+    pub fn requestScanReadIndexForRequestWithConsistency(
         self: *ManagedHttpHostService,
         group_id: u64,
         from_key: []const u8,
@@ -766,17 +772,20 @@ pub const ManagedHttpHostService = struct {
         opts: db_types.ScanOptions,
         consistency: read_gate.ReadConsistency,
     ) !void {
-        try self.featureReads().prepareScanWithConsistency(group_id, from_key, to_key, opts, consistency);
+        _ = from_key;
+        _ = to_key;
+        _ = opts;
+        try self.enrichmentReadIndexes().requestScan(group_id, consistency);
     }
 
-    pub fn prepareScanRequest(
+    pub fn requestScanReadIndexForRequest(
         self: *ManagedHttpHostService,
         group_id: u64,
         from_key: []const u8,
         to_key: []const u8,
         opts: db_types.ScanOptions,
     ) !void {
-        try self.prepareScanRequestWithConsistency(group_id, from_key, to_key, opts, .read_index);
+        try self.requestScanReadIndexForRequestWithConsistency(group_id, from_key, to_key, opts, .read_index);
     }
 
     pub fn syncPending(self: *ManagedHttpHostService) !managed_host.ManagedSyncResult {
@@ -926,9 +935,9 @@ pub const ManagedHttpHostService = struct {
         self.metrics.queued_updates = 0;
     }
 
-    fn requestReadableLeaseViaRequester(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+    fn requestReadIndexViaRequester(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
         const self: *ManagedHttpHostService = @ptrCast(@alignCast(ptr));
-        try self.requestReadableLease(group_id, request_ctx);
+        try self.requestReadIndex(group_id, request_ctx);
     }
 
     fn enqueueTransitionUpdates(self: *ManagedHttpHostService, updates: []const metadata_view.MetadataUpdate) !void {

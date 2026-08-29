@@ -2067,7 +2067,7 @@ pub const MetadataService = struct {
                 self.lockRuntime();
                 {
                     defer self.unlockRuntime();
-                    self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
+                    self.raft.requestReadIndex(self.metadata_group_id, request_ctx) catch |err| switch (err) {
                         error.NotLeader => {},
                         else => return err,
                     };
@@ -5319,7 +5319,7 @@ pub const MetadataHttpService = struct {
         snapshot.queued_updates = self.raft.metrics.queued_updates;
         snapshot.applied_updates = self.raft.metrics.applied_updates;
         snapshot.sync_rounds = self.raft.metrics.sync_rounds;
-        snapshot.read_lease_requests = self.raft.metrics.read_lease_requests;
+        snapshot.read_index_requests = self.raft.metrics.read_index_requests;
         self.unlockRuntime();
 
         self.transition_metrics_mutex.lockUncancelable(std.Options.debug_io);
@@ -5515,7 +5515,7 @@ pub const MetadataHttpService = struct {
                 {
                     defer self.unlockRuntime();
                     request_attempts += 1;
-                    self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
+                    self.raft.requestReadIndex(self.metadata_group_id, request_ctx) catch |err| switch (err) {
                         // A follower may not know the leader yet during elections,
                         // restarts, or after endpoint-level load balancing. Keep
                         // driving raft below and retry the same read context until
@@ -14187,7 +14187,7 @@ test "metadata http service linearizable read waits for leader discovery" {
     try std.testing.expect(!svc.raft.host.http_host.host.isLocalLeader(2910));
     try svc.ensureLinearizableRead();
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
-    try std.testing.expect(svc.metrics().read_lease_requests > 0);
+    try std.testing.expect(svc.metrics().read_index_requests > 0);
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

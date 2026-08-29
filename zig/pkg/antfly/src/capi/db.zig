@@ -155,11 +155,11 @@ const ReadableLeaseHook = struct {
     callback_ctx: ?*anyopaque,
     callback: ReadableLeaseHookFn,
 
-    fn requester(self: *const ReadableLeaseHook) raft_mod.ReadableLeaseRequester {
+    fn requester(self: *const ReadableLeaseHook) raft_mod.ReadSafetyBarrier {
         return .{
             .ptr = @constCast(self),
             .vtable = &.{
-                .request_readable_lease = requestReadableLease,
+                .wait_read_safe = waitReadSafe,
             },
         };
     }
@@ -168,7 +168,7 @@ const ReadableLeaseHook = struct {
         return raft_mod.FeatureReads.init(self.requester());
     }
 
-    fn requestReadableLease(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
+    fn waitReadSafe(ptr: *anyopaque, group_id: u64, request_ctx: []const u8) !void {
         const self: *ReadableLeaseHook = @ptrCast(@alignCast(ptr));
         const code = self.callback(
             self.callback_ctx,

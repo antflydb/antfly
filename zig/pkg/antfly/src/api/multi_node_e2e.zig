@@ -27,6 +27,7 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_table_workflow = @import("../metadata/table_workflow.zig");
 const raft_catalog = @import("../raft/catalog.zig");
 const raft_host = @import("../raft/host.zig");
+const read_gate = @import("../raft/read_gate.zig");
 const raft_sim = @import("../raft/sim_harness.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const std_http_executor = @import("../raft/transport/std_http_executor.zig");
@@ -693,7 +694,7 @@ fn startPublicApiServersWithSharedSessionStorePath(
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor.executor(),
         );
@@ -768,7 +769,7 @@ fn startPublicApiServersWithOptionalSessions(
         read_sources[i] = api_table_reads.HostedProvisionedTableReadSource.init(
             roots[i],
             catalog_sources[i].iface(),
-            cluster.cluster.node(i).runtime.svc.readableLeaseRequester(),
+            read_gate.alreadyReadSafeBarrier(),
             routers[i].iface(),
             forward_executor,
         );
