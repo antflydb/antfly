@@ -7078,6 +7078,7 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "replication lifecycle adapter records stable VoprIo safepoints",
+            "replication backfill service rates compose and heal across production snapshot and stream",
             "replication backfill VOPR exact replays every production recovery mode",
         },
     });

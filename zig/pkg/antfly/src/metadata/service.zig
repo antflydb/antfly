@@ -7380,7 +7380,7 @@ test "metadata cdc provider quantum is bounded by observed lease remainder" {
 fn cdcWorkPermit(service: anytype) metadata_replication_backfill.WorkPermit {
     const Service = @TypeOf(service.*);
     const Callbacks = struct {
-        fn checkpoint(ptr: *anyopaque) !void {
+        fn checkpoint(ptr: *anyopaque, _: metadata_replication_backfill.WorkKind) !void {
             const typed: *Service = @ptrCast(@alignCast(ptr));
             try ensureCdcWorkPermit(typed);
         }

@@ -53,13 +53,18 @@ const empty_cutover_provider_identity: foreign_mod.ExactCutoverIntent.ProviderId
 /// A runtime-owned CDC job must continuously prove that it still owns the
 /// replicated reconciliation lease. Provider calls receive a bounded deadline,
 /// while every provider, apply, and status boundary revalidates ownership.
+pub const WorkKind = enum {
+    snapshot_step,
+    stream_step,
+};
+
 pub const WorkPermit = struct {
     ptr: *anyopaque,
-    checkpoint_fn: *const fn (ptr: *anyopaque) anyerror!void,
+    checkpoint_fn: *const fn (ptr: *anyopaque, kind: WorkKind) anyerror!void,
     deadline_fn: *const fn (ptr: *anyopaque) anyerror!u64,
 
-    pub fn checkpoint(self: @This()) !void {
-        try self.checkpoint_fn(self.ptr);
+    pub fn checkpoint(self: @This(), kind: WorkKind) !void {
+        try self.checkpoint_fn(self.ptr, kind);
     }
 
     pub fn deadlineNs(self: @This()) !u64 {
@@ -148,7 +153,7 @@ pub const SnapshotBackfillRunner = struct {
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 
     fn checkpointWork(self: *SnapshotBackfillRunner) !void {
-        if (self.work_permit) |permit| try permit.checkpoint();
+        if (self.work_permit) |permit| try permit.checkpoint(.snapshot_step);
     }
 
     fn workDeadlineNs(self: *SnapshotBackfillRunner) !?u64 {
@@ -1315,7 +1320,7 @@ pub const StreamingReplicationRunner = struct {
     destination_authorizer: ?stored_destination_authorization.Authorizer = null,
 
     fn checkpointWork(self: *StreamingReplicationRunner) !void {
-        if (self.work_permit) |permit| try permit.checkpoint();
+        if (self.work_permit) |permit| try permit.checkpoint(.stream_step);
     }
 
     fn workDeadlineNs(self: *StreamingReplicationRunner) !?u64 {
@@ -3149,7 +3154,7 @@ test "metadata snapshot backfill stops before apply when its work permit is revo
         write_calls: usize = 0,
         deadline_calls: usize = 0,
 
-        fn checkpoint(ptr: *anyopaque) !void {
+        fn checkpoint(ptr: *anyopaque, _: WorkKind) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.permit_valid) return error.CdcWorkLeaseLost;
         }

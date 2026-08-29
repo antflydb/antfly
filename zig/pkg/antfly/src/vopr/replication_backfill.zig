@@ -12,6 +12,7 @@ const foreign = @import("../foreign/source.zig");
 const table_writes = @import("../api/table_write_source.zig");
 const db_types = @import("../storage/db/types.zig");
 const table_manager = @import("../metadata/table_manager.zig");
+const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Hook = struct {
     vopr_io: *vopr.vopr_io.VoprIo,
@@ -87,6 +88,16 @@ pub const Scenario = struct {
     pub const name: []const u8 = "replication-backfill-production-recovery";
     pub const version: u32 = 1;
 
+    const service_node = vopr.service_rate.Node{
+        .id = vopr.id.stable(name, "service-node.source-1"),
+        .name = name ++ ".service-node.source-1",
+    };
+    const snapshot_operation = vopr.service_rate.Operation.named(name ++ ".snapshot-step", 40);
+    const stream_operation = vopr.service_rate.Operation.named(name ++ ".stream-step", 25);
+    const service_operations = [_]vopr.service_rate.Operation{ snapshot_operation, stream_operation };
+    const node_slowdown_fault_id = vopr.id.stable(name, "service-rate.node-slowdown");
+    const snapshot_slowdown_fault_id = vopr.id.stable(name, "service-rate.snapshot-slowdown");
+
     const safe_checkpoint_id = vopr.id.stable(name, "checkpoint-never-ahead-of-apply");
     const no_loss_id = vopr.id.stable(name, "snapshot-stream-no-loss");
     const stale_rejected_id = vopr.id.stable(name, "stale-owner-rejected");
@@ -148,6 +159,10 @@ pub const Scenario = struct {
         apply_calls: u32 = 0,
         lifecycle_calls: u32 = 0,
         max_snapshot_checkpoint: u64 = 0,
+        service_model: ?vopr.service_rate.Model = null,
+        service_port: ?vopr.service_rate.Port = null,
+        service_heal_stage: u8 = 0,
+        service_charges: [2]u64 = .{ 0, 0 },
 
         const config_v1 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v1\",\"key_template\":\"id\"}]";
         const config_v2 = "[{\"type\":\"postgres\",\"dsn\":\"postgres://vopr\",\"postgres_table\":\"users_v2\",\"key_template\":\"id\"}]";
@@ -156,7 +171,35 @@ pub const Scenario = struct {
             for (self.records.items) |record| table_manager.freeReplicationSourceStatus(self.allocator, record);
             self.records.deinit(self.allocator);
             self.registry.deinit(self.allocator);
+            self.service_port = null;
+            if (self.service_model) |*model| model.deinit();
+            self.service_model = null;
             self.sim.deinit();
+        }
+
+        fn enableServiceRates(self: *@This()) !void {
+            self.service_model = try vopr.service_rate.Model.init(
+                self.allocator,
+                &.{service_node},
+                &service_operations,
+            );
+            errdefer {
+                self.service_model.?.deinit();
+                self.service_model = null;
+            }
+            const model = &self.service_model.?;
+            try model.activate(.{
+                .fault_id = node_slowdown_fault_id,
+                .node_id = service_node.id,
+                .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+            });
+            try model.activate(.{
+                .fault_id = snapshot_slowdown_fault_id,
+                .node_id = service_node.id,
+                .operation_id = snapshot_operation.id,
+                .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+            });
+            self.service_port = try model.port(self.sim.io(), service_node.id);
         }
 
         fn table(self: *@This()) table_manager.TableRecord {
@@ -177,9 +220,27 @@ pub const Scenario = struct {
             self.max_snapshot_checkpoint = @max(self.max_snapshot_checkpoint, record.snapshot_offset);
         }
 
-        fn checkpoint(ptr: *anyopaque) !void {
+        fn checkpoint(ptr: *anyopaque, kind: replication.WorkKind) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (!self.lease_valid) return error.CdcWorkLeaseLost;
+            const port = self.service_port orelse return;
+            const operation, const charge_index = switch (kind) {
+                .snapshot_step => .{ snapshot_operation, @as(usize, 0) },
+                .stream_step => .{ stream_operation, @as(usize, 1) },
+            };
+            _ = try port.charge(operation.id, 1);
+            self.service_charges[charge_index] += 1;
+            switch (self.service_heal_stage) {
+                0 => {
+                    try self.service_model.?.heal(snapshot_slowdown_fault_id);
+                    self.service_heal_stage = 1;
+                },
+                1 => {
+                    try self.service_model.?.heal(node_slowdown_fault_id);
+                    self.service_heal_stage = 2;
+                },
+                else => {},
+            }
         }
 
         fn deadline(_: *anyopaque) !u64 {
@@ -474,6 +535,59 @@ pub const Scenario = struct {
         return world.state.complete;
     }
 };
+
+test "replication backfill service rates compose and heal across production snapshot and stream" {
+    var alloc_state: VoprTestAllocator = .init;
+    defer _ = alloc_state.deinit();
+    const alloc = alloc_state.allocator();
+    var world = try Scenario.init(alloc);
+    defer Scenario.deinit(&world, alloc);
+    const state = world.state;
+    try state.enableServiceRates();
+
+    var done = false;
+    var failure: ?anyerror = null;
+    const Task = struct {
+        fn run(target: *Scenario.State, completed: *bool, task_failure: *?anyerror) void {
+            target.run() catch |err| {
+                task_failure.* = err;
+            };
+            completed.* = true;
+        }
+    };
+    const io = state.sim.io();
+    _ = io.async(Task.run, .{ state, &done, &failure });
+
+    var enabled: vopr.transition.List = .{};
+    defer enabled.deinit(alloc);
+    var events: vopr.event.Sink = .{};
+    defer events.deinit(alloc);
+    var transitions: usize = 0;
+    while (!state.sim.scheduler().quiescent()) {
+        enabled.items.clearRetainingCapacity();
+        try state.sim.scheduler().enumerateReady(&enabled, alloc);
+        try enabled.canonicalize();
+        if (enabled.items.items.len == 0) return error.VoprReplicationServiceRateDeadlock;
+        try state.sim.scheduler().executeReady(enabled.items.items[0].id, &events, alloc);
+        transitions += 1;
+        if (transitions > 10_000) return error.VoprReplicationServiceRateTransitionBudgetExceeded;
+    }
+
+    try std.testing.expect(done);
+    if (failure) |err| return err;
+    try std.testing.expect(state.complete);
+    try std.testing.expectEqual(@as(u8, 7), state.applied_mask);
+    try std.testing.expectEqual(@as(u8, 2), state.service_heal_stage);
+    try std.testing.expect(state.service_charges[0] >= 2);
+    try std.testing.expect(state.service_charges[1] >= 1);
+    const usage = try state.service_model.?.nodeUsage(Scenario.service_node.id);
+    try std.testing.expectEqual(state.service_charges[0] + state.service_charges[1], usage.operations);
+    const expected_snapshot_ns = Scenario.snapshot_operation.base_cost_ns * (state.service_charges[0] + 4);
+    const expected_stream_ns = Scenario.stream_operation.base_cost_ns * state.service_charges[1];
+    try std.testing.expectEqual(expected_snapshot_ns + expected_stream_ns, usage.charged_ns);
+    try std.testing.expectEqual(@as(usize, 0), state.service_model.?.active.items.len);
+    try state.sim.ensureNoCapabilityViolation();
+}
 
 test "replication backfill VOPR exact replays every production recovery mode" {
     const backend_ids = vopr.vopr_io.artifactBackendIds();
