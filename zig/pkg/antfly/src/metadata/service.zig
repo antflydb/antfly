@@ -41,6 +41,7 @@ const transition_state = @import("transition_state.zig");
 const raft_catalog = @import("../raft/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
+const raft_runtime_loop = @import("../raft/runtime_loop.zig");
 const raft_service = @import("../raft/service.zig");
 const raft_transition_service = @import("../raft/transition_service.zig");
 const raft_state_machine = @import("../raft/state_machine/mod.zig");
@@ -2074,11 +2075,7 @@ pub const MetadataService = struct {
                 }
                 next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
             }
-            self.lockRuntime();
-            {
-                defer self.unlockRuntime();
-                try self.raft.runRaftRoundOnly();
-            }
+            // The managed progress driver owns Raft ticks; request polling must not advance virtual time.
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             try request.ensureActive();
             platform_clock.Clock.real().sleepMs(1);
@@ -5473,9 +5470,6 @@ pub const MetadataHttpService = struct {
         var next_request_ns: u64 = 0;
         var request_attempts: usize = 0;
         var not_leader_count: usize = 0;
-        var raft_rounds: usize = 0;
-        var slowest_round: raft_engine.runtime.multi_raft.HostRound = .{};
-        var latest_raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         while (platform_time.monotonicNs() < deadline_ns) {
             try request.ensureActive();
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
@@ -5486,10 +5480,10 @@ pub const MetadataHttpService = struct {
                     defer self.unlockRuntime();
                     request_attempts += 1;
                     self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
-                        // A follower may not know the leader yet during elections,
-                        // restarts, or after endpoint-level load balancing. Keep
-                        // driving raft below and retry the same read context until
-                        // the barrier completes or the caller's timeout expires.
+                        // A follower may not know the leader during elections,
+                        // restarts, or after endpoint-level load balancing. Retry
+                        // the same read context until the barrier completes or the
+                        // caller's timeout expires.
                         error.NotLeader => {
                             not_leader_count += 1;
                         },
@@ -5498,30 +5492,25 @@ pub const MetadataHttpService = struct {
                 }
                 next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
             }
-            var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
-            self.lockRuntime();
-            {
-                defer self.unlockRuntime();
-                if (self.raft.pending_updates.items.len > 0) {
-                    _ = try self.raft.syncPendingRaftOnly();
-                } else {
-                    try self.raft.runRaftRoundOnly();
-                }
-                raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
-                latest_raft_diagnostics_snapshot = raft_diagnostics_snapshot;
-            }
-            raft_rounds += 1;
-            if (raft_diagnostics_snapshot.last_runtime_round) |round| {
-                if (round.elapsed_ns > slowest_round.elapsed_ns) slowest_round = round;
-                logMetadataRaftRoundDiagnostics(round);
-            }
+            // The managed progress driver owns Raft ticks; request polling must not advance virtual time.
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             try request.ensureActive();
             platform_clock.Clock.real().sleepMs(1);
         }
         if (self.linearizable_read_tracker.isComplete(request_id)) return;
         try request.ensureActive();
-        self.logLinearizableReadTimeout(request_id, request_attempts, not_leader_count, raft_rounds, slowest_round, latest_raft_diagnostics_snapshot);
+        const snapshot = blk: {
+            self.lockRuntime();
+            defer self.unlockRuntime();
+            break :blk self.raftDiagnosticsSnapshotLocked();
+        };
+        self.logLinearizableReadTimeout(
+            request_id,
+            request_attempts,
+            not_leader_count,
+            snapshot.last_runtime_round orelse .{},
+            snapshot,
+        );
         return error.MetadataLinearizableReadTimeout;
     }
 
@@ -5530,19 +5519,17 @@ pub const MetadataHttpService = struct {
         request_id: u64,
         request_attempts: usize,
         not_leader_count: usize,
-        raft_rounds: usize,
-        slowest_round: raft_engine.runtime.multi_raft.HostRound,
+        latest_round: raft_engine.runtime.multi_raft.HostRound,
         snapshot: MetadataRaftDiagnosticsSnapshot,
     ) void {
-        const ready = slowest_round.slowest_ready_group;
+        const ready = latest_round.slowest_ready_group;
         std.log.warn(
-            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} raft_rounds={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} slowest_round_ms={d} slowest_inbound_ms={d} slowest_tick_ms={d} slowest_drain_ready_ms={d} slowest_drain_scan_ms={d} slowest_apply_flush_ms={d} slowest_transport_flush_ms={d} slowest_transport_advance_ms={d} slowest_ticked_groups={d} slowest_processed_groups={d} slowest_processed_ready_steps={d} slowest_ready_group_id={d} slowest_ready_group_ms={d}",
+            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} latest_round_ms={d} latest_inbound_ms={d} latest_tick_ms={d} latest_drain_ready_ms={d} latest_drain_scan_ms={d} latest_apply_flush_ms={d} latest_transport_flush_ms={d} latest_transport_advance_ms={d} latest_ticked_groups={d} latest_processed_groups={d} latest_processed_ready_steps={d} latest_ready_group_id={d} latest_ready_group_ms={d}",
             .{
                 request_id,
                 self.metadata_group_id,
                 request_attempts,
                 not_leader_count,
-                raft_rounds,
                 snapshot.pending_updates,
                 snapshot.node_id,
                 snapshot.role,
@@ -5553,17 +5540,17 @@ pub const MetadataHttpService = struct {
                 snapshot.applied_index,
                 snapshot.last_index,
                 snapshot.election_elapsed,
-                @divTrunc(slowest_round.elapsed_ns, std.time.ns_per_ms),
-                @divTrunc(slowest_round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
-                @divTrunc(slowest_round.tick_elapsed_ns, std.time.ns_per_ms),
-                @divTrunc(slowest_round.drain_ready_elapsed_ns, std.time.ns_per_ms),
-                @divTrunc(slowest_round.drain_ready_scan_elapsed_ns, std.time.ns_per_ms),
-                @divTrunc(slowest_round.apply_flush_elapsed_ns, std.time.ns_per_ms),
-                @divTrunc(slowest_round.transport_flush_elapsed_ns, std.time.ns_per_ms),
-                @divTrunc(slowest_round.transport_advance_elapsed_ns, std.time.ns_per_ms),
-                slowest_round.ticked_groups,
-                slowest_round.processed_groups,
-                slowest_round.processed_ready_steps,
+                @divTrunc(latest_round.elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(latest_round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(latest_round.tick_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(latest_round.drain_ready_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(latest_round.drain_ready_scan_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(latest_round.apply_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(latest_round.transport_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(latest_round.transport_advance_elapsed_ns, std.time.ns_per_ms),
+                latest_round.ticked_groups,
+                latest_round.processed_groups,
+                latest_round.processed_ready_steps,
                 ready.group_id,
                 @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
             },
@@ -5617,7 +5604,7 @@ pub const MetadataHttpService = struct {
             },
         );
         std.log.warn(
-            "metadata linearizable read timeout ready pressure request_id={d} group_id={d} slowest_ready_messages={d} slowest_ready_committed_entries={d} slowest_ready_unstable_entries={d} slowest_ready_read_states={d} slowest_ready_has_snapshot={} slowest_ready_async_storage={} slowest_ready_processed={} slowest_ready_denied_backpressure={} slowest_ready_denied_transport_capacity={} slowest_ready_denied_apply_capacity={} slowest_ready_denied_snapshot_throttle={} slowest_ready_has_more={}",
+            "metadata linearizable read timeout ready pressure request_id={d} group_id={d} latest_ready_messages={d} latest_ready_committed_entries={d} latest_ready_unstable_entries={d} latest_ready_read_states={d} latest_ready_has_snapshot={} latest_ready_async_storage={} latest_ready_processed={} latest_ready_denied_backpressure={} latest_ready_denied_transport_capacity={} latest_ready_denied_apply_capacity={} latest_ready_denied_snapshot_throttle={} latest_ready_has_more={}",
             .{
                 request_id,
                 ready.group_id,
@@ -13337,48 +13324,70 @@ test "metadata service status reports repair and rebalance counts" {
     try std.testing.expectEqual(@as(u64, 650), rebalance_status.projected_replication_source_last_change_applied_at_ms_max);
 }
 
-test "metadata service admin snapshot captures projected topology and status" {
-    const Factory = struct {
-        alloc: std.mem.Allocator,
-        store: *raft_engine.core.MemoryStorage,
+const LinearizableReadTestFactory = struct {
+    alloc: std.mem.Allocator,
+    store: *raft_engine.core.MemoryStorage,
+    peer_count: usize,
 
-        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
-            return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
-        }
+    fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+        return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
+    }
 
-        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
-            return .{
-                .group = .{
+    fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const peers = try self.alloc.alloc(raft_engine.core.types.NodeId, self.peer_count);
+        for (peers, 0..) |*peer, index| peer.* = record.local_node_id + index;
+        return .{
+            .group = .{
+                .group_id = record.group_id,
+                .local_node_id = record.local_node_id,
+                .raft_config = .{
+                    .id = record.local_node_id,
                     .group_id = record.group_id,
-                    .local_node_id = record.local_node_id,
-                    .raft_config = .{
-                        .id = record.local_node_id,
-                        .group_id = record.group_id,
-                        .peers = peers,
-                        .election_tick = 5,
-                        .heartbeat_tick = 1,
-                        .pre_vote = false,
-                        .check_quorum = true,
-                    },
-                    .storage = self.store.storage(),
+                    .peers = peers,
+                    .election_tick = 5,
+                    .heartbeat_tick = 1,
+                    .pre_vote = false,
+                    .check_quorum = true,
                 },
-                .bootstrap = switch (record.bootstrap_mode) {
-                    .empty => .empty,
-                    .persisted => .persisted,
-                    .fetch_snapshot => .persisted,
-                },
-            };
-        }
+                .storage = self.store.storage(),
+            },
+            .bootstrap = switch (record.bootstrap_mode) {
+                .empty => .empty,
+                .persisted => .persisted,
+                .fetch_snapshot => .persisted,
+            },
+        };
+    }
 
-        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            _ = alloc;
-            self.alloc.free(desc.group.raft_config.peers);
-        }
-    };
+    fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        _ = alloc;
+        self.alloc.free(desc.group.raft_config.peers);
+    }
+};
 
+const LinearizableReadTestProgress = struct {
+    fn metadataService(svc: *MetadataService) raft_runtime_loop.ProgressSource {
+        return .{ .ptr = svc, .run_once = runMetadataService };
+    }
+
+    fn runMetadataService(ptr: *anyopaque) !void {
+        const svc: *MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.runRound();
+    }
+
+    fn metadataHttpService(svc: *MetadataHttpService) raft_runtime_loop.ProgressSource {
+        return .{ .ptr = svc, .run_once = runMetadataHttpService };
+    }
+
+    fn runMetadataHttpService(ptr: *anyopaque) !void {
+        const svc: *MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.runRaftRoundOnly();
+    }
+};
+
+test "metadata service admin snapshot captures projected topology and status" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-snapshot-root", .{tmp.sub_path});
@@ -13388,7 +13397,7 @@ test "metadata service admin snapshot captures projected topology and status" {
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
-    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var factory = LinearizableReadTestFactory{ .alloc = std.testing.allocator, .store = &store, .peer_count = 1 };
 
     var svc = try MetadataService.init(std.testing.allocator, .{
         .host = .{
@@ -13414,7 +13423,18 @@ test "metadata service admin snapshot captures projected topology and status" {
     });
     try svc.campaignMetadataGroup();
     try svc.runRound();
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var progress = raft_runtime_loop.ManagedProgressDriver.init(
+        io_impl.io(),
+        LinearizableReadTestProgress.metadataService(&svc),
+        std.time.ns_per_ms,
+    );
+    defer progress.deinit();
+    try progress.start();
     try svc.ensureLinearizableRead();
+    progress.stop();
 
     try svc.upsertStore(.{ .store_id = 41, .node_id = 1, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 900 });
     try svc.upsertStore(.{ .store_id = 42, .node_id = 2, .role = "data", .live = true, .capacity_bytes = 1024, .available_bytes = 850 });
@@ -13456,6 +13476,55 @@ test "metadata service admin snapshot captures projected topology and status" {
     try std.testing.expectEqualStrings("lsn:0/16B6A50", snapshot.replication_source_statuses[0].prepared_checkpoint);
     try std.testing.expectEqualStrings("lsn:0/16B6B10", snapshot.replication_source_statuses[0].stream_checkpoint);
     try std.testing.expectEqual(@as(usize, 1), snapshot.status.repair_placement_groups);
+}
+
+test "metadata service timed out follower read does not advance raft time" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-service-read-timeout-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-service-read-timeout-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = LinearizableReadTestFactory{ .alloc = std.testing.allocator, .store = &store, .peer_count = 2 };
+
+    var svc = try MetadataService.init(std.testing.allocator, .{
+        .host = .{
+            .local_node_id = 1,
+            .metadata_group_id = 1974,
+            .replica_root_dir = replica_root,
+            .replica_catalog_path = replica_catalog_path,
+        },
+    }, .{
+        .host = .{
+            .host = .{
+                .descriptor_factory = factory.iface(),
+            },
+        },
+    }, .{});
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 1974,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+
+    const before_status = svc.raft.host.host.raftStatus(1974) orelse return error.MissingRaftStatus;
+    const before_runtime = svc.raft.host.host.runtime_host.metricsSnapshot();
+    try std.testing.expectEqual(.follower, before_status.soft.role);
+
+    try std.testing.expectError(error.DeadlineExceeded, svc.ensureLinearizableReadWithContext(.{
+        .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms,
+    }));
+
+    const after_status = svc.raft.host.host.raftStatus(1974) orelse return error.MissingRaftStatus;
+    const after_runtime = svc.raft.host.host.runtime_host.metricsSnapshot();
+    try std.testing.expectEqual(before_status.hard.current_term, after_status.hard.current_term);
+    try std.testing.expectEqual(before_runtime.virtual_time_ms, after_runtime.virtual_time_ms);
 }
 
 test "metadata service committed metadata changes request lifecycle reconcile hook" {
@@ -14007,47 +14076,6 @@ test "metadata http service catalog cache is independent from volatile projectio
 }
 
 test "metadata http service linearizable read waits for leader discovery" {
-    const Factory = struct {
-        alloc: std.mem.Allocator,
-        store: *raft_engine.core.MemoryStorage,
-
-        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
-            return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
-        }
-
-        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
-            return .{
-                .group = .{
-                    .group_id = record.group_id,
-                    .local_node_id = record.local_node_id,
-                    .raft_config = .{
-                        .id = record.local_node_id,
-                        .group_id = record.group_id,
-                        .peers = peers,
-                        .election_tick = 5,
-                        .heartbeat_tick = 1,
-                        .pre_vote = false,
-                        .check_quorum = true,
-                    },
-                    .storage = self.store.storage(),
-                },
-                .bootstrap = switch (record.bootstrap_mode) {
-                    .empty => .empty,
-                    .persisted => .persisted,
-                    .fetch_snapshot => .persisted,
-                },
-            };
-        }
-
-        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            _ = alloc;
-            self.alloc.free(desc.group.raft_config.peers);
-        }
-    };
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-root", .{tmp.sub_path});
@@ -14059,7 +14087,7 @@ test "metadata http service linearizable read waits for leader discovery" {
 
     var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
     defer store.deinit();
-    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var factory = LinearizableReadTestFactory{ .alloc = std.testing.allocator, .store = &store, .peer_count = 1 };
 
     var svc = try MetadataHttpService.init(std.testing.allocator, .{
         .http = .{
@@ -14094,9 +14122,81 @@ test "metadata http service linearizable read waits for leader discovery" {
     });
 
     try std.testing.expect(!svc.raft.host.http_host.host.isLocalLeader(2910));
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var progress = raft_runtime_loop.ManagedProgressDriver.init(
+        io_impl.io(),
+        LinearizableReadTestProgress.metadataHttpService(&svc),
+        std.time.ns_per_ms,
+    );
+    defer progress.deinit();
+    try progress.start();
     try svc.ensureLinearizableRead();
+    progress.stop();
+
     try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
     try std.testing.expect(svc.metrics().read_lease_requests > 0);
+}
+
+test "metadata http service timed out follower read does not advance raft time" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-timeout-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-timeout-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-timeout-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = LinearizableReadTestFactory{ .alloc = std.testing.allocator, .store = &store, .peer_count = 2 };
+
+    var svc = try MetadataHttpService.init(std.testing.allocator, .{
+        .http = .{
+            .host = .{
+                .local_node_id = 1,
+                .metadata_group_id = 2911,
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+            },
+            .transport = .{
+                .snapshot = .{ .root_dir = snapshot_root },
+            },
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .descriptor_factory = factory.iface(),
+                },
+            },
+        },
+    }, .{
+        .observe_local_replica_root = false,
+    });
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 2911,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+
+    const before_status = svc.raft.raftStatus(2911) orelse return error.MissingRaftStatus;
+    const before_runtime = svc.raft.host.http_host.host.runtime_host.metricsSnapshot();
+    try std.testing.expectEqual(.follower, before_status.soft.role);
+
+    try std.testing.expectError(error.DeadlineExceeded, svc.ensureLinearizableReadWithContext(.{
+        .deadline_ns = platform_time.monotonicNs() + 20 * std.time.ns_per_ms,
+    }));
+
+    const after_status = svc.raft.raftStatus(2911) orelse return error.MissingRaftStatus;
+    const after_runtime = svc.raft.host.http_host.host.runtime_host.metricsSnapshot();
+    try std.testing.expectEqual(before_status.hard.current_term, after_status.hard.current_term);
+    try std.testing.expectEqual(before_runtime.virtual_time_ms, after_runtime.virtual_time_ms);
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {
