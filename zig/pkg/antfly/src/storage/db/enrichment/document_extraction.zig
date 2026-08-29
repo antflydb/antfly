@@ -43,6 +43,10 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
                     return error.PdfExtractionUnavailable;
                 }
 
+                pub fn initWithDecodeLimitsAndCancellation(_: Allocator, _: []const u8, _: DecodeLimits, _: CancellationProbe) anyerror!Reader {
+                    return error.PdfExtractionUnavailable;
+                }
+
                 pub fn deinit(_: *Reader) void {}
 
                 pub fn setCancellationProbe(_: *Reader, _: CancellationProbe) void {}
@@ -370,6 +374,10 @@ pub const PdfRenderSession = struct {
 
     pub fn initWithDecodeLimits(alloc: Allocator, pdf_bytes: []const u8, decode_limits: pdf.reader.DecodeLimits) !PdfRenderSession {
         return .{ .parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, pdf_bytes, decode_limits) };
+    }
+
+    pub fn initWithDecodeLimitsAndCancellation(alloc: Allocator, pdf_bytes: []const u8, decode_limits: pdf.reader.DecodeLimits, cancellation: PdfCancellationProbe) !PdfRenderSession {
+        return .{ .parsed = try pdf.reader.Reader.initWithDecodeLimitsAndCancellation(alloc, pdf_bytes, decode_limits, cancellation) };
     }
 
     pub fn deinit(self: *PdfRenderSession) void {

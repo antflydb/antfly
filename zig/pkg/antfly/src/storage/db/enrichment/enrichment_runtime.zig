@@ -5597,10 +5597,9 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         // credit. The RGBA canvas, PNG encoder, and serialized OCR request are
         // additional live bytes and remain on the independently charged
         // working allocator below.
-        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimits(decoder_alloc, source_bytes, config.pdf_decode_limits);
-        pdf_session = &owned_pdf_session.?;
         pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
-        pdf_session.?.setCancellationProbe(pdf_render_deadline.?.probe());
+        owned_pdf_session = try document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(decoder_alloc, source_bytes, config.pdf_decode_limits, pdf_render_deadline.?.probe());
+        pdf_session = &owned_pdf_session.?;
     }
     for (units, 0..) |unit, idx| {
         if (unit.extraction_status == null or !std.mem.eql(u8, unit.extraction_status.?, pending_status)) continue;
@@ -5885,13 +5884,12 @@ fn completeRuntimeDocumentExtractionGeneratedTextUnit(
     unit.ocr_attempted = kind == .ocr;
     const rendered = if (kind == .ocr and std.mem.eql(u8, route_type, "pdf")) blk: {
         unit.ocr_render_dpi = config.ocr_render_dpi;
-        var rendered_page = document_extraction_mod.PdfRenderSession.initWithDecodeLimits(runtime.alloc, source_bytes, config.pdf_decode_limits) catch |err| {
+        var pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+        var rendered_page = document_extraction_mod.PdfRenderSession.initWithDecodeLimitsAndCancellation(runtime.alloc, source_bytes, config.pdf_decode_limits, pdf_render_deadline.probe()) catch |err| {
             try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
             return err;
         };
         defer rendered_page.deinit();
-        var pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
-        rendered_page.setCancellationProbe(pdf_render_deadline.probe());
         const page = rendered_page.renderPagePngAdaptiveAlloc(runtime.alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
             try setRuntimeGeneratedUnitFailureStage(runtime.alloc, unit, kind, "render");
             return err;

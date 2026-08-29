@@ -141,6 +141,12 @@ const BilevelSampleBudget = struct {
         self.remaining_samples -= samples;
         return true;
     }
+
+    fn takeUpTo(self: *BilevelSampleBudget, requested: u64) u64 {
+        const granted = @min(requested, self.remaining_samples);
+        self.remaining_samples -= granted;
+        return granted;
+    }
 };
 
 fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
@@ -1037,16 +1043,31 @@ fn boxFilteredBilevelSample(run: reader.ImageRun, footprint: SourceFootprint, ca
 /// density follows the source footprint up to 16 strata per destination axis,
 /// avoiding the fixed 4x4 alias pattern without permitting adversarial affine
 /// transforms to multiply work without limit.
-fn adaptiveAffineBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64, footprint: SourceFootprint, cancellation: reader.CancellationProbe) ![4]u8 {
-    const samples_x: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_x - footprint.min_x))));
-    const samples_y: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_y - footprint.min_y))));
+fn adaptiveAffineBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64, footprint: SourceFootprint, max_samples: u64, cancellation: reader.CancellationProbe) ![4]u8 {
+    const desired_x: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_x - footprint.min_x))));
+    const desired_y: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_y - footprint.min_y))));
+    const sample_limit: usize = @intCast(@max(1, @min(max_samples, desired_x * desired_y)));
+    var samples_x: usize = 1;
+    var samples_y: usize = 1;
+    // Grow a balanced grid without exceeding the page-wide probe grant.
+    // Endpoint-inclusive strata conservatively retain rules on footprint
+    // boundaries when exact area integration is no longer affordable.
+    while (samples_x * samples_y < sample_limit) {
+        if (samples_x < desired_x and (samples_x <= samples_y or samples_y == desired_y)) {
+            if ((samples_x + 1) * samples_y > sample_limit) break;
+            samples_x += 1;
+        } else if (samples_y < desired_y) {
+            if (samples_x * (samples_y + 1) > sample_limit) break;
+            samples_y += 1;
+        } else break;
+    }
     const sample_count = samples_x * samples_y;
     const sample_count_u32: u32 = @intCast(sample_count);
     var alpha_sum: u32 = 0;
     var premultiplied_sum: [3]u64 = .{ 0, 0, 0 };
     for (0..samples_y) |sample_y_index| for (0..samples_x) |sample_x_index| {
-        const ox = (@as(f64, @floatFromInt(sample_x_index)) + 0.5) / @as(f64, @floatFromInt(samples_x));
-        const oy = (@as(f64, @floatFromInt(sample_y_index)) + 0.5) / @as(f64, @floatFromInt(samples_y));
+        const ox = if (samples_x == 1) 0.5 else @as(f64, @floatFromInt(sample_x_index)) / @as(f64, @floatFromInt(samples_x - 1));
+        const oy = if (samples_y == 1) 0.5 else @as(f64, @floatFromInt(sample_y_index)) / @as(f64, @floatFromInt(samples_y - 1));
         const sample_index = sample_y_index * samples_x + sample_x_index;
         if (sample_index & 63 == 0) try cancellation.check();
         const sample_world_x = world_x + ox - 0.5;
@@ -1104,11 +1125,26 @@ fn coveragePreservingBilevelSample(
         if (bilevel_sample_budget == null or bilevel_sample_budget.?.reserve(source_samples))
             return try boxFilteredBilevelSample(run, footprint, cancellation);
     }
-    // Once exact source integration would exceed the page budget, retain a
-    // deterministic bounded approximation instead of timing out the entire
-    // OCR request. The shared budget prevents repeated XObject placements
-    // from multiplying source-sized work.
-    return try adaptiveAffineBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, footprint, cancellation);
+    const desired_adaptive_samples: u64 = @as(u64, @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_x - footprint.min_x))))) *
+        @as(u64, @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_y - footprint.min_y)))));
+    const granted_samples = if (bilevel_sample_budget) |budget|
+        budget.takeUpTo(desired_adaptive_samples)
+    else
+        desired_adaptive_samples;
+    // Every adaptive probe is charged to the shared page budget. Once it is
+    // empty, one deterministic center probe is the O(1) per-destination-pixel
+    // floor, so repeated XObjects cannot recover an unbounded source scan.
+    var sample = try adaptiveAffineBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, footprint, granted_samples, cancellation);
+    if (run.bilevel_fallback) |fallback| {
+        const covers_source = footprint.min_x <= 0.5 and footprint.min_y <= 0.5 and
+            footprint.max_x >= @as(f64, @floatFromInt(run.width)) - 0.5 and
+            footprint.max_y >= @as(f64, @floatFromInt(run.height)) - 0.5;
+        if (covers_source) {
+            for (0..3) |channel| sample[channel] = @min(sample[channel], fallback[channel]);
+            sample[3] = @max(sample[3], fallback[3]);
+        }
+    }
+    return sample;
 }
 
 fn bilinearImageSample(run: reader.ImageRun, u: f64, v: f64) [4]u8 {
@@ -3601,14 +3637,15 @@ test "OCR bilevel area filter retains thin rules beyond four-to-one minification
 
 test "OCR bilevel exact integration degrades when the shared page budget is exhausted" {
     var rgba = [_]u8{0xff} ** (1024 * 4);
-    rgba[0] = 0;
-    rgba[1] = 0;
-    rgba[2] = 0;
+    rgba[511 * 4] = 0;
+    rgba[511 * 4 + 1] = 0;
+    rgba[511 * 4 + 2] = 0;
     const run: reader.ImageRun = .{
         .rgba = &rgba,
         .width = 1024,
         .height = 1,
         .bilevel = true,
+        .bilevel_fallback = .{ 0xfe, 0xfe, 0xfe, 0xff },
         .ocr_coverage_minify = true,
         .a = 1,
         .b = 0,
@@ -3623,7 +3660,10 @@ test "OCR bilevel exact integration degrades when the shared page budget is exha
     };
     var budget = BilevelSampleBudget{ .remaining_samples = 8 };
     const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 1, 0, 0, 1, .{}, &budget);
-    try std.testing.expectEqual(@as(u64, 8), budget.remaining_samples);
+    try std.testing.expectEqual(@as(u64, 0), budget.remaining_samples);
+    try std.testing.expectEqual(@as(u8, 0xfe), sample[0]);
+    try std.testing.expectEqual(sample[0], sample[1]);
+    try std.testing.expectEqual(sample[0], sample[2]);
     try std.testing.expectEqual(@as(u8, 0xff), sample[3]);
 }
 

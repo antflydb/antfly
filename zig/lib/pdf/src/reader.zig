@@ -191,6 +191,8 @@ const DecodeBudgetAllocator = struct {
     live_bytes: usize,
     max_live_bytes: usize,
     cumulative_growth_bytes: usize = 0,
+    max_cumulative_growth_bytes: usize = std.math.maxInt(usize),
+    rejected_growth_charge: usize = 0,
     limit_exceeded: bool = false,
 
     fn init(backing: Allocator, initial_live_bytes: usize, max_live_bytes: usize) DecodeBudgetAllocator {
@@ -199,6 +201,12 @@ const DecodeBudgetAllocator = struct {
             .live_bytes = initial_live_bytes,
             .max_live_bytes = max_live_bytes,
         };
+    }
+
+    fn initWithCumulativeLimit(backing: Allocator, initial_live_bytes: usize, max_live_bytes: usize, max_cumulative_growth_bytes: usize) DecodeBudgetAllocator {
+        var result = init(backing, initial_live_bytes, max_live_bytes);
+        result.max_cumulative_growth_bytes = max_cumulative_growth_bytes;
+        return result;
     }
 
     fn allocator(self: *DecodeBudgetAllocator) Allocator {
@@ -214,7 +222,11 @@ const DecodeBudgetAllocator = struct {
     }
 
     fn permitsGrowth(self: *DecodeBudgetAllocator, additional_bytes: usize) bool {
-        if (additional_bytes <= self.max_live_bytes -| self.live_bytes) return true;
+        const live_permitted = additional_bytes <= self.max_live_bytes -| self.live_bytes;
+        const cumulative_permitted = additional_bytes <= self.max_cumulative_growth_bytes -| self.cumulative_growth_bytes;
+        if (live_permitted and cumulative_permitted) return true;
+        if (!live_permitted) self.rejected_growth_charge = @max(self.rejected_growth_charge, self.max_live_bytes);
+        if (!cumulative_permitted) self.rejected_growth_charge = @max(self.rejected_growth_charge, self.max_cumulative_growth_bytes);
         self.limit_exceeded = true;
         return false;
     }
@@ -227,7 +239,7 @@ const DecodeBudgetAllocator = struct {
     /// charged at least its complete allowance even when the rejected growth
     /// itself was never handed to the backing allocator.
     fn materializationCharge(self: *const DecodeBudgetAllocator) usize {
-        if (self.limit_exceeded) return @max(self.max_live_bytes, self.cumulative_growth_bytes);
+        if (self.limit_exceeded) return @max(self.rejected_growth_charge, self.cumulative_growth_bytes);
         return self.cumulative_growth_bytes;
     }
 
@@ -1111,6 +1123,7 @@ const CachedPageImage = struct {
     height: u32,
     interpolate: bool,
     bilevel: bool,
+    bilevel_fallback: ?[4]u8,
 };
 
 /// A request-scoped cache for decoded indirect image XObjects. Forms and
@@ -1149,6 +1162,9 @@ pub const ImageRun = struct {
     /// True when the source is one-bit scan/line-art data. OCR rendering may
     /// use coverage-preserving minification without changing exact PDF mode.
     bilevel: bool = false,
+    /// Whole-image premultiplied coverage summary. OCR minification uses this
+    /// only when a full-source footprint cannot afford exact integration.
+    bilevel_fallback: ?[4]u8 = null,
     ocr_coverage_minify: bool = false,
     alpha: u8 = 0xff,
     paint_order: usize = 0,
@@ -1796,6 +1812,7 @@ const PageImage = struct {
     height: u32,
     interpolate: bool = false,
     bilevel: bool = false,
+    bilevel_fallback: ?[4]u8 = null,
 
     fn deinit(self: *PageImage, alloc: Allocator) void {
         alloc.free(self.name);
@@ -1803,6 +1820,31 @@ const PageImage = struct {
         self.* = undefined;
     }
 };
+
+fn buildBilevelFallbackSample(rgba: []const u8, cancellation: CancellationProbe) !?[4]u8 {
+    if (rgba.len == 0 or rgba.len % 4 != 0) return null;
+    const pixel_count = rgba.len / 4;
+    var alpha_sum: u64 = 0;
+    var premultiplied_sum: [3]u64 = .{ 0, 0, 0 };
+    var has_ink = false;
+    for (0..pixel_count) |pixel| {
+        if (pixel & 4095 == 0) try cancellation.check();
+        const offset = pixel * 4;
+        const alpha = rgba[offset + 3];
+        alpha_sum += alpha;
+        for (0..3) |channel| premultiplied_sum[channel] += @as(u64, rgba[offset + channel]) * alpha;
+        has_ink = has_ink or (alpha != 0 and (rgba[offset] < 0xfe or rgba[offset + 1] < 0xfe or rgba[offset + 2] < 0xfe));
+    }
+    if (alpha_sum == 0) return .{ 0, 0, 0, 0 };
+    const count: u64 = @intCast(pixel_count);
+    var result: [4]u8 = .{ 0, 0, 0, @intCast(@max(1, @min(255, (alpha_sum + count / 2) / count))) };
+    for (0..3) |channel| result[channel] = @intCast(@min(255, (premultiplied_sum[channel] + alpha_sum / 2) / alpha_sum));
+    // A sub-byte average must not round a real one-pixel rule back to pure
+    // white, or OCR loses the only evidence that the rule existed.
+    if (has_ink and result[0] == 0xff and result[1] == 0xff and result[2] == 0xff)
+        result[0..3].* = .{ 0xfe, 0xfe, 0xfe };
+    return result;
+}
 
 const PageShading = struct {
     name: []u8,
@@ -1938,6 +1980,7 @@ const PositionedTextOutput = union(enum) {
 const PositionedTextParser = struct {
     alloc: Allocator,
     output: PositionedTextOutput,
+    cancellation: CancellationProbe = .{},
     operands: std.ArrayList(syntax.Object) = .empty,
     retained_names: std.ArrayList(syntax.Object) = .empty,
     state: TextRunState = .{},
@@ -1989,7 +2032,10 @@ const PositionedTextParser = struct {
         var scanner = syntax.Scanner.init(self.alloc, bytes);
         defer scanner.deinit();
 
+        var lexeme_count: usize = 0;
         while (true) {
+            if (lexeme_count & 255 == 0) try self.cancellation.check();
+            lexeme_count +|= 1;
             var lex = (try readContentLexeme(&scanner)) orelse {
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
@@ -2012,6 +2058,7 @@ const PositionedTextParser = struct {
                     forms,
                     &self.paint_order,
                     &self.next_group_id,
+                    self.cancellation,
                     lex.keyword,
                     self.operands.items,
                 );
@@ -2051,9 +2098,21 @@ fn extractImageRunsFromContentAppend(
     gstates: []const PageExtGState,
     forms: []const PageForm,
 ) !void {
+    return try extractImageRunsFromContentAppendCancelable(alloc, out, bytes, images, gstates, forms, .{});
+}
+
+fn extractImageRunsFromContentAppendCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(ImageRun),
+    bytes: []const u8,
+    images: []const PageImage,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    cancellation: CancellationProbe,
+) !void {
     var paint_order: usize = 0;
     var next_group_id: u32 = 1;
-    return try extractImageRunsFromContentAppendWithState(alloc, out, bytes, images, gstates, forms, .{}, &.{}, .nonzero, &paint_order, &next_group_id);
+    return try extractImageRunsFromContentAppendWithStateCancelable(alloc, out, bytes, images, gstates, forms, .{}, &.{}, .nonzero, &paint_order, &next_group_id, cancellation);
 }
 
 fn extractImageRunsFromContentAppendWithState(
@@ -2068,6 +2127,23 @@ fn extractImageRunsFromContentAppendWithState(
     initial_clip_fill_rule: FillRule,
     paint_order: *usize,
     next_group_id: *u32,
+) anyerror!void {
+    return try extractImageRunsFromContentAppendWithStateCancelable(alloc, out, bytes, images, gstates, forms, initial_state, initial_clip_points, initial_clip_fill_rule, paint_order, next_group_id, .{});
+}
+
+fn extractImageRunsFromContentAppendWithStateCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(ImageRun),
+    bytes: []const u8,
+    images: []const PageImage,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    initial_state: GraphicsState,
+    initial_clip_points: []const [2]f64,
+    initial_clip_fill_rule: FillRule,
+    paint_order: *usize,
+    next_group_id: *u32,
+    cancellation: CancellationProbe,
 ) anyerror!void {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
@@ -2092,7 +2168,10 @@ fn extractImageRunsFromContentAppendWithState(
     var current_clip_fill_rule: FillRule = initial_clip_fill_rule;
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
+    var lexeme_count: usize = 0;
     while (true) {
+        if (lexeme_count & 255 == 0) try cancellation.check();
+        lexeme_count +|= 1;
         var lex = (try readContentLexeme(&scanner)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
@@ -2101,7 +2180,7 @@ fn extractImageRunsFromContentAppendWithState(
 
         if (lex == .eof) break;
         if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyImageOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_clip_points, &current_clip_fill_rule, images, gstates, forms, paint_order, next_group_id, lex.keyword, operands.items);
+            try applyImageOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_clip_points, &current_clip_fill_rule, images, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
             for (operands.items) |*obj| obj.deinit(alloc);
             operands.clearRetainingCapacity();
             continue;
@@ -2124,9 +2203,20 @@ fn extractShapeRunsFromContentAppend(
     gstates: []const PageExtGState,
     forms: []const PageForm,
 ) !void {
+    return try extractShapeRunsFromContentAppendCancelable(alloc, out, bytes, gstates, forms, .{});
+}
+
+fn extractShapeRunsFromContentAppendCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(ShapeRun),
+    bytes: []const u8,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    cancellation: CancellationProbe,
+) !void {
     var paint_order: usize = 0;
     var next_group_id: u32 = 1;
-    return try extractShapeRunsFromContentAppendWithState(alloc, out, bytes, gstates, forms, .{}, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id);
+    return try extractShapeRunsFromContentAppendWithStateCancelable(alloc, out, bytes, gstates, forms, .{}, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, cancellation);
 }
 
 fn extractPatternRunsFromContentAppend(
@@ -2137,9 +2227,21 @@ fn extractPatternRunsFromContentAppend(
     gstates: []const PageExtGState,
     forms: []const PageForm,
 ) !void {
+    return try extractPatternRunsFromContentAppendCancelable(alloc, out, bytes, patterns, gstates, forms, .{});
+}
+
+fn extractPatternRunsFromContentAppendCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(PatternRun),
+    bytes: []const u8,
+    patterns: []const PagePattern,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    cancellation: CancellationProbe,
+) !void {
     var paint_order: usize = 0;
     var next_group_id: u32 = 1;
-    return try extractPatternRunsFromContentAppendWithState(alloc, out, bytes, patterns, gstates, forms, .{}, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id);
+    return try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, bytes, patterns, gstates, forms, .{}, &.{}, .nonzero, &.{}, 0, &paint_order, &next_group_id, cancellation);
 }
 
 fn extractShadingRunsFromContentAppend(
@@ -2150,9 +2252,21 @@ fn extractShadingRunsFromContentAppend(
     gstates: []const PageExtGState,
     forms: []const PageForm,
 ) !void {
+    return try extractShadingRunsFromContentAppendCancelable(alloc, out, bytes, shadings, gstates, forms, .{});
+}
+
+fn extractShadingRunsFromContentAppendCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(ShadingRun),
+    bytes: []const u8,
+    shadings: []const PageShading,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    cancellation: CancellationProbe,
+) !void {
     var paint_order: usize = 0;
     var next_group_id: u32 = 1;
-    return try extractShadingRunsFromContentAppendWithState(alloc, out, bytes, shadings, gstates, forms, .{}, &.{}, .nonzero, &paint_order, &next_group_id);
+    return try extractShadingRunsFromContentAppendWithStateCancelable(alloc, out, bytes, shadings, gstates, forms, .{}, &.{}, .nonzero, &paint_order, &next_group_id, cancellation);
 }
 
 fn extractShadingRunsFromContentAppendWithState(
@@ -2167,6 +2281,23 @@ fn extractShadingRunsFromContentAppendWithState(
     initial_clip_fill_rule: FillRule,
     paint_order: *usize,
     next_group_id: *u32,
+) anyerror!void {
+    return try extractShadingRunsFromContentAppendWithStateCancelable(alloc, out, bytes, shadings, gstates, forms, initial_state, initial_clip_points, initial_clip_fill_rule, paint_order, next_group_id, .{});
+}
+
+fn extractShadingRunsFromContentAppendWithStateCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(ShadingRun),
+    bytes: []const u8,
+    shadings: []const PageShading,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    initial_state: GraphicsState,
+    initial_clip_points: []const [2]f64,
+    initial_clip_fill_rule: FillRule,
+    paint_order: *usize,
+    next_group_id: *u32,
+    cancellation: CancellationProbe,
 ) anyerror!void {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
@@ -2191,7 +2322,10 @@ fn extractShadingRunsFromContentAppendWithState(
     var current_clip_fill_rule: FillRule = initial_clip_fill_rule;
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
+    var lexeme_count: usize = 0;
     while (true) {
+        if (lexeme_count & 255 == 0) try cancellation.check();
+        lexeme_count +|= 1;
         var lex = (try readContentLexeme(&scanner)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
@@ -2200,7 +2334,7 @@ fn extractShadingRunsFromContentAppendWithState(
 
         if (lex == .eof) break;
         if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyShadingOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_clip_points, &current_clip_fill_rule, shadings, gstates, forms, paint_order, next_group_id, lex.keyword, operands.items);
+            try applyShadingOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_clip_points, &current_clip_fill_rule, shadings, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
             for (operands.items) |*obj| obj.deinit(alloc);
             operands.clearRetainingCapacity();
             continue;
@@ -2230,6 +2364,25 @@ fn extractPatternRunsFromContentAppendWithState(
     initial_dash_phase: f64,
     paint_order: *usize,
     next_group_id: *u32,
+) anyerror!void {
+    return try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, bytes, patterns, gstates, forms, initial_state, initial_clip_points, initial_clip_fill_rule, initial_dash_array, initial_dash_phase, paint_order, next_group_id, .{});
+}
+
+fn extractPatternRunsFromContentAppendWithStateCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(PatternRun),
+    bytes: []const u8,
+    patterns: []const PagePattern,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    initial_state: GraphicsState,
+    initial_clip_points: []const [2]f64,
+    initial_clip_fill_rule: FillRule,
+    initial_dash_array: []const f64,
+    initial_dash_phase: f64,
+    paint_order: *usize,
+    next_group_id: *u32,
+    cancellation: CancellationProbe,
 ) anyerror!void {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
@@ -2263,7 +2416,10 @@ fn extractPatternRunsFromContentAppendWithState(
     var current_clip_fill_rule: FillRule = initial_clip_fill_rule;
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
+    var lexeme_count: usize = 0;
     while (true) {
+        if (lexeme_count & 255 == 0) try cancellation.check();
+        lexeme_count +|= 1;
         var lex = (try readContentLexeme(&scanner)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
@@ -2272,7 +2428,7 @@ fn extractPatternRunsFromContentAppendWithState(
 
         if (lex == .eof) break;
         if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyPatternOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, patterns, gstates, forms, paint_order, next_group_id, lex.keyword, operands.items);
+            try applyPatternOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, patterns, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
             try clearContentOperandsRetainingNames(alloc, &operands, &retained_names);
             continue;
         }
@@ -2300,6 +2456,24 @@ fn extractShapeRunsFromContentAppendWithState(
     initial_dash_phase: f64,
     paint_order: *usize,
     next_group_id: *u32,
+) anyerror!void {
+    return try extractShapeRunsFromContentAppendWithStateCancelable(alloc, out, bytes, gstates, forms, initial_state, initial_clip_points, initial_clip_fill_rule, initial_dash, initial_dash_phase, paint_order, next_group_id, .{});
+}
+
+fn extractShapeRunsFromContentAppendWithStateCancelable(
+    alloc: Allocator,
+    out: *std.ArrayList(ShapeRun),
+    bytes: []const u8,
+    gstates: []const PageExtGState,
+    forms: []const PageForm,
+    initial_state: GraphicsState,
+    initial_clip_points: []const [2]f64,
+    initial_clip_fill_rule: FillRule,
+    initial_dash: []const f64,
+    initial_dash_phase: f64,
+    paint_order: *usize,
+    next_group_id: *u32,
+    cancellation: CancellationProbe,
 ) anyerror!void {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
@@ -2333,7 +2507,10 @@ fn extractShapeRunsFromContentAppendWithState(
     try current_dash.appendSlice(alloc, initial_dash);
     try current_clip_points.appendSlice(alloc, initial_clip_points);
 
+    var lexeme_count: usize = 0;
     while (true) {
+        if (lexeme_count & 255 == 0) try cancellation.check();
+        lexeme_count +|= 1;
         var lex = (try readContentLexeme(&scanner)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
@@ -2342,7 +2519,7 @@ fn extractShapeRunsFromContentAppendWithState(
 
         if (lex == .eof) break;
         if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
-            try applyShapeOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, gstates, forms, paint_order, next_group_id, lex.keyword, operands.items);
+            try applyShapeOperator(alloc, out, &state, &stack, &current_path, &current_path_closed, &current_dash, &dash_phase, &current_clip_points, &current_clip_fill_rule, gstates, forms, paint_order, next_group_id, cancellation, lex.keyword, operands.items);
             try clearContentOperandsRetainingNames(alloc, &operands, &retained_names);
             continue;
         }
@@ -2541,7 +2718,12 @@ pub const Reader = struct {
     }
 
     pub fn initWithDecodeLimits(alloc: Allocator, bytes: []const u8, decode_limits: DecodeLimits) !Reader {
+        return try initWithDecodeLimitsAndCancellation(alloc, bytes, decode_limits, .{});
+    }
+
+    pub fn initWithDecodeLimitsAndCancellation(alloc: Allocator, bytes: []const u8, decode_limits: DecodeLimits, cancellation: CancellationProbe) !Reader {
         try decode_limits.validate();
+        try cancellation.check();
         if (bytes.len < 10) return error.InvalidPdfHeader;
         // ISO 32000 permits the header to appear anywhere in the first 1024
         // bytes. In practice scanners and download gateways sometimes prefix
@@ -2559,11 +2741,11 @@ pub const Reader = struct {
         // Use the final EOF marker rather than requiring it to be the final
         // non-whitespace bytes. A number of otherwise valid scanned PDFs have
         // a bounded proxy/scanner diagnostic appended after the PDF body.
-        const eof_offset = std.mem.lastIndexOf(u8, bytes, "%%EOF") orelse return error.MissingPdfEof;
+        const eof_offset = (try lastIndexOfCancelable(bytes, "%%EOF", cancellation)) orelse return error.MissingPdfEof;
         if (bytes.len - (eof_offset + "%%EOF".len) > max_trailing_pdf_bytes) return error.TrailingPdfDataTooLarge;
         const trailer_slice = bytes[0 .. eof_offset + "%%EOF".len];
 
-        const startxref_pos = findLastLine(trailer_slice, "startxref") orelse return error.MissingStartXref;
+        const startxref_pos = (try findLastLineCancelable(trailer_slice, "startxref", cancellation)) orelse return error.MissingStartXref;
         const startxref_offset = try parseStartXref(trailer_slice[startxref_pos..]);
         if (startxref_offset >= bytes.len) return error.InvalidStartXref;
 
@@ -2573,7 +2755,8 @@ pub const Reader = struct {
         var trailer: ?syntax.Object = null;
         errdefer if (trailer) |*value| value.deinit(alloc);
 
-        try parseXrefTable(alloc, bytes, startxref_offset, &entries, &trailer, decode_limits);
+        try cancellation.check();
+        try parseXrefTable(alloc, bytes, startxref_offset, &entries, &trailer, decode_limits, cancellation);
         if (trailer == null) return error.MissingTrailer;
 
         const xref_entries = try entries.toOwnedSlice(alloc);
@@ -2615,9 +2798,12 @@ pub const Reader = struct {
             .image_cache = image_cache,
             .encryption = null,
             .decrypted_streams = decrypted_streams,
+            .cancellation = cancellation,
         };
         errdefer reader.deinit();
+        try reader.checkCancellation();
         try reader.initializeEncryption();
+        try reader.checkCancellation();
         return reader;
     }
 
@@ -2843,9 +3029,13 @@ pub const Reader = struct {
     }
 
     fn readDecodedStreamDataWithLimits(self: *const Reader, obj: *const syntax.Object, decode_limits: DecodeLimits) ![]u8 {
+        try self.checkCancellation();
         if (obj.* != .stream) return error.NotAStream;
         const raw = try self.readRawStreamDataWithLimit(obj, decode_limits.max_working_set_bytes);
-        return try decodeStreamFiltersOwnedAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), decode_limits);
+        const decoded = try decodeStreamFiltersOwnedAlloc(self.alloc, raw, obj.get("Filter"), obj.get("DecodeParms"), decode_limits);
+        errdefer self.alloc.free(decoded);
+        try self.checkCancellation();
+        return decoded;
     }
 
     pub fn pageCount(self: *Reader) !usize {
@@ -2890,6 +3080,7 @@ pub const Reader = struct {
         defer for (layout_runs.items) |*run| run.deinit(self.alloc);
         var layout_parser = try PositionedTextParser.init(self.alloc, .{ .layout = &layout_runs }, .{}, &.{}, .nonzero);
         defer layout_parser.deinit();
+        layout_parser.cancellation = self.cancellation;
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -3065,6 +3256,7 @@ pub const Reader = struct {
 
     pub fn extractPageRenderRunsAlloc(self: *Reader, page_num: usize) !PageRenderRuns {
         self.last_render_diagnostics = null;
+        try self.checkCancellation();
         try self.beginImageCacheScope();
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
@@ -3075,37 +3267,44 @@ pub const Reader = struct {
         else
             try self.alloc.alloc(u8, 0);
         defer self.alloc.free(decoded_content);
+        try self.checkCancellation();
 
         const fonts = try self.collectPageFontsAlloc(&page);
         defer {
             for (fonts) |*font| font.deinit(self.alloc);
             self.alloc.free(fonts);
         }
+        try self.checkCancellation();
         const images = try self.collectPageImagesForContentAlloc(&page, decoded_content);
         defer {
             for (images) |*image| image.deinit(self.alloc);
             self.alloc.free(images);
         }
+        try self.checkCancellation();
         const shadings = try self.collectPageShadingsAlloc(&page);
         defer {
             for (shadings) |*shading| shading.deinit(self.alloc);
             self.alloc.free(shadings);
         }
+        try self.checkCancellation();
         const patterns = try self.collectPagePatternsForContentAlloc(&page, decoded_content);
         defer {
             for (patterns) |*pattern| pattern.deinit(self.alloc);
             self.alloc.free(patterns);
         }
+        try self.checkCancellation();
         const gstates = try self.collectPageExtGStatesAlloc(&page);
         defer {
             for (gstates) |*gstate| gstate.deinit(self.alloc);
             self.alloc.free(gstates);
         }
+        try self.checkCancellation();
         const forms = try self.collectPageFormsForContentAlloc(&page, decoded_content);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
+        try self.checkCancellation();
 
         var text_out = std.ArrayList(TextRun).empty;
         defer text_out.deinit(self.alloc);
@@ -3133,10 +3332,12 @@ pub const Reader = struct {
 
         var text_parser = try PositionedTextParser.init(self.alloc, .{ .render = &text_out }, .{}, &.{}, .nonzero);
         defer text_parser.deinit();
+        text_parser.cancellation = self.cancellation;
 
         if (decoded_content.len > 0) {
             try self.extractRenderRunsFromContentAppend(&text_parser, &image_out, &shading_out, &pattern_out, &shape_out, decoded_content, fonts, images, shadings, patterns, gstates, forms);
         }
+        try self.checkCancellation();
         var vector_budget = VectorTextWorkBudget.init(self.render_target, page_box);
         vector_budget.cancellation = self.cancellation;
         try appendVectorTextRenderRunsAlloc(
@@ -3568,7 +3769,7 @@ pub const Reader = struct {
         // A paint operator may be split into several TextRuns (for example by
         // TJ positioning adjustments). Share one allocator so those fragments
         // cannot each claim the full per-operator materialization allowance.
-        var materialization_allocator = DecodeBudgetAllocator.init(alloc, 0, materialization_limit);
+        var materialization_allocator = DecodeBudgetAllocator.initWithCumulativeLimit(alloc, 0, materialization_limit, materialization_limit);
         defer {
             const materialization_charge = materialization_allocator.materializationCharge();
             if (diagnostics) |value| {
@@ -3802,6 +4003,7 @@ pub const Reader = struct {
         errdefer for (out.items) |*run| run.deinit(self.alloc);
         var parser = try PositionedTextParser.init(self.alloc, .{ .render = &out }, .{}, &.{}, .nonzero);
         defer parser.deinit();
+        parser.cancellation = self.cancellation;
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -3824,7 +4026,7 @@ pub const Reader = struct {
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractImageRunsFromContentAppend(self.alloc, &out, decoded, images, gstates, forms);
+        try extractImageRunsFromContentAppendCancelable(self.alloc, &out, decoded, images, gstates, forms, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -3836,7 +4038,7 @@ pub const Reader = struct {
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractShadingRunsFromContentAppend(self.alloc, &out, decoded, shadings, gstates, forms);
+        try extractShadingRunsFromContentAppendCancelable(self.alloc, &out, decoded, shadings, gstates, forms, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -3848,7 +4050,7 @@ pub const Reader = struct {
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractShapeRunsFromContentAppend(self.alloc, &out, decoded, gstates, forms);
+        try extractShapeRunsFromContentAppendCancelable(self.alloc, &out, decoded, gstates, forms, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -3860,7 +4062,7 @@ pub const Reader = struct {
 
         const decoded = try self.readCombinedContentStreamsAlloc(contents);
         defer self.alloc.free(decoded);
-        try extractPatternRunsFromContentAppend(self.alloc, &out, decoded, patterns, gstates, forms);
+        try extractPatternRunsFromContentAppendCancelable(self.alloc, &out, decoded, patterns, gstates, forms, self.cancellation);
 
         return try out.toOwnedSlice(self.alloc);
     }
@@ -3886,16 +4088,16 @@ pub const Reader = struct {
         const has_shading_paint = contentMayContainOperator(decoded, "sh");
 
         if ((images.len > 0 or forms.len > 0) and has_do) {
-            try extractImageRunsFromContentAppend(self.alloc, image_out, decoded, images, gstates, forms);
+            try extractImageRunsFromContentAppendCancelable(self.alloc, image_out, decoded, images, gstates, forms, self.cancellation);
         }
         if ((shadings.len > 0 and has_shading_paint) or (forms.len > 0 and has_do)) {
-            try extractShadingRunsFromContentAppend(self.alloc, shading_out, decoded, shadings, gstates, forms);
+            try extractShadingRunsFromContentAppendCancelable(self.alloc, shading_out, decoded, shadings, gstates, forms, self.cancellation);
         }
         if ((patterns.len > 0 and has_shape_paint) or (forms.len > 0 and has_do)) {
-            try extractPatternRunsFromContentAppend(self.alloc, pattern_out, decoded, patterns, gstates, forms);
+            try extractPatternRunsFromContentAppendCancelable(self.alloc, pattern_out, decoded, patterns, gstates, forms, self.cancellation);
         }
         if (has_shape_paint or (forms.len > 0 and has_do)) {
-            try extractShapeRunsFromContentAppend(self.alloc, shape_out, decoded, gstates, forms);
+            try extractShapeRunsFromContentAppendCancelable(self.alloc, shape_out, decoded, gstates, forms, self.cancellation);
         }
     }
 
@@ -4041,6 +4243,7 @@ pub const Reader = struct {
     }
 
     fn readCombinedContentStreamsAlloc(self: *const Reader, contents: *const syntax.Object) ![]u8 {
+        try self.checkCancellation();
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
             for (streams) |*stream| stream.deinit(self.alloc);
@@ -4068,6 +4271,7 @@ pub const Reader = struct {
         var retained_bytes: usize = 0;
         var retain_decoded = true;
         for (streams, 0..) |*stream, stream_index| {
+            try self.checkCancellation();
             const separator_len: usize = @intFromBool(stream_index != 0);
             const next_len = std.math.add(usize, total_len, separator_len) catch
                 return error.PdfDecodeWorkingSetTooLarge;
@@ -4129,6 +4333,7 @@ pub const Reader = struct {
         errdefer self.alloc.free(combined);
         var cursor: usize = 0;
         for (streams, parts, 0..) |*stream, *part, stream_index| {
+            try self.checkCancellation();
             if (stream_index != 0) {
                 combined[cursor] = '\n';
                 cursor += 1;
@@ -4152,6 +4357,7 @@ pub const Reader = struct {
     }
 
     fn appendContentStreams(self: *const Reader, out: *std.ArrayList(syntax.Object), value: *const syntax.Object, depth: usize, guard: *TraversalGuard) anyerror!void {
+        try self.checkCancellation();
         if (depth > 128) return error.InvalidContents;
         try guard.enter(self.alloc, value, error.InvalidContents);
         var resolved = try self.resolveValue(value);
@@ -4183,6 +4389,7 @@ pub const Reader = struct {
         }
         var run_parser = try PositionedTextParser.init(self.alloc, .{ .render = &runs }, .{}, &.{}, .nonzero);
         defer run_parser.deinit();
+        run_parser.cancellation = self.cancellation;
 
         const streams = try self.collectContentStreamsAlloc(contents);
         defer {
@@ -4220,25 +4427,25 @@ pub const Reader = struct {
     fn extractSingleContentImageRunsAppend(self: *const Reader, out: *std.ArrayList(ImageRun), obj: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm) !void {
         const decoded = try self.readDecodedStreamData(obj);
         defer self.alloc.free(decoded);
-        try extractImageRunsFromContentAppend(self.alloc, out, decoded, images, gstates, forms);
+        try extractImageRunsFromContentAppendCancelable(self.alloc, out, decoded, images, gstates, forms, self.cancellation);
     }
 
     fn extractSingleContentShadingRunsAppend(self: *const Reader, out: *std.ArrayList(ShadingRun), obj: *const syntax.Object, shadings: []const PageShading, gstates: []const PageExtGState, forms: []const PageForm) !void {
         const decoded = try self.readDecodedStreamData(obj);
         defer self.alloc.free(decoded);
-        try extractShadingRunsFromContentAppend(self.alloc, out, decoded, shadings, gstates, forms);
+        try extractShadingRunsFromContentAppendCancelable(self.alloc, out, decoded, shadings, gstates, forms, self.cancellation);
     }
 
     fn extractSingleContentShapeRunsAppend(self: *const Reader, out: *std.ArrayList(ShapeRun), obj: *const syntax.Object, gstates: []const PageExtGState, forms: []const PageForm) !void {
         const decoded = try self.readDecodedStreamData(obj);
         defer self.alloc.free(decoded);
-        try extractShapeRunsFromContentAppend(self.alloc, out, decoded, gstates, forms);
+        try extractShapeRunsFromContentAppendCancelable(self.alloc, out, decoded, gstates, forms, self.cancellation);
     }
 
     fn extractSingleContentPatternRunsAppend(self: *const Reader, out: *std.ArrayList(PatternRun), obj: *const syntax.Object, patterns: []const PagePattern, gstates: []const PageExtGState, forms: []const PageForm) !void {
         const decoded = try self.readDecodedStreamData(obj);
         defer self.alloc.free(decoded);
-        try extractPatternRunsFromContentAppend(self.alloc, out, decoded, patterns, gstates, forms);
+        try extractPatternRunsFromContentAppendCancelable(self.alloc, out, decoded, patterns, gstates, forms, self.cancellation);
     }
 
     fn appendType3RunShapesAlloc(
@@ -4424,10 +4631,11 @@ pub const Reader = struct {
             var next_shading_group = glyph_group_base;
             var next_shape_group = glyph_group_base;
             var next_pattern_group = glyph_group_base;
-            try extractImageRunsFromContentAppendWithState(alloc, &glyph_images, glyph.content, type3.images, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &image_order, &next_image_group);
-            try extractShadingRunsFromContentAppendWithState(alloc, &glyph_shadings, glyph.content, type3.shadings, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &shading_order, &next_shading_group);
-            try extractPatternRunsFromContentAppendWithState(alloc, &glyph_patterns, glyph.content, type3.patterns, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &pattern_order, &next_pattern_group);
-            try extractShapeRunsFromContentAppendWithState(alloc, &glyph_shapes, glyph.content, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &shape_order, &next_shape_group);
+            const cancellation = if (work_budget) |budget| budget.cancellation else CancellationProbe{};
+            try extractImageRunsFromContentAppendWithStateCancelable(alloc, &glyph_images, glyph.content, type3.images, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &image_order, &next_image_group, cancellation);
+            try extractShadingRunsFromContentAppendWithStateCancelable(alloc, &glyph_shadings, glyph.content, type3.shadings, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &shading_order, &next_shading_group, cancellation);
+            try extractPatternRunsFromContentAppendWithStateCancelable(alloc, &glyph_patterns, glyph.content, type3.patterns, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &pattern_order, &next_pattern_group, cancellation);
+            try extractShapeRunsFromContentAppendWithStateCancelable(alloc, &glyph_shapes, glyph.content, type3.gstates, type3.forms, initial_state, initial_clip, run.clip_fill_rule, &.{}, 0, &shape_order, &next_shape_group, cancellation);
             const next_non_text_group_id = @max(@max(next_image_group, next_shading_group), @max(next_shape_group, next_pattern_group));
             var text_parser = try PositionedTextParser.init(alloc, .{ .render = &glyph_text }, .{
                 .alpha = run.alpha,
@@ -4444,6 +4652,7 @@ pub const Reader = struct {
                 .clip_box = run.clip_box,
             }, initial_clip, run.clip_fill_rule);
             defer text_parser.deinit();
+            text_parser.cancellation = cancellation;
             text_parser.next_group_id = glyph_group_base;
             try text_parser.consume(glyph.content, type3.fonts, type3.gstates, type3.forms);
             next_resource_group_id.* = @max(next_non_text_group_id, text_parser.next_group_id);
@@ -5170,6 +5379,7 @@ pub const Reader = struct {
             out.deinit(self.alloc);
         }
         for (resolved_fonts.dict) |entry| {
+            try self.checkCancellation();
             if (entry.value == .obj_ref) {
                 const ptr = entry.value.obj_ref;
                 const cache_key = (@as(u64, ptr.id) << 16) | @as(u64, ptr.gen);
@@ -5220,6 +5430,7 @@ pub const Reader = struct {
             out.deinit(self.alloc);
         }
         for (resolved_fonts.dict) |entry| {
+            try self.checkCancellation();
             var font_obj = try self.resolveValue(&entry.value);
             defer font_obj.deinit(self.alloc);
             if (font_obj != .dict) continue;
@@ -5249,6 +5460,7 @@ pub const Reader = struct {
             out.deinit(self.alloc);
         }
         for (resolved_xobjects.dict) |entry| {
+            try self.checkCancellation();
             if (!references.contains(entry.key)) continue;
             const cache_key: ?u64 = if (entry.value == .obj_ref)
                 (@as(u64, entry.value.obj_ref.id) << 16) | entry.value.obj_ref.gen
@@ -5269,6 +5481,7 @@ pub const Reader = struct {
                     .height = cached.height,
                     .interpolate = cached.interpolate,
                     .bilevel = cached.bilevel,
+                    .bilevel_fallback = cached.bilevel_fallback,
                 });
                 name = null;
                 image_reference_owned = false;
@@ -5296,6 +5509,10 @@ pub const Reader = struct {
             const bilevel = image_mask or bits_per_component == 1 or
                 streamHasFilter(xobj.get("Filter"), "CCITTFaxDecode") or
                 streamHasFilter(xobj.get("Filter"), "JBIG2Decode");
+            const bilevel_fallback = if (bilevel)
+                try buildBilevelFallbackSample(decoded.rgba, self.cancellation)
+            else
+                null;
 
             var shared_reference_owned = true;
             errdefer if (shared_reference_owned) shared.release(self.alloc);
@@ -5308,6 +5525,7 @@ pub const Reader = struct {
                     .height = decoded.height,
                     .interpolate = interpolate,
                     .bilevel = bilevel,
+                    .bilevel_fallback = bilevel_fallback,
                 });
                 cache.retained_bytes = retained_bytes;
                 // The cache owns the initial reference; the PageImage owns a
@@ -5324,6 +5542,7 @@ pub const Reader = struct {
                 .height = decoded.height,
                 .interpolate = interpolate,
                 .bilevel = bilevel,
+                .bilevel_fallback = bilevel_fallback,
             });
             name = null;
             shared_reference_owned = false;
@@ -5341,6 +5560,7 @@ pub const Reader = struct {
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*shading| shading.deinit(self.alloc);
         for (resolved_shadings.dict) |entry| {
+            try self.checkCancellation();
             var shading_obj = try self.resolveValue(&entry.value);
             defer shading_obj.deinit(self.alloc);
             var shading = self.buildPageShading(entry.key, &shading_obj) catch |err| switch (err) {
@@ -5395,6 +5615,7 @@ pub const Reader = struct {
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*pattern| pattern.deinit(self.alloc);
         for (resolved_patterns.dict) |entry| {
+            try self.checkCancellation();
             if (!references.contains(entry.key)) continue;
             var pat = try self.resolveValue(&entry.value);
             defer pat.deinit(self.alloc);
@@ -5530,6 +5751,7 @@ pub const Reader = struct {
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*form| form.deinit(self.alloc);
         for (resolved_xobjects.dict) |entry| {
+            try self.checkCancellation();
             if (!references.contains(entry.key)) continue;
             var xobj = try self.resolveValue(&entry.value);
             defer xobj.deinit(self.alloc);
@@ -5658,6 +5880,7 @@ pub const Reader = struct {
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*form| form.deinit(self.alloc);
         for (resolved_xobjects.dict) |entry| {
+            try self.checkCancellation();
             if (!references.contains(entry.key)) continue;
             var xobj = try self.resolveValue(&entry.value);
             defer xobj.deinit(self.alloc);
@@ -5815,6 +6038,7 @@ pub const Reader = struct {
         ancestor_live_bytes: usize,
         mask_depth: u8,
     ) anyerror!DecodedRgbaImage {
+        try self.checkCancellation();
         const width_i = (obj.get("Width") orelse return error.UnsupportedPdfRendering).asInteger() orelse return error.UnsupportedPdfRendering;
         const height_i = (obj.get("Height") orelse return error.UnsupportedPdfRendering).asInteger() orelse return error.UnsupportedPdfRendering;
         const image_mask = if (obj.get("ImageMask")) |v| switch (v.*) {
@@ -6005,7 +6229,7 @@ pub const Reader = struct {
             defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
             if (resolved_color_space.asName() != null) {
                 if (source_samples) |samples| {
-                    try decodeDeviceColorSpaceToRgba(rgba, render_pixel_count, samples, "DeviceGray", obj.get("Decode"));
+                    try decodeDeviceColorSpaceToRgba(rgba, render_pixel_count, samples, "DeviceGray", obj.get("Decode"), self.cancellation);
                 } else {
                     // Preserve the allocation-free fast path when no operation
                     // needs exact source samples.
@@ -6062,7 +6286,7 @@ pub const Reader = struct {
             var prepared_matte = try self.prepareMatteSoftMaskAlloc(&transparency_plan, source_view, obj.get("Decode"), width, height, context, transparency_live_bytes, mask_depth);
             defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
             if (resolved_color_space.asName()) |color_space| {
-                try decodeDeviceColorSpaceToRgba(rgba, pixel_count, gray, color_space, obj.get("Decode"));
+                try decodeDeviceColorSpaceToRgba(rgba, pixel_count, gray, color_space, obj.get("Decode"), self.cancellation);
             } else if (resolved_color_space == .array) {
                 if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, gray, resolved_color_space.array, obj.get("Decode"))) {
                     // handled
@@ -6346,6 +6570,7 @@ pub const Reader = struct {
                 samples,
                 source_device_space,
                 obj.get("Decode"),
+                self.cancellation,
             );
             try self.applyImageTransparencyPlanAlloc(jpeg_decoded.rgba, width, height, &transparency_plan, source_view, context, transparency_live_bytes, mask_depth, if (prepared_matte) |*prepared| prepared else null);
             return .{
@@ -6406,7 +6631,7 @@ pub const Reader = struct {
             null;
         defer if (prepared_matte) |*prepared| prepared.deinit(self.alloc);
         if (resolved_color_space.asName()) |color_space| {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, obj.get("Decode"));
+            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, obj.get("Decode"), self.cancellation);
         } else if (resolved_color_space == .array) {
             if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, obj.get("Decode"))) {
                 // handled
@@ -6552,6 +6777,7 @@ pub const Reader = struct {
             const samples = try self.alloc.alloc(u8, allocated_compact_len);
             compact = samples;
             for (0..pixel_count) |pixel| {
+                if (pixel & 4095 == 0) try self.checkCancellation();
                 const source_base = pixel * components;
                 const destination_base = pixel * layout.color_count;
                 const alpha = pixels[source_base + layout.alpha];
@@ -6575,19 +6801,20 @@ pub const Reader = struct {
             try self.decodeResolvedImageColorSpaceToRgba(rgba, pixel_count, color_samples, &resolved_color_space, decode_obj);
         } else {
             if (jp2_color.has_icc_profile) {
-                try decodeMatrixIccToRgba(rgba, pixel_count, color_samples, jp2_color.icc_profile);
+                try decodeMatrixIccToRgba(rgba, pixel_count, color_samples, jp2_color.icc_profile, self.cancellation);
             } else {
                 const container_space = try jpeg2000InferredColorSpace(jp2_color, @intCast(color_component_count));
                 switch (container_space) {
-                    .gray => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceGray", decode_obj),
-                    .rgb => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceRGB", decode_obj),
-                    .cmyk => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceCMYK", decode_obj),
-                    .sycc => try decodeJpeg2000SyccToRgba(rgba, pixel_count, color_samples, decode_obj),
+                    .gray => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceGray", decode_obj, self.cancellation),
+                    .rgb => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceRGB", decode_obj, self.cancellation),
+                    .cmyk => try decodeDeviceColorSpaceToRgba(rgba, pixel_count, color_samples, "DeviceCMYK", decode_obj, self.cancellation),
+                    .sycc => try decodeJpeg2000SyccToRgba(rgba, pixel_count, color_samples, decode_obj, self.cancellation),
                 }
             }
         }
         if (alpha_layout) |layout| {
             for (0..pixel_count) |pixel| {
+                if (pixel & 4095 == 0) try self.checkCancellation();
                 rgba[pixel * 4 + 3] = if (alpha_mode == .ignore)
                     0xff
                 else
@@ -6606,7 +6833,7 @@ pub const Reader = struct {
         decode_obj: ?*const syntax.Object,
     ) !void {
         if (resolved_color_space.asName()) |color_space| {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, decode_obj);
+            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, samples, color_space, decode_obj, self.cancellation);
         } else if (resolved_color_space.* == .array) {
             if (try self.tryDecodeIccBasedImageToRgba(rgba, pixel_count, samples, resolved_color_space.array, decode_obj)) {
                 // handled
@@ -6659,9 +6886,11 @@ pub const Reader = struct {
         pixel_count: usize,
         decoded: []const u8,
         decode_obj: ?*const syntax.Object,
+        cancellation: CancellationProbe,
     ) !void {
         if (decoded.len != pixel_count * 3 or rgba.len < pixel_count * 4) return error.UnsupportedPdfRendering;
         for (0..pixel_count) |i| {
+            if (i & 4095 == 0) try cancellation.check();
             const src = i * 3;
             const dst = i * 4;
             const y = applyDecodeUnit(decoded[src], decode_obj, 0);
@@ -6705,7 +6934,7 @@ pub const Reader = struct {
         else
             return error.UnsupportedPdfRendering;
 
-        try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, device_name, decode_obj);
+        try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, device_name, decode_obj, self.cancellation);
         return true;
     }
 
@@ -6729,7 +6958,7 @@ pub const Reader = struct {
     }
 
     fn tryDecodeCalibratedImageToRgba(
-        _: *const Reader,
+        self: *const Reader,
         rgba: []u8,
         pixel_count: usize,
         decoded: []const u8,
@@ -6739,11 +6968,11 @@ pub const Reader = struct {
         if (color_space.len < 2) return false;
         const name = color_space[0].asName() orelse return false;
         if (std.mem.eql(u8, name, "CalGray")) {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, "DeviceGray", decode_obj);
+            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, "DeviceGray", decode_obj, self.cancellation);
             return true;
         }
         if (std.mem.eql(u8, name, "CalRGB")) {
-            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, "DeviceRGB", decode_obj);
+            try decodeDeviceColorSpaceToRgba(rgba, pixel_count, decoded, "DeviceRGB", decode_obj, self.cancellation);
             return true;
         }
         if (std.mem.eql(u8, name, "Lab")) {
@@ -6901,7 +7130,7 @@ pub const Reader = struct {
             }
         }
 
-        try decodeDeviceColorSpaceToRgba(rgba, pixel_count, alt_bytes, alt_name, null);
+        try decodeDeviceColorSpaceToRgba(rgba, pixel_count, alt_bytes, alt_name, null, self.cancellation);
         return true;
     }
 
@@ -6955,11 +7184,13 @@ pub const Reader = struct {
         decoded: []const u8,
         color_space: []const u8,
         decode_obj: ?*const syntax.Object,
+        cancellation: CancellationProbe,
     ) !void {
         if (std.mem.eql(u8, color_space, "DeviceRGB")) {
             if (decoded.len < pixel_count * 3) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
+                if (i & 4095 == 0) try cancellation.check();
                 const src = i * 3;
                 const dst = i * 4;
                 rgba[dst + 0] = applyDecodeByte(decoded[src + 0], decode_obj, 0);
@@ -6973,6 +7204,7 @@ pub const Reader = struct {
             if (decoded.len < pixel_count) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
+                if (i & 4095 == 0) try cancellation.check();
                 const dst = i * 4;
                 const gray = applyDecodeByte(decoded[i], decode_obj, 0);
                 rgba[dst + 0] = gray;
@@ -6986,6 +7218,7 @@ pub const Reader = struct {
             if (decoded.len < pixel_count * 4) return error.UnsupportedPdfRendering;
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
+                if (i & 4095 == 0) try cancellation.check();
                 const src = i * 4;
                 const dst = i * 4;
                 const color = cmykColor(
@@ -7326,6 +7559,7 @@ pub const Reader = struct {
     }
 
     fn buildPageFont(self: *const Reader, name: []const u8, font_obj: *const syntax.Object) !PageFont {
+        try self.checkCancellation();
         var owned_name: ?[]u8 = try self.alloc.dupe(u8, name);
         errdefer if (owned_name) |value| self.alloc.free(value);
         var decoder: ?FontDecoder = try self.buildFontDecoder(font_obj);
@@ -7349,6 +7583,7 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
+        try self.checkCancellation();
         font.type1 = self.buildType1Font(font_obj) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => blk: {
@@ -7356,6 +7591,7 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
+        try self.checkCancellation();
         const built_sfnt = self.buildSfntFont(font_obj, &font.decoder) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => blk: {
@@ -7367,6 +7603,7 @@ pub const Reader = struct {
             .truetype => |truetype| font.truetype = truetype,
             .cff_otf => |cff_otf| font.cff_otf = cff_otf,
         };
+        try self.checkCancellation();
         font.cff = self.buildEmbeddedCffFont(font_obj) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => blk: {
@@ -7374,6 +7611,7 @@ pub const Reader = struct {
                 break :blk null;
             },
         };
+        try self.checkCancellation();
         // Outline builders probe mutually exclusive embedded formats. A
         // missing `glyf` table in OpenType CFF (or missing `CFF ` in
         // TrueType) is not a user-visible fallback when another native
@@ -7461,6 +7699,7 @@ pub const Reader = struct {
             }
         }
         for (resolved_charprocs.dict) |entry| {
+            try self.checkCancellation();
             if (entry.key.len == 1) {
                 const code = entry.key[0];
                 if (code_to_name[code] == null) code_to_name[code] = entry.key;
@@ -7480,6 +7719,7 @@ pub const Reader = struct {
         defer glyphs.deinit(self.alloc);
         errdefer for (glyphs.items) |*glyph| glyph.deinit(self.alloc);
         for (code_to_name, 0..) |maybe_name, code| {
+            if (code & 31 == 0) try self.checkCancellation();
             const glyph_name = maybe_name orelse continue;
             const proc_obj = resolved_charprocs.get(glyph_name) orelse continue;
             var resolved_proc = try self.resolveValue(proc_obj);
@@ -7522,6 +7762,7 @@ pub const Reader = struct {
                 var resource_content = std.ArrayList(u8).empty;
                 defer resource_content.deinit(self.alloc);
                 for (font.glyphs) |glyph| {
+                    try self.checkCancellation();
                     const glyph_len = std.math.add(usize, glyph.content.len, 1) catch return error.PdfDecodeWorkingSetTooLarge;
                     const next_len = std.math.add(usize, resource_content.items.len, glyph_len) catch return error.PdfDecodeWorkingSetTooLarge;
                     if (next_len > self.decode_limits.max_working_set_bytes / 2) return error.PdfDecodeWorkingSetTooLarge;
@@ -7554,10 +7795,12 @@ pub const Reader = struct {
     }
 
     fn buildSfntFontBudgeted(self: *const Reader, font_obj: *const syntax.Object, decoder: *const FontDecoder) !?BuiltSfntFont {
+        try self.checkCancellation();
         const bytes = try self.readEmbeddedSfntAlloc(font_obj) orelse return null;
         errdefer self.alloc.free(bytes);
         var sfnt = try font_lib.sfnt.Font.init(self.alloc, bytes);
         errdefer sfnt.deinit(self.alloc);
+        try self.checkCancellation();
         const head = try sfnt.head();
 
         if (sfnt.findTable(.{ 'g', 'l', 'y', 'f' }) != null) {
@@ -8207,10 +8450,12 @@ pub const Reader = struct {
     }
 
     fn buildType1FontBudgeted(self: *const Reader, font_obj: *const syntax.Object) !?Type1Font {
+        try self.checkCancellation();
         const raw_bytes = try self.readEmbeddedType1Alloc(font_obj) orelse return null;
         defer self.alloc.free(raw_bytes);
         const bytes = try normalizeType1ProgramAlloc(self.alloc, raw_bytes);
         defer self.alloc.free(bytes);
+        try self.checkCancellation();
 
         const len_iv = try parseType1LenIV(self.alloc, bytes);
         const local_subrs = try parseType1LocalSubrsAlloc(self.alloc, bytes, len_iv);
@@ -8218,6 +8463,7 @@ pub const Reader = struct {
             for (local_subrs) |subr| self.alloc.free(subr);
             if (local_subrs.len > 0) self.alloc.free(local_subrs);
         }
+        try self.checkCancellation();
 
         var code_to_name = [_]?[]const u8{null} ** 256;
         var base_encoding = text_encoding.NamedEncoding.standard;
@@ -8269,6 +8515,7 @@ pub const Reader = struct {
             for (glyphs) |*glyph| glyph.deinit(self.alloc);
             if (glyphs.len > 0) self.alloc.free(glyphs);
         }
+        try self.checkCancellation();
         return .{
             .local_subrs = local_subrs,
             .glyphs = glyphs,
@@ -8361,7 +8608,10 @@ pub const Reader = struct {
         var scanner = syntax.Scanner.init(self.alloc, decoded);
         defer scanner.deinit();
 
+        var lexeme_count: usize = 0;
         while (true) {
+            if (lexeme_count & 255 == 0) try self.checkCancellation();
+            lexeme_count +|= 1;
             var lex = try scanner.readLexeme();
             defer syntax.Scanner.freeLexeme(self.alloc, &lex);
             if (lex == .eof) break;
@@ -8504,6 +8754,29 @@ fn findLastLine(bytes: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+fn lastIndexOfCancelable(bytes: []const u8, needle: []const u8, cancellation: CancellationProbe) !?usize {
+    if (needle.len == 0) return bytes.len;
+    if (needle.len > bytes.len) return null;
+    var i = bytes.len - needle.len;
+    while (true) {
+        if (i & ((1 << 20) - 1) == 0) try cancellation.check();
+        if (std.mem.eql(u8, bytes[i .. i + needle.len], needle)) return i;
+        if (i == 0) break;
+        i -= 1;
+    }
+    return null;
+}
+
+fn findLastLineCancelable(bytes: []const u8, needle: []const u8, cancellation: CancellationProbe) !?usize {
+    var i = bytes.len;
+    while (i > 0) {
+        i -= 1;
+        if (i & ((1 << 20) - 1) == 0) try cancellation.check();
+        if ((i == 0 or bytes[i - 1] == '\n' or bytes[i - 1] == '\r') and std.mem.startsWith(u8, bytes[i..], needle)) return i;
+    }
+    return null;
+}
+
 fn parseStartXref(bytes: []const u8) !usize {
     if (!std.mem.startsWith(u8, bytes, "startxref")) return error.MissingStartXref;
 
@@ -8529,10 +8802,12 @@ fn parseXrefTable(
     entries: *std.ArrayList(XrefEntry),
     trailer_out: *?syntax.Object,
     decode_limits: DecodeLimits,
+    cancellation: CancellationProbe,
 ) anyerror!void {
+    try cancellation.check();
     var visited: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer visited.deinit(alloc);
-    return try parseXrefTableGuarded(alloc, bytes, offset, entries, trailer_out, &visited, decode_limits);
+    return try parseXrefTableGuarded(alloc, bytes, offset, entries, trailer_out, &visited, decode_limits, cancellation);
 }
 
 fn parseXrefTableGuarded(
@@ -8543,7 +8818,9 @@ fn parseXrefTableGuarded(
     trailer_out: *?syntax.Object,
     visited: *std.AutoHashMapUnmanaged(usize, void),
     decode_limits: DecodeLimits,
+    cancellation: CancellationProbe,
 ) anyerror!void {
+    try cancellation.check();
     if (offset >= bytes.len) return error.InvalidStartXref;
     const visit = try visited.getOrPut(alloc, offset);
     if (visit.found_existing) return error.CyclicXref;
@@ -8551,11 +8828,12 @@ fn parseXrefTableGuarded(
     var cursor = offset;
     skipPdfWs(bytes, &cursor);
     if (!std.mem.startsWith(u8, bytes[cursor..], "xref")) {
-        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out, visited, decode_limits);
+        return try parseXrefStream(alloc, bytes, cursor, entries, trailer_out, visited, decode_limits, cancellation);
     }
     cursor += "xref".len;
 
     while (true) {
+        try cancellation.check();
         skipPdfWs(bytes, &cursor);
         if (cursor >= bytes.len) return error.UnexpectedEof;
         if (std.mem.startsWith(u8, bytes[cursor..], "trailer")) {
@@ -8567,6 +8845,7 @@ fn parseXrefTableGuarded(
         const start, const count = try parseSectionHeader(header_line);
         var i: usize = 0;
         while (i < count) : (i += 1) {
+            if (i & 1023 == 0) try cancellation.check();
             const entry_line = try readLine(bytes, &cursor);
             const index = std.math.add(usize, start, i) catch return error.MalformedXrefTable;
             const parsed = try parseXrefEntry(index, entry_line);
@@ -8586,7 +8865,7 @@ fn parseXrefTableGuarded(
     }
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited, decode_limits);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited, decode_limits, cancellation);
         }
     }
 }
@@ -8599,7 +8878,9 @@ fn parseXrefStream(
     trailer_out: *?syntax.Object,
     visited: *std.AutoHashMapUnmanaged(usize, void),
     decode_limits: DecodeLimits,
+    cancellation: CancellationProbe,
 ) anyerror!void {
+    try cancellation.check();
     if (offset >= bytes.len) return error.InvalidStartXref;
 
     var scanner = syntax.Scanner.initWithOffset(alloc, bytes[offset..], offset);
@@ -8624,13 +8905,14 @@ fn parseXrefStream(
 
     const decoded = try decodeStreamDataAlloc(alloc, bytes, xref_stream, decode_limits);
     defer alloc.free(decoded);
+    try cancellation.check();
 
     const widths = try parseXrefWidths(xref_stream.get("W") orelse return error.MalformedXrefStream);
-    try parseXrefStreamEntries(alloc, decoded, widths, xref_stream, entries);
+    try parseXrefStreamEntries(alloc, decoded, widths, xref_stream, entries, cancellation);
 
     if (trailer.get("Prev")) |prev_value| {
         if (prev_value.asInteger()) |prev| {
-            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited, decode_limits);
+            if (prev >= 0) try parseXrefTableGuarded(alloc, bytes, @intCast(prev), entries, trailer_out, visited, decode_limits, cancellation);
         }
     }
 }
@@ -9114,7 +9396,9 @@ fn parseXrefStreamEntries(
     widths: [3]usize,
     stream_obj: *const syntax.Object,
     entries: *std.ArrayList(XrefEntry),
+    cancellation: CancellationProbe,
 ) !void {
+    try cancellation.check();
     const first_two_widths = std.math.add(usize, widths[0], widths[1]) catch return error.MalformedXrefStream;
     const total_width = std.math.add(usize, first_two_widths, widths[2]) catch return error.MalformedXrefStream;
     if (total_width == 0 or decoded.len % total_width != 0) return error.MalformedXrefStream;
@@ -9126,6 +9410,7 @@ fn parseXrefStreamEntries(
         if (index_obj.* != .array or index_obj.array.len % 2 != 0) return error.MalformedXrefStream;
         var i: usize = 0;
         while (i < index_obj.array.len) : (i += 2) {
+            if (i & 1023 == 0) try cancellation.check();
             const start = index_obj.array[i].asInteger() orelse return error.MalformedXrefStream;
             const count = index_obj.array[i + 1].asInteger() orelse return error.MalformedXrefStream;
             if (start < 0 or count < 0) return error.MalformedXrefStream;
@@ -9156,6 +9441,7 @@ fn parseXrefStreamEntries(
     for (spans.items) |span| {
         var i: usize = 0;
         while (i < span.count) : (i += 1) {
+            if (i & 1023 == 0) try cancellation.check();
             const obj_id_usize = std.math.add(usize, span.start, i) catch return error.MalformedXrefStream;
             const obj_id = std.math.cast(u32, obj_id_usize) orelse return error.MalformedXrefStream;
             const entry_type = if (widths[0] == 0) @as(u64, 1) else readBigEndianInt(decoded[cursor .. cursor + widths[0]]);
@@ -10812,6 +11098,7 @@ fn applyTextRunOperator(
     forms: []const PageForm,
     paint_order: *usize,
     next_group_id: *u32,
+    cancellation: CancellationProbe,
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
@@ -11296,6 +11583,7 @@ fn applyTextRunOperator(
         const nested_clip = if (out.isLayout()) &.{} else current_clip_points.items;
         var nested_parser = try PositionedTextParser.init(alloc, out, nested_state, nested_clip, current_clip_fill_rule.*);
         defer nested_parser.deinit();
+        nested_parser.cancellation = cancellation;
         nested_parser.paint_order = paint_order.*;
         nested_parser.next_group_id = next_group_id.*;
         try nested_parser.consume(form.content, form.fonts, form.gstates, form.forms);
@@ -11326,6 +11614,7 @@ fn applyImageOperator(
     forms: []const PageForm,
     paint_order: *usize,
     next_group_id: *u32,
+    cancellation: CancellationProbe,
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
@@ -11479,6 +11768,7 @@ fn applyImageOperator(
                 .height = image.height,
                 .interpolate = image.interpolate,
                 .bilevel = image.bilevel,
+                .bilevel_fallback = image.bilevel_fallback,
                 .alpha = state.fill_alpha,
                 .paint_order = paint_order.*,
                 .blend_mode = state.blend_mode,
@@ -11512,7 +11802,7 @@ fn applyImageOperator(
             nested_state.group_knockout = form.group_knockout;
             next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
-        try extractImageRunsFromContentAppendWithState(alloc, out, form.content, form.images, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id);
+        try extractImageRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.images, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id, cancellation);
     }
 }
 
@@ -11531,6 +11821,7 @@ fn applyShapeOperator(
     forms: []const PageForm,
     paint_order: *usize,
     next_group_id: *u32,
+    cancellation: CancellationProbe,
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
@@ -11603,7 +11894,7 @@ fn applyShapeOperator(
             nested_state.group_knockout = form.group_knockout;
             next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
-        try extractShapeRunsFromContentAppendWithState(alloc, out, form.content, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id);
+        try extractShapeRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id, cancellation);
         return;
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
@@ -11923,6 +12214,7 @@ fn applyShadingOperator(
     forms: []const PageForm,
     paint_order: *usize,
     next_group_id: *u32,
+    cancellation: CancellationProbe,
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
@@ -12051,7 +12343,7 @@ fn applyShadingOperator(
             nested_state.group_knockout = form.group_knockout;
             next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
-        try extractShadingRunsFromContentAppendWithState(alloc, out, form.content, form.shadings, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id);
+        try extractShadingRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.shadings, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, paint_order, next_group_id, cancellation);
         return;
     }
     if (std.mem.eql(u8, op, "sh") and operands.len >= 1 and operands[operands.len - 1] == .name) {
@@ -12106,6 +12398,7 @@ fn applyPatternOperator(
     forms: []const PageForm,
     paint_order: *usize,
     next_group_id: *u32,
+    cancellation: CancellationProbe,
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
@@ -12172,7 +12465,7 @@ fn applyPatternOperator(
             nested_state.group_knockout = form.group_knockout;
             next_group_id.* = std.math.add(u32, next_group_id.*, 1) catch return error.InvalidRenderGroup;
         }
-        try extractPatternRunsFromContentAppendWithState(alloc, out, form.content, form.patterns, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id);
+        try extractPatternRunsFromContentAppendWithStateCancelable(alloc, out, form.content, form.patterns, form.gstates, form.forms, nested_state, current_clip_points.items, current_clip_fill_rule.*, current_dash.items, dash_phase.*, paint_order, next_group_id, cancellation);
         return;
     }
     if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
@@ -14195,7 +14488,8 @@ const IccToneCurve = union(enum) {
     }
 };
 
-fn decodeMatrixIccToRgba(rgba: []u8, pixel_count: usize, samples: []const u8, profile: []const u8) !void {
+fn decodeMatrixIccToRgba(rgba: []u8, pixel_count: usize, samples: []const u8, profile: []const u8, cancellation: CancellationProbe) !void {
+    try cancellation.check();
     if (profile.len < 132 or !std.mem.eql(u8, profile[36..40], "acsp")) return error.UnsupportedPdfRendering;
     const declared_size = readBeU32(profile, 0);
     if (declared_size < 132 or declared_size > profile.len) return error.UnsupportedPdfRendering;
@@ -14213,6 +14507,7 @@ fn decodeMatrixIccToRgba(rgba: []u8, pixel_count: usize, samples: []const u8, pr
         const g_trc = try iccToneCurveTag(bounded_profile, "gTRC");
         const b_trc = try iccToneCurveTag(bounded_profile, "bTRC");
         for (0..pixel_count) |pixel| {
+            if (pixel & 4095 == 0) try cancellation.check();
             const src = pixel * 3;
             const r = try r_trc.evaluate(@as(f64, @floatFromInt(samples[src])) / 255.0);
             const g = try g_trc.evaluate(@as(f64, @floatFromInt(samples[src + 1])) / 255.0);
@@ -14230,6 +14525,7 @@ fn decodeMatrixIccToRgba(rgba: []u8, pixel_count: usize, samples: []const u8, pr
         const white = try iccXyzTag(bounded_profile, "wtpt");
         const curve = try iccToneCurveTag(bounded_profile, "kTRC");
         for (0..pixel_count) |pixel| {
+            if (pixel & 4095 == 0) try cancellation.check();
             const gray = try curve.evaluate(@as(f64, @floatFromInt(samples[pixel])) / 255.0);
             writeIccXyzPixel(rgba[pixel * 4 ..][0..4], .{ gray * white[0], gray * white[1], gray * white[2] });
         }
@@ -14720,6 +15016,66 @@ test "reader init parses basic header and startxref" {
     try std.testing.expect(reader.trailerGet("Root") != null);
 }
 
+test "reader initialization observes cancellation before parsing document state" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    const cancellation = CancellationProbe{ .is_cancelled_fn = Cancelled.check };
+    try std.testing.expectError(
+        error.Canceled,
+        Reader.initWithDecodeLimitsAndCancellation(std.testing.allocator, "%PDF-1.7\n", .{}, cancellation),
+    );
+}
+
+test "decode allocator enforces cumulative churn before allocating" {
+    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(std.testing.allocator, 0, 8, 12);
+    const bounded = budget.allocator();
+    const first = try bounded.alloc(u8, 8);
+    bounded.free(first);
+    try std.testing.expectError(error.OutOfMemory, bounded.alloc(u8, 5));
+    try std.testing.expect(budget.limit_exceeded);
+    try std.testing.expectEqual(@as(usize, 8), budget.cumulative_growth_bytes);
+    try std.testing.expectEqual(@as(usize, 12), budget.materializationCharge());
+}
+
+test "content parsing and pixel conversion observe cancellation" {
+    const CancelAfterFirstCheck = struct {
+        checks: usize = 0,
+
+        fn check(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return self.checks > 1;
+        }
+    };
+    var content_cancel = CancelAfterFirstCheck{};
+    const content_cancellation = CancellationProbe{
+        .context = &content_cancel,
+        .is_cancelled_fn = CancelAfterFirstCheck.check,
+    };
+    var shapes = std.ArrayList(ShapeRun).empty;
+    defer shapes.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.Canceled,
+        extractShapeRunsFromContentAppendCancelable(std.testing.allocator, &shapes, "0 " ** 300 ++ "m", &.{}, &.{}, content_cancellation),
+    );
+    try std.testing.expectEqual(@as(usize, 2), content_cancel.checks);
+
+    var pixel_cancel = CancelAfterFirstCheck{};
+    const pixel_cancellation = CancellationProbe{
+        .context = &pixel_cancel,
+        .is_cancelled_fn = CancelAfterFirstCheck.check,
+    };
+    var rgba: [4097 * 4]u8 = undefined;
+    try std.testing.expectError(
+        error.Canceled,
+        Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &([_]u8{0} ** 4097), "DeviceGray", null, pixel_cancellation),
+    );
+    try std.testing.expectEqual(@as(usize, 2), pixel_cancel.checks);
+}
+
 test "reader init accepts bounded bytes before header and after final eof" {
     const alloc = std.testing.allocator;
     const header = "\xbe\xad%PDF-1.7\r\n";
@@ -14774,7 +15130,7 @@ test "xref parser rejects a cyclic Prev chain" {
 
     try std.testing.expectError(
         error.CyclicXref,
-        parseXrefTable(alloc, bytes, 0, &entries, &trailer, .{}),
+        parseXrefTable(alloc, bytes, 0, &entries, &trailer, .{}, .{}),
     );
 }
 
@@ -15652,7 +16008,7 @@ test "xref trailer is deinitialized once when recursive Prev parsing fails" {
 
     try std.testing.expectError(
         error.ExpectedTrailerDict,
-        parseXrefTable(alloc, bytes, invalid_previous.len, &entries, &trailer, .{}),
+        parseXrefTable(alloc, bytes, invalid_previous.len, &entries, &trailer, .{}, .{}),
     );
 }
 
@@ -15781,7 +16137,7 @@ test "xref parser rejects numeric fields that exceed internal representations" {
     // ObjRef.gen and must be rejected instead of trapping at @intCast.
     try std.testing.expectError(
         error.MalformedXrefStream,
-        parseXrefStreamEntries(std.testing.allocator, &.{ 1, 0, 1, 0, 0 }, .{ 1, 1, 3 }, &stream_object, &entries),
+        parseXrefStreamEntries(std.testing.allocator, &.{ 1, 0, 1, 0, 0 }, .{ 1, 1, 3 }, &stream_object, &entries, .{}),
     );
 }
 
@@ -19537,7 +19893,7 @@ test "JP2 matrix ICC gray profile converts through PCS" {
     Write.u16be(&profile, 188, 256);
 
     var rgba: [8]u8 = undefined;
-    try decodeMatrixIccToRgba(&rgba, 2, &.{ 0, 255 }, &profile);
+    try decodeMatrixIccToRgba(&rgba, 2, &.{ 0, 255 }, &profile, .{});
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255 }, rgba[0..4]);
     try std.testing.expect(rgba[4] >= 250 and rgba[5] >= 250 and rgba[6] >= 250);
     try std.testing.expectEqual(@as(u8, 255), rgba[7]);
@@ -19546,7 +19902,7 @@ test "JP2 matrix ICC gray profile converts through PCS" {
 test "JP2 sYCC conversion uses chroma rather than treating channels as RGB" {
     var rgba: [8]u8 = undefined;
     const samples = [_]u8{ 128, 128, 128, 76, 85, 255 };
-    try Reader.decodeJpeg2000SyccToRgba(&rgba, 2, &samples, null);
+    try Reader.decodeJpeg2000SyccToRgba(&rgba, 2, &samples, null, .{});
     try std.testing.expectEqualSlices(u8, &.{ 128, 128, 128, 255 }, rgba[0..4]);
     try std.testing.expect(rgba[4] > 240);
     try std.testing.expect(rgba[5] < 20);
@@ -19588,7 +19944,7 @@ test "native Matte reversal precedes PDF Decode mapping" {
         .components = .{ 0.25, 0, 0, 0 },
     }, &decode);
     var rgba: [4]u8 = undefined;
-    try Reader.decodeDeviceColorSpaceToRgba(&rgba, 1, &samples, "DeviceGray", &decode);
+    try Reader.decodeDeviceColorSpaceToRgba(&rgba, 1, &samples, "DeviceGray", &decode, .{});
     try std.testing.expect(samples[0] < 2);
     try std.testing.expect(rgba[0] > 253);
     try std.testing.expectEqual(@as(u8, 0xff), rgba[3]);
