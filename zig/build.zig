@@ -6340,6 +6340,7 @@ pub fn build(b: *std.Build) void {
             "resident index repair scheduler skips deferred prefixes with bounded fair quanta",
             "resident index repair scheduler maintains exact aggregate wake precedence",
             "resident index repair progress waits are revision scoped and event driven",
+            "index repair intent string replacement is allocation failure safe",
             "quarantine binding reconciliation serializes with terminal transition",
             "repair admission revisions stay fail closed and reject delayed publishers",
             "db progressive managed admission serves a checkpointed partial generation",

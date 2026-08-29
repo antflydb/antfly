@@ -11955,6 +11955,46 @@ pub const DB = struct {
             .root_generation = entry.intent.root_generation,
             .owner_epoch = entry.intent.owner_epoch,
         };
+        if (update.attempt_failure != null and update.replace_last_error) {
+            return error.InvalidArgument;
+        }
+
+        // Stage every fallible owned-string replacement before mutating the
+        // cloned intent. Once staging succeeds, the swaps below are infallible;
+        // on a later checkpoint failure, entry.deinit owns the replacements.
+        const replacement_candidate_path = if (update.replace_candidate_path)
+            if (update.candidate_relative_path) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_candidate_path_owned = replacement_candidate_path != null;
+        errdefer if (replacement_candidate_path_owned) alloc.free(replacement_candidate_path.?);
+
+        const replacement_previous_active_path = if (update.replace_previous_active_path)
+            if (update.previous_active_relative_path) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_previous_active_path_owned = replacement_previous_active_path != null;
+        errdefer if (replacement_previous_active_path_owned) alloc.free(replacement_previous_active_path.?);
+
+        const replacement_build_resume_key = if (update.replace_build_resume_key)
+            if (update.build_resume_key) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_build_resume_key_owned = replacement_build_resume_key != null;
+        errdefer if (replacement_build_resume_key_owned) alloc.free(replacement_build_resume_key.?);
+
+        const replaces_last_error = update.attempt_failure != null or update.replace_last_error;
+        const replacement_last_error_source = if (update.attempt_failure) |failure|
+            @as(?[]const u8, failure.err_name)
+        else
+            update.last_error;
+        const replacement_last_error = if (replaces_last_error)
+            if (replacement_last_error_source) |value| try alloc.dupe(u8, value) else null
+        else
+            null;
+        var replacement_last_error_owned = replacement_last_error != null;
+        errdefer if (replacement_last_error_owned) alloc.free(replacement_last_error.?);
+
         const now_ms = currentTimeNs() / std.time.ns_per_ms;
         if (update.attempt_failure) |failure| {
             entry.intent.phase = if (failure.terminal) .terminal else entry.intent.phase;
@@ -11964,8 +12004,6 @@ pub const DB = struct {
                 0
             else
                 now_ms +| indexRepairRetryDelayMs(repair_id, entry.intent.failure_streak);
-            if (entry.intent.last_error) |value| alloc.free(value);
-            entry.intent.last_error = try alloc.dupe(u8, failure.err_name);
         }
         if (update.trigger) |value| entry.intent.trigger = value;
         if (update.operator_job_id) |value| entry.intent.operator_job_id = value;
@@ -11973,17 +12011,20 @@ pub const DB = struct {
         if (update.phase) |value| entry.intent.phase = value;
         if (update.replace_candidate_path) {
             if (entry.intent.candidate_relative_path) |value| alloc.free(value);
-            entry.intent.candidate_relative_path = if (update.candidate_relative_path) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.candidate_relative_path = replacement_candidate_path;
+            replacement_candidate_path_owned = false;
         }
         if (update.previous_pointer_captured) |value| entry.intent.previous_pointer_captured = value;
         if (update.replace_previous_active_path) {
             if (entry.intent.previous_active_relative_path) |value| alloc.free(value);
-            entry.intent.previous_active_relative_path = if (update.previous_active_relative_path) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.previous_active_relative_path = replacement_previous_active_path;
+            replacement_previous_active_path_owned = false;
         }
         if (update.candidate_applied_sequence) |value| entry.intent.candidate_applied_sequence = value;
         if (update.replace_build_resume_key) {
             if (entry.intent.build_resume_key) |value| alloc.free(value);
-            entry.intent.build_resume_key = if (update.build_resume_key) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.build_resume_key = replacement_build_resume_key;
+            replacement_build_resume_key_owned = false;
         }
         if (update.build_reprocessed) |value| entry.intent.build_reprocessed = value;
         if (update.estimated_candidate_bytes) |value| entry.intent.estimated_candidate_bytes = value;
@@ -11994,9 +12035,10 @@ pub const DB = struct {
         if (update.next_retry_at_ms) |value| entry.intent.next_retry_at_ms = value;
         if (update.automation) |value| entry.intent.automation = value;
         if (update.owner_epoch) |value| entry.intent.owner_epoch = value;
-        if (update.replace_last_error) {
+        if (replaces_last_error) {
             if (entry.intent.last_error) |value| alloc.free(value);
-            entry.intent.last_error = if (update.last_error) |value| try alloc.dupe(u8, value) else null;
+            entry.intent.last_error = replacement_last_error;
+            replacement_last_error_owned = false;
         }
         entry.intent.updated_at_ms = now_ms;
         const blocks_service = indexRepairIntentBlocksService(entry.intent);
@@ -76457,6 +76499,86 @@ test "resident index repair progress waits are revision scoped and event driven"
     try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
     // A delayed event from the prior revision cannot wake the new schedule.
     try std.testing.expect(!directory.wakeForIndexProgress("semantic_idx", 12));
+}
+
+test "index repair intent string replacement is allocation failure safe" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .open_mode = .writer_no_replay,
+        .start_index_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\",\"external\":true}",
+    });
+    const cfg = db.core.index_manager.get("dense_idx") orelse return error.TestUnexpectedResult;
+    const repair_id = try db.createGenerationRepairIntent(
+        alloc,
+        cfg.*,
+        .operator_generation_validation,
+        0,
+        0,
+        "old-error",
+    );
+    try db.updateIndexRepairIntent(alloc, repair_id, .{
+        .candidate_relative_path = ".repair-shadow-old/indexes/dense_idx",
+        .replace_candidate_path = true,
+        .previous_pointer_captured = true,
+        .previous_active_relative_path = ".repair-shadow-old-active/indexes/dense_idx",
+        .replace_previous_active_path = true,
+        .build_resume_key = "old-resume",
+        .replace_build_resume_key = true,
+        .last_error = "old-error-2",
+        .replace_last_error = true,
+    });
+
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
+                try target_db.updateIndexRepairIntent(failing_alloc, target_repair_id, .{
+                    .candidate_relative_path = ".repair-shadow-new/indexes/dense_idx",
+                    .replace_candidate_path = true,
+                    .previous_active_relative_path = ".repair-shadow-new-active/indexes/dense_idx",
+                    .replace_previous_active_path = true,
+                    .build_resume_key = "new-resume",
+                    .replace_build_resume_key = true,
+                    .last_error = "new-error",
+                    .replace_last_error = true,
+                });
+            }
+        }.run,
+        .{ &db, repair_id },
+    );
+    try std.testing.checkAllAllocationFailures(
+        alloc,
+        struct {
+            fn run(failing_alloc: Allocator, target_db: *DB, target_repair_id: u128) !void {
+                try target_db.recordIndexRepairAttemptFailure(
+                    failing_alloc,
+                    target_repair_id,
+                    "next-failure",
+                    false,
+                );
+            }
+        }.run,
+        .{ &db, repair_id },
+    );
+
+    var updated = try db.loadIndexRepairEntryById(alloc, repair_id);
+    defer updated.deinit(alloc);
+    try std.testing.expectEqualStrings(".repair-shadow-new/indexes/dense_idx", updated.intent.candidate_relative_path.?);
+    try std.testing.expectEqualStrings(".repair-shadow-new-active/indexes/dense_idx", updated.intent.previous_active_relative_path.?);
+    try std.testing.expectEqualStrings("new-resume", updated.intent.build_resume_key.?);
+    try std.testing.expectEqualStrings("next-failure", updated.intent.last_error.?);
+    try std.testing.expectEqual(@as(u32, 1), updated.intent.failure_streak);
 }
 
 test "repair admission revisions stay fail closed and reject delayed publishers" {
