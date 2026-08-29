@@ -107,6 +107,19 @@ pub const Group = struct {
         return try self.raw_node.proposeWithReceipt(data, accepted_index);
     }
 
+    pub fn proposeBatchWithReceipt(
+        self: *Group,
+        payloads: []const []const u8,
+        accepted_first_index: *?core.types.Index,
+        accepted_last_index: *?core.types.Index,
+    ) !void {
+        return try self.raw_node.proposeBatchWithReceipt(
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
+    }
+
     /// Reserves the bounded bookkeeping needed before Raft accepts a proposal.
     /// Callers must do this before proposing so an allocation failure can never
     /// strand an accepted receipt without its compaction proof.

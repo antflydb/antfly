@@ -807,6 +807,21 @@ pub const Host = struct {
         try self.runtime_host.proposeWithReceipt(group_id, data, accepted_index);
     }
 
+    pub fn proposeBatchWithReceipt(
+        self: *Host,
+        group_id: u64,
+        payloads: []const []const u8,
+        accepted_first_index: *?u64,
+        accepted_last_index: *?u64,
+    ) !void {
+        try self.runtime_host.proposeBatchWithReceipt(
+            group_id,
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
+    }
+
     pub fn prepareProposalReceiptTracking(self: *Host, group_id: u64) !void {
         try self.runtime_host.prepareProposalReceiptTracking(group_id);
     }
@@ -1297,6 +1312,21 @@ pub const HttpHost = struct {
 
     pub fn proposeWithReceipt(self: *HttpHost, group_id: u64, data: []const u8, accepted_index: *?u64) !void {
         try self.host.proposeWithReceipt(group_id, data, accepted_index);
+    }
+
+    pub fn proposeBatchWithReceipt(
+        self: *HttpHost,
+        group_id: u64,
+        payloads: []const []const u8,
+        accepted_first_index: *?u64,
+        accepted_last_index: *?u64,
+    ) !void {
+        try self.host.proposeBatchWithReceipt(
+            group_id,
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
     }
 
     pub fn transferLeader(self: *HttpHost, group_id: u64, transferee: u64) !void {

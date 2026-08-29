@@ -61,6 +61,12 @@ pub const max_create_definition_bytes: usize = 2 * 1024 * 1024;
 /// Defense in depth on the final encoded Raft command. This includes the
 /// definition, generated range records, and codec overhead.
 pub const max_transition_command_bytes: usize = 3 * 1024 * 1024;
+/// The decoder-only reconciliation bridge emits predecessor-compatible log
+/// entries as one locally atomic Raft batch. Bound both dimensions before
+/// admission so a malformed or unexpectedly broad plan cannot monopolize the
+/// metadata runtime or create unbounded replication work.
+pub const max_legacy_reconciliation_commands: usize = 4096;
+pub const max_legacy_reconciliation_batch_bytes: usize = max_transition_command_bytes;
 /// Largest legacy v1 membership vector that could fit in a command accepted
 /// by the topology proposal path. The decoder checks this before allocating,
 /// so a corrupt persisted frame cannot turn a compact metadata entry into an

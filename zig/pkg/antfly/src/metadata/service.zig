@@ -116,10 +116,11 @@ pub const TableDropAdmission = struct {
 };
 
 /// Materialize a legacy reconciliation plan before admitting any part of it,
-/// then attach receipt tracking only to its final command. Raft's ordered apply
-/// rule makes that one receipt a proof for the entire batch without adding a
-/// consensus round trip per entry. This is the rolling-upgrade bridge; the
-/// steady-state topology protocol uses one atomic `apply_table_topology` entry.
+/// then append every predecessor-compatible entry atomically in one leader
+/// term. Raft's ordered apply rule makes the terminal receipt a proof for the
+/// entire batch without adding a consensus round trip per entry. This is the
+/// rolling-upgrade bridge; the steady-state topology protocol uses one atomic
+/// `apply_table_topology` entry.
 fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     service: anytype,
     alloc: std.mem.Allocator,
@@ -205,13 +206,11 @@ fn applyReconciliationPlanAndWaitAppliedWithContextImpl(
     try request.ensureActive();
     if (commands.items.len == 0) return;
 
-    // Do not honor cancellation between entries: once the first legacy command
-    // is admitted, stopping early would turn a client disconnect into a partial
-    // catalog transaction. Cancellation remains observable while waiting for
-    // the exact terminal receipt, and is reported as an ambiguous outcome.
-    for (commands.items[0 .. commands.items.len - 1]) |command|
-        try service.proposeTransitionCommand(command);
-    const receipt = try service.proposeTransitionCommandWithReceipt(commands.items[commands.items.len - 1]);
+    // Encoding, rollout normalization, receipt reservation, and the complete
+    // contiguous append all finish before admission becomes visible. Once the
+    // batch is accepted, cancellation remains observable only while waiting
+    // for its exact terminal receipt and is reported as an ambiguous outcome.
+    const receipt = try service.proposeTransitionCommandsWithReceipt(commands.items);
     try service.waitForTransitionAppliedWithContext(receipt, request);
 }
 
@@ -240,8 +239,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
         store: FakeStore = .{},
         tags: [2]CommandTag = undefined,
         command_count: usize = 0,
-        plain_count: usize = 0,
-        receipt_count: usize = 0,
+        batch_count: usize = 0,
         waited: bool = false,
 
         fn projectedStore(self: *@This()) ?*FakeStore {
@@ -253,17 +251,12 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
             self.command_count += 1;
         }
 
-        fn proposeTransitionCommand(self: *@This(), command: metadata_storage.TransitionCommand) !void {
-            self.record(command);
-            self.plain_count += 1;
-        }
-
-        fn proposeTransitionCommandWithReceipt(
+        fn proposeTransitionCommandsWithReceipt(
             self: *@This(),
-            command: metadata_storage.TransitionCommand,
+            commands: []const metadata_storage.TransitionCommand,
         ) !MetadataProposalReceipt {
-            self.record(command);
-            self.receipt_count += 1;
+            for (commands) |command| self.record(command);
+            self.batch_count += 1;
             return .{ .term = 3, .index = 9 };
         }
 
@@ -298,8 +291,7 @@ test "metadata reconciliation plan uses one terminal receipt for ordered apply" 
         .{},
     );
     try std.testing.expectEqual(@as(usize, 2), fake.command_count);
-    try std.testing.expectEqual(@as(usize, 1), fake.plain_count);
-    try std.testing.expectEqual(@as(usize, 1), fake.receipt_count);
+    try std.testing.expectEqual(@as(usize, 1), fake.batch_count);
     try std.testing.expectEqual(CommandTag.upsert_table, fake.tags[0]);
     try std.testing.expectEqual(CommandTag.upsert_range, fake.tags[1]);
     try std.testing.expect(fake.waited);
@@ -1364,6 +1356,57 @@ fn runtimeStatusProtocolSafeCommand(
         },
         else => return command,
     }
+}
+
+const EncodedTransitionBatch = struct {
+    entries: [][]const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.entries) |entry| alloc.free(entry);
+        alloc.free(self.entries);
+        self.* = undefined;
+    }
+};
+
+/// Complete every fallible command transformation before Raft admission. The
+/// returned buffers are immutable and independently owned, allowing the
+/// runtime lock to cover only leadership validation, receipt reservation, and
+/// the contiguous append rather than schema encoding or allocator work.
+fn prepareEncodedTransitionBatch(
+    service: anytype,
+    commands: []const metadata_storage.TransitionCommand,
+) !EncodedTransitionBatch {
+    if (commands.len == 0) return error.EmptyProposalBatch;
+    if (commands.len > metadata_topology_protocol.max_legacy_reconciliation_commands)
+        return error.MetadataTopologyCommandTooLarge;
+
+    const entries = try service.alloc.alloc([]const u8, commands.len);
+    for (entries) |*entry| entry.* = &.{};
+    errdefer {
+        for (entries) |entry| service.alloc.free(entry);
+        service.alloc.free(entries);
+    }
+
+    var total_bytes: usize = 0;
+    for (commands, 0..) |command, i| {
+        var owned_legacy_store: ?metadata_table_manager.StoreRecord = null;
+        defer if (owned_legacy_store) |record|
+            metadata_table_manager.freeStore(service.alloc, record);
+        const safe_command = try runtimeStatusProtocolSafeCommand(
+            service,
+            command,
+            &owned_legacy_store,
+        );
+        try metadata_storage.validateTransitionCommandDataGroupIds(safe_command);
+        const encoded = try metadata_storage.encodeTransitionCommand(service.alloc, safe_command);
+        entries[i] = encoded;
+        total_bytes = std.math.add(usize, total_bytes, encoded.len) catch
+            return error.MetadataTopologyCommandTooLarge;
+        if (encoded.len > metadata_topology_protocol.max_transition_command_bytes or
+            total_bytes > metadata_topology_protocol.max_legacy_reconciliation_batch_bytes)
+            return error.MetadataTopologyCommandTooLarge;
+    }
+    return .{ .entries = entries };
 }
 
 pub const MetadataServiceDeps = struct {
@@ -2825,6 +2868,57 @@ pub const MetadataService = struct {
             std.log.warn(
                 "metadata proposal accepted before dispatch failure group_id={} index={} err={s}",
                 .{ self.metadata_group_id, index, @errorName(err) },
+            );
+        }
+        self.lifecycle_signal.notify(null);
+        return .{ .term = raft_status.hard.current_term, .index = index };
+    }
+
+    /// Prepares every legacy command before taking the runtime lock, then
+    /// admits the complete batch contiguously in one local leader term. The
+    /// terminal receipt is sufficient to prove ordered application of all
+    /// predecessor-compatible entries.
+    pub fn proposeTransitionCommandsWithReceipt(
+        self: *MetadataService,
+        commands: []const metadata_storage.TransitionCommand,
+    ) !MetadataProposalReceipt {
+        var batch = try prepareEncodedTransitionBatch(self, commands);
+        defer batch.deinit(self.alloc);
+
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const raft_status = self.raft.host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        if (raft_status.soft.role != .leader or
+            raft_status.soft.leader_id == null or
+            raft_status.soft.leader_id.? != raft_status.id)
+            return error.NotLeader;
+        try self.raft.host.host.prepareProposalReceiptTracking(self.metadata_group_id);
+        var accepted_first_index: ?u64 = null;
+        var accepted_last_index: ?u64 = null;
+        var dispatch_error: ?anyerror = null;
+        self.raft.host.host.proposeBatchWithReceipt(
+            self.metadata_group_id,
+            batch.entries,
+            &accepted_first_index,
+            &accepted_last_index,
+        ) catch |err| {
+            dispatch_error = err;
+        };
+        const index = try acceptedMetadataProposalIndex(accepted_last_index, dispatch_error);
+        const first_index = accepted_first_index orelse return error.MetadataMutationOutcomeUnknown;
+        if (first_index > index or
+            index - first_index + 1 != @as(u64, @intCast(commands.len)))
+            return error.MetadataMutationOutcomeUnknown;
+        try self.raft.host.host.trackProposalReceipt(
+            self.metadata_group_id,
+            raft_status.hard.current_term,
+            index,
+        );
+        if (dispatch_error) |err| {
+            std.log.warn(
+                "metadata proposal batch accepted before dispatch failure group_id={} term={} first_index={} last_index={} entries={} err={s}",
+                .{ self.metadata_group_id, raft_status.hard.current_term, first_index, index, commands.len, @errorName(err) },
             );
         }
         self.lifecycle_signal.notify(null);
@@ -5012,6 +5106,53 @@ pub const MetadataHttpService = struct {
         command: metadata_storage.TransitionCommand,
     ) !MetadataProposalReceipt {
         return self.proposeTransitionCommandWithReceiptInExpectedTerm(command, null);
+    }
+
+    pub fn proposeTransitionCommandsWithReceipt(
+        self: *MetadataHttpService,
+        commands: []const metadata_storage.TransitionCommand,
+    ) !MetadataProposalReceipt {
+        var batch = try prepareEncodedTransitionBatch(self, commands);
+        defer batch.deinit(self.alloc);
+
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const raft_status = self.raft.host.http_host.host.raftStatus(self.metadata_group_id) orelse
+            return error.NotLeader;
+        if (raft_status.soft.role != .leader or
+            raft_status.soft.leader_id == null or
+            raft_status.soft.leader_id.? != raft_status.id)
+            return error.NotLeader;
+        try self.raft.host.http_host.host.prepareProposalReceiptTracking(self.metadata_group_id);
+        var accepted_first_index: ?u64 = null;
+        var accepted_last_index: ?u64 = null;
+        var dispatch_error: ?anyerror = null;
+        self.raft.host.http_host.proposeBatchWithReceipt(
+            self.metadata_group_id,
+            batch.entries,
+            &accepted_first_index,
+            &accepted_last_index,
+        ) catch |err| {
+            dispatch_error = err;
+        };
+        const index = try acceptedMetadataProposalIndex(accepted_last_index, dispatch_error);
+        const first_index = accepted_first_index orelse return error.MetadataMutationOutcomeUnknown;
+        if (first_index > index or
+            index - first_index + 1 != @as(u64, @intCast(commands.len)))
+            return error.MetadataMutationOutcomeUnknown;
+        try self.raft.host.http_host.host.trackProposalReceipt(
+            self.metadata_group_id,
+            raft_status.hard.current_term,
+            index,
+        );
+        if (dispatch_error) |err| {
+            std.log.warn(
+                "metadata proposal batch accepted before dispatch failure group_id={} term={} first_index={} last_index={} entries={} err={s}",
+                .{ self.metadata_group_id, raft_status.hard.current_term, first_index, index, commands.len, @errorName(err) },
+            );
+        }
+        self.lifecycle_signal.notify(null);
+        return .{ .term = raft_status.hard.current_term, .index = index };
     }
 
     /// Admits a transition only while this node is still leader in the

@@ -789,6 +789,24 @@ pub const MultiRaft = struct {
         try grp.proposeWithReceipt(data, accepted_index);
     }
 
+    pub fn proposeBatchWithReceipt(
+        self: *MultiRaft,
+        group_id: core.types.GroupId,
+        payloads: []const []const u8,
+        accepted_first_index: *?core.types.Index,
+        accepted_last_index: *?core.types.Index,
+    ) !void {
+        accepted_first_index.* = null;
+        accepted_last_index.* = null;
+        try self.resumeOnActivity(group_id);
+        const grp = self.group(group_id) orelse return error.UnknownGroup;
+        try grp.proposeBatchWithReceipt(
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
+    }
+
     pub fn prepareProposalReceiptTracking(self: *MultiRaft, group_id: core.types.GroupId) !void {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         try grp.prepareProposalReceiptTracking();

@@ -84,6 +84,20 @@ pub const RawNode = struct {
         return try self.raft.proposeWithReceipt(data, accepted_index);
     }
 
+    pub fn proposeBatchWithReceipt(
+        self: *RawNode,
+        payloads: []const []const u8,
+        accepted_first_index: *?types.Index,
+        accepted_last_index: *?types.Index,
+    ) !void {
+        self.clearReadyMessages();
+        return try self.raft.proposeBatchWithReceipt(
+            payloads,
+            accepted_first_index,
+            accepted_last_index,
+        );
+    }
+
     pub fn readIndex(self: *RawNode, rctx: []const u8) !void {
         self.clearReadyMessages();
         return try self.raft.readIndex(rctx);

@@ -959,6 +959,93 @@ test "proposal receipt survives replication dispatch allocation failure" {
     try std.testing.expect(accepted_index == null);
 }
 
+test "proposal batch appends contiguously and never forwards without a local receipt" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+
+    const before = fixture.raft.status().last_index;
+    var first_index: ?types.Index = null;
+    var last_index: ?types.Index = null;
+    try fixture.raft.proposeBatchWithReceipt(
+        &.{ "table", "range-a", "range-b" },
+        &first_index,
+        &last_index,
+    );
+    try std.testing.expectEqual(@as(?types.Index, before + 1), first_index);
+    try std.testing.expectEqual(@as(?types.Index, before + 3), last_index);
+    try std.testing.expectEqual(before + 3, fixture.raft.status().last_index);
+    const appended = fixture.raft.log.entries.items[fixture.raft.log.entries.items.len - 3 ..];
+    try std.testing.expectEqual(fixture.raft.hard_state.current_term, appended[0].term);
+    try std.testing.expectEqual(appended[0].term, appended[1].term);
+    try std.testing.expectEqual(appended[1].term, appended[2].term);
+    try std.testing.expectEqualStrings("table", appended[0].data);
+    try std.testing.expectEqualStrings("range-a", appended[1].data);
+    try std.testing.expectEqualStrings("range-b", appended[2].data);
+
+    fixture.raft.soft_state = .{ .role = .follower, .leader_id = 2 };
+    const accepted_before_rejection = fixture.raft.status().last_index;
+    try std.testing.expectError(
+        error.NotLeader,
+        fixture.raft.proposeBatchWithReceipt(&.{ "never", "forwarded" }, &first_index, &last_index),
+    );
+    try std.testing.expect(first_index == null);
+    try std.testing.expect(last_index == null);
+    try std.testing.expectEqual(accepted_before_rejection, fixture.raft.status().last_index);
+}
+
+test "proposal batch retains its terminal receipt after dispatch failure" {
+    var fixture = try initLeaderFromSnapshot();
+    defer fixture.raft.deinit();
+    defer fixture.storage.deinit();
+
+    fixture.raft.messages.clearAndFree(std.testing.allocator);
+    fixture.raft.progress[1].probe_sent = false;
+    const before = fixture.raft.status().last_index;
+    var first_index: ?types.Index = null;
+    var last_index: ?types.Index = null;
+
+    var preappend_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    fixture.raft.alloc = preappend_failing.allocator();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        fixture.raft.proposeBatchWithReceipt(&.{ "not", "admitted" }, &first_index, &last_index),
+    );
+    fixture.raft.alloc = std.testing.allocator;
+    try std.testing.expect(first_index == null);
+    try std.testing.expect(last_index == null);
+    try std.testing.expectEqual(before, fixture.raft.status().last_index);
+
+    // Failure while materializing a later payload must free the already-owned
+    // prefix without exposing any of it through the log.
+    var payload_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    fixture.raft.alloc = payload_failing.allocator();
+    try std.testing.expectError(
+        error.OutOfMemory,
+        fixture.raft.proposeBatchWithReceipt(&.{ "still", "not", "admitted" }, &first_index, &last_index),
+    );
+    fixture.raft.alloc = std.testing.allocator;
+    try std.testing.expect(first_index == null);
+    try std.testing.expect(last_index == null);
+    try std.testing.expectEqual(before, fixture.raft.status().last_index);
+
+    // Entry-array and two payload allocations complete first. The next Raft
+    // allocation builds the peer append message after the full local batch is
+    // already owned by the log.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 3 });
+    fixture.raft.alloc = failing.allocator();
+    defer fixture.raft.alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.OutOfMemory,
+        fixture.raft.proposeBatchWithReceipt(&.{ "table", "range" }, &first_index, &last_index),
+    );
+    fixture.raft.alloc = std.testing.allocator;
+
+    try std.testing.expectEqual(@as(?types.Index, before + 1), first_index);
+    try std.testing.expectEqual(@as(?types.Index, before + 2), last_index);
+    try std.testing.expectEqual(before + 2, fixture.raft.status().last_index);
+}
+
 test "max_committed_size_per_ready paginates committed entries without gaps" {
     var storage = storage_mod.MemoryStorage.init(std.testing.allocator);
     defer storage.deinit();

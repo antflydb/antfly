@@ -147,6 +147,8 @@ fn createCompatible(
     try request.ensureActive();
     try svc.ensureLinearizableReadWithContext(request);
     _ = workflow.createTableWithRangesCatalogLockedWithContext(svc, request, table, ranges) catch |err| {
+        if (err == error.MetadataTopologyCommandTooLarge)
+            return error.CreateTableRequestTooLarge;
         svc.ensureLinearizableReadWithContext(request) catch return afterAdmission(err);
         svc.verifyTableCreateProjection(alloc, table, ranges) catch |verify_err| switch (verify_err) {
             error.TableAlreadyExists => return verify_err,

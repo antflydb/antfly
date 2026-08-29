@@ -446,6 +446,64 @@ pub const Raft = struct {
         try self.bcastAppend();
     }
 
+    /// Appends a complete local proposal batch in one leader term and exposes
+    /// its contiguous index range. Unlike follower proposal forwarding, this
+    /// API is an exact admission contract: no entry is appended on a
+    /// pre-admission failure, while both indexes remain populated if message
+    /// construction fails after the whole batch entered the local log.
+    pub fn proposeBatchWithReceipt(
+        self: *Raft,
+        payloads: []const []const u8,
+        accepted_first_index: *?types.Index,
+        accepted_last_index: *?types.Index,
+    ) !void {
+        accepted_first_index.* = null;
+        accepted_last_index.* = null;
+        if (payloads.len == 0) return error.EmptyProposalBatch;
+        if (self.soft_state.role != .leader) return error.NotLeader;
+        if (self.lead_transferee != null) return error.LeaderTransferInProgress;
+
+        const self_idx = try self.localAppendPeerIndex();
+        const first_index = std.math.add(types.Index, self.log.lastIndex(), 1) catch
+            return error.ProposalIndexOverflow;
+        const last_candidate = std.math.add(
+            types.Index,
+            first_index,
+            @as(types.Index, @intCast(payloads.len - 1)),
+        ) catch
+            return error.ProposalIndexOverflow;
+        _ = std.math.add(types.Index, last_candidate, 1) catch
+            return error.ProposalIndexOverflow;
+
+        const entries = try self.alloc.alloc(types.Entry, payloads.len);
+        defer self.alloc.free(entries);
+        for (entries) |*entry| entry.* = .{};
+        defer for (entries) |*entry| {
+            if (entry.data.len > 0) entry.deinit(self.alloc);
+        };
+        for (payloads, 0..) |payload, i| {
+            entries[i] = .{
+                .term = self.hard_state.current_term,
+                .index = first_index + @as(types.Index, @intCast(i)),
+                .entry_type = .normal,
+                .data = try self.alloc.dupe(u8, payload),
+            };
+        }
+
+        if (!self.increaseUncommittedSizeEntries(entries)) return error.ProposalDropped;
+        const last_index = self.log.appendOwnedEntries(entries) catch |err| {
+            self.reduceUncommittedSizeEntries(entries);
+            return err;
+        };
+        accepted_first_index.* = first_index;
+        accepted_last_index.* = last_index;
+        self.progress[self_idx].match_index = last_index;
+        self.progress[self_idx].next_index = last_index + 1;
+        for (payloads) |_| self.trace(.replicate, null);
+        _ = self.maybeCommit();
+        try self.bcastAppend();
+    }
+
     pub fn readIndex(self: *Raft, rctx: []const u8) !void {
         if (self.soft_state.role != .leader) {
             const leader = self.soft_state.leader_id orelse return error.NotLeader;
@@ -1341,19 +1399,24 @@ pub const Raft = struct {
 
     fn increaseUncommittedSizeEntry(self: *Raft, entry_type: types.EntryType, data: []const u8) bool {
         const size = types.payloadSizeForEntry(entry_type, data);
-        if (self.uncommitted_size > 0 and size > 0 and self.uncommitted_size + size > self.cfg.max_uncommitted_entries_size) {
+        const increased = std.math.add(usize, self.uncommitted_size, size) catch return false;
+        if (self.uncommitted_size > 0 and size > 0 and increased > self.cfg.max_uncommitted_entries_size) {
             return false;
         }
-        self.uncommitted_size += size;
+        self.uncommitted_size = increased;
         return true;
     }
 
     fn increaseUncommittedSizeEntries(self: *Raft, entries: []const types.Entry) bool {
-        const size = types.entriesPayloadSize(entries);
-        if (self.uncommitted_size > 0 and size > 0 and self.uncommitted_size + size > self.cfg.max_uncommitted_entries_size) {
+        var size: usize = 0;
+        for (entries) |entry| {
+            size = std.math.add(usize, size, types.entryPayloadSize(entry)) catch return false;
+        }
+        const increased = std.math.add(usize, self.uncommitted_size, size) catch return false;
+        if (self.uncommitted_size > 0 and size > 0 and increased > self.cfg.max_uncommitted_entries_size) {
             return false;
         }
-        self.uncommitted_size += size;
+        self.uncommitted_size = increased;
         return true;
     }
 
