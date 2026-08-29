@@ -7288,6 +7288,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_graph_inflight_authorization_vopr_test_step.dependOn(&run_production_cluster_graph_inflight_authorization_vopr_tests.step);
 
+    const production_cluster_graph_stale_snapshot_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production public graph stale snapshot retry exhaustion exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_graph_stale_snapshot_vopr_tests = b.addRunArtifact(production_cluster_graph_stale_snapshot_vopr_tests);
+    const production_cluster_graph_stale_snapshot_vopr_test_step = b.step(
+        "production-cluster-graph-stale-snapshot-vopr-test",
+        "Run public graph stale-snapshot retry exhaustion, recovery, and exact replay",
+    );
+    production_cluster_graph_stale_snapshot_vopr_test_step.dependOn(&run_production_cluster_graph_stale_snapshot_vopr_tests.step);
+
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},
@@ -7391,6 +7403,11 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_durable_join_takeover_vopr_tests,
         run_production_cluster_graph_split_overlapping_faults_vopr_tests,
         run_production_cluster_graph_split_socket_pressure_vopr_tests,
+        run_production_cluster_service_rate_vopr_tests,
+        run_production_cluster_graph_hydration_vopr_tests,
+        run_production_cluster_graph_cancellation_vopr_tests,
+        run_production_cluster_graph_inflight_authorization_vopr_tests,
+        run_production_cluster_graph_stale_snapshot_vopr_tests,
     }) |run_production_cluster_test| {
         // addRunArtifact appends cache-dir, seed, and --listen arguments after
         // the artifact; simple mode needs only the artifact itself.
@@ -7460,7 +7477,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_graph_split_socket_pressure_vopr_test_step.dependOn(&run_production_cluster_graph_split_socket_pressure_vopr_tests.step);
     const production_cluster_vopr_test_step = b.step(
         "production-cluster-vopr-test",
-        "Run production DataServer smoke, active-reconfiguration, graph, and graph-during-split histories",
+        "Run every focused production DataServer cluster history through v28",
     );
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_smoke_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_vopr_deep_test_step);
@@ -7474,6 +7491,11 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_durable_join_takeover_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_overlapping_faults_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_split_socket_pressure_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_service_rate_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_graph_hydration_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_graph_inflight_authorization_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_graph_stale_snapshot_vopr_test_step);
 
     const generation_reranking_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,

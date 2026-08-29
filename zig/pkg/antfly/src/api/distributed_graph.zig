@@ -50,6 +50,7 @@ const tables_api = @import("tables.zig");
 /// after an owned intermediate result is internally consistent and hold no
 /// catalog or database lease.
 pub const LifecyclePhase = enum {
+    source_snapshot_acquired,
     snapshot_validated,
     expand_round_completed,
     target_authorization_started,
@@ -899,6 +900,10 @@ pub fn executeCrossRange(
     request_worker.execution_deadline_ns = req.execution_deadline_ns;
     request_worker.cancellation = req.cancellation;
     try request_worker.ensureActive();
+    request_worker.reachLifecycle(.{
+        .phase = .source_snapshot_acquired,
+        .group_count = base_result.shard_identity_read_generations.len,
+    });
 
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
@@ -8357,6 +8362,7 @@ test "distributed graph retries once on topology change and succeeds" {
             const state: *TestState = @ptrCast(@alignCast(ptr));
             state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
             switch (event.phase) {
+                .source_snapshot_acquired => state.lifecycle_valid = state.lifecycle_valid and event.group_count > 0,
                 .snapshot_validated => {},
                 .target_authorization_started => state.lifecycle_valid = state.lifecycle_valid and event.table_name.len > 0,
                 .expand_round_completed => {
@@ -8481,6 +8487,7 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("doc:b", results[0].hits[0].id);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.source_snapshot_acquired)]);
     try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@intFromEnum(LifecyclePhase.snapshot_validated)]);
     try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.attempt_failed)]);
     try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.expand_round_completed)]);

@@ -334,6 +334,14 @@ pub const Fixture = struct {
     graph_authorization_denied_status: u16 = 0,
     graph_authorization_recovered_status: u16 = 0,
     graph_authorization_sound: bool = false,
+    graph_stale_snapshot_armed: bool = false,
+    graph_stale_snapshot_boundary_observed: bool = false,
+    graph_stale_snapshot_attempt_failures: u64 = 0,
+    graph_stale_snapshot_error_code: u16 = 0,
+    graph_stale_snapshot_rejected_without_partial: bool = false,
+    graph_stale_snapshot_status: u16 = 0,
+    graph_stale_snapshot_recovered: bool = false,
+    graph_stale_snapshot_sound: bool = false,
     split_graph_inflight_started: bool = false,
     split_graph_inflight_complete: bool = false,
     split_graph_inflight_rejected: bool = false,
@@ -405,6 +413,7 @@ pub const Fixture = struct {
     graph_hydration_enabled: bool = false,
     graph_cancellation_enabled: bool = false,
     graph_inflight_authorization_revocation_enabled: bool = false,
+    graph_stale_snapshot_retry_exhaustion_enabled: bool = false,
     join_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
@@ -446,6 +455,11 @@ pub const Fixture = struct {
     pub fn setGraphInflightAuthorizationRevocationEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.graph_inflight_authorization_revocation_enabled = enabled;
+    }
+
+    pub fn setGraphStaleSnapshotRetryExhaustionEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.graph_stale_snapshot_retry_exhaustion_enabled = enabled;
     }
 
     pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
@@ -527,6 +541,9 @@ pub const Fixture = struct {
             return error.InvalidProductionClusterGraphCancellationMode;
         if (self.graph_inflight_authorization_revocation_enabled and !self.graph_enabled)
             return error.InvalidProductionClusterGraphAuthorizationMode;
+        if (self.graph_stale_snapshot_retry_exhaustion_enabled and
+            (!self.graph_enabled or !self.active_split_enabled))
+            return error.InvalidProductionClusterGraphStaleSnapshotMode;
         switch (self.fault_mode) {
             .clean => {},
             .join_finalizer_ack_failure => if (!self.join_enabled or self.active_split_enabled)
@@ -872,6 +889,18 @@ pub const Fixture = struct {
     ) void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
         switch (event.phase) {
+            .source_snapshot_acquired => {
+                if (self.graph_stale_snapshot_retry_exhaustion_enabled and
+                    self.graph_stale_snapshot_armed)
+                {
+                    self.graph_stale_snapshot_armed = false;
+                    self.graph_stale_snapshot_boundary_observed = true;
+                    self.publishSplitAtStaleGraphBoundary() catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                }
+            },
             .target_authorization_started => {
                 if (self.graph_inflight_authorization_revocation_enabled and
                     self.graph_authorization_revocation_armed and
@@ -909,6 +938,14 @@ pub const Fixture = struct {
                 }
             },
             .hydration_completed => self.graph_hydration_completed_count +|= 1,
+            .attempt_failed => {
+                if (self.graph_stale_snapshot_retry_exhaustion_enabled and
+                    self.graph_stale_snapshot_boundary_observed)
+                {
+                    self.graph_stale_snapshot_attempt_failures +|= 1;
+                    self.graph_stale_snapshot_error_code = event.error_code;
+                }
+            },
             else => {},
         }
         if (self.fault_mode == .clean or self.fault_mode == .resource_pressure or
@@ -1606,6 +1643,10 @@ pub const Fixture = struct {
                 self.graph_authorization_sound = try self.runGraphInflightAuthorizationRevocationQuery();
                 if (!self.graph_authorization_sound)
                     return error.ProductionDataGraphAuthorizationMutationFailed;
+            } else if (self.graph_stale_snapshot_retry_exhaustion_enabled) {
+                self.graph_stale_snapshot_sound = try self.runGraphStaleSnapshotRetryExhaustionQuery();
+                if (!self.graph_stale_snapshot_sound)
+                    return error.ProductionDataGraphStaleSnapshotRetryExhaustionFailed;
             } else if (self.graph_hydration_enabled) {
                 self.graph_hydration_sound = try self.runGraphHydrationQuery();
                 if (!self.graph_hydration_sound)
@@ -1613,7 +1654,7 @@ pub const Fixture = struct {
             }
         }
 
-        if (!self.active_split_enabled) return;
+        if (!self.active_split_enabled or self.graph_stale_snapshot_retry_exhaustion_enabled) return;
 
         // A full distributed witness must do more than host a static
         // topology. Turn on production control rounds, admit a metadata split,
@@ -2105,6 +2146,58 @@ pub const Fixture = struct {
         return self.graph_authorization_recovered;
     }
 
+    fn runGraphStaleSnapshotRetryExhaustionQuery(self: *Fixture) !bool {
+        const query_body = try test_contract_helpers.encodeGraphTraverseQueryWithDocumentsRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{"doc:c"},
+            &.{"links"},
+            2,
+            10,
+        );
+        defer self.alloc.free(query_body);
+
+        const failures_before = self.graph_stale_snapshot_attempt_failures;
+        self.graph_stale_snapshot_armed = true;
+        var stale = try self.client.fetchQueryRaw(
+            self.data_api_uris[self.graph_probe_route_index],
+            "docs",
+            query_body,
+        );
+        defer stale.deinit(self.alloc);
+        self.graph_stale_snapshot_status = stale.status;
+        self.graph_stale_snapshot_rejected_without_partial = stale.status == 503 and
+            std.mem.indexOf(u8, stale.body, "distributed_query_unavailable") != null and
+            std.mem.indexOf(u8, stale.body, "doc:c") == null and
+            std.mem.indexOf(u8, stale.body, "doc:x") == null and
+            std.mem.indexOf(u8, stale.body, "doc:k") == null and
+            std.mem.indexOf(u8, stale.body, "production-right") == null and
+            std.mem.indexOf(u8, stale.body, "production-split") == null;
+        if (!self.graph_stale_snapshot_boundary_observed or
+            !self.split_finalized or !self.split_published or
+            self.graph_stale_snapshot_attempt_failures != failures_before + 2 or
+            self.graph_stale_snapshot_error_code != @intFromError(error.TopologyChanged) or
+            !self.graph_stale_snapshot_rejected_without_partial)
+            return false;
+
+        const post_split_read_result = self.runRead(
+            3,
+            0,
+            "docs",
+            "doc:k",
+            "production-split",
+        );
+        self.split_sound = try operationSucceeded(post_split_read_result);
+        self.graph_hydration_sound = try self.runGraphHydrationQuery();
+        self.graph_stale_snapshot_recovered = self.split_sound and self.graph_hydration_sound;
+        self.post_split_graph_sound = self.graph_stale_snapshot_recovered;
+        self.graph_sound = self.graph_sound and self.post_split_graph_sound;
+        self.topology_sound = self.topology_sound and self.split_sound;
+        self.phase = .post_split_graph_query_complete;
+        return self.graph_stale_snapshot_recovered;
+    }
+
     fn graphAuthorizationResponseSound(
         self: *Fixture,
         body: []const u8,
@@ -2594,6 +2687,30 @@ pub const Fixture = struct {
         }
     }
 
+    /// Publish a real metadata/data-plane split after the public coordinator
+    /// has already acquired its source snapshot. Returning to the coordinator
+    /// with refreshed production catalogs makes the retained snapshot stale;
+    /// no graph response is fabricated by the harness.
+    fn publishSplitAtStaleGraphBoundary(self: *Fixture) !void {
+        try self.metadata.?.requestExternalDataSplit(
+            split_transition_id,
+            metadata_sim.VoprPublicClusterFixture.data_group_id,
+            split_destination_group_id,
+            split_key,
+        );
+        self.phase = .split_requested;
+        try self.waitForSplitFinalized();
+        self.split_finalized = true;
+        self.phase = .split_finalized;
+        std.debug.assert(!self.control_round_active);
+        self.stopControlDriver();
+        try self.metadata.?.retireExternalDataSplit(split_transition_id);
+        self.split_published = true;
+        self.phase = .split_published;
+        try self.waitForDataLeader(split_destination_group_id);
+        try self.refreshDataServerMetadataSnapshots();
+    }
+
     fn waitForSplitFinalized(self: *Fixture) !void {
         for (0..30_000) |_| {
             if (try self.metadata.?.externalDataSplitFinalized(split_transition_id)) return;
@@ -3074,6 +3191,13 @@ pub const Fixture = struct {
         graph_authorization_denied_status: u16,
         graph_authorization_recovered_status: u16,
         graph_authorization_ok: bool,
+        graph_stale_snapshot_boundary_observed: bool,
+        graph_stale_snapshot_attempt_failures: u64,
+        graph_stale_snapshot_error_code: u16,
+        graph_stale_snapshot_rejected_without_partial: bool,
+        graph_stale_snapshot_status: u16,
+        graph_stale_snapshot_recovered: bool,
+        graph_stale_snapshot_ok: bool,
         split_graph_inflight_started: bool,
         split_graph_inflight_complete: bool,
         split_graph_inflight_rejected: bool,
@@ -3122,6 +3246,7 @@ pub const Fixture = struct {
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
                 (!self.graph_inflight_authorization_revocation_enabled or self.graph_authorization_sound) and
+                (!self.graph_stale_snapshot_retry_exhaustion_enabled or self.graph_stale_snapshot_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
@@ -3148,6 +3273,13 @@ pub const Fixture = struct {
             .graph_authorization_denied_status = self.graph_authorization_denied_status,
             .graph_authorization_recovered_status = self.graph_authorization_recovered_status,
             .graph_authorization_ok = self.graph_authorization_sound,
+            .graph_stale_snapshot_boundary_observed = self.graph_stale_snapshot_boundary_observed,
+            .graph_stale_snapshot_attempt_failures = self.graph_stale_snapshot_attempt_failures,
+            .graph_stale_snapshot_error_code = self.graph_stale_snapshot_error_code,
+            .graph_stale_snapshot_rejected_without_partial = self.graph_stale_snapshot_rejected_without_partial,
+            .graph_stale_snapshot_status = self.graph_stale_snapshot_status,
+            .graph_stale_snapshot_recovered = self.graph_stale_snapshot_recovered,
+            .graph_stale_snapshot_ok = self.graph_stale_snapshot_sound,
             .split_graph_inflight_started = self.split_graph_inflight_started,
             .split_graph_inflight_complete = self.split_graph_inflight_complete,
             .split_graph_inflight_rejected = self.split_graph_inflight_rejected,
