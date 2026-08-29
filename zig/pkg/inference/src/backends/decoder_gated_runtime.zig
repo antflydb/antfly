@@ -1737,6 +1737,8 @@ fn tryBackendOwnedSampledToken(
             decode_context,
         )) |_| {
             if (try cb.decoderRuntimeSampleResidentLogits(&.{
+                .linear_slot = finalLmHeadSlot(configured_layer_count),
+                .hidden_size = gpt_config.hidden_size,
                 .out_dim = gpt_config.vocab_size,
                 .final_logit_softcap = if (gpt_config.final_logit_softcapping > 0.0) gpt_config.final_logit_softcapping else 0,
                 .temperature = sampling.temperature,

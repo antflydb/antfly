@@ -520,6 +520,10 @@ pub const DecoderRuntimeApplyRmsNormLinearRequest = struct {
     hidden_size: usize,
     eps: f32,
     out_dim: usize,
+    /// Diagnostic-only escape hatch used by the fail-closed LM-head repack
+    /// quality campaign. Ordinary full-logit consumers retain checkpoint
+    /// semantics through the exact companion slot.
+    use_transformed_lm_head: bool = false,
 };
 
 pub const DecoderRuntimeApplyLayerNormLinearSampleRequest = struct {
@@ -559,6 +563,11 @@ pub const DecoderRuntimeApplyRmsNormLinearSampleRequest = struct {
 /// Sample from the full logits left resident in the backend's sample-logits
 /// buffer by the most recent decode frame's fused lm-head tail.
 pub const DecoderRuntimeSampleResidentLogitsRequest = struct {
+    /// Identifies the tail that produced the resident buffer. Backends use the
+    /// slot and shape to reject sampling when that buffer contains lossy
+    /// transformed logits rather than checkpoint-format logits.
+    linear_slot: usize,
+    hidden_size: usize,
     out_dim: usize,
     /// Gemma-style final-logit softcap applied on-device before sampling
     /// (0 = disabled).
@@ -611,6 +620,8 @@ pub const DecoderRuntimeApplyLinearRequest = struct {
     input: CT,
     in_dim: usize,
     out_dim: usize,
+    /// See DecoderRuntimeApplyRmsNormLinearRequest.use_transformed_lm_head.
+    use_transformed_lm_head: bool = false,
 };
 
 pub const DecoderRuntimeApplyLinearLayerNormRequest = struct {

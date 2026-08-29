@@ -118,6 +118,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     raw_linear_slot_disable_mapped_quant_weight: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
     /// Main transformed lm-head slot -> checkpoint-format correction slot.
     raw_linear_slot_lm_head_refine_slots: [decoder_runtime_linear_slot_capacity]?usize = [_]?usize{null} ** decoder_runtime_linear_slot_capacity,
+    raw_lm_head_q4_resident_sampling_rejections: u64 = 0,
     raw_model_mapped_buffer_prepared: bool = false,
     raw_linear_slot_model_buffer_bound: [decoder_runtime_linear_slot_capacity]bool = [_]bool{false} ** decoder_runtime_linear_slot_capacity,
     raw_quant_runtime_private_prepare_nanos: u128 = 0,

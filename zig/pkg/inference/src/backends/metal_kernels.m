@@ -65,6 +65,7 @@
 #define TERMITE_METAL_DECODE_GQA_SPLIT_SCRATCH_MAX_BYTES 2105344u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_E2B_DEFAULT_MIN_KV_TOKENS 192u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS 32u
+#define TERMITE_METAL_DECODE_GQA_SPLIT_Q2_DEFAULT_MIN_KV_TOKENS 512u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_KEY_CHUNK 32u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_SHAPE_COUNT 2u
 #define TERMITE_METAL_DECODE_GQA_SPLIT_VARIANT_COUNT 4u
@@ -11464,10 +11465,11 @@ static size_t termite_metal_decode_gqa_split_min_kv_tokens_from_env(bool *explic
     {
         fprintf(
             stderr,
-            "metal-runtime-create: invalid TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV=%s; using model defaults e2b=%u e4b/a4b=%u\n",
+            "metal-runtime-create: invalid TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV=%s; using model defaults e2b=%u e4b/a4b=%u q_len2=%u\n",
             value,
             TERMITE_METAL_DECODE_GQA_SPLIT_E2B_DEFAULT_MIN_KV_TOKENS,
-            TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS);
+            TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS,
+            TERMITE_METAL_DECODE_GQA_SPLIT_Q2_DEFAULT_MIN_KV_TOKENS);
         return 0u;
     }
     if (explicit_out != NULL) *explicit_out = true;
@@ -11487,6 +11489,27 @@ static size_t termite_metal_decode_gqa_split_default_min_kv_tokens(
     return e2b_geometry
         ? TERMITE_METAL_DECODE_GQA_SPLIT_E2B_DEFAULT_MIN_KV_TOKENS
         : TERMITE_METAL_DECODE_GQA_SPLIT_E4B_A4B_DEFAULT_MIN_KV_TOKENS;
+}
+
+// Only single-token decode received whole-model exact-token qualification at
+// the short-context floors. Keep speculative q_len=2 verification on the
+// established 512-token floor unless an explicit diagnostic override requests
+// otherwise; the pure policy and tensor oracles exercise that override.
+static size_t termite_metal_decode_gqa_split_effective_default_min_kv_tokens(
+    size_t q_len,
+    size_t num_heads,
+    size_t num_kv_heads,
+    size_t head_dim,
+    size_t sliding_window
+) {
+    const size_t model_default = termite_metal_decode_gqa_split_default_min_kv_tokens(
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        sliding_window);
+    return q_len == 2u && model_default < TERMITE_METAL_DECODE_GQA_SPLIT_Q2_DEFAULT_MIN_KV_TOKENS
+        ? TERMITE_METAL_DECODE_GQA_SPLIT_Q2_DEFAULT_MIN_KV_TOKENS
+        : model_default;
 }
 
 int termite_metal_pipelined_decode_frame_device_default(void);
@@ -19578,7 +19601,8 @@ int termite_metal_decode_gqa_split_policy_probe(
 ) {
     return termite_metal_decode_gqa_split_policy_probe_impl(
         requested_variant,
-        termite_metal_decode_gqa_split_default_min_kv_tokens(
+        termite_metal_decode_gqa_split_effective_default_min_kv_tokens(
+            q_len,
             num_heads,
             num_kv_heads,
             head_dim,
@@ -19701,7 +19725,20 @@ static bool termite_metal_decode_gqa_split_eligible(
     if (scratch_buffer_out != NULL) *scratch_buffer_out = nil;
     if (launch_out != NULL) memset(launch_out, 0, sizeof(*launch_out));
     if (strict_failure_out != NULL) *strict_failure_out = false;
-    if (runtime == NULL || !runtime->decode_gqa_split_enabled) return false;
+    if (runtime == NULL) return false;
+    const size_t min_kv_tokens = runtime->decode_gqa_split_min_kv_explicit
+        ? runtime->decode_gqa_split_min_kv_override
+        : termite_metal_decode_gqa_split_effective_default_min_kv_tokens(
+            q_len,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            sliding_window);
+    // Record the effective floor before every policy exit so the documented
+    // disable/rollback lane reports the model- and q_len-specific policy it
+    // bypassed instead of the runtime's generic initialization value.
+    runtime->decode_gqa_split_min_kv_tokens = min_kv_tokens;
+    if (!runtime->decode_gqa_split_enabled) return false;
     const bool legacy_geometry = num_heads == 8u &&
         (num_kv_heads == 1u || num_kv_heads == 2u) &&
         ((head_dim == 256u && sliding_window == 512u) ||
@@ -19721,14 +19758,6 @@ static bool termite_metal_decode_gqa_split_eligible(
     if (format != 3u || sinks != NULL || softcap != 0.0f || q_len == 0u || q_len > 2u ||
         (!legacy_geometry && !a4b_geometry) ||
         page_size == 0u || page_size % 8u != 0u) return false;
-    const size_t min_kv_tokens = runtime->decode_gqa_split_min_kv_explicit
-        ? runtime->decode_gqa_split_min_kv_override
-        : termite_metal_decode_gqa_split_default_min_kv_tokens(
-            num_heads,
-            num_kv_heads,
-            head_dim,
-            sliding_window);
-    runtime->decode_gqa_split_min_kv_tokens = min_kv_tokens;
     if (kv_tokens < min_kv_tokens) {
         runtime->decode_gqa_split_below_min_kv_calls += 1u;
         return false;

@@ -3564,7 +3564,7 @@ fn metalStatsCompactJson(
         allocator,
         &out,
         \\,
-        \\"lm_head_q4_q6_refine":{{"dispatches":{d}}},
+        \\"lm_head_q4_q6_refine":{{"dispatches":{d},"resident_sampling_rejections":{d}}},
         \\"q4_0_policy":{{
         \\"mmv_nr4_nsg2":{d},
         \\"mmv_nr8_nsg2":{d},
@@ -3578,6 +3578,7 @@ fn metalStatsCompactJson(
     ,
         .{
             provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
+            provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
             provider.metal_runtime_q4_0_mmv_nr4_nsg2_dispatches,
             provider.metal_runtime_q4_0_mmv_nr8_nsg2_dispatches,
             provider.metal_runtime_q4_0_mmv_nr4_nsg4_dispatches,
@@ -5887,7 +5888,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
         },
     );
     print(
-        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} lm_head_q4_q6_refine_dispatches={d}\n",
+        "metal_q4_q6_k_dispatch: q4_linear_reduce={d} q4_linear_reduce_rows={d}/{d}/{d}/{d} q4_pair_reduce={d} q4_pair_act_reduce={d} q4_pair_act_reduce_out_f16={d} q4_activation_rhs_reduce={d} q6_linear_reduce={d} q6_linear_reduce_rows={d}/{d}/{d}/{d} q6_linear_reduce_in_f16={d} lm_head_q4_q6_refine_dispatches={d} lm_head_q4_resident_sampling_rejections={d}\n",
         .{
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce,
             metal_snapshot.provider.metal_runtime_q4_k_linear_reduce_rows_1,
@@ -5905,6 +5906,7 @@ fn printMetalQuantDispatchSummary(metal_snapshot: ops.BackendDebugTimingSnapshot
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_65_plus,
             metal_snapshot.provider.metal_runtime_q6_k_linear_reduce_f16_input,
             metal_snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches,
+            metal_snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections,
         },
     );
     print(
@@ -6417,6 +6419,11 @@ fn tryRunLiveWholeModelExecutorGenerate(
     // A raw-logit evidence run must consume the same ModelOutput tensors as
     // sampling instead of the device-only greedy/sample shortcut.
     const diagnostic_host_logits = dump_generate_logits_path != null or teacher_force_token_ids != null;
+    if (dump_generate_logits_path != null) {
+        std.debug.print("generate_logits_suppress_token_ids:", .{});
+        for (gpt_config.suppressTokenIds()) |token_id| std.debug.print(" {d}", .{token_id});
+        std.debug.print("\n", .{});
+    }
     const use_runtime_token_decode = runtimeTokenDecodeEnabled() and !diagnostic_host_logits;
     const use_greedy_decode = use_runtime_token_decode and runtime_caps.supports_greedy_decode and isPureGreedyConfig(config);
     const use_sample_decode = use_runtime_token_decode and runtime_caps.supports_sample_decode and !use_greedy_decode;
@@ -8482,6 +8489,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     snapshot.provider.metal_runtime_q6_k_linear_reduce = 10;
     snapshot.provider.metal_runtime_q6_k_linear_reduce_rows_1 = 3;
     snapshot.provider.metal_runtime_lm_head_q4_q6_refine_dispatches = 7;
+    snapshot.provider.metal_runtime_lm_head_q4_resident_sampling_rejections = 2;
 
     const json = try metalStatsCompactJson(std.testing.allocator, snapshot, .{});
     defer std.testing.allocator.free(json);
@@ -8496,6 +8504,7 @@ test "metal stats compact json derives plan counters from runtime handwritten di
     try std.testing.expectEqual(@as(i64, 3), k_quant.get("q6_linear_reduce_rows_1").?.integer);
     const refine = parsed.value.object.get("lm_head_q4_q6_refine").?.object;
     try std.testing.expectEqual(@as(i64, 7), refine.get("dispatches").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), refine.get("resident_sampling_rejections").?.integer);
 
     const plan = parsed.value.object.get("quant_kernel_plan").?.object;
     try std.testing.expectEqual(@as(i64, 30), plan.get("planned").?.integer);

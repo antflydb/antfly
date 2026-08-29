@@ -30,7 +30,13 @@ import benchmark_metal_gemma4_lm_head_repack_quality as quality  # noqa: E402
 SUITE_PATH = SCRIPT_DIR / "fixtures/gemma4_lm_head_repack_quality_v2.json"
 
 
-def metric_step(*, top1_match: bool = True, candidate_nll: float = 1.0) -> dict:
+def metric_step(
+    *,
+    top1_match: bool = True,
+    candidate_nll: float = 1.0,
+    candidate_logits_distinct: bool = True,
+    refined_top1_match: bool = True,
+) -> dict:
     return {
         "baseline_expected_nll": 1.0,
         "candidate_expected_nll": candidate_nll,
@@ -42,6 +48,8 @@ def metric_step(*, top1_match: bool = True, candidate_nll: float = 1.0) -> dict:
         "_sum_abs": 0.0,
         "_sum_sq": 0.0,
         "element_count": 16,
+        "candidate_logits_distinct": candidate_logits_distinct,
+        "refined_top1_match": refined_top1_match,
     }
 
 
@@ -124,6 +132,21 @@ class ThresholdContractTests(unittest.TestCase):
         self.assertEqual(0.5, aggregate["top1_agreement"])
         self.assertIn("top-1 agreement gate failed", failures)
 
+    def test_aggregate_gate_rejects_vacuous_dump_and_refine_divergence(self) -> None:
+        aggregate, failures = quality.aggregate_metrics(
+            [metric_step(candidate_logits_distinct=False), metric_step()],
+            quality.DEFAULT_THRESHOLDS,
+        )
+        self.assertEqual(1, aggregate["distinct_candidate_logit_steps"])
+        self.assertIn("candidate transformed-logit attestation gate failed", failures)
+
+        aggregate, failures = quality.aggregate_metrics(
+            [metric_step(refined_top1_match=False), metric_step()],
+            quality.DEFAULT_THRESHOLDS,
+        )
+        self.assertEqual(0.5, aggregate["refined_argmax_agreement"])
+        self.assertIn("top-8 Q4 nomination plus Q6 refinement gate failed", failures)
+
     def test_campaign_dimensions_require_repeatability_and_reviewed_vocab(self) -> None:
         quality.validate_campaign_dimensions(2, quality.REVIEWED_VOCAB_SIZE, 120.0)
         for repetitions in (1, 5):
@@ -198,6 +221,51 @@ class EvidenceContractTests(unittest.TestCase):
                 values.tofile(destination)
             with self.assertRaisesRegex(quality.ContractError, "non-finite"):
                 quality.read_logits(nonfinite, 2)
+
+    def test_logit_comparison_attests_raw_q4_and_exact_refine_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            baseline_path = root / "baseline.f32"
+            candidate_path = root / "candidate.f32"
+            baseline = array.array("f", (float(value) for value in range(12)))
+            candidate = array.array("f", baseline)
+            candidate[0] += 0.25
+            with baseline_path.open("wb") as destination:
+                baseline.tofile(destination)
+            with candidate_path.open("wb") as destination:
+                candidate.tofile(destination)
+
+            metrics = quality.compare_logits(
+                baseline_path,
+                candidate_path,
+                expected_token_id=10,
+                expected_count=12,
+                suppress_token_ids=[11],
+            )
+            self.assertTrue(metrics["candidate_logits_distinct"])
+            self.assertEqual(10, metrics["production_baseline_top1"])
+            self.assertTrue(metrics["refined_top1_match"])
+
+            candidate = array.array("f", reversed(baseline))
+            with candidate_path.open("wb") as destination:
+                candidate.tofile(destination)
+            metrics = quality.compare_logits(
+                baseline_path,
+                candidate_path,
+                expected_token_id=11,
+                expected_count=12,
+                suppress_token_ids=[],
+            )
+            self.assertFalse(metrics["refined_top1_match"])
+
+            with self.assertRaisesRegex(quality.ContractError, "duplicate or out-of-range"):
+                quality.compare_logits(
+                    baseline_path,
+                    candidate_path,
+                    expected_token_id=11,
+                    expected_count=12,
+                    suppress_token_ids=[1, 1],
+                )
 
     def test_dump_paths_are_step_and_phase_unique(self) -> None:
         base = Path("/tmp/evidence/logits")

@@ -25511,6 +25511,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.provider_impl.raw_quant_runtime_mapped_attempts = 0;
         self.provider_impl.raw_quant_runtime_mapped_fallbacks = 0;
         self.provider_impl.raw_quant_runtime_mapped_failures = 0;
+        self.provider_impl.raw_lm_head_q4_resident_sampling_rejections = 0;
         metal_runtime.resetExactJitDispatchStats(self.provider_impl.raw_decode_runtime) catch {};
         metal_tensor_mod.resetMemoryStats();
     }
@@ -25877,6 +25878,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_q6_k_linear_reduce_rows_65_plus = runtime_stats.q6_k_linear_reduce_rows_65_plus;
         stats.metal_runtime_q6_k_linear_reduce_f16_input = runtime_stats.q6_k_linear_reduce_f16_input;
         stats.metal_runtime_lm_head_q4_q6_refine_dispatches = runtime_stats.lm_head_q4_q6_refine_dispatches;
+        stats.metal_runtime_lm_head_q4_resident_sampling_rejections =
+            self.provider_impl.raw_lm_head_q4_resident_sampling_rejections;
         const provider_generated_stats = metal_runtime.providerGeneratedQuantSnapshot(self.provider_impl.raw_provider);
         for (
             &stats.metal_runtime_antfly_generated_dispatch_counts,
@@ -26237,6 +26240,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .input = linear_input,
             .in_dim = request.in_dim,
             .out_dim = request.out_dim,
+            .use_transformed_lm_head = request.use_transformed_lm_head,
         })) orelse return null;
         return self.ctFromOwnedMetalTensor(tensor);
     }
@@ -26870,7 +26874,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 frame_plan.matchesTail(request.norm_slot, request.linear_slot, request.hidden_size, request.out_dim))
             {
                 if (self.active_prefill_frame_tail_contract) |planned_tail_contract| {
-                    self.timing_stats.prefill_frame_tail_contract_hits += 1;
+                    const full_logit_slot = metal_runtime.fullLogitLmHeadLinearSlot(
+                        self.provider_impl,
+                        request.linear_slot,
+                        request.hidden_size,
+                        request.out_dim,
+                        request.use_transformed_lm_head,
+                    );
+                    const contract_compatible = full_logit_slot == request.linear_slot;
                     if (try metal_runtime.decoderRuntimeEncodeRmsNormLinearLogitsDevice(self.provider_impl, .{
                         .input = input,
                         .norm_slot = request.norm_slot,
@@ -26878,10 +26889,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         .hidden_size = request.hidden_size,
                         .eps = request.eps,
                         .out_dim = request.out_dim,
-                        .planned_layer_contract = planned_tail_contract,
+                        .use_transformed_lm_head = request.use_transformed_lm_head,
+                        .planned_layer_contract = if (contract_compatible)
+                            planned_tail_contract
+                        else
+                            ops.PlannedLayerContract{},
                     })) |tensor| {
+                        if (contract_compatible) {
+                            self.timing_stats.prefill_frame_tail_contract_hits += 1;
+                        } else {
+                            self.timing_stats.prefill_frame_tail_contract_misses += 1;
+                        }
                         return self.ctFromOwnedMetalTensor(tensor);
                     }
+                    self.timing_stats.prefill_frame_tail_contract_misses += 1;
                 } else {
                     self.timing_stats.prefill_frame_tail_contract_misses += 1;
                 }
@@ -26894,6 +26915,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .eps = request.eps,
             .out_dim = request.out_dim,
+            .use_transformed_lm_head = request.use_transformed_lm_head,
         })) orelse return null;
         return self.ctFromOwnedMetalTensor(tensor);
     }
@@ -26923,6 +26945,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeSampleResidentLogitsOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         return metal_runtime.decoderRuntimeSampleResidentLogits(self.provider_impl, .{
+            .linear_slot = request.linear_slot,
+            .hidden_size = request.hidden_size,
             .out_dim = request.out_dim,
             .final_logit_softcap = request.final_logit_softcap,
             .temperature = request.temperature,

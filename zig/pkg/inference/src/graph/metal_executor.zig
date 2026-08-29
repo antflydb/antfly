@@ -2390,6 +2390,7 @@ fn runtimePrefill(
                 .vocab_size = tail.vocab_size,
                 .eps = tail.norm_eps,
                 .final_logit_softcap = runtime_ctx.gpt_config.final_logit_softcapping,
+                .use_transformed_lm_head = decoder_tail_runtime.repackQualityRawLogitsEnabled(),
                 .greedy_token_id = tail.greedy_token_id,
             } };
         }

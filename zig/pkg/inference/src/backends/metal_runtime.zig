@@ -4466,7 +4466,17 @@ pub fn decoderRuntimeEncodeRmsNormLinearLogitsDevice(self: anytype, request: any
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
     if (!request.input.isDevice()) return null;
-    const effective_slot = exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim) orelse request.linear_slot;
+    const use_transformed_lm_head = if (@hasField(@TypeOf(request), "use_transformed_lm_head"))
+        request.use_transformed_lm_head
+    else
+        false;
+    const effective_slot = fullLogitLmHeadLinearSlot(
+        self,
+        request.linear_slot,
+        request.hidden_size,
+        request.out_dim,
+        use_transformed_lm_head,
+    );
     const quant_kind = ensureQuantizedRuntimeLinearSlotPrepared(self, effective_slot, request.hidden_size, request.out_dim);
     const format = metalQuantFormatForKind(quant_kind);
     if (format == .unsupported) return null;
@@ -4983,6 +4993,18 @@ pub fn decoderRuntimeResidentLogitsSamplingSupported(self: anytype, out_dim: usi
 pub fn decoderRuntimeSampleResidentLogits(self: anytype, request: anytype) !?usize {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
+    if (request.linear_slot >= decoder_runtime_linear_slot_capacity or request.hidden_size == 0) return null;
+    const exact_slot = exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim);
+    if (!residentLmHeadLogitsAreCheckpointExact(exact_slot)) {
+        // This entry point is installed only for MetalNativeProvider; count
+        // every refusal as part of the release telemetry contract.
+        self.raw_lm_head_q4_resident_sampling_rejections += 1;
+        if (getenvBool("TERMITE_METAL_TRACE_DECODER_RUNTIME_DECODE")) std.debug.print(
+            "decoder-runtime-decode: rejected resident lm_head logits main_slot={d} exact_slot={?d}\n",
+            .{ request.linear_slot, exact_slot },
+        );
+        return null;
+    }
     if (request.out_dim == 0) return null;
     if (!decoderRuntimeResidentLogitsSamplingSupported(self, request.out_dim, request.top_k, request.top_p)) return null;
     // Only materialize penalty entries when the config actually penalizes.
@@ -8402,7 +8424,17 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
     // Generic/full-logit consumers (sampling, MTP verification, diagnostics)
     // retain checkpoint semantics. Only the planned greedy tail uses the
     // transformed slot plus exact candidate refinement.
-    const effective_slot = exactLmHeadLinearSlot(self, request.slot, request.in_dim, request.out_dim) orelse request.slot;
+    const use_transformed_lm_head = if (@hasField(@TypeOf(request), "use_transformed_lm_head"))
+        request.use_transformed_lm_head
+    else
+        false;
+    const effective_slot = fullLogitLmHeadLinearSlot(
+        self,
+        request.slot,
+        request.in_dim,
+        request.out_dim,
+        use_transformed_lm_head,
+    );
 
     if (try tryApplyQuantizedRuntimeLinear(
         self,
@@ -8481,7 +8513,17 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
     if (request.input.ndim() != 2) return null;
     if (@as(usize, @intCast(request.input.dim(0))) != 1) return null;
     if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
-    const effective_slot = exactLmHeadLinearSlot(self, request.linear_slot, request.hidden_size, request.out_dim) orelse request.linear_slot;
+    const use_transformed_lm_head = if (@hasField(@TypeOf(request), "use_transformed_lm_head"))
+        request.use_transformed_lm_head
+    else
+        false;
+    const effective_slot = fullLogitLmHeadLinearSlot(
+        self,
+        request.linear_slot,
+        request.hidden_size,
+        request.out_dim,
+        use_transformed_lm_head,
+    );
 
     if (self.raw_linear_slot_kinds[effective_slot] == .quantized) {
         if (frame_active) return null;
@@ -8536,6 +8578,7 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
             .input = normed_tensor,
             .in_dim = request.hidden_size,
             .out_dim = request.out_dim,
+            .use_transformed_lm_head = use_transformed_lm_head,
         });
     }
 
@@ -8555,6 +8598,7 @@ pub fn decoderRuntimeApplyRmsNormLinear(self: anytype, request: anytype) !?Metal
             .input = normed,
             .in_dim = request.hidden_size,
             .out_dim = request.out_dim,
+            .use_transformed_lm_head = use_transformed_lm_head,
         });
     }
 
@@ -10833,6 +10877,7 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT_FRAME_SCRATCH"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DECODE_GQA_SPLIT_Q2_DEFAULT_MIN_KV_TOKENS 512u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "attention_decode_gqa_split_scratch_buffer_alt"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "submitted_frame_decode_gqa_split_scratch_slot ^ 1u"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "runtime->submitted_frame_decode_gqa_split_scratch_valid ="));
@@ -10923,6 +10968,34 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     var auto_resolved: c_uint = 99;
     var auto_splits: c_uint = 99;
     var auto_scratch: usize = 99;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_gqa_split_policy_probe(
+        @intFromEnum(DecodeGqaSplitVariant.auto),
+        2,
+        511,
+        8,
+        2,
+        512,
+        0,
+        &auto_resolved,
+        &auto_splits,
+        &auto_scratch,
+    ));
+    try std.testing.expectEqual(@as(c_uint, 0), auto_splits);
+    try std.testing.expectEqual(@as(usize, 0), auto_scratch);
+    try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_gqa_split_policy_probe(
+        @intFromEnum(DecodeGqaSplitVariant.auto),
+        2,
+        512,
+        8,
+        2,
+        512,
+        0,
+        &auto_resolved,
+        &auto_splits,
+        &auto_scratch,
+    ));
+    try std.testing.expectEqual(@as(c_uint, 16), auto_splits);
+    try std.testing.expectEqual(@as(usize, 2 * 8 * 16 * (512 + 2) * @sizeOf(f32)), auto_scratch);
     try std.testing.expectEqual(@as(c_int, 1), termite_metal_decode_gqa_split_policy_probe(
         @intFromEnum(DecodeGqaSplitVariant.auto),
         2,
@@ -21540,6 +21613,44 @@ pub fn exactLmHeadLinearSlot(self: anytype, main_slot: usize, in_dim: usize, out
     if (quantizedRuntimeLinearKind(main_storage) != .q4_k or
         quantizedRuntimeLinearKind(refine_storage) != .q6_k) return null;
     return refine_slot;
+}
+
+/// Resolve the slot used by full-logit consumers. Checkpoint semantics are the
+/// default; only the explicit quality-evidence request may observe the lossy
+/// transformed slot so the repack gate measures what it claims to measure.
+pub fn fullLogitLmHeadLinearSlot(
+    self: anytype,
+    main_slot: usize,
+    in_dim: usize,
+    out_dim: usize,
+    use_transformed_lm_head: bool,
+) usize {
+    return chooseFullLogitLmHeadLinearSlot(
+        main_slot,
+        exactLmHeadLinearSlot(self, main_slot, in_dim, out_dim),
+        use_transformed_lm_head,
+    );
+}
+
+fn chooseFullLogitLmHeadLinearSlot(
+    main_slot: usize,
+    exact_slot: ?usize,
+    use_transformed_lm_head: bool,
+) usize {
+    if (use_transformed_lm_head) return main_slot;
+    return exact_slot orelse main_slot;
+}
+
+fn residentLmHeadLogitsAreCheckpointExact(exact_slot: ?usize) bool {
+    return exact_slot == null;
+}
+
+test "LM-head full-logit and resident-sampling policy is fail closed" {
+    try std.testing.expectEqual(@as(usize, 17), chooseFullLogitLmHeadLinearSlot(17, null, false));
+    try std.testing.expectEqual(@as(usize, 19), chooseFullLogitLmHeadLinearSlot(17, 19, false));
+    try std.testing.expectEqual(@as(usize, 17), chooseFullLogitLmHeadLinearSlot(17, 19, true));
+    try std.testing.expect(residentLmHeadLogitsAreCheckpointExact(null));
+    try std.testing.expect(!residentLmHeadLogitsAreCheckpointExact(19));
 }
 
 fn setRuntimeQuantPrepareMode(self: anytype, slot: usize, mode: RawQuantizedRuntimeLinearStorageMode) void {

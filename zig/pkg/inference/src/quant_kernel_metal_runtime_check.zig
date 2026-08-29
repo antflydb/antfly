@@ -1366,6 +1366,12 @@ const split_gqa_short_checks = [_]SplitGqaCheckCase{
     .{ .name = "decode_gqa_split_short_e4b_q1_kv23_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 23, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 22, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
     .{ .name = "decode_gqa_split_short_a4b_q1_kv23_hd256_swa1024", .shape = .{ .q_len = 1, .kv_tokens = 23, .num_heads = 16, .num_kv_heads = 8, .head_dim = 256, .query_position_offset = 22, .sliding_window = 1024, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
     .{ .name = "decode_gqa_split_short_a4b_q1_kv23_hd512_global", .shape = .{ .q_len = 1, .kv_tokens = 23, .num_heads = 16, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 22, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_short_e2b_q2_kv23_hd256_swa512", .shape = .{ .q_len = 2, .kv_tokens = 23, .num_heads = 8, .num_kv_heads = 1, .head_dim = 256, .query_position_offset = 21, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_short_e2b_q2_kv23_hd512_global", .shape = .{ .q_len = 2, .kv_tokens = 23, .num_heads = 8, .num_kv_heads = 1, .head_dim = 512, .query_position_offset = 21, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_short_e4b_q2_kv23_hd256_swa512", .shape = .{ .q_len = 2, .kv_tokens = 23, .num_heads = 8, .num_kv_heads = 2, .head_dim = 256, .query_position_offset = 21, .sliding_window = 512, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_short_e4b_q2_kv23_hd512_global", .shape = .{ .q_len = 2, .kv_tokens = 23, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 21, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_short_a4b_q2_kv23_hd256_swa1024", .shape = .{ .q_len = 2, .kv_tokens = 23, .num_heads = 16, .num_kv_heads = 8, .head_dim = 256, .query_position_offset = 21, .sliding_window = 1024, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
+    .{ .name = "decode_gqa_split_short_a4b_q2_kv23_hd512_global", .shape = .{ .q_len = 2, .kv_tokens = 23, .num_heads = 16, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 21, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } },
 };
 
 // The production local-attention fallback at the first ragged SWA boundary.
@@ -1397,6 +1403,8 @@ const split_gqa_production_selection_checks = [_]SplitGqaSelectionCheck{
     .{ .check = .{ .name = "decode_gqa_default_e4b_global_kv193", .shape = .{ .q_len = 1, .kv_tokens = 193, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 192, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
     .{ .check = .{ .name = "decode_gqa_default_e4b_global_kv511", .shape = .{ .q_len = 1, .kv_tokens = 511, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 510, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
     .{ .check = .{ .name = "decode_gqa_default_e4b_global_kv512", .shape = .{ .q_len = 1, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
+    .{ .check = .{ .name = "decode_gqa_default_e4b_q2_global_kv511", .shape = .{ .q_len = 2, .kv_tokens = 511, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 509, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = false },
+    .{ .check = .{ .name = "decode_gqa_default_e4b_q2_global_kv512", .shape = .{ .q_len = 2, .kv_tokens = 512, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 510, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
     .{ .check = .{ .name = "decode_gqa_default_e4b_global_kv513", .shape = .{ .q_len = 2, .kv_tokens = 513, .num_heads = 8, .num_kv_heads = 2, .head_dim = 512, .query_position_offset = 511, .sliding_window = 0, .page_size = 16, .permuted_pages = true, .physical_page_bias = 1 } }, .expect_route = true },
     // Preserve the established long-global tensor checks in addition to the
     // pure schedule-policy matrix. These exercise real staged/reducer output
@@ -1700,6 +1708,22 @@ fn splitGqaVariantEnvValue(variant: SplitGqaVariant) [*:0]const u8 {
     };
 }
 
+fn independentlyQualifiedM4Device() !bool {
+    var info: metal_runtime.MetalDeviceInfo = .{};
+    if (metal_runtime.termite_metal_device_info_get(&info) != 0) {
+        return error.MetalRuntimeUnavailable;
+    }
+    var name_buffer: [4096]u8 = undefined;
+    const name_len = termite_metal_copy_device_name(null, 0);
+    if (name_len == 0 or name_len > name_buffer.len or
+        termite_metal_copy_device_name(name_buffer[0..].ptr, name_buffer.len) != name_len)
+    {
+        return error.MetalRuntimeUnavailable;
+    }
+    return info.apple_gpu_family == 9 and
+        std.mem.startsWith(u8, name_buffer[0..name_len], "Apple M4");
+}
+
 fn runSplitGqaPolicyProbeChecks() !void {
     const shapes = [_]struct { head_dim: usize, sliding_window: usize }{
         .{ .head_dim = 256, .sliding_window = 512 },
@@ -1726,7 +1750,12 @@ fn runSplitGqaPolicyProbeChecks() !void {
                             &split_count,
                             &scratch_bytes,
                         );
-                        const qualified_min_kv: usize = if (num_kv_heads == 1) 192 else 32;
+                        const qualified_min_kv: usize = if (q_len == 2)
+                            512
+                        else if (num_kv_heads == 1)
+                            192
+                        else
+                            32;
                         if (kv_tokens < qualified_min_kv) {
                             if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
                                 split_count != 0 or scratch_bytes != 0)
@@ -1781,7 +1810,8 @@ fn runSplitGqaPolicyProbeChecks() !void {
                         &split_count,
                         &scratch_bytes,
                     );
-                    if (kv_tokens < 32) {
+                    const qualified_min_kv: usize = if (q_len == 2) 512 else 32;
+                    if (kv_tokens < qualified_min_kv) {
                         if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
                             split_count != 0 or scratch_bytes != 0)
                         {
@@ -1828,40 +1858,42 @@ fn runSplitGqaPolicyProbeChecks() !void {
     for (min_kv_values) |min_kv| {
         for (short_kv_values) |kv_tokens| {
             for (short_shapes) |shape| {
-                var resolved: u32 = 99;
-                var split_count: u32 = 99;
-                var scratch_bytes: usize = 99;
-                const rc = termite_metal_decode_gqa_split_policy_probe_with_min_kv(
-                    @intFromEnum(SplitGqaVariant.auto),
-                    min_kv,
-                    1,
-                    kv_tokens,
-                    shape.num_heads,
-                    shape.num_kv_heads,
-                    shape.head_dim,
-                    shape.sliding_window,
-                    &resolved,
-                    &split_count,
-                    &scratch_bytes,
-                );
-                if (kv_tokens < min_kv) {
-                    if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
-                        split_count != 0 or scratch_bytes != 0)
-                    {
-                        return error.GeneratedMetalKernelMismatch;
+                for ([_]usize{ 1, 2 }) |q_len| {
+                    var resolved: u32 = 99;
+                    var split_count: u32 = 99;
+                    var scratch_bytes: usize = 99;
+                    const rc = termite_metal_decode_gqa_split_policy_probe_with_min_kv(
+                        @intFromEnum(SplitGqaVariant.auto),
+                        min_kv,
+                        q_len,
+                        kv_tokens,
+                        shape.num_heads,
+                        shape.num_kv_heads,
+                        shape.head_dim,
+                        shape.sliding_window,
+                        &resolved,
+                        &split_count,
+                        &scratch_bytes,
+                    );
+                    if (kv_tokens < min_kv) {
+                        if (rc != 0 or resolved != @intFromEnum(SplitGqaVariant.auto) or
+                            split_count != 0 or scratch_bytes != 0)
+                        {
+                            return error.GeneratedMetalKernelMismatch;
+                        }
+                    } else {
+                        const expected_splits: usize = @min(32, (kv_tokens + 31) / 32);
+                        const expected_scratch = q_len * shape.num_heads * expected_splits *
+                            (shape.head_dim + 2) * @sizeOf(f32);
+                        if (rc != 1 or resolved != @intFromEnum(SplitGqaVariant.s32_k32_r256) or
+                            split_count != @as(u32, @intCast(expected_splits)) or
+                            scratch_bytes != expected_scratch)
+                        {
+                            return error.GeneratedMetalKernelMismatch;
+                        }
                     }
-                } else {
-                    const expected_splits: usize = @min(32, (kv_tokens + 31) / 32);
-                    const expected_scratch = shape.num_heads * expected_splits *
-                        (shape.head_dim + 2) * @sizeOf(f32);
-                    if (rc != 1 or resolved != @intFromEnum(SplitGqaVariant.s32_k32_r256) or
-                        split_count != @as(u32, @intCast(expected_splits)) or
-                        scratch_bytes != expected_scratch)
-                    {
-                        return error.GeneratedMetalKernelMismatch;
-                    }
+                    checked += 1;
                 }
-                checked += 1;
             }
         }
     }
@@ -2375,9 +2407,18 @@ fn runSplitGqaChecks(allocator: std.mem.Allocator) !void {
     const production_runtime = termite_metal_decode_runtime_create() orelse return error.MetalRuntimeUnavailable;
     defer termite_metal_decode_runtime_destroy(production_runtime);
     if (termite_metal_decode_runtime_ready(production_runtime) == 0) return error.MetalRuntimeUnavailable;
+    const independent_m4_qualification = try independentlyQualifiedM4Device();
+    const reported_device_default = termite_metal_pipelined_decode_frame_device_default() != 0;
+    if (reported_device_default != independent_m4_qualification) {
+        std.debug.print(
+            "split GQA A4B device-default mismatch reported={} independent_m4={}\n",
+            .{ reported_device_default, independent_m4_qualification },
+        );
+        return error.GeneratedMetalKernelMismatch;
+    }
     for (split_gqa_production_selection_checks) |selection| {
         const device_qualified = selection.check.shape.num_heads != 16 or
-            termite_metal_pipelined_decode_frame_device_default() != 0;
+            independent_m4_qualification;
         const expected_route = selection.expect_route and device_qualified;
         const expected_variant: ?SplitGqaVariant = if (expected_route) .s32_k32_r256 else null;
         const result = try runSplitGqaCheck(allocator, production_runtime, selection.check, expected_variant);

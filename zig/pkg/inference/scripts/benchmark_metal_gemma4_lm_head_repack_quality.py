@@ -32,10 +32,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_SUITE = SCRIPT_DIR / "fixtures/gemma4_lm_head_repack_quality_v2.json"
 REVIEWED_SUITE_SHA256 = "f9f9240bbb6ec8ce0f0284053ac210f156711ff1fd050e7f019484ffbae52393"
 SUITE_SCHEMA = "antfly.gemma4_lm_head_repack_quality_suite.v2"
-EVIDENCE_SCHEMA = "antfly.gemma4_lm_head_repack_quality_evidence.v2"
+EVIDENCE_SCHEMA = "antfly.gemma4_lm_head_repack_quality_evidence.v3"
 REVIEWED_VOCAB_SIZE = 262144
 PROMPT_IDS_RE = re.compile(r"^prompt_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
 TOKEN_IDS_RE = re.compile(r"^token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$", re.MULTILINE)
+SUPPRESS_IDS_RE = re.compile(
+    r"^generate_logits_suppress_token_ids:(?P<ids>(?:\s+-?\d+)*)\s*$",
+    re.MULTILINE,
+)
 CASE_ID_RE = re.compile(r"[a-z][a-z0-9_]{1,63}")
 HEX_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 SAFE_PARENT_ENV = (
@@ -352,8 +356,15 @@ def read_logits(path: Path, expected_count: int) -> array.array[float]:
     return values
 
 
-def top_ids(values: array.array[float], count: int) -> list[int]:
-    return heapq.nlargest(count, range(len(values)), key=values.__getitem__)
+def top_ids(
+    values: array.array[float], count: int, *, suppress_token_ids: set[int] | None = None
+) -> list[int]:
+    suppressed = suppress_token_ids or set()
+    return heapq.nlargest(
+        count,
+        (token_id for token_id in range(len(values)) if token_id not in suppressed),
+        key=lambda token_id: (values[token_id], -token_id),
+    )
 
 
 def logsumexp(values: array.array[float]) -> float:
@@ -367,6 +378,7 @@ def compare_logits(
     *,
     expected_token_id: int,
     expected_count: int,
+    suppress_token_ids: list[int],
 ) -> dict[str, Any]:
     baseline = read_logits(baseline_path, expected_count)
     candidate = read_logits(candidate_path, expected_count)
@@ -401,13 +413,27 @@ def compare_logits(
         if q and mixture:
             js += 0.5 * q * (log_q - math.log(mixture))
 
-    base_top10 = top_ids(baseline, 10)
-    candidate_top10 = top_ids(candidate, 10)
+    suppressed = set(suppress_token_ids)
+    if len(suppressed) != len(suppress_token_ids) or any(
+        token_id < 0 or token_id >= expected_count for token_id in suppressed
+    ):
+        raise ContractError("suppress-token policy contains duplicate or out-of-range IDs")
+    if expected_count - len(suppressed) < 10:
+        raise ContractError("suppress-token policy leaves fewer than ten candidate tokens")
+    base_top10 = top_ids(baseline, 10, suppress_token_ids=suppressed)
+    candidate_top10 = top_ids(candidate, 10, suppress_token_ids=suppressed)
+    production_baseline_top1 = base_top10[0]
+    candidate_nomination_top8 = top_ids(candidate, 8, suppress_token_ids=suppressed)
+    refined_top1 = max(
+        candidate_nomination_top8,
+        key=lambda token_id: (baseline[token_id], -token_id),
+    )
     baseline_nll = baseline_lse - float(baseline[expected_token_id])
     candidate_nll = candidate_lse - float(candidate[expected_token_id])
     return {
         "baseline_sha256": stable_file_provenance(baseline_path)["sha256"],
         "candidate_sha256": stable_file_provenance(candidate_path)["sha256"],
+        "candidate_logits_distinct": baseline != candidate,
         "expected_token_id": expected_token_id,
         "baseline_expected_rank": 1 + sum(value > baseline[expected_token_id] for value in baseline),
         "candidate_expected_rank": 1 + sum(value > candidate[expected_token_id] for value in candidate),
@@ -420,6 +446,10 @@ def compare_logits(
         "baseline_top10": base_top10,
         "candidate_top10": candidate_top10,
         "top10_overlap": len(set(base_top10) & set(candidate_top10)),
+        "production_baseline_top1": production_baseline_top1,
+        "candidate_nomination_top8": candidate_nomination_top8,
+        "refined_top1": refined_top1,
+        "refined_top1_match": refined_top1 == production_baseline_top1,
         "max_abs": max_abs,
         "mean_abs": sum_abs / expected_count,
         "rmse": math.sqrt(sum_sq / expected_count),
@@ -460,6 +490,7 @@ def run_teacher_case(
     }
     if mode == "candidate":
         extra["TERMITE_METAL_ENABLE_LM_HEAD_Q4_REPACK"] = candidate_format
+        extra["TERMITE_METAL_LM_HEAD_Q4_REPACK_QUALITY_RAW_LOGITS"] = "1"
     elif mode != "baseline":
         raise ContractError(f"invalid mode: {mode}")
     command = generate_command(
@@ -478,6 +509,9 @@ def run_teacher_case(
     )
     observed_prompt_ids = parse_id_line(PROMPT_IDS_RE, output, "prompt_token_ids")
     observed_token_ids = parse_id_line(TOKEN_IDS_RE, output, "token_ids")
+    suppress_token_ids = parse_id_line(
+        SUPPRESS_IDS_RE, output, "generate_logits_suppress_token_ids"
+    )
     if observed_prompt_ids != prompt_ids:
         raise ContractError(f"prompt IDs changed during {mode} run; output={log_path}")
     if observed_token_ids != continuation_ids:
@@ -499,6 +533,7 @@ def run_teacher_case(
         "log_path": str(log_path),
         "log_sha256": stable_file_provenance(log_path)["sha256"],
         "dump_paths": [str(path) for path in dumps],
+        "suppress_token_ids": suppress_token_ids,
     }
 
 
@@ -560,6 +595,12 @@ def aggregate_metrics(steps: list[dict[str, Any]], thresholds: dict[str, float])
         "mean_top10_overlap_fraction": math.fsum(step["top10_overlap"] for step in steps) / (10 * token_count),
         "min_top10_overlap": min(step["top10_overlap"] for step in steps),
         "min_top10_overlap_fraction": min(step["top10_overlap"] for step in steps) / 10,
+        "distinct_candidate_logit_steps": sum(
+            step["candidate_logits_distinct"] for step in steps
+        ),
+        "refined_argmax_matches": sum(step["refined_top1_match"] for step in steps),
+        "refined_argmax_agreement": sum(step["refined_top1_match"] for step in steps)
+        / token_count,
         "mean_kl_base_to_candidate": math.fsum(step["kl_base_to_candidate"] for step in steps) / token_count,
         "max_kl_base_to_candidate": max(step["kl_base_to_candidate"] for step in steps),
         "mean_js_divergence": math.fsum(step["js_divergence"] for step in steps) / token_count,
@@ -586,6 +627,14 @@ def aggregate_metrics(steps: list[dict[str, Any]], thresholds: dict[str, float])
         (
             aggregate["min_top10_overlap_fraction"] >= thresholds["min_step_top10_overlap_fraction"],
             "minimum top-10 overlap",
+        ),
+        (
+            aggregate["distinct_candidate_logit_steps"] == token_count,
+            "candidate transformed-logit attestation",
+        ),
+        (
+            aggregate["refined_argmax_matches"] == token_count,
+            "top-8 Q4 nomination plus Q6 refinement",
         ),
     )
     for passed, label in checks:
@@ -697,11 +746,16 @@ def main() -> int:
             for step_index, token_id in enumerate(continuation_ids):
                 baseline_path = Path(runs["baseline"]["dump_paths"][step_index])
                 candidate_path = Path(runs["candidate"]["dump_paths"][step_index])
+                if runs["baseline"]["suppress_token_ids"] != runs["candidate"]["suppress_token_ids"]:
+                    raise ContractError(
+                        f"baseline/candidate suppress-token policy differs for {case_id}"
+                    )
                 metrics = compare_logits(
                     baseline_path,
                     candidate_path,
                     expected_token_id=token_id,
                     expected_count=args.vocab_size,
+                    suppress_token_ids=runs["baseline"]["suppress_token_ids"],
                 )
                 metrics.update(
                     {
@@ -782,6 +836,8 @@ def main() -> int:
             "vocab_size": args.vocab_size,
             "thresholds": thresholds,
             "candidate_format": args.candidate_format,
+            "candidate_logit_path": "explicit transformed Q4_K slot",
+            "refined_argmax_gate": "Q4_K top-8 nomination rescored with checkpoint Q6_K logits must match exact Q6_K argmax at every step",
             "invocation_arguments": sys.argv[1:],
         },
         "provenance": {

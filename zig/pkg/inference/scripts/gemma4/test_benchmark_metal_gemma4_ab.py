@@ -82,17 +82,22 @@ if concurrent and os.environ.get("TERMITE_METAL_DISABLE_CONCURRENT_PLANNED_DISPA
 
 model_topology = os.environ.get("FAKE_GEMMA4_TOPOLOGY", "e4b")
 decode_frames = tokens
+prompt_tokens = int(os.environ.get("FAKE_PROMPT_TOKENS", "20"))
+split_disabled = os.environ.get("TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT") == "1"
 default_split_min_kv = 192 if model_topology == "e2b" else 32
 split_min_kv = int(
     os.environ.get("TERMITE_METAL_DECODE_GQA_SPLIT_MIN_KV", str(default_split_min_kv))
 )
-below_floor_frames = min(decode_frames, max(split_min_kv - (20 + 1), 0))
+below_floor_frames = min(decode_frames, max(split_min_kv - (prompt_tokens + 1), 0))
 split_frames = decode_frames - below_floor_frames
+if split_disabled:
+    below_floor_frames = 0
+    split_frames = 0
 if model_topology == "e2b":
     attention = 35 * decode_frames + 28
-    paged_attention = 35 * below_floor_frames + 28
+    paged_attention = 35 * (decode_frames if split_disabled else below_floor_frames) + 28
     split_attention = 35 * split_frames
-    below_floor_calls = 35 * below_floor_frames
+    below_floor_calls = 0 if split_disabled else 35 * below_floor_frames
     generated_flash_prefill = 0
     generated_flash_prefill_hd512 = 7
     prefill_paged_kv = 7
@@ -101,9 +106,9 @@ if model_topology == "e2b":
     logical_prefill_q4 = 275
 elif model_topology == "e4b":
     attention = 42 * decode_frames
-    paged_attention = 42 * below_floor_frames
+    paged_attention = 42 * (decode_frames if split_disabled else below_floor_frames)
     split_attention = 42 * split_frames
-    below_floor_calls = 42 * below_floor_frames
+    below_floor_calls = 0 if split_disabled else 42 * below_floor_frames
     generated_flash_prefill = 35
     generated_flash_prefill_hd512 = 7
     prefill_paged_kv = 42
@@ -129,8 +134,11 @@ if gqa_global_variant not in ("s8", "s16", "s24", "s32"):
 decode_pairs = pair_count * decode_frames if pair_decode else 0
 prefill_pairs = pair_count if pair_prefill else 0
 q4_row_one = logical_decode_q4 * decode_frames - 2 * decode_pairs
-q4_row_9_64 = logical_prefill_q4 - 2 * prefill_pairs
-q4_row_65 = 0
+q4_prefill_dispatches = logical_prefill_q4 - 2 * prefill_pairs
+q4_prefill_rows = [0, 0, 0, 0]
+q4_prefill_bucket = 0 if prompt_tokens == 1 else 1 if prompt_tokens <= 8 else 2 if prompt_tokens <= 64 else 3
+q4_prefill_rows[q4_prefill_bucket] = q4_prefill_dispatches
+q4_rows = [q4_row_one + q4_prefill_rows[0], *q4_prefill_rows[1:]]
 
 q4_variant_names = ("nr4-nsg2", "nr8-nsg2", "nr4-nsg4", "nr8-nsg4")
 q4_workload_env = {
@@ -281,7 +289,10 @@ payload = {
             "below_min_kv": below_floor_calls,
         },
         "prepared_frame": {"fast_path": decode_frames, "fallback": 0},
-        "lm_head_q4_q6_refine": {"dispatches": tokens if lm_head_repack else 0},
+        "lm_head_q4_q6_refine": {
+            "dispatches": tokens if lm_head_repack else 0,
+            "resident_sampling_rejections": 0,
+        },
         "stage_timing_ns": stage,
         "q4_0_policy": q4_variants,
         "frame_fallbacks": {
@@ -295,8 +306,8 @@ payload = {
 json_path.write_text(json.dumps(payload))
 
 print("generate-setup: live whole-model executor skipped")
-print("gen_debug: executePrefill whole-model fast path seq_len=20")
-print("prompt_token_ids:", " ".join(str(index) for index in range(20)))
+print(f"gen_debug: executePrefill whole-model fast path seq_len={prompt_tokens}")
+print("prompt_token_ids:", " ".join(str(index) for index in range(prompt_tokens)))
 print("token_ids:", " ".join(str(index) for index in range(tokens)))
 print(
     "metal_attention_dispatch: "
@@ -341,7 +352,7 @@ if os.environ.get("TERMITE_METAL_TRACE_DECODE_GQA_SPLIT_SCHEDULE") == "1":
 print(f"metal_prepared_frame: fast_path={decode_frames} fallback=0")
 print("metal_runtime_memory: total_mb=5718 frame_retained_mb=209")
 print(
-    f"metal_q4_0_dispatch: linear_reduce_rows={q4_row_one}/0/{q4_row_9_64}/{q4_row_65} "
+    f"metal_q4_0_dispatch: linear_reduce_rows={q4_rows[0]}/{q4_rows[1]}/{q4_rows[2]}/{q4_rows[3]} "
     f"pair_act_reduce={decode_pairs + prefill_pairs}"
 )
 print(
@@ -379,7 +390,8 @@ print(
     "metal_q4_q6_k_dispatch: "
     f"q4_linear_reduce_rows={tokens if lm_head_repack else 0}/0/0/0 "
     f"q6_linear_reduce_rows={1 if lm_head_repack else tokens + 1}/0/0/0 "
-    f"lm_head_q4_q6_refine_dispatches={tokens if lm_head_repack else 0}"
+    f"lm_head_q4_q6_refine_dispatches={tokens if lm_head_repack else 0} "
+    "lm_head_q4_resident_sampling_rejections=0"
 )
 p = stage["prefill"]
 d = stage["decode"]
@@ -401,29 +413,26 @@ class RouteFormulaTests(unittest.TestCase):
         for tokens in (4, 128, 300):
             with self.subTest(tokens=tokens):
                 split = _route_expectations("split_ffn", tokens)
-                self.assertEqual(split["q4_row_one"], 210 * tokens)
+                self.assertEqual(split["q4_rows"], (210 * tokens, 0, 342, 0))
                 self.assertEqual(split["decode_pairs"], 0)
-                self.assertEqual(split["q4_row_9_64"], 342)
-                self.assertEqual(split["q4_row_65_plus"], 0)
                 gqa = _route_expectations("gqa_split_schedule", tokens)
                 self.assertEqual(gqa["attention"], 42 * tokens)
                 self.assertEqual(gqa["decode_pairs"], 0)
                 paired = _route_expectations("pair_decode_prefill", tokens)
-                self.assertEqual(paired["q4_row_one"], 126 * tokens)
+                self.assertEqual(paired["q4_rows"], (126 * tokens, 0, 258, 0))
                 self.assertEqual(paired["decode_pairs"], 42 * tokens)
-                self.assertEqual(paired["q4_row_9_64"], 258)
-                self.assertEqual(paired["q4_row_65_plus"], 0)
                 self.assertEqual(paired["prefill_pairs"], 42)
                 self.assertEqual(
-                    paired["q4_row_one"] + 2 * paired["decode_pairs"],
+                    paired["q4_decode_row_one"] + 2 * paired["decode_pairs"],
                     paired["logical_decode_q4"],
                 )
                 self.assertEqual(
-                    paired["q4_row_9_64"] + 2 * paired["prefill_pairs"],
+                    sum(paired["q4_rows"]) - paired["q4_decode_row_one"]
+                    + 2 * paired["prefill_pairs"],
                     paired["logical_prefill_q4"],
                 )
                 repack = _route_expectations("lm_head_repack", tokens)
-                self.assertEqual(repack["q4_row_one"], 126 * tokens)
+                self.assertEqual(repack["q4_decode_row_one"], 126 * tokens)
                 self.assertEqual(repack["decode_pairs"], 42 * tokens)
                 self.assertEqual(repack["prefill_pairs"], 0)
                 e2b = _route_expectations("lm_head_repack", tokens, "e2b")
@@ -439,7 +448,7 @@ class RouteFormulaTests(unittest.TestCase):
                         7,
                     ),
                 )
-                self.assertEqual(e2b["q4_row_one"], 105 * tokens)
+                self.assertEqual(e2b["q4_decode_row_one"], 105 * tokens)
                 self.assertEqual(e2b["decode_pairs"], 35 * tokens)
                 self.assertEqual(
                     e2b["q4_mmv_variants"],
@@ -447,6 +456,35 @@ class RouteFormulaTests(unittest.TestCase):
                 )
         with self.assertRaisesRegex(BenchmarkContractError, "not qualified for E2B"):
             _route_expectations("split_ffn", OUTPUT_TOKENS, "e2b")
+
+    def test_prefill_row_buckets_follow_live_prompt_length(self) -> None:
+        self.assertEqual(
+            (210 * OUTPUT_TOKENS, 342, 0, 0),
+            _route_expectations("split_ffn", OUTPUT_TOKENS, prompt_tokens=8)["q4_rows"],
+        )
+        self.assertEqual(
+            (210 * OUTPUT_TOKENS, 0, 0, 342),
+            _route_expectations("split_ffn", OUTPUT_TOKENS, prompt_tokens=65)["q4_rows"],
+        )
+
+    def test_split_rollback_has_all_paged_decode_and_no_below_floor_hits(self) -> None:
+        rollback = _route_expectations("gqa_split_rollback", OUTPUT_TOKENS)
+        self.assertEqual(0, rollback["split_frames"])
+        self.assertEqual(0, rollback["below_floor_calls"])
+        self.assertEqual(
+            (42 * OUTPUT_TOKENS, 0, 35, 7, 0, 42),
+            rollback["attention_routes"],
+        )
+        paired_rollback = _route_expectations(
+            "gqa_split_rollback_pair_decode", OUTPUT_TOKENS, "e2b"
+        )
+        self.assertEqual(0, paired_rollback["split_frames"])
+        self.assertEqual(0, paired_rollback["below_floor_calls"])
+        self.assertEqual(35 * OUTPUT_TOKENS, paired_rollback["decode_pairs"])
+        self.assertEqual(
+            (35 * OUTPUT_TOKENS + 28, 0, 0, 7, 0, 7),
+            paired_rollback["attention_routes"],
+        )
 
 
 class HarnessTests(unittest.TestCase):
@@ -552,7 +590,7 @@ class HarnessTests(unittest.TestCase):
         completed = self.run_paired(out)
         self.assertIn("passed=True", completed.stdout)
         summary = json.loads((out / "summary.json").read_text())
-        self.assertEqual(summary["schema"], "antfly.gemma4_metal_ab.v7")
+        self.assertEqual(summary["schema"], "antfly.gemma4_metal_ab.v8")
         self.assertTrue(summary["passed"])
         self.assertEqual(len(summary["performance_samples"]), 4)
         self.assertEqual(len(summary["stage_timing_samples"]), 2)
@@ -721,6 +759,117 @@ class HarnessTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(BenchmarkContractError, "fallback/invalid override"):
             build_summary(out)
+
+    def test_gqa_split_rollback_profile_attests_all_paged_route(self) -> None:
+        out = self.tmp / "gqa-rollback"
+        command = self.paired_command(out)
+        command.extend(
+            (
+                "--candidate-route-profile",
+                "gqa_split_rollback",
+                "--candidate-env",
+                "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT=1",
+            )
+        )
+        environment = os.environ.copy()
+        environment["STAGE_TIMING_RUNS"] = "0"
+        completed = subprocess.run(
+            command,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertIn("passed=True", completed.stdout)
+        summary = json.loads((out / "summary.json").read_text())
+        candidate = next(
+            sample
+            for sample in summary["performance_samples"]
+            if sample["variant"] == "candidate" and sample["index"] == 1
+        )
+        self.assertEqual(candidate["routes"]["paged_1x"], 42 * OUTPUT_TOKENS)
+        self.assertEqual(candidate["routes"]["decode_gqa_split"], 0)
+        self.assertEqual(
+            candidate["routes"]["decode_gqa_split_policy"],
+            {"min_kv": 32, "below_min_kv": 0},
+        )
+
+        e2b_out = self.tmp / "gqa-rollback-pair-e2b"
+        e2b = self.paired_command(e2b_out)
+        e2b.extend(
+            (
+                "--model-topology",
+                "e2b",
+                "--baseline-route-profile",
+                "pair_decode",
+                "--candidate-route-profile",
+                "gqa_split_rollback_pair_decode",
+                "--expected-pair-mmv-variant",
+                "nr4-nsg4",
+                "--common-env",
+                "FAKE_GEMMA4_TOPOLOGY=e2b",
+                "--baseline-env",
+                "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION=1",
+                "--candidate-env",
+                "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION=1",
+                "--candidate-env",
+                "TERMITE_METAL_DISABLE_DECODE_GQA_SPLIT=1",
+            )
+        )
+        completed = subprocess.run(
+            e2b,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertIn("passed=True", completed.stdout)
+        e2b_summary = json.loads((e2b_out / "summary.json").read_text())
+        e2b_candidate = next(
+            sample
+            for sample in e2b_summary["performance_samples"]
+            if sample["variant"] == "candidate" and sample["index"] == 1
+        )
+        self.assertEqual(e2b_candidate["routes"]["paged_1x"], 35 * OUTPUT_TOKENS + 28)
+        self.assertEqual(e2b_candidate["routes"]["decode_gqa_split"], 0)
+        self.assertEqual(
+            e2b_candidate["routes"]["decode_gqa_split_policy"],
+            {"min_kv": 192, "below_min_kv": 0},
+        )
+
+        invalid = self.paired_command(self.tmp / "gqa-rollback-missing-flag")
+        invalid.extend(("--candidate-route-profile", "gqa_split_rollback"))
+        rejected = subprocess.run(invalid, text=True, capture_output=True, check=False)
+        self.assertNotEqual(0, rejected.returncode)
+        self.assertIn("decode GQA split rollback disagree", rejected.stderr)
+
+    def test_live_prompt_length_selects_the_prefill_row_bucket(self) -> None:
+        out = self.tmp / "prompt-row-bucket"
+        command = self.paired_command(out)
+        command[command.index("--expected-prompt-tokens") + 1] = "8"
+        command[command.index("--expected-prompt-token-ids-sha256") + 1] = token_digest(8)
+        command.extend(("--common-env", "FAKE_PROMPT_TOKENS=8"))
+        environment = os.environ.copy()
+        environment["STAGE_TIMING_RUNS"] = "0"
+        completed = subprocess.run(
+            command,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertIn("passed=True", completed.stdout)
+        summary = json.loads((out / "summary.json").read_text())
+        candidate = next(
+            sample
+            for sample in summary["performance_samples"]
+            if sample["variant"] == "candidate" and sample["index"] == 1
+        )
+        self.assertEqual(
+            candidate["routes"]["q4_linear_reduce_rows"],
+            [210 * OUTPUT_TOKENS, 342, 0, 0],
+        )
 
     def test_paired_mode_requires_balanced_even_run_count(self) -> None:
         out = self.tmp / "odd-paired"
