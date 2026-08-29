@@ -6258,7 +6258,7 @@ pub const Reader = struct {
                     if (reduced_coverage) |coverage|
                         try decodeJbig2CoverageToRgba(rgba, coverage, obj.get("Decode"), self.cancellation)
                     else
-                        try decodeJbig2DeviceGrayToRgba(rgba, render_width, render_height, source_bitmap, obj.get("Decode"));
+                        try decodeJbig2DeviceGrayToRgba(rgba, render_width, render_height, source_bitmap, obj.get("Decode"), self.cancellation);
                 }
             } else if (resolved_color_space == .array) {
                 const samples = source_samples orelse return error.UnsupportedPdfRendering;
@@ -6286,7 +6286,7 @@ pub const Reader = struct {
             const rgba = try self.alloc.alloc(u8, rgba_len);
             errdefer self.alloc.free(rgba);
             if (image_mask) {
-                try decodeGrayMaskToRgba(rgba, gray, obj.get("Decode"));
+                try decodeGrayMaskToRgba(rgba, gray, obj.get("Decode"), self.cancellation);
                 return .{ .rgba = rgba, .width = width, .height = height };
             }
 
@@ -6386,7 +6386,7 @@ pub const Reader = struct {
                 try ensureDecodeWorkingSet(local_decode_limits.max_working_set_bytes, &.{ encoded.len, decoded_mask.pixels.len, mask_rgba_len });
                 const rgba = try self.alloc.alloc(u8, mask_rgba_len);
                 errdefer self.alloc.free(rgba);
-                try decodeGrayMaskToRgba(rgba, decoded_mask.pixels, obj.get("Decode"));
+                try decodeGrayMaskToRgba(rgba, decoded_mask.pixels, obj.get("Decode"), self.cancellation);
                 return .{ .rgba = rgba, .width = decoded_mask.width, .height = decoded_mask.height };
             }
             try transparency_plan.validateColorKeyBits(header.bits_per_component);
@@ -6440,7 +6440,7 @@ pub const Reader = struct {
                 const rgba = if (indexed_color_space)
                     try self.jpeg2000IndexedU16ToRgbaAlloc(decoded_u16.pixels, width, height, decoded_u16.components, header.bits_per_component, decoded_u16.jp2_color, obj, jpx_alpha_mode)
                 else blk: {
-                    const normalized = try normalizeU16SamplesToU8Alloc(self.alloc, decoded_u16.pixels, header.bits_per_component);
+                    const normalized = try normalizeU16SamplesToU8Alloc(self.alloc, decoded_u16.pixels, header.bits_per_component, self.cancellation);
                     defer self.alloc.free(normalized);
                     break :blk try self.jpeg2000SamplesToRgbaAlloc(normalized, width, height, decoded_u16.components, decoded_u16.jp2_color, obj, jpx_alpha_mode);
                 };
@@ -6741,6 +6741,7 @@ pub const Reader = struct {
         defer self.alloc.free(indexes);
         const max_sample: u32 = (@as(u32, 1) << @intCast(bits_per_component)) - 1;
         for (indexes, 0..) |*index, pixel| {
+            if (pixel & 4095 == 0) try self.checkCancellation();
             const sample = pixels[pixel * components + layout.offsets[0]];
             if (sample > max_sample or sample > std.math.maxInt(u8)) return error.UnsupportedPdfRendering;
             index.* = @intCast(sample);
@@ -6754,6 +6755,7 @@ pub const Reader = struct {
         try self.decodeResolvedImageColorSpaceToRgba(rgba, pixel_count, indexes, &color_space, null);
         if (alpha_layout) |embedded| {
             for (0..pixel_count) |pixel| {
+                if (pixel & 4095 == 0) try self.checkCancellation();
                 const alpha = pixels[pixel * components + embedded.alpha];
                 if (alpha > max_sample) return error.UnsupportedPdfRendering;
                 rgba[pixel * 4 + 3] = if (alpha_mode == .ignore)
@@ -7008,6 +7010,7 @@ pub const Reader = struct {
             const white = parseLabWhitePoint(params);
             var i: usize = 0;
             while (i < pixel_count) : (i += 1) {
+                if (i & 4095 == 0) try self.checkCancellation();
                 const src = i * 3;
                 const dst = i * 4;
                 const l = applyDecodeUnit(decoded[src + 0], decode_obj, 0) * 100.0;
@@ -7075,6 +7078,7 @@ pub const Reader = struct {
 
         var i: usize = 0;
         while (i < pixel_count) : (i += 1) {
+            if (i & 4095 == 0) try self.checkCancellation();
             const idx = try applyIndexedDecode(decoded[i], decode_obj, palette_entries);
             if (idx >= palette_entries) return error.UnsupportedPdfRendering;
             const src = @as(usize, idx) * comps;
@@ -7149,6 +7153,7 @@ pub const Reader = struct {
 
         var i: usize = 0;
         while (i < pixel_count) : (i += 1) {
+            if (i & 4095 == 0) try self.checkCancellation();
             const tint = applyDecodeUnit(decoded[i], decode_obj, 0);
             for (0..alt_components) |component| {
                 alt_bytes[i * alt_components + component] = floatChannel(evalExponentialTintComponent(&transform, tint, component));
@@ -7545,7 +7550,7 @@ pub const Reader = struct {
     ) anyerror!void {
         switch (plan.*) {
             .none => {},
-            .color_key => |mask| try applyColorKeyMaskFromSamples(rgba, source_samples orelse return error.UnsupportedPdfRendering, mask),
+            .color_key => |mask| try applyColorKeyMaskFromSamples(rgba, source_samples orelse return error.UnsupportedPdfRendering, mask, self.cancellation),
             .explicit_mask => |mask_plan| {
                 const active_key = try context.enterMask(self.alloc, mask_plan.metadata.reference_key, mask_depth);
                 defer context.leaveMask(active_key);
@@ -9156,10 +9161,12 @@ fn decodeGrayMaskToRgba(
     rgba: []u8,
     gray: []const u8,
     decode_obj: ?*const syntax.Object,
+    cancellation: CancellationProbe,
 ) !void {
     const decode_reversed = parseMaskDecodeReversed(decode_obj);
     if (rgba.len != gray.len * 4) return error.UnsupportedPdfRendering;
     for (gray, 0..) |sample, i| {
+        if (i & 4095 == 0) try cancellation.check();
         const paint = if (decode_reversed) sample >= 128 else sample < 128;
         const dst = i * 4;
         rgba[dst + 0] = 0;
@@ -9355,6 +9362,7 @@ fn decodeJbig2DeviceGrayToRgba(
     height: u32,
     encoded: []const u8,
     decode_obj: ?*const syntax.Object,
+    cancellation: CancellationProbe,
 ) !void {
     const row_bytes = (@as(usize, width) + 7) / 8;
     const required = std.math.mul(usize, row_bytes, height) catch return error.UnsupportedPdfRendering;
@@ -9363,6 +9371,8 @@ fn decodeJbig2DeviceGrayToRgba(
     const white_gray = applyDecodeByte(0xff, decode_obj, 0);
     for (0..height) |y| {
         for (0..width) |x| {
+            const pixel = y * @as(usize, width) + x;
+            if (pixel & 4095 == 0) try cancellation.check();
             const byte = encoded[y * row_bytes + x / 8];
             const shift: u3 = @intCast(7 - (x & 7));
             const jbig2_black = ((byte >> shift) & 1) != 0;
@@ -14768,7 +14778,7 @@ fn parseColorKeyMask(mask_array: []const syntax.Object, component_count: usize) 
     return mask;
 }
 
-fn applyColorKeyMaskFromSamples(rgba: []u8, samples: ImageSourceSamples, mask: ColorKeyMask) !void {
+fn applyColorKeyMaskFromSamples(rgba: []u8, samples: ImageSourceSamples, mask: ColorKeyMask, cancellation: CancellationProbe) !void {
     if (samples.component_count == 0 or samples.component_count > 4 or samples.stride == 0) return error.UnsupportedPdfRendering;
     if (samples.bits_per_component == 0 or samples.bits_per_component > 16) return error.UnsupportedPdfRendering;
     if (mask.component_count != samples.component_count) return error.UnsupportedPdfRendering;
@@ -14787,6 +14797,7 @@ fn applyColorKeyMaskFromSamples(rgba: []u8, samples: ImageSourceSamples, mask: C
     }
 
     for (0..samples.pixel_count) |pixel| {
+        if (pixel & 4095 == 0) try cancellation.check();
         var matches = true;
         const base = pixel * samples.stride;
         for (0..samples.component_count) |component| {
@@ -14807,12 +14818,13 @@ fn applyColorKeyMaskFromSamples(rgba: []u8, samples: ImageSourceSamples, mask: C
     }
 }
 
-fn normalizeU16SamplesToU8Alloc(alloc: Allocator, samples: []const u16, bits_per_component: u8) ![]u8 {
+fn normalizeU16SamplesToU8Alloc(alloc: Allocator, samples: []const u16, bits_per_component: u8, cancellation: CancellationProbe) ![]u8 {
     if (bits_per_component <= 8 or bits_per_component > 16) return error.UnsupportedPdfRendering;
     const max_sample: u32 = (@as(u32, 1) << @intCast(bits_per_component)) - 1;
     const normalized = try alloc.alloc(u8, samples.len);
     errdefer alloc.free(normalized);
-    for (samples, normalized) |sample, *out| {
+    for (samples, normalized, 0..) |sample, *out, index| {
+        if (index & 4095 == 0) try cancellation.check();
         if (sample > max_sample) return error.UnsupportedPdfRendering;
         out.* = @intCast((@as(u32, sample) * 255 + max_sample / 2) / max_sample);
     }
@@ -15214,6 +15226,63 @@ test "content parsing and pixel conversion observe cancellation" {
         Reader.decodeDeviceColorSpaceToRgba(&rgba, 4097, &([_]u8{0} ** 4097), "DeviceGray", null, pixel_cancellation),
     );
     try std.testing.expectEqual(@as(usize, 2), pixel_cancel.checks);
+}
+
+test "late image color conversions observe cancellation" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    const cancellation: CancellationProbe = .{ .is_cancelled_fn = Cancelled.check };
+    const alloc = std.testing.allocator;
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n",
+    };
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var pdf = try Reader.init(alloc, sample);
+    defer pdf.deinit();
+    pdf.setCancellationProbe(cancellation);
+
+    var rgba: [4]u8 = undefined;
+    var lab_scanner = syntax.Scanner.init(alloc, "[/Lab << /WhitePoint [1 1 1] >>]");
+    defer lab_scanner.deinit();
+    var lab = try lab_scanner.readObject();
+    defer lab.deinit(alloc);
+    try std.testing.expectError(error.Canceled, pdf.tryDecodeCalibratedImageToRgba(&rgba, 1, &.{ 0, 0, 0 }, lab.array, null));
+
+    var indexed_scanner = syntax.Scanner.init(alloc, "[/Indexed /DeviceRGB 0 <ff0000>]");
+    defer indexed_scanner.deinit();
+    var indexed = try indexed_scanner.readObject();
+    defer indexed.deinit(alloc);
+    try std.testing.expectError(error.Canceled, pdf.decodeIndexedImageToRgba(&rgba, 1, &.{0}, indexed.array, null));
+
+    var spot_scanner = syntax.Scanner.init(alloc, "[/Separation /Spot /DeviceRGB << /FunctionType 2 /Domain [0 1] /C0 [1 1 1] /C1 [1 0 0] /N 1 >>]");
+    defer spot_scanner.deinit();
+    var spot = try spot_scanner.readObject();
+    defer spot.deinit(alloc);
+    try std.testing.expectError(error.Canceled, pdf.tryDecodeSpotColorSpaceToRgba(&rgba, 1, &.{0}, spot.array, null));
+
+    var image_scanner = syntax.Scanner.init(alloc, "<< /ColorSpace [/Indexed /DeviceRGB 0 <ff0000>] >>");
+    defer image_scanner.deinit();
+    var image_obj = try image_scanner.readObject();
+    defer image_obj.deinit(alloc);
+    try std.testing.expectError(error.Canceled, pdf.jpeg2000IndexedU16ToRgbaAlloc(&.{0}, 1, 1, 1, 8, .{}, &image_obj, .ignore));
+
+    try std.testing.expectError(error.Canceled, normalizeU16SamplesToU8Alloc(alloc, &.{0}, 16, cancellation));
+    try std.testing.expectError(error.Canceled, decodeGrayMaskToRgba(&rgba, &.{0}, null, cancellation));
+    try std.testing.expectError(error.Canceled, decodeJbig2DeviceGrayToRgba(&rgba, 1, 1, &.{0}, null, cancellation));
+
+    const mask = ColorKeyMask{ .component_count = 1, .ranges = .{ .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 }, .{ 0, 0 } } };
+    try std.testing.expectError(error.Canceled, applyColorKeyMaskFromSamples(&rgba, .{
+        .data = .{ .u8 = @constCast(&[_]u8{0}) },
+        .pixel_count = 1,
+        .component_count = 1,
+        .stride = 1,
+        .bits_per_component = 8,
+    }, mask, cancellation));
 }
 
 test "reader init accepts bounded bytes before header and after final eof" {
@@ -19790,12 +19859,12 @@ test "reader rejects a malformed JBIG2 soft mask instead of dropping it" {
 test "JBIG2 black pixels use PDF sample polarity and honor Decode" {
     const encoded_bits = [_]u8{0b10000000};
     var rgba: [8]u8 = undefined;
-    try decodeJbig2DeviceGrayToRgba(&rgba, 2, 1, &encoded_bits, null);
+    try decodeJbig2DeviceGrayToRgba(&rgba, 2, 1, &encoded_bits, null, .{});
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 255, 255, 255, 255, 255 }, &rgba);
 
     var decode_items = [_]syntax.Object{ .{ .integer = 1 }, .{ .integer = 0 } };
     const decode = syntax.Object{ .array = &decode_items };
-    try decodeJbig2DeviceGrayToRgba(&rgba, 2, 1, &encoded_bits, &decode);
+    try decodeJbig2DeviceGrayToRgba(&rgba, 2, 1, &encoded_bits, &decode, .{});
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255, 0, 0, 0, 255 }, &rgba);
 }
 
@@ -20000,7 +20069,7 @@ test "color key mask compares source RGB samples" {
         .component_count = 3,
         .stride = 4,
         .bits_per_component = 8,
-    }, try parseColorKeyMask(&mask_array, 3));
+    }, try parseColorKeyMask(&mask_array, 3), .{});
     try std.testing.expectEqual(@as(u8, 0), rgba[3]);
     try std.testing.expectEqual(@as(u8, 255), rgba[7]);
     try std.testing.expectEqual(@as(u8, 0), rgba[11]);
@@ -20023,7 +20092,7 @@ test "color key mask supports four-component source samples and rejects malforme
         .stride = 4,
         .bits_per_component = 8,
     };
-    try applyColorKeyMaskFromSamples(&rgba, view, try parseColorKeyMask(&cmyk_mask, 4));
+    try applyColorKeyMaskFromSamples(&rgba, view, try parseColorKeyMask(&cmyk_mask, 4), .{});
     try std.testing.expectEqual(@as(u8, 0), rgba[3]);
 
     const malformed = [_]syntax.Object{ .{ .integer = 1 }, .{ .boolean = true } };
@@ -20171,9 +20240,9 @@ test "image masks honor PDF Decode polarity across native sample conventions" {
     try std.testing.expectEqualSlices(u8, &.{ 255, 0 }, &.{ packed_rgba[3], packed_rgba[7] });
 
     var gray_rgba: [8]u8 = undefined;
-    try decodeGrayMaskToRgba(&gray_rgba, &.{ 0, 255 }, null);
+    try decodeGrayMaskToRgba(&gray_rgba, &.{ 0, 255 }, null, .{});
     try std.testing.expectEqualSlices(u8, &.{ 255, 0 }, &.{ gray_rgba[3], gray_rgba[7] });
-    try decodeGrayMaskToRgba(&gray_rgba, &.{ 0, 255 }, &reversed_decode);
+    try decodeGrayMaskToRgba(&gray_rgba, &.{ 0, 255 }, &reversed_decode, .{});
     try std.testing.expectEqualSlices(u8, &.{ 0, 255 }, &.{ gray_rgba[3], gray_rgba[7] });
 }
 

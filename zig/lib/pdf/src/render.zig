@@ -149,6 +149,27 @@ const BilevelSampleBudget = struct {
     }
 };
 
+const BilevelCancellationPoller = struct {
+    const work_per_check: u64 = 4096;
+
+    cancellation: reader.CancellationProbe,
+    work_since_check: u64 = 0,
+
+    fn init(cancellation: reader.CancellationProbe) BilevelCancellationPoller {
+        return .{ .cancellation = cancellation };
+    }
+
+    /// Account source-sample work across the complete image run. Keeping this
+    /// state outside the per-destination-pixel sampler avoids a deadline probe
+    /// (and, in production, a monotonic-clock read) for every output pixel.
+    fn complete(self: *BilevelCancellationPoller, work: u64) !void {
+        self.work_since_check +|= work;
+        if (self.work_since_check < work_per_check) return;
+        try self.cancellation.check();
+        self.work_since_check %= work_per_check;
+    }
+};
+
 fn rotateRawPageCanvasAlloc(alloc: Allocator, raw: *RawPageCanvas, rotation: PageRotation, cancellation: reader.CancellationProbe) !void {
     switch (rotation) {
         .none => return,
@@ -917,6 +938,7 @@ fn drawImageRunCancelable(
     const coverage_minify = run.ocr_coverage_minify and run.bilevel and
         (@as(f64, @floatFromInt(run.width)) > projected_width or
             @as(f64, @floatFromInt(run.height)) > projected_height);
+    var bilevel_cancellation = BilevelCancellationPoller.init(cancellation);
 
     var py = y0;
     while (py < y1) : (py += 1) {
@@ -935,7 +957,7 @@ fn drawImageRunCancelable(
             const dst = (py * canvas_w + px) * 4;
             var sample: [4]u8 = undefined;
             if (coverage_minify) {
-                sample = try coveragePreservingBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, cancellation, bilevel_sample_budget);
+                sample = try coveragePreservingBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, &bilevel_cancellation, bilevel_sample_budget);
             } else if (filtered) {
                 sample = bilinearImageSample(run, u, 1.0 - v);
             } else {
@@ -998,7 +1020,7 @@ fn channelByte(value: f64) u8 {
 /// image matrices. The source rectangles of adjacent destination pixels form
 /// a partition during ordinary minification, so total work remains linear in
 /// the source image instead of growing with the reduction ratio.
-fn boxFilteredBilevelSample(run: reader.ImageRun, footprint: SourceFootprint, cancellation: reader.CancellationProbe) ![4]u8 {
+fn boxFilteredBilevelSample(run: reader.ImageRun, footprint: SourceFootprint, cancellation: *BilevelCancellationPoller) ![4]u8 {
     const total_area = footprint.area();
     if (total_area <= 0 or !finite(total_area)) return .{ 0, 0, 0, 0 };
     const width_f: f64 = @floatFromInt(run.width);
@@ -1017,11 +1039,10 @@ fn boxFilteredBilevelSample(run: reader.ImageRun, footprint: SourceFootprint, ca
     var premultiplied_area: [3]f64 = .{ 0, 0, 0 };
     var sy = y0;
     while (sy < y1) : (sy += 1) {
-        if ((sy - y0) & 31 == 0) try cancellation.check();
         const y_weight = @max(0.0, @min(max_y, @as(f64, @floatFromInt(sy + 1))) - @max(min_y, @as(f64, @floatFromInt(sy))));
         var sx = x0;
         while (sx < x1) : (sx += 1) {
-            if ((sx - x0) & 4095 == 0) try cancellation.check();
+            try cancellation.complete(1);
             const x_weight = @max(0.0, @min(max_x, @as(f64, @floatFromInt(sx + 1))) - @max(min_x, @as(f64, @floatFromInt(sx))));
             const weight = x_weight * y_weight;
             if (weight <= 0) continue;
@@ -1043,7 +1064,7 @@ fn boxFilteredBilevelSample(run: reader.ImageRun, footprint: SourceFootprint, ca
 /// density follows the source footprint up to 16 strata per destination axis,
 /// avoiding the fixed 4x4 alias pattern without permitting adversarial affine
 /// transforms to multiply work without limit.
-fn adaptiveAffineBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64, footprint: SourceFootprint, max_samples: u64, cancellation: reader.CancellationProbe) ![4]u8 {
+fn adaptiveAffineBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64, inv_a: f64, inv_b: f64, inv_c: f64, inv_d: f64, footprint: SourceFootprint, max_samples: u64, cancellation: *BilevelCancellationPoller) ![4]u8 {
     const desired_x: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_x - footprint.min_x))));
     const desired_y: usize = @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_y - footprint.min_y))));
     const sample_limit: usize = @intCast(@max(1, @min(max_samples, desired_x * desired_y)));
@@ -1066,10 +1087,9 @@ fn adaptiveAffineBilevelSample(run: reader.ImageRun, world_x: f64, world_y: f64,
     var alpha_sum: u32 = 0;
     var premultiplied_sum: [3]u64 = .{ 0, 0, 0 };
     for (0..samples_y) |sample_y_index| for (0..samples_x) |sample_x_index| {
+        try cancellation.complete(1);
         const ox = if (samples_x == 1) 0.5 else @as(f64, @floatFromInt(sample_x_index)) / @as(f64, @floatFromInt(samples_x - 1));
         const oy = if (samples_y == 1) 0.5 else @as(f64, @floatFromInt(sample_y_index)) / @as(f64, @floatFromInt(samples_y - 1));
-        const sample_index = sample_y_index * samples_x + sample_x_index;
-        if (sample_index & 63 == 0) try cancellation.check();
         const sample_world_x = world_x + ox - 0.5;
         const sample_world_y = world_y - oy + 0.5;
         const dx = sample_world_x - run.e;
@@ -1113,7 +1133,7 @@ fn coveragePreservingBilevelSample(
     inv_b: f64,
     inv_c: f64,
     inv_d: f64,
-    cancellation: reader.CancellationProbe,
+    cancellation: *BilevelCancellationPoller,
     bilevel_sample_budget: ?*BilevelSampleBudget,
 ) ![4]u8 {
     const footprint = imageSourceFootprint(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d) orelse return .{ 0, 0, 0, 0 };
@@ -3684,7 +3704,8 @@ test "OCR bilevel exact integration uses cached full-source summary when unaffor
         .draw_height = 1,
     };
     var budget = BilevelSampleBudget{ .remaining_samples = 8 };
-    const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 1, 0, 0, 1, .{}, &budget);
+    var cancellation = BilevelCancellationPoller.init(.{});
+    const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 1, 0, 0, 1, &cancellation, &budget);
     try std.testing.expectEqual(@as(u64, 8), budget.remaining_samples);
     try std.testing.expectEqual(@as(u8, 0xfe), sample[0]);
     try std.testing.expectEqual(sample[0], sample[1]);
@@ -3713,8 +3734,31 @@ test "OCR bilevel fallback scales alpha by transformed source coverage" {
         .draw_height = 0.1,
     };
     var budget = BilevelSampleBudget{ .remaining_samples = 0 };
-    const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 10, 0, 0, 10, .{}, &budget);
+    var cancellation = BilevelCancellationPoller.init(.{});
+    const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 10, 0, 0, 10, &cancellation, &budget);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 3 }, &sample);
+}
+
+test "bilevel cancellation polling is amortized across destination pixels" {
+    const ProbeState = struct {
+        checks: usize = 0,
+
+        fn isCancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context.?)));
+            self.checks += 1;
+            return false;
+        }
+    };
+
+    var state = ProbeState{};
+    var cancellation = BilevelCancellationPoller.init(.{
+        .context = &state,
+        .is_cancelled_fn = ProbeState.isCancelled,
+    });
+    for (0..BilevelCancellationPoller.work_per_check * 3 + 17) |_| try cancellation.complete(1);
+
+    try std.testing.expectEqual(@as(usize, 3), state.checks);
+    try std.testing.expectEqual(@as(u64, 17), cancellation.work_since_check);
 }
 
 test "legacy shape raster path observes cancellation" {
