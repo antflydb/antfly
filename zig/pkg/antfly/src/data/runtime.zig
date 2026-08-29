@@ -31320,6 +31320,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         done: bool = false,
         driver_done: [3]bool = .{ false, false, false },
         driver_active: [3]bool = .{ false, false, false },
+        driver_paused: [3]bool = .{ false, false, false },
         driver_rounds: [3]u64 = .{ 0, 0, 0 },
         stop_driver: bool = false,
         failure: ?anyerror = null,
@@ -31335,7 +31336,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         fn drive(self: *@This(), index: usize) void {
             defer self.driver_done[index] = true;
             while (!self.stop_driver) {
-                if (!self.nodeIsRunning(index)) {
+                if (!self.nodeIsRunning(index) or self.driver_paused[index]) {
                     self.io.sleep(.fromMilliseconds(1), .awake) catch |err| {
                         self.driver_failure = err;
                         self.stop_driver = true;
@@ -31385,6 +31386,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             self.stage = 1;
             try self.transferAndWait(171, 1);
             try self.transferAndWait(172, 2);
+            try self.exerciseReadSafetyBarriers();
             var ops = self.servers[0].localShardOperationAdapter();
             self.stage = 10;
             try self.executeIdempotent(&ops, .{ .accept_merge_receiver = .{
@@ -31447,6 +31449,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // the first transition instead of relying on independently seeded
             // fixture state.
             self.stage = 5;
+            try self.exerciseRetiredReadSafetyBarrier();
             try self.activateSplitTopology();
             try self.transferAndWait(self.split_record.source_group_id, 1);
             try self.transferAndWait(self.split_record.destination_group_id, 1);
@@ -31540,6 +31543,176 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             try self.waitForSplitFinalizedEverywhere();
             try self.verifySplitDocumentsEverywhere();
             try self.waitForDurableWatermarkConvergence(&.{ 172, 173 });
+            self.stage = 63;
+            try self.exerciseDerivedStateReadBarrier();
+        }
+
+        fn waitReadSafeTask(
+            server: *DataServer,
+            group_id: u64,
+            timeout_ms: ?u32,
+            cancellation: antfly.db.types.CancellationToken,
+        ) !void {
+            try server.waitDataReadSafeWithCancellation(
+                group_id,
+                "data-runtime-vopr:read-safety",
+                timeout_ms,
+                cancellation,
+            );
+        }
+
+        fn waitForPendingReadBarrier(self: *@This(), server_index: usize) !void {
+            for (0..1_000) |_| {
+                const apply_sm = self.servers[server_index].data_raft_apply orelse
+                    return error.MissingDataRaft;
+                if (apply_sm.read_barriers.pendingCount() == 1) return;
+                try self.io.sleep(.fromMilliseconds(1), .awake);
+            }
+            return error.VoprDataServerReadBarrierRegistrationTimeout;
+        }
+
+        fn pauseAllRaftDrivers(self: *@This()) void {
+            @memset(&self.driver_paused, true);
+        }
+
+        fn resumeAllRaftDrivers(self: *@This()) void {
+            @memset(&self.driver_paused, false);
+        }
+
+        fn exerciseReadSafetyBarriers(self: *@This()) !void {
+            // Group 172 is led by node 2. Once node 1 has learned that leader,
+            // follower initiation can forward and complete through node 1's
+            // matching local apply. Before that routing view arrives it may
+            // return typed NotLeader, but it must not retain a waiter and the
+            // resolved leader retry must complete the synchronous contract.
+            self.stage = 2;
+            const follower_completed = blk: {
+                self.servers[0].waitDataReadSafeWithCancellation(
+                    172,
+                    "data-runtime-vopr:follower",
+                    1_000,
+                    .none,
+                ) catch |err| {
+                    if (err != error.NotLeader) return err;
+                    break :blk false;
+                };
+                break :blk true;
+            };
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                self.servers[0].data_raft_apply.?.read_barriers.pendingCount(),
+            );
+            if (!follower_completed) {
+                try self.servers[1].waitDataReadSafeWithCancellation(
+                    172,
+                    "data-runtime-vopr:leader",
+                    1_000,
+                    .none,
+                );
+            }
+
+            // Hold Ready processing after registration, enqueue a leadership
+            // transfer, then resume the old/new leaders. The old-leader
+            // request may complete from its already established quorum proof
+            // or fail closed on its logical timeout; either way a retry on the
+            // replacement leader must complete through that owner's apply.
+            self.stage = 20;
+            self.pauseAllRaftDrivers();
+            var leader_change = self.io.async(waitReadSafeTask, .{
+                &self.servers[1], 172, @as(?u32, 1_000), antfly.db.types.CancellationToken.none,
+            });
+            try self.waitForPendingReadBarrier(1);
+            const old_leader = self.leader(172) orelse return error.VoprDataServerLeaderTimeout;
+            const old_raft = self.servers[old_leader - 1].data_raft orelse
+                return error.MissingDataRaft;
+            try old_raft.host.http_host.transferLeader(172, 3);
+            self.driver_paused[old_leader - 1] = false;
+            self.driver_paused[2] = false;
+            try self.waitForLeader(172, 3);
+            leader_change.await(self.io) catch |err| if (err != error.ReadIndexTimeout) return err;
+            self.resumeAllRaftDrivers();
+            try self.servers[2].waitDataReadSafeWithCancellation(
+                172,
+                "data-runtime-vopr:replacement-leader",
+                1_000,
+                .none,
+            );
+
+            // With every Ready owner paused, the same production barrier must
+            // fail within its logical deadline and release tracker ownership.
+            self.stage = 21;
+            self.pauseAllRaftDrivers();
+            defer self.resumeAllRaftDrivers();
+            try std.testing.expectError(
+                error.ReadIndexTimeout,
+                self.servers[2].waitDataReadSafeWithCancellation(
+                    172,
+                    "data-runtime-vopr:timeout",
+                    3,
+                    .none,
+                ),
+            );
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                self.servers[2].data_raft_apply.?.read_barriers.pendingCount(),
+            );
+
+            self.stage = 22;
+            var cancelled = std.atomic.Value(bool).init(false);
+            var cancellation = self.io.async(waitReadSafeTask, .{
+                &self.servers[2],
+                172,
+                @as(?u32, 1_000),
+                antfly.db.types.CancellationToken.fromAtomic(&cancelled),
+            });
+            try self.waitForPendingReadBarrier(2);
+            cancelled.store(true, .release);
+            try std.testing.expectError(error.Cancelled, cancellation.await(self.io));
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                self.servers[2].data_raft_apply.?.read_barriers.pendingCount(),
+            );
+        }
+
+        fn exerciseRetiredReadSafetyBarrier(self: *@This()) !void {
+            // The merged donor is about to leave placement permanently. Drive
+            // the same state-machine retirement callback used by MultiRaft
+            // while a strong read is pending and prove bounded fail-closed
+            // completion with no retained waiter.
+            self.stage = 41;
+            self.pauseAllRaftDrivers();
+            defer self.resumeAllRaftDrivers();
+            var retired = self.io.async(waitReadSafeTask, .{
+                &self.servers[2], 171, @as(?u32, 5), antfly.db.types.CancellationToken.none,
+            });
+            try self.waitForPendingReadBarrier(2);
+            self.servers[2].data_raft_apply.?.stateMachine().retireGroup(171);
+            try std.testing.expectEqual(
+                @as(usize, 0),
+                self.servers[2].data_raft_apply.?.read_barriers.pendingCount(),
+            );
+            try std.testing.expectError(error.ReadIndexTimeout, retired.await(self.io));
+        }
+
+        fn exerciseDerivedStateReadBarrier(self: *@This()) !void {
+            // Node 2 leads both post-split groups. The graph barrier composes
+            // the applied ReadState with production full-index visibility;
+            // returning from the base-state barrier alone is insufficient.
+            const graph_barrier = self.servers[1].dataGraphReadBarrier();
+            try graph_barrier.wait(
+                self.alloc,
+                self.split_record.source_group_id,
+                self.split_record.table_contract.table_name,
+                1_000,
+                .none,
+            );
+            try graph_barrier.wait(
+                self.alloc,
+                self.split_record.destination_group_id,
+                self.split_record.table_contract.table_name,
+                1_000,
+                .none,
+            );
         }
 
         fn executeIdempotent(
