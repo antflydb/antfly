@@ -45379,7 +45379,7 @@ test "provisioned table write source drop table waits for active read cache leas
 
     var source = ProvisionedTableWriteSource.init(replica_root_dir, catalog.iface());
     source.read_cache = &read_cache;
-    source.drop_cleanup_read_drain_timeout_ns = 250 * std.time.ns_per_ms;
+    source.drop_cleanup_read_drain_timeout_ns = 3 * std.time.ns_per_s;
 
     var probe = Probe{};
     test_before_drop_table_delete_hook = .{ .ptr = &probe, .run = Probe.run };
@@ -45390,7 +45390,23 @@ test "provisioned table write source drop table waits for active read cache leas
     var thread_joined = false;
     defer if (!thread_joined) thread.join();
 
-    io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
+    // Observe the actual exclusive-cache barrier before checking deletion.
+    // A fixed sleep can false-pass when the worker has not been scheduled.
+    const barrier_deadline_ns = platform_time.monotonicNs() + 2 * std.time.ns_per_s;
+    var barrier_observed = false;
+    while (platform_time.monotonicNs() < barrier_deadline_ns) {
+        barrier_observed = read_cache.testingExclusiveTableAccessActive("docs");
+        if (barrier_observed) break;
+        io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
+    }
+    if (!barrier_observed) {
+        read_lease.release();
+        read_lease_active = false;
+        thread.join();
+        thread_joined = true;
+        if (worker.err) |err| return err;
+        return error.TestUnexpectedResult;
+    }
     try std.testing.expect(!probe.entered.load(.acquire));
 
     read_lease.release();

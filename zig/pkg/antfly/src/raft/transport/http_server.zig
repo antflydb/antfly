@@ -298,8 +298,13 @@ pub const HttpServer = struct {
         if (req.method == .DELETE) {
             if (routes.Routes.matchSnapshotFetch(req.uri)) |snapshot_id| {
                 const store = self.snapshot_store orelse return error.MissingSnapshotStore;
+                // Legacy snapshot release was added after the v1 fetch
+                // contract. Older or minimal stores intentionally rely on
+                // TTL cleanup, so capability absence is a normal protocol
+                // response rather than a handler failure (and must not emit
+                // an error log for every compatible legacy transfer).
                 const release = store.vtable.release_snapshot orelse
-                    return error.UnsupportedSnapshotRelease;
+                    return try self.textResponse(501, "snapshot artifact release unsupported");
                 release(store.ptr, snapshot_id) catch |err| switch (err) {
                     error.FileNotFound => {},
                     else => return err,
@@ -790,6 +795,16 @@ test "http server stores and fetches snapshot bodies by route" {
             };
         }
 
+        fn legacyIface(self: *@This()) SnapshotStore {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .put_snapshot = putSnapshot,
+                    .get_snapshot = getSnapshot,
+                },
+            };
+        }
+
         fn putSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, snapshot_id: []const u8, body: []const u8) !void {
             _ = snapshot_id;
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -862,6 +877,12 @@ test "http server stores and fetches snapshot bodies by route" {
     var released = try server.handle(.{ .method = .GET, .uri = fetch_path });
     defer released.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), released.status);
+
+    var legacy_server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), store.legacyIface(), null);
+    var unsupported_release = try legacy_server.handle(.{ .method = .DELETE, .uri = fetch_path });
+    defer unsupported_release.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 501), unsupported_release.status);
+    try std.testing.expectEqualStrings("snapshot artifact release unsupported", unsupported_release.body);
 }
 
 test "http server dispatches live snapshot uploads to handler" {

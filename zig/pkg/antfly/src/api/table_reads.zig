@@ -710,7 +710,12 @@ pub const ProvisionedTableReadCache = struct {
                 const active_leases = self.activeLeaseCountForTableLocked(table_name);
                 self.releaseExclusiveTableAccessLocked(table_name);
                 self.ready.broadcast(io);
-                std.log.err("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
+                // The caller retains durable convergence ownership and may
+                // retry this bounded drain. Treat timeout as actionable
+                // repair pressure, not process corruption: strict test and
+                // production error-log gates reserve `err` for invariants
+                // that cannot recover without operator intervention.
+                std.log.warn("table read generation drain timed out table={s} pending_opens={} retired_entries={} active_leases={} wait_ms={}", .{
                     table_name,
                     pending_opens,
                     retired_entries,
@@ -870,6 +875,17 @@ pub const ProvisionedTableReadCache = struct {
         table_name: []const u8,
     ) bool {
         return self.exclusive_table_access.get(table_name) != null;
+    }
+
+    pub fn testingExclusiveTableAccessActive(
+        self: *ProvisionedTableReadCache,
+        table_name: []const u8,
+    ) bool {
+        if (!builtin.is_test) @compileError("testingExclusiveTableAccessActive is test-only");
+        const io = self.threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        return self.hasExclusiveTableAccessLocked(table_name);
     }
 
     fn hasExclusiveGroupAccessLocked(self: *ProvisionedTableReadCache, group_id: u64) bool {
