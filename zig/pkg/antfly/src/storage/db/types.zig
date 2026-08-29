@@ -2898,6 +2898,9 @@ pub const DBIndexStats = struct {
     // Compact lifecycle used when DBIndexStats crosses process boundaries.
     // The full local durable diagnostics remain authoritative when present.
     index_repair_status: ?IndexRepairStatus = null,
+    // Separate from lifecycle because a terminal scheduler checkpoint can be
+    // retryable while paused/irrecoverable states require operator action.
+    index_repair_action_required: bool = false,
     // Internal proof that the active managed-admission generation is safe to
     // query. Under progressive publication it may still have incomplete source
     // coverage; repair intent remains authoritative until full convergence.

@@ -1801,6 +1801,8 @@ pub const IndexRepairStatus = struct {
     state: []const u8,
     /// Whether an operator must resume, retry, reconfigure, or drop the affected index.
     action_required: bool,
+    /// Diagnostic reason automation stopped. Present only when action_required is true.
+    reason: ?[]const u8 = null,
 };
 
 /// Statistics for an index

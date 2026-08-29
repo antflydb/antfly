@@ -1823,6 +1823,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
             .index_repair_last_error = index_repair_last_error,
             .index_repair_wait_reason = item.index_repair_wait_reason,
             .index_repair_status = item.index_repair_status,
+            .index_repair_action_required = item.index_repair_action_required,
             .index_repair_active_generation_serviceable = item.index_repair_active_generation_serviceable,
             .projection_checkpoint_status = item.projection_checkpoint_status,
             .projection_checkpoint_applied_sequence = item.projection_checkpoint_applied_sequence,

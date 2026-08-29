@@ -7,6 +7,7 @@ from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
 from ..models.index_repair_status_state import IndexRepairStatusState
+from ..types import UNSET, Unset
 
 T = TypeVar("T", bound="IndexRepairStatus")
 
@@ -20,16 +21,20 @@ class IndexRepairStatus:
             state (IndexRepairStatusState): Stable repair state. Internal state-machine phases are intentionally not exposed
                 here.
             action_required (bool): Whether an operator must resume, retry, reconfigure, or drop the affected index.
+            reason (str | Unset): Diagnostic reason automation stopped. Present only when action_required is true.
     """
 
     state: IndexRepairStatusState
     action_required: bool
+    reason: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         state = self.state.value
 
         action_required = self.action_required
+
+        reason = self.reason
 
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
@@ -39,6 +44,8 @@ class IndexRepairStatus:
                 "action_required": action_required,
             }
         )
+        if reason is not UNSET:
+            field_dict["reason"] = reason
 
         return field_dict
 
@@ -49,9 +56,12 @@ class IndexRepairStatus:
 
         action_required = d.pop("action_required")
 
+        reason = d.pop("reason", UNSET)
+
         index_repair_status = cls(
             state=state,
             action_required=action_required,
+            reason=reason,
         )
 
         index_repair_status.additional_properties = d

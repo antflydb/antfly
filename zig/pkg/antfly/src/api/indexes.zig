@@ -1486,8 +1486,42 @@ fn publicIndexRepairState(item: anytype) ?[]const u8 {
         item.index_repair_automation,
         item.index_repair_phase,
         item.index_repair_wait_reason,
+        publicIndexRepairActionRequired(item),
     ) orelse return null;
     return @tagName(status);
+}
+
+fn publicIndexRepairActionRequired(item: anytype) bool {
+    const T = @TypeOf(item);
+    if (@hasField(T, "repair_action_required")) return item.repair_action_required;
+    if (@hasField(T, "index_repair_action_required")) return item.index_repair_action_required;
+    if (@hasField(T, "index_repair_automation") and
+        std.mem.eql(u8, item.index_repair_automation, "paused")) return true;
+    if (@hasField(T, "index_repair_phase")) {
+        return std.mem.eql(u8, item.index_repair_phase, "terminal");
+    }
+    if (@hasField(T, "repair_state")) {
+        const state = item.repair_state orelse return false;
+        return std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed");
+    }
+    if (@hasField(T, "index_repair_status")) {
+        const status = item.index_repair_status orelse return false;
+        return status == .paused or status == .failed;
+    }
+    return false;
+}
+
+fn publicIndexRepairReason(item: anytype) ?[]const u8 {
+    const T = @TypeOf(item);
+    if (@hasField(T, "repair_reason")) return item.repair_reason;
+    if (@hasField(T, "index_repair_last_error")) {
+        if (item.index_repair_last_error) |reason| return reason;
+    }
+    // Corrupt durable state may not have a readable intent/last_error. Its
+    // synthetic trigger is still a stable, useful operator diagnosis.
+    if (@hasField(T, "index_repair_trigger") and
+        !std.mem.eql(u8, item.index_repair_trigger, "none")) return item.index_repair_trigger;
+    return null;
 }
 
 fn repairActiveGenerationServiceable(item: anytype) bool {
@@ -1592,7 +1626,10 @@ const AggregatedIndexStatus = struct {
     kind: ?db_mod.types.IndexKind = null,
     load_error: ?[]const u8 = null,
     load_error_matches_desired_incarnation: bool = false,
+    load_error_action_required: bool = false,
     repair_state: ?[]const u8 = null,
+    repair_action_required: bool = false,
+    repair_reason: ?[]const u8 = null,
     // This is proof about an observed repair, not the neutral element for an
     // AND reduction. A repair-free aggregate must not suppress live catch-up
     // telemetry merely because every observed repair (there are none) is
@@ -1855,7 +1892,18 @@ fn aggregateIndexStatusIndexed(
         if (item.load_error) |load_error| {
             const matches_desired_incarnation = coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
             if (matches_desired_incarnation) {
-                if (!aggregate.load_error_matches_desired_incarnation) aggregate.load_error = load_error;
+                const actionable = publicIndexRepairState(item) != null and
+                    publicIndexRepairActionRequired(item);
+                const prefer_actionable = actionable and !aggregate.load_error_action_required;
+                const same_actionability = actionable == aggregate.load_error_action_required;
+                const prefer_deterministic = aggregate.load_error == null or
+                    std.mem.order(u8, load_error, aggregate.load_error.?) == .lt;
+                if (!aggregate.load_error_matches_desired_incarnation or prefer_actionable or
+                    (same_actionability and prefer_deterministic))
+                {
+                    aggregate.load_error = load_error;
+                    aggregate.load_error_action_required = actionable;
+                }
                 aggregate.load_error_matches_desired_incarnation = true;
             } else if (aggregate.load_error == null) {
                 aggregate.load_error = load_error;
@@ -1892,8 +1940,27 @@ fn aggregateIndexStatusIndexed(
                     aggregate.repair_active_generation_serviceable and
                         item.index_repair_active_generation_serviceable;
                 aggregate.repair_observation_count += 1;
-                if (aggregate.repair_state == null or repairStateRank(state) > repairStateRank(aggregate.repair_state.?)) {
+                const action_required = publicIndexRepairActionRequired(item);
+                const reason = publicIndexRepairReason(item);
+                const replace_state = aggregate.repair_state == null or
+                    repairStateRank(state) > repairStateRank(aggregate.repair_state.?);
+                if (replace_state) {
                     aggregate.repair_state = state;
+                    aggregate.repair_action_required = action_required;
+                    aggregate.repair_reason = reason;
+                } else if (std.mem.eql(u8, state, aggregate.repair_state.?)) {
+                    // Any shard requiring intervention makes the distributed
+                    // index actionable. Prefer a reason from that class, then
+                    // use lexical order to make aggregation deterministic.
+                    const prefer_actionable = action_required and !aggregate.repair_action_required;
+                    const same_actionability = action_required == aggregate.repair_action_required;
+                    const prefer_reason = reason != null and
+                        (aggregate.repair_reason == null or
+                            std.mem.order(u8, reason.?, aggregate.repair_reason.?) == .lt);
+                    if (prefer_actionable or (same_actionability and prefer_reason)) {
+                        aggregate.repair_reason = reason;
+                    }
+                    aggregate.repair_action_required = aggregate.repair_action_required or action_required;
                 }
             }
         }
@@ -2615,6 +2682,7 @@ test "index status exposes compact repair state without internal diagnostics" {
     const item = db_mod.types.DBIndexStats{
         .name = "visual",
         .kind = .dense_vector,
+        .load_error = "TransientCandidateOpenFailure",
         .index_repair_id = 1,
         .index_repair_phase = "building",
         .index_repair_automation = "enabled",
@@ -2659,7 +2727,38 @@ test "index status exposes compact repair state without internal diagnostics" {
 
     var failed = item;
     failed.index_repair_phase = "terminal";
+    failed.index_repair_status = .failed;
+    failed.index_repair_action_required = true;
+    failed.index_repair_last_error = "activation_manifest_missing";
+    failed.load_error = "InvalidIndexConfig";
+    failed.coverage_generation = 42;
+    failed.coverage_config_hash = 99;
+    failed.coverage_identity_ready = true;
     try std.testing.expectEqualStrings("failed", publicIndexRepairState(failed).?);
+
+    encoded.clearRetainingCapacity();
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        failed,
+        0,
+        .external,
+        false,
+        42,
+        99,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: InvalidIndexConfig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"failed\",\"action_required\":true,\"reason\":\"activation_manifest_missing\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"readiness\":{\"state\":\"failed\"") != null);
 
     var corrupt = failed;
     corrupt.index_repair_id = null;
@@ -2668,6 +2767,74 @@ test "index status exposes compact repair state without internal diagnostics" {
     var waiting = item;
     waiting.index_repair_wait_reason = "backoff";
     try std.testing.expectEqualStrings("waiting", publicIndexRepairState(waiting).?);
+}
+
+test "index status aggregation preserves actionable repair diagnostics for the requested incarnation" {
+    var rebuilding_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .load_error = "TransientCandidateOpenFailure",
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .index_repair_status = .rebuilding,
+        .index_repair_last_error = "candidate_retry_pending",
+    }};
+    var failed_indexes = [_]db_mod.types.DBIndexStats{.{
+        .name = "visual",
+        .kind = .dense_vector,
+        .load_error = "InvalidIndexConfig",
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .index_repair_status = .failed,
+        .index_repair_action_required = true,
+        .index_repair_last_error = "activation_manifest_missing",
+    }};
+    const runtimes = [_]runtime_status.LocalTableRuntimeStatus{
+        .{
+            .group_id = 1,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = rebuilding_indexes[0..] },
+        },
+        .{
+            .group_id = 2,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = .{ .index_count = 1, .indexes = failed_indexes[0..] },
+        },
+    };
+    const aggregate = aggregateIndexStatusIndexed(&runtimes, "visual", &.{ 1, 2 }, 42, 99, null) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("failed", aggregate.repair_state.?);
+    try std.testing.expect(aggregate.repair_action_required);
+    try std.testing.expectEqualStrings("activation_manifest_missing", aggregate.repair_reason.?);
+    try std.testing.expectEqualStrings("InvalidIndexConfig", aggregate.load_error.?);
+    try std.testing.expect(aggregate.load_error_matches_desired_incarnation);
+    try std.testing.expect(aggregate.load_error_action_required);
+
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        aggregate,
+        aggregate.table_doc_count,
+        .external,
+        false,
+        42,
+        99,
+        null,
+        aggregate.async_indexing,
+        aggregate.enrichment,
+        aggregate.resolution,
+        aggregate.promotion,
+        aggregate.resolver_replay,
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: InvalidIndexConfig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"failed\",\"action_required\":true,\"reason\":\"activation_manifest_missing\"}") != null);
 }
 
 test "complete partial embeddings coverage is ready after active generation proof" {
@@ -4049,12 +4216,23 @@ fn appendSingleIndexRuntimeStatus(
         observed_repair_state
     else
         null;
-    // A load failure with no durable automatic repair remains a terminal
-    // operator-visible error. Once a repair intent exists, the compact repair
-    // state is authoritative; exposing the quarantined root's raw load error
-    // at the same time would incorrectly tell clients to drop/recreate.
+    const repair_action_required = repair_state != null and publicIndexRepairActionRequired(item);
+    const repair_reason = if (repair_action_required) publicIndexRepairReason(item) else null;
+    // Runnable repair owns a quarantined root, so its raw load error is stale
+    // implementation noise. Once repair genuinely requires operator action,
+    // expose an exact load failure only when it belongs to the requested
+    // incarnation; the repair reason independently explains why automation
+    // stopped.
     const raw_load_error: ?[]const u8 = if (@hasField(@TypeOf(item), "load_error")) item.load_error else null;
-    const load_error: ?[]const u8 = if (repair_state == null) raw_load_error else null;
+    const raw_load_error_matches_desired_incarnation = if (@hasField(@TypeOf(item), "load_error_matches_desired_incarnation"))
+        item.load_error_matches_desired_incarnation
+    else
+        index_type != .embeddings or coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
+    const load_error: ?[]const u8 = if (repair_state == null or
+        (repair_action_required and raw_load_error_matches_desired_incarnation))
+        raw_load_error
+    else
+        null;
     const repair_blocks_readiness = repair_state != null;
     if (load_error != null) {
         backfill_active = false;
@@ -4088,10 +4266,7 @@ fn appendSingleIndexRuntimeStatus(
         ((embeddings_materialization_current and item.enrichment_failed) or coverage_degraded);
     const terminal_enrichment_failure = enrichment_degraded or
         (if (visible_enrichment) |stats| stats.worker_failed else false);
-    const terminal_load_failure = load_error != null and if (@hasField(@TypeOf(item), "load_error_matches_desired_incarnation"))
-        item.load_error_matches_desired_incarnation
-    else
-        index_type != .embeddings or coverageIdentityMatches(item, coverage_generation, coverage_config_hash);
+    const terminal_load_failure = load_error != null and raw_load_error_matches_desired_incarnation;
 
     try out.append(alloc, '{');
     if (index_type != .algebraic) {
@@ -4145,7 +4320,11 @@ fn appendSingleIndexRuntimeStatus(
         try out.appendSlice(alloc, ",\"repair\":{\"state\":");
         try appendJsonString(alloc, out, state);
         try out.appendSlice(alloc, ",\"action_required\":");
-        try out.appendSlice(alloc, if (std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")) "true" else "false");
+        try out.appendSlice(alloc, if (repair_action_required) "true" else "false");
+        if (repair_reason) |reason| {
+            try out.appendSlice(alloc, ",\"reason\":");
+            try appendJsonString(alloc, out, reason);
+        }
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, ",\"doc_count\":");

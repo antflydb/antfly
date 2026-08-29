@@ -6196,6 +6196,7 @@ pub fn build(b: *std.Build) void {
             "derived coverage source totals ignore derived index fan out",
             "derived coverage aggregation rejects mixed config observations",
             "index status exposes compact repair state without internal diagnostics",
+            "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
             "rebuild quarantine remains an explicit failed public index status",
             "index repair aggregation exposes a waiting shard over rebuilding shards",
             "derived coverage aggregation rejects stale index incarnations",
@@ -6885,7 +6886,10 @@ pub fn build(b: *std.Build) void {
     const run_dense_index_repair_job_tests = addFilteredTestRunArtifact(b, dense_index_repair_job_tests);
     const dense_index_repair_status_tests = b.addTest(.{
         .root_module = api_derived_coverage_test_mod,
-        .filters = &.{"index status exposes compact repair state without internal diagnostics"},
+        .filters = &.{
+            "index status exposes compact repair state without internal diagnostics",
+            "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
+        },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,

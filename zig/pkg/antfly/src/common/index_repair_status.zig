@@ -32,18 +32,23 @@ pub fn summarize(
     automation: []const u8,
     phase: []const u8,
     wait_reason: []const u8,
+    action_required: bool,
 ) ?IndexRepairStatus {
     if (std.mem.eql(u8, automation, "paused")) return .paused;
-    if (std.mem.eql(u8, phase, "terminal")) return .failed;
+    // Some terminal durable phases are scheduler checkpoints whose source
+    // coverage can make them runnable again. Keep those in the waiting class;
+    // `failed` is reserved for a genuinely operator-actionable terminal state.
+    if (std.mem.eql(u8, phase, "terminal")) return if (action_required) .failed else .waiting;
     if (!has_intent) return null;
     if (!std.mem.eql(u8, wait_reason, "none")) return .waiting;
     return .rebuilding;
 }
 
 test "compact index repair status keeps corrupt terminal state actionable" {
-    try std.testing.expectEqual(IndexRepairStatus.failed, summarize(false, "none", "terminal", "terminal").?);
-    try std.testing.expectEqual(IndexRepairStatus.paused, summarize(true, "paused", "detected", "paused").?);
-    try std.testing.expectEqual(IndexRepairStatus.waiting, summarize(true, "enabled", "building", "backoff").?);
-    try std.testing.expectEqual(IndexRepairStatus.rebuilding, summarize(true, "enabled", "building", "none").?);
-    try std.testing.expect(summarize(false, "none", "none", "none") == null);
+    try std.testing.expectEqual(IndexRepairStatus.failed, summarize(false, "none", "terminal", "terminal", true).?);
+    try std.testing.expectEqual(IndexRepairStatus.waiting, summarize(true, "enabled", "terminal", "terminal", false).?);
+    try std.testing.expectEqual(IndexRepairStatus.paused, summarize(true, "paused", "detected", "paused", true).?);
+    try std.testing.expectEqual(IndexRepairStatus.waiting, summarize(true, "enabled", "building", "backoff", false).?);
+    try std.testing.expectEqual(IndexRepairStatus.rebuilding, summarize(true, "enabled", "building", "none", false).?);
+    try std.testing.expect(summarize(false, "none", "none", "none", false) == null);
 }

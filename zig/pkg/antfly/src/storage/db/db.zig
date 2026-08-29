@@ -23213,6 +23213,7 @@ pub const DB = struct {
             item.index_repair_phase = "terminal";
             item.index_repair_wait_reason = "terminal";
             item.index_repair_status = .failed;
+            item.index_repair_action_required = true;
             item.repair_degraded = true;
             return;
         }
@@ -23243,11 +23244,13 @@ pub const DB = struct {
             "convergence"
         else
             "none";
+        item.index_repair_action_required = indexRepairActionRequired(intent);
         item.index_repair_status = index_repair_status.summarize(
             true,
             item.index_repair_automation,
             item.index_repair_phase,
             item.index_repair_wait_reason,
+            item.index_repair_action_required,
         );
         // Keep status available when either optional bounded proof cannot be
         // read; query admission independently retries it and remains closed.
@@ -80262,6 +80265,18 @@ test "db missing activation certification exposes predecessor action required" {
         failure.token.action,
     );
     try std.testing.expect(failure.claim_owner_repair_id == null);
+    const terminal_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, terminal_stats);
+    var observed_terminal_status = false;
+    for (terminal_stats.indexes) |item| {
+        if (!std.mem.eql(u8, item.name, "dense_idx")) continue;
+        observed_terminal_status = true;
+        try std.testing.expectEqual(types.IndexRepairStatus.failed, item.index_repair_status.?);
+        try std.testing.expect(item.index_repair_action_required);
+        try std.testing.expectEqualStrings("activation_manifest_missing", item.index_repair_last_error.?);
+        try std.testing.expectEqualStrings("InvalidIndexConfig", item.load_error.?);
+    }
+    try std.testing.expect(observed_terminal_status);
     try std.testing.expectError(error.IndexUnavailable, db.search(alloc, .{
         .index_name = "dense_idx",
         .query = .{ .dense_knn = .{ .vector = &.{ 1, 0 }, .k = 1 } },

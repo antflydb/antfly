@@ -9747,6 +9747,8 @@ export interface components {
             state: "rebuilding" | "waiting" | "paused" | "failed";
             /** @description Whether an operator must resume, retry, reconfigure, or drop the affected index. */
             action_required: boolean;
+            /** @description Diagnostic reason automation stopped. Present only when action_required is true. */
+            reason?: string;
         };
         FullTextIndexStats: {
             /**

@@ -482,6 +482,7 @@ const IndexSummary = struct {
     error_text: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
     repair_action_required: ?bool = null,
+    repair_reason: ?[]const u8 = null,
 };
 
 fn summarizeIndex(index: antfly_client.types.IndexStatus) IndexSummary {
@@ -578,6 +579,7 @@ fn summarizeStats(stats: anytype) IndexSummary {
         .error_text = error_text,
         .repair_state = if (repair) |value| value.state else null,
         .repair_action_required = if (repair) |value| value.action_required else null,
+        .repair_reason = if (repair) |value| if (@hasField(@TypeOf(value), "reason")) value.reason else null else null,
     };
 }
 
@@ -637,6 +639,7 @@ fn writeIndexFailureDiagnostic(
     if (summary.repair_action_required) |action_required| {
         try writer.print(" action_required={any}", .{action_required});
     }
+    if (summary.repair_reason) |reason| try writer.print(" repair_reason={s}", .{reason});
     try writePendingReasons(writer, summary.pending_reasons);
     try writer.writeAll("; run index list --output json for full diagnostics");
 }
@@ -1316,6 +1319,7 @@ test "index wait prefers authoritative readiness contract" {
         .repair = .{
             .state = "failed",
             .action_required = true,
+            .reason = "activation_manifest_missing",
         },
         .readiness = .{
             .state = .failed,
@@ -1335,13 +1339,14 @@ test "index wait prefers authoritative readiness contract" {
     try std.testing.expectEqualStrings("load failed", summary.error_text.?);
     try std.testing.expectEqualStrings("failed", summary.repair_state.?);
     try std.testing.expect(summary.repair_action_required.?);
+    try std.testing.expectEqualStrings("activation_manifest_missing", summary.repair_reason.?);
     try std.testing.expectEqualStrings("repair", summary.pending_reasons[0]);
 
     var failure_buffer: [512]u8 = undefined;
     var failure_writer = std.Io.Writer.fixed(&failure_buffer);
     try writeIndexFailureDiagnostic(&failure_writer, "dense", .queryable, summary);
     try std.testing.expectEqualStrings(
-        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true pending_reasons=[repair]; run index list --output json for full diagnostics",
+        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true repair_reason=activation_manifest_missing pending_reasons=[repair]; run index list --output json for full diagnostics",
         failure_writer.buffered(),
     );
 

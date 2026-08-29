@@ -18918,6 +18918,9 @@ components:
         action_required:
           type: boolean
           description: Whether an operator must resume, retry, reconfigure, or drop the affected index.
+        reason:
+          type: string
+          description: Diagnostic reason automation stopped. Present only when action_required is true.
     FullTextIndexStats:
       type: object
       required:
