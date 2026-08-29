@@ -24,6 +24,45 @@ pub const IndexRepairStatus = enum(u8) {
     failed = 4,
 };
 
+/// Query availability and desired-incarnation convergence are separate repair
+/// effects. A proven active generation may remain safe to query while its
+/// replacement needs operator action; that repair still prevents the desired
+/// incarnation from being complete.
+pub const LifecycleProjection = struct {
+    present: bool,
+    action_required: bool,
+    active_generation_serviceable: bool,
+    blocks_queryable: bool,
+    blocks_complete: bool,
+};
+
+/// Project the compact repair lifecycle into the two public milestones. The
+/// serviceability input must come from the incarnation/version-scoped admission
+/// proof owned by storage; callers must not infer it from a repair phase.
+pub fn projectLifecycle(
+    status: ?IndexRepairStatus,
+    action_required: bool,
+    active_generation_serviceable: bool,
+) LifecycleProjection {
+    const present = status != null;
+    const normalized_action_required = action_required or if (status) |state|
+        state == .paused or state == .failed
+    else
+        false;
+    const serving = present and active_generation_serviceable;
+    const runnable = status != null and status.? == .rebuilding;
+    return .{
+        .present = present,
+        .action_required = present and normalized_action_required,
+        .active_generation_serviceable = serving,
+        .blocks_queryable = present and !serving,
+        // Only a runnable replacement may be redundant after its active
+        // generation is proven. Waiting/paused/failed debt remains incomplete
+        // even when a retained generation can still answer queries.
+        .blocks_complete = present and (!serving or normalized_action_required or !runnable),
+    };
+}
+
 /// Collapse durable repair diagnostics without requiring an intent ID for
 /// corrupt terminal state. Callers must not infer serviceability from this
 /// lifecycle; that is a separate bounded proof.
@@ -51,4 +90,27 @@ test "compact index repair status keeps corrupt terminal state actionable" {
     try std.testing.expectEqual(IndexRepairStatus.waiting, summarize(true, "enabled", "building", "backoff", false).?);
     try std.testing.expectEqual(IndexRepairStatus.rebuilding, summarize(true, "enabled", "building", "none", false).?);
     try std.testing.expect(summarize(false, "none", "none", "none", false) == null);
+}
+
+test "repair lifecycle separates serving availability from convergence" {
+    const rebuilding = projectLifecycle(.rebuilding, false, true);
+    try std.testing.expect(!rebuilding.blocks_queryable);
+    try std.testing.expect(!rebuilding.blocks_complete);
+
+    const retained_failure = projectLifecycle(.failed, true, true);
+    try std.testing.expect(retained_failure.action_required);
+    try std.testing.expect(!retained_failure.blocks_queryable);
+    try std.testing.expect(retained_failure.blocks_complete);
+
+    const retained_wait = projectLifecycle(.waiting, false, true);
+    try std.testing.expect(!retained_wait.blocks_queryable);
+    try std.testing.expect(retained_wait.blocks_complete);
+
+    const blocking_failure = projectLifecycle(.failed, true, false);
+    try std.testing.expect(blocking_failure.blocks_queryable);
+    try std.testing.expect(blocking_failure.blocks_complete);
+
+    const healthy = projectLifecycle(null, false, true);
+    try std.testing.expect(!healthy.present);
+    try std.testing.expect(!healthy.active_generation_serviceable);
 }

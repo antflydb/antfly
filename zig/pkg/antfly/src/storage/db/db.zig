@@ -72635,6 +72635,27 @@ test "db replay blocks and preserves corrupt dense embedding artifacts" {
     );
     try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
 
+    // A terminal replacement failure is actionable completeness debt, but it
+    // cannot revoke the explicitly retained active generation. Status and the
+    // API query coordinator consume this same scoped serviceability proof.
+    try reopened.updateIndexRepairIntent(alloc, repair_id, .{
+        .phase = .terminal,
+        .last_error = "IndexRepairConfigurationChanged",
+        .replace_last_error = true,
+    });
+    const terminal_stats = try reopened.stats(alloc);
+    defer types.freeDBStats(alloc, terminal_stats);
+    var observed_terminal_repair = false;
+    for (terminal_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "dv_v1")) continue;
+        observed_terminal_repair = true;
+        try std.testing.expectEqual(types.IndexRepairStatus.failed, index_stats.index_repair_status.?);
+        try std.testing.expect(index_stats.index_repair_action_required);
+        try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+    }
+    try std.testing.expect(observed_terminal_repair);
+    try std.testing.expect(!reopened.core.index_manager.repairUnavailable("dv_v1"));
+
     var result = try reopened.search(alloc, .{
         .index_name = "dv_v1",
         .dense = .{

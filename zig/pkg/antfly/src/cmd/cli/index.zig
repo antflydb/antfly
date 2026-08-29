@@ -482,6 +482,8 @@ const IndexSummary = struct {
     error_text: ?[]const u8 = null,
     repair_state: ?[]const u8 = null,
     repair_action_required: ?bool = null,
+    repair_blocks_queryable: ?bool = null,
+    repair_blocks_complete: ?bool = null,
     repair_reason: ?[]const u8 = null,
 };
 
@@ -579,6 +581,8 @@ fn summarizeStats(stats: anytype) IndexSummary {
         .error_text = error_text,
         .repair_state = if (repair) |value| value.state else null,
         .repair_action_required = if (repair) |value| value.action_required else null,
+        .repair_blocks_queryable = if (repair) |value| if (@hasField(@TypeOf(value), "blocks_queryable")) value.blocks_queryable else null else null,
+        .repair_blocks_complete = if (repair) |value| if (@hasField(@TypeOf(value), "blocks_complete")) value.blocks_complete else null else null,
         .repair_reason = if (repair) |value| if (@hasField(@TypeOf(value), "reason")) value.reason else null else null,
     };
 }
@@ -639,6 +643,8 @@ fn writeIndexFailureDiagnostic(
     if (summary.repair_action_required) |action_required| {
         try writer.print(" action_required={any}", .{action_required});
     }
+    if (summary.repair_blocks_queryable) |blocks| try writer.print(" blocks_queryable={any}", .{blocks});
+    if (summary.repair_blocks_complete) |blocks| try writer.print(" blocks_complete={any}", .{blocks});
     if (summary.repair_reason) |reason| try writer.print(" repair_reason={s}", .{reason});
     try writePendingReasons(writer, summary.pending_reasons);
     try writer.writeAll("; run index list --output json for full diagnostics");
@@ -744,6 +750,13 @@ fn writeWaitSuccess(
     if (summary.indexed) |indexed| try writer.print(" indexed_entries={d}", .{indexed});
     if (summary.visible) |visible| try writer.print(" visible_entries={d}", .{visible});
     try writePendingReasons(writer, summary.pending_reasons);
+    if (summary.repair_action_required orelse false) {
+        try writer.writeAll(" warning=repair_action_required");
+        if (summary.repair_state) |state| try writer.print(" repair_state={s}", .{state});
+        if (summary.repair_blocks_queryable) |blocks| try writer.print(" blocks_queryable={any}", .{blocks});
+        if (summary.repair_blocks_complete) |blocks| try writer.print(" blocks_complete={any}", .{blocks});
+        if (summary.repair_reason) |reason| try writer.print(" repair_reason={s}", .{reason});
+    }
     try writer.writeAll("\n");
     cli.writeStdout(io, out.written());
 }
@@ -1319,6 +1332,8 @@ test "index wait prefers authoritative readiness contract" {
         .repair = .{
             .state = "failed",
             .action_required = true,
+            .blocks_queryable = true,
+            .blocks_complete = true,
             .reason = "activation_manifest_missing",
         },
         .readiness = .{
@@ -1339,6 +1354,8 @@ test "index wait prefers authoritative readiness contract" {
     try std.testing.expectEqualStrings("load failed", summary.error_text.?);
     try std.testing.expectEqualStrings("failed", summary.repair_state.?);
     try std.testing.expect(summary.repair_action_required.?);
+    try std.testing.expect(summary.repair_blocks_queryable.?);
+    try std.testing.expect(summary.repair_blocks_complete.?);
     try std.testing.expectEqualStrings("activation_manifest_missing", summary.repair_reason.?);
     try std.testing.expectEqualStrings("repair", summary.pending_reasons[0]);
 
@@ -1346,9 +1363,35 @@ test "index wait prefers authoritative readiness contract" {
     var failure_writer = std.Io.Writer.fixed(&failure_buffer);
     try writeIndexFailureDiagnostic(&failure_writer, "dense", .queryable, summary);
     try std.testing.expectEqualStrings(
-        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true repair_reason=activation_manifest_missing pending_reasons=[repair]; run index list --output json for full diagnostics",
+        "embeddings index dense failed while waiting until queryable: state=failed source_coverage=- incarnation=g-000000000000002a error=load failed repair_state=failed action_required=true blocks_queryable=true blocks_complete=true repair_reason=activation_manifest_missing pending_reasons=[repair]; run index list --output json for full diagnostics",
         failure_writer.buffered(),
     );
+
+    const retained_failure = summarizeStats(antfly_client.types.EmbeddingsIndexStats{
+        .index_type = .embeddings,
+        .rebuilding = false,
+        .backfill_state = "failed",
+        .repair = .{
+            .state = "failed",
+            .action_required = true,
+            .blocks_queryable = false,
+            .blocks_complete = true,
+            .reason = "activation_manifest_missing",
+        },
+        .readiness = .{
+            .state = .failed,
+            .queryable = true,
+            .complete = false,
+            .incarnation = "g-000000000000002a",
+            .target_revision = 11,
+            .published_revision = 11,
+            .pending_reasons = &.{"repair"},
+        },
+    });
+    try std.testing.expect(retained_failure.failed);
+    try std.testing.expect(retained_failure.queryable);
+    try std.testing.expectEqual(WaitDisposition.ready, waitDisposition(retained_failure, .queryable));
+    try std.testing.expectEqual(WaitDisposition.failed, waitDisposition(retained_failure, .complete));
 
     var empty_reasons_buffer: [64]u8 = undefined;
     var empty_reasons_writer = std.Io.Writer.fixed(&empty_reasons_buffer);

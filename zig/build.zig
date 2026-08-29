@@ -3648,6 +3648,7 @@ pub fn build(b: *std.Build) void {
         "partial coverage embeddings readiness counts skipped source units",
         "partial coverage embeddings readiness does not mask pending enrichment",
         "complete partial embeddings coverage is ready after active generation proof",
+        "actionable repair remains visible while retained generation stays queryable",
         "progressive embeddings readiness exposes a queryable partial generation",
         "create table raw parser merges default full text with quickstart embedding index",
         "create table raw parser accepts its canonical full text output",
@@ -6214,6 +6215,8 @@ pub fn build(b: *std.Build) void {
             "runtime status cache stable absence removal retires the old table epoch",
             "partial coverage embeddings readiness counts skipped source units",
             "partial coverage embeddings readiness does not mask pending enrichment",
+            "complete partial embeddings coverage is ready after active generation proof",
+            "actionable repair remains visible while retained generation stays queryable",
             "progressive embeddings readiness exposes a queryable partial generation",
             "stale in-place status preserves an incarnation-scoped serviceability proof",
             "identity-proven embeddings stay current during sibling startup catch-up",
@@ -6889,6 +6892,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{
             "index status exposes compact repair state without internal diagnostics",
             "index status aggregation preserves actionable repair diagnostics for the requested incarnation",
+            "actionable repair remains visible while retained generation stays queryable",
         },
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

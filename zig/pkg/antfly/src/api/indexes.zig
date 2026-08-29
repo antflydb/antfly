@@ -2714,7 +2714,7 @@ test "index status exposes compact repair state without internal diagnostics" {
         null,
         true,
     );
-    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false,\"blocks_queryable\":true,\"blocks_complete\":true}") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"rebuilding\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"backfill_state\":\"running\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "load failed") == null);
@@ -2757,7 +2757,7 @@ test "index status exposes compact repair state without internal diagnostics" {
         true,
     );
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: InvalidIndexConfig\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"failed\",\"action_required\":true,\"reason\":\"activation_manifest_missing\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"failed\",\"action_required\":true,\"blocks_queryable\":true,\"blocks_complete\":true,\"reason\":\"activation_manifest_missing\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"readiness\":{\"state\":\"failed\"") != null);
 
     var corrupt = failed;
@@ -2834,7 +2834,7 @@ test "index status aggregation preserves actionable repair diagnostics for the r
         true,
     );
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: InvalidIndexConfig\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"failed\",\"action_required\":true,\"reason\":\"activation_manifest_missing\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"failed\",\"action_required\":true,\"blocks_queryable\":true,\"blocks_complete\":true,\"reason\":\"activation_manifest_missing\"}") != null);
 }
 
 test "complete partial embeddings coverage is ready after active generation proof" {
@@ -2900,9 +2900,50 @@ test "complete partial embeddings coverage is ready after active generation proo
         "{\"rebuilding\":false,\"backfill_active\":false,\"backfill_state\":\"ready\",\"coverage\":{\"policy\":\"partial\",\"complete\":true,\"healthy\":true,\"pending\":0},\"dense_replay_applied_sequence\":7,\"dense_replay_target_sequence\":7,\"replay_catch_up_required\":false}",
         encoded.items,
     );
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.items, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("repair") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false,\"blocks_queryable\":false,\"blocks_complete\":false}") != null);
+}
+
+test "actionable repair remains visible while retained generation stays queryable" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "thumbnail",
+        .kind = .dense_vector,
+        .load_error = "CandidateManifestInvalid",
+        .doc_count = 1,
+        .node_count = 1,
+        .root_node = 1,
+        .coverage_generation = 42,
+        .coverage_config_hash = 99,
+        .coverage_identity_ready = true,
+        .index_repair_status = .failed,
+        .index_repair_action_required = true,
+        .index_repair_last_error = "activation_manifest_missing",
+        .index_repair_active_generation_serviceable = true,
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .embeddings,
+        item,
+        0,
+        .external,
+        false,
+        42,
+        99,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"error\":\"load failed: CandidateManifestInvalid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"failed\",\"action_required\":true,\"blocks_queryable\":false,\"blocks_complete\":true,\"reason\":\"activation_manifest_missing\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"readiness\":{\"state\":\"failed\",\"queryable\":true,\"complete\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"pending_reasons\":[\"repair\"]") != null);
 }
 
 test "progressive embeddings readiness exposes a queryable partial generation" {
@@ -3476,9 +3517,7 @@ test "serviceable repair preserves sibling shard dense catch-up fallback" {
         "{\"rebuilding\":true,\"backfill_active\":true,\"dense_replay_applied_sequence\":9,\"dense_replay_target_sequence\":13,\"dense_publish_pending\":true,\"replay_catch_up_required\":true,\"catch_up_phase\":\"replay\"}",
         encoded.items,
     );
-    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, encoded.items, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value.object.get("repair") == null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false,\"blocks_queryable\":false,\"blocks_complete\":false}") != null);
 }
 
 test "derived coverage aggregation rejects stale index incarnations" {
@@ -4212,11 +4251,23 @@ fn appendSingleIndexRuntimeStatus(
     }
     if (catch_up_active and catch_up_phase == .idle and replay_catch_up_required) catch_up_phase = .replay;
 
-    const repair_state = if (embeddings_materialization_current and !active_generation_serviceable)
+    // Repair health and serving-generation availability are orthogonal. Keep
+    // the repair visible even when an incarnation-scoped proof allows the
+    // active generation to continue serving queries.
+    const repair_state = if (embeddings_materialization_current)
         observed_repair_state
     else
         null;
-    const repair_action_required = repair_state != null and publicIndexRepairActionRequired(item);
+    const repair_status = if (repair_state) |state|
+        std.meta.stringToEnum(index_repair_status.IndexRepairStatus, state)
+    else
+        null;
+    const repair_lifecycle = index_repair_status.projectLifecycle(
+        repair_status,
+        publicIndexRepairActionRequired(item),
+        active_generation_serviceable,
+    );
+    const repair_action_required = repair_lifecycle.action_required;
     const repair_reason = if (repair_action_required) publicIndexRepairReason(item) else null;
     // Runnable repair owns a quarantined root, so its raw load error is stale
     // implementation noise. Once repair genuinely requires operator action,
@@ -4233,7 +4284,7 @@ fn appendSingleIndexRuntimeStatus(
         raw_load_error
     else
         null;
-    const repair_blocks_readiness = repair_state != null;
+    const repair_blocks_readiness = repair_lifecycle.blocks_complete;
     if (load_error != null) {
         backfill_active = false;
         catch_up_active = false;
@@ -4321,6 +4372,10 @@ fn appendSingleIndexRuntimeStatus(
         try appendJsonString(alloc, out, state);
         try out.appendSlice(alloc, ",\"action_required\":");
         try out.appendSlice(alloc, if (repair_action_required) "true" else "false");
+        try out.appendSlice(alloc, ",\"blocks_queryable\":");
+        try out.appendSlice(alloc, if (repair_lifecycle.blocks_queryable) "true" else "false");
+        try out.appendSlice(alloc, ",\"blocks_complete\":");
+        try out.appendSlice(alloc, if (repair_lifecycle.blocks_complete) "true" else "false");
         if (repair_reason) |reason| {
             try out.appendSlice(alloc, ",\"reason\":");
             try appendJsonString(alloc, out, reason);
@@ -4560,6 +4615,9 @@ fn appendSingleIndexRuntimeStatus(
         terminal_load_failure,
         terminal_enrichment_failure,
         repair_state,
+        repair_action_required,
+        repair_lifecycle.blocks_queryable,
+        repair_lifecycle.blocks_complete,
         replay_applied_sequence,
         replay_target_sequence,
         replay_catch_up_required,
@@ -4583,6 +4641,9 @@ fn appendIndexReadinessStatus(
     terminal_load_failure: bool,
     terminal_enrichment_failure: bool,
     repair_state: ?[]const u8,
+    repair_action_required: bool,
+    repair_blocks_queryable: bool,
+    repair_blocks_complete: bool,
     replay_applied_sequence: u64,
     replay_target_sequence: u64,
     replay_catch_up_required: bool,
@@ -4597,17 +4658,16 @@ fn appendIndexReadinessStatus(
         true;
     const incarnation_current = index_type != .embeddings or
         (coverage_generation != 0 and authority.incarnation_current);
-    const repair_failed = if (repair_state) |state|
-        std.mem.eql(u8, state, "paused") or std.mem.eql(u8, state, "failed")
-    else
-        false;
+    const repair_failed = repair_state != null and repair_action_required;
     const failed = terminal_load_failure or repair_failed or terminal_enrichment_failure;
+    const serving_failed = (terminal_load_failure or terminal_enrichment_failure or repair_failed) and
+        (!active_generation_serviceable or repair_blocks_queryable);
     const publication_pending = index_type == .embeddings and incarnation_current and
         replay_target_sequence > replay_applied_sequence;
     const coverage_pending = index_type == .embeddings and embeddings_coverage_policy != .external and
         (!incarnation_current or backfill_active);
     const pending = !failed and (!observation_fresh or !topology_complete or !incarnation_current or
-        backfill_active or repair_state != null or replay_catch_up_required or catch_up_active or
+        backfill_active or repair_blocks_complete or replay_catch_up_required or catch_up_active or
         publication_pending or coverage_pending);
     const published_generation_has_results = index_type == .embeddings and repair_state == null and
         if (@hasField(Item, "doc_count")) item.doc_count > 0 else false;
@@ -4616,7 +4676,7 @@ fn appendIndexReadinessStatus(
             item.expected_group_count > 0 and item.repair_observation_count == item.expected_group_count
         else
             true;
-    const queryable_partial = !failed and pending and index_type == .embeddings and
+    const queryable_partial = !serving_failed and (pending or failed) and index_type == .embeddings and
         (active_generation_serviceable or published_generation_has_results) and
         ((observation_fresh and topology_complete and incarnation_current) or
             stale_generation_serviceable);
@@ -4662,7 +4722,7 @@ fn appendIndexReadinessStatus(
     if (!observation_fresh) try appendReason(alloc, out, "runtime_unavailable", &emitted);
     if (!topology_complete) try appendReason(alloc, out, "shard_observation_incomplete", &emitted);
     if (!incarnation_current) try appendReason(alloc, out, "incarnation_pending", &emitted);
-    if (repair_state != null) try appendReason(alloc, out, "repair", &emitted);
+    if (repair_blocks_complete) try appendReason(alloc, out, "repair", &emitted);
     if (backfill_active) try appendReason(alloc, out, "backfill", &emitted);
     if (coverage_pending) try appendReason(alloc, out, "coverage", &emitted);
     if (replay_catch_up_required or catch_up_active) try appendReason(alloc, out, "replay", &emitted);
