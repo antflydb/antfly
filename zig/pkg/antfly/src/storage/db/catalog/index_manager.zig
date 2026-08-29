@@ -4112,6 +4112,11 @@ pub const IndexManager = struct {
         recovered: usize = 0,
         remaining: usize = 0,
         target_outcome: QuarantineRetryTargetOutcome = .not_targeted,
+        /// Recovery policy after a targeted open failed. The detached open may
+        /// reclassify the same exact incarnation, so repair owners must branch
+        /// on this post-attempt value rather than the policy which authorized
+        /// the retry.
+        target_action: ?IndexLoadRecoveryAction = null,
     };
 
     pub const QuarantineRetryTargetOutcome = enum {
@@ -4205,6 +4210,7 @@ pub const IndexManager = struct {
 
         var tasks = std.ArrayListUnmanaged(RetryTask).empty;
         var target_outcome: QuarantineRetryTargetOutcome = if (target == null) .not_targeted else .absent;
+        var target_action: ?IndexLoadRecoveryAction = null;
         defer {
             for (tasks.items) |*task| task.deinit(self.alloc);
             tasks.deinit(self.alloc);
@@ -4320,8 +4326,11 @@ pub const IndexManager = struct {
                     continue;
                 }
                 self.updateFailedIndexLoadError(task.name, err, now_ns);
-                if (target != null) target_outcome = .attempted_failed;
                 const updated = self.failed_index_loads.get(task.name) orelse continue;
+                if (target != null) {
+                    target_outcome = .attempted_failed;
+                    target_action = updated.action;
+                }
                 std.log.warn("quarantined index retry failed name={s} attempt={d} err={s}", .{
                     task.name,
                     updated.retry_attempts,
@@ -4416,6 +4425,7 @@ pub const IndexManager = struct {
             .recovered = recovered,
             .remaining = self.failed_index_loads.count(),
             .target_outcome = target_outcome,
+            .target_action = target_action,
         };
     }
 
@@ -26381,6 +26391,7 @@ test "targeted quarantine retry preserves exact repair claim authority" {
         fence,
     );
     try std.testing.expectEqual(.attempted_failed, authorized.target_outcome);
+    try std.testing.expectEqual(IndexManager.IndexLoadRecoveryAction.manual_intervention, authorized.target_action.?);
     try std.testing.expectEqual(@as(usize, 0), authorized.recovered);
     try std.testing.expectEqual(@as(usize, 1), authorized.remaining);
     const after = manager.failedIndexLoadSnapshot(cfg.name).?;

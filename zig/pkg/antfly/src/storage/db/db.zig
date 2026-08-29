@@ -11569,8 +11569,12 @@ pub const DB = struct {
             // Only an operator-requested rebuild starts from a generation that
             // is still proven healthy. Coverage mismatch or missing proof is
             // fail-closed until replacement validation publishes cleanup.
-            .operator_generation_rebuild => intent.phase == .activating or intent.phase == .validating,
-            .replay_artifact_unavailable => intent.phase == .activating or intent.phase == .validating,
+            .operator_generation_rebuild => intent.phase == .activating or
+                intent.phase == .validating or
+                intent.phase == .rolling_back,
+            .replay_artifact_unavailable => intent.phase == .activating or
+                intent.phase == .validating or
+                intent.phase == .rolling_back,
             .artifact_coverage_mismatch,
             .artifact_counter_missing,
             .root_generation_rebuild,
@@ -13067,6 +13071,21 @@ pub const DB = struct {
         );
     }
 
+    test "rollback predecessor retry policy preserves automatic recovery boundaries" {
+        try std.testing.expectEqual(
+            ActivatedIndexRepairRollback.retry_deferred,
+            activatedIndexRepairRollbackFailureDisposition(.retry_open),
+        );
+        try std.testing.expectEqual(
+            ActivatedIndexRepairRollback.rebuild_required,
+            activatedIndexRepairRollbackFailureDisposition(.rebuild_from_artifacts),
+        );
+        try std.testing.expectEqual(
+            ActivatedIndexRepairRollback.action_required,
+            activatedIndexRepairRollbackFailureDisposition(.manual_intervention),
+        );
+    }
+
     fn removeIndexRepairIntentAndPin(self: *DB, alloc: Allocator, repair_id: u128) !void {
         return try removeIndexRepairIntentAndPinContext(self.async_context, alloc, repair_id);
     }
@@ -13161,6 +13180,23 @@ pub const DB = struct {
         alloc: Allocator,
         repair_id: u128,
     ) !void {
+        return try self.discardInactiveIndexRepairCandidateWithTerminal(
+            alloc,
+            repair_id,
+            null,
+        );
+    }
+
+    /// Deletes only a proven-inactive candidate, then publishes its durable
+    /// disposition in one repair-control checkpoint. A manual predecessor
+    /// failure must not expose an intermediate runnable preflight intent if the
+    /// process stops after filesystem cleanup.
+    fn discardInactiveIndexRepairCandidateWithTerminal(
+        self: *DB,
+        alloc: Allocator,
+        repair_id: u128,
+        terminal_reason: ?[]const u8,
+    ) !void {
         var entry = try self.loadIndexRepairEntryById(alloc, repair_id);
         defer entry.deinit(alloc);
         const candidate = entry.intent.candidate_relative_path orelse return;
@@ -13185,7 +13221,7 @@ pub const DB = struct {
             // shadow in the unwind path.
             try std.Io.Dir.cwd().deleteTree(io_impl.io(), shadow_root);
         }
-        try self.updateIndexRepairIntent(alloc, repair_id, .{
+        const reset = IndexRepairIntentUpdate{
             .phase = .preflight,
             .replace_candidate_path = true,
             .replace_build_resume_key = true,
@@ -13195,7 +13231,26 @@ pub const DB = struct {
             .failure_streak = 0,
             .next_retry_at_ms = 0,
             .replace_last_error = true,
-        });
+        };
+        if (terminal_reason) |reason| {
+            var terminal = reset;
+            terminal.phase = null;
+            terminal.failure_streak = null;
+            terminal.next_retry_at_ms = null;
+            terminal.replace_last_error = false;
+            terminal.attempt_failure = .{
+                .err_name = reason,
+                .terminal = true,
+            };
+            try self.updateIndexRepairIntentWithBindingEffect(
+                alloc,
+                repair_id,
+                terminal,
+                .release,
+            );
+        } else {
+            try self.updateIndexRepairIntent(alloc, repair_id, reset);
+        }
         if (entry.intent.kind == .algebraic) self.scheduleInactiveRepairShadowCleanup();
     }
 
@@ -13253,16 +13308,29 @@ pub const DB = struct {
     const ActivatedIndexRepairRollback = enum {
         not_active,
         prior_generation_restored,
+        retry_deferred,
         rebuild_required,
+        action_required,
     };
 
+    fn activatedIndexRepairRollbackFailureDisposition(
+        action: index_manager_mod.IndexManager.IndexLoadRecoveryAction,
+    ) ActivatedIndexRepairRollback {
+        return switch (action) {
+            .retry_open => .retry_deferred,
+            .rebuild_from_artifacts => .rebuild_required,
+            .manual_intervention => .action_required,
+        };
+    }
+
     /// Rolls a failed-to-load activated candidate back to the exact pointer
-    /// captured before activation. The candidate is then inactive and may be
-    /// discarded without risking the prior generation. Quarantine ownership
-    /// remains bound to this durable repair across the detached reopen, so
-    /// discovery can neither steal the retry nor publish a stale incarnation.
-    /// A poisoned prior root may still fail to reopen; that is expected and
-    /// leaves the index quarantined while a fresh candidate is built.
+    /// captured before activation. `rolling_back` is checkpointed while the
+    /// structural/apply fence and exact quarantine claim are both held, before
+    /// the pointer changes. Restart can therefore distinguish a crash before
+    /// activation from an interrupted rollback and idempotently finish from
+    /// either pointer. Slow reopen I/O remains outside the service fence while
+    /// the exact repair claim prevents discovery or an ordinary retry from
+    /// publishing underneath it.
     fn rollbackUnavailableActivatedIndexRepair(
         self: *DB,
         alloc: Allocator,
@@ -13272,29 +13340,73 @@ pub const DB = struct {
         defer entry.deinit(alloc);
         if (!entry.intent.previous_pointer_captured) return .not_active;
         const candidate = entry.intent.candidate_relative_path orelse return .not_active;
-        if (!try self.core.index_manager.isRepairCandidateActive(entry.intent.index_name, candidate)) return .not_active;
+        var claim: ?index_manager_mod.IndexManager.FailedIndexLoadRepairClaim = null;
+        var predecessor_loaded = false;
         {
             var structural_guard = self.beginIndexStructuralMutation("index repair rollback", entry.intent.index_name);
             defer structural_guard.deinit();
             lockApply(self);
             defer self.core.unlockApply();
-            try self.core.index_manager.restoreActiveIndexRootPointer(
-                entry.intent.index_name,
-                candidate,
-                entry.intent.previous_active_relative_path,
-            );
+
+            const active_pointer = try self.core.index_manager.captureActiveIndexRootPointer(entry.intent.index_name);
+            defer if (active_pointer) |value| alloc.free(value);
+            const candidate_active = active_pointer != null and
+                std.mem.eql(u8, active_pointer.?, candidate);
+            const predecessor_active = if (entry.intent.previous_active_relative_path) |previous|
+                active_pointer != null and std.mem.eql(u8, active_pointer.?, previous)
+            else
+                active_pointer == null;
+
+            if (entry.intent.phase != .rolling_back and !candidate_active) return .not_active;
+            if (entry.intent.phase == .rolling_back and !candidate_active and !predecessor_active) {
+                return error.RepairOwnershipLost;
+            }
+
+            if (self.core.index_manager.failedIndexLoadSnapshot(entry.intent.index_name)) |failure| {
+                claim = switch (self.core.index_manager.claimFailedIndexLoadRepair(
+                    entry.intent.index_name,
+                    .{ .exact = failure.token },
+                    entry.intent.repair_id,
+                )) {
+                    .claimed, .already_claimed => |value| value,
+                    .absent, .mismatch, .claimed_by_other => return error.RepairOwnershipLost,
+                };
+            } else if (predecessor_active) {
+                // A restart may have already opened the restored predecessor
+                // before the durable rollback owner resumes.
+                predecessor_loaded = true;
+            } else {
+                // A loaded active candidate is reconciled by the caller before
+                // entering rollback. Absence here has no safe retry identity.
+                return error.RepairOwnershipLost;
+            }
+
+            if (entry.intent.phase != .rolling_back) {
+                var checkpointed = false;
+                defer if (!checkpointed) self.core.index_manager.releaseFailedIndexLoadRepairClaim(
+                    entry.intent.index_name,
+                    entry.intent.repair_id,
+                );
+                try self.updateIndexRepairIntent(alloc, repair_id, .{
+                    .phase = .rolling_back,
+                    .next_retry_at_ms = 0,
+                    .replace_last_error = true,
+                });
+                checkpointed = true;
+            }
+            if (candidate_active) {
+                try self.core.index_manager.restoreActiveIndexRootPointer(
+                    entry.intent.index_name,
+                    candidate,
+                    entry.intent.previous_active_relative_path,
+                );
+            }
         }
 
-        const failure = self.core.index_manager.failedIndexLoadSnapshot(entry.intent.index_name) orelse
-            return error.RepairOwnershipLost;
-        const claim = switch (self.core.index_manager.claimFailedIndexLoadRepair(
-            entry.intent.index_name,
-            .{ .exact = failure.token },
-            entry.intent.repair_id,
-        )) {
-            .claimed, .already_claimed => |value| value,
-            .absent, .mismatch, .claimed_by_other => return error.RepairOwnershipLost,
-        };
+        if (predecessor_loaded) {
+            try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
+            return .prior_generation_restored;
+        }
         if (comptime builtin.is_test) {
             if (test_index_repair_rollback_retry_hook) |hook| {
                 try hook.before_retry(hook.ptr, self, repair_id);
@@ -13302,19 +13414,48 @@ pub const DB = struct {
         }
         const retry = try self.retryQuarantinedIndexLoadTarget(.{
             .name = entry.intent.index_name,
-            .token = claim.token,
+            .token = claim.?.token,
             .authority = .{ .repair_claim = entry.intent.repair_id },
         }, true);
-        const rollback = switch (retry.target_outcome) {
-            .recovered => ActivatedIndexRepairRollback.prior_generation_restored,
-            .attempted_failed => ActivatedIndexRepairRollback.rebuild_required,
+        switch (retry.target_outcome) {
+            .recovered => {
+                try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
+                return .prior_generation_restored;
+            },
+            .attempted_failed => switch (activatedIndexRepairRollbackFailureDisposition(
+                retry.target_action orelse return error.RepairOwnershipLost,
+            )) {
+                .retry_deferred => {
+                    // Retain both the rollback phase and exact claim. The
+                    // durable repair backoff owns subsequent retries, avoiding
+                    // a hot loop and preventing generic retry from racing it.
+                    try self.recordIndexRepairAttemptFailure(
+                        alloc,
+                        repair_id,
+                        "rollback_predecessor_retry_open",
+                        false,
+                    );
+                    return .retry_deferred;
+                },
+                .action_required => {
+                    try self.discardInactiveIndexRepairCandidateWithTerminal(
+                        alloc,
+                        repair_id,
+                        "rollback_predecessor_manual_intervention",
+                    );
+                    return .action_required;
+                },
+                .rebuild_required => {
+                    try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
+                    return .rebuild_required;
+                },
+                .not_active, .prior_generation_restored => unreachable,
+            },
             // An exact repair-authorized forced retry is always targeted and
             // ignores backoff. Any other outcome means its incarnation or
             // ownership changed while detached I/O was in flight.
             .not_targeted, .absent, .stale, .repair_claimed, .backoff => return error.RepairOwnershipLost,
-        };
-        try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
-        return rollback;
+        }
     }
 
     /// Cheap startup discovery. This authorizes and durably records repair
@@ -13819,7 +13960,9 @@ pub const DB = struct {
         // ownership. Operator and generation-health intents may coexist with
         // retry/manual load failures but must not be reclassified as automatic
         // destructive recovery merely because they share an index name.
-        if (entry.intent.trigger == .incomplete_bulk_publish) {
+        if (entry.intent.trigger == .incomplete_bulk_publish and
+            entry.intent.phase != .rolling_back)
+        {
             // Retryable terminal phases release their quarantine claim so an
             // operator may intervene. Reclaiming classifies action/config and
             // claims the current incarnation in one catalog-locked operation.
@@ -13901,6 +14044,66 @@ pub const DB = struct {
             try self.recordIndexRepairAttemptFailure(alloc, repair_id, "index_configuration_changed", true);
             result.terminal = true;
             return result;
+        }
+
+        // Activation recovery is structural O(1) work and precedes corpus
+        // validation or capacity admission. `rolling_back` is an explicit
+        // durable decision: if restart finds the candidate healthy before the
+        // pointer moved, reconciliation may still commit it; otherwise the
+        // rollback owner must finish retiring it and must never resume it as a
+        // convergence candidate.
+        if (entry.intent.phase == .activating or
+            entry.intent.phase == .validating or
+            entry.intent.phase == .cleanup or
+            entry.intent.phase == .rolling_back)
+        {
+            if (entry.intent.candidate_relative_path == null) {
+                try self.recordIndexRepairAttemptFailure(alloc, repair_id, "activated_candidate_missing", true);
+                result.terminal = true;
+                return result;
+            }
+            if (try self.reconcileActivatedIndexRepair(alloc, repair_id)) {
+                result.attempted = true;
+                var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
+                try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
+                applyCommittedRepairOutcomeToAdvance(&result, repair);
+                result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
+                return result;
+            }
+            const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
+            switch (rolled_back) {
+                .not_active => {
+                    // `activating` is durable before pointer publication. If
+                    // that publication never happened, retain the ready shadow
+                    // and resume its bounded convergence path.
+                    try self.updateIndexRepairIntent(alloc, repair_id, .{
+                        .phase = .waiting_for_convergence,
+                    });
+                    entry.intent.phase = .waiting_for_convergence;
+                },
+                .prior_generation_restored => {
+                    // Yield after the rollback quantum. The restored generation
+                    // is immediately available while the original durable
+                    // repair resumes from preflight on the next owner turn.
+                    result.attempted = true;
+                    result.deferred = true;
+                    return result;
+                },
+                .retry_deferred => {
+                    var deferred = try self.loadIndexRepairEntryById(alloc, repair_id);
+                    defer deferred.deinit(alloc);
+                    result.attempted = true;
+                    result.deferred = true;
+                    result.next_retry_at_ms = deferred.intent.next_retry_at_ms;
+                    return result;
+                },
+                .action_required => {
+                    result.attempted = true;
+                    result.terminal = true;
+                    return result;
+                },
+                .rebuild_required => {},
+            }
         }
 
         // Check the exact index generation before the shared enrichment
@@ -14052,52 +14255,6 @@ pub const DB = struct {
             });
             entry.intent.estimated_candidate_bytes = estimated_candidate_bytes;
             entry.intent.planned_disk_bytes = planned_disk_bytes;
-        }
-
-        // A process may stop after pointer activation but before publishing a
-        // clean checkpoint or deleting the intent. Never rebuild in that case:
-        // prove that the recorded candidate is active and loaded, finish the
-        // validation checkpoint, then atomically release intent and replay pin.
-        if (entry.intent.phase == .activating or
-            entry.intent.phase == .validating or
-            entry.intent.phase == .cleanup)
-        {
-            if (entry.intent.candidate_relative_path == null) {
-                try self.recordIndexRepairAttemptFailure(alloc, repair_id, "activated_candidate_missing", true);
-                result.terminal = true;
-                return result;
-            }
-            if (try self.reconcileActivatedIndexRepair(alloc, repair_id)) {
-                result.attempted = true;
-                var repair = types.ArtifactRepairResult{ .indexes_rebuilt = 1 };
-                try self.finalizeCommittedIndexRepairOutcome(alloc, entry.intent.index_name, 0, &repair);
-                applyCommittedRepairOutcomeToAdvance(&result, repair);
-                result.repaired = repair.indexes_degraded_after == 0 and !repair.debt_remaining;
-                return result;
-            }
-            const rolled_back = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
-            // `activating` was persisted before the pointer write. If the
-            // candidate is not active, retain the ready generation and resume
-            // convergence. This transition is authorized only after the durable
-            // pointer was checked above; an ambiguous or failed rollback leaves
-            // the intent in `activating` and fails closed.
-            switch (rolled_back) {
-                .not_active => {
-                    try self.updateIndexRepairIntent(alloc, repair_id, .{
-                        .phase = .waiting_for_convergence,
-                    });
-                    entry.intent.phase = .waiting_for_convergence;
-                },
-                .prior_generation_restored => {
-                    // Yield after the rollback quantum. The discard transition
-                    // has already restored the trigger's ordinary admission
-                    // policy and scheduled the resumable preflight immediately.
-                    result.attempted = true;
-                    result.deferred = true;
-                    return result;
-                },
-                .rebuild_required => {},
-            }
         }
 
         // Capacity is checked and claimed through the shared ResourceManager
@@ -14844,7 +15001,21 @@ pub const DB = struct {
                 try self.finalizeCommittedIndexRepairOutcome(alloc, cfg.name, 0, &result);
                 return result;
             }
-            _ = try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id);
+            switch (try self.rollbackUnavailableActivatedIndexRepair(alloc, repair_id)) {
+                .prior_generation_restored, .retry_deferred => {
+                    result.in_progress += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
+                    return result;
+                },
+                .action_required => {
+                    result.failed += 1;
+                    result.unresolved += 1;
+                    result.debt_remaining = true;
+                    return result;
+                },
+                .not_active, .rebuild_required => {},
+            }
             var durable_entry = try self.loadIndexRepairEntryById(alloc, repair_id);
             defer durable_entry.deinit(alloc);
             const resumable = durable_entry.intent.candidate_relative_path != null and switch (durable_entry.intent.phase) {
@@ -22750,6 +22921,8 @@ pub const DB = struct {
             "terminal"
         else if (intent.next_retry_at_ms > currentTimeNs() / std.time.ns_per_ms)
             "backoff"
+        else if (intent.phase == .rolling_back)
+            "rollback"
         else if (intent.phase == .waiting_for_convergence)
             "convergence"
         else
@@ -22815,6 +22988,7 @@ pub const DB = struct {
                 item.backfill_active = intent.phase != .terminal;
                 item.repair_degraded = intent.phase == .activating or
                     intent.phase == .validating or
+                    intent.phase == .rolling_back or
                     intent.phase == .terminal;
             },
         }
@@ -79439,6 +79613,34 @@ test "db failed activated dense generation rolls back to retained predecessor" {
         reopened.core.index_manager.loadFailure("dense_idx") orelse return error.TestUnexpectedResult,
     );
 
+    const RollbackCheckpointCrash = struct {
+        fn afterSnapshot(_: *anyopaque, _: *DB, _: []const u8, _: u64) !void {}
+
+        fn afterPhase(_: *anyopaque, _: *DB, _: u128, phase: index_repair_state.Phase) !void {
+            if (phase == .rolling_back) return error.TestCrashBeforeRollbackPointerRestore;
+        }
+    };
+    var rollback_checkpoint_ctx: u8 = 0;
+    reopened.shadow_index_repair_hook = .{
+        .ptr = &rollback_checkpoint_ctx,
+        .after_snapshot_build = RollbackCheckpointCrash.afterSnapshot,
+        .after_phase_persisted = RollbackCheckpointCrash.afterPhase,
+    };
+    try std.testing.expectError(
+        error.TestCrashBeforeRollbackPointerRestore,
+        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id),
+    );
+    reopened.shadow_index_repair_hook = null;
+    {
+        var checkpointed = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer checkpointed.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.rolling_back, checkpointed.intent.phase);
+        try std.testing.expect(try reopened.core.index_manager.isRepairCandidateActive(
+            "dense_idx",
+            checkpointed.intent.candidate_relative_path.?,
+        ));
+    }
+
     const RollbackDiscovery = struct {
         repair_id: u128,
         observed: bool = false,
@@ -79446,6 +79648,14 @@ test "db failed activated dense generation rolls back to retained predecessor" {
         fn beforeRetry(raw: *anyopaque, db: *DB, observed_repair_id: u128) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
+            var rolling_back = try db.loadIndexRepairEntryById(db.alloc, observed_repair_id);
+            defer rolling_back.deinit(db.alloc);
+            try std.testing.expectEqual(index_repair_state.Phase.rolling_back, rolling_back.intent.phase);
+            const generic_retry = try db.retryQuarantinedIndexLoad("dense_idx", true);
+            try std.testing.expectEqual(
+                index_manager_mod.IndexManager.QuarantineRetryTargetOutcome.repair_claimed,
+                generic_retry.target_outcome,
+            );
             const discovery = try db.discoverRecoverableStartupIndexFailures(db.alloc, 1);
             try std.testing.expectEqual(@as(usize, 0), discovery.discovered);
             try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
@@ -79454,6 +79664,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
                 db.core.index_manager.failedIndexLoadSnapshot("dense_idx").?.claim_owner_repair_id.?,
             );
             self.observed = true;
+            return error.TestCrashAfterRollbackPointerRestore;
         }
     };
     var rollback_discovery = RollbackDiscovery{ .repair_id = repair_id };
@@ -79462,11 +79673,25 @@ test "db failed activated dense generation rolls back to retained predecessor" {
         .before_retry = RollbackDiscovery.beforeRetry,
     };
     defer DB.test_index_repair_rollback_retry_hook = null;
+    try std.testing.expectError(
+        error.TestCrashAfterRollbackPointerRestore,
+        reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id),
+    );
+    try std.testing.expect(rollback_discovery.observed);
+    {
+        var interrupted_rollback = try reopened.loadIndexRepairEntryById(alloc, repair_id);
+        defer interrupted_rollback.deinit(alloc);
+        try std.testing.expectEqual(index_repair_state.Phase.rolling_back, interrupted_rollback.intent.phase);
+        try std.testing.expect(!try reopened.core.index_manager.isRepairCandidateActive(
+            "dense_idx",
+            interrupted_rollback.intent.candidate_relative_path.?,
+        ));
+    }
+    DB.test_index_repair_rollback_retry_hook = null;
     try std.testing.expectEqual(
         DB.ActivatedIndexRepairRollback.prior_generation_restored,
         try reopened.rollbackUnavailableActivatedIndexRepair(alloc, repair_id),
     );
-    try std.testing.expect(rollback_discovery.observed);
     try std.testing.expect(reopened.core.index_manager.loadFailure("dense_idx") == null);
 
     // The previous generation is immediately serviceable after rollback,
@@ -90337,7 +90562,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                     }
                 },
                 .invalidate => self.invalidate_calls += 1,
-                .index_repair_pending, .index_repair_cleared => {},
+                .index_repair_pending, .index_repair_cleared, .index_repair_progress => {},
             }
         }
     };

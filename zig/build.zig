@@ -6342,6 +6342,7 @@ pub fn build(b: *std.Build) void {
             "resident index repair progress waits are revision scoped and event driven",
             "index repair intent string replacement is allocation failure safe",
             "quarantine binding reconciliation serializes with terminal transition",
+            "rollback predecessor retry policy preserves automatic recovery boundaries",
             "db failed activated dense generation rolls back to retained predecessor",
             "repair admission revisions stay fail closed and reject delayed publishers",
             "db progressive managed admission serves a checkpointed partial generation",

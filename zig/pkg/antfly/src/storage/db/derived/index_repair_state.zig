@@ -22,7 +22,10 @@ const types = @import("../types.zig");
 
 const file_name = "index_repair.checkpoint";
 const magic = "AFIDXRP1";
-const format_version: u32 = 9;
+// Version 10 adds the durable `rolling_back` phase without changing field
+// layout. Older readers reject the newer semantic explicitly at the header
+// instead of misclassifying its phase byte as generic checkpoint corruption.
+const format_version: u32 = 10;
 const max_file_bytes: usize = 16 * 1024 * 1024;
 const max_entries: usize = 65_536;
 const max_index_name_bytes: usize = 4 * 1024;
@@ -91,6 +94,12 @@ pub const Phase = enum(u8) {
     validating = 8,
     cleanup = 9,
     terminal = 10,
+    /// The repair owner durably chose the retained predecessor after an
+    /// activated candidate could not be loaded. The active-root pointer may
+    /// still select either generation after a crash. Recovery may validate an
+    /// already-active candidate which became healthy, but after the predecessor
+    /// is selected it must never resume this candidate as convergence work.
+    rolling_back = 11,
 };
 
 pub const Automation = enum(u8) {
@@ -550,11 +559,21 @@ fn phaseTransitionAllowed(from: Phase, to: Phase) bool {
         .catching_up => to == .ready or to == .waiting_for_convergence or to == .preflight,
         .ready => to == .waiting_for_convergence or to == .catching_up or to == .activating or to == .preflight,
         .waiting_for_convergence => to == .catching_up or to == .ready or to == .activating or to == .preflight,
-        .activating => to == .validating or to == .cleanup or to == .waiting_for_convergence or to == .preflight,
-        .validating => to == .cleanup or to == .preflight,
-        .cleanup => to == .preflight,
+        .activating => to == .validating or to == .cleanup or to == .waiting_for_convergence or to == .preflight or to == .rolling_back,
+        .validating => to == .cleanup or to == .preflight or to == .rolling_back,
+        .cleanup => to == .preflight or to == .rolling_back,
         .terminal => to == .detected,
+        .rolling_back => to == .cleanup or to == .preflight,
     };
+}
+
+test "rolling back is durable and cannot resume candidate convergence" {
+    try std.testing.expect(phaseTransitionAllowed(.activating, .rolling_back));
+    try std.testing.expect(phaseTransitionAllowed(.validating, .rolling_back));
+    try std.testing.expect(phaseTransitionAllowed(.cleanup, .rolling_back));
+    try std.testing.expect(phaseTransitionAllowed(.rolling_back, .preflight));
+    try std.testing.expect(!phaseTransitionAllowed(.rolling_back, .waiting_for_convergence));
+    try std.testing.expect(!phaseTransitionAllowed(.rolling_back, .activating));
 }
 
 pub fn removeEntryAndPin(
