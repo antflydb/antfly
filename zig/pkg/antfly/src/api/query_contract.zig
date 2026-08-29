@@ -15424,8 +15424,7 @@ test "api query contract owns the admitted graph wire for exact proxying" {
         \\        "filter": {"term":"active","path":"/status"}
         \\      }
         \\    }
-        \\  },
-        \\  "graph_searches": null
+        \\  }
         \\}
     ;
     var owned = try parseQueryRequest(alloc, null, "docs", body);

@@ -18480,37 +18480,6 @@ fn parseRemoteGraphPathResultNodes(
     return .{ .nodes = nodes, .hits = try hits.toOwnedSlice(alloc) };
 }
 
-fn parseRemoteLegacyGraphNodes(
-    alloc: std.mem.Allocator,
-    value: []const indexes_openapi.LegacyGraphResultNode,
-) !ParsedRemoteGraphNodes {
-    if (value.len > public_limits.max_graph_result_items)
-        return error.InvalidRemoteResponse;
-    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, value.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (nodes[0..initialized]) |*node| node.deinit(alloc);
-        alloc.free(nodes);
-    }
-    var hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
-    errdefer {
-        for (hits.items) |*hit| hit.deinit(alloc);
-        hits.deinit(alloc);
-    }
-
-    for (value, 0..) |item, i| {
-        nodes[i] = try parseRemoteLegacyGraphNodeWithKey(alloc, item.key, item);
-        initialized += 1;
-        if (item.document) |document| {
-            try appendRemoteGraphDocumentHit(alloc, &hits, item.key, item.table, document);
-        }
-    }
-    return .{
-        .nodes = nodes,
-        .hits = try hits.toOwnedSlice(alloc),
-    };
-}
-
 const OwnedRemoteGraphNodePath = struct {
     nodes: [][]const u8,
     tables: ?[]const ?[]const u8,
@@ -18595,37 +18564,6 @@ fn parseRemoteGraphNodeWithKey(
         .distance = distance,
         .path = if (owned_path) |value| value.nodes else null,
         .path_tables = if (owned_path) |value| value.tables else null,
-        .path_edges = path_edges,
-        .provenance = provenance,
-    };
-}
-
-fn parseRemoteLegacyGraphNodeWithKey(
-    alloc: std.mem.Allocator,
-    key: []const u8,
-    item: indexes_openapi.LegacyGraphResultNode,
-) !graph_query_mod.GraphResultNode {
-    try validateRemoteCanonicalGraphIdentity(key, item.table);
-    const depth = std.math.cast(u32, item.depth orelse 0) orelse return error.InvalidRemoteResponse;
-    if (depth > graph_pattern_mod.max_pattern_hops) return error.InvalidRemoteResponse;
-    const distance = item.distance orelse 0;
-    if (!std.math.isFinite(distance) or distance < 0) return error.InvalidRemoteResponse;
-    const owned_key = try alloc.dupe(u8, key);
-    errdefer alloc.free(owned_key);
-    const owned_table = if (item.table) |table| try alloc.dupe(u8, table) else null;
-    errdefer if (owned_table) |table| alloc.free(table);
-    const path = if (item.path) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
-    errdefer if (path) |value| freeRemoteGraphNodePath(alloc, value);
-    const path_edges = if (item.path_edges) |value| try cloneRemoteLegacyGraphNodePathEdges(alloc, value) else null;
-    errdefer if (path_edges) |value| freeRemoteGraphNodePathEdges(alloc, value);
-    const provenance = if (item.provenance) |value| try cloneRemoteGraphNodePath(alloc, value) else null;
-    errdefer if (provenance) |value| freeRemoteGraphNodePath(alloc, value);
-    return .{
-        .key = owned_key,
-        .table = owned_table,
-        .depth = depth,
-        .distance = distance,
-        .path = path,
         .path_edges = path_edges,
         .provenance = provenance,
     };
@@ -18787,35 +18725,6 @@ fn freeRemoteGraphNodePath(alloc: std.mem.Allocator, value: []const []const u8) 
     if (value.len > 0) alloc.free(value);
 }
 
-fn cloneRemoteLegacyGraphNodePathEdges(
-    alloc: std.mem.Allocator,
-    value: []const indexes_openapi.PathEdge,
-) ![]graph_query_mod.PathEdgeInfo {
-    const edges = try alloc.alloc(graph_query_mod.PathEdgeInfo, value.len);
-    var initialized: usize = 0;
-    errdefer freeRemoteGraphNodePathEdgeItems(alloc, edges, initialized);
-    for (value, 0..) |item, i| {
-        const source = try alloc.dupe(u8, item.source orelse return error.InvalidRemoteResponse);
-        errdefer alloc.free(source);
-        const target = try alloc.dupe(u8, item.target orelse return error.InvalidRemoteResponse);
-        errdefer alloc.free(target);
-        const edge_type = try alloc.dupe(u8, item.type orelse return error.InvalidRemoteResponse);
-        errdefer alloc.free(edge_type);
-        const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
-        errdefer if (metadata.len > 0) alloc.free(metadata);
-        edges[i] = .{
-            .source = source,
-            .target = target,
-            .edge_type = edge_type,
-            .weight = item.weight orelse return error.InvalidRemoteResponse,
-            .metadata = metadata,
-        };
-        initialized += 1;
-    }
-    for (edges) |edge| graph_edge_weight.validateStored(edge.weight) catch return error.InvalidRemoteResponse;
-    return edges;
-}
-
 fn cloneRemoteCanonicalGraphNodePathEdges(
     alloc: std.mem.Allocator,
     value: []const indexes_openapi.GraphPathEdge,
@@ -18866,64 +18775,6 @@ fn freeRemoteGraphNodePathEdgeItems(
 
 fn freeRemoteGraphNodePathEdges(alloc: std.mem.Allocator, edges: []const graph_query_mod.PathEdgeInfo) void {
     freeRemoteGraphNodePathEdgeItems(alloc, edges, edges.len);
-}
-
-fn parseRemoteLegacyGraphPaths(alloc: std.mem.Allocator, value: []const indexes_openapi.Path) ![]graph_paths.Path {
-    if (value.len > public_limits.max_graph_result_items)
-        return error.InvalidRemoteResponse;
-    const paths = try alloc.alloc(graph_paths.Path, value.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (paths[0..initialized]) |path| graph_paths.freePath(alloc, path);
-        alloc.free(paths);
-    }
-    for (value, 0..) |item, i| {
-        const wire_nodes = item.nodes orelse return error.InvalidRemoteResponse;
-        const wire_edges = item.edges orelse return error.InvalidRemoteResponse;
-        const wire_length = item.length orelse return error.InvalidRemoteResponse;
-        const length = std.math.cast(u32, wire_length) orelse return error.InvalidRemoteResponse;
-        if (wire_nodes.len == 0 or wire_nodes.len > graph_pattern_mod.max_pattern_hops + 1 or
-            wire_edges.len + 1 != wire_nodes.len or length != wire_edges.len)
-            return error.InvalidRemoteResponse;
-        for (wire_nodes) |node| if (node.len == 0) return error.InvalidRemoteResponse;
-        const total_weight = item.total_weight orelse return error.InvalidRemoteResponse;
-        if (!std.math.isFinite(total_weight) or total_weight < 0) return error.InvalidRemoteResponse;
-        var weight_sum: f64 = 0;
-        for (wire_edges, 0..) |edge, edge_index| {
-            const source = edge.source orelse return error.InvalidRemoteResponse;
-            const target = edge.target orelse return error.InvalidRemoteResponse;
-            const edge_type = edge.type orelse return error.InvalidRemoteResponse;
-            const weight = edge.weight orelse return error.InvalidRemoteResponse;
-            if (source.len == 0 or target.len == 0 or edge_type.len == 0 or
-                !std.mem.eql(u8, source, wire_nodes[edge_index]) or
-                !std.mem.eql(u8, target, wire_nodes[edge_index + 1]))
-                return error.InvalidRemoteResponse;
-            graph_edge_weight.validateStored(weight) catch return error.InvalidRemoteResponse;
-            weight_sum += weight;
-            if (!std.math.isFinite(weight_sum)) return error.InvalidRemoteResponse;
-        }
-        if (!graphPathScoreEql(total_weight, weight_sum)) return error.InvalidRemoteResponse;
-        const nodes = try cloneRemoteGraphNodePath(alloc, wire_nodes);
-        errdefer freeRemoteGraphNodePath(alloc, nodes);
-        const edges = try parseRemotePathEdges(alloc, wire_edges);
-        errdefer {
-            for (edges) |edge| {
-                alloc.free(edge.source);
-                alloc.free(edge.target);
-                alloc.free(edge.edge_type);
-                if (edge.metadata.len > 0) alloc.free(edge.metadata);
-            }
-            if (edges.len > 0) alloc.free(edges);
-        }
-        paths[i] = .{
-            .nodes = nodes,
-            .edges = edges,
-            .total_weight = total_weight,
-            .length = length,
-        };
-        initialized += 1;
-    }
-    return paths;
 }
 
 fn parseRemoteCanonicalGraphPaths(
@@ -19052,49 +18903,6 @@ fn graphPathScoreEql(left: f64, right: f64) bool {
     if (!std.math.isFinite(left) or !std.math.isFinite(right)) return false;
     const scale = @max(@as(f64, 1), @max(@abs(left), @abs(right)));
     return @abs(left - right) <= 1e-12 * scale;
-}
-
-fn parseRemotePathEdges(alloc: std.mem.Allocator, value: []const indexes_openapi.PathEdge) ![]graph_paths.PathEdge {
-    const edges = try alloc.alloc(graph_paths.PathEdge, value.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (edges[0..initialized]) |edge| {
-            alloc.free(edge.source);
-            alloc.free(edge.target);
-            alloc.free(edge.edge_type);
-            if (edge.metadata.len > 0) alloc.free(edge.metadata);
-        }
-        if (edges.len > 0) alloc.free(edges);
-    }
-    for (value, 0..) |item, i| {
-        const source_value = item.source orelse return error.InvalidRemoteResponse;
-        const target_value = item.target orelse return error.InvalidRemoteResponse;
-        const edge_type_value = item.type orelse return error.InvalidRemoteResponse;
-        const weight = item.weight orelse return error.InvalidRemoteResponse;
-        if (source_value.len == 0 or target_value.len == 0 or edge_type_value.len == 0)
-            return error.InvalidRemoteResponse;
-        graph_edge_weight.validateStored(weight) catch return error.InvalidRemoteResponse;
-        const source = try alloc.dupe(u8, source_value);
-        errdefer alloc.free(source);
-        const target = try alloc.dupe(u8, target_value);
-        errdefer alloc.free(target);
-        const edge_type = try alloc.dupe(u8, edge_type_value);
-        errdefer alloc.free(edge_type);
-        const metadata = if (item.metadata) |metadata_value|
-            try std.json.Stringify.valueAlloc(alloc, metadata_value, .{})
-        else
-            "";
-        errdefer if (metadata.len > 0) alloc.free(metadata);
-        edges[i] = .{
-            .source = source,
-            .target = target,
-            .edge_type = edge_type,
-            .weight = weight,
-            .metadata = metadata,
-        };
-        initialized += 1;
-    }
-    return edges;
 }
 
 fn parseRemoteCanonicalPathEdges(
@@ -19241,39 +19049,6 @@ test "remote canonical graph result stats and aggregate exactness fail closed" {
     try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteSearchResult(alloc,
         \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"path":{"kind":"paths","paths":[{"path":{"nodes":[{"key":"a"},{"key":"b","table":"entities"}],"edges":[{"from":{"key":"a"},"to":{"key":"wrong","table":"entities"},"direction":"out","type":"related","weight":1}],"objective":"min_hops","weight_sum":1,"objective_value":1,"length":1}}],"stats":{"returned_items":1,"truncated":false}}},"took":0,"status":200,"table":"docs"}]}
     ));
-}
-
-test "remote legacy graph results preserve opaque operation names" {
-    const alloc = std.testing.allocator;
-    var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":{"value":0,"relation":"exact"},"hits":[]},"graph_results":{"$legacy":{"type":"neighbors","total":0}},"took":0,"status":200,"table":"docs"}]}
-    );
-    defer result.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
-    try std.testing.expectEqualStrings("$legacy", result.graph_results[0].name);
-}
-
-test "remote legacy graph paths require contiguous identities and exact weight sums" {
-    const alloc = std.testing.allocator;
-    const nodes = [_][]const u8{ "a", "b" };
-    var edges = [_]indexes_openapi.PathEdge{.{
-        .source = "a",
-        .target = "wrong",
-        .type = "related",
-        .weight = 0.5,
-    }};
-    var paths = [_]indexes_openapi.Path{.{
-        .nodes = &nodes,
-        .edges = &edges,
-        .total_weight = 0.5,
-        .length = 1,
-    }};
-    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteLegacyGraphPaths(alloc, &paths));
-
-    edges[0].target = "b";
-    paths[0].total_weight = 0.25;
-    try std.testing.expectError(error.InvalidRemoteResponse, parseRemoteLegacyGraphPaths(alloc, &paths));
 }
 
 test "remote canonical graph paths reject impossible shapes and weight domains" {

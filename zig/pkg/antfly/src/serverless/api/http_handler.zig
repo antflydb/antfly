@@ -6066,6 +6066,17 @@ const ServerlessPatternEdgeReader = struct {
         return if (std.mem.eql(u8, value, self.source_table)) null else value;
     }
 
+    /// Serverless artifacts contain exactly one physical source table. Perform
+    /// this check before streaming any half of a split cross-table traversal.
+    pub fn validatePatternSourceTable(
+        self: @This(),
+        table: ?[]const u8,
+        _: bool,
+    ) !void {
+        if (self.canonicalizeTable(table) != null)
+            return error.GraphExternalAliasSourceUnsupported;
+    }
+
     pub fn getEdges(
         self: @This(),
         alloc: Allocator,
@@ -6083,13 +6094,6 @@ const ServerlessPatternEdgeReader = struct {
             graph_pattern_mod.default_max_explored_edges,
             graph_pattern_mod.default_max_explored_edge_bytes,
         );
-    }
-
-    /// A published serverless artifact contains only one source table, so it
-    /// cannot prove completeness when a reversed variable-length edge may have
-    /// unnamed intermediate sources in another table.
-    pub fn supportsReverseVariablePaths(_: @This()) bool {
-        return false;
     }
 
     pub fn getEdgesBounded(

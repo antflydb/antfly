@@ -1820,14 +1820,6 @@ const DistributedEdgeReader = struct {
         return canonicalGraphNodeTable(self.source_table, table);
     }
 
-    /// Incoming adjacency is routed by its declared physical source table.
-    /// For a reversed variable-length edge, unnamed intermediate sources have
-    /// no table declaration, so consulting only that endpoint table cannot
-    /// prove a complete result across the catalog.
-    pub fn supportsReverseVariablePaths(_: @This()) bool {
-        return false;
-    }
-
     pub fn getEdges(
         self: @This(),
         a: std.mem.Allocator,
@@ -1850,6 +1842,21 @@ const DistributedEdgeReader = struct {
             => error.QueryCandidateBudgetExceeded,
             else => err,
         };
+    }
+
+    /// Validate every physical source domain before a bounded matcher can fill
+    /// its output sink. This prevents a cross-table `both` query from returning
+    /// only its outgoing half when the incoming source lacks a graph index.
+    pub fn validatePatternSourceTable(
+        self: @This(),
+        table: ?[]const u8,
+        _: bool,
+    ) !void {
+        const table_name = table orelse self.source_table;
+        const table_state = try self.admission.ensureTable(table_name);
+        if (!table_state.allowed) return;
+        if (!(try self.admission.graphIndexAvailable(table_state, self.index_name)))
+            return error.UnsupportedQueryRequest;
     }
 
     pub fn getEdgesBounded(

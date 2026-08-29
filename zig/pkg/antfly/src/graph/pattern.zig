@@ -65,11 +65,22 @@ pub const PatternEdgeStep = struct {
     min_weight: ?f64 = null,
     max_weight: ?f64 = null,
     types: []const []const u8 = &.{},
-    /// Execution-only source-table hint installed when a conjunctive edge is
-    /// expanded in reverse from its bound target. The boolean distinguishes a
-    /// declared query-table alias (null) from the absence of an override.
-    reverse_from_declared_alias: bool = false,
-    reverse_source_table: ?[]const u8 = null,
+};
+
+/// A table declaration needs an outer optional because null is itself the
+/// canonical spelling of the queried table. Keeping physical routing out of
+/// PatternEdgeStep prevents planner state from leaking into the public AST.
+const DeclaredTableRoute = struct {
+    table: ?[]const u8,
+};
+
+/// One physically oriented adjacency read. Cross-table `both` expands to an
+/// outgoing read from the bound node's table and an incoming read from the
+/// opposite alias's declared source table. For an incoming read, the physical
+/// source table is also the table of the reached node.
+const PhysicalEdgeTraversal = struct {
+    step: PatternEdgeStep,
+    incoming_source: ?DeclaredTableRoute = null,
 };
 
 pub const PatternStep = struct {
@@ -808,7 +819,7 @@ pub fn matchPatternFromRefsWithEdgeReader(
                 edge_reader,
                 current_binding.key,
                 current_binding.table,
-                step.edge,
+                .{ .step = step.edge },
                 step.node_filter,
                 if (step_idx + 1 == pattern.len) opts.target_nodes else &.{},
                 step_idx + 1 == pattern.len and opts.target_required,
@@ -1138,7 +1149,7 @@ fn findReachableNodes(
     edge_reader: anytype,
     start_key: []const u8,
     start_table: ?[]const u8,
-    edge: PatternEdgeStep,
+    traversal: PhysicalEdgeTraversal,
     node_filter: NodeFilter,
     target_nodes: []const node_identity.Ref,
     target_required: bool,
@@ -1175,7 +1186,7 @@ fn findReachableNodes(
         edge_reader,
         start_key,
         start_table,
-        edge,
+        traversal,
         node_filter,
         target_nodes,
         target_required,
@@ -1195,7 +1206,7 @@ fn streamReachableNodes(
     edge_reader: anytype,
     start_key: []const u8,
     start_table: ?[]const u8,
-    edge: PatternEdgeStep,
+    traversal: PhysicalEdgeTraversal,
     node_filter: NodeFilter,
     target_nodes: []const node_identity.Ref,
     target_required: bool,
@@ -1207,6 +1218,7 @@ fn streamReachableNodes(
     work_budget: *WorkBudget,
     observer: ReachableObserver,
 ) !void {
+    const edge = traversal.step;
     const min_hops = if (edge.min_hops == 0) @as(u32, 1) else edge.min_hops;
     const max_hops = if (edge.max_hops == 0) @as(u32, 1) else edge.max_hops;
     // A fixed relationship is not a variable-length path: a physical
@@ -1214,12 +1226,11 @@ fn streamReachableNodes(
     // expansion remains node-simple, apart from an explicit already-bound
     // cycle target.
     const fixed_single_hop = min_hops == 1 and max_hops == 1;
-    if (edge.reverse_from_declared_alias and max_hops > 1) {
-        if (comptime @hasDecl(@TypeOf(edge_reader), "supportsReverseVariablePaths")) {
-            if (!edge_reader.supportsReverseVariablePaths())
-                return error.GraphReverseVariablePathUnsupported;
-        }
-    }
+    // The endpoint declaration determines only the first incoming source
+    // table. Unnamed intermediate sources may live anywhere in the catalog, so
+    // a cross-table reverse variable path cannot be proven from this plan.
+    if (traversal.incoming_source != null and max_hops > 1)
+        return error.GraphReverseVariablePathUnsupported;
     var ancestry = ReachabilityAncestry.init(alloc, work_budget);
     defer ancestry.deinit();
     var current = std.ArrayListUnmanaged(Frontier).empty;
@@ -1246,12 +1257,12 @@ fn streamReachableNodes(
             const edges = try getEdgesForBudget(
                 alloc,
                 edge_reader,
-                if (edge.reverse_from_declared_alias) edge.reverse_source_table else frontier.table,
+                if (traversal.incoming_source) |source| source.table else frontier.table,
                 frontier.key,
                 edge.types,
                 edge.direction,
                 work_budget,
-                edge.reverse_from_declared_alias,
+                traversal.incoming_source != null,
             );
             defer edge_reader.freeEdges(alloc, edges);
             if (stats) |active| {
@@ -1278,7 +1289,7 @@ fn streamReachableNodes(
                         frontier.table,
                         graph_edge,
                         target_key,
-                        edge,
+                        traversal,
                     );
                     if (shouldRejectPathRevisit(
                         frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
@@ -1323,7 +1334,7 @@ fn streamReachableNodes(
                         frontier.table,
                         graph_edge,
                         target_key,
-                        edge,
+                        traversal,
                     );
                     if (shouldRejectPathRevisit(
                         frontierContainsNode(frontier.*, .{ .table = target_table, .key = target_key }),
@@ -1352,7 +1363,7 @@ fn streamReachableNodes(
                     frontier.table,
                     graph_edge,
                     target_key,
-                    edge,
+                    traversal,
                 );
                 const revisits_path = frontierContainsNode(
                     frontier.*,
@@ -1541,13 +1552,13 @@ fn resolvedEdgeTargetTable(
     current_table: ?[]const u8,
     graph_edge: graph_mod.Edge,
     target_key: []const u8,
-    step: PatternEdgeStep,
+    traversal: PhysicalEdgeTraversal,
 ) ?[]const u8 {
-    if (step.reverse_from_declared_alias and
-        step.direction == .in and
+    if (traversal.incoming_source != null and
+        traversal.step.direction == .in and
         std.mem.eql(u8, target_key, graph_edge.source))
     {
-        return canonicalizeNodeTable(edge_reader, step.reverse_source_table);
+        return canonicalizeNodeTable(edge_reader, traversal.incoming_source.?.table);
     }
     return canonicalEdgeTargetTable(edge_reader, current_table, graph_edge, target_key);
 }
@@ -2376,45 +2387,57 @@ fn streamConjunctiveGroup(
 
     const source = from_binding orelse to_binding.?;
     const target = if (from_binding != null) to_binding else from_binding;
-    var step = edge.step;
     const new_alias = if (from_binding != null) edge.to else edge.from;
     const new_node = findMatchNode(group_nodes, new_alias);
-    if (from_binding == null) {
-        step.direction = reverseDirection(step.direction);
-        step.reverse_from_declared_alias = true;
-        step.reverse_source_table = if (new_node) |node| node.table else null;
-    }
     const node_filter = if (new_node) |node| node.filter else NodeFilter{};
     var target_node_storage: [1]node_identity.Ref = undefined;
     const target_nodes: []const node_identity.Ref = if (target) |binding| blk: {
         target_node_storage[0] = .{ .key = binding.key, .table = binding.table };
         break :blk &target_node_storage;
     } else &.{};
+    const reached_table = if (target) |binding|
+        binding.table
+    else if (new_node) |node|
+        node.table
+    else
+        return error.InvalidArgument;
+    var traversal_storage: [2]PhysicalEdgeTraversal = undefined;
+    const traversals = try planPhysicalEdgeTraversals(
+        edge_reader,
+        edge.step,
+        from_binding != null,
+        source.table,
+        reached_table,
+        &traversal_storage,
+    );
     processed[edge_index] = true;
     defer processed[edge_index] = false;
-    try streamReachableIntoConjunctiveGroup(
-        alloc,
-        edge_reader,
-        pattern,
-        group_nodes,
-        edges,
-        predicates,
-        state,
-        processed,
-        processed_count + 1,
-        completed_optional_index,
-        optional_match_count,
-        opts,
-        work_budget,
-        sink,
-        source,
-        target != null,
-        new_alias,
-        new_node,
-        step,
-        node_filter,
-        target_nodes,
-    );
+    for (traversals) |traversal| {
+        if (sink.full()) break;
+        try streamReachableIntoConjunctiveGroup(
+            alloc,
+            edge_reader,
+            pattern,
+            group_nodes,
+            edges,
+            predicates,
+            state,
+            processed,
+            processed_count + 1,
+            completed_optional_index,
+            optional_match_count,
+            opts,
+            work_budget,
+            sink,
+            source,
+            target != null,
+            new_alias,
+            new_node,
+            traversal,
+            node_filter,
+            target_nodes,
+        );
+    }
 }
 
 fn streamReachableIntoConjunctiveGroup(
@@ -2436,7 +2459,7 @@ fn streamReachableIntoConjunctiveGroup(
     target_bound: bool,
     new_alias: []const u8,
     new_node: ?MatchNode,
-    step: PatternEdgeStep,
+    traversal: PhysicalEdgeTraversal,
     node_filter: NodeFilter,
     target_nodes: []const node_identity.Ref,
 ) !void {
@@ -2525,7 +2548,7 @@ fn streamReachableIntoConjunctiveGroup(
         edge_reader,
         source.key,
         source.table,
-        step,
+        traversal,
         node_filter,
         target_nodes,
         target_bound,
@@ -2804,48 +2827,59 @@ fn expandConjunctiveEdge(
 
     const source = from_binding orelse to_binding.?;
     const target = if (from_binding != null) to_binding else from_binding;
-    var step = edge.step;
     const new_alias = if (from_binding != null) edge.to else edge.from;
     const new_node = findMatchNode(group_nodes, new_alias);
-    if (from_binding == null) {
-        step.direction = reverseDirection(step.direction);
-        step.reverse_from_declared_alias = true;
-        step.reverse_source_table = if (new_node) |node| node.table else null;
-    }
     const node_filter = if (new_node) |node| node.filter else NodeFilter{};
     var target_node_storage: [1]node_identity.Ref = undefined;
     const target_nodes: []const node_identity.Ref = if (target) |binding| blk: {
         target_node_storage[0] = .{ .key = binding.key, .table = binding.table };
         break :blk &target_node_storage;
     } else &.{};
-    const reachable = try findReachableNodes(
-        alloc,
+    const reached_table = if (target) |binding|
+        binding.table
+    else if (new_node) |node|
+        node.table
+    else
+        return error.InvalidArgument;
+    var traversal_storage: [2]PhysicalEdgeTraversal = undefined;
+    const traversals = try planPhysicalEdgeTraversals(
         edge_reader,
-        source.key,
+        edge.step,
+        from_binding != null,
         source.table,
-        step,
-        node_filter,
-        target_nodes,
-        target != null,
-        0,
-        opts.require_complete,
-        opts.max_intermediate_states,
-        opts.evaluator,
-        opts.node_admission,
-        false,
-        opts.stats,
-        work_budget,
+        reached_table,
+        &traversal_storage,
     );
-    defer {
-        for (reachable) |*node| node.deinit(alloc);
-        if (reachable.len > 0) alloc.free(reachable);
-    }
-    for (reachable) |reached| {
-        if (new_node) |node| if (!declaredNodeTableMatches(edge_reader, reached.table, node.table)) continue;
-        var expanded = try cloneConjunctiveState(alloc, state);
-        errdefer expanded.deinit(alloc);
-        if (target == null) try appendConcreteBinding(alloc, &expanded, new_alias, reached);
-        try out.append(alloc, expanded);
+    for (traversals) |traversal| {
+        const reachable = try findReachableNodes(
+            alloc,
+            edge_reader,
+            source.key,
+            source.table,
+            traversal,
+            node_filter,
+            target_nodes,
+            target != null,
+            0,
+            opts.require_complete,
+            opts.max_intermediate_states,
+            opts.evaluator,
+            opts.node_admission,
+            false,
+            opts.stats,
+            work_budget,
+        );
+        defer {
+            for (reachable) |*node| node.deinit(alloc);
+            if (reachable.len > 0) alloc.free(reachable);
+        }
+        for (reachable) |reached| {
+            if (new_node) |node| if (!declaredNodeTableMatches(edge_reader, reached.table, node.table)) continue;
+            var expanded = try cloneConjunctiveState(alloc, state);
+            errdefer expanded.deinit(alloc);
+            if (target == null) try appendConcreteBinding(alloc, &expanded, new_alias, reached);
+            try out.append(alloc, expanded);
+        }
     }
 }
 
@@ -2868,14 +2902,89 @@ fn correlatedEdgesExist(alloc: Allocator, edge_reader: anytype, state: Conjuncti
         const from = findBinding(state.bindings, edge.from) orelse return false;
         const to = findBinding(state.bindings, edge.to) orelse return false;
         const targets = [_]node_identity.Ref{.{ .key = to.key, .table = to.table }};
-        const reachable = try findReachableNodes(alloc, edge_reader, from.key, from.table, edge.step, .{}, &targets, true, 1, false, opts.max_intermediate_states, opts.evaluator, opts.node_admission, false, opts.stats, work_budget);
-        defer {
-            for (reachable) |*node| node.deinit(alloc);
-            if (reachable.len > 0) alloc.free(reachable);
+        var traversal_storage: [2]PhysicalEdgeTraversal = undefined;
+        const traversals = try planPhysicalEdgeTraversals(
+            edge_reader,
+            edge.step,
+            true,
+            from.table,
+            to.table,
+            &traversal_storage,
+        );
+        var exists = false;
+        for (traversals) |traversal| {
+            const reachable = try findReachableNodes(alloc, edge_reader, from.key, from.table, traversal, .{}, &targets, true, 1, false, opts.max_intermediate_states, opts.evaluator, opts.node_admission, false, opts.stats, work_budget);
+            defer {
+                for (reachable) |*node| node.deinit(alloc);
+                if (reachable.len > 0) alloc.free(reachable);
+            }
+            if (reachable.len > 0) {
+                exists = true;
+                break;
+            }
         }
-        if (reachable.len == 0) return false;
+        if (!exists) return false;
     }
     return edges.len > 0;
+}
+
+/// Compile one logical MATCH edge into one or two physically routed reads.
+/// Incoming adjacency is stored with its physical source, so crossing a table
+/// boundary requires the opposite alias's table. An undirected cross-table
+/// edge spans two disjoint physical source domains and therefore needs both
+/// oriented reads; charging each read preserves the public work budgets.
+fn planPhysicalEdgeTraversals(
+    edge_reader: anytype,
+    declared_step: PatternEdgeStep,
+    starts_at_declared_from: bool,
+    start_table: ?[]const u8,
+    reached_table: ?[]const u8,
+    storage: *[2]PhysicalEdgeTraversal,
+) ![]const PhysicalEdgeTraversal {
+    var step = declared_step;
+    if (!starts_at_declared_from) step.direction = reverseDirection(step.direction);
+
+    const canonical_start = canonicalizeNodeTable(edge_reader, start_table);
+    const canonical_reached = canonicalizeNodeTable(edge_reader, reached_table);
+    var traversal_count: usize = 1;
+    if (optionalTableEql(canonical_start, canonical_reached)) {
+        storage[0] = .{ .step = step };
+    } else {
+        const max_hops = if (step.max_hops == 0) @as(u32, 1) else step.max_hops;
+        if (max_hops > 1 and step.direction != .out)
+            return error.GraphReverseVariablePathUnsupported;
+
+        switch (step.direction) {
+            .out => storage[0] = .{ .step = step },
+            .in => storage[0] = .{
+                .step = step,
+                .incoming_source = .{ .table = reached_table },
+            },
+            .both => {
+                var outgoing = step;
+                outgoing.direction = .out;
+                var incoming = step;
+                incoming.direction = .in;
+                storage[0] = .{ .step = outgoing };
+                storage[1] = .{
+                    .step = incoming,
+                    .incoming_source = .{ .table = reached_table },
+                };
+                traversal_count = 2;
+            },
+        }
+    }
+
+    const traversals = storage[0..traversal_count];
+    if (comptime @hasDecl(@TypeOf(edge_reader), "validatePatternSourceTable")) {
+        for (traversals) |traversal| {
+            try edge_reader.validatePatternSourceTable(
+                if (traversal.incoming_source) |source| source.table else start_table,
+                traversal.incoming_source != null,
+            );
+        }
+    }
+    return traversals;
 }
 
 fn reverseDirection(direction: graph_mod.EdgeDirection) graph_mod.EdgeDirection {
@@ -3426,12 +3535,8 @@ test "conjunctive reverse expansion uses the declared cross-table source alias" 
     try std.testing.expectEqualStrings("entities", matches[0].bindings[0].table.?);
 }
 
-test "reverse variable expansion fails closed when the reader cannot prove intermediate source tables" {
+test "cross-table reverse variable expansion fails closed before reading adjacency" {
     const Reader = struct {
-        pub fn supportsReverseVariablePaths(_: @This()) bool {
-            return false;
-        }
-
         pub fn getEdges(_: @This(), _: Allocator, _: ?[]const u8, _: []const u8, _: []const []const u8, _: graph_mod.EdgeDirection) ![]graph_mod.Edge {
             return error.TestUnexpectedResult;
         }
@@ -3447,12 +3552,13 @@ test "reverse variable expansion fails closed when the reader cannot prove inter
             "bound-target",
             null,
             .{
-                .types = &.{"LINKS"},
-                .direction = .in,
-                .min_hops = 1,
-                .max_hops = 2,
-                .reverse_from_declared_alias = true,
-                .reverse_source_table = "entities",
+                .step = .{
+                    .types = &.{"LINKS"},
+                    .direction = .in,
+                    .min_hops = 1,
+                    .max_hops = 2,
+                },
+                .incoming_source = .{ .table = "entities" },
             },
             .{},
             &.{},
@@ -3467,6 +3573,220 @@ test "reverse variable expansion fails closed when the reader cannot prove inter
             &work_budget,
         ),
     );
+}
+
+test "cross-table both preflights every physical source before streaming" {
+    const Reader = struct {
+        pub fn validatePatternSourceTable(_: @This(), table: ?[]const u8, incoming: bool) !void {
+            if (incoming) {
+                try std.testing.expectEqualStrings("entities", table.?);
+                return error.GraphExternalAliasSourceUnsupported;
+            }
+            try std.testing.expect(table == null);
+        }
+    };
+    var storage: [2]PhysicalEdgeTraversal = undefined;
+    try std.testing.expectError(
+        error.GraphExternalAliasSourceUnsupported,
+        planPhysicalEdgeTraversals(
+            Reader{},
+            .{ .direction = .both },
+            true,
+            null,
+            "entities",
+            &storage,
+        ),
+    );
+}
+
+test "conjunctive cross-table directions use physical source routing in every execution mode" {
+    const alloc = std.testing.allocator;
+    const Calls = struct {
+        both_out: usize = 0,
+        both_in: usize = 0,
+    };
+    const Reader = struct {
+        calls: *Calls,
+
+        pub fn canonicalizeTable(_: @This(), table: ?[]const u8) ?[]const u8 {
+            if (table) |name| if (std.mem.eql(u8, name, "docs")) return null;
+            return table;
+        }
+
+        pub fn getEdgesBoundedForPattern(
+            self: @This(),
+            a: Allocator,
+            table: ?[]const u8,
+            key: []const u8,
+            types: []const []const u8,
+            direction: graph_mod.EdgeDirection,
+            _: usize,
+            _: usize,
+            source_table_declared: bool,
+        ) ![]graph_mod.Edge {
+            if (types.len != 1) return error.TestUnexpectedResult;
+            const edge_type = types[0];
+            var edge: graph_mod.Edge = undefined;
+            if (std.mem.eql(u8, edge_type, "incoming")) {
+                try std.testing.expectEqualStrings("entities", table.?);
+                try std.testing.expectEqualStrings("post", key);
+                try std.testing.expectEqual(graph_mod.EdgeDirection.in, direction);
+                try std.testing.expect(source_table_declared);
+                edge = .{ .source = "reply", .target = "post", .edge_type = "incoming", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"docs\"}" };
+            } else if (std.mem.eql(u8, edge_type, "seed")) {
+                try std.testing.expect(table == null);
+                try std.testing.expectEqualStrings("root", key);
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, direction);
+                try std.testing.expect(!source_table_declared);
+                edge = .{ .source = "root", .target = "entity", .edge_type = "seed", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"entities\"}" };
+            } else if (std.mem.eql(u8, edge_type, "reverse_in")) {
+                try std.testing.expectEqualStrings("entities", table.?);
+                try std.testing.expectEqualStrings("entity", key);
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, direction);
+                try std.testing.expect(!source_table_declared);
+                edge = .{ .source = "entity", .target = "local", .edge_type = "reverse_in", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"docs\"}" };
+            } else if (std.mem.eql(u8, edge_type, "either")) {
+                try std.testing.expectEqualStrings("post", key);
+                switch (direction) {
+                    .out => {
+                        try std.testing.expect(table == null);
+                        try std.testing.expect(!source_table_declared);
+                        self.calls.both_out += 1;
+                        edge = .{ .source = "post", .target = "sent", .edge_type = "either", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"entities\"}" };
+                    },
+                    .in => {
+                        try std.testing.expectEqualStrings("entities", table.?);
+                        try std.testing.expect(source_table_declared);
+                        self.calls.both_in += 1;
+                        edge = .{ .source = "received", .target = "post", .edge_type = "either", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"docs\"}" };
+                    },
+                    .both => return error.TestUnexpectedResult,
+                }
+            } else if (std.mem.eql(u8, edge_type, "bind")) {
+                try std.testing.expect(table == null);
+                try std.testing.expectEqualStrings("post", key);
+                try std.testing.expectEqual(graph_mod.EdgeDirection.out, direction);
+                edge = .{ .source = "post", .target = "reply", .edge_type = "bind", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"entities\"}" };
+            } else if (std.mem.eql(u8, edge_type, "blocks")) {
+                try std.testing.expectEqualStrings("entities", table.?);
+                try std.testing.expectEqualStrings("post", key);
+                try std.testing.expectEqual(graph_mod.EdgeDirection.in, direction);
+                try std.testing.expect(source_table_declared);
+                edge = .{ .source = "reply", .target = "post", .edge_type = "blocks", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "{\"target_table\":\"docs\"}" };
+            } else return error.TestUnexpectedResult;
+
+            const result = try a.alloc(graph_mod.Edge, 1);
+            result[0] = edge;
+            return result;
+        }
+
+        pub fn freeEdges(_: @This(), a: Allocator, edges: []graph_mod.Edge) void {
+            a.free(edges);
+        }
+    };
+
+    var calls = Calls{};
+    const reader = Reader{ .calls = &calls };
+
+    const incoming_nodes = [_]MatchNode{
+        .{ .alias = "post" },
+        .{ .alias = "reply", .table = "entities" },
+    };
+    const incoming_edges = [_]MatchEdge{.{
+        .from = "post",
+        .to = "reply",
+        .step = .{ .direction = .in, .types = &.{"incoming"} },
+    }};
+    const incoming_pattern = ConjunctivePattern{
+        .anchor_alias = "post",
+        .nodes = &incoming_nodes,
+        .edges = &incoming_edges,
+    };
+    const incoming_matches = try matchConjunctivePatternWithEdgeReader(
+        alloc,
+        reader,
+        &.{"post"},
+        incoming_pattern,
+        .{ .max_results = 1, .return_aliases = &.{"reply"} },
+    );
+    defer freeMatches(alloc, incoming_matches);
+    try std.testing.expectEqual(@as(usize, 1), incoming_matches.len);
+    try std.testing.expectEqualStrings("reply", incoming_matches[0].bindings[0].key);
+    try std.testing.expectEqualStrings("entities", incoming_matches[0].bindings[0].table.?);
+
+    const count_specs = [_]CountAggregateSpec{.{}};
+    const incoming_counts = try aggregateConjunctivePatternWithEdgeReader(
+        alloc,
+        reader,
+        &.{"post"},
+        incoming_pattern,
+        &count_specs,
+        .{},
+    );
+    defer {
+        for (incoming_counts) |*result| result.deinit(alloc);
+        alloc.free(incoming_counts);
+    }
+    try std.testing.expectEqual(@as(u128, 1), incoming_counts[0].value);
+
+    const reverse_nodes = [_]MatchNode{
+        .{ .alias = "root" },
+        .{ .alias = "entity", .table = "entities" },
+        .{ .alias = "local" },
+    };
+    const reverse_edges = [_]MatchEdge{
+        .{ .from = "root", .to = "entity", .step = .{ .types = &.{"seed"} } },
+        .{ .from = "local", .to = "entity", .step = .{ .direction = .in, .types = &.{"reverse_in"} } },
+    };
+    const reverse_matches = try matchConjunctivePatternWithEdgeReader(
+        alloc,
+        reader,
+        &.{"root"},
+        .{ .anchor_alias = "root", .nodes = &reverse_nodes, .edges = &reverse_edges },
+        .{ .max_results = 1, .return_aliases = &.{"local"} },
+    );
+    defer freeMatches(alloc, reverse_matches);
+    try std.testing.expectEqual(@as(usize, 1), reverse_matches.len);
+    try std.testing.expectEqualStrings("local", reverse_matches[0].bindings[0].key);
+    try std.testing.expect(reverse_matches[0].bindings[0].table == null);
+
+    const both_edges = [_]MatchEdge{.{
+        .from = "post",
+        .to = "reply",
+        .step = .{ .direction = .both, .types = &.{"either"} },
+    }};
+    const both_matches = try matchConjunctivePatternWithEdgeReader(
+        alloc,
+        reader,
+        &.{"post"},
+        .{ .anchor_alias = "post", .nodes = &incoming_nodes, .edges = &both_edges },
+        .{ .max_results = 10, .return_aliases = &.{"reply"} },
+    );
+    defer freeMatches(alloc, both_matches);
+    try std.testing.expectEqual(@as(usize, 2), both_matches.len);
+    try std.testing.expectEqual(@as(usize, 1), calls.both_out);
+    try std.testing.expectEqual(@as(usize, 1), calls.both_in);
+
+    const required_edges = [_]MatchEdge{.{
+        .from = "post",
+        .to = "reply",
+        .step = .{ .types = &.{"bind"} },
+    }};
+    const negative_edges = [_]MatchEdge{.{
+        .from = "post",
+        .to = "reply",
+        .step = .{ .direction = .in, .types = &.{"blocks"} },
+    }};
+    const predicates = [_]MatchPredicate{.{ .not_exists = &negative_edges }};
+    const anti_matches = try matchConjunctivePatternWithEdgeReader(
+        alloc,
+        reader,
+        &.{"post"},
+        .{ .anchor_alias = "post", .nodes = &incoming_nodes, .edges = &required_edges, .predicates = &predicates },
+        .{ .max_results = 10 },
+    );
+    defer freeMatches(alloc, anti_matches);
+    try std.testing.expectEqual(@as(usize, 0), anti_matches.len);
 }
 
 test "conjunctive fixed edges preserve self loops while variable paths remain node simple" {

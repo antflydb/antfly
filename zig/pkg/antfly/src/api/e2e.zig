@@ -1267,7 +1267,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     try std.testing.expect(count_profile_result.profile != null);
     try std.testing.expect(count_profile_result.took >= 0);
     try std.testing.expectEqual(@as(i64, 1), count_profile_result.profile.?.object.get("shards").?.object.get("total").?.integer);
-    try std.testing.expectEqual(std.json.Value.null, count_profile_result.profile.?.object.get("merge").?);
+    try ant_json.testing.expectObjectFieldAbsent(count_profile_result.profile.?, "merge");
 
     const delete_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator, "{\"deletes\":[\"doc:a\",\"doc:c\"]}");
     defer std.testing.allocator.free(delete_body);
