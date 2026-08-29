@@ -9,14 +9,16 @@
 const std = @import("std");
 const vopr = @import("vopr");
 const data_runtime = @import("../data/runtime.zig");
+const distributed_graph = @import("../api/distributed_graph.zig");
 const metadata_sim = @import("../metadata/sim_harness.zig");
 const production_cluster = @import("production_cluster.zig");
 const serverless_workflow = @import("serverless_workflow.zig");
+const serverless_runtime = @import("../serverless/runtime/manager.zig");
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 22;
+    pub const version: u32 = 23;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -32,6 +34,7 @@ pub const Scenario = struct {
     const production_durable_join_takeover_id = vopr.id.stable(name, "public-durable-shuffle-finalizer-takeover");
     const production_overlapping_faults_id = vopr.id.stable(name, "production-graph-overlapping-link-resource-faults-recover");
     const production_socket_pressure_id = vopr.id.stable(name, "production-listener-socket-pressure-recovers-during-split");
+    const production_service_rate_id = vopr.id.stable(name, "production-service-rates-compose-and-heal");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
     const graph_topology_id = vopr.id.stable(name, "public-graph-topology-churn-fails-closed");
     const graph_partial_id = vopr.id.stable(name, "public-graph-partial-result-rejected");
@@ -60,6 +63,7 @@ pub const Scenario = struct {
         .{ .id = production_durable_join_takeover_id, .name = name ++ ".public-durable-shuffle-finalizer-takeover", .kind = .always },
         .{ .id = production_overlapping_faults_id, .name = name ++ ".production-graph-overlapping-link-resource-faults-recover", .kind = .always },
         .{ .id = production_socket_pressure_id, .name = name ++ ".production-listener-socket-pressure-recovers-during-split", .kind = .always },
+        .{ .id = production_service_rate_id, .name = name ++ ".production-service-rates-compose-and-heal", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
         .{ .id = graph_topology_id, .name = name ++ ".public-graph-topology-churn-fails-closed", .kind = .always },
         .{ .id = graph_partial_id, .name = name ++ ".public-graph-partial-result-rejected", .kind = .always },
@@ -97,6 +101,7 @@ pub const Scenario = struct {
         production_data_plane_durable_join_takeover,
         production_data_plane_graph_split_overlapping_faults,
         production_data_plane_graph_split_socket_pressure,
+        production_data_plane_service_rate,
 
         fn isProduction(self: Mode) bool {
             return self == .production_data_plane_baseline or
@@ -110,12 +115,13 @@ pub const Scenario = struct {
                 self == .production_data_plane_join_split or
                 self == .production_data_plane_durable_join_takeover or
                 self == .production_data_plane_graph_split_overlapping_faults or
-                self == .production_data_plane_graph_split_socket_pressure;
+                self == .production_data_plane_graph_split_socket_pressure or
+                self == .production_data_plane_service_rate;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -155,6 +161,7 @@ pub const Scenario = struct {
         vopr.id.stable(name, "production-data-plane-durable-join-takeover"),
         vopr.id.stable(name, "production-data-plane-graph-split-overlapping-faults"),
         vopr.id.stable(name, "production-data-plane-graph-split-socket-pressure"),
+        vopr.id.stable(name, "production-data-plane-service-rate"),
     };
     const mode_names = [_][]const u8{
         name ++ ".clean",
@@ -178,6 +185,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-durable-join-takeover",
         name ++ ".production-data-plane-graph-split-overlapping-faults",
         name ++ ".production-data-plane-graph-split-socket-pressure",
+        name ++ ".production-data-plane-service-rate",
     };
 
     const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
@@ -192,6 +200,7 @@ pub const Scenario = struct {
     const production_durable_join_takeover_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_takeover);
     const production_graph_split_overlapping_faults_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_overlapping_faults);
     const production_graph_split_socket_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_socket_pressure);
+    const production_service_rate_ordinal: usize = @intFromEnum(Mode.production_data_plane_service_rate);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -312,10 +321,131 @@ pub const Scenario = struct {
         graph_partial_rejected_sound: bool = false,
     };
 
+    const raft_operation = vopr.service_rate.Operation.named(name ++ ".raft-round", 10);
+    const lsm_operation = vopr.service_rate.Operation.named(name ++ ".lsm-maintenance", 20);
+    const graph_expand_operation = vopr.service_rate.Operation.named(name ++ ".graph-expand", 30);
+    const graph_hydrate_operation = vopr.service_rate.Operation.named(name ++ ".graph-hydrate", 40);
+    const graph_edges_operation = vopr.service_rate.Operation.named(name ++ ".graph-edges", 50);
+    const publish_operation = vopr.service_rate.Operation.named(name ++ ".serverless-publish", 60);
+    const enrichment_operation = vopr.service_rate.Operation.named(name ++ ".serverless-enrichment", 70);
+    const compaction_operation = vopr.service_rate.Operation.named(name ++ ".serverless-compaction", 80);
+    const prune_operation = vopr.service_rate.Operation.named(name ++ ".serverless-prune", 90);
+    const service_nodes = [_]vopr.service_rate.Node{
+        .{ .id = deployment_node_ids[0], .name = name ++ ".node.1" },
+        .{ .id = deployment_node_ids[1], .name = name ++ ".node.2" },
+        .{ .id = deployment_node_ids[2], .name = name ++ ".node.3" },
+        .{ .id = deployment_node_ids[3], .name = name ++ ".node.serverless" },
+    };
+    const service_operations = [_]vopr.service_rate.Operation{
+        raft_operation,
+        lsm_operation,
+        graph_expand_operation,
+        graph_hydrate_operation,
+        graph_edges_operation,
+        publish_operation,
+        enrichment_operation,
+        compaction_operation,
+        prune_operation,
+    };
+
+    const CostAccounting = struct {
+        pre_heal_units: u64 = 0,
+        post_heal_units: u64 = 0,
+        sound: bool = true,
+
+        fn record(self: *@This(), healed: bool, base_cost_ns: u64, units: u64, charged_ns: u64) void {
+            var expected = std.math.mul(u64, base_cost_ns, units) catch {
+                self.sound = false;
+                return;
+            };
+            if (!healed) expected = std.math.mul(u64, expected, 2) catch {
+                self.sound = false;
+                return;
+            };
+            self.sound = self.sound and charged_ns == expected;
+            if (healed)
+                self.post_heal_units +|= units
+            else
+                self.pre_heal_units +|= units;
+        }
+    };
+
+    const DataServiceRateAdapter = struct {
+        port: vopr.service_rate.Port,
+        healed: *const bool,
+        accounting: CostAccounting = .{},
+
+        fn iface(self: *@This()) data_runtime.DataServerWorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, kind: data_runtime.DataServerWorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const was_healed = self.healed.*;
+            const operation = switch (kind) {
+                .raft_round => raft_operation,
+                .lsm_maintenance_step => lsm_operation,
+            };
+            const charged = try self.port.charge(operation.id, units);
+            self.accounting.record(was_healed, operation.base_cost_ns, units, charged);
+        }
+    };
+
+    const GraphServiceRateAdapter = struct {
+        port: vopr.service_rate.Port,
+        healed: *const bool,
+        accounting: CostAccounting = .{},
+
+        fn iface(self: *@This()) distributed_graph.WorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, _: u64, kind: distributed_graph.WorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const was_healed = self.healed.*;
+            const operation = switch (kind) {
+                .expand => graph_expand_operation,
+                .hydrate => graph_hydrate_operation,
+                .get_edges => graph_edges_operation,
+            };
+            const charged = try self.port.charge(operation.id, units);
+            self.accounting.record(was_healed, operation.base_cost_ns, units, charged);
+        }
+    };
+
+    const ServerlessServiceRateAdapter = struct {
+        port: vopr.service_rate.Port,
+        healed: *const bool,
+        accounting: CostAccounting = .{},
+
+        fn iface(self: *@This()) serverless_runtime.RuntimeWorkCostPort {
+            return .{ .ptr = self, .charge_fn = charge };
+        }
+
+        fn charge(ptr: *anyopaque, kind: serverless_runtime.RuntimeWorkKind, units: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const was_healed = self.healed.*;
+            const operation = switch (kind) {
+                .publish_round => publish_operation,
+                .enrichment_round => enrichment_operation,
+                .compaction_round => compaction_operation,
+                .prune_round => prune_operation,
+            };
+            const charged = try self.port.charge(operation.id, units);
+            self.accounting.record(was_healed, operation.base_cost_ns, units, charged);
+        }
+    };
+
     const State = struct {
         owner_alloc: std.mem.Allocator,
         fixture_allocator: FixtureAllocator,
         sim: vopr.vopr_io.VoprIo,
+        service_rate_model: vopr.service_rate.Model,
+        data_service_rate_adapters: [3]DataServiceRateAdapter,
+        graph_service_rate_adapters: [3]GraphServiceRateAdapter,
+        serverless_service_rate_adapter: ServerlessServiceRateAdapter,
+        service_rates_enabled: bool = false,
+        service_rates_healed: bool = false,
         public_cluster: ?*metadata_sim.VoprPublicClusterFixture = null,
         production_cluster: ?*production_cluster.Fixture = null,
         deployment: ?vopr.deployment.Composer = null,
@@ -355,6 +485,28 @@ pub const Scenario = struct {
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4655_4c4c },
             });
             errdefer self.sim.deinit();
+            self.service_rates_enabled = false;
+            self.service_rates_healed = false;
+            self.service_rate_model = try vopr.service_rate.Model.init(
+                fixture_alloc,
+                &service_nodes,
+                &service_operations,
+            );
+            errdefer self.service_rate_model.deinit();
+            for (&self.data_service_rate_adapters, &self.graph_service_rate_adapters, service_nodes[0..3]) |*data_adapter, *graph_adapter, node| {
+                data_adapter.* = .{
+                    .port = try self.service_rate_model.port(self.sim.io(), node.id),
+                    .healed = &self.service_rates_healed,
+                };
+                graph_adapter.* = .{
+                    .port = try self.service_rate_model.port(self.sim.io(), node.id),
+                    .healed = &self.service_rates_healed,
+                };
+            }
+            self.serverless_service_rate_adapter = .{
+                .port = try self.service_rate_model.port(self.sim.io(), service_nodes[3].id),
+                .healed = &self.service_rates_healed,
+            };
             self.serverless = try serverless_workflow.Scenario.Fixture.initWithVoprIo(fixture_alloc, &self.sim);
             errdefer self.serverless.deinit();
             self.mode = null;
@@ -405,6 +557,7 @@ pub const Scenario = struct {
             self.serverless.deinit();
             if (self.public_cluster) |fixture| fixture.deinit();
             if (self.production_cluster) |fixture| fixture.deinit();
+            self.service_rate_model.deinit();
             self.sim.deinit();
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
             self.owner_alloc.destroy(self);
@@ -412,6 +565,55 @@ pub const Scenario = struct {
 
         fn start(self: *State, mode: Mode) !void {
             self.mode = mode;
+        }
+
+        fn enableServiceRates(self: *State) !void {
+            self.service_rates_enabled = true;
+            self.service_rates_healed = false;
+            for (service_nodes, 0..) |node, index| try self.service_rate_model.activate(.{
+                .fault_id = vopr.id.derive(name ++ ".service-rate-slowdown", node.id, index),
+                .node_id = node.id,
+                .multiplier_ppm = 2 * vopr.service_rate.parts_per_million,
+            });
+            var data_ports: [3]data_runtime.DataServerWorkCostPort = undefined;
+            var graph_ports: [3]distributed_graph.WorkCostPort = undefined;
+            for (&data_ports, &graph_ports, &self.data_service_rate_adapters, &self.graph_service_rate_adapters) |*data_port, *graph_port, *data_adapter, *graph_adapter| {
+                data_port.* = data_adapter.iface();
+                graph_port.* = graph_adapter.iface();
+            }
+            self.production_cluster.?.setWorkCostPorts(.{
+                .data = data_ports,
+                .graph = graph_ports,
+            });
+            self.serverless.setWorkCostPort(self.serverless_service_rate_adapter.iface());
+        }
+
+        fn healServiceRates(self: *State) void {
+            if (!self.service_rates_enabled or self.service_rates_healed) return;
+            self.service_rate_model.healAll();
+            self.service_rates_healed = true;
+        }
+
+        fn serviceRatesSound(self: *const State) bool {
+            if (!self.service_rates_enabled) return true;
+            var data_pre: u64 = 0;
+            var data_post: u64 = 0;
+            var graph_post: u64 = 0;
+            var accounting_sound = self.serverless_service_rate_adapter.accounting.sound;
+            for (self.data_service_rate_adapters) |adapter| {
+                data_pre +|= adapter.accounting.pre_heal_units;
+                data_post +|= adapter.accounting.post_heal_units;
+                accounting_sound = accounting_sound and adapter.accounting.sound;
+            }
+            for (self.graph_service_rate_adapters) |adapter| {
+                graph_post +|= adapter.accounting.post_heal_units;
+                accounting_sound = accounting_sound and adapter.accounting.sound;
+            }
+            return self.service_rates_healed and
+                self.service_rate_model.activeEffectCount() == 0 and
+                data_pre > 0 and data_post > 0 and graph_post > 0 and
+                self.serverless_service_rate_adapter.accounting.pre_heal_units > 0 and
+                accounting_sound;
         }
 
         fn clusterHealth(self: *State) ?ClusterHealth {
@@ -516,6 +718,13 @@ pub const Scenario = struct {
                     self.complete = true;
                     return;
                 };
+                if (mode == .production_data_plane_service_rate) self.enableServiceRates() catch |err| {
+                    self.initialization_failed = true;
+                    self.initialization_error_code = @intFromError(err);
+                    self.initialization_done = true;
+                    self.complete = true;
+                    return;
+                };
                 self.production_cluster.?.setActiveSplitEnabled(
                     mode == .production_data_plane or
                         mode == .production_data_plane_graph_split or
@@ -529,6 +738,7 @@ pub const Scenario = struct {
                 );
                 self.production_cluster.?.setGraphEnabled(
                     mode == .production_data_plane_graph or
+                        mode == .production_data_plane_service_rate or
                         mode == .production_data_plane_graph_split or
                         mode == .production_data_plane_graph_split_transport_failure or
                         mode == .production_data_plane_graph_split_owner_restart or
@@ -626,6 +836,7 @@ pub const Scenario = struct {
             defer {
                 self.serverless.stopPublicCatalog();
                 self.serverless_done = true;
+                self.healServiceRates();
                 if (self.production_cluster) |fixture|
                     fixture.start()
                 else if (self.public_cluster) |fixture|
@@ -792,7 +1003,7 @@ pub const Scenario = struct {
                     .custom,
                     domain_id,
                 ),
-                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split => {},
+                .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_join_split, .production_data_plane_service_rate => {},
             }
         }
 
@@ -924,6 +1135,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".production-split-finalized", @intFromBool(if (production) |production_fixture| production_fixture.split_finalized else false));
         try builder.addNamed(allocator, name ++ ".production-split-published", @intFromBool(if (production) |production_fixture| production_fixture.split_published else false));
         try builder.addNamed(allocator, name ++ ".production-split-round-trip", @intFromBool(if (production) |production_fixture| production_fixture.split_sound else false));
+        try builder.addNamed(allocator, name ++ ".service-rates-enabled", @intFromBool(state.service_rates_enabled));
+        try builder.addNamed(allocator, name ++ ".service-rates-healed", @intFromBool(state.service_rates_healed));
+        try builder.addNamed(allocator, name ++ ".service-rates-sound", @intFromBool(state.serviceRatesSound()));
+        try builder.addNamed(allocator, name ++ ".service-rate-active-effects", @intCast(state.service_rate_model.activeEffectCount()));
         try builder.addNamed(allocator, name ++ ".data-hosts", if (cluster) |snapshot| @intCast(snapshot.hosts) else 0);
         try builder.addNamed(allocator, name ++ ".public-requests-ok", @intFromBool(if (cluster) |snapshot| snapshot.requests_ok else false));
         try builder.addNamed(allocator, name ++ ".write-ok", @intFromBool(if (production) |value| value.write_sound else if (fixture) |public_cluster| public_cluster.write_sound else false));
@@ -1001,6 +1216,7 @@ pub const Scenario = struct {
         const cluster = state.clusterHealth();
         const production_mode = state.mode != null and state.mode.?.isProduction();
         const production_graph_mode = state.mode == .production_data_plane_graph or
+            state.mode == .production_data_plane_service_rate or
             state.mode == .production_data_plane_graph_split or
             state.mode == .production_data_plane_graph_split_transport_failure or
             state.mode == .production_data_plane_graph_split_owner_restart or
@@ -1098,6 +1314,8 @@ pub const Scenario = struct {
                 cluster.?.socket_pressure_error_code == @intFromError(error.ProcessFdQuotaExceeded) and
                 cluster.?.socket_pressure_no_ingress and cluster.?.socket_pressure_recovered and
                 cluster.?.post_split_graph_query_ok));
+        try sink.check(allocator, production_service_rate_id, !state.complete or
+            state.mode.? != .production_data_plane_service_rate or state.serviceRatesSound());
         try sink.check(allocator, graph_restart_id, !state.complete or state.mode.? != .graph_inflight_restart or
             (cluster != null and cluster.?.graph_inflight_restart_observed and cluster.?.graph_inflight_restart_recovered and
                 cluster.?.graph_query_ok));
@@ -1177,12 +1395,14 @@ fn runExactMode(
     const production_durable_join_takeover_mode = mode_id == Scenario.mode_ids[Scenario.production_durable_join_takeover_ordinal];
     const production_graph_split_overlapping_faults_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_overlapping_faults_ordinal];
     const production_graph_split_socket_pressure_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_split_socket_pressure_ordinal];
+    const production_service_rate_mode = mode_id == Scenario.mode_ids[Scenario.production_service_rate_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
         production_split_mode or production_graph_split_mode or
         production_graph_split_transport_mode or production_graph_split_owner_restart_mode or
         production_graph_split_partial_write_mode or production_graph_split_resource_pressure_mode or
         production_join_split_mode or production_durable_join_takeover_mode or
-        production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode;
+        production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode or
+        production_service_rate_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
     // truth, while comparable scheduling ensures the experiment changes the
@@ -1197,6 +1417,8 @@ fn runExactMode(
         Scenario.production_graph_split_transport_ordinal
     else if (production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode)
         Scenario.production_graph_split_transport_ordinal
+    else if (production_service_rate_mode)
+        Scenario.production_graph_ordinal
     else
         mode_ordinal;
     var fair_choices = vopr.choice.PrefixedFairSeeded.init(&.{mode_id}, 0x4655_4c4c + schedule_ordinal);
@@ -1211,7 +1433,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_graph_split_socket_pressure_mode)
+            (if (production_service_rate_mode)
+                "full-cluster-vopr-v23-service-rate"
+            else if (production_graph_split_socket_pressure_mode)
                 "full-cluster-vopr-v22-graph-split-socket-pressure"
             else if (production_graph_split_overlapping_faults_mode)
                 "full-cluster-vopr-v21-graph-split-overlapping-faults"
@@ -1455,6 +1679,19 @@ test "full cluster production data plane graph active split socket pressure exac
         Scenario.mode_ids[ordinal],
         ordinal,
         500_000,
+        .complete,
+    );
+}
+
+test "full cluster production service rates compose heal and exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_service_rate_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        90_000,
         .complete,
     );
 }

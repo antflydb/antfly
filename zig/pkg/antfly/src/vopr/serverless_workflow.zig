@@ -759,6 +759,10 @@ pub const Scenario = struct {
             try self.run();
         }
 
+        pub fn setWorkCostPort(self: *Fixture, port: ?runtime_manager.RuntimeWorkCostPort) void {
+            self.runtime.setWorkCostPort(port);
+        }
+
         pub fn cleanWorkflowVisible(self: *const Fixture) bool {
             return self.workflowVisibleForMode(.clean);
         }

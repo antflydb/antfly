@@ -174,6 +174,11 @@ pub const Fixture = struct {
         "{\"inserts\":{\"pressure:probe\":{\"title\":\"pressure\",\"body\":\"production-owner-resource-recovery\"}},\"sync_level\":\"write\"}";
     const DataServer = data_runtime.DataServer;
 
+    pub const WorkCostPorts = struct {
+        data: [node_count]data_runtime.DataServerWorkCostPort,
+        graph: [node_count]api_distributed_graph.WorkCostPort,
+    };
+
     alloc: std.mem.Allocator,
     sim: *vopr.vopr_io.VoprIo,
     metadata: ?*metadata_sim.VoprPublicClusterFixture = null,
@@ -333,6 +338,7 @@ pub const Fixture = struct {
     graph_enabled: bool = false,
     join_enabled: bool = false,
     fault_mode: FaultMode = .clean,
+    work_cost_ports: ?WorkCostPorts = null,
 
     pub fn create(alloc: std.mem.Allocator, sim: *vopr.vopr_io.VoprIo) !*Fixture {
         const self = try alloc.create(Fixture);
@@ -365,6 +371,11 @@ pub const Fixture = struct {
     pub fn setFaultMode(self: *Fixture, mode: FaultMode) void {
         std.debug.assert(self.phase == .created);
         self.fault_mode = mode;
+    }
+
+    pub fn setWorkCostPorts(self: *Fixture, ports: WorkCostPorts) void {
+        std.debug.assert(self.phase == .created);
+        self.work_cost_ports = ports;
     }
 
     pub fn currentGraphOwnerIndex(self: *Fixture) ?usize {
@@ -611,6 +622,7 @@ pub const Fixture = struct {
             // deterministic fiber and multi-replica commits traverse the same
             // production queue/retry path as a native deployment.
             .data_raft_async_send_worker_count = 1,
+            .work_cost_port = if (self.work_cost_ports) |ports| ports.data[index] else null,
         }, &self.metadata_base_uris);
         self.data_server_live[index] = true;
         errdefer {
@@ -621,6 +633,9 @@ pub const Fixture = struct {
             .ptr = self,
             .reach_fn = observeDistributedGraphLifecycle,
         });
+        _ = self.data_servers[index].read_source.withDistributedGraphWorkCostPort(
+            if (self.work_cost_ports) |ports| ports.graph[index] else null,
+        );
         const data_raft = self.data_servers[index].data_raft orelse return error.MissingDataRaft;
         self.data_raft_listeners[index] = try raft_transport.HttpxRuntime.startAt(
             self.alloc,

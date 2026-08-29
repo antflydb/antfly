@@ -2623,6 +2623,7 @@ pub const ProvisionedTableReadSource = struct {
     /// deployment owners that need to coordinate cancellation, topology, or
     /// transport changes at an internally consistent suspension point.
     distributed_graph_lifecycle_hook: ?distributed_graph.LifecycleHook = null,
+    distributed_graph_work_cost_port: ?distributed_graph.WorkCostPort = null,
 
     const topology_read_attempt_limit: usize = 4;
 
@@ -2707,6 +2708,14 @@ pub const ProvisionedTableReadSource = struct {
         return self;
     }
 
+    pub fn withDistributedGraphWorkCostPort(
+        self: *ProvisionedTableReadSource,
+        port: ?distributed_graph.WorkCostPort,
+    ) *ProvisionedTableReadSource {
+        self.distributed_graph_work_cost_port = port;
+        return self;
+    }
+
     fn distributedInternalExecutor(self: *ProvisionedTableReadSource) http_common.RequestExecutor {
         std.debug.assert(self.distributed_executor != null);
         return .{ .ptr = self, .vtable = &.{ .execute = executeDistributedInternalRequest } };
@@ -2735,6 +2744,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.remote_content = self.remote_content;
         hosted.graph_read_barrier = self.graph_read_barrier;
         hosted.distributed_graph_lifecycle_hook = self.distributed_graph_lifecycle_hook;
+        hosted.distributed_graph_work_cost_port = self.distributed_graph_work_cost_port;
         // Preserve the production resident/admission owner for routes that
         // resolve back to this DataServer. The hosted coordinator owns route
         // selection; it must not turn a local route into an unmanaged DB open.
@@ -4307,6 +4317,7 @@ pub const HostedProvisionedTableReadSource = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     distributed_graph_lifecycle_hook: ?distributed_graph.LifecycleHook = null,
+    distributed_graph_work_cost_port: ?distributed_graph.WorkCostPort = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -4384,6 +4395,14 @@ pub const HostedProvisionedTableReadSource = struct {
         hook: ?distributed_graph.LifecycleHook,
     ) *HostedProvisionedTableReadSource {
         self.distributed_graph_lifecycle_hook = hook;
+        return self;
+    }
+
+    pub fn withDistributedGraphWorkCostPort(
+        self: *HostedProvisionedTableReadSource,
+        port: ?distributed_graph.WorkCostPort,
+    ) *HostedProvisionedTableReadSource {
+        self.distributed_graph_work_cost_port = port;
         return self;
     }
 
@@ -8368,6 +8387,7 @@ const ProvisionedGraphWorkerContext = struct {
         return .{
             .ptr = self,
             .lifecycle_hook = self.source.distributed_graph_lifecycle_hook,
+            .work_cost_port = self.source.distributed_graph_work_cost_port,
             .vtable = &.{
                 .execute_graph_expand = executeProvisionedGraphExpand,
                 .execute_graph_hydrate = executeProvisionedGraphHydrate,
@@ -8383,6 +8403,7 @@ fn hostedGraphWorker(self: *HostedProvisionedTableReadSource) distributed_graph.
     return .{
         .ptr = self,
         .lifecycle_hook = self.distributed_graph_lifecycle_hook,
+        .work_cost_port = self.distributed_graph_work_cost_port,
         .vtable = &.{
             .execute_graph_expand = executeHostedGraphExpand,
             .execute_graph_hydrate = executeHostedGraphHydrate,

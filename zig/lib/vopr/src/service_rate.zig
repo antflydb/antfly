@@ -105,6 +105,10 @@ pub const Model = struct {
         return self.usage[self.nodeIndex(node_id) orelse return error.UnknownServiceRateNode];
     }
 
+    pub fn activeEffectCount(self: *const Model) usize {
+        return self.active.items.len;
+    }
+
     fn nodeIndex(self: *const Model, node_id: ids.StableId) ?usize {
         for (self.nodes, 0..) |node, index| if (node.id == node_id) return index;
         return null;
@@ -165,11 +169,13 @@ test "node and operation slowdowns compose and heal reversibly" {
     try std.testing.expectEqual(@as(u64, 20), try model.effectiveCostNs(node.id, read.id, 2));
     try model.activate(.{ .fault_id = 101, .node_id = node.id, .multiplier_ppm = 2 * parts_per_million });
     try model.activate(.{ .fault_id = 102, .node_id = node.id, .operation_id = read.id, .multiplier_ppm = 3 * parts_per_million });
+    try std.testing.expectEqual(@as(usize, 2), model.activeEffectCount());
     try std.testing.expectEqual(@as(u64, 120), try model.effectiveCostNs(node.id, read.id, 2));
     try std.testing.expectEqual(@as(u64, 50), try model.effectiveCostNs(node.id, write.id, 1));
     try model.heal(101);
     try std.testing.expectEqual(@as(u64, 60), try model.effectiveCostNs(node.id, read.id, 2));
     try model.heal(102);
+    try std.testing.expectEqual(@as(usize, 0), model.activeEffectCount());
     try std.testing.expectEqual(@as(u64, 20), try model.effectiveCostNs(node.id, read.id, 2));
     const port = try model.port(std.testing.io, node.id);
     try std.testing.expectEqual(@as(u64, 20), try port.charge(read.id, 2));

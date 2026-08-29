@@ -7240,6 +7240,18 @@ pub fn build(b: *std.Build) void {
     );
     full_cluster_vopr_test_step.dependOn(&run_full_cluster_vopr_tests.step);
 
+    const production_cluster_service_rate_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production service rates compose heal and exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_service_rate_vopr_tests = b.addRunArtifact(production_cluster_service_rate_vopr_tests);
+    const production_cluster_service_rate_vopr_test_step = b.step(
+        "production-cluster-service-rate-vopr-test",
+        "Run composed DataServer, graph, and serverless reversible service-rate history",
+    );
+    production_cluster_service_rate_vopr_test_step.dependOn(&run_production_cluster_service_rate_vopr_tests.step);
+
     const production_cluster_baseline_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production data plane baseline exact replay"},

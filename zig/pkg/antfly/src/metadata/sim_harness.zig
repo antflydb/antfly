@@ -7478,7 +7478,7 @@ pub const VoprPublicClusterFixture = struct {
         self.raft_wire_runtimes[node_index].setTarget(
             self.cluster.cluster.node(node_index).serverRequestExecutor(),
         );
-        self.read_sources[node_index].requester =
+        self.read_sources[node_index].read_safety_barrier =
             read_gate.alreadyReadSafeBarrier();
         const restarted_node_id = self.cluster.cluster.configs[node_index].host.http.host.local_node_id;
         try self.cluster.virtual_network.registerNode(
