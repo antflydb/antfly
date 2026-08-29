@@ -31,10 +31,17 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
+const platform_clock = @import("antfly_platform").clock;
+const platform_time = @import("antfly_platform").time;
 
 pub const AppliedMetadataBatch = struct {
     commit_index: u64,
     entries_bytes: []const u8,
+};
+
+pub const CatalogProjectionSnapshot = struct {
+    tables: []metadata.TableRecord,
+    ranges: []metadata.RangeRecord,
 };
 
 pub const ExtensionMemberKey = struct {
@@ -1598,6 +1605,33 @@ pub const RaftApplyStore = struct {
             filled = i + 1;
         }
         return out;
+    }
+
+    /// Capture the table and range namespaces from one committed apply-store
+    /// revision without acquiring the outer Raft runtime lock.
+    pub fn captureCatalogProjection(
+        self: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        deadline_ns: ?u64,
+    ) !CatalogProjectionSnapshot {
+        const io = self.io_impl.io();
+        if (deadline_ns) |deadline| {
+            while (!self.apply_mutex.tryLock()) {
+                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+                platform_clock.Clock.real().sleepMs(1);
+            }
+        } else {
+            self.apply_mutex.lockUncancelable(io);
+        }
+        defer self.apply_mutex.unlock(io);
+
+        const tables = try self.listTables(alloc, group_id);
+        errdefer self.freeTables(alloc, tables);
+        return .{
+            .tables = tables,
+            .ranges = try self.listRanges(alloc, group_id),
+        };
     }
 
     pub fn freeTables(_: *RaftApplyStore, alloc: std.mem.Allocator, records: []metadata.TableRecord) void {
@@ -8345,6 +8379,37 @@ test "metadata raft apply store publishes listeners only after commit" {
     const tables = try store.listTables(std.testing.allocator, 41);
     defer store.freeTables(std.testing.allocator, tables);
     try std.testing.expectEqual(@as(usize, 0), tables.len);
+}
+
+test "metadata raft apply store catalog projection honors apply deadline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-catalog-projection-deadline", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+
+    const io = store.io_impl.io();
+    store.apply_mutex.lockUncancelable(io);
+    {
+        defer store.apply_mutex.unlock(io);
+        try std.testing.expectError(
+            error.CatalogRoutingSnapshotTimeout,
+            store.captureCatalogProjection(
+                std.testing.allocator,
+                41,
+                platform_time.monotonicNs() + std.time.ns_per_ms,
+            ),
+        );
+    }
+
+    const snapshot = try store.captureCatalogProjection(std.testing.allocator, 41, null);
+    defer store.freeTables(std.testing.allocator, snapshot.tables);
+    defer store.freeRanges(std.testing.allocator, snapshot.ranges);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.tables.len);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.ranges.len);
 }
 
 test "metadata raft apply store resolves stale store drain intent at apply time" {
