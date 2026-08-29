@@ -199,6 +199,9 @@ from .edge_type_config_topology import EdgeTypeConfigTopology
 from .edges_response import EdgesResponse
 from .embedder_config import EmbedderConfig
 from .embedder_provider import EmbedderProvider
+from .embedding_index_activity import EmbeddingIndexActivity
+from .embedding_index_activity_phase import EmbeddingIndexActivityPhase
+from .embedding_source_coverage_status import EmbeddingSourceCoverageStatus
 from .embedding_type_1 import EmbeddingType1
 from .embedding_type_3 import EmbeddingType3
 from .embeddings_index_config import EmbeddingsIndexConfig
@@ -376,6 +379,8 @@ from .image_url_content_part_type import ImageURLContentPartType
 from .incomplete_details import IncompleteDetails
 from .incomplete_details_reason import IncompleteDetailsReason
 from .index_execution_config import IndexExecutionConfig
+from .index_milestone_status import IndexMilestoneStatus
+from .index_milestones import IndexMilestones
 from .index_publication_policy import IndexPublicationPolicy
 from .index_readiness_state import IndexReadinessState
 from .index_readiness_status import IndexReadinessStatus
@@ -1031,6 +1036,8 @@ __all__ = (
     "EdgeTypeConfigTopology",
     "EmbedderConfig",
     "EmbedderProvider",
+    "EmbeddingIndexActivity",
+    "EmbeddingIndexActivityPhase",
     "EmbeddingsIndexConfig",
     "EmbeddingsIndexStats",
     "EmbeddingsIndexStatsAsyncIndexing",
@@ -1039,6 +1046,7 @@ __all__ = (
     "EmbeddingsIndexStatsIndexType",
     "EmbeddingsIndexStatsPromotion",
     "EmbeddingsIndexStatsResolution",
+    "EmbeddingSourceCoverageStatus",
     "EmbeddingType1",
     "EmbeddingType3",
     "EnrichmentConfig",
@@ -1208,6 +1216,8 @@ __all__ = (
     "IncompleteDetails",
     "IncompleteDetailsReason",
     "IndexExecutionConfig",
+    "IndexMilestones",
+    "IndexMilestoneStatus",
     "IndexPublicationPolicy",
     "IndexReadinessState",
     "IndexReadinessStatus",

@@ -11,12 +11,15 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.derived_coverage_status import DerivedCoverageStatus
+    from ..models.embedding_index_activity import EmbeddingIndexActivity
+    from ..models.embedding_source_coverage_status import EmbeddingSourceCoverageStatus
     from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
     from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
     from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
     from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
     from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
     from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
+    from ..models.index_milestones import IndexMilestones
     from ..models.index_readiness_status import IndexReadinessStatus
     from ..models.index_repair_status import IndexRepairStatus
 
@@ -31,6 +34,15 @@ class EmbeddingsIndexStats:
     Attributes:
         index_type (EmbeddingsIndexStatsIndexType): Discriminator for the index stats variant.
         readiness (IndexReadinessStatus | Unset):
+        incarnation (str | Unset): Opaque identity of the desired embeddings index incarnation.
+        target_revision (int | Unset):
+        published_revision (int | Unset):
+        milestones (IndexMilestones | Unset):
+        source_coverage (EmbeddingSourceCoverageStatus | Unset):
+        searchable_vectors (int | Unset): Physical vectors or sparse entries visible to queries; chunked indexes may
+            exceed source coverage.
+        activity (EmbeddingIndexActivity | Unset): Volatile index-incarnation activity. It explains motion but never
+            participates in readiness.
         error (str | Unset): Error message if stats could not be retrieved
         total_indexed (int | Unset): Number of vectors/documents in the index
         disk_usage (int | Unset): Size of the index in bytes
@@ -106,6 +118,13 @@ class EmbeddingsIndexStats:
 
     index_type: EmbeddingsIndexStatsIndexType
     readiness: IndexReadinessStatus | Unset = UNSET
+    incarnation: str | Unset = UNSET
+    target_revision: int | Unset = UNSET
+    published_revision: int | Unset = UNSET
+    milestones: IndexMilestones | Unset = UNSET
+    source_coverage: EmbeddingSourceCoverageStatus | Unset = UNSET
+    searchable_vectors: int | Unset = UNSET
+    activity: EmbeddingIndexActivity | Unset = UNSET
     error: str | Unset = UNSET
     total_indexed: int | Unset = UNSET
     disk_usage: int | Unset = UNSET
@@ -172,6 +191,26 @@ class EmbeddingsIndexStats:
         readiness: dict[str, Any] | Unset = UNSET
         if not isinstance(self.readiness, Unset):
             readiness = self.readiness.to_dict()
+
+        incarnation = self.incarnation
+
+        target_revision = self.target_revision
+
+        published_revision = self.published_revision
+
+        milestones: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.milestones, Unset):
+            milestones = self.milestones.to_dict()
+
+        source_coverage: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.source_coverage, Unset):
+            source_coverage = self.source_coverage.to_dict()
+
+        searchable_vectors = self.searchable_vectors
+
+        activity: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.activity, Unset):
+            activity = self.activity.to_dict()
 
         error = self.error
 
@@ -314,6 +353,20 @@ class EmbeddingsIndexStats:
         )
         if readiness is not UNSET:
             field_dict["readiness"] = readiness
+        if incarnation is not UNSET:
+            field_dict["incarnation"] = incarnation
+        if target_revision is not UNSET:
+            field_dict["target_revision"] = target_revision
+        if published_revision is not UNSET:
+            field_dict["published_revision"] = published_revision
+        if milestones is not UNSET:
+            field_dict["milestones"] = milestones
+        if source_coverage is not UNSET:
+            field_dict["source_coverage"] = source_coverage
+        if searchable_vectors is not UNSET:
+            field_dict["searchable_vectors"] = searchable_vectors
+        if activity is not UNSET:
+            field_dict["activity"] = activity
         if error is not UNSET:
             field_dict["error"] = error
         if total_indexed is not UNSET:
@@ -436,12 +489,15 @@ class EmbeddingsIndexStats:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.derived_coverage_status import DerivedCoverageStatus
+        from ..models.embedding_index_activity import EmbeddingIndexActivity
+        from ..models.embedding_source_coverage_status import EmbeddingSourceCoverageStatus
         from ..models.embeddings_index_stats_async_indexing import EmbeddingsIndexStatsAsyncIndexing
         from ..models.embeddings_index_stats_hbc_cache import EmbeddingsIndexStatsHbcCache
         from ..models.embeddings_index_stats_hbc_posting import EmbeddingsIndexStatsHbcPosting
         from ..models.embeddings_index_stats_promotion import EmbeddingsIndexStatsPromotion
         from ..models.embeddings_index_stats_resolution import EmbeddingsIndexStatsResolution
         from ..models.enrichment_runtime_status import EnrichmentRuntimeStatus
+        from ..models.index_milestones import IndexMilestones
         from ..models.index_readiness_status import IndexReadinessStatus
         from ..models.index_repair_status import IndexRepairStatus
 
@@ -454,6 +510,35 @@ class EmbeddingsIndexStats:
             readiness = UNSET
         else:
             readiness = IndexReadinessStatus.from_dict(_readiness)
+
+        incarnation = d.pop("incarnation", UNSET)
+
+        target_revision = d.pop("target_revision", UNSET)
+
+        published_revision = d.pop("published_revision", UNSET)
+
+        _milestones = d.pop("milestones", UNSET)
+        milestones: IndexMilestones | Unset
+        if isinstance(_milestones, Unset):
+            milestones = UNSET
+        else:
+            milestones = IndexMilestones.from_dict(_milestones)
+
+        _source_coverage = d.pop("source_coverage", UNSET)
+        source_coverage: EmbeddingSourceCoverageStatus | Unset
+        if isinstance(_source_coverage, Unset):
+            source_coverage = UNSET
+        else:
+            source_coverage = EmbeddingSourceCoverageStatus.from_dict(_source_coverage)
+
+        searchable_vectors = d.pop("searchable_vectors", UNSET)
+
+        _activity = d.pop("activity", UNSET)
+        activity: EmbeddingIndexActivity | Unset
+        if isinstance(_activity, Unset):
+            activity = UNSET
+        else:
+            activity = EmbeddingIndexActivity.from_dict(_activity)
 
         error = d.pop("error", UNSET)
 
@@ -614,6 +699,13 @@ class EmbeddingsIndexStats:
         embeddings_index_stats = cls(
             index_type=index_type,
             readiness=readiness,
+            incarnation=incarnation,
+            target_revision=target_revision,
+            published_revision=published_revision,
+            milestones=milestones,
+            source_coverage=source_coverage,
+            searchable_vectors=searchable_vectors,
+            activity=activity,
             error=error,
             total_indexed=total_indexed,
             disk_usage=disk_usage,

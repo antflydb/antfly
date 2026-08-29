@@ -9738,6 +9738,16 @@ export interface components {
             /** @description Stable, machine-readable blockers. Empty when state is ready. */
             pending_reasons: string[];
         };
+        IndexMilestoneStatus: {
+            /** @description Whether this milestone is satisfied by the observed index incarnation. */
+            reached: boolean;
+            /** @description Milestone-specific, machine-readable blockers. Empty whenever reached is true. */
+            blockers: string[];
+        };
+        IndexMilestones: {
+            queryable: components["schemas"]["IndexMilestoneStatus"];
+            complete: components["schemas"]["IndexMilestoneStatus"];
+        };
         /** @description Compact user-facing state for an automatic index repair. Detailed diagnostics are available from the admin API and metrics. */
         IndexRepairStatus: {
             /**
@@ -9760,7 +9770,16 @@ export interface components {
              * @enum {string}
              */
             index_type: "full_text";
+            /**
+             * @deprecated
+             * @description Deprecated compatibility projection. Use milestones and revision fields.
+             */
             readiness?: components["schemas"]["IndexReadinessStatus"];
+            /** Format: uint64 */
+            target_revision?: number;
+            /** Format: uint64 */
+            published_revision?: number;
+            milestones?: components["schemas"]["IndexMilestones"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -9891,6 +9910,73 @@ export interface components {
          * @enum {string}
          */
         DerivedCoverageObservationIncompleteReason: "runtime_unavailable" | "missing_group" | "unknown_group" | "remote_unknown_group" | "stale_group" | "summary_unavailable" | "config_mismatch" | "counter_mismatch";
+        EmbeddingSourceCoverageStatus: {
+            policy: components["schemas"]["DerivedCoverageStatusPolicy"];
+            /** @description Whether total and all outcome counts are exact across the expected shards. */
+            observation_complete: boolean;
+            observation_incomplete_reasons: components["schemas"]["DerivedCoverageObservationIncompleteReason"][];
+            /** @description Semantic configuration fingerprint for the observed index incarnation. */
+            config_fingerprint: string;
+            /**
+             * Format: uint64
+             * @description Source documents in scope. This is a lower bound when observation_complete is false.
+             */
+            total: number;
+            /**
+             * Format: uint64
+             * @description Sources awaiting a terminal generation decision; null when the observation is incomplete.
+             */
+            pending: number | null;
+            /**
+             * Format: uint64
+             * @description Sources that durably produced material for this index incarnation.
+             */
+            covered: number;
+            /**
+             * Format: uint64
+             * @description Sources intentionally producing no material after generation evaluated them.
+             */
+            skipped: number;
+            /**
+             * Format: uint64
+             * @description Sources whose generation reached a non-retryable failure.
+             */
+            failed: number;
+            /** @description Whether source outcomes satisfy the configured coverage policy. Replay and publication are reported independently by revisions and milestones. */
+            complete: boolean;
+            healthy: boolean;
+            degraded: boolean;
+        };
+        /** @enum {string} */
+        EmbeddingIndexActivityPhase: "preparing" | "embedding" | "publishing" | "retrying" | "idle";
+        /** @description Volatile index-incarnation activity. It explains motion but never participates in readiness. */
+        EmbeddingIndexActivity: {
+            /** @description Opaque worker-and-index-incarnation identity. Rates are valid only between samples with the same epoch. */
+            epoch: string;
+            phase: components["schemas"]["EmbeddingIndexActivityPhase"];
+            /**
+             * Format: uint64
+             * @description Chunks created for this index during the activity epoch.
+             */
+            chunks_created: number;
+            /** Format: uint64 */
+            embedding_batches_completed: number;
+            /**
+             * Format: uint64
+             * @description Embedding vectors successfully computed for this index during the activity epoch.
+             */
+            embeddings_computed: number;
+            /**
+             * Format: uint64
+             * @description Items currently submitted to an embedding provider for this index.
+             */
+            active_batch_size: number;
+            /**
+             * Format: date-time
+             * @description Completion time of the latest successful embedding batch, or null before the first batch.
+             */
+            last_progress_at: string | null;
+        };
         DerivedCoverageStatus: {
             policy: components["schemas"]["DerivedCoverageStatusPolicy"];
             /** @description Whether every expected shard contributed a fresh, configuration-compatible observation with valid outcome cardinality. */
@@ -10044,7 +10130,25 @@ export interface components {
              * @enum {string}
              */
             index_type: "embeddings";
+            /**
+             * @deprecated
+             * @description Deprecated compatibility projection. Use milestones and the explicit status dimensions.
+             */
             readiness?: components["schemas"]["IndexReadinessStatus"];
+            /** @description Opaque identity of the desired embeddings index incarnation. */
+            incarnation?: string;
+            /** Format: uint64 */
+            target_revision?: number;
+            /** Format: uint64 */
+            published_revision?: number;
+            milestones?: components["schemas"]["IndexMilestones"];
+            source_coverage?: components["schemas"]["EmbeddingSourceCoverageStatus"];
+            /**
+             * Format: uint64
+             * @description Physical vectors or sparse entries visible to queries; chunked indexes may exceed source coverage.
+             */
+            searchable_vectors?: number;
+            activity?: components["schemas"]["EmbeddingIndexActivity"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -10203,7 +10307,16 @@ export interface components {
              * @enum {string}
              */
             index_type: "graph";
+            /**
+             * @deprecated
+             * @description Deprecated compatibility projection. Use milestones and revision fields.
+             */
             readiness?: components["schemas"]["IndexReadinessStatus"];
+            /** Format: uint64 */
+            target_revision?: number;
+            /** Format: uint64 */
+            published_revision?: number;
+            milestones?: components["schemas"]["IndexMilestones"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**
@@ -10347,7 +10460,16 @@ export interface components {
              * @enum {string}
              */
             index_type: "algebraic";
+            /**
+             * @deprecated
+             * @description Deprecated compatibility projection. Use milestones and revision fields.
+             */
             readiness?: components["schemas"]["IndexReadinessStatus"];
+            /** Format: uint64 */
+            target_revision?: number;
+            /** Format: uint64 */
+            published_revision?: number;
+            milestones?: components["schemas"]["IndexMilestones"];
             /** @description Error message if stats could not be retrieved */
             error?: string;
             /**

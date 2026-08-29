@@ -11493,8 +11493,7 @@ pub const DataServer = struct {
         var snapshot = try remote_metadata.fetchSnapshot();
         defer freeAdminSnapshotOwned(self.alloc, &snapshot);
         const reporter_incarnation = try self.reporterIncarnation();
-        if (snapshot.status.runtime_status_protocol_ready_version >=
-            metadata_runtime_status_protocol.current_record_version and
+        if (runtimeStatusReadyForStoreRegistration(snapshot.status.runtime_status_protocol_ready_version) and
             (!storeReporterIncarnationVisible(
                 snapshot.stores,
                 registration.store_id,
@@ -11504,10 +11503,9 @@ pub const DataServer = struct {
                 registration.store_id,
             )))
         {
-            // A process that registered while v13 was still rolling out has a
-            // legacy zero-incarnation record. Re-register once activation is
-            // durable so it gains causal authority without churning status
-            // records throughout the mixed-version window.
+            // A process that registered before the V14 native-restore boundary
+            // has an incomplete record. Re-register as soon as that mandatory
+            // boundary is safe; optional V15 activity must not delay it.
             self.store_registration_confirmed = false;
             try self.registerNodeIfConfigured();
         }
@@ -17072,6 +17070,10 @@ fn storeNativeGenerationRestoreCapabilityVisible(
     return false;
 }
 
+fn runtimeStatusReadyForStoreRegistration(ready_version: u16) bool {
+    return ready_version >= metadata_runtime_status_protocol.native_restore_identity_record_version;
+}
+
 test "data store registration waits for native generation capability acknowledgment" {
     const expected = antfly.metadata.table_manager.StoreRecord{
         .store_id = 101,
@@ -17088,6 +17090,9 @@ test "data store registration waits for native generation capability acknowledgm
     committed.native_generation_restore_version = antfly.metadata.table_manager.native_generation_restore_protocol_version;
     try std.testing.expect(storeRegistrationVisible(&.{committed}, expected));
     try std.testing.expect(storeNativeGenerationRestoreCapabilityVisible(&.{committed}, expected.store_id));
+    try std.testing.expect(!runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.repair_status_record_version));
+    try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.native_restore_identity_record_version));
+    try std.testing.expect(runtimeStatusReadyForStoreRegistration(metadata_runtime_status_protocol.embedding_activity_record_version));
 }
 
 fn findRangeByGroupId(

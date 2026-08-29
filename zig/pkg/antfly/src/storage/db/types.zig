@@ -2156,8 +2156,12 @@ pub const EnrichmentStats = struct {
 /// whenever the owning enrichment runtime is recreated.
 pub const EmbeddingActivityStats = struct {
     epoch: u64 = 0,
-    // Internal incarnation fence. API encoders expose only `epoch`.
+    // Internal incarnation fence. API encoders omit internal fence fields.
     index_generation: u64 = 0,
+    // Internal ownership fence. A failed supervised provider batch records
+    // its exact failure identity here; only the worker supervisor may promote
+    // that candidate to the public `retrying` state.
+    retry_fingerprint: u64 = 0,
     chunks_created: u64 = 0,
     embedding_batches_completed: u64 = 0,
     embeddings_computed: u64 = 0,

@@ -546,24 +546,60 @@ fn indexEmbeddingActivityPtrAssumeLocked(runtime: *EnrichmentRuntime, index_name
     return result.value_ptr;
 }
 
-fn noteIndexEmbedBatchStartedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize) void {
+const EmbeddingWorkOwner = enum {
+    supervised_replay,
+    synchronous_request,
+};
+
+fn noteIndexEmbedBatchStartedAssumeLocked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    items: usize,
+    owner: EmbeddingWorkOwner,
+) void {
     for (index_names) |index_name| {
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
         activity.active_batch_size +|= @intCast(items);
-        activity.retrying = false;
+        if (owner == .supervised_replay) {
+            activity.retrying = false;
+            activity.retry_fingerprint = runtime.active_failure_fingerprint;
+        }
     }
 }
 
-fn noteIndexEmbedBatchFinishedAssumeLocked(runtime: *EnrichmentRuntime, index_names: []const []const u8, items: usize, success: bool) void {
+fn noteIndexEmbedBatchFinishedAssumeLocked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    items: usize,
+    success: bool,
+    owner: EmbeddingWorkOwner,
+) void {
     const completed_at_ms = runtime.config.clock.nowRealtimeMs();
     for (index_names) |index_name| {
         const activity = indexEmbeddingActivityPtrAssumeLocked(runtime, index_name) orelse continue;
         activity.active_batch_size -|= @intCast(items);
-        activity.retrying = !success;
         if (!success) continue;
+        if (owner == .supervised_replay) activity.retry_fingerprint = 0;
         activity.embedding_batches_completed +|= 1;
         activity.embeddings_computed +|= @intCast(items);
         activity.last_progress_at_ms = @max(activity.last_progress_at_ms, completed_at_ms);
+    }
+}
+
+fn markScheduledIndexEmbeddingRetryAssumeLocked(runtime: *EnrichmentRuntime) void {
+    if (runtime.active_failure_fingerprint == 0) return;
+    var iter = runtime.index_embedding_activity.valueIterator();
+    while (iter.next()) |activity| {
+        if (activity.retry_fingerprint == runtime.active_failure_fingerprint)
+            activity.retrying = true;
+    }
+}
+
+fn clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime: *EnrichmentRuntime) void {
+    var iter = runtime.index_embedding_activity.valueIterator();
+    while (iter.next()) |activity| {
+        activity.retrying = false;
+        activity.retry_fingerprint = 0;
     }
 }
 
@@ -574,7 +610,7 @@ fn noteIndexChunksCreatedAssumeLocked(runtime: *EnrichmentRuntime, index_names: 
     }
 }
 
-fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
+pub fn noteIndexChunksCreated(runtime: *EnrichmentRuntime, index_names: []const []const u8, count: usize) void {
     if (count == 0) return;
     if (comptime builtin.os.tag == .freestanding) {
         noteIndexChunksCreatedAssumeLocked(runtime, index_names, count);
@@ -611,7 +647,7 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
-        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
         return;
     }
 
@@ -625,7 +661,7 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
-        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
@@ -633,7 +669,7 @@ fn noteEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names: []const []con
         runtime.active_embed_batch_bytes = @intCast(bytes);
         runtime.active_embed_batch_max_bytes = @intCast(max_bytes);
         runtime.active_embed_batch_started_ms = now_ms;
-        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .supervised_replay);
     }
 }
 
@@ -653,7 +689,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
-        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success);
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
         return;
     }
 
@@ -675,7 +711,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
-        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success);
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
     } else {
         if (success) {
             runtime.embed_batches_completed += 1;
@@ -691,7 +727,7 @@ fn noteEmbedBatchFinished(runtime: *EnrichmentRuntime, index_names: []const []co
         runtime.active_embed_batch_bytes = 0;
         runtime.active_embed_batch_max_bytes = 0;
         runtime.active_embed_batch_started_ms = 0;
-        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success);
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, success, .supervised_replay);
     }
 }
 
@@ -704,7 +740,7 @@ fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names:
     if (comptime builtin.os.tag == .freestanding) {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
-        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
         return;
     }
 
@@ -714,11 +750,11 @@ fn noteTrackedRequestEmbedBatchStarted(runtime: *EnrichmentRuntime, index_names:
         defer runtime.mutex.unlock(io);
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
-        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
     } else {
         runtime.embed_batches_started += 1;
         runtime.embed_items_started += @intCast(items);
-        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items);
+        noteIndexEmbedBatchStartedAssumeLocked(runtime, index_names, items, .synchronous_request);
     }
 }
 
@@ -733,14 +769,14 @@ fn noteTrackedRequestEmbedBatchFinished(
 ) void {
     if (!success) {
         if (comptime builtin.os.tag == .freestanding) {
-            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false);
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
         } else if (runtime.io_impl) |io_impl| {
             const io = io_impl.io();
             runtime.mutex.lockUncancelable(io);
             defer runtime.mutex.unlock(io);
-            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false);
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
         } else {
-            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false);
+            noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, false, .synchronous_request);
         }
         return;
     }
@@ -754,7 +790,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
-        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true);
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
         return;
     }
 
@@ -770,7 +806,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
-        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true);
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
     } else {
         runtime.embed_batches_completed += 1;
         runtime.embed_items_completed += @intCast(items);
@@ -780,7 +816,7 @@ fn noteTrackedRequestEmbedBatchFinished(
         runtime.last_embed_batch_completed_ms = @max(runtime.last_embed_batch_completed_ms, runtime.config.clock.nowRealtimeMs());
         runtime.last_embed_batch_ns = elapsed_ns;
         runtime.total_embed_ns += elapsed_ns;
-        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true);
+        noteIndexEmbedBatchFinishedAssumeLocked(runtime, index_names, items, true, .synchronous_request);
     }
 }
 
@@ -876,6 +912,48 @@ pub fn embedDensePartsTracked(
     return vector;
 }
 
+pub fn embedSparseTracked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    alloc: Allocator,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    text: []const u8,
+) !embedder_mod.SparseEmbedding {
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, 1);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const sparse = sparse_embedder.embedSparse(alloc, embedding_name, text) catch |err| {
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, 1, text.len, text.len, elapsedNsSince(runtime, started_ns), true);
+    return sparse;
+}
+
+pub fn embedSparseBatchTracked(
+    runtime: *EnrichmentRuntime,
+    index_names: []const []const u8,
+    alloc: Allocator,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    embedding_name: []const u8,
+    texts: []const []const u8,
+) ![]embedder_mod.SparseEmbedding {
+    const stats = textBatchByteStats(texts);
+    noteTrackedRequestEmbedBatchStarted(runtime, index_names, texts.len);
+    const started_ns = runtime.config.clock.nowRealtimeNs();
+    const sparse_batch = sparse_embedder.embedSparseBatch(alloc, embedding_name, texts) catch |err| {
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return err;
+    };
+    if (sparse_batch.len != texts.len) {
+        embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
+        noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), false);
+        return error.InvalidEmbeddingResponse;
+    }
+    noteTrackedRequestEmbedBatchFinished(runtime, index_names, texts.len, stats.total_bytes, stats.max_bytes, elapsedNsSince(runtime, started_ns), true);
+    return sparse_batch;
+}
+
 test "request embedding telemetry preserves an overlapping replay batch snapshot" {
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
@@ -937,6 +1015,7 @@ test "enrichment runtime status scopes embedding activity to exact consumer inde
     noteEmbedBatchStarted(&runtime, &.{"semantic"}, 4, 400, 125);
     noteEmbedBatchFinished(&runtime, &.{"semantic"}, 4, 400, 125, 20, true);
     noteIndexChunksCreated(&runtime, &.{"semantic"}, 9);
+    runtime.active_failure_fingerprint = 41;
     noteEmbedBatchStarted(&runtime, &.{"visual"}, 3, 300, 100);
     noteEmbedBatchFinished(&runtime, &.{"visual"}, 3, 300, 100, 15, false);
 
@@ -954,7 +1033,73 @@ test "enrichment runtime status scopes embedding activity to exact consumer inde
     try std.testing.expectEqual(@as(u64, 0), visual.embedding_batches_completed);
     try std.testing.expectEqual(@as(u64, 0), visual.embeddings_computed);
     try std.testing.expectEqual(@as(u64, 0), visual.active_batch_size);
-    try std.testing.expect(visual.retrying);
+    // A provider failure is only a retry candidate. It becomes `retrying`
+    // when the supervisor accepts ownership and schedules the next attempt.
+    try std.testing.expect(!visual.retrying);
+    markScheduledIndexEmbeddingRetryAssumeLocked(&runtime);
+    try std.testing.expect(runtime.indexEmbeddingActivity("visual").retrying);
+    try std.testing.expect(!runtime.indexEmbeddingActivity("semantic").retrying);
+
+    runtime.active_failure_fingerprint = 99;
+    markScheduledIndexEmbeddingRetryAssumeLocked(&runtime);
+    try std.testing.expect(runtime.indexEmbeddingActivity("visual").retrying);
+
+    noteEmbedBatchStarted(&runtime, &.{"visual"}, 3, 300, 100);
+    try std.testing.expect(!runtime.indexEmbeddingActivity("visual").retrying);
+}
+
+test "request embedding failure never claims a supervised retry" {
+    const alloc = std.testing.allocator;
+    const FailingSparseEmbedder = struct {
+        fn embed(
+            _: *anyopaque,
+            _: Allocator,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!embedder_mod.SparseEmbedding {
+            return error.TestSparseRequestFailure;
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/request-activity-indexes", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = undefined,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .activity_epoch = 23,
+        .config = .{},
+        .ownership = undefined,
+        .active_failure_fingerprint = 41,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+
+    var failing_sparse: u8 = 0;
+    const sparse_embedder = embedder_mod.SparseEmbedder{
+        .ptr = &failing_sparse,
+        .sparse_embed_fn = FailingSparseEmbedder.embed,
+    };
+    try std.testing.expectError(
+        error.TestSparseRequestFailure,
+        embedSparseTracked(&runtime, &.{"semantic"}, alloc, sparse_embedder, "sparse_v1", "hello"),
+    );
+    markScheduledIndexEmbeddingRetryAssumeLocked(&runtime);
+    const activity = runtime.indexEmbeddingActivity("semantic");
+    try std.testing.expectEqual(@as(u64, 0), activity.active_batch_size);
+    try std.testing.expectEqual(@as(u64, 0), activity.retry_fingerprint);
+    try std.testing.expect(!activity.retrying);
 }
 
 fn boundedTextBatchEnd(texts: []const []const u8, start: usize, max_items: usize, max_bytes: usize) usize {
@@ -2488,6 +2633,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.worker_failed = false;
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -2626,6 +2772,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             self.applied_sequence = max_seen;
             self.processed_requests += processed_request_count;
             self.retrying = false;
+            clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
             self.worker_failed = false;
             self.consecutive_retry_count = 0;
             self.next_retry_at_ms = 0;
@@ -2958,6 +3105,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.target_sequence = @max(self.target_sequence, @max(target_sequence, next_applied));
         self.last_error_name = null;
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.worker_failed = false;
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -3211,6 +3359,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.target_sequence = @max(self.target_sequence, sequence);
         self.last_error_name = null;
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.worker_failed = false;
         self.consecutive_retry_count = 0;
         self.next_retry_at_ms = 0;
@@ -3329,6 +3478,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.error_count += 1;
         self.fatal_error_count += 1;
         self.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(self);
         self.next_retry_at_ms = 0;
         self.worker_failed = true;
         self.retry_error_has_request_identity = false;
@@ -3356,6 +3506,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.retry_failure_count +|= 1;
         self.next_retry_at_ms = self.config.clock.nowRealtimeMs() +| workerRetryDelayMs(self.consecutive_retry_count);
         self.retrying = true;
+        markScheduledIndexEmbeddingRetryAssumeLocked(self);
         self.retry_error_has_request_identity = false;
         status = runtimeStatusSnapshot(self);
         broadcastRuntimeStateChanged(self, io);
@@ -3836,6 +3987,7 @@ fn noteTerminalRequestFailure(
     runtime.error_count += 1;
     runtime.fatal_error_count += 1;
     runtime.retrying = false;
+    clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
     runtime.next_retry_at_ms = 0;
     runtime.worker_failed = false;
     for (indexes) |index_name| if (index_name.len > 0) markIsolatedFailedIndex(runtime, index_name);
@@ -4512,6 +4664,7 @@ fn runForegroundCatchUpPassOwned(
         runtime.applied_sequence = max_seen;
         runtime.processed_requests += processed_request_count;
         runtime.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
         runtime.worker_failed = false;
         runtime.consecutive_retry_count = 0;
         runtime.next_retry_at_ms = 0;
@@ -4529,6 +4682,7 @@ fn runForegroundCatchUpPassOwned(
         var status: enrichment_state.RuntimeStatus = .{};
         runtime.mutex.lockUncancelable(io);
         runtime.retrying = false;
+        clearScheduledIndexEmbeddingRetriesAssumeLocked(runtime);
         runtime.worker_failed = false;
         runtime.consecutive_retry_count = 0;
         runtime.next_retry_at_ms = 0;

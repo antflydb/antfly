@@ -33072,7 +33072,7 @@ fn appendDocumentUnitChunkSparseEmbeddingWrites(
         }
         if (consumer_indexes.len == 0) continue;
 
-        var sparse = try sparse_embedder.embedSparse(alloc, entry.name, chunk_text);
+        var sparse = try enrichment_runtime_mod.embedSparseTracked(runtime, consumer_indexes, alloc, sparse_embedder, entry.name, chunk_text);
         defer sparse.deinit(alloc);
         const artifact_key = try appendSparseEmbeddingArtifactWrite(
             alloc,
@@ -34966,7 +34966,9 @@ fn chunkEmbeddingSourcesForRequest(
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: []const types.BatchWrite,
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
+    chunks_created: *usize,
 ) ![]ChunkEmbeddingSource {
+    chunks_created.* = 0;
     const artifact_name = requestArtifactName(request);
     var sources = std.ArrayListUnmanaged(ChunkEmbeddingSource).empty;
     errdefer {
@@ -34985,6 +34987,7 @@ fn chunkEmbeddingSourcesForRequest(
             .key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id)),
             .text = try alloc.dupe(u8, chunk_text),
         });
+        chunks_created.* += 1;
     }
     if (sources.items.len > 0) return try sources.toOwnedSlice(alloc);
 
@@ -35063,6 +35066,7 @@ fn flushGeneratedDenseChunkBatch(
 
 fn flushGeneratedSparseChunkBatch(
     alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
     sparse_embedder: embedder_mod.SparseEmbedder,
     embedding_name: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
@@ -35074,7 +35078,7 @@ fn flushGeneratedSparseChunkBatch(
 ) !void {
     if (chunk_texts.items.len == 0) return;
 
-    const sparse_batch = try sparse_embedder.embedSparseBatch(alloc, embedding_name, chunk_texts.items);
+    const sparse_batch = try enrichment_runtime_mod.embedSparseBatchTracked(runtime, consumer_indexes, alloc, sparse_embedder, embedding_name, chunk_texts.items);
     defer embedder_mod.freeSparseEmbeddingBatch(alloc, sparse_batch);
     if (sparse_batch.len != source_indexes.items.len) return error.InvalidEmbeddingResponse;
 
@@ -35142,6 +35146,7 @@ fn flushGeneratedDenseChunkSourceBatch(
 fn flushGeneratedSparseChunkSourceBatch(
     alloc: Allocator,
     db: *DB,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
     sparse_embedder: embedder_mod.SparseEmbedder,
     embedding_name: []const u8,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
@@ -35172,7 +35177,7 @@ fn flushGeneratedSparseChunkSourceBatch(
         try source_indexes.append(alloc, i);
     }
 
-    try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
+    try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources.items, &source_indexes, &chunk_texts, consumer_indexes);
 }
 
 fn appendMaterializedChunkSourceToBatch(
@@ -35367,9 +35372,11 @@ fn computeDenseRequestImpl(
             try computeDenseMaterializedChunkRequestImpl(alloc, db, runtime, request, artifact_writes, dense_embeddings, skip_unchanged_artifacts, appendForConsumers, dense_embedder, embedding_name, consumer_indexes);
             return;
         }
-        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
+        var chunks_created: usize = 0;
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache, &chunks_created);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
+        enrichment_runtime_mod.noteIndexChunksCreated(runtime, consumer_indexes, chunks_created);
         var pending_writes = if (skip_unchanged_artifacts)
             try PendingArtifactWriteIndex.init(alloc, artifact_writes.items)
         else
@@ -35477,6 +35484,7 @@ fn computeDenseRequestImpl(
 fn computeSparseMaterializedChunkRequest(
     alloc: Allocator,
     db: *DB,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
     request: enrichment_types.GeneratedEnrichmentRequest,
     artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
@@ -35505,11 +35513,11 @@ fn computeSparseMaterializedChunkRequest(
         try pending_chunk_keys.put(alloc, write.key, {});
         _ = try appendMaterializedChunkSourceToBatch(alloc, &sources, &batch_source_bytes, write.key, write.value, request.source_field);
         if (sources.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-            try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+            try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
             batch_source_bytes = 0;
         }
     }
-    try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+    try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
     batch_source_bytes = 0;
 
     const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "chunk", artifact_name);
@@ -35521,7 +35529,7 @@ fn computeSparseMaterializedChunkRequest(
     defer alloc.free(lower);
     while (true) {
         const next_lower = try scanMaterializedChunkSourceStoreBatch(alloc, db, prefix, upper_bound, lower, request.source_field, &pending_chunk_keys, &sources, &batch_source_bytes, max_batch_items, max_batch_bytes);
-        try flushGeneratedSparseChunkSourceBatch(alloc, db, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
+        try flushGeneratedSparseChunkSourceBatch(alloc, db, runtime, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, &sources, consumer_indexes, &pending_writes);
         batch_source_bytes = 0;
         if (next_lower) |owned_next| {
             alloc.free(lower);
@@ -35541,10 +35549,8 @@ fn computeSparseRequestDerived(
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
     cache: *std.ArrayListUnmanaged(ChunkCacheEntry),
 ) !void {
-    const sparse_embedder = if (db.enrichment_runtime) |runtime|
-        runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder
-    else
-        return error.MissingSparseEmbedder;
+    const runtime = db.enrichment_runtime orelse return error.MissingSparseEmbedder;
+    const sparse_embedder = runtime.config.sparse_embedder orelse return error.MissingSparseEmbedder;
 
     const embedding_name = requestEmbeddingName(request);
     const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, embedding_name);
@@ -35556,12 +35562,14 @@ fn computeSparseRequestDerived(
 
     if (requestHasChunking(request) and requestArtifactName(request).len > 0) {
         if (requestUsesMaterializedChunkArtifact(db, requestArtifactName(request))) {
-            try computeSparseMaterializedChunkRequest(alloc, db, request, artifact_writes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes);
+            try computeSparseMaterializedChunkRequest(alloc, db, runtime, request, artifact_writes, sparse_embeddings, sparse_embedder, embedding_name, consumer_indexes);
             return;
         }
-        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache);
+        var chunks_created: usize = 0;
+        const sources = try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, artifact_writes.items, cache, &chunks_created);
         defer freeChunkEmbeddingSources(alloc, sources);
         if (sources.len == 0) return;
+        enrichment_runtime_mod.noteIndexChunksCreated(runtime, consumer_indexes, chunks_created);
         var pending_writes = try PendingArtifactWriteIndex.init(alloc, artifact_writes.items);
         defer pending_writes.deinit(alloc);
 
@@ -35585,18 +35593,18 @@ fn computeSparseRequestDerived(
             if (chunk_texts.items.len > 0 and
                 (chunk_texts.items.len >= max_batch_items or batch_source_bytes + source.text.len > max_batch_bytes))
             {
-                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 batch_source_bytes = 0;
             }
             try chunk_texts.append(alloc, source.text);
             try source_indexes.append(alloc, i);
             batch_source_bytes += source.text.len;
             if (chunk_texts.items.len >= max_batch_items or batch_source_bytes >= max_batch_bytes) {
-                try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+                try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
                 batch_source_bytes = 0;
             }
         }
-        try flushGeneratedSparseChunkBatch(alloc, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
+        try flushGeneratedSparseChunkBatch(alloc, runtime, sparse_embedder, embedding_name, artifact_writes, sparse_embeddings, sources, &source_indexes, &chunk_texts, consumer_indexes);
         return;
     }
 
@@ -35613,7 +35621,7 @@ fn computeSparseRequestDerived(
     }
     defer alloc.free(source_text.?);
 
-    var sparse = try sparse_embedder.embedSparse(alloc, embedding_name, source_text.?);
+    var sparse = try enrichment_runtime_mod.embedSparseTracked(runtime, consumer_indexes, alloc, sparse_embedder, embedding_name, source_text.?);
     defer sparse.deinit(alloc);
     const artifact_key = try appendSparseEmbeddingArtifactWrite(
         alloc,
@@ -57609,6 +57617,17 @@ test "db full_index precomputes generated enrichments into the committed batch" 
 
     const sparse_applied = try db.core.loadAppliedSequence(alloc, "sp_v1");
     try std.testing.expect(sparse_applied > 0);
+
+    const runtime = db.enrichment_runtime.?;
+    const dense_activity = runtime.indexEmbeddingActivity("dv_v1");
+    const sparse_activity = runtime.indexEmbeddingActivity("sp_v1");
+    for ([_]types.EmbeddingActivityStats{ dense_activity, sparse_activity }) |activity| {
+        try std.testing.expect(activity.chunks_created > 0);
+        try std.testing.expect(activity.embedding_batches_completed > 0);
+        try std.testing.expect(activity.embeddings_computed > 0);
+        try std.testing.expectEqual(@as(u64, 0), activity.active_batch_size);
+        try std.testing.expect(!activity.retrying);
+    }
 }
 
 test "db full_text sync level does not wait for dense hbc visibility" {

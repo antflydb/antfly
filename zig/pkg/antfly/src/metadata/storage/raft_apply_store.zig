@@ -4380,9 +4380,10 @@ fn storeHasRuntimeEmbeddingActivity(record: metadata.StoreRecord) bool {
 }
 
 fn storeRuntimeStatusRecordVersion(record: metadata.StoreRecord) ?u16 {
-    if (storeHasRuntimeEmbeddingActivity(record) or
-        record.native_generation_restore_version != 0)
-        return runtime_status_protocol.current_record_version;
+    if (storeHasRuntimeEmbeddingActivity(record))
+        return runtime_status_protocol.embedding_activity_record_version;
+    if (record.native_generation_restore_version != 0)
+        return runtime_status_protocol.native_restore_identity_record_version;
     if (storeHasRuntimeRepairStatus(record) or
         record.reporter_incarnation != 0 or record.status_generation != 0)
         return runtime_status_protocol.repair_status_record_version;
@@ -11479,6 +11480,33 @@ test "metadata runtime status writer preserves the version twelve rolling-upgrad
             runtime_status_protocol.legacy_record_version,
         ),
     );
+
+    encoded.clearRetainingCapacity();
+    var native_store = store;
+    native_store.native_generation_restore_version = metadata_table_manager.native_generation_restore_protocol_version;
+    try std.testing.expectEqual(
+        runtime_status_protocol.native_restore_identity_record_version,
+        storeRuntimeStatusRecordVersion(native_store).?,
+    );
+
+    // V14 is already released for native restore identity. It must continue to
+    // end after repair state rather than interpreting v15 activity bytes.
+    try appendRuntimeIndexStatusRecord(
+        alloc,
+        &encoded,
+        indexes[0],
+        runtime_status_protocol.native_restore_identity_record_version,
+    );
+    var native_pos: usize = 0;
+    const native_decoded = try readRuntimeIndexStatusRecord(
+        alloc,
+        encoded.items,
+        &native_pos,
+        runtime_status_protocol.native_restore_identity_record_version,
+    );
+    defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, native_decoded);
+    try std.testing.expectEqual(encoded.items.len, native_pos);
+    try std.testing.expectEqual(@as(u64, 0), native_decoded.embedding_activity.epoch);
 
     encoded.clearRetainingCapacity();
     indexes[0].embedding_activity = .{ .epoch = 17, .embeddings_computed = 23 };
