@@ -121,6 +121,7 @@ pub const Fixture = struct {
         clean,
         graph_transport_failure,
         graph_transport_resource_pressure,
+        graph_hydration_transport_failure,
         graph_owner_restart,
         graph_partial_write,
         resource_pressure,
@@ -325,6 +326,11 @@ pub const Fixture = struct {
     graph_cancellation_observed: bool = false,
     graph_cancellation_recovered: bool = false,
     graph_cancellation_sound: bool = false,
+    graph_cancellation_fault_injected: bool = false,
+    graph_cancellation_fault_observed: bool = false,
+    graph_cancellation_fault_matches: u64 = 0,
+    graph_cancellation_fault_count_before: u64 = 0,
+    graph_cancellation_fault_healed: bool = false,
     graph_authorization_revoked: bool = false,
     graph_authorization_boundary_observed: bool = false,
     graph_authorization_revocation_armed: bool = false,
@@ -518,6 +524,7 @@ pub const Fixture = struct {
         } else return error.ProductionDataGraphRemoteCoordinatorMissing;
         self.graph_transport_target_index = target_index;
         self.graph_transport_target_configured = true;
+        self.graph_transport_fault_endpoint = try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
         self.graph_probe_route_index = coordinator_index;
         return coordinator_index;
     }
@@ -546,6 +553,9 @@ pub const Fixture = struct {
             return error.InvalidProductionClusterGraphStaleSnapshotMode;
         switch (self.fault_mode) {
             .clean => {},
+            .graph_hydration_transport_failure => if (!self.graph_enabled or
+                !self.graph_cancellation_enabled or self.active_split_enabled)
+                return error.InvalidProductionClusterFaultMode,
             .join_finalizer_ack_failure => if (!self.join_enabled or self.active_split_enabled)
                 return error.InvalidProductionClusterFaultMode,
             else => if (!self.graph_enabled or !self.active_split_enabled)
@@ -925,11 +935,29 @@ pub const Fixture = struct {
                 if (self.graph_cancellation_enabled and
                     self.graph_hydration_fanout_started_count == 1)
                 {
+                    if (self.fault_mode == .graph_hydration_transport_failure) {
+                        const endpoint = self.graph_transport_fault_endpoint orelse {
+                            self.failure = error.ProductionGraphCancellationFaultEndpointMissing;
+                            return;
+                        };
+                        self.graph_cancellation_fault_count_before =
+                            self.sim.outboundEndpointPayloadOutageCount();
+                        self.sim.setOutboundEndpointPayloadOutage(
+                            endpoint,
+                            "/graph-hydrate",
+                        ) catch |err| {
+                            self.failure = err;
+                            return;
+                        };
+                        self.graph_cancellation_fault_injected = true;
+                    }
                     const cancellation = event.cancellation orelse {
                         self.failure = error.ProductionGraphCancellationTokenMissing;
                         return;
                     };
-                    for (0..250) |_| {
+                    const cancellation_wait_rounds: usize =
+                        if (self.fault_mode == .graph_hydration_transport_failure) 1_000 else 250;
+                    for (0..cancellation_wait_rounds) |_| {
                         if (cancellation.isCancelled()) break;
                         self.sim.io().sleep(.fromMilliseconds(1), .awake) catch return;
                     } else {
@@ -948,7 +976,8 @@ pub const Fixture = struct {
             },
             else => {},
         }
-        if (self.fault_mode == .clean or self.fault_mode == .resource_pressure or
+        if (self.fault_mode == .clean or self.fault_mode == .graph_hydration_transport_failure or
+            self.fault_mode == .resource_pressure or
             self.fault_mode == .socket_pressure or
             self.fault_mode == .join_finalizer_ack_failure) return;
         switch (event.phase) {
@@ -992,7 +1021,7 @@ pub const Fixture = struct {
                         self.sim.setOutboundEndpointPayloadPartialWrite(endpoint, "/graph-expand", 1) catch unreachable;
                         self.graph_partial_write_injected = true;
                     },
-                    .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
+                    .graph_hydration_transport_failure, .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             .attempt_failed => {
@@ -1022,7 +1051,7 @@ pub const Fixture = struct {
                         self.graph_restart_recovered.wait(self.sim.io()) catch return;
                     },
                     .graph_partial_write => {},
-                    .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
+                    .graph_hydration_transport_failure, .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                 }
             },
             else => {},
@@ -1726,7 +1755,7 @@ pub const Fixture = struct {
                                     return error.ProductionGraphPartialWriteTargetLeadershipChanged;
                                 break :blk try parseHttpBaseUriAddress(self.data_api_uris[target_index]);
                             },
-                        .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
+                        .graph_hydration_transport_failure, .resource_pressure, .socket_pressure, .join_finalizer_ack_failure => unreachable,
                     }
                     self.graph_transport_fault_armed = true;
                 }
@@ -2036,6 +2065,12 @@ pub const Fixture = struct {
             10,
         );
         defer self.alloc.free(query_body);
+        defer if (self.graph_cancellation_fault_injected and
+            !self.graph_cancellation_fault_healed)
+        {
+            self.sim.setOutboundEndpointOutage(null);
+            self.graph_cancellation_fault_healed = true;
+        };
 
         const started_before = self.graph_hydration_started_count;
         const fanout_before = self.graph_hydration_fanout_started_count;
@@ -2062,6 +2097,19 @@ pub const Fixture = struct {
             self.graph_hydration_completed_count != completed_before)
             return false;
 
+        if (self.fault_mode == .graph_hydration_transport_failure) {
+            for (0..1_000) |_| {
+                const current = self.sim.outboundEndpointPayloadOutageCount();
+                if (current > self.graph_cancellation_fault_count_before) {
+                    self.graph_cancellation_fault_matches =
+                        current - self.graph_cancellation_fault_count_before;
+                    self.graph_cancellation_fault_observed = true;
+                    break;
+                }
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+            } else return false;
+        }
+
         self.graph_cancellation_requested = true;
         const cancelled_request = blk: {
             var response = in_flight.cancel(self.sim.io()) catch |err| switch (err) {
@@ -2075,11 +2123,21 @@ pub const Fixture = struct {
             self.graph_hydration_completed_count == completed_before;
         if (!self.graph_cancellation_observed) return false;
 
+        if (self.fault_mode == .graph_hydration_transport_failure) {
+            self.sim.setOutboundEndpointOutage(null);
+            self.graph_cancellation_fault_healed = true;
+        }
+
         self.graph_hydration_sound = try self.runGraphHydrationQuery();
         self.graph_cancellation_recovered = self.graph_hydration_sound and
             self.graph_hydration_started_count == started_before + 2 and
             self.graph_hydration_fanout_started_count == fanout_before + 2 and
-            self.graph_hydration_completed_count == completed_before + 1;
+            self.graph_hydration_completed_count == completed_before + 1 and
+            (self.fault_mode != .graph_hydration_transport_failure or
+                (self.graph_cancellation_fault_injected and
+                    self.graph_cancellation_fault_observed and
+                    self.graph_cancellation_fault_matches > 0 and
+                    self.graph_cancellation_fault_healed));
         return self.graph_cancellation_recovered;
     }
 
@@ -3183,6 +3241,10 @@ pub const Fixture = struct {
         graph_cancellation_observed: bool,
         graph_cancellation_recovered: bool,
         graph_cancellation_ok: bool,
+        graph_cancellation_fault_injected: bool,
+        graph_cancellation_fault_observed: bool,
+        graph_cancellation_fault_matches: u64,
+        graph_cancellation_fault_healed: bool,
         graph_authorization_boundary_observed: bool,
         graph_authorization_revoked: bool,
         graph_authorization_denied_without_leak: bool,
@@ -3265,6 +3327,10 @@ pub const Fixture = struct {
             .graph_cancellation_observed = self.graph_cancellation_observed,
             .graph_cancellation_recovered = self.graph_cancellation_recovered,
             .graph_cancellation_ok = self.graph_cancellation_sound,
+            .graph_cancellation_fault_injected = self.graph_cancellation_fault_injected,
+            .graph_cancellation_fault_observed = self.graph_cancellation_fault_observed,
+            .graph_cancellation_fault_matches = self.graph_cancellation_fault_matches,
+            .graph_cancellation_fault_healed = self.graph_cancellation_fault_healed,
             .graph_authorization_boundary_observed = self.graph_authorization_boundary_observed,
             .graph_authorization_revoked = self.graph_authorization_revoked,
             .graph_authorization_denied_without_leak = self.graph_authorization_denied_without_leak,

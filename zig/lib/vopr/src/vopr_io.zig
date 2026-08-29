@@ -572,6 +572,12 @@ pub const VoprIo = struct {
         return self.network.outboundEndpointPayloadPartialWriteCount();
     }
 
+    /// Monotonic count of semantic client-stream writes rejected by the
+    /// currently selected endpoint payload outage. Healing does not erase it.
+    pub fn outboundEndpointPayloadOutageCount(self: *const VoprIo) u64 {
+        return self.network.outboundEndpointPayloadOutageCount();
+    }
+
     /// Apply or clear a reversible connection quota for one logical listener's
     /// bound address. Zero denies new connections without disturbing
     /// established streams.

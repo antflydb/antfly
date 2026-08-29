@@ -7276,6 +7276,18 @@ pub fn build(b: *std.Build) void {
     );
     production_cluster_graph_cancellation_vopr_test_step.dependOn(&run_production_cluster_graph_cancellation_vopr_tests.step);
 
+    const production_cluster_graph_cancellation_transport_vopr_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"full cluster production public graph cancellation under transport fault exact replay"},
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 16 else 7) * 1024 * 1024 * 1024,
+    });
+    const run_production_cluster_graph_cancellation_transport_vopr_tests = b.addRunArtifact(production_cluster_graph_cancellation_transport_vopr_tests);
+    const production_cluster_graph_cancellation_transport_vopr_test_step = b.step(
+        "production-cluster-graph-cancellation-transport-fault-vopr-test",
+        "Run public graph cancellation with outstanding hydration under a scoped transport outage",
+    );
+    production_cluster_graph_cancellation_transport_vopr_test_step.dependOn(&run_production_cluster_graph_cancellation_transport_vopr_tests.step);
+
     const production_cluster_graph_inflight_authorization_vopr_tests = b.addTest(.{
         .root_module = lib_test_mod,
         .filters = &.{"full cluster production public graph inflight authorization revocation exact replay"},
@@ -7406,6 +7418,7 @@ pub fn build(b: *std.Build) void {
         run_production_cluster_service_rate_vopr_tests,
         run_production_cluster_graph_hydration_vopr_tests,
         run_production_cluster_graph_cancellation_vopr_tests,
+        run_production_cluster_graph_cancellation_transport_vopr_tests,
         run_production_cluster_graph_inflight_authorization_vopr_tests,
         run_production_cluster_graph_stale_snapshot_vopr_tests,
     }) |run_production_cluster_test| {
@@ -7494,6 +7507,7 @@ pub fn build(b: *std.Build) void {
     production_cluster_vopr_test_step.dependOn(production_cluster_service_rate_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_hydration_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_vopr_test_step);
+    production_cluster_vopr_test_step.dependOn(production_cluster_graph_cancellation_transport_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_inflight_authorization_vopr_test_step);
     production_cluster_vopr_test_step.dependOn(production_cluster_graph_stale_snapshot_vopr_test_step);
 

@@ -27,6 +27,10 @@ pub const Faults = struct {
     outbound_endpoint_down: ?ids.StableId = null,
     outbound_endpoint_payload_contains: ?[]u8 = null,
     outbound_endpoint_payload_failure: ?[]usize = null,
+    /// Monotonic matched semantic-stream outages. Unlike activation state,
+    /// this survives healing so scenarios can prove that the selected
+    /// production request actually reached the fault boundary.
+    outbound_endpoint_payload_outage_count: u64 = 0,
     /// When set with a payload selector, the first matching client write is
     /// accepted only up to this byte count instead of failing. The selector is
     /// then disarmed, modeling a real short stream write rather than a link
@@ -692,6 +696,10 @@ pub const Network = struct {
         return self.faults.outbound_endpoint_payload_partial_write_count;
     }
 
+    pub fn outboundEndpointPayloadOutageCount(self: *const Network) u64 {
+        return self.faults.outbound_endpoint_payload_outage_count;
+    }
+
     fn clearOutboundEndpointPayloadFault(self: *Network) void {
         if (self.faults.outbound_endpoint_payload_contains) |selector| self.allocator.free(selector);
         if (self.faults.outbound_endpoint_payload_failure) |failure| self.allocator.free(failure);
@@ -936,6 +944,7 @@ pub const Network = struct {
             for (self.socket_order.items) |socket_state| socket_state.outbound_fault_match_len = 0;
             return .{ .partial = limit };
         }
+        self.faults.outbound_endpoint_payload_outage_count +|= 1;
         return .blocked;
     }
 
@@ -1320,12 +1329,14 @@ test "outbound endpoint outage is directional and endpoint scoped" {
     try network.setOutboundEndpointPayloadOutage(blocked_address, "/graph-expand");
     try std.testing.expectEqual(@as(usize, "POST /batch".len), try network.write(blocked_client.handle, "", &.{"POST /batch"}, 1));
     try std.testing.expectError(error.NetworkDown, network.write(blocked_client.handle, "", &.{"POST /internal/v1/groups/7/tables/docs/graph-expand"}, 1));
+    try std.testing.expectEqual(@as(u64, 1), network.outboundEndpointPayloadOutageCount());
     try std.testing.expectEqual(@as(usize, "response /graph-expand".len), try network.write(blocked_server.handle, "", &.{"response /graph-expand"}, 1));
     network.setOutboundEndpointOutage(null);
 
     try network.setOutboundEndpointPayloadOutage(blocked_address, "/graph-expand");
     try std.testing.expectEqual(@as(usize, "POST /internal/graph-".len), try network.write(blocked_client.handle, "", &.{"POST /internal/graph-"}, 1));
     try std.testing.expectError(error.NetworkDown, network.write(blocked_client.handle, "", &.{"expand HTTP/1.1"}, 1));
+    try std.testing.expectEqual(@as(u64, 2), network.outboundEndpointPayloadOutageCount());
     network.setOutboundEndpointOutage(null);
 
     try network.setOutboundEndpointPayloadPartialWrite(blocked_address, "/graph-expand", 2);

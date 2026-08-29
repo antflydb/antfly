@@ -18,7 +18,7 @@ const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
-    pub const version: u32 = 28;
+    pub const version: u32 = 29;
 
     const acknowledged_id = vopr.id.stable(name, "acknowledged-data-visible");
     const quorum_id = vopr.id.stable(name, "metadata-quorum-recovers");
@@ -37,6 +37,7 @@ pub const Scenario = struct {
     const production_service_rate_id = vopr.id.stable(name, "production-service-rates-compose-and-heal");
     const production_graph_hydration_id = vopr.id.stable(name, "production-public-graph-hydrates-documents");
     const production_graph_cancellation_id = vopr.id.stable(name, "production-public-graph-cancellation-drains-fanout");
+    const production_graph_cancellation_transport_id = vopr.id.stable(name, "production-public-graph-cancellation-under-transport-fault");
     const production_graph_authorization_id = vopr.id.stable(name, "production-public-graph-inflight-authorization-revocation");
     const production_graph_stale_snapshot_id = vopr.id.stable(name, "production-public-graph-stale-snapshot-retry-exhaustion");
     const graph_restart_id = vopr.id.stable(name, "public-graph-inflight-restart-sound");
@@ -70,6 +71,7 @@ pub const Scenario = struct {
         .{ .id = production_service_rate_id, .name = name ++ ".production-service-rates-compose-and-heal", .kind = .always },
         .{ .id = production_graph_hydration_id, .name = name ++ ".production-public-graph-hydrates-documents", .kind = .always },
         .{ .id = production_graph_cancellation_id, .name = name ++ ".production-public-graph-cancellation-drains-fanout", .kind = .always },
+        .{ .id = production_graph_cancellation_transport_id, .name = name ++ ".production-public-graph-cancellation-under-transport-fault", .kind = .always },
         .{ .id = production_graph_authorization_id, .name = name ++ ".production-public-graph-inflight-authorization-revocation", .kind = .always },
         .{ .id = production_graph_stale_snapshot_id, .name = name ++ ".production-public-graph-stale-snapshot-retry-exhaustion", .kind = .always },
         .{ .id = graph_restart_id, .name = name ++ ".public-graph-inflight-restart-sound", .kind = .always },
@@ -112,6 +114,7 @@ pub const Scenario = struct {
         production_data_plane_service_rate,
         production_data_plane_graph_hydration,
         production_data_plane_graph_cancellation,
+        production_data_plane_graph_cancellation_transport_failure,
         production_data_plane_graph_inflight_authorization_revocation,
         production_data_plane_graph_stale_snapshot_retry_exhaustion,
 
@@ -131,13 +134,14 @@ pub const Scenario = struct {
                 self == .production_data_plane_service_rate or
                 self == .production_data_plane_graph_hydration or
                 self == .production_data_plane_graph_cancellation or
+                self == .production_data_plane_graph_cancellation_transport_failure or
                 self == .production_data_plane_graph_inflight_authorization_revocation or
                 self == .production_data_plane_graph_stale_snapshot_retry_exhaustion;
         }
 
         fn publicFault(self: Mode) PublicFault {
             return switch (self) {
-                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion => .clean,
+                .clean, .serverless_stale_generation, .production_data_plane_baseline, .production_data_plane_graph, .production_data_plane, .production_data_plane_graph_split, .production_data_plane_graph_split_transport_failure, .production_data_plane_graph_split_owner_restart, .production_data_plane_graph_split_partial_write, .production_data_plane_graph_split_resource_pressure, .production_data_plane_join_split, .production_data_plane_durable_join_takeover, .production_data_plane_graph_split_overlapping_faults, .production_data_plane_graph_split_socket_pressure, .production_data_plane_service_rate, .production_data_plane_graph_hydration, .production_data_plane_graph_cancellation, .production_data_plane_graph_cancellation_transport_failure, .production_data_plane_graph_inflight_authorization_revocation, .production_data_plane_graph_stale_snapshot_retry_exhaustion => .clean,
                 .metadata_partition => .metadata_partition,
                 .node_restart => .node_restart,
                 .graph_inflight_restart => .graph_inflight_restart,
@@ -182,6 +186,7 @@ pub const Scenario = struct {
             vopr.id.stable(name, "production-data-plane-service-rate"),
             vopr.id.stable(name, "production-data-plane-graph-hydration"),
             vopr.id.stable(name, "production-data-plane-graph-cancellation"),
+            vopr.id.stable(name, "production-data-plane-graph-cancellation-transport-failure"),
             vopr.id.stable(name, "production-data-plane-graph-inflight-authorization-revocation"),
             vopr.id.stable(name, "production-data-plane-graph-stale-snapshot-retry-exhaustion"),
         };
@@ -211,6 +216,7 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-service-rate",
         name ++ ".production-data-plane-graph-hydration",
         name ++ ".production-data-plane-graph-cancellation",
+        name ++ ".production-data-plane-graph-cancellation-transport-failure",
         name ++ ".production-data-plane-graph-inflight-authorization-revocation",
         name ++ ".production-data-plane-graph-stale-snapshot-retry-exhaustion",
     };
@@ -230,6 +236,7 @@ pub const Scenario = struct {
     const production_service_rate_ordinal: usize = @intFromEnum(Mode.production_data_plane_service_rate);
     const production_graph_hydration_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_hydration);
     const production_graph_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_cancellation);
+    const production_graph_cancellation_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_cancellation_transport_failure);
     const production_graph_authorization_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_inflight_authorization_revocation);
     const production_graph_stale_snapshot_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_stale_snapshot_retry_exhaustion);
 
@@ -330,6 +337,10 @@ pub const Scenario = struct {
         graph_cancellation_observed: bool = false,
         graph_cancellation_recovered: bool = false,
         graph_cancellation_ok: bool = false,
+        graph_cancellation_fault_injected: bool = false,
+        graph_cancellation_fault_observed: bool = false,
+        graph_cancellation_fault_matches: u64 = 0,
+        graph_cancellation_fault_healed: bool = false,
         graph_authorization_boundary_observed: bool = false,
         graph_authorization_revoked: bool = false,
         graph_authorization_denied_without_leak: bool = false,
@@ -692,6 +703,10 @@ pub const Scenario = struct {
                     .graph_cancellation_observed = snapshot.graph_cancellation_observed,
                     .graph_cancellation_recovered = snapshot.graph_cancellation_recovered,
                     .graph_cancellation_ok = snapshot.graph_cancellation_ok,
+                    .graph_cancellation_fault_injected = snapshot.graph_cancellation_fault_injected,
+                    .graph_cancellation_fault_observed = snapshot.graph_cancellation_fault_observed,
+                    .graph_cancellation_fault_matches = snapshot.graph_cancellation_fault_matches,
+                    .graph_cancellation_fault_healed = snapshot.graph_cancellation_fault_healed,
                     .graph_authorization_boundary_observed = snapshot.graph_authorization_boundary_observed,
                     .graph_authorization_revoked = snapshot.graph_authorization_revoked,
                     .graph_authorization_denied_without_leak = snapshot.graph_authorization_denied_without_leak,
@@ -819,6 +834,7 @@ pub const Scenario = struct {
                         mode == .production_data_plane_service_rate or
                         mode == .production_data_plane_graph_hydration or
                         mode == .production_data_plane_graph_cancellation or
+                        mode == .production_data_plane_graph_cancellation_transport_failure or
                         mode == .production_data_plane_graph_inflight_authorization_revocation or
                         mode == .production_data_plane_graph_stale_snapshot_retry_exhaustion or
                         mode == .production_data_plane_graph_split or
@@ -833,7 +849,8 @@ pub const Scenario = struct {
                     mode == .production_data_plane_graph_hydration,
                 );
                 self.production_cluster.?.setGraphCancellationEnabled(
-                    mode == .production_data_plane_graph_cancellation,
+                    mode == .production_data_plane_graph_cancellation or
+                        mode == .production_data_plane_graph_cancellation_transport_failure,
                 );
                 self.production_cluster.?.setGraphInflightAuthorizationRevocationEnabled(
                     mode == .production_data_plane_graph_inflight_authorization_revocation,
@@ -852,6 +869,7 @@ pub const Scenario = struct {
                     .production_data_plane_graph_split_resource_pressure => .resource_pressure,
                     .production_data_plane_graph_split_overlapping_faults => .graph_transport_resource_pressure,
                     .production_data_plane_graph_split_socket_pressure => .socket_pressure,
+                    .production_data_plane_graph_cancellation_transport_failure => .graph_hydration_transport_failure,
                     .production_data_plane_durable_join_takeover => .join_finalizer_ack_failure,
                     else => .clean,
                 });
@@ -1092,6 +1110,22 @@ pub const Scenario = struct {
                         resource_domains[target_index],
                     );
                 },
+                .production_data_plane_graph_cancellation_transport_failure => {
+                    const production = self.production_cluster orelse
+                        return error.MissingProductionCluster;
+                    const target_index = production.currentGraphOwnerIndex() orelse
+                        return error.ProductionDataGraphLeaderMissing;
+                    const coordinator_index = try production.configureGraphTransportTarget(target_index);
+                    const link_id = for (deployment_links) |link| {
+                        if (link.from_node == deployment_node_ids[coordinator_index] and
+                            link.to_node == deployment_node_ids[target_index]) break link.id;
+                    } else return error.ProductionGraphCancellationTransportLinkMissing;
+                    try deployment.activateFault(
+                        vopr.id.stable(name, "fault.production-graph-cancellation-transport"),
+                        .network,
+                        link_id,
+                    );
+                },
                 .production_data_plane_durable_join_takeover => for (process_domains[0..3], 0..) |domain_id, index| try deployment.activateFault(
                     vopr.id.derive("full-cluster.production-durable-join-finalizer-ack-failure", domain_id, index),
                     .custom,
@@ -1255,6 +1289,10 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".public-graph-cancellation-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_cancellation_observed else false));
         try builder.addNamed(allocator, name ++ ".public-graph-cancellation-recovered", @intFromBool(if (cluster) |snapshot| snapshot.graph_cancellation_recovered else false));
         try builder.addNamed(allocator, name ++ ".public-graph-cancellation-ok", @intFromBool(if (cluster) |snapshot| snapshot.graph_cancellation_ok else false));
+        try builder.addNamed(allocator, name ++ ".public-graph-cancellation-fault-injected", @intFromBool(if (cluster) |snapshot| snapshot.graph_cancellation_fault_injected else false));
+        try builder.addNamed(allocator, name ++ ".public-graph-cancellation-fault-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_cancellation_fault_observed else false));
+        try builder.addNamed(allocator, name ++ ".public-graph-cancellation-fault-matches", if (cluster) |snapshot| @intCast(snapshot.graph_cancellation_fault_matches) else 0);
+        try builder.addNamed(allocator, name ++ ".public-graph-cancellation-fault-healed", @intFromBool(if (cluster) |snapshot| snapshot.graph_cancellation_fault_healed else false));
         try builder.addNamed(allocator, name ++ ".public-graph-authorization-boundary-observed", @intFromBool(if (cluster) |snapshot| snapshot.graph_authorization_boundary_observed else false));
         try builder.addNamed(allocator, name ++ ".public-graph-authorization-revoked", @intFromBool(if (cluster) |snapshot| snapshot.graph_authorization_revoked else false));
         try builder.addNamed(allocator, name ++ ".public-graph-authorization-denied-without-leak", @intFromBool(if (cluster) |snapshot| snapshot.graph_authorization_denied_without_leak else false));
@@ -1336,6 +1374,7 @@ pub const Scenario = struct {
             state.mode == .production_data_plane_service_rate or
             state.mode == .production_data_plane_graph_hydration or
             state.mode == .production_data_plane_graph_cancellation or
+            state.mode == .production_data_plane_graph_cancellation_transport_failure or
             state.mode == .production_data_plane_graph_inflight_authorization_revocation or
             state.mode == .production_data_plane_graph_stale_snapshot_retry_exhaustion or
             state.mode == .production_data_plane_graph_split or
@@ -1452,6 +1491,19 @@ pub const Scenario = struct {
                 cluster.?.graph_hydration_started_count == 2 and
                 cluster.?.graph_hydration_fanout_started_count == 2 and
                 cluster.?.graph_hydration_completed_count == 1));
+        try sink.check(allocator, production_graph_cancellation_transport_id, !state.complete or
+            state.mode.? != .production_data_plane_graph_cancellation_transport_failure or
+            (cluster != null and cluster.?.graph_cancellation_ok and
+                cluster.?.graph_cancellation_requested and
+                cluster.?.graph_cancellation_observed and
+                cluster.?.graph_cancellation_recovered and
+                cluster.?.graph_cancellation_fault_injected and
+                cluster.?.graph_cancellation_fault_observed and
+                cluster.?.graph_cancellation_fault_matches > 0 and
+                cluster.?.graph_cancellation_fault_healed and
+                cluster.?.graph_hydration_started_count == 2 and
+                cluster.?.graph_hydration_fanout_started_count == 2 and
+                cluster.?.graph_hydration_completed_count == 1));
         try sink.check(allocator, production_graph_authorization_id, !state.complete or
             state.mode.? != .production_data_plane_graph_inflight_authorization_revocation or
             (cluster != null and cluster.?.graph_authorization_ok and
@@ -1554,6 +1606,7 @@ fn runExactMode(
     const production_service_rate_mode = mode_id == Scenario.mode_ids[Scenario.production_service_rate_ordinal];
     const production_graph_hydration_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_hydration_ordinal];
     const production_graph_cancellation_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_cancellation_ordinal];
+    const production_graph_cancellation_transport_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_cancellation_transport_ordinal];
     const production_graph_inflight_authorization_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_authorization_ordinal];
     const production_graph_stale_snapshot_mode = mode_id == Scenario.mode_ids[Scenario.production_graph_stale_snapshot_ordinal];
     const production_mode = production_baseline_mode or production_graph_mode or
@@ -1563,7 +1616,8 @@ fn runExactMode(
         production_join_split_mode or production_durable_join_takeover_mode or
         production_graph_split_overlapping_faults_mode or production_graph_split_socket_pressure_mode or
         production_service_rate_mode or production_graph_hydration_mode or
-        production_graph_cancellation_mode or production_graph_inflight_authorization_mode or
+        production_graph_cancellation_mode or production_graph_cancellation_transport_mode or
+        production_graph_inflight_authorization_mode or
         production_graph_stale_snapshot_mode;
     // Fault extensions of the promoted graph/split history keep its
     // cooperative scheduling seed. The prefixed mode remains distinct replay
@@ -1583,7 +1637,7 @@ fn runExactMode(
         Scenario.production_graph_ordinal
     else if (production_graph_hydration_mode)
         Scenario.production_graph_ordinal
-    else if (production_graph_cancellation_mode)
+    else if (production_graph_cancellation_mode or production_graph_cancellation_transport_mode)
         Scenario.production_graph_ordinal
     else if (production_graph_inflight_authorization_mode)
         Scenario.production_graph_ordinal
@@ -1603,7 +1657,9 @@ fn runExactMode(
         .resource_budget = if (production_mode) 256 else 96,
         .backend_ids = &backend_ids,
         .source_revision = if (production_mode)
-            (if (production_graph_inflight_authorization_mode)
+            (if (production_graph_cancellation_transport_mode)
+                "full-cluster-vopr-v29-graph-cancellation-transport-failure"
+            else if (production_graph_inflight_authorization_mode)
                 "full-cluster-vopr-v27-graph-inflight-authorization"
             else if (production_graph_stale_snapshot_mode)
                 "full-cluster-vopr-v28-graph-stale-snapshot"
@@ -1896,6 +1952,19 @@ test "full cluster production public graph cancellation exact replay" {
         Scenario.mode_ids[ordinal],
         ordinal,
         110_000,
+        .complete,
+    );
+}
+
+test "full cluster production public graph cancellation under transport fault exact replay" {
+    var history_allocator: FixtureAllocator = .init;
+    defer std.debug.assert(history_allocator.deinit() == .ok);
+    const ordinal = Scenario.production_graph_cancellation_transport_ordinal;
+    try runExactMode(
+        history_allocator.allocator(),
+        Scenario.mode_ids[ordinal],
+        ordinal,
+        140_000,
         .complete,
     );
 }
