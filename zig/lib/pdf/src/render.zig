@@ -1125,6 +1125,22 @@ fn coveragePreservingBilevelSample(
         if (bilevel_sample_budget == null or bilevel_sample_budget.?.reserve(source_samples))
             return try boxFilteredBilevelSample(run, footprint, cancellation);
     }
+    if (run.bilevel_fallback) |fallback| {
+        // The summary represents average coverage over the source image, not
+        // over this destination pixel. Use it only when the transformed image
+        // is wholly inside the pixel, and scale its alpha by the transformed
+        // image area. Otherwise a tiny mask could become a fully opaque blob.
+        if (imageContainedByDestinationPixel(run, world_x, world_y)) {
+            const image_area = std.math.clamp(@abs(run.a * run.d - run.b * run.c), 0.0, 1.0);
+            // This is exact for the full-image contribution: the cached color
+            // is alpha-weighted over the source and the determinant is its
+            // area in destination pixels. Returning it directly also avoids a
+            // single adaptive probe turning a tiny image fully opaque.
+            var covered = fallback;
+            covered[3] = channelByte(@as(f64, @floatFromInt(fallback[3])) * image_area);
+            return covered;
+        }
+    }
     const desired_adaptive_samples: u64 = @as(u64, @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_x - footprint.min_x))))) *
         @as(u64, @intFromFloat(@min(16.0, @max(1.0, @ceil(footprint.max_y - footprint.min_y)))));
     const granted_samples = if (bilevel_sample_budget) |budget|
@@ -1134,17 +1150,26 @@ fn coveragePreservingBilevelSample(
     // Every adaptive probe is charged to the shared page budget. Once it is
     // empty, one deterministic center probe is the O(1) per-destination-pixel
     // floor, so repeated XObjects cannot recover an unbounded source scan.
-    var sample = try adaptiveAffineBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, footprint, granted_samples, cancellation);
-    if (run.bilevel_fallback) |fallback| {
-        const covers_source = footprint.min_x <= 0.5 and footprint.min_y <= 0.5 and
-            footprint.max_x >= @as(f64, @floatFromInt(run.width)) - 0.5 and
-            footprint.max_y >= @as(f64, @floatFromInt(run.height)) - 0.5;
-        if (covers_source) {
-            for (0..3) |channel| sample[channel] = @min(sample[channel], fallback[channel]);
-            sample[3] = @max(sample[3], fallback[3]);
-        }
+    return try adaptiveAffineBilevelSample(run, world_x, world_y, inv_a, inv_b, inv_c, inv_d, footprint, granted_samples, cancellation);
+}
+
+fn imageContainedByDestinationPixel(run: reader.ImageRun, world_x: f64, world_y: f64) bool {
+    const min_x = world_x - 0.5;
+    const max_x = world_x + 0.5;
+    const min_y = world_y - 0.5;
+    const max_y = world_y + 0.5;
+    const corners = [_][2]f64{
+        .{ 0, 0 },
+        .{ 1, 0 },
+        .{ 0, 1 },
+        .{ 1, 1 },
+    };
+    for (corners) |corner| {
+        const x = run.e + run.a * corner[0] + run.c * corner[1];
+        const y = run.f + run.b * corner[0] + run.d * corner[1];
+        if (!finite(x) or !finite(y) or x < min_x or x > max_x or y < min_y or y > max_y) return false;
     }
-    return sample;
+    return true;
 }
 
 fn bilinearImageSample(run: reader.ImageRun, u: f64, v: f64) [4]u8 {
@@ -3635,7 +3660,7 @@ test "OCR bilevel area filter retains thin rules beyond four-to-one minification
     try std.testing.expectEqual(@as(u8, 0xff), canvas[3]);
 }
 
-test "OCR bilevel exact integration degrades when the shared page budget is exhausted" {
+test "OCR bilevel exact integration uses cached full-source summary when unaffordable" {
     var rgba = [_]u8{0xff} ** (1024 * 4);
     rgba[511 * 4] = 0;
     rgba[511 * 4 + 1] = 0;
@@ -3660,11 +3685,36 @@ test "OCR bilevel exact integration degrades when the shared page budget is exha
     };
     var budget = BilevelSampleBudget{ .remaining_samples = 8 };
     const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 1, 0, 0, 1, .{}, &budget);
-    try std.testing.expectEqual(@as(u64, 0), budget.remaining_samples);
+    try std.testing.expectEqual(@as(u64, 8), budget.remaining_samples);
     try std.testing.expectEqual(@as(u8, 0xfe), sample[0]);
     try std.testing.expectEqual(sample[0], sample[1]);
     try std.testing.expectEqual(sample[0], sample[2]);
     try std.testing.expectEqual(@as(u8, 0xff), sample[3]);
+}
+
+test "OCR bilevel fallback scales alpha by transformed source coverage" {
+    var rgba = [_]u8{ 0, 0, 0, 0xff };
+    const run: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 1,
+        .height = 1,
+        .bilevel = true,
+        .bilevel_fallback = .{ 0, 0, 0, 0xff },
+        .ocr_coverage_minify = true,
+        .a = 0.1,
+        .b = 0,
+        .c = 0,
+        .d = 0.1,
+        .e = 0.1,
+        .f = 0.1,
+        .x = 0.1,
+        .y = 0.1,
+        .draw_width = 0.1,
+        .draw_height = 0.1,
+    };
+    var budget = BilevelSampleBudget{ .remaining_samples = 0 };
+    const sample = try coveragePreservingBilevelSample(run, 0.5, 0.5, 10, 0, 0, 10, .{}, &budget);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 3 }, &sample);
 }
 
 test "legacy shape raster path observes cancellation" {

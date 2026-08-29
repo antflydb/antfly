@@ -5609,6 +5609,11 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
             units[idx].ocr_attempted = true;
             if (std.mem.eql(u8, route_type, "pdf")) {
                 units[idx].ocr_render_dpi = config.ocr_render_dpi;
+                // Parsing and each page render receive independent wall-clock
+                // budgets. Batch/provider latency between pages must not make
+                // the next native render inherit an already-expired deadline.
+                pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(runtime.syncWaitTimeoutMs());
+                pdf_session.?.setCancellationProbe(pdf_render_deadline.?.probe());
                 const render_started_ns = runtime.config.clock.nowRealtimeNs();
                 const rendered_page = pdf_session.?.renderPagePngAdaptiveAlloc(working_alloc, unit.page_number orelse 1, config.ocr_render_dpi, config.ocr_max_rendered_pixels, config.ocr_max_rendered_dimension) catch |err| {
                     logRuntimeOcrRenderProfile(runtime, source_fingerprint, unit.page_number, config.ocr_render_dpi, null, null, null, null, render_started_ns, @errorName(err));

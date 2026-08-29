@@ -171,6 +171,7 @@ fn renderParsedPagePngNativeAlloc(
     defer render_runs.deinit(reader_alloc);
     try parsed.checkCancellation();
     if (profile == .ocr) {
+        try reader.prepareOcrBilevelFallbacksAlloc(reader_alloc, render_runs.image_runs, parsed.cancellationProbe());
         for (render_runs.image_runs) |*run| run.ocr_coverage_minify = run.bilevel;
     }
     scalePageRenderRuns(&render_runs, scale);

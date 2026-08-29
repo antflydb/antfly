@@ -21,6 +21,15 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+pub const CancellationProbe = struct {
+    context: ?*const anyopaque = null,
+    is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
+
+    pub fn check(self: CancellationProbe) !void {
+        if (self.is_cancelled_fn) |is_cancelled| if (is_cancelled(self.context)) return error.Canceled;
+    }
+};
+
 /// Tracks every live allocation made while decoding. The wrapper delegates
 /// allocations directly to `backing`, so the final page allocation can be
 /// detached and returned to the caller without a copy.
@@ -88,8 +97,14 @@ const WorkingSetAllocator = struct {
 
 const DecodeWorkBudget = struct {
     remaining: u64,
+    cancellation: CancellationProbe = .{},
+
+    fn checkCancellation(self: *const DecodeWorkBudget) !void {
+        try self.cancellation.check();
+    }
 
     fn charge(self: *DecodeWorkBudget, units: u64) !void {
+        try self.checkCancellation();
         if (units > self.remaining) return error.Jbig2WorkLimitExceeded;
         self.remaining -= units;
     }
@@ -186,6 +201,7 @@ const Bitmap = struct {
         try work.chargePixels(x_clip.len, y_clip.len);
         var row: u32 = 0;
         while (row < y_clip.len) : (row += 1) {
+            try work.checkCancellation();
             const sy = y_clip.source_start + row;
             const ty = y_clip.target_start + row;
             var column: u32 = 0;
@@ -466,6 +482,7 @@ fn decodeGenericBitmap(alloc: Allocator, work: *DecodeWorkBudget, arith: *Arithm
     errdefer bitmap.deinit(alloc);
     var y: u32 = 0;
     while (y < height) : (y += 1) {
+        try work.checkCancellation();
         var x: u32 = 0;
         while (x < width) : (x += 1) {
             const ix: i64 = x;
@@ -551,6 +568,7 @@ fn decodeRefinement0(alloc: Allocator, work: *DecodeWorkBudget, arith: *Arithmet
     errdefer bitmap.deinit(alloc);
     var y: u32 = 0;
     while (y < height) : (y += 1) {
+        try work.checkCancellation();
         var x: u32 = 0;
         while (x < width) : (x += 1) {
             const ix: i64 = x;
@@ -655,6 +673,7 @@ fn decodeTextRegion(alloc: Allocator, work: *DecodeWorkBudget, arith: *Arithmeti
     var first_s: i64 = 0;
     var count: u32 = 0;
     while (count < params.instances) {
+        try work.checkCancellation();
         const count_before_strip = count;
         const dt = try decodeInteger(arith, int_ctx.dt) orelse return error.InvalidJbig2Integer;
         strip_t += dt * strips;
@@ -1127,13 +1146,27 @@ pub fn decodeAlloc(
     max_work_units: u64,
     expected_dimensions: ?ExpectedDimensions,
 ) !Decoded {
+    return decodeAllocWithCancellation(alloc, globals, bytes, max_output_bytes, max_working_set_bytes, max_work_units, expected_dimensions, .{});
+}
+
+pub fn decodeAllocWithCancellation(
+    alloc: Allocator,
+    globals: ?[]const u8,
+    bytes: []const u8,
+    max_output_bytes: usize,
+    max_working_set_bytes: usize,
+    max_work_units: u64,
+    expected_dimensions: ?ExpectedDimensions,
+    cancellation: CancellationProbe,
+) !Decoded {
+    try cancellation.check();
     if (max_output_bytes == 0) return error.Jbig2ImageTooLarge;
     if (max_working_set_bytes == 0) return error.Jbig2WorkingSetTooLarge;
     if (max_work_units == 0) return error.Jbig2WorkLimitExceeded;
     const input_bytes = std.math.add(usize, bytes.len, if (globals) |value| value.len else 0) catch return error.Jbig2WorkingSetTooLarge;
     if (input_bytes >= max_working_set_bytes) return error.Jbig2WorkingSetTooLarge;
     var budget = WorkingSetAllocator{ .backing = alloc, .live_bytes = input_bytes, .max_live_bytes = max_working_set_bytes };
-    var work = DecodeWorkBudget{ .remaining = max_work_units };
+    var work = DecodeWorkBudget{ .remaining = max_work_units, .cancellation = cancellation };
     var decoder = Decoder{ .alloc = budget.allocator(), .work = &work, .max_bytes = max_output_bytes, .expected_dimensions = expected_dimensions };
     defer decoder.deinit();
     if (globals) |global_bytes| decoder.decodeStream(global_bytes) catch |err| {
@@ -1162,6 +1195,18 @@ test "arithmetic decoder matches Annex E context transitions" {
     for (0..16) |_| bits = (bits << 1) | try decoder.decode(&contexts, 0);
     try std.testing.expectEqual(@as(u16, 2), bits);
     try std.testing.expect(contexts[0] != 0);
+}
+
+test "decoder rejects an already-cancelled request before allocation" {
+    const Cancelled = struct {
+        fn check(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    try std.testing.expectError(
+        error.Canceled,
+        decodeAllocWithCancellation(std.testing.allocator, null, &.{}, 1024, 4096, 4096, null, .{ .is_cancelled_fn = Cancelled.check }),
+    );
 }
 
 test "bitmap composition clips work to visible pixels" {

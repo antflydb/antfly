@@ -19,6 +19,7 @@ const codeblock = @import("codeblock.zig");
 const codestream = @import("codestream.zig");
 const color = @import("color.zig");
 const color_transform = @import("color_transform.zig");
+const decode_control = @import("decode_control.zig");
 const packet = @import("packet.zig");
 const reconstruct = @import("reconstruct.zig");
 const tier1_encode = @import("tier1_encode.zig");
@@ -292,16 +293,23 @@ pub fn decodeHeader(allocator: std.mem.Allocator, path: []const u8) !Header {
 }
 
 pub fn decodeHeaderBytes(allocator: std.mem.Allocator, bytes: []const u8) !Header {
+    return decodeHeaderBytesWithCancellation(allocator, bytes, .{});
+}
+
+pub fn decodeHeaderBytesWithCancellation(allocator: std.mem.Allocator, bytes: []const u8, cancellation: decode_control.CancellationProbe) !Header {
+    try cancellation.check();
     if (box.hasSignature(bytes)) {
         const parsed = try box.parse(bytes);
         if (parsed.codestream_offset == null) return error.MissingCodestreamBox;
         var state = try codestream.parseState(allocator, bytes[parsed.codestream_offset.?..]);
         defer state.deinit(allocator);
+        try cancellation.check();
         return fromCodestream(.jp2, &state);
     }
     if (codestream.hasSoc(bytes)) {
         var state = try codestream.parseState(allocator, bytes);
         defer state.deinit(allocator);
+        try cancellation.check();
         return fromCodestream(.j2k, &state);
     }
     return error.UnsupportedImageFormat;
@@ -314,6 +322,11 @@ pub fn decodeU8(allocator: std.mem.Allocator, path: []const u8) !DecodedImage {
 }
 
 pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedImage {
+    return decodeU8BytesWithCancellation(allocator, bytes, .{});
+}
+
+pub fn decodeU8BytesWithCancellation(allocator: std.mem.Allocator, bytes: []const u8, cancellation: decode_control.CancellationProbe) !DecodedImage {
+    try cancellation.check();
     var jp2_color = Jp2ColorMetadata{};
     const codestream_bytes = if (box.hasSignature(bytes)) blk: {
         var parsed = try box.parseOwned(allocator, bytes);
@@ -328,8 +341,9 @@ pub fn decodeU8Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedIm
 
     var state = try codestream.parseState(allocator, codestream_bytes);
     defer state.deinit(allocator);
+    try cancellation.check();
 
-    return decodeU8BytesFromState(allocator, codestream_bytes, &state, jp2_color);
+    return decodeU8BytesFromState(allocator, codestream_bytes, &state, jp2_color, cancellation);
 }
 
 fn decodeU8BytesFromState(
@@ -337,7 +351,9 @@ fn decodeU8BytesFromState(
     codestream_bytes: []const u8,
     state: *const codestream.State,
     jp2_color: Jp2ColorMetadata,
+    cancellation: decode_control.CancellationProbe,
 ) !DecodedImage {
+    try cancellation.check();
     _ = state.coding_style orelse return error.MissingCodingStyle;
 
     if (state.fullNativeDecodeSupport() != .supported) return error.UnsupportedNativeDecode;
@@ -348,7 +364,9 @@ fn decodeU8BytesFromState(
 
     // Standard JPEG 2000 decode path with canonical policies.
     if (state.header.uses_multiple_tiles) {
-        const pixels = try decodeMultiTile(allocator, codestream_bytes, state);
+        const pixels = try decodeMultiTile(allocator, codestream_bytes, state, cancellation);
+        errdefer allocator.free(pixels);
+        try cancellation.check();
         return .{
             .allocator = allocator,
             .width = state.header.width,
@@ -367,14 +385,16 @@ fn decodeU8BytesFromState(
     // order. Keep the optimized raw-plane path below for the common 1:1 case.
     if (hasSubsampledComponents(state)) {
         const pixels = if (state.header.components[0].bits_per_component == 8) blk: {
-            var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, state, 0);
+            var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, state, 0, cancellation);
             defer component_planes.deinit(allocator);
             break :blk try reconstruct.interleaveComponentSamplesU8(allocator, &component_planes, state);
         } else blk: {
-            var component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, state, 0);
+            var component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, state, 0, cancellation);
             defer component_planes.deinit(allocator);
             break :blk try reconstruct.interleaveNativeComponentSamplesU8(allocator, &component_planes, state);
         };
+        errdefer allocator.free(pixels);
+        try cancellation.check();
         return .{
             .allocator = allocator,
             .width = state.header.width,
@@ -415,14 +435,14 @@ fn decodeU8BytesFromState(
 
     const policy = policiesForState(&decode_state);
     const pixels = if (try reconstruct.StreamingPlaneAssembler.canAssemble(&decode_state)) blk: {
-        const planes = try decodeStreamingRawPlanes(allocator, &packet_model, payload_info.payload, &decode_state, policy, 0);
+        const planes = try decodeStreamingRawPlanes(allocator, &packet_model, payload_info.payload, &decode_state, policy, 0, cancellation);
         defer {
             for (planes) |plane| allocator.free(plane);
             allocator.free(planes);
         }
         break :blk try reconstruct.interleaveComponentPlanesU8(allocator, &decode_state, planes);
     } else blk: {
-        var execution = try packet.executeTier1SegmentsForState(
+        var execution = try packet.executeTier1SegmentsForStateWithCancellation(
             allocator,
             &packet_model,
             payload_info.payload,
@@ -432,6 +452,7 @@ fn decodeU8BytesFromState(
             policy.magnitude,
             0,
             .standard,
+            cancellation,
         );
         defer execution.deinit(allocator);
         const reconstruction = try reconstruct.reconstructTier1ExecutionReportWithOptions(
@@ -441,6 +462,8 @@ fn decodeU8BytesFromState(
             false,
             false,
         );
+        errdefer allocator.free(reconstruction.pixels);
+        try cancellation.check();
         break :blk reconstruction.pixels;
     };
     return .{
@@ -459,7 +482,12 @@ fn decodeU8BytesFromState(
 /// equal-grid component planes are interleaved directly, avoiding a full-size
 /// presentation buffer when a PDF renderer needs only page-raster resolution.
 pub fn decodeU8BytesAtResolution(allocator: std.mem.Allocator, bytes: []const u8, requested_discard_levels: u8) !DecodedImage {
-    if (requested_discard_levels == 0) return decodeU8Bytes(allocator, bytes);
+    return decodeU8BytesAtResolutionWithCancellation(allocator, bytes, requested_discard_levels, .{});
+}
+
+pub fn decodeU8BytesAtResolutionWithCancellation(allocator: std.mem.Allocator, bytes: []const u8, requested_discard_levels: u8, cancellation: decode_control.CancellationProbe) !DecodedImage {
+    if (requested_discard_levels == 0) return decodeU8BytesWithCancellation(allocator, bytes, cancellation);
+    try cancellation.check();
 
     var jp2_color = Jp2ColorMetadata{};
     const codestream_bytes = if (box.hasSignature(bytes)) blk: {
@@ -475,16 +503,18 @@ pub fn decodeU8BytesAtResolution(allocator: std.mem.Allocator, bytes: []const u8
 
     var state = try codestream.parseState(allocator, codestream_bytes);
     defer state.deinit(allocator);
+    try cancellation.check();
     _ = state.coding_style orelse return error.MissingCodingStyle;
     const discard_levels = @min(requested_discard_levels, minimumDecompositionLevels(&state));
     if (discard_levels == 0)
-        return decodeU8BytesFromState(allocator, codestream_bytes, &state, jp2_color);
+        return decodeU8BytesFromState(allocator, codestream_bytes, &state, jp2_color, cancellation);
     if (state.header.uses_multiple_tiles) return error.UnsupportedReducedMultiTileDecode;
     if (state.fullNativeDecodeSupport() != .supported) return error.UnsupportedNativeDecode;
     try reconstruct.requireHomogeneousComponents(&state.header);
 
-    var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, discard_levels);
+    var component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, discard_levels, cancellation);
     defer component_planes.deinit(allocator);
+    try cancellation.check();
     if (component_planes.planes.len == 0 or component_planes.planes.len > 5)
         return error.UnsupportedPlaneCount;
     const width = component_planes.widths[0];
@@ -500,6 +530,7 @@ pub fn decodeU8BytesAtResolution(allocator: std.mem.Allocator, bytes: []const u8
     const pixels = try allocator.alloc(u8, output_len);
     errdefer allocator.free(pixels);
     for (0..pixel_count) |pixel_index| {
+        if (pixel_index & 4095 == 0) try cancellation.check();
         for (component_planes.planes, 0..) |plane, component_index|
             pixels[pixel_index * component_planes.planes.len + component_index] = plane[pixel_index];
     }
@@ -538,9 +569,9 @@ pub fn decodeComponentPlanesU8BytesAtResolution(allocator: std.mem.Allocator, by
     if (discard_levels > 0 and state.header.uses_multiple_tiles) return error.UnsupportedReducedMultiTileDecode;
 
     var component_planes = if (state.header.uses_multiple_tiles)
-        try reconstructComponentPlanesU8FromPlanes(allocator, try decodeMultiTileComponentPlanesU8(allocator, codestream_bytes, &state), &state)
+        try reconstructComponentPlanesU8FromPlanes(allocator, try decodeMultiTileComponentPlanesU8(allocator, codestream_bytes, &state, .{}), &state)
     else
-        try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, discard_levels);
+        try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, &state, discard_levels, .{});
     errdefer component_planes.deinit(allocator);
 
     const widths = try usizeDimensionsToU32(allocator, component_planes.widths);
@@ -584,9 +615,9 @@ pub fn decodeComponentPlanesU16BytesAtResolution(allocator: std.mem.Allocator, b
     if (discard_levels > 0 and state.header.uses_multiple_tiles) return error.UnsupportedReducedMultiTileDecode;
 
     var component_planes = if (state.header.uses_multiple_tiles)
-        try reconstructComponentPlanesU16FromPlanes(allocator, try decodeMultiTileComponentPlanesU16(allocator, codestream_bytes, &state), &state)
+        try reconstructComponentPlanesU16FromPlanes(allocator, try decodeMultiTileComponentPlanesU16(allocator, codestream_bytes, &state, .{}), &state)
     else
-        try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, &state, discard_levels);
+        try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, &state, discard_levels, .{});
     errdefer component_planes.deinit(allocator);
 
     const widths = try usizeDimensionsToU32(allocator, component_planes.widths);
@@ -631,6 +662,11 @@ fn componentPlanesU8DecodeSupport(state: *const codestream.State) NativeDecodeSu
 }
 
 pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedImageU16 {
+    return decodeU16BytesWithCancellation(allocator, bytes, .{});
+}
+
+pub fn decodeU16BytesWithCancellation(allocator: std.mem.Allocator, bytes: []const u8, cancellation: decode_control.CancellationProbe) !DecodedImageU16 {
+    try cancellation.check();
     var jp2_color = Jp2ColorMetadata{};
     const codestream_bytes = if (box.hasSignature(bytes)) blk: {
         var parsed = try box.parseOwned(allocator, bytes);
@@ -645,6 +681,7 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
 
     var state = try codestream.parseState(allocator, codestream_bytes);
     defer state.deinit(allocator);
+    try cancellation.check();
 
     const full_support = state.fullNativeDecodeSupport();
     if (full_support != .supported) return error.UnsupportedNativeDecode;
@@ -656,7 +693,9 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
     _ = state.coding_style orelse return error.MissingCodingStyle;
 
     if (state.header.uses_multiple_tiles) {
-        const pixels = try decodeMultiTileU16(allocator, codestream_bytes, &state);
+        const pixels = try decodeMultiTileU16(allocator, codestream_bytes, &state, cancellation);
+        errdefer allocator.free(pixels);
+        try cancellation.check();
         return .{
             .allocator = allocator,
             .width = state.header.width,
@@ -696,7 +735,7 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
     defer packet_model.deinit(allocator);
 
     const policy = policiesForState(&decode_state);
-    var execution = try packet.executeTier1SegmentsForState(
+    var execution = try packet.executeTier1SegmentsForStateWithCancellation(
         allocator,
         &packet_model,
         payload_info.payload,
@@ -706,6 +745,7 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
         policy.magnitude,
         0,
         .standard,
+        cancellation,
     );
     defer execution.deinit(allocator);
 
@@ -715,11 +755,14 @@ pub fn decodeU16Bytes(allocator: std.mem.Allocator, bytes: []const u8) !DecodedI
         &execution,
     );
     defer component_planes.deinit(allocator);
+    try cancellation.check();
     const pixels = try reconstruct.interleaveComponentPlanesU16(
         allocator,
         &component_planes,
         &state,
     );
+    errdefer allocator.free(pixels);
+    try cancellation.check();
     return .{
         .allocator = allocator,
         .width = state.header.width,
@@ -853,7 +896,9 @@ fn decodeStreamingRawPlanes(
     state: *const codestream.State,
     policy: Tier1Policy,
     discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
 ) ![][]i32 {
+    try cancellation.check();
     var assembler = try reconstruct.StreamingPlaneAssembler.initAtResolution(allocator, state, discard_levels);
     defer assembler.deinit();
     const Visitor = struct {
@@ -862,7 +907,7 @@ fn decodeStreamingRawPlanes(
             try plane_assembler.appendCodeblock(codeblock_state);
         }
     };
-    try packet.visitTier1CodeblocksForState(
+    try packet.visitTier1CodeblocksForStateWithCancellation(
         allocator,
         packet_model,
         payload,
@@ -873,6 +918,7 @@ fn decodeStreamingRawPlanes(
         0,
         .standard,
         .{ .context = &assembler, .visit = Visitor.visit },
+        cancellation,
     );
     return assembler.finish(discard_levels);
 }
@@ -882,7 +928,7 @@ fn decodeSingleTileComponentPlanesU8(
     codestream_bytes: []const u8,
     state: *const codestream.State,
 ) ![][]u8 {
-    const component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, state, 0);
+    const component_planes = try decodeSingleTileComponentPlanesU8AtResolution(allocator, codestream_bytes, state, 0, .{});
     allocator.free(component_planes.widths);
     allocator.free(component_planes.heights);
     return component_planes.planes;
@@ -893,7 +939,9 @@ fn decodeSingleTileComponentPlanesU8AtResolution(
     codestream_bytes: []const u8,
     state: *const codestream.State,
     discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
 ) !reconstruct.ComponentPlanesU8 {
+    try cancellation.check();
     const packed_headers = try collectPackedPacketHeaders(allocator, state, 1, null);
     defer freePackedPacketHeaders(allocator, packed_headers);
 
@@ -930,6 +978,7 @@ fn decodeSingleTileComponentPlanesU8AtResolution(
             &decode_state,
             policy,
             discard_levels,
+            cancellation,
         );
         defer {
             for (raw_planes) |plane| allocator.free(plane);
@@ -943,7 +992,7 @@ fn decodeSingleTileComponentPlanesU8AtResolution(
         );
     }
 
-    var execution = try packet.executeTier1SegmentsForState(
+    var execution = try packet.executeTier1SegmentsForStateWithCancellation(
         allocator,
         &packet_model,
         payload_info.payload,
@@ -953,6 +1002,7 @@ fn decodeSingleTileComponentPlanesU8AtResolution(
         policy.magnitude,
         0,
         .standard,
+        cancellation,
     );
     defer execution.deinit(allocator);
 
@@ -964,7 +1014,7 @@ fn decodeSingleTileComponentPlanesU16(
     codestream_bytes: []const u8,
     state: *const codestream.State,
 ) ![][]u16 {
-    const component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, state, 0);
+    const component_planes = try decodeSingleTileComponentPlanesU16AtResolution(allocator, codestream_bytes, state, 0, .{});
     allocator.free(component_planes.widths);
     allocator.free(component_planes.heights);
     return component_planes.planes;
@@ -975,7 +1025,9 @@ fn decodeSingleTileComponentPlanesU16AtResolution(
     codestream_bytes: []const u8,
     state: *const codestream.State,
     discard_levels: u8,
+    cancellation: decode_control.CancellationProbe,
 ) !reconstruct.ComponentPlanesU16 {
+    try cancellation.check();
     const packed_headers = try collectPackedPacketHeaders(allocator, state, 1, null);
     defer freePackedPacketHeaders(allocator, packed_headers);
 
@@ -1012,6 +1064,7 @@ fn decodeSingleTileComponentPlanesU16AtResolution(
             &decode_state,
             policy,
             discard_levels,
+            cancellation,
         );
         defer {
             for (raw_planes) |plane| allocator.free(plane);
@@ -1025,7 +1078,7 @@ fn decodeSingleTileComponentPlanesU16AtResolution(
         );
     }
 
-    var execution = try packet.executeTier1SegmentsForState(
+    var execution = try packet.executeTier1SegmentsForStateWithCancellation(
         allocator,
         &packet_model,
         payload_info.payload,
@@ -1035,6 +1088,7 @@ fn decodeSingleTileComponentPlanesU16AtResolution(
         policy.magnitude,
         0,
         .standard,
+        cancellation,
     );
     defer execution.deinit(allocator);
 
@@ -1045,7 +1099,9 @@ fn decodeMultiTileComponentPlanesU8(
     allocator: std.mem.Allocator,
     codestream_bytes: []const u8,
     state: *const codestream.State,
+    cancellation: decode_control.CancellationProbe,
 ) ![][]u8 {
+    try cancellation.check();
     const num_components = state.header.components.len;
 
     const component_widths = try allocator.alloc(usize, num_components);
@@ -1101,6 +1157,7 @@ fn decodeMultiTileComponentPlanesU8(
     }
 
     for (tile_payloads, 0..) |tr, tile_idx| {
+        try cancellation.check();
         const tile_bounds = tile_grid.tileBounds(@intCast(tile_idx));
         const this_tile_w = tile_bounds.width;
         const this_tile_h = tile_bounds.height;
@@ -1139,7 +1196,7 @@ fn decodeMultiTileComponentPlanesU8(
         defer packet_model.deinit(allocator);
 
         const policy = policiesForState(&tile_state);
-        var execution = try packet.executeTier1SegmentsForState(
+        var execution = try packet.executeTier1SegmentsForStateWithCancellation(
             allocator,
             &packet_model,
             tr.payload,
@@ -1149,6 +1206,7 @@ fn decodeMultiTileComponentPlanesU8(
             policy.magnitude,
             0,
             .standard,
+            cancellation,
         );
         defer execution.deinit(allocator);
 
@@ -1164,6 +1222,7 @@ fn decodeMultiTileComponentPlanesU8(
             const copy_h = component_planes.heights[c];
             var y: usize = 0;
             while (y < copy_h) : (y += 1) {
+                if (y & 255 == 0) try cancellation.check();
                 const dst_row = (comp_y0 + y) * component_widths[c] + comp_x0;
                 const src_row = y * copy_w;
                 @memcpy(out_planes[c][dst_row .. dst_row + copy_w], plane[src_row .. src_row + copy_w]);
@@ -1183,7 +1242,9 @@ fn decodeMultiTileComponentPlanesU16(
     allocator: std.mem.Allocator,
     codestream_bytes: []const u8,
     state: *const codestream.State,
+    cancellation: decode_control.CancellationProbe,
 ) ![][]u16 {
+    try cancellation.check();
     const num_components = state.header.components.len;
 
     const component_widths = try allocator.alloc(usize, num_components);
@@ -1239,6 +1300,7 @@ fn decodeMultiTileComponentPlanesU16(
     }
 
     for (tile_payloads, 0..) |tr, tile_idx| {
+        try cancellation.check();
         const tile_bounds = tile_grid.tileBounds(@intCast(tile_idx));
         const this_tile_w = tile_bounds.width;
         const this_tile_h = tile_bounds.height;
@@ -1277,7 +1339,7 @@ fn decodeMultiTileComponentPlanesU16(
         defer packet_model.deinit(allocator);
 
         const policy = policiesForState(&tile_state);
-        var execution = try packet.executeTier1SegmentsForState(
+        var execution = try packet.executeTier1SegmentsForStateWithCancellation(
             allocator,
             &packet_model,
             tr.payload,
@@ -1287,6 +1349,7 @@ fn decodeMultiTileComponentPlanesU16(
             policy.magnitude,
             0,
             .standard,
+            cancellation,
         );
         defer execution.deinit(allocator);
 
@@ -1302,6 +1365,7 @@ fn decodeMultiTileComponentPlanesU16(
             const copy_h = component_planes.heights[c];
             var y: usize = 0;
             while (y < copy_h) : (y += 1) {
+                if (y & 255 == 0) try cancellation.check();
                 const dst_row = (comp_y0 + y) * component_widths[c] + comp_x0;
                 const src_row = y * copy_w;
                 @memcpy(out_planes[c][dst_row .. dst_row + copy_w], plane[src_row .. src_row + copy_w]);
@@ -1323,11 +1387,12 @@ fn decodeMultiTile(
     allocator: std.mem.Allocator,
     codestream_bytes: []const u8,
     state: *const codestream.State,
+    cancellation: decode_control.CancellationProbe,
 ) ![]u8 {
     if (state.header.components[0].bits_per_component == 8) {
         var component_planes = try reconstructComponentPlanesU8FromPlanes(
             allocator,
-            try decodeMultiTileComponentPlanesU8(allocator, codestream_bytes, state),
+            try decodeMultiTileComponentPlanesU8(allocator, codestream_bytes, state, cancellation),
             state,
         );
         defer component_planes.deinit(allocator);
@@ -1336,7 +1401,7 @@ fn decodeMultiTile(
 
     var component_planes = try reconstructComponentPlanesU16FromPlanes(
         allocator,
-        try decodeMultiTileComponentPlanesU16(allocator, codestream_bytes, state),
+        try decodeMultiTileComponentPlanesU16(allocator, codestream_bytes, state, cancellation),
         state,
     );
     defer component_planes.deinit(allocator);
@@ -1347,10 +1412,11 @@ fn decodeMultiTileU16(
     allocator: std.mem.Allocator,
     codestream_bytes: []const u8,
     state: *const codestream.State,
+    cancellation: decode_control.CancellationProbe,
 ) ![]u16 {
     var component_planes = try reconstructComponentPlanesU16FromPlanes(
         allocator,
-        try decodeMultiTileComponentPlanesU16(allocator, codestream_bytes, state),
+        try decodeMultiTileComponentPlanesU16(allocator, codestream_bytes, state, cancellation),
         state,
     );
     defer component_planes.deinit(allocator);
@@ -2013,6 +2079,29 @@ test "decode OpenJPEG header parsing for lossy J2K" {
     try std.testing.expectEqual(@as(u32, 16), header.width);
     try std.testing.expectEqual(@as(u32, 16), header.height);
     try std.testing.expectEqual(@as(u16, 1), header.components);
+}
+
+test "native decode observes cancellation inside tier-one scheduling" {
+    const allocator = std.testing.allocator;
+    const bytes = readTestFile(allocator, "testdata/image/jpeg2000/gray_16x16_lossless_3level.j2k") catch return;
+    defer allocator.free(bytes);
+    const State = struct {
+        checks: usize = 0,
+
+        fn cancelled(context: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(context orelse return true)));
+            self.checks += 1;
+            // Initial parsing succeeds; cancellation is first observed by the
+            // bounded tier-one/codeblock scheduling path.
+            return self.checks >= 5;
+        }
+    };
+    var state = State{};
+    try std.testing.expectError(
+        error.Canceled,
+        decodeU8BytesWithCancellation(allocator, bytes, .{ .context = &state, .is_cancelled_fn = State.cancelled }),
+    );
+    try std.testing.expect(state.checks >= 5);
 }
 
 test "decode OpenJPEG flat128 8x8 (all zero coefficients)" {
