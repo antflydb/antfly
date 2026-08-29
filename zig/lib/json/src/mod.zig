@@ -281,14 +281,16 @@ test "parseFromSlice stays source-compatible with std.json callers" {
 
 test "generated OpenAPI object metadata preserves automatic SIMD admission" {
     const T = struct {
+        required_nullable: ?u32,
         optional_value: ?u32 = null,
 
         pub const antflyOpenApiFieldMetadata = .{
+            .{ "required_nullable", "required_nullable", false },
             .{ "optional_value", "optional_value", true },
         };
 
         pub fn jsonParse(_: Allocator, _: anytype, _: ParseOptions) !@This() {
-            return error.TestExpectedError;
+            return error.UnexpectedToken;
         }
     };
     const input = " " ** 256;
@@ -299,6 +301,24 @@ test "generated OpenAPI object metadata preserves automatic SIMD admission" {
     } else {
         try std.testing.expectEqual(Backend.stdlib, selection.selected);
         try std.testing.expectEqual(BackendSelectionReason.unsupported_target, selection.reason);
+    }
+
+    if (simdTargetSupported()) {
+        var parsed = try parseFromSliceWithConfig(
+            T,
+            std.testing.allocator,
+            "{\"required_nullable\":null}",
+            .{},
+            .{ .simd_min_input_len = 0 },
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(?u32, null), parsed.value.required_nullable);
+        try std.testing.expectEqual(@as(?u32, null), parsed.value.optional_value);
+
+        try std.testing.expectError(
+            error.MissingField,
+            parseFromSliceWithConfig(T, std.testing.allocator, "{}", .{}, .{ .simd_min_input_len = 0 }),
+        );
     }
 }
 

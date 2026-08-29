@@ -127,6 +127,38 @@ test "optional non-nullable properties reject explicit null without losing omiss
     );
 }
 
+test "required nullable presence remains distinct from optional non-nullable omission" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    try std.testing.expectError(error.MissingField, std.json.parseFromSliceLeaky(
+        types.MixedPresence,
+        alloc,
+        \\{}
+    ,
+        .{},
+    ));
+
+    const explicit_null = try std.json.parseFromSliceLeaky(
+        types.MixedPresence,
+        alloc,
+        \\{"required_nullable":null}
+    ,
+        .{},
+    );
+    try std.testing.expect(explicit_null.required_nullable == null);
+    try std.testing.expect(explicit_null.optional_non_nullable == null);
+
+    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSliceLeaky(
+        types.MixedPresence,
+        alloc,
+        \\{"required_nullable":null,"optional_non_nullable":null}
+    ,
+        .{},
+    ));
+}
+
 test "OpenAPI wire names remain distinct from ergonomic Zig field names" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -126,6 +126,18 @@
           }
         }
       },
+      "MixedPresence": {
+        "type": "object",
+        "required": ["required_nullable"],
+        "properties": {
+          "required_nullable": {
+            "type": ["string", "null"]
+          },
+          "optional_non_nullable": {
+            "type": "string"
+          }
+        }
+      },
       "Flexible": {
         "type": ["string", "integer", "null"],
         "description": "A lossless multi-type value whose helper name collides with a component"

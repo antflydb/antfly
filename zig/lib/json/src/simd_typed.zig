@@ -1062,7 +1062,11 @@ fn fillDefaults(comptime T: type, result: *T, seen: []bool) json.ParseFromValueE
             if (field.default_value_ptr) |ptr| {
                 const typed_ptr: *align(@alignOf(field.type)) const field.type = @ptrCast(@alignCast(ptr));
                 @field(result.*, field.name) = typed_ptr.*;
-            } else if (@typeInfo(field.type) == .optional) {
+            } else if (!hasOpenApiFieldMetadata(T) and @typeInfo(field.type) == .optional) {
+                // Preserve std.json's ordinary Zig-struct behavior. Generated
+                // OpenAPI structs encode property presence in the field
+                // default: an optional-typed field without a default is a
+                // required nullable property and must remain missing here.
                 @field(result.*, field.name) = null;
             } else {
                 return error.MissingField;
@@ -1358,27 +1362,38 @@ test "simd typed parser prefers allocation-light raw subtree parsers" {
 test "simd typed parser consumes generated OpenAPI field metadata without custom fallback" {
     const alloc = std.testing.allocator;
     const OpenApiObject = struct {
+        required_nullable: ?u32,
         optional_value: ?u32 = null,
 
         pub const antflyOpenApiFieldMetadata = .{
+            .{ "required_nullable", "required_nullable", false },
             .{ "wire.value", "optional_value", true },
         };
 
         pub fn jsonParse(_: Allocator, _: anytype, _: json.ParseOptions) !@This() {
-            return error.TestExpectedError;
+            return error.UnexpectedToken;
         }
     };
 
     try std.testing.expect(!containsCustomJsonParseType(OpenApiObject));
 
-    const valid = "{\"wire.value\":7}";
+    const valid = "{\"required_nullable\":null,\"wire.value\":7}";
     var valid_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, valid);
     defer valid_structural.deinit(alloc);
     var parsed = try parseFromSlice(OpenApiObject, alloc, valid, .{}, valid_structural);
     defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u32, null), parsed.value.required_nullable);
     try std.testing.expectEqual(@as(?u32, 7), parsed.value.optional_value);
 
-    const invalid = "{\"wire.value\":null}";
+    const missing_required = "{\"wire.value\":7}";
+    var missing_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, missing_required);
+    defer missing_structural.deinit(alloc);
+    try std.testing.expectError(
+        error.MissingField,
+        parseFromSliceLeaky(OpenApiObject, alloc, missing_required, .{}, missing_structural),
+    );
+
+    const invalid = "{\"required_nullable\":null,\"wire.value\":null}";
     var invalid_structural = try simd_stage1.buildStructuralIndexAlloc(alloc, invalid);
     defer invalid_structural.deinit(alloc);
     try std.testing.expectError(
