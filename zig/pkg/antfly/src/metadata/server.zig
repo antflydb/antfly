@@ -191,7 +191,10 @@ pub const MetadataServer = struct {
                 svc.raft.host.http_host.request_executor,
             );
             const incoming_graph_routes = try alloc.create(api_distributed_graph.IncomingSourceGroupCache);
-            incoming_graph_routes.* = api_distributed_graph.IncomingSourceGroupCache.init(alloc);
+            incoming_graph_routes.* = api_distributed_graph.IncomingSourceGroupCache.initWithDurableStore(
+                alloc,
+                cfg.api_server_cfg.incoming_graph_route_store,
+            );
             owned_incoming_graph_routes = incoming_graph_routes;
             _ = public_read_source.withIncomingGraphRoutes(incoming_graph_routes);
             _ = public_read_source.withInternalServiceAuth(

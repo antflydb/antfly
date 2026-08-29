@@ -29,6 +29,8 @@ const graph_node_identity = @import("../graph/node_identity.zig");
 const graph_pattern_mod = @import("../graph/pattern.zig");
 const graph_paths_mod = @import("../graph/paths.zig");
 const graph_traversal_mod = @import("../graph/traversal.zig");
+const backend_erased = @import("../storage/backend_erased.zig");
+const mem_backend = @import("../storage/mem_backend.zig");
 const doc_set = @import("../storage/db/doc_set.zig");
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
@@ -243,21 +245,74 @@ pub const IncomingSourceGroupsResponse = struct {
 
 /// Exact, generation-fenced coordinator directory for incoming graph routes.
 /// Source-owned reverse adjacency remains authoritative; a miss falls back to
-/// bounded exact probes and records their result. Keys include the complete
-/// topology/read-generation fence, so cached negatives and positives cannot
-/// cross a snapshot boundary. Memory is process-bounded and cache exhaustion
-/// drops old hints without affecting correctness.
+/// bounded exact probes and records their result. The bounded in-memory L1 may
+/// be backed by an engine-owned durable L2. Its fixed hash-slot keyspace bounds
+/// disk cardinality under adversarial high-cardinality negative lookups; each
+/// value carries the full logical-key digest and topology/read-generation
+/// fence, so collisions, stale observations, and corrupt records are misses.
+/// Eviction, restart, or persistence failures likewise degrade to exact probes
+/// rather than affecting query correctness.
 pub const IncomingSourceGroupCache = struct {
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
+    durable_mutex: std.atomic.Mutex = .unlocked,
+    durable_store: ?*backend_erased.Store = null,
     entries: std.StringHashMapUnmanaged([]u64) = .empty,
     resident_bytes: usize = 0,
+    durable_hits: std.atomic.Value(u64) = .init(0),
+    durable_misses: std.atomic.Value(u64) = .init(0),
+    durable_read_failures: std.atomic.Value(u64) = .init(0),
+    durable_write_failures: std.atomic.Value(u64) = .init(0),
 
     const max_resident_bytes: usize = 16 * 1024 * 1024;
     const max_entries: usize = 65_536;
+    const max_source_groups_per_key: usize = 65_536;
+    const durable_key_prefix = "\x00\x00__incoming_graph_route_v1__:";
+    const durable_value_magic = "IGR1";
+    const route_digest_len = std.crypto.hash.sha2.Sha256.digest_length;
+    const durable_slot_count: u32 = 1 << 20;
+    const DurableKey = [durable_key_prefix.len + @sizeOf(u32)]u8;
+    const durable_value_header_len = durable_value_magic.len + route_digest_len + route_digest_len + @sizeOf(u32);
+
+    pub const Stats = struct {
+        durable_hits: u64 = 0,
+        durable_misses: u64 = 0,
+        durable_read_failures: u64 = 0,
+        durable_write_failures: u64 = 0,
+    };
+
+    const NormalizedEntry = struct {
+        cache_key: []u8,
+        groups: []u64,
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            alloc.free(self.cache_key);
+            if (self.groups.len > 0) alloc.free(self.groups);
+            self.* = undefined;
+        }
+    };
 
     pub fn init(alloc: std.mem.Allocator) @This() {
         return .{ .alloc = alloc };
+    }
+
+    pub fn initWithDurableStore(alloc: std.mem.Allocator, durable_store: ?*backend_erased.Store) @This() {
+        return .{ .alloc = alloc, .durable_store = durable_store };
+    }
+
+    /// The store is borrowed and must outlive the cache. Attach it during
+    /// single-threaded runtime construction, before serving requests.
+    pub fn attachDurableStore(self: *@This(), durable_store: ?*backend_erased.Store) void {
+        self.durable_store = durable_store;
+    }
+
+    pub fn stats(self: *const @This()) Stats {
+        return .{
+            .durable_hits = self.durable_hits.load(.monotonic),
+            .durable_misses = self.durable_misses.load(.monotonic),
+            .durable_read_failures = self.durable_read_failures.load(.monotonic),
+            .durable_write_failures = self.durable_write_failures.load(.monotonic),
+        };
     }
 
     pub fn deinit(self: *@This()) void {
@@ -288,7 +343,8 @@ pub const IncomingSourceGroupCache = struct {
         }
         const has_read_fence = incomingRouteRequestHasReadFence(req);
         const fence = incomingRouteFence(table_name, req);
-        var complete = has_read_fence;
+        var missing = std.ArrayListUnmanaged(usize).empty;
+        defer missing.deinit(out_alloc);
         for (req.keys, 0..) |key, i| {
             const cache_key = try incomingRouteCacheKeyAlloc(out_alloc, fence, key);
             defer out_alloc.free(cache_key);
@@ -307,10 +363,40 @@ pub const IncomingSourceGroupCache = struct {
                 entries[i] = .{ .source_group_ids = groups, .complete = true };
             } else {
                 entries[i] = .{};
-                complete = false;
+                try missing.append(out_alloc, i);
             }
             initialized += 1;
         }
+        if (has_read_fence and self.durable_store != null and missing.items.len > 0) {
+            const durable = self.resolveDurableBatchAlloc(
+                out_alloc,
+                table_name,
+                req.index_name,
+                fence,
+                req.keys,
+                missing.items,
+            ) catch blk: {
+                _ = self.durable_read_failures.fetchAdd(1, .monotonic);
+                _ = self.durable_misses.fetchAdd(@intCast(missing.items.len), .monotonic);
+                break :blk null;
+            };
+            if (durable) |groups_by_missing| {
+                defer out_alloc.free(groups_by_missing);
+                for (missing.items, groups_by_missing) |entry_index, maybe_groups| {
+                    const groups = maybe_groups orelse {
+                        _ = self.durable_misses.fetchAdd(1, .monotonic);
+                        continue;
+                    };
+                    entries[entry_index] = .{ .source_group_ids = groups, .complete = true };
+                    _ = self.durable_hits.fetchAdd(1, .monotonic);
+                    const cache_key = try incomingRouteCacheKeyAlloc(out_alloc, fence, req.keys[entry_index]);
+                    defer out_alloc.free(cache_key);
+                    self.rememberAlloc(cache_key, groups) catch {};
+                }
+            }
+        }
+        var complete = has_read_fence;
+        for (entries) |entry| complete = complete and entry.complete;
         return .{ .entries = entries, .complete = complete };
     }
 
@@ -326,41 +412,173 @@ pub const IncomingSourceGroupCache = struct {
         // generation vector remain exact-probe-only.
         if (!incomingRouteRequestHasReadFence(req)) return;
         const fence = incomingRouteFence(table_name, req);
+        const normalized = try self.alloc.alloc(NormalizedEntry, req.keys.len);
+        var normalized_count: usize = 0;
+        defer {
+            for (normalized[0..normalized_count]) |*entry| entry.deinit(self.alloc);
+            if (normalized.len > 0) self.alloc.free(normalized);
+        }
         for (req.keys, response.entries) |key, entry| {
+            if (entry.source_group_ids.len > max_source_groups_per_key) return error.ResourceLimitExceeded;
             const cache_key = try incomingRouteCacheKeyAlloc(self.alloc, fence, key);
-            var cache_key_owned = true;
-            errdefer if (cache_key_owned) self.alloc.free(cache_key);
+            errdefer self.alloc.free(cache_key);
             const groups = try self.alloc.dupe(u64, entry.source_group_ids);
-            var groups_owned = true;
-            errdefer if (groups_owned and groups.len > 0) self.alloc.free(groups);
+            errdefer if (groups.len > 0) self.alloc.free(groups);
             std.mem.sort(u64, groups, {}, std.sort.asc(u64));
             if (groups.len > 1) {
                 for (groups[1..], groups[0 .. groups.len - 1]) |group_id, previous| {
                     if (group_id == previous) return error.InvalidGraphIncomingRouteResult;
                 }
             }
-
-            platform_sync.lockYielding(&self.mutex);
-            defer self.mutex.unlock();
-            const new_bytes = cache_key.len + groups.len * @sizeOf(u64);
-            if (new_bytes > max_resident_bytes) return error.ResourceLimitExceeded;
-            while (self.entries.count() >= max_entries or self.resident_bytes +| new_bytes > max_resident_bytes) {
-                if (!self.evictOneLocked()) break;
-            }
-            const gop = try self.entries.getOrPut(self.alloc, cache_key);
-            if (gop.found_existing) {
-                self.resident_bytes -= gop.key_ptr.*.len + gop.value_ptr.*.len * @sizeOf(u64);
-                self.alloc.free(gop.value_ptr.*);
-                self.alloc.free(cache_key);
-                cache_key_owned = false;
-            } else {
-                gop.key_ptr.* = cache_key;
-                cache_key_owned = false;
-            }
-            gop.value_ptr.* = groups;
-            groups_owned = false;
-            self.resident_bytes += gop.key_ptr.*.len + groups.len * @sizeOf(u64);
+            normalized[normalized_count] = .{ .cache_key = cache_key, .groups = groups };
+            normalized_count += 1;
         }
+
+        if (self.durable_store != null) {
+            self.persistNormalized(table_name, req.index_name, req.keys, fence, normalized) catch {
+                _ = self.durable_write_failures.fetchAdd(1, .monotonic);
+            };
+        }
+        for (normalized) |*entry| {
+            try self.rememberOwned(entry.cache_key, entry.groups);
+            entry.cache_key = &.{};
+            entry.groups = &.{};
+        }
+    }
+
+    fn rememberAlloc(self: *@This(), cache_key: []const u8, groups: []const u64) !void {
+        const owned_key = try self.alloc.dupe(u8, cache_key);
+        errdefer self.alloc.free(owned_key);
+        const owned_groups = try self.alloc.dupe(u64, groups);
+        errdefer if (owned_groups.len > 0) self.alloc.free(owned_groups);
+        try self.rememberOwned(owned_key, owned_groups);
+    }
+
+    fn rememberOwned(self: *@This(), cache_key: []u8, groups: []u64) !void {
+        const new_bytes = cache_key.len + groups.len * @sizeOf(u64);
+        if (new_bytes > max_resident_bytes) return error.ResourceLimitExceeded;
+        platform_sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+
+        if (self.entries.getEntry(cache_key)) |existing| {
+            const old_key = existing.key_ptr.*;
+            const old_groups = existing.value_ptr.*;
+            self.resident_bytes -= old_key.len + old_groups.len * @sizeOf(u64);
+            _ = self.entries.remove(cache_key);
+            self.alloc.free(old_key);
+            if (old_groups.len > 0) self.alloc.free(old_groups);
+        }
+        while (self.entries.count() >= max_entries or self.resident_bytes +| new_bytes > max_resident_bytes) {
+            if (!self.evictOneLocked()) break;
+        }
+        const gop = try self.entries.getOrPut(self.alloc, cache_key);
+        std.debug.assert(!gop.found_existing);
+        gop.key_ptr.* = cache_key;
+        gop.value_ptr.* = groups;
+        self.resident_bytes += gop.key_ptr.*.len + groups.len * @sizeOf(u64);
+    }
+
+    fn resolveDurableBatchAlloc(
+        self: *@This(),
+        out_alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        fence: [route_digest_len]u8,
+        keys: []const []const u8,
+        missing: []const usize,
+    ) ![]?[]u64 {
+        const store = self.durable_store orelse return error.GraphIncomingRouteDirectoryUnavailable;
+        const decoded = try out_alloc.alloc(?[]u64, missing.len);
+        errdefer {
+            for (decoded) |groups| if (groups) |owned| if (owned.len > 0) out_alloc.free(owned);
+            out_alloc.free(decoded);
+        }
+        @memset(decoded, null);
+        platform_sync.lockYielding(&self.durable_mutex);
+        defer self.durable_mutex.unlock();
+        var txn = try store.beginRead();
+        defer txn.abort();
+        for (missing, 0..) |key_index, i| {
+            if (key_index >= keys.len) return error.InvalidGraphIncomingRouteResult;
+            const identity = incomingRouteDurableIdentity(table_name, index_name, keys[key_index]);
+            const durable_key = incomingRouteDurableKey(identity);
+            const encoded = txn.get(&durable_key) catch |err| switch (err) {
+                error.NotFound => continue,
+                else => return err,
+            };
+            decoded[i] = decodeIncomingRouteDurableValueAlloc(out_alloc, identity, fence, encoded) catch {
+                _ = self.durable_read_failures.fetchAdd(1, .monotonic);
+                continue;
+            };
+        }
+        return decoded;
+    }
+
+    fn decodeIncomingRouteDurableValueAlloc(
+        out_alloc: std.mem.Allocator,
+        identity: [route_digest_len]u8,
+        fence: [route_digest_len]u8,
+        encoded: []const u8,
+    ) !?[]u64 {
+        if (encoded.len < durable_value_header_len or
+            !std.mem.eql(u8, encoded[0..durable_value_magic.len], durable_value_magic))
+        {
+            return error.CorruptGraphIncomingRouteDirectory;
+        }
+        const stored_identity = encoded[durable_value_magic.len..][0..route_digest_len];
+        if (!std.mem.eql(u8, stored_identity, &identity)) return null;
+        const stored_fence = encoded[durable_value_magic.len + route_digest_len ..][0..route_digest_len];
+        if (!std.mem.eql(u8, stored_fence, &fence)) return null;
+        const count_offset = durable_value_magic.len + route_digest_len + route_digest_len;
+        const group_count = std.mem.readInt(u32, encoded[count_offset..][0..@sizeOf(u32)], .big);
+        if (group_count > max_source_groups_per_key) return error.CorruptGraphIncomingRouteDirectory;
+        const expected_len = std.math.add(usize, durable_value_header_len, std.math.mul(usize, group_count, @sizeOf(u64)) catch
+            return error.CorruptGraphIncomingRouteDirectory) catch return error.CorruptGraphIncomingRouteDirectory;
+        if (encoded.len != expected_len) return error.CorruptGraphIncomingRouteDirectory;
+        const groups = try out_alloc.alloc(u64, group_count);
+        errdefer if (groups.len > 0) out_alloc.free(groups);
+        var offset = durable_value_header_len;
+        for (groups, 0..) |*group, i| {
+            group.* = std.mem.readInt(u64, encoded[offset..][0..@sizeOf(u64)], .big);
+            if (i > 0 and group.* <= groups[i - 1]) return error.CorruptGraphIncomingRouteDirectory;
+            offset += @sizeOf(u64);
+        }
+        return groups;
+    }
+
+    fn persistNormalized(
+        self: *@This(),
+        table_name: []const u8,
+        index_name: []const u8,
+        keys: []const []const u8,
+        fence: [route_digest_len]u8,
+        normalized: []const NormalizedEntry,
+    ) !void {
+        if (keys.len != normalized.len) return error.InvalidGraphIncomingRouteResult;
+        const store = self.durable_store orelse return;
+        platform_sync.lockYielding(&self.durable_mutex);
+        defer self.durable_mutex.unlock();
+        var batch = try store.beginBatch();
+        errdefer batch.abort();
+        for (keys, normalized) |key, entry| {
+            const identity = incomingRouteDurableIdentity(table_name, index_name, key);
+            const durable_key = incomingRouteDurableKey(identity);
+            const encoded_len = try std.math.add(usize, durable_value_header_len, try std.math.mul(usize, entry.groups.len, @sizeOf(u64)));
+            const encoded = try self.alloc.alloc(u8, encoded_len);
+            defer self.alloc.free(encoded);
+            @memcpy(encoded[0..durable_value_magic.len], durable_value_magic);
+            @memcpy(encoded[durable_value_magic.len..][0..route_digest_len], &identity);
+            @memcpy(encoded[durable_value_magic.len + route_digest_len ..][0..route_digest_len], &fence);
+            const count_offset = durable_value_magic.len + route_digest_len + route_digest_len;
+            std.mem.writeInt(u32, encoded[count_offset..][0..@sizeOf(u32)], @intCast(entry.groups.len), .big);
+            var offset = durable_value_header_len;
+            for (entry.groups) |group| {
+                std.mem.writeInt(u64, encoded[offset..][0..@sizeOf(u64)], group, .big);
+                offset += @sizeOf(u64);
+            }
+            try batch.put(&durable_key, encoded);
+        }
+        try batch.commit();
     }
 
     fn clearLocked(self: *@This()) void {
@@ -402,6 +620,25 @@ fn incomingRouteCacheKeyAlloc(
     const out = try alloc.alloc(u8, fence.len + key.len);
     @memcpy(out[0..fence.len], &fence);
     @memcpy(out[fence.len..], key);
+    return out;
+}
+
+fn incomingRouteDurableIdentity(table_name: []const u8, index_name: []const u8, key: []const u8) [std.crypto.hash.sha2.Sha256.digest_length]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hashIncomingRouteComponent(&hasher, table_name);
+    hashIncomingRouteComponent(&hasher, index_name);
+    hashIncomingRouteComponent(&hasher, key);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
+fn incomingRouteDurableKey(identity: [std.crypto.hash.sha2.Sha256.digest_length]u8) IncomingSourceGroupCache.DurableKey {
+    const raw_slot = std.mem.readInt(u32, identity[0..@sizeOf(u32)], .big);
+    const slot = raw_slot & (IncomingSourceGroupCache.durable_slot_count - 1);
+    var out: IncomingSourceGroupCache.DurableKey = undefined;
+    @memcpy(out[0..IncomingSourceGroupCache.durable_key_prefix.len], IncomingSourceGroupCache.durable_key_prefix);
+    std.mem.writeInt(u32, out[IncomingSourceGroupCache.durable_key_prefix.len..][0..@sizeOf(u32)], slot, .big);
     return out;
 }
 
@@ -3320,6 +3557,113 @@ test "incoming graph route cache is exact and generation fenced" {
     });
     defer miss.deinit(alloc);
     try std.testing.expect(!miss.complete);
+}
+
+test "incoming graph route directory survives cache restart and replaces stale fences" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "incoming-graph-routes-test" });
+    defer store.deinit();
+
+    const generations = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 101 },
+        .{ .group_id = 22, .generation = 202 },
+    };
+    const keys = [_][]const u8{"doc:a"};
+    const req = IncomingSourceGroupsRequest{
+        .index_name = "relations",
+        .keys = &keys,
+        .topology_epoch = 9,
+        .identity_read_generations = &generations,
+    };
+    {
+        var cache = IncomingSourceGroupCache.initWithDurableStore(alloc, &store);
+        defer cache.deinit();
+        try cache.record("docs", req, .{
+            .entries = @constCast(&[_]IncomingSourceGroupEntry{
+                .{ .source_group_ids = @constCast(&[_]u64{22}) },
+            }),
+            .complete = true,
+        });
+    }
+
+    const newer_generations = [_]db_mod.types.ShardIdentityReadGeneration{
+        .{ .group_id = 11, .generation = 101 },
+        .{ .group_id = 22, .generation = 203 },
+    };
+    const newer_req = IncomingSourceGroupsRequest{
+        .index_name = req.index_name,
+        .keys = &keys,
+        .topology_epoch = req.topology_epoch,
+        .identity_read_generations = &newer_generations,
+    };
+    {
+        var recovered = IncomingSourceGroupCache.initWithDurableStore(alloc, &store);
+        defer recovered.deinit();
+        var hit = try recovered.resolveAlloc(alloc, "docs", req);
+        defer hit.deinit(alloc);
+        try std.testing.expect(hit.complete);
+        try std.testing.expectEqualSlices(u64, &.{22}, hit.entries[0].source_group_ids);
+        try std.testing.expectEqual(@as(u64, 1), recovered.stats().durable_hits);
+
+        var miss = try recovered.resolveAlloc(alloc, "docs", newer_req);
+        defer miss.deinit(alloc);
+        try std.testing.expect(!miss.complete);
+        try recovered.record("docs", newer_req, .{
+            .entries = @constCast(&[_]IncomingSourceGroupEntry{
+                .{ .source_group_ids = @constCast(&[_]u64{11}) },
+            }),
+            .complete = true,
+        });
+    }
+
+    // Stable logical keys retain only the newest fenced value. A process that
+    // asks for the old snapshot must miss and perform an exact probe.
+    var restarted = IncomingSourceGroupCache.initWithDurableStore(alloc, &store);
+    defer restarted.deinit();
+    var old_miss = try restarted.resolveAlloc(alloc, "docs", req);
+    defer old_miss.deinit(alloc);
+    try std.testing.expect(!old_miss.complete);
+    var new_hit = try restarted.resolveAlloc(alloc, "docs", newer_req);
+    defer new_hit.deinit(alloc);
+    try std.testing.expect(new_hit.complete);
+    try std.testing.expectEqualSlices(u64, &.{11}, new_hit.entries[0].source_group_ids);
+
+    // These logical keys intentionally share the same 20-bit durable slot.
+    // The later observation may evict the earlier hint, but the full identity
+    // digest prevents a collision from ever becoming a false authoritative
+    // route.
+    const collision_a_keys = [_][]const u8{"collision:724"};
+    const collision_b_keys = [_][]const u8{"collision:1548"};
+    var collision_a_req = newer_req;
+    collision_a_req.keys = &collision_a_keys;
+    var collision_b_req = newer_req;
+    collision_b_req.keys = &collision_b_keys;
+    try std.testing.expectEqual(
+        incomingRouteDurableKey(incomingRouteDurableIdentity("docs", "relations", collision_a_keys[0])),
+        incomingRouteDurableKey(incomingRouteDurableIdentity("docs", "relations", collision_b_keys[0])),
+    );
+    try restarted.record("docs", collision_a_req, .{
+        .entries = @constCast(&[_]IncomingSourceGroupEntry{
+            .{ .source_group_ids = @constCast(&[_]u64{11}) },
+        }),
+        .complete = true,
+    });
+    try restarted.record("docs", collision_b_req, .{
+        .entries = @constCast(&[_]IncomingSourceGroupEntry{
+            .{ .source_group_ids = @constCast(&[_]u64{22}) },
+        }),
+        .complete = true,
+    });
+    restarted.clear();
+    var collision_miss = try restarted.resolveAlloc(alloc, "docs", collision_a_req);
+    defer collision_miss.deinit(alloc);
+    try std.testing.expect(!collision_miss.complete);
+    var collision_hit = try restarted.resolveAlloc(alloc, "docs", collision_b_req);
+    defer collision_hit.deinit(alloc);
+    try std.testing.expect(collision_hit.complete);
+    try std.testing.expectEqualSlices(u64, &.{22}, collision_hit.entries[0].source_group_ids);
 }
 
 test "distributed graph per-key authoritative incoming routes avoid shard probes" {

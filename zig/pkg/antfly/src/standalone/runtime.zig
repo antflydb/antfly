@@ -1773,6 +1773,28 @@ pub fn runFromIterator(
         try backend.runtimeStoreForNamespace("system/api-restore-jobs")
     else
         &local_restore_job_store.?;
+    // Incoming reverse-route observations are an exact, fenced directory, not
+    // disposable cache state: retain one latest generation per logical graph
+    // key so restarts and L1 eviction do not reintroduce all-shard probes.
+    const incoming_graph_route_root = if (lite_backend == null)
+        try std.fmt.allocPrint(alloc, "{s}/incoming-graph-routes", .{resolved.replica_root_dir})
+    else
+        null;
+    defer if (incoming_graph_route_root) |path| alloc.free(path);
+    var incoming_graph_route_backend: ?antfly.lsm_backend.BackendHandle = if (incoming_graph_route_root) |path|
+        try antfly.lsm_backend.BackendHandle.open(alloc, path, .{})
+    else
+        null;
+    defer if (incoming_graph_route_backend) |*backend| backend.close();
+    var local_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = if (incoming_graph_route_backend) |*backend|
+        try backend.backend.runtimeStore(alloc, .{ .name = "system/incoming-graph-routes" })
+    else
+        null;
+    defer if (local_incoming_graph_route_store) |*store| store.deinit();
+    const incoming_graph_route_store = if (lite_backend) |*backend|
+        try backend.runtimeStoreForNamespace("system/incoming-graph-routes")
+    else
+        &local_incoming_graph_route_store.?;
     var storage_maintenance = try antfly.storage_maintenance.Coordinator.init(
         alloc,
         if (lite_backend) |*backend| backend.maintenanceSource() else antfly.storage_maintenance.localSource,
@@ -2167,6 +2189,7 @@ pub fn runFromIterator(
             .user_manager = if (user_manager) |*manager| manager else null,
             .session_store = if (lite_session_store) |*store| store else null,
             .restore_job_store = restore_job_store,
+            .incoming_graph_route_store = incoming_graph_route_store,
             .session_ttl_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.ttl_seconds * std.time.ns_per_s else standalone_session_ttl_ns,
             .session_cleanup_interval_ns = if (loaded_config) |*cfg| cfg.transaction_sessions.cleanup_interval_seconds * std.time.ns_per_s else standalone_session_cleanup_interval_ns,
             .session_max_count = if (loaded_config) |*cfg| cfg.transaction_sessions.max_count else standalone_session_max_count,

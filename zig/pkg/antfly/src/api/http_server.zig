@@ -871,6 +871,10 @@ pub const ApiHttpServerConfig = struct {
     /// Engine-owned durable storage for restore jobs. The caller retains
     /// ownership and must keep the store alive until server deinit completes.
     restore_job_store: ?*backend_erased.Store = null,
+    /// Engine-owned durable L2 for exact incoming-graph route observations.
+    /// The caller retains ownership and must keep the store alive until all
+    /// API/read-source caches using it have been deinitialized.
+    incoming_graph_route_store: ?*backend_erased.Store = null,
     restore_job_store_path: ?[]const u8 = null,
     restore_execution_guard: ?RestoreExecutionGuard = null,
     /// Local scratch root for remote backup upload staging. When omitted, the
@@ -1986,6 +1990,7 @@ pub const ApiHttpServer = struct {
         first_request_started_at_ns: u64 = 0,
         first_request_elapsed_ms: u64 = 0,
         query_embedding_cache: query_embedding_cache.Stats = .{},
+        incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
             .used_bytes = 0,
@@ -2114,7 +2119,10 @@ pub const ApiHttpServer = struct {
             .table_reads = table_read_source,
             .table_writes = table_write_source,
             .foreign_registry = cfg.foreign_registry,
-            .incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.init(owner_alloc),
+            .incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.initWithDurableStore(
+                owner_alloc,
+                cfg.incoming_graph_route_store,
+            ),
             .created_at_ns = platform_time.monotonicNs(),
             .txn_sessions = blk: {
                 var registry = transactions_api.SessionRegistry.initWithOptions(
@@ -2203,6 +2211,7 @@ pub const ApiHttpServer = struct {
             else
                 @intCast(@divTrunc(first_request_started_at_ns - self.created_at_ns, std.time.ns_per_ms)),
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
+            .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
     }

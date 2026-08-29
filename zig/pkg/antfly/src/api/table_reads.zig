@@ -2515,6 +2515,7 @@ pub const ProvisionedTableReadSource = struct {
     io_impl: ?*std.Io.Threaded = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     cache: ?*ProvisionedTableReadCache = null,
+    incoming_graph_routes: ?*distributed_graph.IncomingSourceGroupCache = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     prepare_for_read: ?ReadPreparation = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
@@ -2574,6 +2575,14 @@ pub const ProvisionedTableReadSource = struct {
 
     pub fn withIo(self: *ProvisionedTableReadSource, io_impl: *std.Io.Threaded) *ProvisionedTableReadSource {
         self.io_impl = io_impl;
+        return self;
+    }
+
+    pub fn withIncomingGraphRoutes(
+        self: *ProvisionedTableReadSource,
+        cache: *distributed_graph.IncomingSourceGroupCache,
+    ) *ProvisionedTableReadSource {
+        self.incoming_graph_routes = cache;
         return self;
     }
 
@@ -7827,8 +7836,11 @@ fn resolveProvisionedIncomingSourceGroups(
     _: raft_mod.ReadConsistency,
 ) !distributed_graph.IncomingSourceGroupsResponse {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
-    const cache = ctx.source.cache orelse return try emptyIncomingSourceGroupsResponseAlloc(alloc, req.keys.len);
-    return try cache.incoming_graph_routes.resolveAlloc(alloc, table_name, req);
+    const routes = ctx.source.incoming_graph_routes orelse if (ctx.source.cache) |cache|
+        &cache.incoming_graph_routes
+    else
+        return try emptyIncomingSourceGroupsResponseAlloc(alloc, req.keys.len);
+    return try routes.resolveAlloc(alloc, table_name, req);
 }
 
 fn recordProvisionedIncomingSourceGroups(
@@ -7838,8 +7850,11 @@ fn recordProvisionedIncomingSourceGroups(
     response: distributed_graph.IncomingSourceGroupsResponse,
 ) !void {
     const ctx: *ProvisionedGraphWorkerContext = @ptrCast(@alignCast(ptr));
-    const cache = ctx.source.cache orelse return;
-    try cache.incoming_graph_routes.record(table_name, req, response);
+    const routes = ctx.source.incoming_graph_routes orelse if (ctx.source.cache) |cache|
+        &cache.incoming_graph_routes
+    else
+        return;
+    try routes.record(table_name, req, response);
 }
 
 fn resolveHostedIncomingSourceGroups(

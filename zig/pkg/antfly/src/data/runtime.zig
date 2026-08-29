@@ -1804,6 +1804,10 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_rejected_admissions_total", "counter", "Query embedding results rejected by cache admission control", api_request_stats.query_embedding_cache.rejected_admissions);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_entries", "gauge", "Live query embedding cache entries", api_request_stats.query_embedding_cache.entries);
         try health_metrics.appendPromMetric(writer, "antfly_query_embedding_cache_live_bytes", "gauge", "Accounted live query embedding cache bytes", api_request_stats.query_embedding_cache.live_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_hits_total", "counter", "Durable incoming-graph route directory hits", api_request_stats.incoming_graph_routes.durable_hits);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_misses_total", "counter", "Durable incoming-graph route directory misses, including stale fences", api_request_stats.incoming_graph_routes.durable_misses);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_read_failures_total", "counter", "Durable incoming-graph route directory read or decode failures", api_request_stats.incoming_graph_routes.durable_read_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_incoming_graph_route_directory_write_failures_total", "counter", "Durable incoming-graph route directory write failures", api_request_stats.incoming_graph_routes.durable_write_failures);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_bytes", "gauge", "Shared inference cache bytes in use", api_request_stats.inference_cache_budget.used_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_limit_bytes", "gauge", "Shared inference cache byte limit", api_request_stats.inference_cache_budget.max_bytes);
         try health_metrics.appendPromMetric(writer, "antfly_inference_cache_budget_rejected_reservations_total", "counter", "Shared inference cache reservations rejected by the hard limit", api_request_stats.inference_cache_budget.rejected_reservations);
@@ -4913,6 +4917,8 @@ pub const DataServer = struct {
     distributed_entity_sink: ?antfly.public_api.DistributedEntitySink = null,
     status_source: antfly.public_api.http_server.StatusSource,
     http_server: ?antfly.public_api.ApiHttpServer = null,
+    owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
+    owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     ha_cfg: DataServerHAConfig = .{},
     /// Immutable startup role used by lock-free ingress policy snapshots.
@@ -5263,6 +5269,30 @@ pub const DataServer = struct {
     pub fn initApiServer(self: *DataServer) !void {
         if (self.http_server != null) return;
         var api_server_cfg = self.api_server_cfg;
+        if (api_server_cfg.incoming_graph_route_store == null and
+            api_server_cfg.deployment_mode != .serverless)
+        {
+            const route_root = try std.fmt.allocPrint(
+                self.alloc,
+                "{s}/incoming-graph-routes",
+                .{self.write_source.replica_root_dir},
+            );
+            defer self.alloc.free(route_root);
+            self.owned_incoming_graph_route_backend = try lsm_backend_mod.BackendHandle.open(self.alloc, route_root, .{});
+            errdefer {
+                self.owned_incoming_graph_route_backend.?.close();
+                self.owned_incoming_graph_route_backend = null;
+            }
+            self.owned_incoming_graph_route_store = try self.owned_incoming_graph_route_backend.?.backend.runtimeStore(
+                self.alloc,
+                .{ .name = "system/incoming-graph-routes" },
+            );
+            errdefer {
+                self.owned_incoming_graph_route_store.?.deinit();
+                self.owned_incoming_graph_route_store = null;
+            }
+            api_server_cfg.incoming_graph_route_store = &self.owned_incoming_graph_route_store.?;
+        }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
         // Runtimes that do not supply engine-owned persistence keep API job
@@ -5388,6 +5418,10 @@ pub const DataServer = struct {
             self.read_source.source(),
             self.write_source.source(),
         );
+        // Graph queries issued through the provisioned source and auxiliary
+        // API helpers share one fenced directory. This prevents duplicate L1s
+        // from diverging and gives both paths the configured durable L2.
+        _ = self.read_source.withIncomingGraphRoutes(&self.http_server.?.incoming_graph_routes);
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
     }
 
@@ -6895,6 +6929,8 @@ pub const DataServer = struct {
         self.store_status_heartbeat_cache.clear(self.alloc);
         self.provisioned_storage.deinit();
         self.write_source.deinit();
+        if (self.owned_incoming_graph_route_store) |*store| store.deinit();
+        if (self.owned_incoming_graph_route_backend) |*backend| backend.close();
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
@@ -6914,6 +6950,8 @@ pub const DataServer = struct {
         self.owned_backend_runtime = null;
         self.backend_runtime = null;
         self.query_io_impl = null;
+        self.owned_incoming_graph_route_store = null;
+        self.owned_incoming_graph_route_backend = null;
     }
 
     fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
@@ -27120,6 +27158,10 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_inflight_limit 16") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_query_embedding_cache_live_bytes 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_hits_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_misses_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_read_failures_total 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_incoming_graph_route_directory_write_failures_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_limit_bytes 67108864") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_inference_cache_budget_rejected_reservations_total 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_resource_disk_reserved_bytes 0") != null);
