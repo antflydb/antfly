@@ -51,7 +51,7 @@ fn printEmbeddingReadinessWarning(
         .embeddings_index_stats => |value| value,
         else => {
             std.debug.print(
-                "warning: semantic index {s} has no embeddings readiness status; results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
+                "warning: semantic index {s} has no embeddings readiness status; results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
                 .{ index.config.name, table_name, index.config.name },
             );
             return;
@@ -69,17 +69,17 @@ fn printEmbeddingReadinessWarning(
         stats.backfill_state orelse if (stats.rebuilding orelse true) "running" else "not_ready";
     if (stats.coverage) |coverage| {
         std.debug.print(
-            "warning: semantic index {s} is {s} (coverage {d}/{d}, complete={any}); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
+            "warning: semantic index {s} is {s} (coverage {d}/{d}, complete={any}); results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
             .{ index.config.name, state, coverage.produced, coverage.source_total, coverage.complete, table_name, index.config.name },
         );
     } else if (stats.backfill_progress) |progress| {
         std.debug.print(
-            "warning: semantic index {s} is {s} ({d:.1}%); results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
+            "warning: semantic index {s} is {s} ({d:.1}%); results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
             .{ index.config.name, state, @max(0.0, @min(1.0, progress)) * 100.0, table_name, index.config.name },
         );
     } else {
         std.debug.print(
-            "warning: semantic index {s} is {s}; results may be incomplete. Run `antfly index wait --table {s} --index {s}`.\n",
+            "warning: semantic index {s} is {s}; results may be incomplete. Run `antfly index wait --table {s} --index {s} --until complete`.\n",
             .{ index.config.name, state, table_name, index.config.name },
         );
     }
