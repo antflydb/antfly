@@ -1127,6 +1127,7 @@ const CachedPageImage = struct {
     height: u32,
     interpolate: bool,
     bilevel: bool,
+    image_mask: bool,
 };
 
 /// A request-scoped cache for decoded indirect image XObjects. Forms and
@@ -1169,6 +1170,10 @@ pub const ImageRun = struct {
     /// only when a full-source footprint cannot afford exact integration.
     bilevel_fallback: ?[4]u8 = null,
     ocr_coverage_minify: bool = false,
+    /// PDF image masks are stencils: their decoded samples provide coverage,
+    /// while the active nonstroking color at each `Do` provides paint. Keep
+    /// that color on the occurrence instead of mutating shared decoded RGBA.
+    stencil_color: ?[4]u8 = null,
     alpha: u8 = 0xff,
     paint_order: usize = 0,
     paint_phase: usize = 0,
@@ -1815,6 +1820,7 @@ const PageImage = struct {
     height: u32,
     interpolate: bool = false,
     bilevel: bool = false,
+    image_mask: bool = false,
 
     fn deinit(self: *PageImage, alloc: Allocator) void {
         alloc.free(self.name);
@@ -5509,6 +5515,7 @@ pub const Reader = struct {
                     .height = cached.height,
                     .interpolate = cached.interpolate,
                     .bilevel = cached.bilevel,
+                    .image_mask = cached.image_mask,
                 });
                 name = null;
                 image_reference_owned = false;
@@ -5547,6 +5554,7 @@ pub const Reader = struct {
                     .height = decoded.height,
                     .interpolate = interpolate,
                     .bilevel = bilevel,
+                    .image_mask = image_mask,
                 });
                 cache.retained_bytes = retained_bytes;
                 // The cache owns the initial reference; the PageImage owns a
@@ -5563,6 +5571,7 @@ pub const Reader = struct {
                 .height = decoded.height,
                 .interpolate = interpolate,
                 .bilevel = bilevel,
+                .image_mask = image_mask,
             });
             name = null;
             shared_reference_owned = false;
@@ -11791,6 +11800,50 @@ fn applyImageOperator(
         }
         return;
     }
+    if (std.mem.eql(u8, op, "rg") and operands.len >= 3) {
+        state.fill_color_space = "DeviceRGB";
+        state.fill_pattern_name = null;
+        state.fill_color = rgbColor(
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        );
+        return;
+    }
+    if (std.mem.eql(u8, op, "g") and operands.len >= 1) {
+        state.fill_color_space = "DeviceGray";
+        state.fill_pattern_name = null;
+        state.fill_color = grayColor(numericObjectValue(&operands[operands.len - 1]) orelse 0);
+        return;
+    }
+    if (std.mem.eql(u8, op, "k") and operands.len >= 4) {
+        state.fill_color_space = "DeviceCMYK";
+        state.fill_pattern_name = null;
+        state.fill_color = cmykColor(
+            numericObjectValue(&operands[operands.len - 4]) orelse 0,
+            numericObjectValue(&operands[operands.len - 3]) orelse 0,
+            numericObjectValue(&operands[operands.len - 2]) orelse 0,
+            numericObjectValue(&operands[operands.len - 1]) orelse 0,
+        );
+        return;
+    }
+    if (std.mem.eql(u8, op, "cs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
+        state.fill_color_space = operands[operands.len - 1].name;
+        if (!std.mem.eql(u8, state.fill_color_space, "Pattern")) state.fill_pattern_name = null;
+        return;
+    }
+    if ((std.mem.eql(u8, op, "sc") or std.mem.eql(u8, op, "scn")) and operands.len >= 1) {
+        if (std.mem.eql(u8, state.fill_color_space, "Pattern")) {
+            if (operands[operands.len - 1] == .name) {
+                state.fill_pattern_name = operands[operands.len - 1].name;
+                if (decodePatternBaseColorOperands(operands[0 .. operands.len - 1])) |color| state.fill_color = color;
+            }
+        } else if (try decodeShapeColorOperands(state.fill_color_space, operands)) |color| {
+            state.fill_pattern_name = null;
+            state.fill_color = color;
+        }
+        return;
+    }
     if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -11881,6 +11934,15 @@ fn applyImageOperator(
         const name = operands[operands.len - 1].name;
         for (images) |image| {
             if (!std.mem.eql(u8, image.name, name)) continue;
+            const stencil_color: ?[4]u8 = if (image.image_mask) blk: {
+                if (state.fill_pattern_name != null or std.mem.eql(u8, state.fill_color_space, "Pattern"))
+                    return error.UnsupportedPdfRendering;
+                if (!std.mem.eql(u8, state.fill_color_space, "DeviceGray") and
+                    !std.mem.eql(u8, state.fill_color_space, "DeviceRGB") and
+                    !std.mem.eql(u8, state.fill_color_space, "DeviceCMYK"))
+                    return error.UnsupportedPdfRendering;
+                break :blk state.fill_color;
+            } else null;
             const rgba = if (image.shared_rgba) |shared| blk: {
                 shared.retain();
                 break :blk shared.bytes;
@@ -11895,6 +11957,7 @@ fn applyImageOperator(
                 .height = image.height,
                 .interpolate = image.interpolate,
                 .bilevel = image.bilevel,
+                .stencil_color = stencil_color,
                 .alpha = state.fill_alpha,
                 .paint_order = paint_order.*,
                 .blend_mode = state.blend_mode,
@@ -19209,7 +19272,7 @@ test "reader decodes 1-bit image mask xobject" {
     const alloc = std.testing.allocator;
     // PDF's default stencil Decode [0 1] paints zero samples.
     const image_data = &.{0b00000000};
-    const content = "q\n1 0 0 1 20 30 cm\n/Im1 Do\nQ\n";
+    const content = "q\n0.2 0.4 0.6 rg\n1 0 0 1 20 30 cm\n/Im1 Do\nQ\n";
     const objects = [_][]const u8{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
         "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
@@ -19257,6 +19320,7 @@ test "reader decodes 1-bit image mask xobject" {
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[1]);
     try std.testing.expectEqual(@as(u8, 0), runs[0].rgba[2]);
     try std.testing.expectEqual(@as(u8, 0xff), runs[0].rgba[3]);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 51, 102, 153, 255 }), runs[0].stencil_color);
 }
 
 test "reader applies soft mask image alpha" {
@@ -21534,11 +21598,11 @@ test "reader extracts text and shapes through form xobject" {
     try std.testing.expect(shape_runs[0].paint_order < text_runs[0].paint_order);
 }
 
-test "reader shares one decoded image across independent form xobjects" {
+test "reader shares one decoded image mask while preserving per-use stencil color" {
     const alloc = std.testing.allocator;
-    const image_data = [_]u8{ 0xff, 0, 0 };
+    const image_data = [_]u8{0};
     const form_content = "q\n1 0 0 1 10 10 cm\n/Im1 Do\nQ\n";
-    const page_content = "q\n/Fm1 Do\n/Fm2 Do\nQ\n";
+    const page_content = "q\n1 0 0 rg\n/Fm1 Do\n0 0 1 rg\n/Fm2 Do\nQ\n";
     const obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
     const obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
     const obj3 = "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Resources << /XObject << /Fm1 5 0 R /Fm2 7 0 R >> >> /Contents 4 0 R >>\nendobj\n";
@@ -21552,7 +21616,7 @@ test "reader shares one decoded image across independent form xobjects" {
     defer alloc.free(obj5);
     const obj6 = try std.fmt.allocPrint(
         alloc,
-        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /ImageMask true /Width 1 /Height 1 /BitsPerComponent 1 /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
         .{ image_data.len, image_data },
     );
     defer alloc.free(obj6);
@@ -21606,6 +21670,8 @@ test "reader shares one decoded image across independent form xobjects" {
     try std.testing.expect(image_runs[0].shared_rgba != null);
     try std.testing.expectEqual(image_runs[0].shared_rgba, image_runs[1].shared_rgba);
     try std.testing.expectEqual(image_runs[0].rgba.ptr, image_runs[1].rgba.ptr);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 255, 0, 0, 255 }), image_runs[0].stencil_color);
+    try std.testing.expectEqual(@as(?[4]u8, .{ 0, 0, 255, 255 }), image_runs[1].stencil_color);
 }
 
 test "reader does not decode images below an unused form xobject" {

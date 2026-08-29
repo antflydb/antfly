@@ -972,6 +972,12 @@ fn drawImageRunCancelable(
                 const src = (@as(usize, sy) * @as(usize, run.width) + @as(usize, sx)) * 4;
                 sample = .{ run.rgba[src], run.rgba[src + 1], run.rgba[src + 2], run.rgba[src + 3] };
             }
+            if (run.stencil_color) |color| {
+                sample[0] = color[0];
+                sample[1] = color[1];
+                sample[2] = color[2];
+                sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, color[3]) + 127) / 255);
+            }
             sample[3] = @intCast((@as(u16, sample[3]) * @as(u16, run.alpha) + 127) / 255);
             blendPixelMode(canvas, dst, sample, run.blend_mode);
         }
@@ -3617,6 +3623,30 @@ test "image minification honors explicit interpolation policy" {
     try std.testing.expect(filtered[0] > 0 and filtered[2] > 0);
     try std.testing.expectEqual(@as(u8, 0), filtered[1]);
     try std.testing.expectEqual(@as(u8, 0xff), filtered[3]);
+}
+
+test "image mask stencil paints decoded coverage with its occurrence color" {
+    var rgba = [_]u8{ 0, 0, 0, 0xff };
+    const run: reader.ImageRun = .{
+        .rgba = &rgba,
+        .width = 1,
+        .height = 1,
+        .stencil_color = .{ 51, 102, 153, 255 },
+        .a = 1,
+        .b = 0,
+        .c = 0,
+        .d = 1,
+        .e = 0,
+        .f = 0,
+        .x = 0,
+        .y = 0,
+        .draw_width = 1,
+        .draw_height = 1,
+    };
+
+    var canvas = [_]u8{0xff} ** 4;
+    drawImageRun(&canvas, 1, 1, 0, 0, 1, run);
+    try std.testing.expectEqualSlices(u8, &.{ 51, 102, 153, 255 }, &canvas);
 }
 
 test "OCR bilevel minification preserves source ink coverage" {
