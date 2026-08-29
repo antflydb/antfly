@@ -103,6 +103,11 @@ const maxHASeededSlotActivationReceiptBytes = 64 * 1024
 // reconciliation promptly without consuming the error rate limiter.
 const haStatusCheckpointRequeueAfter = 5 * time.Millisecond
 
+// Runtime-admin observations can wait on independent tenant networks. Keep
+// those waits from head-of-line blocking Lease-backed failover for every other
+// AntflyCluster while retaining a fixed upper bound on operator concurrency.
+const antflyClusterMaxConcurrentReconciles = 16
+
 const haStartupGateObservationRequeueAfter = 5 * time.Second
 
 // Runtime LSN, replication health, and failure-detector evidence do not emit
@@ -14181,6 +14186,7 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 	builder := ctrl.NewControllerManagedBy(mgr).
+		WithOptions(controller.Options{MaxConcurrentReconciles: antflyClusterMaxConcurrentReconciles}).
 		For(&antflyv1.AntflyCluster{}, ctrlbuilder.WithPredicates(antflyClusterDesiredStateEventPredicate())).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
