@@ -33153,9 +33153,17 @@ fn completeDocumentExtractionGeneratedText(
             var rendered_page: ?[]u8 = null;
             defer if (rendered_page) |png| alloc.free(png);
             if (std.mem.eql(u8, extraction.route_type, "pdf")) {
-                rendered_page = document_extraction_mod.renderPdfPagePngAlloc(
+                var pdf_session = document_extraction_mod.PdfRenderSession.initWithDecodeLimits(alloc, source_bytes, config.pdf_decode_limits) catch |err| {
+                    const any_err: anyerror = err;
+                    if (any_err == error.OutOfMemory) return any_err;
+                    try markGeneratedUnitTextFailure(alloc, unit, "ocr_text", .ocr, any_err);
+                    continue;
+                };
+                defer pdf_session.deinit();
+                var pdf_render_deadline = document_extraction_mod.PdfRenderDeadline.init(active_runtime.syncWaitTimeoutMs());
+                pdf_session.setCancellationProbe(pdf_render_deadline.probe());
+                rendered_page = pdf_session.renderPagePngAlloc(
                     alloc,
-                    source_bytes,
                     unit.page_number orelse 1,
                     config.ocr_render_dpi,
                     config.ocr_max_rendered_pixels,
