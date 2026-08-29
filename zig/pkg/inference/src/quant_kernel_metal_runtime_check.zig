@@ -2670,7 +2670,7 @@ test "quant kernel metal runtime flash prefill checks cover the generated flash 
 
 test "quant kernel metal runtime split GQA checks cover production shapes and poisoned ragged pages" {
     try std.testing.expectEqual(@as(usize, 9), split_gqa_checks.len);
-    try std.testing.expectEqual(@as(usize, 6), split_gqa_short_checks.len);
+    try std.testing.expectEqual(@as(usize, 12), split_gqa_short_checks.len);
     try std.testing.expectEqual(@as(usize, 4), split_gqa_concrete_variants.len);
     try std.testing.expectEqual(@as(usize, 5), split_gqa_policy_variants.len);
     try std.testing.expectEqual(@as(usize, 15), split_gqa_policy_kv_boundaries.len);
@@ -2728,17 +2728,28 @@ test "quant kernel metal runtime split GQA checks cover production shapes and po
     try std.testing.expectEqual(@as(usize, 5), hd512_count);
     try std.testing.expectEqual(@as(usize, 2), long_global_count);
     try std.testing.expectEqual(@as(usize, 2), a4b_count);
+    var short_q1_count: usize = 0;
+    var short_q2_count: usize = 0;
     for (split_gqa_short_checks) |check| {
         try std.testing.expectEqual(@as(usize, 23), check.shape.kv_tokens);
-        try std.testing.expectEqual(@as(usize, 1), check.shape.q_len);
-        try std.testing.expectEqual(@as(usize, 22), check.shape.query_position_offset);
+        switch (check.shape.q_len) {
+            1 => short_q1_count += 1,
+            2 => short_q2_count += 1,
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqual(
+            check.shape.kv_tokens - check.shape.q_len,
+            check.shape.query_position_offset,
+        );
         try std.testing.expectEqual(@as(usize, 16), check.shape.page_size);
         try std.testing.expect(check.shape.permuted_pages);
     }
+    try std.testing.expectEqual(@as(usize, 6), short_q1_count);
+    try std.testing.expectEqual(@as(usize, 6), short_q2_count);
 }
 
 test "quant kernel metal runtime split GQA production policy uses qualified model floors" {
-    try std.testing.expectEqual(@as(usize, 23), split_gqa_production_selection_checks.len);
+    try std.testing.expectEqual(@as(usize, 25), split_gqa_production_selection_checks.len);
     const e2b_local = split_gqa_production_selection_checks[0];
     try std.testing.expectEqual(@as(usize, 1), e2b_local.check.shape.num_kv_heads);
     try std.testing.expectEqual(@as(usize, 256), e2b_local.check.shape.head_dim);
@@ -2762,11 +2773,12 @@ test "quant kernel metal runtime split GQA production policy uses qualified mode
         }
         try std.testing.expect(found);
     }
-    for ([_]usize{ 31, 32, 33, 191, 192, 193, 511, 512, 513, 4095, 4096, 4097 }) |kv_tokens| {
+    for ([_]usize{ 31, 32, 33, 191, 192, 193, 511, 512, 4095, 4096, 4097 }) |kv_tokens| {
         var found = false;
         for (split_gqa_production_selection_checks) |selection| {
             if (selection.check.shape.num_heads == 8 and selection.check.shape.num_kv_heads == 2 and
-                selection.check.shape.head_dim == 512 and selection.check.shape.kv_tokens == kv_tokens)
+                selection.check.shape.head_dim == 512 and selection.check.shape.q_len == 1 and
+                selection.check.shape.kv_tokens == kv_tokens)
             {
                 found = true;
                 try std.testing.expectEqual(kv_tokens >= 32, selection.expect_route);
@@ -2774,7 +2786,28 @@ test "quant kernel metal runtime split GQA production policy uses qualified mode
         }
         try std.testing.expect(found);
     }
-    const ring_wrap = split_gqa_production_selection_checks[18];
+    for ([_]usize{ 511, 512, 513 }) |kv_tokens| {
+        var found = false;
+        for (split_gqa_production_selection_checks) |selection| {
+            if (selection.check.shape.num_heads == 8 and selection.check.shape.num_kv_heads == 2 and
+                selection.check.shape.head_dim == 512 and selection.check.shape.q_len == 2 and
+                selection.check.shape.kv_tokens == kv_tokens)
+            {
+                found = true;
+                try std.testing.expectEqual(kv_tokens >= 512, selection.expect_route);
+            }
+        }
+        try std.testing.expect(found);
+    }
+    var ring_wrap_match: ?SplitGqaSelectionCheck = null;
+    for (split_gqa_production_selection_checks) |selection| {
+        if (std.mem.eql(u8, selection.check.name, "decode_gqa_default_local_kv2003_ring_wrap")) {
+            try std.testing.expect(ring_wrap_match == null);
+            ring_wrap_match = selection;
+        }
+    }
+    try std.testing.expect(ring_wrap_match != null);
+    const ring_wrap = ring_wrap_match.?;
     try std.testing.expectEqual(@as(usize, 2003), ring_wrap.check.shape.kv_tokens);
     try std.testing.expectEqual(@as(usize, 256), ring_wrap.check.shape.head_dim);
     try std.testing.expectEqual(@as(usize, 512), ring_wrap.check.shape.sliding_window);
@@ -2788,10 +2821,15 @@ test "quant kernel metal runtime split GQA production policy uses qualified mode
     try std.testing.expectEqual(@as(usize, 126), ring_page_count);
     try std.testing.expectEqual(@as(usize, 125), physicalPageWithinSpan(ring_wrap.check.shape, ring_page_count, 105));
     try std.testing.expectEqual(@as(usize, 0), physicalPageWithinSpan(ring_wrap.check.shape, ring_page_count, 106));
-    for (split_gqa_production_selection_checks[19..]) |selection| {
+    var a4b_count: usize = 0;
+    for (split_gqa_production_selection_checks) |selection| {
+        if (selection.check.shape.num_heads != 16) continue;
+        a4b_count += 1;
         try std.testing.expectEqual(@as(usize, 16), selection.check.shape.num_heads);
+        try std.testing.expectEqual(@as(usize, 1), selection.check.shape.q_len);
         try std.testing.expectEqual(selection.check.shape.kv_tokens >= 32, selection.expect_route);
     }
+    try std.testing.expectEqual(@as(usize, 4), a4b_count);
     try std.testing.expectEqualSlices(
         usize,
         &.{ 31, 32, 33, 191, 192, 193, 511, 512, 513, 1023, 1024, 2003, 4095, 4096, 8191 },
