@@ -23201,6 +23201,23 @@ pub const DB = struct {
         }
     }
 
+    /// A serviceable admission disposition does not by itself prove that a
+    /// physical generation is installed.
+    fn repairGenerationInstalled(
+        self: *DB,
+        intent: index_repair_state.IndexRepairIntent,
+    ) bool {
+        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
+        if (types.indexConfigHash(cfg.*) != intent.config_hash) return false;
+        return switch (intent.kind) {
+            .full_text => self.core.index_manager.textIndexEntry(intent.index_name) != null,
+            .dense_vector => self.core.index_manager.denseIndex(intent.index_name) != null,
+            .sparse_vector => self.core.index_manager.sparseIndex(intent.index_name) != null,
+            .graph => self.core.index_manager.graphIndex(intent.index_name) != null,
+            .algebraic => self.core.index_manager.algebraicIndex(intent.index_name) != null,
+        };
+    }
+
     fn applyDurableIndexRepairStats(
         self: *DB,
         alloc: Allocator,
@@ -23265,8 +23282,15 @@ pub const DB = struct {
         const managed_admission = intent.trigger == .projection_generation_invalid and
             intent.last_error != null and
             std.mem.eql(u8, intent.last_error.?, managed_catalog_admission_rebuild_reason);
-        const retained_replay_generation = intent.trigger == .replay_artifact_unavailable and
-            !self.core.index_manager.repairUnavailable(intent.index_name);
+        const generation_installed = self.repairGenerationInstalled(intent);
+        // The resident gate is version/incarnation fenced. Pair its decision
+        // with physical presence so neither a missing slot nor a stale config
+        // can manufacture serviceability.
+        const resident_admission_open = !self.core.index_manager.repairUnavailable(intent.index_name) and
+            self.core.index_manager.loadFailure(intent.index_name) == null and
+            generation_installed;
+        const admitted_serving_generation = indexRepairAdmission(intent) == .serviceable and
+            resident_admission_open;
         // Query admission is monotonic for one managed incarnation. Once an
         // authoritative status sample proves the progressive generation safe,
         // clear the same resident gate used by search. A following producer
@@ -23281,8 +23305,8 @@ pub const DB = struct {
         }
         item.index_repair_active_generation_serviceable = active_generation_complete or
             active_generation_queryable or
-            retained_replay_generation or
-            (managed_admission and !self.core.index_manager.repairUnavailable(intent.index_name));
+            admitted_serving_generation or
+            (managed_admission and resident_admission_open);
         switch (intent.trigger) {
             .incomplete_bulk_publish,
             .root_generation_rebuild,
@@ -79193,6 +79217,16 @@ test "db durable repair classification emits exact admission and action edges" {
         0,
         null,
     );
+    const serviceable_stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, serviceable_stats);
+    var observed_serviceable_rebuild = false;
+    for (serviceable_stats.indexes) |index_stats| {
+        if (!std.mem.eql(u8, index_stats.name, "search_idx")) continue;
+        observed_serviceable_rebuild = true;
+        try std.testing.expectEqual(types.IndexRepairStatus.rebuilding, index_stats.index_repair_status.?);
+        try std.testing.expect(index_stats.index_repair_active_generation_serviceable);
+    }
+    try std.testing.expect(observed_serviceable_rebuild);
 
     const Capture = struct {
         count: usize = 0,

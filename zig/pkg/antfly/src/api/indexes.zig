@@ -2946,6 +2946,43 @@ test "actionable repair remains visible while retained generation stays queryabl
     try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"pending_reasons\":[\"repair\"]") != null);
 }
 
+test "serviceable full text replacement remains queryable while rebuilding" {
+    const item = db_mod.types.DBIndexStats{
+        .name = "search_idx",
+        .kind = .full_text,
+        .doc_count = 10,
+        .term_count = 40,
+        .backfill_active = true,
+        .backfill_progress = 0.3,
+        .index_repair_status = .rebuilding,
+        .index_repair_active_generation_serviceable = true,
+    };
+    var encoded = std.ArrayListUnmanaged(u8).empty;
+    defer encoded.deinit(std.testing.allocator);
+    try appendSingleIndexRuntimeStatus(
+        std.testing.allocator,
+        &encoded,
+        .full_text,
+        item,
+        10,
+        .external,
+        false,
+        0,
+        0,
+        null,
+        .{},
+        null,
+        null,
+        null,
+        .{},
+        null,
+        true,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"repair\":{\"state\":\"rebuilding\",\"action_required\":false,\"blocks_queryable\":false,\"blocks_complete\":false}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"readiness\":{\"state\":\"queryable_partial\",\"queryable\":true,\"complete\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.items, "\"pending_reasons\":[\"backfill\"]") != null);
+}
+
 test "progressive embeddings readiness exposes a queryable partial generation" {
     const item = db_mod.types.DBIndexStats{
         .name = "semantic_idx",
@@ -4676,8 +4713,9 @@ fn appendIndexReadinessStatus(
             item.expected_group_count > 0 and item.repair_observation_count == item.expected_group_count
         else
             true;
-    const queryable_partial = !serving_failed and (pending or failed) and index_type == .embeddings and
-        (active_generation_serviceable or published_generation_has_results) and
+    const queryable_partial = !serving_failed and (pending or failed) and
+        (active_generation_serviceable or
+            (index_type == .embeddings and published_generation_has_results)) and
         ((observation_fresh and topology_complete and incarnation_current) or
             stale_generation_serviceable);
     const readiness_state = if (failed)
