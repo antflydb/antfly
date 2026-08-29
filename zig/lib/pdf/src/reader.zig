@@ -1101,26 +1101,6 @@ const max_glyph_charstring_operations: usize = 16_384;
 const min_text_materialization_bytes: usize = 256 * 1024;
 const max_text_materialization_bytes: usize = 64 * 1024 * 1024;
 
-fn fixedWidthCodeCount(byte_len: usize, code_bytes: usize) u64 {
-    if (code_bytes == 0) return byte_len;
-    const full_codes = byte_len / code_bytes;
-    return @intCast(full_codes + @intFromBool(byte_len % code_bytes != 0));
-}
-
-fn vectorTextGlyphCount(run: TextRun, font: PageFont) u64 {
-    if (run.raw_text) |raw| {
-        if (font.type3 != null or font.type1 != null) return raw.len;
-        if (font.truetype) |truetype| {
-            if (truetype.raw_code_bytes > 0) return fixedWidthCodeCount(raw.len, truetype.raw_code_bytes);
-            return std.unicode.utf8CountCodepoints(run.text) catch run.text.len;
-        }
-        if (font.cff_otf) |cff_otf| return fixedWidthCodeCount(raw.len, cff_otf.code_bytes);
-        if (font.cff) |cff| return fixedWidthCodeCount(raw.len, cff.code_bytes);
-        return raw.len;
-    }
-    return std.unicode.utf8CountCodepoints(run.text) catch run.text.len;
-}
-
 /// Caps native outline work in units that track the renderer's dominant
 /// operation: point-in-path edge tests. The allowance scales with the final
 /// raster, so thumbnails do not inherit page-sized work and large requested
@@ -1128,20 +1108,6 @@ fn vectorTextGlyphCount(run: TextRun, font: PageFont) u64 {
 /// transactional per PDF paint operator; rejected text stays on the bounded
 /// text fallback path instead of leaving a partially painted glyph.
 const VectorTextWorkBudget = struct {
-    const MaterializationReservation = struct {
-        points: u64,
-        resource_bytes: u64,
-
-        fn byteLimit(self: MaterializationReservation) usize {
-            // A source/flattened point can temporarily coexist with contour,
-            // path, and destination metadata. Keep enough headroom for normal
-            // fonts while imposing a process-safe ceiling per PDF operator.
-            const point_bytes = saturatedMulU64(self.points, 32);
-            const requested = saturatedAddU64(point_bytes, self.resource_bytes);
-            return @intCast(@min(@max(requested, min_text_materialization_bytes), max_text_materialization_bytes));
-        }
-    };
-
     remaining_edge_tests: u64,
     remaining_points: u64,
     remaining_resource_bytes: u64,
@@ -1163,9 +1129,11 @@ const VectorTextWorkBudget = struct {
         const page_height = @max(1.0, @abs(page_box.max_y - page_box.min_y));
         const pixels = saturatedMulU64(resolved.width, resolved.height);
         return .{
-            // Roughly 32 non-AA edge tests per output pixel. Antialiased
-            // outlines are charged four samples below.
-            .remaining_edge_tests = saturatedMulU64(pixels, 32),
+            // Allow an average of sixteen edges across the four antialiasing
+            // samples below. Dense, valid text routinely crosses the former
+            // eight-edge allowance; the budget remains finite and scales
+            // linearly with the requested raster.
+            .remaining_edge_tests = saturatedMulU64(pixels, 64),
             .remaining_points = saturatedAddU64(saturatedMulU64(pixels, 4), 65_536),
             .remaining_resource_bytes = @min(saturatedMulU64(pixels, 16), 256 * 1024 * 1024),
             .raster_pixels = pixels,
@@ -1215,53 +1183,20 @@ const VectorTextWorkBudget = struct {
         return true;
     }
 
-    /// Reserves a conservative upper bound before a text operator expands any
-    /// glyphs. Reconciliation immediately after that operator replaces the
-    /// reservation with its measured vector work. This prevents a single long
-    /// text-showing operator from allocating its entire outline/resource set
-    /// before the page budget has a chance to reject it.
-    fn reserveTextMaterialization(self: *VectorTextWorkBudget, run: TextRun, font: PageFont) ?MaterializationReservation {
+    /// Bounds temporary allocations before a text operator expands any glyphs.
+    /// The operator remains transactional and `admit` charges the measured
+    /// output before commit. Do not reserve every glyph at its maximum possible
+    /// flattened size here: that turns ordinary dense text into a page-wide
+    /// bitmap fallback even when its actual outlines are small.
+    fn textMaterializationByteLimit(self: *const VectorTextWorkBudget) ?usize {
         if (self.exhausted) return null;
-        const glyph_count = vectorTextGlyphCount(run, font);
-        const paint_copies: u64 = switch (@mod(run.render_mode, 8)) {
-            2, 6 => 2,
-            3, 7 => 0,
-            else => 1,
-        };
-        // Native outline flattening is capped at 4096 points per glyph below.
-        // Reserve output copies plus the temporary flattened path, which
-        // makes this a real upper bound rather than a statistical estimate.
-        const materialization_copies = if (paint_copies == 0) 0 else paint_copies + 1;
-        // A Type1 `seac` glyph expands to independently bounded base and
-        // accent outlines.
-        const outline_paths_per_glyph: u64 = if (font.type1 != null) 2 else 1;
-        const construction_units = saturatedMulU64(saturatedMulU64(glyph_count, max_flattened_glyph_points), outline_paths_per_glyph);
-        const resource_bytes: u64 = 0;
-        const points = saturatedMulU64(construction_units, materialization_copies);
-        if (points > self.remaining_points or resource_bytes > self.remaining_resource_bytes) {
-            self.exhausted = true;
-            return null;
-        }
-        self.remaining_points -= points;
-        self.remaining_resource_bytes -= resource_bytes;
-        return .{ .points = points, .resource_bytes = resource_bytes };
-    }
-
-    fn releaseTextMaterialization(self: *VectorTextWorkBudget, reservation: MaterializationReservation) void {
-        self.remaining_points = saturatedAddU64(self.remaining_points, reservation.points);
-        self.remaining_resource_bytes = saturatedAddU64(self.remaining_resource_bytes, reservation.resource_bytes);
-    }
-
-    fn reconcileTextMaterialization(
-        self: *VectorTextWorkBudget,
-        reservation: MaterializationReservation,
-        shapes: []const ShapeRun,
-        patterns: []const PatternRun,
-        images: []const ImageRun,
-        shadings: []const ShadingRun,
-    ) bool {
-        self.releaseTextMaterialization(reservation);
-        return self.admit(shapes, patterns, images, shadings);
+        // A source/flattened point can temporarily coexist with contour, path,
+        // and destination metadata. Resource-bearing Type3 glyphs also need
+        // room for their remaining independently owned samples. Both routes
+        // retain a fixed process-safe ceiling per PDF paint operator.
+        const point_bytes = saturatedMulU64(self.remaining_points, 32);
+        const requested = @max(point_bytes, self.remaining_resource_bytes);
+        return @intCast(@min(@max(requested, min_text_materialization_bytes), max_text_materialization_bytes));
     }
 };
 
@@ -1373,12 +1308,20 @@ const TextVerticalMetrics = struct {
 
 const TextRunStackEntry = struct {
     matrix: GraphicsMatrix,
+    current_font_index: ?usize,
+    font_size: f64,
     alpha: u8,
     stroke_alpha: u8,
     text_a: f64,
     text_b: f64,
     text_c: f64,
     text_d: f64,
+    horizontal_scale: f64,
+    char_spacing: f64,
+    word_spacing: f64,
+    rise: f64,
+    render_mode: i64,
+    leading: f64,
     fill_color: [4]u8,
     stroke_color: [4]u8,
     stroke_width: f64,
@@ -3118,15 +3061,19 @@ pub const Reader = struct {
         for (shape_out.items) |item| update_next_group(&next_resource_group_id, item.group_id);
         for (pattern_out.items) |item| update_next_group(&next_resource_group_id, item.group_id);
         for (text_runs) |item| update_next_group(&next_resource_group_id, item.group_id);
+        const materialization_limit = if (work_budget) |budget|
+            budget.textMaterializationByteLimit() orelse return false
+        else
+            max_text_materialization_bytes;
+        // A paint operator may be split into several TextRuns (for example by
+        // TJ positioning adjustments). Share one allocator so those fragments
+        // cannot each claim the full per-operator materialization allowance.
+        var materialization_allocator = DecodeBudgetAllocator.init(alloc, 0, materialization_limit);
+        const bounded_alloc = materialization_allocator.allocator();
         for (text_runs) |run| {
             if (!run.vectorizable) return false;
             const font_index = run.font_index orelse return false;
             if (font_index >= fonts.len) return false;
-            const reservation = if (work_budget) |budget|
-                budget.reserveTextMaterialization(run, fonts[font_index]) orelse return false
-            else
-                null;
-            const materialization_limit = if (reservation) |reserved| reserved.byteLimit() else max_text_materialization_bytes;
             const image_start = group_images.items.len;
             const shading_start = group_shadings.items.len;
             const pattern_start = group_patterns.items.len;
@@ -3143,9 +3090,6 @@ pub const Reader = struct {
                 }
                 if (needs_combined_renderer) {
                     if (image_out == null or shading_out == null) return false;
-                    if (work_budget) |budget| budget.releaseTextMaterialization(reservation.?);
-                    var materialization_allocator = DecodeBudgetAllocator.init(alloc, 0, materialization_limit);
-                    const bounded_alloc = materialization_allocator.allocator();
                     const complete = appendType3RunResourceRunsAlloc(bounded_alloc, &group_images, &group_shadings, &group_patterns, &group_shapes, run, type3, raw, &type3_paint_phase, &next_resource_group_id, work_budget) catch |err| {
                         if (err == error.OutOfMemory and materialization_allocator.limit_exceeded) return false;
                         return err;
@@ -3159,8 +3103,6 @@ pub const Reader = struct {
                 for (temp_shapes.items) |*shape| shape.deinit(alloc);
                 temp_shapes.deinit(alloc);
             }
-            var materialization_allocator = DecodeBudgetAllocator.init(alloc, 0, materialization_limit);
-            const bounded_alloc = materialization_allocator.allocator();
             const complete = appendVectorTextRunShapesAlloc(bounded_alloc, &temp_shapes, fonts, run, &type3_paint_phase) catch |err| {
                 if (err == error.OutOfMemory and materialization_allocator.limit_exceeded) return false;
                 return err;
@@ -3174,8 +3116,7 @@ pub const Reader = struct {
                 if (err == error.OutOfMemory and materialization_allocator.limit_exceeded) return false;
                 return err;
             };
-            if (work_budget) |budget| if (!budget.reconcileTextMaterialization(
-                reservation.?,
+            if (work_budget) |budget| if (!budget.admit(
                 group_shapes.items[shape_start..],
                 group_patterns.items[pattern_start..],
                 group_images.items[image_start..],
@@ -9929,12 +9870,20 @@ fn applyTextRunOperator(
         errdefer if (clip_points) |points| alloc.free(points);
         try stack.append(alloc, .{
             .matrix = state.matrix,
+            .current_font_index = state.current_font_index,
+            .font_size = state.font_size,
             .alpha = state.alpha,
             .stroke_alpha = state.stroke_alpha,
             .text_a = state.text_a,
             .text_b = state.text_b,
             .text_c = state.text_c,
             .text_d = state.text_d,
+            .horizontal_scale = state.horizontal_scale,
+            .char_spacing = state.char_spacing,
+            .word_spacing = state.word_spacing,
+            .rise = state.rise,
+            .render_mode = state.render_mode,
+            .leading = state.leading,
             .fill_color = state.fill_color,
             .stroke_color = state.stroke_color,
             .stroke_width = state.stroke_width,
@@ -9958,12 +9907,20 @@ fn applyTextRunOperator(
             var entry = stack.pop().?;
             defer entry.deinit(alloc);
             state.matrix = entry.matrix;
+            state.current_font_index = entry.current_font_index;
+            state.font_size = entry.font_size;
             state.alpha = entry.alpha;
             state.stroke_alpha = entry.stroke_alpha;
             state.text_a = entry.text_a;
             state.text_b = entry.text_b;
             state.text_c = entry.text_c;
             state.text_d = entry.text_d;
+            state.horizontal_scale = entry.horizontal_scale;
+            state.char_spacing = entry.char_spacing;
+            state.word_spacing = entry.word_spacing;
+            state.rise = entry.rise;
+            state.render_mode = entry.render_mode;
+            state.leading = entry.leading;
             state.fill_color = entry.fill_color;
             state.stroke_color = entry.stroke_color;
             state.stroke_width = entry.stroke_width;
@@ -15364,6 +15321,45 @@ test "reader applies text state operators to positioned runs" {
     try std.testing.expectApproxEqAbs(@as(f64, 43.5), runs.items[0].advance_width, 0.001);
 }
 
+test "reader restores scoped PDF text state on Q" {
+    const alloc = std.testing.allocator;
+    const content =
+        "BT /F1 10 Tf ET\n" ++
+        "q\n" ++
+        "BT /F2 20 Tf 2 Tc 5 Tw 150 Tz 4 Ts 1 Tr 30 TL ET\n" ++
+        "Q\n" ++
+        "BT 10 20 Td (A B) Tj (C) ' ET\n";
+
+    const fonts = [_]PageFont{
+        .{ .name = try alloc.dupe(u8, "F1"), .decoder = .{} },
+        .{ .name = try alloc.dupe(u8, "F2"), .decoder = .{} },
+    };
+    defer {
+        for (fonts) |value| {
+            var font = value;
+            font.deinit(alloc);
+        }
+    }
+
+    var runs = std.ArrayList(TextRun).empty;
+    defer {
+        for (runs.items) |*run| run.deinit(alloc);
+        runs.deinit(alloc);
+    }
+
+    try extractTextRunsFromContentAppend(alloc, &runs, content, &fonts, &.{}, &.{});
+    try std.testing.expectEqual(@as(usize, 2), runs.items.len);
+    try std.testing.expectEqual(@as(?u16, 0), runs.items[0].font_index);
+    try std.testing.expectApproxEqAbs(@as(f64, 10), runs.items[0].font_size, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 1), runs.items[0].horizontal_scale, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), runs.items[0].char_spacing, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), runs.items[0].word_spacing, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 20), runs.items[0].y, 0.001);
+    try std.testing.expectEqual(@as(i64, 0), runs.items[0].render_mode);
+    try std.testing.expectApproxEqAbs(@as(f64, 18), runs.items[0].advance_width, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 6), runs.items[1].y, 0.001);
+}
+
 test "Type1 and Type3 spacing follows horizontal scaling in measurement and geometry" {
     const alloc = std.testing.allocator;
     var a_name = [_]u8{'A'};
@@ -20568,51 +20564,74 @@ test "vector text admission is raster relative and transactional" {
     try std.testing.expectEqual(remaining, budget.remaining_edge_tests);
 }
 
-test "vector text reserves before long glyph materialization and reconciles measured work" {
+test "vector text bounds materialization and charges measured work" {
     var budget = VectorTextWorkBudget.init(.{ .width = 100, .height = 100 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
-    const font = PageFont{ .name = @constCast("F"), .decoder = .{} };
     const initial_points = budget.remaining_points;
-    const reservation = budget.reserveTextMaterialization(.{
-        .text = @constCast("A"),
-        .raw_text = @constCast("A"),
-        .font_index = 0,
-        .x = 0,
-        .y = 0,
-        .font_size = 12,
-    }, font).?;
-    try std.testing.expect(budget.remaining_points < initial_points);
+    const byte_limit = budget.textMaterializationByteLimit().?;
+    try std.testing.expectEqual(initial_points, budget.remaining_points);
+    try std.testing.expect(byte_limit >= min_text_materialization_bytes);
+    try std.testing.expect(byte_limit <= max_text_materialization_bytes);
 
     const points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } };
     const shape = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = @constCast(&points) };
-    try std.testing.expect(budget.reconcileTextMaterialization(reservation, (&shape)[0..1], &.{}, &.{}, &.{}));
+    try std.testing.expect(budget.admit((&shape)[0..1], &.{}, &.{}, &.{}));
     try std.testing.expectEqual(initial_points - points.len, budget.remaining_points);
 
     var constrained = VectorTextWorkBudget.init(.{ .width = 10, .height = 10 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
-    constrained.remaining_points = max_flattened_glyph_points * 2 - 1;
-    try std.testing.expect(constrained.reserveTextMaterialization(.{
-        .text = @constCast("A"),
-        .raw_text = @constCast("A"),
-        .font_index = 0,
-        .x = 0,
-        .y = 0,
-        .font_size = 12,
-    }, font) == null);
+    constrained.remaining_points = 1;
+    try std.testing.expectEqual(min_text_materialization_bytes, constrained.textMaterializationByteLimit().?);
+    const too_many_points = [_][2]f64{ .{ 0, 0 }, .{ 1, 0 } };
+    const too_large = ShapeRun{ .kind = .fill, .color = .{ 0, 0, 0, 255 }, .stroke_width = 0, .closed = true, .points = @constCast(&too_many_points) };
+    try std.testing.expect(!constrained.admit((&too_large)[0..1], &.{}, &.{}, &.{}));
     try std.testing.expect(constrained.exhausted);
+    try std.testing.expect(constrained.textMaterializationByteLimit() == null);
+}
 
-    var cid_budget = VectorTextWorkBudget.init(.{ .width = 10, .height = 10 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
-    cid_budget.remaining_points = max_flattened_glyph_points * 2;
-    const cid_font = PageFont{ .name = @constCast("CID"), .decoder = .{ .code_bytes = 4 } };
-    const cid_reservation = cid_budget.reserveTextMaterialization(.{
-        .text = @constCast("A"),
-        .raw_text = @constCast(&[_]u8{1}),
+test "dense low complexity Type1 text remains native within measured budget" {
+    const alloc = std.testing.allocator;
+    var glyph_name = [_]u8{'A'};
+    var outline_program = [_]u8{
+        139, 139, 21,
+        189, 139, 5,
+        139, 189, 5,
+        89,  139, 5,
+        14,
+    };
+    var glyphs = [_]Type1Glyph{.{
+        .code = 'A',
+        .name = &glyph_name,
+        .charstring = &outline_program,
+        .advance = 600,
+    }};
+    var font_name = [_]u8{'F'};
+    var fonts = [_]PageFont{.{
+        .name = &font_name,
+        .decoder = .{},
+        .type1 = .{ .glyphs = &glyphs },
+    }};
+    var text = [_]u8{'A'} ** 32;
+    var run = TextRun{
+        .text = &text,
+        .raw_text = &text,
         .font_index = 0,
+        .vectorizable = true,
         .x = 0,
-        .y = 0,
-        .font_size = 12,
-    }, cid_font) orelse return error.UnexpectedTextMaterializationRejection;
-    try std.testing.expectEqual(@as(u64, max_flattened_glyph_points * 2), cid_reservation.points);
-    try std.testing.expectEqual(@as(u64, 0), cid_budget.remaining_points);
-    try std.testing.expectEqual(@as(u64, 2), fixedWidthCodeCount(4, 2));
+        .y = 50,
+        .font_size = 1,
+    };
+    var shape_out = std.ArrayList(ShapeRun).empty;
+    defer {
+        for (shape_out.items) |*shape| shape.deinit(alloc);
+        shape_out.deinit(alloc);
+    }
+    var pattern_out = std.ArrayList(PatternRun).empty;
+    defer pattern_out.deinit(alloc);
+    var budget = VectorTextWorkBudget.init(.{ .width = 100, .height = 100 }, .{ .min_x = 0, .min_y = 0, .max_x = 100, .max_y = 100 });
+
+    try Reader.appendVectorTextRenderRunsAlloc(alloc, null, null, &shape_out, &pattern_out, &fonts, &.{}, (&run)[0..1], &budget);
+    try std.testing.expect(run.vectorizable);
+    try std.testing.expectEqual(@as(usize, text.len), shape_out.items.len);
+    try std.testing.expect(!budget.exhausted);
 }
 
 test "image XObject occurrences retain one decoded sample buffer" {
