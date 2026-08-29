@@ -285,6 +285,7 @@ pub const IncomingSourceGroupCache = struct {
     durable_misses: std.atomic.Value(u64) = .init(0),
     durable_read_failures: std.atomic.Value(u64) = .init(0),
     durable_write_failures: std.atomic.Value(u64) = .init(0),
+    durable_write_retries: std.atomic.Value(u64) = .init(0),
     durable_writes_coalesced: std.atomic.Value(u64) = .init(0),
     durable_writes_dropped: std.atomic.Value(u64) = .init(0),
     durable_batches_committed: std.atomic.Value(u64) = .init(0),
@@ -302,12 +303,15 @@ pub const IncomingSourceGroupCache = struct {
     const max_pending_durable_bytes: usize = 8 * 1024 * 1024;
     const max_durable_flush_entries: usize = 512;
     const max_durable_flush_bytes: usize = 4 * 1024 * 1024;
+    const durable_flush_max_attempts: usize = 4;
+    const durable_flush_retry_base_ns: u64 = std.time.ns_per_ms;
 
     pub const Stats = struct {
         durable_hits: u64 = 0,
         durable_misses: u64 = 0,
         durable_read_failures: u64 = 0,
         durable_write_failures: u64 = 0,
+        durable_write_retries: u64 = 0,
         durable_writes_coalesced: u64 = 0,
         durable_writes_dropped: u64 = 0,
         durable_batches_committed: u64 = 0,
@@ -367,6 +371,7 @@ pub const IncomingSourceGroupCache = struct {
             .durable_misses = self.durable_misses.load(.monotonic),
             .durable_read_failures = self.durable_read_failures.load(.monotonic),
             .durable_write_failures = self.durable_write_failures.load(.monotonic),
+            .durable_write_retries = self.durable_write_retries.load(.monotonic),
             .durable_writes_coalesced = self.durable_writes_coalesced.load(.monotonic),
             .durable_writes_dropped = self.durable_writes_dropped.load(.monotonic),
             .durable_batches_committed = self.durable_batches_committed.load(.monotonic),
@@ -380,6 +385,10 @@ pub const IncomingSourceGroupCache = struct {
         self.closing = true;
         self.pending_mutex.unlock();
         if (self.durable_jobs) |lane| lane.closeOwner(self.durable_job_owner_id);
+        // A submission can fail before the lane owns a job. Once producers are
+        // fenced and all owned jobs have stopped, make one bounded synchronous
+        // drain so accepted hints are not silently abandoned on clean shutdown.
+        self.flushPendingDurableWrites();
 
         platform_sync.lockYielding(&self.mutex);
         self.clearLocked();
@@ -414,6 +423,10 @@ pub const IncomingSourceGroupCache = struct {
         table_name: []const u8,
         req: IncomingSourceGroupsRequest,
     ) !IncomingSourceGroupsResponse {
+        // Re-kick a queue retained after a transient allocation/submission or
+        // storage failure. This is intentionally best-effort and never blocks
+        // the lookup path on durable persistence.
+        defer self.scheduleDurableFlush();
         const entries = try out_alloc.alloc(IncomingSourceGroupEntry, req.keys.len);
         var initialized: usize = 0;
         errdefer {
@@ -835,14 +848,67 @@ pub const IncomingSourceGroupCache = struct {
                 self.pending_durable_bytes -= removed.value.encoded.len;
             }
             self.pending_mutex.unlock();
-            self.persistEncodedDurableBatch(writes[0..count]) catch {
-                for (writes[0..count]) |write| self.alloc.free(write.encoded);
-                _ = self.durable_write_failures.fetchAdd(1, .monotonic);
-                continue;
-            };
+            if (!self.persistEncodedDurableBatchWithRetry(writes[0..count])) {
+                self.requeueFailedDurableWrites(writes[0..count]);
+                return;
+            }
             for (writes[0..count]) |write| self.alloc.free(write.encoded);
             _ = self.durable_batches_committed.fetchAdd(1, .monotonic);
         }
+    }
+
+    fn persistEncodedDurableBatchWithRetry(self: *@This(), writes: []const PendingDurableWrite) bool {
+        for (0..durable_flush_max_attempts) |attempt| {
+            self.persistEncodedDurableBatch(writes) catch {
+                if (attempt + 1 == durable_flush_max_attempts) {
+                    _ = self.durable_write_failures.fetchAdd(1, .monotonic);
+                    return false;
+                }
+                _ = self.durable_write_retries.fetchAdd(1, .monotonic);
+                platform_time.sleepNs(durable_flush_retry_base_ns << @intCast(attempt));
+                continue;
+            };
+            return true;
+        }
+        unreachable;
+    }
+
+    /// Return a failed batch to the bounded coalescer. A newer write for the
+    /// same slot wins, and queue limits remain hard even if producers filled
+    /// the capacity while persistence was in flight.
+    fn requeueFailedDurableWrites(self: *@This(), writes: []const PendingDurableWrite) void {
+        platform_sync.lockYielding(&self.pending_mutex);
+        defer self.pending_mutex.unlock();
+        for (writes) |write| {
+            if (self.closing) {
+                self.alloc.free(write.encoded);
+                _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
+                continue;
+            }
+            const slot = std.mem.readInt(u32, write.durable_key[durable_key_prefix.len..][0..@sizeOf(u32)], .big);
+            if (self.pending_durable.contains(slot)) {
+                self.alloc.free(write.encoded);
+                _ = self.durable_writes_coalesced.fetchAdd(1, .monotonic);
+                continue;
+            }
+            if (self.pending_durable.count() >= max_pending_durable_entries or
+                write.encoded.len > max_pending_durable_bytes or
+                self.pending_durable_bytes > max_pending_durable_bytes - write.encoded.len)
+            {
+                self.alloc.free(write.encoded);
+                _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
+                continue;
+            }
+            self.pending_durable.putNoClobber(self.alloc, slot, write) catch {
+                self.alloc.free(write.encoded);
+                _ = self.durable_writes_dropped.fetchAdd(1, .monotonic);
+                continue;
+            };
+            self.pending_durable_bytes += write.encoded.len;
+        }
+        // Do not spin forever against a persistently unavailable store. The
+        // next read/write re-kicks this retained queue; deinit drains it once.
+        self.durable_flush_scheduled = false;
     }
 
     fn persistEncodedDurableBatch(self: *@This(), writes: []const PendingDurableWrite) !void {
@@ -3957,6 +4023,7 @@ test "incoming graph route durable writes leave the query path" {
 
     const DeferredLane = struct {
         job: ?background_runtime.Job = null,
+        fail_submissions: usize = 1,
 
         fn lane(self: *@This()) background_runtime.DurableJobLane {
             return .{ .ptr = self, .vtable = &vtable };
@@ -3964,6 +4031,10 @@ test "incoming graph route durable writes leave the query path" {
 
         fn submit(ptr: *anyopaque, job: background_runtime.Job) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_submissions > 0) {
+                self.fail_submissions -= 1;
+                return error.TestTransientSubmissionFailure;
+            }
             if (self.job != null) return error.TestUnexpectedResult;
             self.job = job;
         }
@@ -4012,13 +4083,15 @@ test "incoming graph route durable writes leave the query path" {
         }),
         .complete = true,
     });
-    try std.testing.expect(deferred.job != null);
+    try std.testing.expect(deferred.job == null);
     try std.testing.expectEqual(@as(usize, 1), cache.stats().pending_durable_entries);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats().durable_write_failures);
 
     var l1_hit = try cache.resolveAlloc(alloc, "docs", req);
     defer l1_hit.deinit(alloc);
     try std.testing.expect(l1_hit.complete);
     try std.testing.expectEqualSlices(u64, &.{22}, l1_hit.entries[0].source_group_ids);
+    try std.testing.expect(deferred.job != null);
 
     try deferred.runPending();
     try std.testing.expectEqual(@as(usize, 0), cache.stats().pending_durable_entries);
@@ -4028,6 +4101,29 @@ test "incoming graph route durable writes leave the query path" {
     defer durable_hit.deinit(alloc);
     try std.testing.expect(durable_hit.complete);
     try std.testing.expectEqualSlices(u64, &.{22}, durable_hit.entries[0].source_group_ids);
+}
+
+test "incoming graph route durable failures retry boundedly and retain accepted hints" {
+    const alloc = std.testing.allocator;
+    var cache = IncomingSourceGroupCache.init(alloc);
+    defer cache.deinit();
+
+    const identity = incomingRouteDurableIdentity("docs", "relations", "doc:a");
+    const durable_key = incomingRouteDurableKey(identity);
+    const encoded = try alloc.dupe(u8, "accepted-route-hint");
+    try cache.enqueueEncodedDurableWrite(durable_key, encoded);
+
+    cache.flushPendingDurableWrites();
+    const snapshot = cache.stats();
+    try std.testing.expectEqual(@as(u64, IncomingSourceGroupCache.durable_flush_max_attempts - 1), snapshot.durable_write_retries);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.durable_write_failures);
+    try std.testing.expectEqual(@as(u64, 0), snapshot.durable_writes_dropped);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.pending_durable_entries);
+    try std.testing.expect(!cache.durable_flush_scheduled);
+
+    // Avoid a second intentionally failing drain in deinit; clear owns and
+    // releases the retained encoded value.
+    cache.clear();
 }
 
 test "incoming graph route directory survives cache restart and replaces stale fences" {

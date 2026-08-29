@@ -2118,12 +2118,18 @@ pub const IndexManager = struct {
     const DenseVectorMetadataPresenceMemo = struct {
         values: std.AutoHashMapUnmanaged(u64, bool) = .empty,
         metadata: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
+        reverse_values: std.AutoHashMapUnmanaged(u64, bool) = .empty,
+        reverse_metadata: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
 
         fn deinit(self: *@This(), alloc: Allocator) void {
             var it = self.metadata.valueIterator();
             while (it.next()) |value| alloc.free(value.*);
+            var reverse_it = self.reverse_metadata.valueIterator();
+            while (reverse_it.next()) |value| alloc.free(value.*);
             self.values.deinit(alloc);
             self.metadata.deinit(alloc);
+            self.reverse_values.deinit(alloc);
+            self.reverse_metadata.deinit(alloc);
             self.* = undefined;
         }
 
@@ -2154,6 +2160,30 @@ pub const IndexManager = struct {
         fn noteAbsent(self: *@This(), alloc: Allocator, vector_id: u64) !void {
             try self.values.put(alloc, vector_id, false);
             if (self.metadata.fetchRemove(vector_id)) |existing| {
+                alloc.free(existing.value);
+            }
+        }
+
+        fn getReverse(self: *const @This(), vector_id: u64) ?bool {
+            return self.reverse_values.get(vector_id);
+        }
+
+        fn getReverseMetadata(self: *const @This(), vector_id: u64) ?[]const u8 {
+            return self.reverse_metadata.get(vector_id);
+        }
+
+        fn noteReversePresent(self: *@This(), alloc: Allocator, vector_id: u64, doc_key: []const u8) !void {
+            const owned = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned);
+            try self.reverse_values.put(alloc, vector_id, true);
+            if (try self.reverse_metadata.fetchPut(alloc, vector_id, owned)) |existing| {
+                alloc.free(existing.value);
+            }
+        }
+
+        fn noteReverseAbsent(self: *@This(), alloc: Allocator, vector_id: u64) !void {
+            try self.reverse_values.put(alloc, vector_id, false);
+            if (self.reverse_metadata.fetchRemove(vector_id)) |existing| {
                 alloc.free(existing.value);
             }
         }
@@ -10082,6 +10112,12 @@ pub const IndexManager = struct {
         conflicts,
     };
 
+    const DenseVectorIdOccupancy = struct {
+        state: DenseVectorMetadataState,
+        vector_present: bool,
+        identity_inconsistent: bool = false,
+    };
+
     const PendingDenseVectorMapping = struct {
         doc_key: []const u8,
         parent_doc_key: ?[]const u8 = null,
@@ -10111,44 +10147,12 @@ pub const IndexManager = struct {
         batch_options: StoreBatchOptions,
     ) !void {
         if (writes.len == 0) return;
-
+        // Keep one ingestion implementation for both the all-index and named
+        // entry points. In particular, the entry implementation selects the
+        // encoded embedding artifact key for multi-source indexes so equal
+        // document keys from different artifact streams remain distinct.
         for (self.dense_indexes.items) |*entry| {
-            var store_batch = try store.beginWriteBatchWithOptions(batch_options);
-            errdefer store_batch.abort();
-            const store_txn = store_batch.asTxn();
-
-            var items: OwnedDenseInsertItems = .{};
-            defer items.deinit(self.alloc);
-            _ = try items.ensureArena(self.alloc);
-            var pending_mappings = std.ArrayListUnmanaged(PendingDenseVectorMapping).empty;
-            defer pending_mappings.deinit(self.alloc);
-            var all_vector_ids_new = true;
-
-            for (writes) |write| {
-                if (!self.keyInRange(write.doc_key)) continue;
-                if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
-                if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
-
-                if (write.artifact_key == null) {
-                    const artifact_name = entry.embedding_name orelse entry.config.name;
-                    try self.writeDenseEmbeddingArtifactTxn(store_txn, write.doc_key, write.doc_key, artifact_name, "_embeddings", null, write.vector);
-                }
-                const assignment = try self.ensureDenseVectorIdTxn(store_txn, write.index_name, write.doc_key, write.parent_doc_key);
-                all_vector_ids_new = all_vector_ids_new and assignment.can_assume_absent;
-                try items.appendBorrowed(self.alloc, assignment.vector_id, write.vector, write.doc_key);
-                try pending_mappings.append(self.alloc, .{
-                    .doc_key = items.items.items[items.items.items.len - 1].metadata,
-                    .parent_doc_key = write.parent_doc_key,
-                    .vector_id = assignment.vector_id,
-                });
-            }
-
-            if (items.items.items.len == 0) continue;
-            try entry.index.batchInsertWithMetadataOptions(
-                items.items.items,
-                denseHbcBatchOptions(batch_options, all_vector_ids_new, entry.index.hasExternalVectorLoader()),
-            );
-            try self.commitDenseVectorMappingsWithRollback(&store_batch, store_txn, entry, entry.config.name, pending_mappings.items);
+            try self.applyDenseEmbeddingWritesEntry(store, entry, writes, batch_options);
         }
     }
 
@@ -13509,6 +13513,8 @@ pub const IndexManager = struct {
         }
         var pending_mappings = std.ArrayListUnmanaged(PendingDenseVectorMapping).empty;
         defer pending_mappings.deinit(self.alloc);
+        var metadata_presence_memo = DenseVectorMetadataPresenceMemo{};
+        defer metadata_presence_memo.deinit(self.alloc);
         var mapping_batch = try runtime_store.store.beginBatch();
         errdefer mapping_batch.abort();
 
@@ -13520,7 +13526,13 @@ pub const IndexManager = struct {
             const vector_values = (try mapper.extractDenseVectorField(self.alloc, doc.value, entry.field_name, entry.dims)) orelse continue;
             errdefer self.alloc.free(vector_values);
 
-            const assignment = try self.ensureDenseVectorIdTxn(&mapping_batch, entry.config.name, raw_key, null);
+            const assignment = try self.ensureDenseVectorIdTxnWithMemo(
+                &mapping_batch,
+                entry.config.name,
+                raw_key,
+                null,
+                &metadata_presence_memo,
+            );
             try items.append(self.alloc, .{
                 .vector_id = assignment.vector_id,
                 .vector = vector_values,
@@ -13636,33 +13648,6 @@ pub const IndexManager = struct {
         if (flushed_batches > 0) try entry.index.checkpointLsmWalAfterDurableBoundary();
     }
 
-    fn denseVectorIdHasExistingMetadata(
-        self: *IndexManager,
-        entry: *DenseIndex,
-        vector_id: u64,
-        memo: ?*DenseVectorMetadataPresenceMemo,
-    ) !bool {
-        if (memo) |cache| {
-            if (cache.get(vector_id)) |present| return present;
-        }
-        const existing_metadata = entry.index.getMetadata(vector_id) catch |err| switch (err) {
-            error.NotFound => null,
-            else => return err,
-        };
-        const present = existing_metadata != null;
-        if (memo) |cache| {
-            if (existing_metadata) |metadata| {
-                defer self.alloc.free(metadata);
-                try cache.notePresent(self.alloc, vector_id, metadata);
-            } else {
-                try cache.noteAbsent(self.alloc, vector_id);
-            }
-        } else if (existing_metadata) |metadata| {
-            self.alloc.free(metadata);
-        }
-        return present;
-    }
-
     fn denseVectorIdMetadataState(
         self: *IndexManager,
         entry: *DenseIndex,
@@ -13689,6 +13674,141 @@ pub const IndexManager = struct {
         return .absent;
     }
 
+    /// Resolve both sides of the vector identity invariant. HBC metadata is
+    /// authoritative for the live vector while the durable reverse mapping is
+    /// authoritative across recovery. An ID is available only when neither
+    /// side belongs to another logical member.
+    fn denseVectorIdOccupancyTxn(
+        self: *IndexManager,
+        txn: anytype,
+        entry: *DenseIndex,
+        index_name: []const u8,
+        vector_id: u64,
+        doc_key: []const u8,
+        memo: ?*DenseVectorMetadataPresenceMemo,
+    ) !DenseVectorIdOccupancy {
+        const metadata_state = try self.denseVectorIdMetadataState(entry, vector_id, doc_key, memo);
+        var owned_reverse_doc_key: ?[]u8 = null;
+        defer if (owned_reverse_doc_key) |key| self.alloc.free(key);
+        const reverse_doc_key: ?[]const u8 = if (memo) |cache| blk: {
+            if (cache.getReverseMetadata(vector_id)) |key| break :blk key;
+            if (cache.getReverse(vector_id) == false) break :blk null;
+            owned_reverse_doc_key = try self.lookupDenseDocKeyByVectorIdTxn(txn, index_name, vector_id);
+            if (owned_reverse_doc_key) |key| {
+                try cache.noteReversePresent(self.alloc, vector_id, key);
+                break :blk cache.getReverseMetadata(vector_id).?;
+            }
+            try cache.noteReverseAbsent(self.alloc, vector_id);
+            break :blk null;
+        } else blk: {
+            owned_reverse_doc_key = try self.lookupDenseDocKeyByVectorIdTxn(txn, index_name, vector_id);
+            break :blk owned_reverse_doc_key;
+        };
+        const reverse_matches = if (reverse_doc_key) |key| std.mem.eql(u8, key, doc_key) else false;
+        const reverse_conflicts = if (reverse_doc_key) |key| !std.mem.eql(u8, key, doc_key) else false;
+        const identity_inconsistent =
+            (metadata_state == .matches and reverse_conflicts) or
+            (metadata_state == .conflicts and reverse_matches);
+
+        if (metadata_state == .conflicts or reverse_conflicts) {
+            return .{
+                .state = .conflicts,
+                .vector_present = metadata_state != .absent,
+                .identity_inconsistent = identity_inconsistent,
+            };
+        }
+        return .{
+            .state = if (metadata_state == .matches or reverse_matches) .matches else .absent,
+            .vector_present = metadata_state != .absent,
+        };
+    }
+
+    fn noteDenseVectorIdSelected(
+        self: *IndexManager,
+        memo: ?*DenseVectorMetadataPresenceMemo,
+        vector_id: u64,
+        doc_key: []const u8,
+    ) !void {
+        if (memo) |cache| try cache.notePresent(self.alloc, vector_id, doc_key);
+    }
+
+    /// Prefer the stable hash ID, but spill a collision into the durable ID
+    /// allocator. The memo reserves IDs selected earlier in the same batch, so
+    /// two colliding members cannot both be staged before HBC is updated.
+    fn assignDenseVectorIdFromPreferredTxn(
+        self: *IndexManager,
+        txn: anytype,
+        entry: *DenseIndex,
+        index_name: []const u8,
+        doc_key: []const u8,
+        preferred_vector_id: u64,
+        memo: ?*DenseVectorMetadataPresenceMemo,
+    ) !DenseVectorIdAssignment {
+        const preferred = try self.denseVectorIdOccupancyTxn(
+            txn,
+            entry,
+            index_name,
+            preferred_vector_id,
+            doc_key,
+            memo,
+        );
+        if (preferred.identity_inconsistent) return error.InvalidDenseVectorMetadata;
+        if (preferred.state != .conflicts) {
+            try self.noteDenseVectorIdSelected(memo, preferred_vector_id, doc_key);
+            return .{
+                .vector_id = preferred_vector_id,
+                .needs_mapping = false,
+                .can_assume_absent = !preferred.vector_present,
+            };
+        }
+
+        while (true) {
+            const vector_id = try self.reserveDenseVectorIdTxn(txn, index_name);
+            const candidate = try self.denseVectorIdOccupancyTxn(
+                txn,
+                entry,
+                index_name,
+                vector_id,
+                doc_key,
+                memo,
+            );
+            if (candidate.identity_inconsistent) return error.InvalidDenseVectorMetadata;
+            if (candidate.state == .conflicts) continue;
+            try self.noteDenseVectorIdSelected(memo, vector_id, doc_key);
+            return .{
+                .vector_id = vector_id,
+                .needs_mapping = true,
+                .can_assume_absent = !candidate.vector_present,
+            };
+        }
+    }
+
+    fn mappedDenseVectorIdAssignmentTxn(
+        self: *IndexManager,
+        txn: anytype,
+        entry: *DenseIndex,
+        index_name: []const u8,
+        doc_key: []const u8,
+        vector_id: u64,
+        memo: ?*DenseVectorMetadataPresenceMemo,
+    ) !DenseVectorIdAssignment {
+        const occupancy = try self.denseVectorIdOccupancyTxn(
+            txn,
+            entry,
+            index_name,
+            vector_id,
+            doc_key,
+            memo,
+        );
+        if (occupancy.state == .conflicts) return error.InvalidDenseVectorMetadata;
+        try self.noteDenseVectorIdSelected(memo, vector_id, doc_key);
+        return .{
+            .vector_id = vector_id,
+            .needs_mapping = false,
+            .can_assume_absent = !occupancy.vector_present,
+        };
+    }
+
     fn legacyOrdinalDenseVectorIdAssignmentTxn(
         self: *IndexManager,
         txn: anytype,
@@ -13702,12 +13822,20 @@ pub const IndexManager = struct {
         const vector_id: u64 = ordinal;
         // Compatibility only: pre-DOCID dense vectors may have used the document
         // ordinal as the HBC vector ID. New assignments use deterministic IDs.
-        return switch (try self.denseVectorIdMetadataState(entry, vector_id, doc_key, metadata_presence_memo)) {
-            .matches => .{
+        const occupancy = try self.denseVectorIdOccupancyTxn(
+            txn,
+            entry,
+            entry.config.name,
+            vector_id,
+            doc_key,
+            metadata_presence_memo,
+        );
+        return switch (occupancy.state) {
+            .matches => if (occupancy.vector_present) .{
                 .vector_id = vector_id,
                 .needs_mapping = false,
                 .can_assume_absent = false,
-            },
+            } else null,
             .absent, .conflicts => null,
         };
     }
@@ -13716,9 +13844,11 @@ pub const IndexManager = struct {
         self: *IndexManager,
         entry: *DenseIndex,
         index_txn: anytype,
+        store_txn: anytype,
         writes: []const mapper.DenseEmbeddingWrite,
         keep_write: []const bool,
         prefetched_ordinals: ?[]const ?doc_identity.DocOrdinal,
+        prefetched_mapped_vector_ids: ?[]const ?u64,
         memo: *DenseVectorMetadataPresenceMemo,
     ) !void {
         var candidate_count: usize = 0;
@@ -13734,7 +13864,7 @@ pub const IndexManager = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const max_candidate_ids = candidate_count * 2;
+        const max_candidate_ids = candidate_count * 3;
         const vector_ids_storage = try arena.alloc(u64, max_candidate_ids);
         const out_metadata = try arena.alloc(?[]const u8, max_candidate_ids);
         const lookups = try arena.alloc(hbc_mod.FixedKeyLookup, max_candidate_ids);
@@ -13747,6 +13877,12 @@ pub const IndexManager = struct {
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             if (write.vector.len == 0 and write.artifact_key == null) continue;
             const member_key = if (entry.embedding_names.len > 0) write.artifact_key orelse write.doc_key else write.doc_key;
+            if (prefetched_mapped_vector_ids) |mapped_vector_ids| {
+                if (mapped_vector_ids[write_index]) |mapped_vector_id| {
+                    vector_ids_storage[filled] = mapped_vector_id;
+                    filled += 1;
+                }
+            }
             vector_ids_storage[filled] = deterministicDenseVectorId(member_key);
             filled += 1;
             if (entry.embedding_names.len == 0 and write.parent_doc_key == null) {
@@ -13794,6 +13930,74 @@ pub const IndexManager = struct {
                 try memo.noteAbsent(self.alloc, vector_id);
             }
         }
+        try self.prefetchDenseReverseMappingsTxn(store_txn, entry.config.name, vector_ids, memo);
+    }
+
+    fn prefetchDenseReverseMappingsTxn(
+        self: *IndexManager,
+        txn: anytype,
+        index_name: []const u8,
+        vector_ids: []const u64,
+        memo: *DenseVectorMetadataPresenceMemo,
+    ) !void {
+        if (vector_ids.len == 0) return;
+        const PendingLookup = struct {
+            vector_index: usize,
+            legacy: bool,
+            key: []u8,
+
+            fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
+                return std.mem.lessThan(u8, lhs.key, rhs.key);
+            }
+        };
+
+        const pending = try self.alloc.alloc(PendingLookup, vector_ids.len * 2);
+        var initialized: usize = 0;
+        defer {
+            for (pending[0..initialized]) |item| self.alloc.free(item.key);
+            self.alloc.free(pending);
+        }
+        for (vector_ids, 0..) |vector_id, i| {
+            pending[i * 2] = .{
+                .vector_index = i,
+                .legacy = false,
+                .key = try denseVectorIdMappingKey(self.alloc, index_name, vector_id),
+            };
+            initialized += 1;
+            pending[i * 2 + 1] = .{
+                .vector_index = i,
+                .legacy = true,
+                .key = try legacyDenseVectorIdMappingKey(self.alloc, index_name, vector_id),
+            };
+            initialized += 1;
+        }
+        std.sort.pdq(PendingLookup, pending, {}, PendingLookup.lessThan);
+
+        const read_keys = try self.alloc.alloc([]const u8, pending.len);
+        defer self.alloc.free(read_keys);
+        const read_values = try self.alloc.alloc(?[]const u8, pending.len);
+        defer self.alloc.free(read_values);
+        for (pending, 0..) |item, i| read_keys[i] = item.key;
+        try txn.getManySorted(read_keys, read_values);
+
+        const modern_found = try self.alloc.alloc(bool, vector_ids.len);
+        defer self.alloc.free(modern_found);
+        @memset(modern_found, false);
+        for (pending, read_values) |item, maybe_doc_key| {
+            const doc_key = maybe_doc_key orelse continue;
+            const vector_id = vector_ids[item.vector_index];
+            if (item.legacy) {
+                if (!modern_found[item.vector_index] and memo.getReverse(vector_id) != true) {
+                    try memo.noteReversePresent(self.alloc, vector_id, doc_key);
+                }
+            } else {
+                try memo.noteReversePresent(self.alloc, vector_id, doc_key);
+                modern_found[item.vector_index] = true;
+            }
+        }
+        for (vector_ids) |vector_id| {
+            if (memo.getReverse(vector_id) == null) try memo.noteReverseAbsent(self.alloc, vector_id);
+        }
     }
 
     fn ensureDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8, parent_doc_key: ?[]const u8) !DenseVectorIdAssignment {
@@ -13810,6 +14014,19 @@ pub const IndexManager = struct {
     ) !DenseVectorIdAssignment {
         const mutable_txn = txn;
         if (try self.lookupDenseVectorIdTxn(mutable_txn, index_name, doc_key)) |existing| {
+            if (self.denseIndex(index_name)) |entry| {
+                return try self.mappedDenseVectorIdAssignmentTxn(
+                    mutable_txn,
+                    entry,
+                    index_name,
+                    doc_key,
+                    existing,
+                    metadata_presence_memo,
+                );
+            }
+            // Mapping utilities are also used before an in-memory index is
+            // attached (including migration tooling). Preserve that API while
+            // enforcing the stronger two-sided invariant whenever HBC exists.
             return .{
                 .vector_id = existing,
                 .needs_mapping = false,
@@ -13820,19 +14037,14 @@ pub const IndexManager = struct {
             if (try self.legacyOrdinalDenseVectorIdAssignmentTxn(mutable_txn, entry, doc_key, parent_doc_key, metadata_presence_memo)) |assignment| {
                 return assignment;
             }
-            const vector_id = deterministicDenseVectorId(doc_key);
-            if (try self.denseVectorIdHasExistingMetadata(entry, vector_id, metadata_presence_memo)) {
-                return .{
-                    .vector_id = vector_id,
-                    .needs_mapping = false,
-                    .can_assume_absent = false,
-                };
-            }
-            return .{
-                .vector_id = vector_id,
-                .needs_mapping = false,
-                .can_assume_absent = true,
-            };
+            return try self.assignDenseVectorIdFromPreferredTxn(
+                mutable_txn,
+                entry,
+                index_name,
+                doc_key,
+                deterministicDenseVectorId(doc_key),
+                metadata_presence_memo,
+            );
         }
         const vector_id = deterministicDenseVectorId(doc_key);
         return .{
@@ -13875,35 +14087,35 @@ pub const IndexManager = struct {
         _ = replacement_deletes;
         const mutable_txn = txn;
         if (try self.lookupDenseVectorIdTxn(mutable_txn, index_name, doc_key)) |mapped| {
-            return .{
-                .vector_id = mapped,
-                .needs_mapping = false,
-                .can_assume_absent = false,
-            };
+            return try self.mappedDenseVectorIdAssignmentTxn(
+                mutable_txn,
+                entry,
+                index_name,
+                doc_key,
+                mapped,
+                metadata_presence_memo,
+            );
         }
 
         if (try self.legacyOrdinalDenseVectorIdAssignmentTxn(mutable_txn, entry, doc_key, parent_doc_key, metadata_presence_memo)) |assignment| {
             return assignment;
         }
 
-        const vector_id = deterministicDenseVectorId(doc_key);
-        if (try self.denseVectorIdHasExistingMetadata(entry, vector_id, metadata_presence_memo)) {
-            return .{
-                .vector_id = vector_id,
-                .needs_mapping = false,
-                .can_assume_absent = false,
-            };
-        }
-        return .{
-            .vector_id = vector_id,
-            .needs_mapping = false,
-            .can_assume_absent = true,
-        };
+        return try self.assignDenseVectorIdFromPreferredTxn(
+            mutable_txn,
+            entry,
+            index_name,
+            doc_key,
+            deterministicDenseVectorId(doc_key),
+            metadata_presence_memo,
+        );
     }
 
     fn replaceDenseVectorIdFromPrefetchedState(
         self: *IndexManager,
+        txn: anytype,
         entry: *DenseIndex,
+        index_name: []const u8,
         doc_key: []const u8,
         parent_doc_key: ?[]const u8,
         mapped_vector_id: ?u64,
@@ -13911,16 +14123,27 @@ pub const IndexManager = struct {
         metadata_presence_memo: *DenseVectorMetadataPresenceMemo,
     ) !DenseVectorIdAssignment {
         if (mapped_vector_id) |mapped| {
-            return .{
-                .vector_id = mapped,
-                .needs_mapping = false,
-                .can_assume_absent = false,
-            };
+            return try self.mappedDenseVectorIdAssignmentTxn(
+                txn,
+                entry,
+                index_name,
+                doc_key,
+                mapped,
+                metadata_presence_memo,
+            );
         }
         if (parent_doc_key == null) {
             if (ordinal) |legacy_ordinal| {
                 const legacy_vector_id: u64 = legacy_ordinal;
-                if ((try self.denseVectorIdMetadataState(entry, legacy_vector_id, doc_key, metadata_presence_memo)) == .matches) {
+                const occupancy = try self.denseVectorIdOccupancyTxn(
+                    txn,
+                    entry,
+                    index_name,
+                    legacy_vector_id,
+                    doc_key,
+                    metadata_presence_memo,
+                );
+                if (occupancy.state == .matches and occupancy.vector_present) {
                     return .{
                         .vector_id = legacy_vector_id,
                         .needs_mapping = false,
@@ -13930,19 +14153,14 @@ pub const IndexManager = struct {
             }
         }
 
-        const vector_id = deterministicDenseVectorId(doc_key);
-        if (try self.denseVectorIdHasExistingMetadata(entry, vector_id, metadata_presence_memo)) {
-            return .{
-                .vector_id = vector_id,
-                .needs_mapping = false,
-                .can_assume_absent = false,
-            };
-        }
-        return .{
-            .vector_id = vector_id,
-            .needs_mapping = false,
-            .can_assume_absent = true,
-        };
+        return try self.assignDenseVectorIdFromPreferredTxn(
+            txn,
+            entry,
+            index_name,
+            doc_key,
+            deterministicDenseVectorId(doc_key),
+            metadata_presence_memo,
+        );
     }
 
     fn reserveDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8) !u64 {
@@ -13970,6 +14188,7 @@ pub const IndexManager = struct {
             next_id = @max(next_id, std.mem.readInt(u64, raw[0..8], .little));
         }
 
+        if (next_id == 0 or next_id == std.math.maxInt(u64)) return error.ResourceLimitExceeded;
         var next_buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &next_buf, next_id + 1, .little);
         try mutable_txn.put(next_key, &next_buf);
@@ -14023,17 +14242,22 @@ pub const IndexManager = struct {
 
         var txn = try runtime_store.store.beginRead();
         defer txn.abort();
-        if (try self.lookupDenseVectorIdTxn(&txn, index_name, doc_key)) |mapped| return mapped;
-
+        if (try self.lookupDenseVectorIdTxn(&txn, index_name, doc_key)) |mapped| {
+            if (self.denseIndex(index_name)) |entry| {
+                _ = try self.mappedDenseVectorIdAssignmentTxn(&txn, entry, index_name, doc_key, mapped, null);
+            }
+            return mapped;
+        }
         const entry = self.denseIndex(index_name) orelse return null;
         if (try doc_identity.lookupOrdinalTxn(self.alloc, &txn, doc_key)) |ordinal| {
             const vector_id: u64 = ordinal;
             if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches) return vector_id;
         }
         const vector_id = deterministicDenseVectorId(doc_key);
-        const metadata = (try entry.index.getMetadata(vector_id)) orelse return null;
-        self.alloc.free(metadata);
-        return vector_id;
+        return if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches)
+            vector_id
+        else
+            null;
     }
 
     fn lookupDenseVectorIdTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
@@ -14128,13 +14352,22 @@ pub const IndexManager = struct {
     }
 
     fn resolveDenseVectorIdForDeleteTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
-        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |mapped| return mapped;
+        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |mapped| {
+            if (self.denseIndex(index_name)) |entry| {
+                _ = try self.mappedDenseVectorIdAssignmentTxn(txn, entry, index_name, doc_key, mapped, null);
+            }
+            return mapped;
+        }
         const entry = self.denseIndex(index_name) orelse return null;
         if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
             const vector_id: u64 = ordinal;
             if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches) return vector_id;
         }
-        return deterministicDenseVectorId(doc_key);
+        const vector_id = deterministicDenseVectorId(doc_key);
+        return if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches)
+            vector_id
+        else
+            null;
     }
 
     fn indexTextBatchForConfig(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, writes: []const types.BatchWrite) !TextBatchMutationStats {
@@ -15512,7 +15745,16 @@ pub const IndexManager = struct {
         {
             var existing_index_write_txn = try entry.index.beginRuntimeWriteTxn();
             defer existing_index_write_txn.abort();
-            try self.prefetchDenseExistingMetadataTxn(entry, &existing_index_write_txn, writes, keep_write, prefetched_ordinals, &metadata_presence_memo);
+            try self.prefetchDenseExistingMetadataTxn(
+                entry,
+                &existing_index_write_txn,
+                store_txn,
+                writes,
+                keep_write,
+                prefetched_ordinals,
+                prefetched_mapped_vector_ids,
+                &metadata_presence_memo,
+            );
 
             for (writes, 0..) |write, write_index| {
                 if (!keep_write[write_index]) continue;
@@ -15522,7 +15764,9 @@ pub const IndexManager = struct {
                 if (write.vector.len > 0) {
                     if (entry.dims != write.vector.len) return error.InvalidVectorDimensions;
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
+                        store_txn,
                         entry,
+                        entry.config.name,
                         member_key,
                         write.parent_doc_key,
                         prefetched_mapped_vector_ids[write_index],
@@ -15553,7 +15797,9 @@ pub const IndexManager = struct {
                 } else if (write.artifact_key != null) {
                     const vector = preloaded_artifact_vectors[write_index] orelse continue;
                     const assignment = try self.replaceDenseVectorIdFromPrefetchedState(
+                        store_txn,
                         entry,
+                        entry.config.name,
                         member_key,
                         write.parent_doc_key,
                         prefetched_mapped_vector_ids[write_index],
@@ -18306,16 +18552,20 @@ pub const IndexManager = struct {
     }
 
     fn lookupDenseVectorIdForDocKeyTxn(self: *IndexManager, txn: anytype, index_name: []const u8, doc_key: []const u8) !?u64 {
-        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |mapped| return mapped;
         const entry = self.denseIndex(index_name) orelse return null;
+        if (try self.lookupDenseVectorIdTxn(txn, index_name, doc_key)) |mapped| {
+            _ = try self.mappedDenseVectorIdAssignmentTxn(txn, entry, index_name, doc_key, mapped, null);
+            return mapped;
+        }
         if (try doc_identity.lookupOrdinalTxn(self.alloc, txn, doc_key)) |ordinal| {
             const vector_id: u64 = ordinal;
             if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches) return vector_id;
         }
         const vector_id = deterministicDenseVectorId(doc_key);
-        const metadata = (try entry.index.getMetadata(vector_id)) orelse return null;
-        self.alloc.free(metadata);
-        return vector_id;
+        return if ((try self.denseVectorIdMetadataState(entry, vector_id, doc_key, null)) == .matches)
+            vector_id
+        else
+            null;
     }
 
     fn keyInRange(self: *const IndexManager, key: []const u8) bool {
@@ -23128,7 +23378,9 @@ test "dense index unions multiple embedding artifact sources without overwriting
         .{ .index_name = @constCast("document_vectors"), .doc_key = @constCast(doc_key), .artifact_key = @constCast(title_artifact), .vector = &.{} },
         .{ .index_name = @constCast("document_vectors"), .doc_key = @constCast(doc_key), .artifact_key = @constCast(body_artifact), .vector = &.{} },
     };
-    try manager.applyDenseEmbeddingWritesByName(&store, "document_vectors", &writes);
+    // Exercise the generic dispatch path used by enrichment batching. It must
+    // preserve artifact identity exactly like the named maintenance API.
+    try manager.applyDenseEmbeddingWrites(&store, &writes);
 
     const entry = manager.denseIndex("document_vectors") orelse return error.IndexNotFound;
     try std.testing.expect(!entry.supports_unit_grouping);
@@ -23992,6 +24244,102 @@ test "dense vector id ignores ordinal metadata for a different doc" {
     try std.testing.expectEqual(stable_vector_id, vector_ids[0]);
 }
 
+test "dense vector id allocator spills preferred-id collisions without aliasing members" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
+    defer alloc.free(cwd);
+    const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
+    defer alloc.free(absolute_path);
+    const path_z = try alloc.dupeZ(u8, absolute_path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, absolute_path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+    try manager.addAllNoBackfill(&store, &.{.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"metric\":\"l2_squared\",\"embedding_name\":\"dv_v1\",\"external\":true}",
+    }});
+
+    const entry = manager.denseIndex("dv_v1") orelse return error.IndexNotFound;
+    const occupied_id: u64 = 7;
+    try entry.index.batchInsertWithMetadata(&.{.{
+        .vector_id = occupied_id,
+        .vector = &[_]f32{ 1.0, 0.0, 0.0 },
+        .metadata = "artifact:first",
+    }});
+    try manager.writeDenseVectorMapping(&store, "dv_v1", "artifact:first", occupied_id);
+
+    var batch = try store.beginWriteBatch();
+    defer batch.abort();
+    var memo: IndexManager.DenseVectorMetadataPresenceMemo = .{};
+    defer memo.deinit(alloc);
+    const spilled = try manager.assignDenseVectorIdFromPreferredTxn(
+        batch.asTxn(),
+        entry,
+        "dv_v1",
+        "artifact:second",
+        occupied_id,
+        &memo,
+    );
+    try std.testing.expect(spilled.vector_id != occupied_id);
+    try std.testing.expect(spilled.needs_mapping);
+    try std.testing.expect(spilled.can_assume_absent);
+
+    const first_in_batch = try manager.assignDenseVectorIdFromPreferredTxn(
+        batch.asTxn(),
+        entry,
+        "dv_v1",
+        "artifact:batch-a",
+        99,
+        &memo,
+    );
+    const second_in_batch = try manager.assignDenseVectorIdFromPreferredTxn(
+        batch.asTxn(),
+        entry,
+        "dv_v1",
+        "artifact:batch-b",
+        99,
+        &memo,
+    );
+    try std.testing.expectEqual(@as(u64, 99), first_in_batch.vector_id);
+    try std.testing.expect(second_in_batch.vector_id != first_in_batch.vector_id);
+    try std.testing.expect(second_in_batch.needs_mapping);
+
+    // A crossed forward/reverse identity is corruption, not a normal hash
+    // collision. Fail closed instead of manufacturing a duplicate vector.
+    try manager.writeDenseVectorMappingTxn(
+        batch.asTxn(),
+        "dv_v1",
+        "artifact:second",
+        null,
+        occupied_id,
+    );
+    var corruption_memo: IndexManager.DenseVectorMetadataPresenceMemo = .{};
+    defer corruption_memo.deinit(alloc);
+    try std.testing.expectError(
+        error.InvalidDenseVectorMetadata,
+        manager.assignDenseVectorIdFromPreferredTxn(
+            batch.asTxn(),
+            entry,
+            "dv_v1",
+            "artifact:first",
+            occupied_id,
+            &corruption_memo,
+        ),
+    );
+}
+
 test "dense metadata prefetch includes legacy ordinal vector ids" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -24078,10 +24426,21 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
 
     var memo: IndexManager.DenseVectorMetadataPresenceMemo = .{};
     defer memo.deinit(alloc);
-    try manager.prefetchDenseExistingMetadataTxn(entry, &index_txn, &writes, &keep_write, ordinals, &memo);
+    try manager.prefetchDenseExistingMetadataTxn(
+        entry,
+        &index_txn,
+        identity_txn.asTxn(),
+        &writes,
+        &keep_write,
+        ordinals,
+        null,
+        &memo,
+    );
 
     try std.testing.expectEqualStrings("doc:legacy", memo.getMetadata(1).?);
     try std.testing.expectEqual(@as(?bool, false), memo.get(stable_vector_id));
+    try std.testing.expectEqual(@as(?bool, false), memo.getReverse(1));
+    try std.testing.expectEqual(@as(?bool, false), memo.getReverse(stable_vector_id));
 }
 
 test "dense vector metadata presence memo stores present and absent ids" {
@@ -24098,6 +24457,11 @@ test "dense vector metadata presence memo stores present and absent ids" {
     metadata[0] = 'x';
     try std.testing.expectEqualStrings("doc:7", memo.getMetadata(7).?);
     try std.testing.expectEqual(@as(?[]const u8, null), memo.getMetadata(9));
+    try memo.noteReversePresent(std.testing.allocator, 7, "artifact:7");
+    try memo.noteReverseAbsent(std.testing.allocator, 9);
+    try std.testing.expectEqual(@as(?bool, true), memo.getReverse(7));
+    try std.testing.expectEqual(@as(?bool, false), memo.getReverse(9));
+    try std.testing.expectEqualStrings("artifact:7", memo.getReverseMetadata(7).?);
 }
 
 test "dense vector metadata presence memo accepts memo-owned metadata input" {

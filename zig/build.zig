@@ -6199,6 +6199,7 @@ pub fn build(b: *std.Build) void {
             "incoming graph route cache is exact and generation fenced",
             "incoming graph route durable hint coalescer is byte bounded",
             "incoming graph route durable writes leave the query path",
+            "incoming graph route durable failures retry boundedly and retain accepted hints",
             "incoming graph route directory survives cache restart and replaces stale fences",
             "distributed graph per-key authoritative incoming routes avoid shard probes",
             "distributed graph root probe retires resolved keys between shard waves",
