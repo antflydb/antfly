@@ -465,6 +465,13 @@ pub const GraphIndex = struct {
                 .lsm => |*handle| try handle.backend.checkpointWalAfterDurableBoundary(),
             }
         }
+
+        fn pinNativeCheckpoint(self: *ReverseStoreOwner) !lsm_backend.Backend.NativeCheckpoint {
+            return switch (self.*) {
+                .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
+                .none, .mem, .lmdb => error.Unsupported,
+            };
+        }
     };
 
     const OpenedReverseStore = struct {
@@ -488,7 +495,26 @@ pub const GraphIndex = struct {
     }
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *GraphIndex) !void {
+        try self.outgoing_owner.checkpointLsmWalAfterDurableBoundary();
         try self.reverse_owner.checkpointLsmWalAfterDurableBoundary();
+    }
+
+    pub const NativeCheckpoints = struct {
+        outgoing: lsm_backend.Backend.NativeCheckpoint,
+        reverse: lsm_backend.Backend.NativeCheckpoint,
+
+        pub fn deinit(self: *NativeCheckpoints) void {
+            self.reverse.deinit();
+            self.outgoing.deinit();
+            self.* = undefined;
+        }
+    };
+
+    pub fn pinNativeCheckpoints(self: *GraphIndex) !NativeCheckpoints {
+        var outgoing = try self.outgoing_owner.pinNativeCheckpoint();
+        errdefer outgoing.deinit();
+        const reverse = try self.reverse_owner.pinNativeCheckpoint();
+        return .{ .outgoing = outgoing, .reverse = reverse };
     }
 
     fn beginWriteOutgoingBatch(self: *GraphIndex) !backend_erased.Batch {

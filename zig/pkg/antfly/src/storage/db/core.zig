@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
+const snapshot_admission_mod = @import("snapshot_admission.zig");
 const apply_state = @import("derived/apply_state.zig");
 const index_repair_state = @import("derived/index_repair_state.zig");
 const doc_identity = @import("doc_identity.zig");
@@ -36,6 +37,7 @@ const shard_mod = @import("../shard.zig");
 const hbc_mod = @import("../hbc_adapter.zig");
 const ttl_mod = @import("../ttl.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
+const native_artifact_sink = @import("../native_artifact_sink.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const NodeAdmission = @import("../../graph/node_admission.zig").NodeAdmission;
@@ -46,6 +48,18 @@ const enrichment_types = @import("enrichment/enrichment_types.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const transactions_mod = @import("../transactions.zig");
 const types = @import("types.zig");
+
+const store_snapshot_file_name = "store.bin";
+const store_snapshot_v2_magic = "AFSTKV02";
+const logical_store_artifact_format = "antfly-kv-stream";
+const logical_store_artifact_version: u32 = 2;
+pub const logical_snapshot_manifest_file_name = "SNAPSHOT.json";
+const logical_snapshot_manifest_format_version: u32 = 1;
+const store_snapshot_batch_entries: usize = 8192;
+const store_snapshot_batch_bytes: usize = 8 * 1024 * 1024;
+const legacy_store_snapshot_max_bytes: usize = 256 * 1024 * 1024;
+const store_snapshot_max_field_bytes: u64 = 1024 * 1024 * 1024;
+pub const primary_lsm_checkpoint_directory_name = "primary-lsm";
 
 pub const PrimaryBackendKind = db_config.PrimaryBackendKind;
 pub const PrimaryBackend = db_config.PrimaryBackend;
@@ -270,6 +284,8 @@ pub const OpenedCoreResources = struct {
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
@@ -282,6 +298,10 @@ pub const OpenedCoreResources = struct {
         alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         alloc.destroy(self.apply_mutex);
+        self.snapshot_admission.* = undefined;
+        alloc.destroy(self.snapshot_admission);
+        self.snapshot_replay_admission.* = undefined;
+        alloc.destroy(self.snapshot_replay_admission);
         self.repair_replay_mutex.* = undefined;
         alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
@@ -306,6 +326,7 @@ pub const AsyncResources = struct {
     index_repair_checkpoint: ?index_repair_state.Location,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
 };
 
@@ -318,6 +339,8 @@ pub const BatchExecutionResources = struct {
     replay_source: replay_source_mod.Source,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     identity_namespace: doc_identity.Namespace,
@@ -352,6 +375,8 @@ pub const DBCore = struct {
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
     apply_mutex: *apply_rw_lock_mod.ApplyRwLock,
+    snapshot_admission: *snapshot_admission_mod.SnapshotAdmission,
+    snapshot_replay_admission: *snapshot_admission_mod.SnapshotAdmission,
     repair_replay_mutex: *std.atomic.Mutex,
     log_mutex: *std.atomic.Mutex,
     schema: ?schema_mod.TableSchema,
@@ -371,6 +396,8 @@ pub const DBCore = struct {
             .shard_manager = opened.shard_manager,
             .index_manager = opened.index_manager,
             .apply_mutex = opened.apply_mutex,
+            .snapshot_admission = opened.snapshot_admission,
+            .snapshot_replay_admission = opened.snapshot_replay_admission,
             .repair_replay_mutex = opened.repair_replay_mutex,
             .log_mutex = opened.log_mutex,
             .schema = opened.schema,
@@ -385,6 +412,10 @@ pub const DBCore = struct {
         self.alloc.destroy(self.log_mutex);
         self.apply_mutex.* = undefined;
         self.alloc.destroy(self.apply_mutex);
+        self.snapshot_admission.* = undefined;
+        self.alloc.destroy(self.snapshot_admission);
+        self.snapshot_replay_admission.* = undefined;
+        self.alloc.destroy(self.snapshot_replay_admission);
         self.repair_replay_mutex.* = undefined;
         self.alloc.destroy(self.repair_replay_mutex);
         self.index_manager.deinit();
@@ -417,6 +448,7 @@ pub const DBCore = struct {
             .index_repair_checkpoint = if (self.index_repair_checkpoint) |*checkpoint| checkpoint.location() else null,
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .snapshot_replay_admission = self.snapshot_replay_admission,
             .repair_replay_mutex = self.repair_replay_mutex,
         };
     }
@@ -431,6 +463,8 @@ pub const DBCore = struct {
             .replay_source = self.replaySource(),
             .index_manager = self.index_manager,
             .apply_mutex = self.apply_mutex,
+            .snapshot_admission = self.snapshot_admission,
+            .snapshot_replay_admission = self.snapshot_replay_admission,
             .repair_replay_mutex = self.repair_replay_mutex,
             .log_mutex = self.log_mutex,
             .identity_namespace = self.identity_namespace,
@@ -938,11 +972,27 @@ pub const DBCore = struct {
         return try transaction_runtime_mod.recoverOnce(alloc, self.store, effective_config);
     }
 
-    pub fn writeSnapshot(self: *DBCore, snapshot_root: []const u8) !u64 {
-        var total: u64 = 0;
-        total += try writeStoreSnapshot(self.alloc, self.store, snapshot_root);
-        total += try writeChangeJournalSnapshot(self.alloc, self.store, snapshot_root);
-        return total;
+    /// Pins the backend-neutral primary image used by portable snapshots.
+    /// Keep this logical even for an LSM-backed source: portable backups are
+    /// intentionally restorable into any supported primary backend.
+    pub fn pinPortableSnapshot(self: *DBCore) !PinnedStoreSnapshot {
+        return .{ .logical = .{ .txn = try self.store.beginReadTxn() } };
+    }
+
+    /// Pins the fastest self-contained primary image supported by the active
+    /// backend. Backends without a physical checkpoint fall back to the same
+    /// bounded streaming image used by portable snapshots.
+    pub fn pinNativeSnapshot(self: *DBCore) !PinnedStoreSnapshot {
+        switch (self.primary_store_owner) {
+            .lsm => |owner| {
+                const checkpoint = owner.handle.backend.pinNativeCheckpoint() catch |err| switch (err) {
+                    error.Unsupported => return .{ .logical = .{ .txn = try self.store.beginReadTxn() } },
+                    else => return err,
+                };
+                return .{ .lsm = checkpoint };
+            },
+            .none, .mem => return try self.pinPortableSnapshot(),
+        }
     }
 
     pub fn syncStore(self: *DBCore, full: bool) !void {
@@ -1800,12 +1850,16 @@ pub fn openCoreResourcesFromPrimaryStore(
     var owned_shard_manager: ?*shard_mod.ShardManager = null;
     var owned_index_manager: ?*index_manager_mod.IndexManager = null;
     var owned_apply_mutex: ?*apply_rw_lock_mod.ApplyRwLock = null;
+    var owned_snapshot_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
+    var owned_snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null;
     var owned_repair_replay_mutex: ?*std.atomic.Mutex = null;
     var owned_log_mutex: ?*std.atomic.Mutex = null;
     errdefer {
         if (owned_log_mutex) |ptr| alloc.destroy(ptr);
         if (owned_repair_replay_mutex) |ptr| alloc.destroy(ptr);
         if (owned_apply_mutex) |ptr| alloc.destroy(ptr);
+        if (owned_snapshot_admission) |ptr| alloc.destroy(ptr);
+        if (owned_snapshot_replay_admission) |ptr| alloc.destroy(ptr);
         if (owned_index_manager) |ptr| alloc.destroy(ptr);
         if (owned_shard_manager) |ptr| alloc.destroy(ptr);
         if (owned_change_journal) |ptr| alloc.destroy(ptr);
@@ -1832,6 +1886,12 @@ pub fn openCoreResourcesFromPrimaryStore(
     const apply_mutex = try alloc.create(apply_rw_lock_mod.ApplyRwLock);
     apply_mutex.* = .{};
     owned_apply_mutex = apply_mutex;
+    const snapshot_admission = try alloc.create(snapshot_admission_mod.SnapshotAdmission);
+    snapshot_admission.* = .{};
+    owned_snapshot_admission = snapshot_admission;
+    const snapshot_replay_admission = try alloc.create(snapshot_admission_mod.SnapshotAdmission);
+    snapshot_replay_admission.* = .{};
+    owned_snapshot_replay_admission = snapshot_replay_admission;
     const repair_replay_mutex = try alloc.create(std.atomic.Mutex);
     repair_replay_mutex.* = .unlocked;
     owned_repair_replay_mutex = repair_replay_mutex;
@@ -1916,6 +1976,8 @@ pub fn openCoreResourcesFromPrimaryStore(
     owned_shard_manager = null;
     owned_index_manager = null;
     owned_apply_mutex = null;
+    owned_snapshot_admission = null;
+    owned_snapshot_replay_admission = null;
     owned_repair_replay_mutex = null;
     owned_log_mutex = null;
 
@@ -1930,6 +1992,8 @@ pub fn openCoreResourcesFromPrimaryStore(
         .shard_manager = shard_manager,
         .index_manager = index_manager,
         .apply_mutex = apply_mutex,
+        .snapshot_admission = snapshot_admission,
+        .snapshot_replay_admission = snapshot_replay_admission,
         .repair_replay_mutex = repair_replay_mutex,
         .log_mutex = log_mutex,
         .schema = schema,
@@ -1981,12 +2045,29 @@ pub fn clearAllKeysFromStore(alloc: Allocator, store: *docstore_mod.DocStore) !v
 }
 
 pub fn importStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !void {
-    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot_root});
-    defer alloc.free(snapshot_path);
-
     var io_impl = threadedIo();
     defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), snapshot_path, alloc, .limited(256 * 1024 * 1024));
+    _ = try importStoreSnapshotWithIo(alloc, io_impl.io(), store, snapshot_root, .none);
+}
+
+/// Returns true for the streaming v2 format. Its store image already contains
+/// the replay namespace, so callers must not apply the legacy sidecar again.
+pub fn importStoreSnapshotWithIo(
+    alloc: Allocator,
+    io: std.Io,
+    store: *docstore_mod.DocStore,
+    snapshot_root: []const u8,
+    cancellation: types.CancellationToken,
+) !bool {
+    try validateLogicalSnapshotManifestIfPresent(alloc, io, snapshot_root);
+    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, store_snapshot_file_name });
+    defer alloc.free(snapshot_path);
+    if (try storeSnapshotHasV2Magic(io, snapshot_path)) {
+        try importStreamingStoreSnapshot(alloc, io, store, snapshot_path, cancellation);
+        return true;
+    }
+
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, snapshot_path, alloc, .limited(legacy_store_snapshot_max_bytes));
     defer alloc.free(raw);
 
     var decoded = try lsm_table_file.decodeAlloc(alloc, raw);
@@ -1995,6 +2076,7 @@ pub fn importStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snap
     const batch_size = 8192;
     var offset: usize = 0;
     while (offset < decoded.entries.len) {
+        try cancellation.check();
         const end = @min(offset + batch_size, decoded.entries.len);
         const writes = try alloc.alloc(docstore_mod.KVPair, end - offset);
         defer alloc.free(writes);
@@ -2009,6 +2091,55 @@ pub fn importStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snap
     }
 
     try store.sync(true);
+    return false;
+}
+
+const LogicalSnapshotManifest = struct {
+    format_version: u32 = logical_snapshot_manifest_format_version,
+    primary_artifact_format: []const u8 = logical_store_artifact_format,
+    primary_artifact_version: u32 = logical_store_artifact_version,
+    replay_embedded: bool = true,
+};
+
+/// Publishes the format identity for logical snapshots which travel without a
+/// native-generation manifest (HA seeds, split/bootstrap snapshots, and the C
+/// API). v0.2.0 snapshots have no descriptor and remain readable through the
+/// legacy store.bin/change-journal.bin path.
+pub fn writeLogicalSnapshotManifest(alloc: Allocator, io: std.Io, snapshot_root: []const u8) !u64 {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, logical_snapshot_manifest_file_name });
+    defer alloc.free(path);
+    const encoded = try std.json.Stringify.valueAlloc(alloc, LogicalSnapshotManifest{}, .{});
+    defer alloc.free(encoded);
+    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var writer_buffer: [1024]u8 = undefined;
+    var writer = file.writer(io, &writer_buffer);
+    try writer.interface.writeAll(encoded);
+    try writer.end();
+    try file.sync(io);
+    try fs_paths.syncDirPortable(io, snapshot_root);
+    return @intCast(encoded.len);
+}
+
+fn validateLogicalSnapshotManifestIfPresent(alloc: Allocator, io: std.Io, snapshot_root: []const u8) !void {
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, logical_snapshot_manifest_file_name });
+    defer alloc.free(path);
+    const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer alloc.free(encoded);
+    var parsed = std.json.parseFromSlice(LogicalSnapshotManifest, alloc, encoded, .{
+        .ignore_unknown_fields = false,
+    }) catch return error.InvalidTableFile;
+    defer parsed.deinit();
+    if (parsed.value.format_version != logical_snapshot_manifest_format_version or
+        !std.mem.eql(u8, parsed.value.primary_artifact_format, logical_store_artifact_format) or
+        parsed.value.primary_artifact_version != logical_store_artifact_version or
+        !parsed.value.replay_embedded)
+    {
+        return error.UnsupportedBackupFormat;
+    }
 }
 
 pub fn importChangeJournalSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !void {
@@ -2047,75 +2178,234 @@ fn importOpaqueLogSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snap
     if (cursor != raw.len) return error.InvalidTableFile;
 }
 
-fn writeStoreSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !u64 {
-    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot_root});
-    defer alloc.free(snapshot_path);
+const LogicalPinnedStoreSnapshot = struct {
+    txn: docstore_mod.DocStore.Txn,
 
-    var builder = StoreSnapshotEntryBuilder{ .alloc = alloc };
-    defer builder.deinit();
-    try store.scanWithContext("", "", .{}, &builder, StoreSnapshotEntryBuilder.scanEntry);
-
-    const encoded = try lsm_table_file.encodeAlloc(alloc, builder.entries.items);
-    defer alloc.free(encoded);
-    try writeFileAbsolute(snapshot_path, encoded);
-    return encoded.len;
-}
-
-fn writeChangeJournalSnapshot(alloc: Allocator, store: *docstore_mod.DocStore, snapshot_root: []const u8) !u64 {
-    if (!try store.hasReplayEntries()) return 0;
-    const entries = try store.iterateReplayFrom(alloc, 1);
-    defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
+    fn deinit(self: *LogicalPinnedStoreSnapshot) void {
+        self.txn.abort();
+        self.* = undefined;
     }
 
-    var encoded = std.ArrayListUnmanaged(u8).empty;
-    defer encoded.deinit(alloc);
-    var integer: [8]u8 = undefined;
-    std.mem.writeInt(u64, &integer, @intCast(entries.len), .little);
-    try encoded.appendSlice(alloc, &integer);
-    for (entries) |entry| {
-        std.mem.writeInt(u64, &integer, entry.sequence, .little);
-        try encoded.appendSlice(alloc, &integer);
-        std.mem.writeInt(u64, &integer, @intCast(entry.payload.len), .little);
-        try encoded.appendSlice(alloc, &integer);
-        try encoded.appendSlice(alloc, entry.payload);
-        if (encoded.items.len > 256 * 1024 * 1024) return error.SnapshotTooLarge;
+    /// Streams the immutable read transaction with bounded memory. The read
+    /// snapshot is acquired under the DB revision fence, but materialization
+    /// deliberately runs after that fence is released.
+    fn materialize(
+        self: *LogicalPinnedStoreSnapshot,
+        alloc: Allocator,
+        io: std.Io,
+        snapshot_root: []const u8,
+        cancellation: types.CancellationToken,
+    ) !u64 {
+        return try self.materializeWithSink(alloc, io, snapshot_root, cancellation, null);
     }
 
-    const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/change-journal.bin", .{snapshot_root});
-    defer alloc.free(snapshot_path);
-    try writeFileAbsolute(snapshot_path, encoded.items);
-    return encoded.items.len;
-}
+    fn materializeWithSink(
+        self: *LogicalPinnedStoreSnapshot,
+        alloc: Allocator,
+        io: std.Io,
+        snapshot_root: []const u8,
+        cancellation: types.CancellationToken,
+        sink: ?native_artifact_sink.Sink,
+    ) !u64 {
+        try cancellation.check();
+        const snapshot_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, store_snapshot_file_name });
+        defer alloc.free(snapshot_path);
+        var file = try fs_paths.createFilePortable(io, snapshot_path, .{ .truncate = true });
+        defer file.close(io);
+        var writer_buffer: [256 * 1024]u8 = undefined;
+        var writer = file.writer(io, &writer_buffer);
+        try writer.interface.writeAll(store_snapshot_v2_magic);
+        var hasher = native_artifact_sink.Sha256.init(.{});
+        hasher.update(store_snapshot_v2_magic);
+        var total: u64 = store_snapshot_v2_magic.len;
 
-const StoreSnapshotEntryBuilder = struct {
-    alloc: Allocator,
-    entries: std.ArrayListUnmanaged(lsm_table_file.Entry) = .empty,
-
-    fn deinit(self: *@This()) void {
-        for (self.entries.items) |entry| {
-            self.alloc.free(@constCast(entry.key));
-            self.alloc.free(@constCast(entry.value));
+        var cursor = try self.txn.openCursor();
+        defer cursor.close();
+        var entry = try cursor.first();
+        while (entry) |kv| : (entry = try cursor.next()) {
+            try cancellation.check();
+            var lengths: [16]u8 = undefined;
+            std.mem.writeInt(u64, lengths[0..8], @intCast(kv.key.len), .little);
+            std.mem.writeInt(u64, lengths[8..16], @intCast(kv.value.len), .little);
+            try writer.interface.writeAll(&lengths);
+            try writer.interface.writeAll(kv.key);
+            try writer.interface.writeAll(kv.value);
+            hasher.update(&lengths);
+            hasher.update(kv.key);
+            hasher.update(kv.value);
+            total = std.math.add(u64, total, 16 + @as(u64, @intCast(kv.key.len)) + @as(u64, @intCast(kv.value.len))) catch
+                return error.SnapshotTooLarge;
         }
-        self.entries.deinit(self.alloc);
-    }
-
-    fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
-        const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        const owned_key = try self.alloc.dupe(u8, key);
-        errdefer self.alloc.free(owned_key);
-        const owned_value = try self.alloc.dupe(u8, value);
-        errdefer self.alloc.free(owned_value);
-        try self.entries.append(self.alloc, .{
-            .namespace_name = null,
-            .key = owned_key,
-            .value = owned_value,
-            .tombstone = false,
-        });
-        return .@"continue";
+        try cancellation.check();
+        try writer.end();
+        try file.sync(io);
+        if (sink) |active| {
+            var digest: [native_artifact_sink.Sha256.digest_length]u8 = undefined;
+            hasher.final(&digest);
+            try active.record(snapshot_path, total, digest);
+        }
+        try fs_paths.syncDirPortable(io, snapshot_root);
+        return total;
     }
 };
+
+pub const PinnedStoreSnapshot = union(enum) {
+    logical: LogicalPinnedStoreSnapshot,
+    lsm: lsm_backend_mod.Backend.NativeCheckpoint,
+
+    pub fn deinit(self: *PinnedStoreSnapshot) void {
+        switch (self.*) {
+            .logical => |*snapshot| snapshot.deinit(),
+            .lsm => |*snapshot| snapshot.deinit(),
+        }
+        self.* = undefined;
+    }
+
+    pub fn materialize(
+        self: *PinnedStoreSnapshot,
+        alloc: Allocator,
+        io: std.Io,
+        snapshot_root: []const u8,
+        cancellation: types.CancellationToken,
+    ) !u64 {
+        return try self.materializeWithSink(alloc, io, snapshot_root, cancellation, null);
+    }
+
+    pub fn materializeWithSink(
+        self: *PinnedStoreSnapshot,
+        alloc: Allocator,
+        io: std.Io,
+        snapshot_root: []const u8,
+        cancellation: types.CancellationToken,
+        sink: ?native_artifact_sink.Sink,
+    ) !u64 {
+        return switch (self.*) {
+            .logical => |*snapshot| try snapshot.materializeWithSink(alloc, io, snapshot_root, cancellation, sink),
+            .lsm => |*snapshot| blk: {
+                const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, primary_lsm_checkpoint_directory_name });
+                defer alloc.free(destination);
+                break :blk try snapshot.materializeWithSink(io, destination, cancellation, sink);
+            },
+        };
+    }
+
+    pub fn artifactFormat(self: *const PinnedStoreSnapshot) []const u8 {
+        return switch (self.*) {
+            .logical => logical_store_artifact_format,
+            .lsm => "antfly-lsm-checkpoint",
+        };
+    }
+
+    pub fn artifactVersion(self: *const PinnedStoreSnapshot) u32 {
+        return switch (self.*) {
+            .logical => logical_store_artifact_version,
+            .lsm => 1,
+        };
+    }
+};
+
+fn importStreamingStoreSnapshot(
+    alloc: Allocator,
+    io: std.Io,
+    store: *docstore_mod.DocStore,
+    path: []const u8,
+    cancellation: types.CancellationToken,
+) !void {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size < store_snapshot_v2_magic.len) return error.InvalidTableFile;
+    var magic: [store_snapshot_v2_magic.len]u8 = undefined;
+    if (try file.readPositionalAll(io, &magic, 0) != magic.len or
+        !std.mem.eql(u8, &magic, store_snapshot_v2_magic))
+    {
+        return error.InvalidTableFile;
+    }
+
+    var batch = std.ArrayListUnmanaged(docstore_mod.OwnedKVPair).empty;
+    defer {
+        freeStoreSnapshotBatch(alloc, batch.items);
+        batch.deinit(alloc);
+    }
+    var batch_bytes: usize = 0;
+    var offset: u64 = store_snapshot_v2_magic.len;
+    while (offset < stat.size) {
+        try cancellation.check();
+        if (stat.size - offset < 16) return error.InvalidTableFile;
+        var lengths: [16]u8 = undefined;
+        if (try file.readPositionalAll(io, &lengths, offset) != lengths.len)
+            return error.InvalidTableFile;
+        offset += lengths.len;
+        const key_len_u64 = std.mem.readInt(u64, lengths[0..8], .little);
+        const value_len_u64 = std.mem.readInt(u64, lengths[8..16], .little);
+        if (key_len_u64 > store_snapshot_max_field_bytes or value_len_u64 > store_snapshot_max_field_bytes)
+            return error.InvalidTableFile;
+        const record_len = std.math.add(u64, key_len_u64, value_len_u64) catch
+            return error.InvalidTableFile;
+        if (record_len > stat.size - offset) return error.InvalidTableFile;
+        const key_len = std.math.cast(usize, key_len_u64) orelse return error.InvalidTableFile;
+        const value_len = std.math.cast(usize, value_len_u64) orelse return error.InvalidTableFile;
+        const key = try alloc.alloc(u8, key_len);
+        var key_owned = true;
+        errdefer if (key_owned) alloc.free(key);
+        if (try file.readPositionalAll(io, key, offset) != key.len) return error.InvalidTableFile;
+        offset += key_len_u64;
+        const value = try alloc.alloc(u8, value_len);
+        var value_owned = true;
+        errdefer if (value_owned) alloc.free(value);
+        if (try file.readPositionalAll(io, value, offset) != value.len) return error.InvalidTableFile;
+        offset += value_len_u64;
+        try batch.append(alloc, .{ .key = key, .value = value });
+        key_owned = false;
+        value_owned = false;
+        const record_bytes = std.math.add(usize, key_len, value_len) catch
+            return error.InvalidTableFile;
+        batch_bytes = std.math.add(usize, batch_bytes, record_bytes) catch
+            return error.InvalidTableFile;
+        if (batch.items.len >= store_snapshot_batch_entries or batch_bytes >= store_snapshot_batch_bytes) {
+            try flushStoreSnapshotBatch(alloc, store, batch.items);
+            freeStoreSnapshotBatch(alloc, batch.items);
+            batch.clearRetainingCapacity();
+            batch_bytes = 0;
+        }
+    }
+    if (batch.items.len > 0) {
+        try flushStoreSnapshotBatch(alloc, store, batch.items);
+        freeStoreSnapshotBatch(alloc, batch.items);
+        batch.clearRetainingCapacity();
+    }
+    try store.sync(true);
+}
+
+fn flushStoreSnapshotBatch(alloc: Allocator, store: *docstore_mod.DocStore, entries: []const docstore_mod.OwnedKVPair) !void {
+    const writes = try alloc.alloc(docstore_mod.KVPair, entries.len);
+    defer alloc.free(writes);
+    for (entries, 0..) |entry, index| writes[index] = .{ .key = entry.key, .value = entry.value };
+    try store.putBatch(writes, &.{});
+}
+
+fn freeStoreSnapshotBatch(alloc: Allocator, entries: []const docstore_mod.OwnedKVPair) void {
+    for (entries) |entry| {
+        alloc.free(entry.key);
+        alloc.free(entry.value);
+    }
+}
+
+fn storeSnapshotHasV2Magic(io: std.Io, path: []const u8) !bool {
+    var file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size < store_snapshot_v2_magic.len) return false;
+    var magic: [store_snapshot_v2_magic.len]u8 = undefined;
+    if (try file.readPositionalAll(io, &magic, 0) != magic.len) return false;
+    return std.mem.eql(u8, &magic, store_snapshot_v2_magic);
+}
 
 fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
