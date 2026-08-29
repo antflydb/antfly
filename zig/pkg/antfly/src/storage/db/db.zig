@@ -25,6 +25,7 @@ const Io = std.Io;
 const AtomicU64 = platform.atomic.Value(u64);
 const fs_paths = @import("../../common/fs_paths.zig");
 const common_secrets = @import("../../common/secrets.zig");
+const threaded_io_limits = @import("../../common/threaded_io_limits.zig");
 const backend_types = @import("../backend_types.zig");
 const docstore_mod = @import("../docstore.zig");
 const segment_mod = @import("../../segment.zig");
@@ -1039,6 +1040,22 @@ fn backgroundRuntimeAllocator(fallback: Allocator) Allocator {
     if (comptime builtin.link_libc) return std.heap.c_allocator;
     if (comptime builtin.single_threaded) return fallback;
     return std.heap.smp_allocator;
+}
+
+fn createOwnedFilesystemIo(alloc: Allocator) !*background_runtime_mod.IoImpl {
+    if (comptime builtin.os.tag == .freestanding) {
+        return error.UnsupportedPlatform;
+    } else {
+        const io_impl = try alloc.create(background_runtime_mod.IoImpl);
+        errdefer alloc.destroy(io_impl);
+        io_impl.* = threaded_io_limits.initService(alloc);
+        return io_impl;
+    }
+}
+
+fn destroyOwnedFilesystemIo(alloc: Allocator, io_impl: *background_runtime_mod.IoImpl) void {
+    if (comptime builtin.os.tag != .freestanding) io_impl.deinit();
+    alloc.destroy(io_impl);
 }
 
 const AppliedSequenceCoalescer = struct {
@@ -3221,6 +3238,9 @@ pub const DB = struct {
     repair_cleanup_owner_id: u64,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
+    /// Synchronous filesystem authority lent to an internally owned manual
+    /// backend runtime. It must outlive both the publication lease and runtime.
+    owned_filesystem_io: ?*background_runtime_mod.IoImpl,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
     capacity_source: ?types.RepairCapacitySource,
     executor: *derived_executor_mod.Executor,
@@ -3518,18 +3538,38 @@ pub const DB = struct {
                     }
                 }
             }
+            const runtime_alloc = backgroundRuntimeAllocator(alloc);
+            var owned_filesystem_io: ?*background_runtime_mod.IoImpl = null;
+            errdefer if (owned_filesystem_io) |io_impl|
+                destroyOwnedFilesystemIo(runtime_alloc, io_impl);
+            var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
+            errdefer if (owned_backend_runtime) |*handle| handle.deinit();
+            const backend_runtime = opts.backend_runtime orelse blk_runtime: {
+                var filesystem_io: ?Io = null;
+                if (opts.executor.backend == .manual and
+                    opts.physical_root_mode == .filesystem_managed)
+                {
+                    const io_impl = try createOwnedFilesystemIo(runtime_alloc);
+                    owned_filesystem_io = io_impl;
+                    if (comptime builtin.os.tag != .freestanding) filesystem_io = io_impl.io();
+                }
+                owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
+                    .backend = opts.executor.backend,
+                    .filesystem_io = filesystem_io,
+                });
+                break :blk_runtime owned_backend_runtime.?.runtime;
+            };
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
             } else if (opts.physical_root_mode == .external_backend)
                 null
             else
-                try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, opts.backend_runtime);
+                try generation_lifecycle.acquirePublishedGenerationReadWithRuntime(alloc, path, backend_runtime);
             errdefer if (generation_read_lease) |*lease| lease.deinit();
             const open_started_ns = monotonicTimeNs();
             const ha_write_gate = if (opts.ha_write_gate) |gate| gate.pinned() else null;
             var profile = OpenProfile{};
-            const runtime_alloc = backgroundRuntimeAllocator(alloc);
             var owned_resource_manager: ?*resource_manager_mod.ResourceManager = null;
             const bind_cache_resource_manager = opts.resource_manager != null;
             if (opts.resource_manager == null) {
@@ -3543,19 +3583,11 @@ pub const DB = struct {
                 alloc.destroy(manager);
             };
             var owned_async_context: ?*AsyncContext = null;
-            var owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle = null;
             var owned_executor: ?*derived_executor_mod.Executor = null;
             errdefer {
                 if (owned_executor) |ptr| runtime_alloc.destroy(ptr);
-                if (owned_backend_runtime) |*handle| handle.deinit();
                 if (owned_async_context) |ptr| runtime_alloc.destroy(ptr);
             }
-            const backend_runtime = opts.backend_runtime orelse blk_runtime: {
-                owned_backend_runtime = try background_runtime_mod.BackendRuntimeHandle.init(runtime_alloc, .{
-                    .backend = opts.executor.backend,
-                });
-                break :blk_runtime owned_backend_runtime.?.runtime;
-            };
             var effective_executor = opts.executor;
             if (backend_runtime.io_impl == null and effective_executor.backend == .io_threaded) {
                 effective_executor.backend = .manual;
@@ -3670,6 +3702,7 @@ pub const DB = struct {
                 .backend_owner_id = backend_owner_id,
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
                 .owned_backend_runtime = owned_backend_runtime,
+                .owned_filesystem_io = owned_filesystem_io,
                 .owned_resource_manager = owned_resource_manager,
                 .capacity_source = opts.capacity_source orelse opts.resource_manager.?.capacitySource(),
                 .executor = executor,
@@ -3701,6 +3734,7 @@ pub const DB = struct {
             var executor_ready = false;
             owned_async_context = null;
             owned_backend_runtime = null;
+            owned_filesystem_io = null;
             owned_resource_manager = null;
             owned_executor = null;
             generation_read_lease = null;
@@ -4720,6 +4754,8 @@ pub const DB = struct {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
         }
+        if (self.owned_filesystem_io) |io_impl|
+            destroyOwnedFilesystemIo(self.runtime_alloc, io_impl);
         self.* = undefined;
         self.closed = true;
     }
@@ -48207,6 +48243,48 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
 
     try std.testing.expectEqual(runtime.ptr(), db.backend_runtime);
     try std.testing.expect(db.owned_backend_runtime == null);
+}
+
+test "db open owns filesystem io for its manual backend runtime" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+    });
+    try std.testing.expect(db.owned_backend_runtime != null);
+    try std.testing.expect(db.owned_filesystem_io != null);
+    try std.testing.expect(db.backend_runtime.io() == null);
+    try std.testing.expect(db.backend_runtime.filesystemIo() != null);
+    db.close();
+
+    // Closing must release the publication lease before destroying the
+    // runtime and its filesystem authority so the same root can reopen.
+    var reopened = try DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+    });
+    reopened.close();
+}
+
+test "db open rejects borrowed manual runtime without filesystem authority" {
+    const alloc = std.testing.allocator;
+
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+    });
+    defer runtime.deinit();
+
+    var path_buf: [256]u8 = undefined;
+    const path = tempPath(&path_buf);
+    defer cleanupTempDir(path);
+
+    try std.testing.expectError(error.BackendRuntimeIoUnavailable, DB.open(alloc, std.mem.span(path), .{
+        .backend_runtime = runtime.ptr(),
+        .executor = .{ .backend = .manual },
+    }));
 }
 
 test "db text merge enabled requires backend runtime io" {
