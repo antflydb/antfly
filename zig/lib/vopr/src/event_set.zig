@@ -329,6 +329,7 @@ test "saved event-set plans compose and count across histories" {
         try history.addObservation(.{ .index = index, .digest = digest, .features = &.{} });
     }
     try history.addEvent(.{ .index = 1, .ordinal = 0, .id = 10, .name = "request", .kind = .domain, .actor_id = 7, .resource_id = 8, .payload_digest = 1 });
+    try history.addEvent(.{ .index = 1, .ordinal = 1, .id = 12, .name = "request-detail", .kind = .state_change, .actor_id = 7, .resource_id = 8, .payload_digest = 3 });
     try history.addEvent(.{ .index = 2, .ordinal = 0, .id = 11, .name = "response", .kind = .client_response, .actor_id = 7, .resource_id = 8, .payload_digest = 2 });
     history.summary = .{ .transitions = 2, .final_observation_digest = digest, .property_failures = 0 };
 
@@ -342,6 +343,10 @@ test "saved event-set plans compose and count across histories" {
         .{ .name = "next-response", .operation = .next_after, .inputs = &.{ 0, 1 }, .max_transition_distance = 1 },
         .{ .name = "previous-request", .operation = .previous_before, .inputs = &.{ 1, 0 }, .max_transition_distance = 1 },
         .{ .name = "sequence", .operation = .sequence, .inputs = &.{ 0, 1 }, .max_transition_distance = 1 },
+        .{ .name = "actor-events", .operation = .select, .query = .{ .selector = .{ .actor_id = 7 } } },
+        .{ .name = "distinct-moments", .operation = .distinct_moment, .inputs = &.{9} },
+        .{ .name = "first-per-moment", .operation = .first_per_moment, .inputs = &.{9} },
+        .{ .name = "last-per-moment", .operation = .last_per_moment, .inputs = &.{9} },
     };
     var plan: Plan = .{
         .format = format,
@@ -351,12 +356,21 @@ test "saved event-set plans compose and count across histories" {
     };
     const histories = [_]History{ .{ .id = "run-a", .artifact = &history }, .{ .id = "run-b", .artifact = &history } };
     try std.testing.expectEqual(@as(usize, 2), try count(std.testing.allocator, &histories, plan));
-    for ([_]usize{ 3, 4, 5, 6, 7 }) |result_index| {
+    for ([_]usize{ 3, 4, 6, 7 }) |result_index| {
         plan.result = result_index;
         try std.testing.expectEqual(@as(usize, 2), try count(std.testing.allocator, &histories, plan));
     }
+    plan.result = 5;
+    try std.testing.expectEqual(@as(usize, 4), try count(std.testing.allocator, &histories, plan));
     plan.result = 2;
     try std.testing.expectEqual(@as(usize, 4), try count(std.testing.allocator, &histories, plan));
+    for ([_]usize{ 10, 11, 12 }) |result_index| {
+        plan.result = result_index;
+        var moments = try evaluateAlloc(std.testing.allocator, &histories, plan);
+        defer moments.deinit();
+        try std.testing.expectEqual(@as(usize, 4), moments.matches.len);
+        try std.testing.expectEqual(@as(u64, if (result_index == 12) 12 else 10), moments.matches[0].event_id);
+    }
     plan.result = 8;
     const encoded = try renderAlloc(std.testing.allocator, plan);
     defer std.testing.allocator.free(encoded);
@@ -372,4 +386,32 @@ test "event-set validation rejects forward references and invalid operations" {
         .steps = &.{.{ .name = "cycle", .operation = .@"union", .inputs = &.{ 0, 0 } }},
         .result = 0,
     }).validate());
+    try std.testing.expectError(error.UnsupportedEventSetFormat, (Plan{
+        .format = "vopr-event-set-v0",
+        .name = "obsolete",
+        .steps = &.{.{ .name = "events", .operation = .select, .query = .{} }},
+        .result = 0,
+    }).validate());
+    try std.testing.expectError(error.DuplicateEventSetStepName, (Plan{
+        .format = format,
+        .name = "duplicate",
+        .steps = &.{
+            .{ .name = "events", .operation = .select, .query = .{} },
+            .{ .name = "events", .operation = .complement, .inputs = &.{0} },
+        },
+        .result = 1,
+    }).validate());
+    try std.testing.expectError(error.InvalidTimelineEventSetOperation, (Plan{
+        .format = format,
+        .name = "malformed-sequence",
+        .steps = &.{
+            .{ .name = "events", .operation = .select, .query = .{} },
+            .{ .name = "sequence", .operation = .sequence, .inputs = &.{0} },
+        },
+        .result = 1,
+    }).validate());
+    try std.testing.expectError(
+        error.UnknownField,
+        parseAlloc(std.testing.allocator, "{\"selector\":{\"name\":\"legacy-ad-hoc-query\"}}"),
+    );
 }

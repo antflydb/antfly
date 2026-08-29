@@ -726,6 +726,74 @@ test "runner publishes canonical events without changing replay truth" {
     }
 }
 
+test "bounded NDJSON stream failure is diagnostic-only at the runner boundary" {
+    const Scenario = struct {
+        pub const name: []const u8 = "runner-bounded-live-events";
+        pub const version: u32 = 1;
+        const step_id = ids.stable("transition", name ++ ".step");
+        pub const properties = &[_]property.Declaration{};
+        pub const World = struct { done: bool = false };
+        pub fn init(_: std.mem.Allocator) !World {
+            return .{};
+        }
+        pub fn deinit(_: *World, _: std.mem.Allocator) void {}
+        pub fn enumerate(world: *World, list: *transition.List, allocator_: std.mem.Allocator) !void {
+            if (!world.done) try list.append(allocator_, .{ .id = step_id, .name = name ++ ".step", .kind = .workload });
+        }
+        pub fn execute(world: *World, _: transition.Transition, events: *event.Sink, allocator_: std.mem.Allocator) !outcome.TransitionOutcome {
+            world.done = true;
+            try events.emitNamed(allocator_, .domain, name ++ ".domain", 11);
+            return .applied();
+        }
+        pub fn observe(world: *World, builder: *observation.Builder, allocator_: std.mem.Allocator) !void {
+            try builder.addNamed(allocator_, name ++ ".done", @intFromBool(world.done));
+        }
+        pub fn evaluate(_: *World, _: *property.Sink, _: std.mem.Allocator) !void {}
+        pub fn done(world: *World) bool {
+            return world.done;
+        }
+    };
+    const FailingSink = struct {
+        attempts: u64 = 0,
+
+        fn write(ptr: *anyopaque, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            return error.InjectedEventStreamFailure;
+        }
+    };
+
+    var sink: FailingSink = .{};
+    var scratch: [512]u8 = undefined;
+    var stream = try event_stream.Ndjson.init(
+        "runner-bounded-live-events-history",
+        .{ .ptr = &sink, .write_fn = FailingSink.write },
+        &scratch,
+    );
+    var streamed_source = choice.Seeded.init(11);
+    var streamed = try run(Scenario, std.testing.allocator, streamed_source.source(), .{
+        .seed = 11,
+        .transition_budget = 1,
+        .event_observer = stream.observer(),
+    });
+    defer streamed.deinit();
+    var plain_source = choice.Seeded.init(11);
+    var plain = try run(Scenario, std.testing.allocator, plain_source.source(), .{
+        .seed = 11,
+        .transition_budget = 1,
+    });
+    defer plain.deinit();
+
+    const streamed_bytes = try streamed.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(streamed_bytes);
+    const plain_bytes = try plain.renderAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(plain_bytes);
+    try std.testing.expectEqualSlices(u8, plain_bytes, streamed_bytes);
+    try std.testing.expectEqual(@as(u64, 1), sink.attempts);
+    try std.testing.expectEqual(@as(u64, 1), stream.stats.write_failures);
+    try std.testing.expectEqual(@as(u64, 1), stream.stats.dropped_disabled);
+}
+
 test "runner automatically records phased health outside canonical replay bytes" {
     const Scenario = struct {
         pub const name: []const u8 = "runner-health-phases";
