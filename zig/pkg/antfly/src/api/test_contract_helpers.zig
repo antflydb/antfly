@@ -549,6 +549,34 @@ pub fn encodeGraphTraverseQueryRequest(
     });
 }
 
+pub fn encodeGraphTraverseQueryWithDocumentsRequest(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    index_name: []const u8,
+    start_keys: []const []const u8,
+    edge_types: []const []const u8,
+    max_depth: i64,
+    limit: i64,
+) ![]u8 {
+    var graph_searches = std.json.ArrayHashMap(indexes_openapi.GraphQuery){};
+    defer graph_searches.deinit(alloc);
+    try graph_searches.map.put(alloc, name, .{
+        .type = .traverse,
+        .index_name = index_name,
+        .start_nodes = .{ .keys = start_keys },
+        .params = .{
+            .edge_types = edge_types,
+            .max_depth = max_depth,
+        },
+        .include_documents = true,
+        .fields = &.{"title"},
+    });
+    return try stringifyJsonAlloc(alloc, metadata_openapi.QueryRequest{
+        .graph_searches = graph_searches,
+        .limit = limit,
+    });
+}
+
 pub fn encodeGraphTraverseQueryRequestWithPaths(
     alloc: std.mem.Allocator,
     name: []const u8,

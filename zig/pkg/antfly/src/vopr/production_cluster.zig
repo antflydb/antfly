@@ -268,6 +268,9 @@ pub const Fixture = struct {
     join_finalizer_persisted_group_id: u64 = 0,
     durable_join_takeover_sound: bool = false,
     graph_sound: bool = false,
+    graph_hydration_sound: bool = false,
+    graph_hydration_started_count: u64 = 0,
+    graph_hydration_completed_count: u64 = 0,
     split_graph_inflight_started: bool = false,
     split_graph_inflight_complete: bool = false,
     split_graph_inflight_rejected: bool = false,
@@ -336,6 +339,7 @@ pub const Fixture = struct {
     teardown_started: bool = false,
     active_split_enabled: bool = true,
     graph_enabled: bool = false,
+    graph_hydration_enabled: bool = false,
     join_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
@@ -361,6 +365,11 @@ pub const Fixture = struct {
     pub fn setGraphEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.graph_enabled = enabled;
+    }
+
+    pub fn setGraphHydrationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.graph_hydration_enabled = enabled;
     }
 
     pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
@@ -436,6 +445,8 @@ pub const Fixture = struct {
 
     pub fn bootstrap(self: *Fixture) !void {
         if (self.phase != .created) return error.ProductionFixtureAlreadyBootstrapped;
+        if (self.graph_hydration_enabled and !self.graph_enabled)
+            return error.InvalidProductionClusterGraphHydrationMode;
         switch (self.fault_mode) {
             .clean => {},
             .join_finalizer_ack_failure => if (!self.join_enabled or self.active_split_enabled)
@@ -734,6 +745,11 @@ pub const Fixture = struct {
         event: api_distributed_graph.LifecycleEvent,
     ) void {
         const self: *Fixture = @ptrCast(@alignCast(ptr));
+        switch (event.phase) {
+            .hydration_started => self.graph_hydration_started_count +|= 1,
+            .hydration_completed => self.graph_hydration_completed_count +|= 1,
+            else => {},
+        }
         if (self.fault_mode == .clean or self.fault_mode == .resource_pressure or
             self.fault_mode == .socket_pressure or
             self.fault_mode == .join_finalizer_ack_failure) return;
@@ -1419,6 +1435,11 @@ pub const Fixture = struct {
             self.graph_sound = right_hop_sound and round_trip_sound;
             self.phase = .graph_query_complete;
             if (!self.graph_sound) return error.ProductionDataGraphQueryFailed;
+            if (self.graph_hydration_enabled) {
+                self.graph_hydration_sound = try self.runGraphHydrationQuery();
+                if (!self.graph_hydration_sound)
+                    return error.ProductionDataGraphHydrationQueryFailed;
+            }
         }
 
         if (!self.active_split_enabled) return;
@@ -1751,6 +1772,43 @@ pub const Fixture = struct {
                 continue;
             }
             return try self.graphResponseComplete(response.body, start_key, max_depth, expected_keys);
+        }
+        return false;
+    }
+
+    fn runGraphHydrationQuery(self: *Fixture) !bool {
+        const query_body = try test_contract_helpers.encodeGraphTraverseQueryWithDocumentsRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{"doc:c"},
+            &.{"links"},
+            2,
+            10,
+        );
+        defer self.alloc.free(query_body);
+        const started_before = self.graph_hydration_started_count;
+        const completed_before = self.graph_hydration_completed_count;
+
+        for (0..node_count * 4) |attempt| {
+            const uri = self.data_api_uris[attempt % node_count];
+            var response = self.client.fetchQueryRaw(uri, "docs", query_body) catch |err| switch (err) {
+                error.Canceled => return err,
+                else => {
+                    try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                    continue;
+                },
+            };
+            defer response.deinit(self.alloc);
+            if (response.status != 200) {
+                if (response.status != 409 and response.status != 503)
+                    return error.UnexpectedHttpStatus;
+                try self.sim.io().sleep(.fromMilliseconds(1), .awake);
+                continue;
+            }
+            return self.graph_hydration_started_count == started_before + 1 and
+                self.graph_hydration_completed_count == completed_before + 1 and
+                try self.graphHydrationResponseComplete(response.body);
         }
         return false;
     }
@@ -2118,6 +2176,36 @@ pub const Fixture = struct {
                 );
                 return false;
             }
+        }
+        return true;
+    }
+
+    fn graphHydrationResponseComplete(self: *Fixture, body: []const u8) !bool {
+        var parsed = try std.json.parseFromSlice(
+            metadata_openapi.QueryResponses,
+            self.alloc,
+            body,
+            .{},
+        );
+        defer parsed.deinit();
+        const responses = parsed.value.responses orelse return false;
+        if (responses.len != 1) return false;
+        const graph_results = responses[0].graph_results orelse return false;
+        const walk = graph_results.map.get("walk") orelse return false;
+        const nodes = walk.nodes orelse return false;
+        if (walk.total != 2 or nodes.len != 2) return false;
+        for ([_]struct { key: []const u8, title: []const u8 }{
+            .{ .key = "doc:x", .title = "production-right" },
+            .{ .key = "doc:k", .title = "production-split" },
+        }) |expected| {
+            const node = for (nodes) |candidate| {
+                if (std.mem.eql(u8, candidate.key, expected.key)) break candidate;
+            } else return false;
+            const document = node.document orelse return false;
+            if (document != .object) return false;
+            const title = document.object.get("title") orelse return false;
+            if (title != .string or !std.mem.eql(u8, title.string, expected.title))
+                return false;
         }
         return true;
     }
@@ -2633,6 +2721,9 @@ pub const Fixture = struct {
         join_finalizer_persisted_group_id: u64,
         durable_join_takeover_ok: bool,
         graph_query_ok: bool,
+        graph_hydration_ok: bool,
+        graph_hydration_started_count: u64,
+        graph_hydration_completed_count: u64,
         split_graph_inflight_started: bool,
         split_graph_inflight_complete: bool,
         split_graph_inflight_rejected: bool,
@@ -2678,6 +2769,7 @@ pub const Fixture = struct {
                 self.tenant_sound and
                 (!self.join_enabled or self.join_sound) and
                 (!self.graph_enabled or self.graph_sound) and
+                (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
@@ -2688,6 +2780,9 @@ pub const Fixture = struct {
             .join_finalizer_persisted_group_id = self.join_finalizer_persisted_group_id,
             .durable_join_takeover_ok = self.durable_join_takeover_sound,
             .graph_query_ok = self.graph_sound,
+            .graph_hydration_ok = self.graph_hydration_sound,
+            .graph_hydration_started_count = self.graph_hydration_started_count,
+            .graph_hydration_completed_count = self.graph_hydration_completed_count,
             .split_graph_inflight_started = self.split_graph_inflight_started,
             .split_graph_inflight_complete = self.split_graph_inflight_complete,
             .split_graph_inflight_rejected = self.split_graph_inflight_rejected,
