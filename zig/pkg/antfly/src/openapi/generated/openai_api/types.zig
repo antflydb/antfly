@@ -1220,11 +1220,11 @@ pub const AuditLog = struct {
     /// The details for events with this `type`.
     ip_allowlist_config_deactivated: ?std.json.Value = null,
     /// This event has no additional fields beyond the standard audit log attributes.
-    login_succeeded: ?std.json.Value = null,
+    login_succeeded: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// The details for events with this `type`.
     login_failed: ?std.json.Value = null,
     /// This event has no additional fields beyond the standard audit log attributes.
-    logout_succeeded: ?std.json.Value = null,
+    logout_succeeded: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// The details for events with this `type`.
     logout_failed: ?std.json.Value = null,
     /// The details for events with this `type`.
@@ -2203,7 +2203,7 @@ pub const ChatCompletionAllowedTools = struct {
     /// Constrains the tools available to the model to a pre-defined set. `auto` allows the model to pick from among the allowed tools and generate a message. `required` requires the model to call one or more of the allowed tools.
     mode: []const u8,
     /// A list of tool definitions that the model should be allowed to call. For the Chat Completions API, the list of tool definitions might look like: ```json [ { "type": "function", "function": { "name": "get_weather" } }, { "type": "function", "function": { "name": "get_time" } } ] ```
-    tools: []const std.json.Value,
+    tools: []const std.json.ArrayHashMap(std.json.Value),
 };
 
 /// Constrains the tools available to the model to a pre-defined set.
@@ -6258,7 +6258,7 @@ pub const CreateEvalCustomDataSourceConfig = struct {
     /// The type of data source. Always `custom`.
     type: []const u8,
     /// The json schema for each row in the data source.
-    item_schema: std.json.Value,
+    item_schema: std.json.ArrayHashMap(std.json.Value),
     /// Whether the eval should expect you to populate the sample namespace (ie, by generating responses off of your data source)
     include_sample_schema: ?bool = null,
 
@@ -6323,7 +6323,7 @@ pub const CreateEvalLogsDataSourceConfig = struct {
     /// The type of data source. Always `logs`.
     type: []const u8,
     /// Metadata filters for the logs data source.
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -6356,7 +6356,7 @@ pub const CreateEvalRequest = struct {
     name: ?[]const u8 = null,
     metadata: ?Metadata = null,
     /// The configuration for the data source used for the evaluation runs. Dictates the schema of the data used in the evaluation.
-    data_source_config: std.json.Value,
+    data_source_config: std.json.ArrayHashMap(std.json.Value),
     /// A list of graders for all eval runs in this group. Graders can reference variables in the data source using double curly braces notation, like `{{item.variable_name}}`. To reference the model's output, use the `sample` namespace (ie, `{{sample.output_text}}`).
     testing_criteria: []const std.json.Value,
 
@@ -6450,7 +6450,7 @@ pub const CreateEvalRunRequest = struct {
     name: ?[]const u8 = null,
     metadata: ?Metadata = null,
     /// Details about the run's data source.
-    data_source: std.json.Value,
+    data_source: std.json.ArrayHashMap(std.json.Value),
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -6488,7 +6488,7 @@ pub const CreateEvalStoredCompletionsDataSourceConfig = struct {
     /// The type of data source. Always `stored_completions`.
     type: []const u8,
     /// Metadata filters for the stored completions data source.
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -8132,7 +8132,7 @@ pub const CreateTranscriptionResponseDiarizedJson = struct {
     /// Segments of the transcript annotated with timestamps and speaker labels.
     segments: []const TranscriptionDiarizedSegment,
     /// Token or duration usage statistics for the request.
-    usage: ?std.json.Value = null,
+    usage: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -8176,7 +8176,7 @@ pub const CreateTranscriptionResponseJson = struct {
     /// The log probabilities of the tokens in the transcription. Only returned with the models `gpt-4o-transcribe` and `gpt-4o-mini-transcribe` if `logprobs` is added to the `include` array.
     logprobs: ?[]const std.json.Value = null,
     /// Token usage statistics for the request.
-    usage: ?std.json.Value = null,
+    usage: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -8502,7 +8502,7 @@ pub const CreateVectorStoreRequest = struct {
     description: ?[]const u8 = null,
     expires_after: ?VectorStoreExpirationAfter = null,
     /// The chunking strategy used to chunk the file(s). If not set, will use the `auto` strategy. Only applicable if `file_ids` is non-empty.
-    chunking_strategy: ?std.json.Value = null,
+    chunking_strategy: ?std.json.ArrayHashMap(std.json.Value) = null,
     metadata: ?Metadata = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -9395,7 +9395,7 @@ pub const Embedding = struct {
     object: []const u8,
 };
 
-pub const EmptyModelParam = struct {};
+pub const EmptyModelParam = std.json.ArrayHashMap(std.json.Value);
 
 pub const Error = struct {
     code: std.json.Value,
@@ -9431,7 +9431,7 @@ pub const Eval = struct {
     /// The name of the evaluation.
     name: []const u8,
     /// Configuration of data sources used in runs of the evaluation.
-    data_source_config: std.json.Value,
+    data_source_config: std.json.ArrayHashMap(std.json.Value),
     /// A list of testing criteria.
     testing_criteria: []const std.json.Value,
     /// The Unix timestamp (in seconds) for when the eval was created.
@@ -9452,7 +9452,7 @@ pub const EvalCustomDataSourceConfig = struct {
     /// The type of data source. Always `custom`.
     type: []const u8,
     /// The json schema for the run data source items. Learn how to build JSON schemas [here](https://json-schema.org/).
-    schema: std.json.Value,
+    schema: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const EvalGraderLabelModel = struct {
@@ -9736,7 +9736,7 @@ pub const EvalLogsDataSourceConfig = struct {
     type: []const u8,
     metadata: ?Metadata = null,
     /// The json schema for the run data source items. Learn how to build JSON schemas [here](https://json-schema.org/).
-    schema: std.json.Value,
+    schema: std.json.ArrayHashMap(std.json.Value),
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -9878,7 +9878,7 @@ pub const EvalRun = struct {
     /// Results per testing criteria applied during the evaluation run.
     per_testing_criteria_results: []const std.json.Value,
     /// Information about the run's data source.
-    data_source: std.json.Value,
+    data_source: std.json.ArrayHashMap(std.json.Value),
     metadata: Metadata,
     @"error": EvalApiError,
 };
@@ -9914,7 +9914,7 @@ pub const EvalRunOutputItem = struct {
     /// The identifier for the data source item.
     datasource_item_id: i64,
     /// Details of the input data source item.
-    datasource_item: std.json.Value,
+    datasource_item: std.json.ArrayHashMap(std.json.Value),
     /// A list of grader results for this output item.
     results: []const EvalRunOutputItemResult,
     /// A sample containing the input and output of the evaluation run.
@@ -9991,7 +9991,7 @@ pub const EvalStoredCompletionsDataSourceConfig = struct {
     type: []const u8,
     metadata: ?Metadata = null,
     /// The json schema for the run data source items. Learn how to build JSON schemas [here](https://json-schema.org/).
-    schema: std.json.Value,
+    schema: std.json.ArrayHashMap(std.json.Value),
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -10594,7 +10594,7 @@ pub const FineTuneReinforcementHyperparameters = struct {
 /// Configuration for the reinforcement fine-tuning method.
 pub const FineTuneReinforcementMethod = struct {
     /// The grader used for the fine-tuning job.
-    grader: std.json.Value,
+    grader: std.json.ArrayHashMap(std.json.Value),
     hyperparameters: ?FineTuneReinforcementHyperparameters = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -10859,7 +10859,7 @@ pub const FineTuningJobEvent = struct {
     /// The type of event.
     type: ?[]const u8 = null,
     /// The data associated with the event.
-    data: ?std.json.Value = null,
+    data: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -11151,7 +11151,7 @@ pub const FunctionObject = struct {
 };
 
 /// The parameters the functions accepts, described as a JSON Schema object. See the [guide](/docs/guides/function-calling) for examples, and the [JSON Schema reference](https://json-schema.org/understanding-json-schema/) for documentation about the format. Omitting `parameters` defines a function with an empty parameter list.
-pub const FunctionParameters = std.json.Value;
+pub const FunctionParameters = std.json.ArrayHashMap(std.json.Value);
 
 /// Execute a shell command.
 pub const FunctionShellAction = struct {
@@ -14944,7 +14944,7 @@ pub const MCPListToolsTool = struct {
     name: []const u8,
     description: ?std.json.Value = null,
     /// The JSON schema describing the tool's input.
-    input_schema: std.json.Value,
+    input_schema: std.json.ArrayHashMap(std.json.Value),
     annotations: ?std.json.Value = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -17926,7 +17926,7 @@ pub const RealtimeBetaServerEventConversationItemInputAudioTranscriptionComplete
     transcript: []const u8,
     logprobs: ?std.json.Value = null,
     /// Usage statistics for the transcription.
-    usage: std.json.Value,
+    usage: std.json.ArrayHashMap(std.json.Value),
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -19038,7 +19038,7 @@ pub const RealtimeClientEventSessionUpdate = struct {
     /// The event type, must be `session.update`.
     type: []const u8,
     /// Update the Realtime session. Choose either a realtime session or a transcription session.
-    session: std.json.Value,
+    session: std.json.ArrayHashMap(std.json.Value),
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -19545,7 +19545,7 @@ pub const RealtimeFunctionTool = struct {
     /// The description of the function, including guidance on when and how to call it, and guidance about what to tell the user when calling (if anything).
     description: ?[]const u8 = null,
     /// Parameters of the function in JSON Schema.
-    parameters: ?std.json.Value = null,
+    parameters: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -20116,7 +20116,7 @@ pub const RealtimeServerEventConversationItemInputAudioTranscriptionCompleted = 
     transcript: []const u8,
     logprobs: ?std.json.Value = null,
     /// Usage statistics for the transcription, this is billed according to the ASR model's pricing rather than the realtime model's pricing.
-    usage: std.json.Value,
+    usage: std.json.ArrayHashMap(std.json.Value),
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -22278,7 +22278,7 @@ pub const ResponseFormatJsonSchema = struct {
 };
 
 /// The schema for the response format, described as a JSON Schema object. Learn how to build JSON schemas [here](https://json-schema.org/).
-pub const ResponseFormatJsonSchemaSchema = std.json.Value;
+pub const ResponseFormatJsonSchemaSchema = std.json.ArrayHashMap(std.json.Value);
 
 /// Default response format. Used to generate text responses.
 pub const ResponseFormatText = struct {
@@ -22604,7 +22604,7 @@ pub const ResponseOutputTextAnnotationAddedEvent = struct {
     /// The sequence number of this event.
     sequence_number: i64,
     /// The annotation object being added. (See annotation schema for details.)
-    annotation: std.json.Value,
+    annotation: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const ResponsePromptVariables = std.json.Value;
@@ -23211,9 +23211,9 @@ pub const RunCompletionUsage = std.json.Value;
 
 pub const RunGraderRequest = struct {
     /// The grader used for the fine-tuning job.
-    grader: std.json.Value,
+    grader: std.json.ArrayHashMap(std.json.Value),
     /// The dataset item provided to the grader. This will be used to populate the `item` namespace. See [the guide](/docs/guides/graders) for more details.
-    item: ?std.json.Value = null,
+    item: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// The model sample to be evaluated. This value will be used to populate the `sample` namespace. See [the guide](/docs/guides/graders) for more details. The `output_json` variable will be populated if the model sample is a valid JSON string.
     model_sample: []const u8,
 
@@ -23592,7 +23592,7 @@ pub const RunStepDeltaStepDetailsToolCallsFileSearchObject = struct {
     /// The type of tool call. This is always going to be `file_search` for this type of tool call.
     type: []const u8,
     /// For now, this is always going to be an empty object.
-    file_search: std.json.Value,
+    file_search: std.json.ArrayHashMap(std.json.Value),
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -23829,7 +23829,7 @@ pub const RunStepObject = struct {
     /// The status of the run step, which can be either `in_progress`, `cancelled`, `failed`, `completed`, or `expired`.
     status: []const u8,
     /// The details of the run step.
-    step_details: std.json.Value,
+    step_details: std.json.ArrayHashMap(std.json.Value),
     last_error: std.json.Value,
     expired_at: std.json.Value,
     cancelled_at: std.json.Value,
@@ -24794,7 +24794,7 @@ pub const ToolChoiceAllowed = struct {
     /// Constrains the tools available to the model to a pre-defined set. `auto` allows the model to pick from among the allowed tools and generate a message. `required` requires the model to call one or more of the allowed tools.
     mode: []const u8,
     /// A list of tool definitions that the model should be allowed to call. For the Responses API, the list of tool definitions might look like: ```json [ { "type": "function", "name": "get_weather" }, { "type": "mcp", "server_label": "deepwiki" }, { "type": "image_generation" } ] ```
-    tools: []const std.json.Value,
+    tools: []const std.json.ArrayHashMap(std.json.Value),
 };
 
 /// Use this option to force the model to call a specific custom tool.
@@ -26327,12 +26327,12 @@ pub const VadConfig = struct {
 
 pub const ValidateGraderRequest = struct {
     /// The grader used for the fine-tuning job.
-    grader: std.json.Value,
+    grader: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const ValidateGraderResponse = struct {
     /// The grader used for the fine-tuning job.
-    grader: ?std.json.Value = null,
+    grader: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -26409,7 +26409,7 @@ pub const VectorStoreFileObject = struct {
     status: []const u8,
     last_error: std.json.Value,
     /// The strategy used to chunk the file.
-    chunking_strategy: ?std.json.Value = null,
+    chunking_strategy: ?std.json.ArrayHashMap(std.json.Value) = null,
     attributes: ?VectorStoreFileAttributes = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -27145,7 +27145,7 @@ pub const WebSearchToolCall = struct {
     /// The status of the web search tool call.
     status: []const u8,
     /// An object describing the specific action taken in this web search call. Includes details on how the model used the web (search, open_page, find_in_page).
-    action: std.json.Value,
+    action: std.json.ArrayHashMap(std.json.Value),
 };
 
 /// Sent when a batch API request has been cancelled.

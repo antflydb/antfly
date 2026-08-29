@@ -18114,11 +18114,10 @@ fn parseRemoteArtifactKind(value: []const u8) !db_mod.types.ArtifactKind {
 
 fn parseRemoteIndexScoresAlloc(
     alloc: std.mem.Allocator,
-    maybe_value: ?std.json.Value,
+    maybe_value: ?std.json.ArrayHashMap(f64),
 ) ![]fusion_mod.IndexScore {
     const value = maybe_value orelse return &.{};
-    if (value != .object) return &.{};
-    const object = value.object;
+    const object = value.map;
     if (object.count() == 0) return &.{};
 
     var scores = try alloc.alloc(fusion_mod.IndexScore, object.count());
@@ -18130,15 +18129,9 @@ fn parseRemoteIndexScoresAlloc(
 
     var it = object.iterator();
     while (it.next()) |entry| {
-        const score: f64 = switch (entry.value_ptr.*) {
-            .float => |v| v,
-            .integer => |v| @floatFromInt(v),
-            .number_string => |v| std.fmt.parseFloat(f64, v) catch continue,
-            else => continue,
-        };
         scores[initialized] = .{
             .index_name = try alloc.dupe(u8, entry.key_ptr.*),
-            .score = score,
+            .score = entry.value_ptr.*,
         };
         initialized += 1;
     }
@@ -18573,7 +18566,7 @@ fn remoteGraphDocumentHit(
     alloc: std.mem.Allocator,
     key: []const u8,
     table: ?[]const u8,
-    document: std.json.Value,
+    document: std.json.ArrayHashMap(std.json.Value),
 ) !db_mod.types.SearchHit {
     const id = try alloc.dupe(u8, key);
     errdefer alloc.free(id);
@@ -18589,7 +18582,7 @@ fn appendRemoteGraphDocumentHit(
     hits: *std.ArrayListUnmanaged(db_mod.types.SearchHit),
     key: []const u8,
     table: ?[]const u8,
-    document: std.json.Value,
+    document: std.json.ArrayHashMap(std.json.Value),
 ) !void {
     var hit = try remoteGraphDocumentHit(alloc, key, table, document);
     errdefer hit.deinit(alloc);

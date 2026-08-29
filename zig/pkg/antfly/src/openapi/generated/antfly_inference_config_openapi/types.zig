@@ -652,7 +652,7 @@ pub const FunctionDefinition = struct {
     /// A description of what the function does
     description: ?[]const u8 = null,
     /// JSON Schema object describing the function parameters
-    parameters: ?std.json.Value = null,
+    parameters: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Whether to enforce strict parameter validation
     strict: ?bool = null,
 
@@ -845,7 +845,7 @@ pub const GenerateChoice = struct {
     message: GenerateMessage,
     finish_reason: FinishReason,
     /// Log probability information (not supported, always null)
-    logprobs: OpenApiOptionalNullable(std.json.Value) = .absent,
+    logprobs: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
@@ -1547,7 +1547,7 @@ pub const ModelsResponse = struct {
     /// OpenAI-compatible response object type.
     object: []const u8,
     /// OpenAI-compatible flat model list for generation/embedding models.
-    data: []const std.json.Value,
+    data: []const std.json.ArrayHashMap(std.json.Value),
     /// Whether clients should show model download commands.
     allow_downloads: bool,
     backends: BackendRuntimes,

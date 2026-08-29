@@ -410,14 +410,18 @@ pub const TypeGenerator = struct {
             return;
         }
 
-        // A named free-form object must retain its arbitrary JSON fields. An
-        // empty Zig struct would parse successfully while silently discarding
-        // the entire payload.
-        if (schema.properties.count() == 0) {
+        // A named free-form object must retain its arbitrary JSON fields while
+        // preserving the schema's object-only wire domain. Raw std.json.Value
+        // is reserved for deliberately untyped or multi-type schemas because
+        // it would also accept arrays, scalars, and null here.
+        if (schema.properties.count() == 0 and
+            (schema.additional_properties != null or
+                (schema.primaryType() != null and std.mem.eql(u8, schema.primaryType().?, "object"))))
+        {
             if (schema.additional_properties) |additional_properties| switch (additional_properties) {
                 .boolean => |allowed| if (allowed) {
                     if (schema.description) |desc| try self.w.docComment(desc);
-                    try self.w.line("pub const {s} = std.json.Value;", .{type_name});
+                    try self.w.line("pub const {s} = std.json.ArrayHashMap(std.json.Value);", .{type_name});
                     return;
                 },
                 .schema => {
@@ -426,7 +430,15 @@ pub const TypeGenerator = struct {
                     try self.w.line("pub const {s} = {s};", .{ type_name, zig_type });
                     return;
                 },
-            };
+            } else {
+                // JSON Schema and OpenAPI allow additional properties by
+                // default. A property-free object without an explicit closed
+                // marker is therefore an arbitrary-key object, not `{}` and
+                // not an unconstrained JSON value.
+                if (schema.description) |desc| try self.w.docComment(desc);
+                try self.w.line("pub const {s} = std.json.ArrayHashMap(std.json.Value);", .{type_name});
+                return;
+            }
         }
 
         // Object with properties → struct
@@ -1852,7 +1864,10 @@ pub const TypeGenerator = struct {
         } else if (std.mem.eql(u8, type_str, "object")) {
             if (schema.additional_properties) |ap| {
                 switch (ap) {
-                    .boolean => return "std.json.Value",
+                    .boolean => |allowed| {
+                        if (allowed) return "std.json.ArrayHashMap(std.json.Value)";
+                        if (schema.properties.count() == 0) return "struct {}";
+                    },
                     .schema => |s| {
                         const inner = try self.zigTypeForSchemaOrRef(s.*);
                         return std.fmt.allocPrint(self.arena, "std.json.ArrayHashMap({s})", .{inner});
@@ -1863,7 +1878,7 @@ pub const TypeGenerator = struct {
                 // Named inline object — would need anonymous struct generation
                 return "std.json.Value";
             }
-            return "std.json.Value";
+            return "std.json.ArrayHashMap(std.json.Value)";
         }
 
         return "std.json.Value";
@@ -1948,7 +1963,7 @@ test "zigTypeForSchema primitives" {
     }));
 }
 
-test "named free-form object preserves arbitrary JSON" {
+test "free-form objects preserve arbitrary fields and the object wire kind" {
     const alloc = std.testing.allocator;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
@@ -1958,6 +1973,9 @@ test "named free-form object preserves arbitrary JSON" {
     try schemas.put(arena, "DocumentQuery", .{ .schema = .{
         .schema_type = .{ .single = "object" },
         .additional_properties = .{ .boolean = true },
+    } });
+    try schemas.put(arena, "ImplicitDocument", .{ .schema = .{
+        .schema_type = .{ .single = "object" },
     } });
     const doc = types.OpenApiDoc{
         .openapi = "3.0.3",
@@ -1969,7 +1987,30 @@ test "named free-form object preserves arbitrary JSON" {
     var gen = TypeGenerator.init(arena, &w, &resolver);
     try gen.generateAll(&doc);
 
-    try std.testing.expect(std.mem.indexOf(u8, w.toSlice(), "pub const DocumentQuery = std.json.Value;") != null);
+    try std.testing.expectEqualStrings(
+        "std.json.ArrayHashMap(std.json.Value)",
+        try gen.zigTypeForSchema(.{
+            .schema_type = .{ .single = "object" },
+            .additional_properties = .{ .boolean = true },
+        }),
+    );
+    try std.testing.expectEqualStrings(
+        "struct {}",
+        try gen.zigTypeForSchema(.{
+            .schema_type = .{ .single = "object" },
+            .additional_properties = .{ .boolean = false },
+        }),
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        w.toSlice(),
+        "pub const DocumentQuery = std.json.ArrayHashMap(std.json.Value);",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        w.toSlice(),
+        "pub const ImplicitDocument = std.json.ArrayHashMap(std.json.Value);",
+    ) != null);
 }
 
 test "explicit Zig raw JSON override wins over nested structural unions" {
@@ -2866,8 +2907,8 @@ test "object schema with base properties and oneOf variants flattens variant fie
     try std.testing.expect(std.mem.indexOf(u8, output, "@\"type\": []const u8,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "mem_only: ?bool = null,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "template: ?[]const u8 = null,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "embedder: ?std.json.Value = null,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "chunker: ?std.json.Value = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "embedder: ?std.json.ArrayHashMap(std.json.Value) = null,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "chunker: ?std.json.ArrayHashMap(std.json.Value) = null,") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "pub fn jsonStringify(self: @This(), jw: anytype) !void {") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "try jw.write(self.@\"type\");") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "if (self.template) |value| {") != null);

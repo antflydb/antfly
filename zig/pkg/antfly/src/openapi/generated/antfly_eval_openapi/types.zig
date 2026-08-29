@@ -113,7 +113,7 @@ pub const EvalRequest = struct {
     /// Generated output to evaluate (optional for retrieval-only)
     output: ?[]const u8 = null,
     /// Retrieved documents/context
-    context: ?[]const std.json.Value = null,
+    context: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// IDs of retrieved documents (for retrieval metrics)
     retrieved_ids: ?[]const []const u8 = null,
 
@@ -370,7 +370,7 @@ pub const EvaluatorScore = struct {
     /// Human-readable explanation of the result
     reason: ?[]const u8 = null,
     /// Additional evaluator-specific data
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{

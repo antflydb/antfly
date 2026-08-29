@@ -243,8 +243,8 @@ pub const InvokeInferenceConnectionPathParams = struct {
 };
 
 /// Parse the JSON request body for invokeInferenceConnection.
-pub fn parseInvokeInferenceConnectionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.Value) {
-    return std.json.parseFromSlice(std.json.Value, allocator, body, .{ .ignore_unknown_fields = true });
+pub fn parseInvokeInferenceConnectionBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(std.json.ArrayHashMap(std.json.Value)) {
+    return std.json.parseFromSlice(std.json.ArrayHashMap(std.json.Value), allocator, body, .{ .ignore_unknown_fields = true });
 }
 
 /// Parse the JSON request body for evaluate.

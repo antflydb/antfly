@@ -304,6 +304,7 @@ test "generate 3.1 types with nullable and ref siblings" {
     try err_props.put(arena, "details", types.SchemaOrRef{
         .schema = types.Schema{
             .schema_type = .{ .array = &.{ "object", "null" } },
+            .additional_properties = .{ .boolean = true },
             .description = "Error detail payload",
         },
     });
@@ -355,8 +356,8 @@ test "generate 3.1 types with nullable and ref siblings" {
     ) != null);
 
     // Required + nullable (3.1 type array): `?T` with no default
-    try std.testing.expect(std.mem.indexOf(u8, out, "details: ?std.json.Value,") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "details: ?std.json.Value = null") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "details: ?std.json.ArrayHashMap(std.json.Value),") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "details: ?std.json.ArrayHashMap(std.json.Value) = null") == null);
 
     // $ref description sibling → doc comment on field
     try std.testing.expect(std.mem.indexOf(u8, out, "/// Current adoption status") != null);

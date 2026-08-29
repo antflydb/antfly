@@ -601,7 +601,7 @@ pub const IPRangeQuery = struct {
 };
 
 pub const MatchAllQuery = struct {
-    match_all: std.json.Value,
+    match_all: std.json.ArrayHashMap(std.json.Value),
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -624,7 +624,7 @@ pub const MatchAllQuery = struct {
 };
 
 pub const MatchNoneQuery = struct {
-    match_none: std.json.Value,
+    match_none: std.json.ArrayHashMap(std.json.Value),
     boost: OpenApiOptionalNullable(std.meta.Child(Boost)) = .absent,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {

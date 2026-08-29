@@ -983,7 +983,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var saw_alice = false;
     var saw_bob = false;
     for (join_hits) |hit| {
-        const source_value = hit._source.?.object;
+        const source_value = hit._source.?.map;
         try std.testing.expect(source_value.get("customer_id") == null);
         const title = source_value.get("title").?.string;
         const joined_name = source_value.get("customers.name").?.string;
@@ -1042,7 +1042,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var saw_left_beta = false;
     var saw_left_gamma = false;
     for (filtered_nested_hits) |hit| {
-        const source_value = hit._source.?.object;
+        const source_value = hit._source.?.map;
         try std.testing.expect(source_value.get("customer_id") == null);
         const title = source_value.get("title").?.string;
         if (std.mem.eql(u8, title, "alpha")) {
@@ -1088,7 +1088,7 @@ test "public api smoke e2e creates table inserts and queries documents" {
     var saw_right_beta = false;
     var saw_right_zoe = false;
     for (right_join_hits) |hit| {
-        const source_value = hit._source.?.object;
+        const source_value = hit._source.?.map;
         const joined_name = source_value.get("customers.name").?.string;
         if (std.mem.eql(u8, joined_name, "Alice")) {
             saw_right_alpha = true;

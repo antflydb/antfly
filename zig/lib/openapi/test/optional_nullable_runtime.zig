@@ -128,6 +128,54 @@ test "optional non-nullable properties reject explicit null without losing omiss
     );
 }
 
+test "free-form object properties reject non-object JSON on every parser backend" {
+    const alloc = std.testing.allocator;
+    const valid =
+        \\{"id":1,"name":"Mochi","metadata":{"nested":{"ok":true},"count":2}}
+    ;
+
+    var standard = try std.json.parseFromSlice(types.Pet, alloc, valid, .{});
+    defer standard.deinit();
+    try std.testing.expect(standard.value.metadata.?.map.get("nested").? == .object);
+    try std.testing.expectEqual(@as(i64, 2), standard.value.metadata.?.map.get("count").?.integer);
+
+    var simd = try antfly_json.parseFromSliceWithConfig(
+        types.Pet,
+        alloc,
+        valid,
+        .{},
+        .{ .preferred_backend = .simd, .simd_min_input_len = 0 },
+    );
+    defer simd.deinit();
+    try std.testing.expect(simd.value.metadata.?.map.get("nested").? == .object);
+    try std.testing.expectEqual(@as(i64, 2), simd.value.metadata.?.map.get("count").?.integer);
+
+    const invalid_values = [_][]const u8{
+        \\{"id":1,"name":"Mochi","metadata":null}
+        ,
+        \\{"id":1,"name":"Mochi","metadata":"not-an-object"}
+        ,
+        \\{"id":1,"name":"Mochi","metadata":[1,2]}
+        ,
+    };
+    for (invalid_values) |invalid| {
+        try std.testing.expectError(
+            error.UnexpectedToken,
+            std.json.parseFromSlice(types.Pet, alloc, invalid, .{}),
+        );
+        try std.testing.expectError(
+            error.UnexpectedToken,
+            antfly_json.parseFromSliceWithConfig(
+                types.Pet,
+                alloc,
+                invalid,
+                .{},
+                .{ .preferred_backend = .simd, .simd_min_input_len = 0 },
+            ),
+        );
+    }
+}
+
 test "required nullable presence remains distinct from optional non-nullable omission" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
@@ -197,6 +245,29 @@ test "required nullable fields require wire presence on every parser backend" {
     );
     defer explicit_null.deinit();
     try std.testing.expect(explicit_null.value.details == null);
+
+    var concrete = try antfly_json.parseFromSliceWithConfig(
+        types.Error,
+        alloc,
+        \\{"error":"boom","message":"failed","details":{"retry":false}}
+    ,
+        .{},
+        .{ .preferred_backend = .simd, .simd_min_input_len = 0 },
+    );
+    defer concrete.deinit();
+    try std.testing.expect(!concrete.value.details.?.map.get("retry").?.bool);
+
+    try std.testing.expectError(
+        error.UnexpectedToken,
+        antfly_json.parseFromSliceWithConfig(
+            types.Error,
+            alloc,
+            \\{"error":"boom","message":"failed","details":"wrong-kind"}
+        ,
+            .{},
+            .{ .preferred_backend = .simd, .simd_min_input_len = 0 },
+        ),
+    );
 }
 
 test "OpenAPI wire names remain distinct from ergonomic Zig field names" {

@@ -140,7 +140,7 @@ pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
     /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
-    schema: ?std.json.Value = null,
+    schema: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{

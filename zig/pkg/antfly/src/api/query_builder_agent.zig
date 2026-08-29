@@ -24,6 +24,7 @@ const query_contract = @import("query_contract.zig");
 
 const AgentQuestion = metadata_openapi.AgentQuestion;
 const AgentStatus = metadata_openapi.AgentStatus;
+const JsonObject = std.json.ArrayHashMap(std.json.Value);
 
 pub const GenerationRunner = struct {
     ptr: *anyopaque,
@@ -2218,7 +2219,10 @@ pub fn buildQueryBuilderResponseWithContext(
             (request.max_user_clarifications orelse 0) - if (request.decisions) |decisions| @as(i64, @intCast(decisions.len)) else 0,
         ),
         .questions = if (clarification_question) |question| try alloc.dupe(AgentQuestion, &[_]AgentQuestion{question}) else null,
-        .query = built_query.query,
+        .query = if (built_query.query == .object)
+            .{ .map = built_query.query.object }
+        else
+            return error.InvalidQueryBuilderGeneration,
         .query_request = query_request,
         .retrieval_query_request = retrieval_query_request,
         .specialist = specialist,
@@ -2363,7 +2367,7 @@ fn resolveQueryBuilderFields(
     alloc: std.mem.Allocator,
     request_fields: ?[]const []const u8,
     table_schema_fields: ?[]const []const u8,
-    example_documents: ?[]const std.json.Value,
+    example_documents: ?[]const std.json.ArrayHashMap(std.json.Value),
 ) ![]const []const u8 {
     if (request_fields) |fields| {
         if (fields.len > 0) return fields;
@@ -2376,7 +2380,7 @@ fn resolveQueryBuilderFields(
 
 fn collectQueryBuilderExampleFields(
     alloc: std.mem.Allocator,
-    example_documents: []const std.json.Value,
+    example_documents: []const std.json.ArrayHashMap(std.json.Value),
 ) ![]const []const u8 {
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(alloc);
@@ -2384,8 +2388,7 @@ fn collectQueryBuilderExampleFields(
     defer fields.deinit(alloc);
 
     for (example_documents) |document| {
-        if (document != .object) continue;
-        var it = document.object.iterator();
+        var it = document.map.iterator();
         while (it.next()) |entry| {
             if (seen.contains(entry.key_ptr.*)) continue;
             try seen.put(alloc, entry.key_ptr.*, {});
@@ -3078,7 +3081,7 @@ fn buildSemanticQueryBuilderMessages(
     field_capabilities: []const QueryBuilderFieldCapability,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
     semantic_indexes: []const []const u8,
-    example_documents: ?[]const std.json.Value,
+    example_documents: ?[]const JsonObject,
 ) ![]const generating.ChatMessage {
     const system = try buildSemanticQueryBuilderSystemPrompt(alloc, mode, fields, full_text_index_metadata, field_capabilities, embedding_index_metadata, semantic_indexes, example_documents orelse &.{});
     const hybrid_mode = std.ascii.eqlIgnoreCase(mode, "hybrid");
@@ -3249,7 +3252,7 @@ fn buildSemanticQueryBuilderSystemPrompt(
     field_capabilities: []const QueryBuilderFieldCapability,
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex,
     semantic_indexes: []const []const u8,
-    example_documents: []const std.json.Value,
+    example_documents: []const JsonObject,
 ) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -3354,7 +3357,7 @@ fn buildBleveQueryBuilderMessages(
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
     field_capabilities: []const QueryBuilderFieldCapability,
-    example_documents: ?[]const std.json.Value,
+    example_documents: ?[]const JsonObject,
 ) ![]const generating.ChatMessage {
     const system = try buildBleveQueryBuilderSystemPrompt(alloc, fields, full_text_index_metadata, field_capabilities, example_documents orelse &.{});
     const user = try std.fmt.allocPrint(
@@ -3418,7 +3421,7 @@ fn buildBleveQueryBuilderSystemPrompt(
     fields: []const []const u8,
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
     field_capabilities: []const QueryBuilderFieldCapability,
-    example_documents: []const std.json.Value,
+    example_documents: []const JsonObject,
 ) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -3493,7 +3496,7 @@ fn buildGraphQueryBuilderMessages(
     fields: []const []const u8,
     graph_indexes: []const []const u8,
     graph_index_metadata: []const QueryBuilderGraphIndex,
-    example_documents: ?[]const std.json.Value,
+    example_documents: ?[]const JsonObject,
 ) ![]const generating.ChatMessage {
     const system = try buildGraphQueryBuilderSystemPrompt(alloc, fields, graph_indexes, graph_index_metadata, example_documents orelse &.{});
     const user = try std.fmt.allocPrint(
@@ -3526,7 +3529,7 @@ fn buildGraphQueryBuilderSystemPrompt(
     fields: []const []const u8,
     graph_indexes: []const []const u8,
     graph_index_metadata: []const QueryBuilderGraphIndex,
-    example_documents: []const std.json.Value,
+    example_documents: []const JsonObject,
 ) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
@@ -3809,7 +3812,7 @@ fn validateGeneratedQueryBuilderBleveQuery(
 }
 
 fn validateGeneratedQueryBuilderBleveObject(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     object: std.json.ObjectMap,
     depth: usize,
@@ -3885,7 +3888,7 @@ fn validateGeneratedQueryBuilderBleveObject(
 }
 
 fn validateGeneratedQueryBuilderRangeObject(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     object: std.json.ObjectMap,
 ) QueryBuilderValidationError!void {
@@ -3913,7 +3916,7 @@ fn validateGeneratedQueryBuilderRangeObject(
 }
 
 fn validateGeneratedQueryBuilderBooleanObject(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     object: std.json.ObjectMap,
     depth: usize,
@@ -3940,7 +3943,7 @@ fn validateGeneratedQueryBuilderBooleanObject(
 }
 
 fn validateGeneratedQueryBuilderTextOperator(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     key: []const u8,
     value: std.json.Value,
@@ -3969,7 +3972,7 @@ fn validateGeneratedQueryBuilderTextOperator(
 }
 
 fn validateGeneratedQueryBuilderOperatorOptions(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     object: std.json.ObjectMap,
     depth: usize,
@@ -3993,7 +3996,7 @@ fn validateGeneratedQueryBuilderOperatorOptions(
 }
 
 fn validateGeneratedQueryBuilderQueryOrArray(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     value: std.json.Value,
     depth: usize,
@@ -4004,7 +4007,7 @@ fn validateGeneratedQueryBuilderQueryOrArray(
 }
 
 fn validateGeneratedQueryBuilderQueryArray(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     value: std.json.Value,
     depth: usize,
@@ -4025,7 +4028,7 @@ fn validateQueryBuilderStringArray(value: std.json.Value) QueryBuilderValidation
 }
 
 fn queryBuilderFieldAllowed(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     field: []const u8,
 ) bool {
@@ -4037,17 +4040,16 @@ fn queryBuilderFieldAllowed(
     return queryBuilderFieldInSlice(fields, field);
 }
 
-fn queryBuilderConstraintArray(constraints: ?std.json.Value, key: []const u8) ?std.json.Array {
+fn queryBuilderConstraintArray(constraints: ?JsonObject, key: []const u8) ?std.json.Array {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const entry = value.object.get(key) orelse return null;
+    const entry = value.map.get(key) orelse return null;
     if (entry != .array or entry.array.items.len == 0) return null;
     return entry.array;
 }
 
 fn queryBuilderSelectableFields(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
 ) ![]const []const u8 {
     const allowed = queryBuilderConstraintArray(constraints, "allowed_fields") orelse return fields;
@@ -4356,10 +4358,8 @@ fn queryBuilderConstraintTreeSearch(
 ) !?metadata_openapi.TreeSearchConfig {
     const constraints = request.constraints;
     if (constraints) |value| {
-        if (value == .object) {
-            if (value.object.get("tree_search")) |raw| {
-                if (try queryBuilderTreeSearchFromValue(alloc, value, raw)) |tree_search| return tree_search;
-            }
+        if (value.map.get("tree_search")) |raw| {
+            if (try queryBuilderTreeSearchFromValue(alloc, value, raw)) |tree_search| return tree_search;
         }
     }
     const index = queryBuilderTreeIndex(request, graph_indexes) orelse return null;
@@ -4378,7 +4378,7 @@ fn queryBuilderConstraintTreeSearch(
 fn queryBuilderTreeStartNodes(
     alloc: std.mem.Allocator,
     request: metadata_openapi.QueryBuilderRequest,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
 ) !?[]const u8 {
     if (try queryBuilderConstraintFirstStringDup(alloc, constraints, &.{ "tree_start_nodes", "start_nodes" })) |start_nodes| return start_nodes;
     const start_node = queryBuilderInferredIntentNodeText(request.intent, .start) orelse return null;
@@ -4387,7 +4387,7 @@ fn queryBuilderTreeStartNodes(
 
 fn queryBuilderTreeSearchFromValue(
     alloc: std.mem.Allocator,
-    constraints: std.json.Value,
+    constraints: JsonObject,
     value: std.json.Value,
 ) !?metadata_openapi.TreeSearchConfig {
     switch (value) {
@@ -4429,7 +4429,7 @@ fn queryBuilderTreeIndex(
 
 fn queryBuilderConstraintFirstStringDup(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     keys: []const []const u8,
 ) !?[]const u8 {
     for (keys) |key| {
@@ -4440,7 +4440,7 @@ fn queryBuilderConstraintFirstStringDup(
 
 fn queryBuilderConstraintOptionalStringDup(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     key: []const u8,
 ) !?[]const u8 {
     const value = queryBuilderConstraintString(constraints, key) orelse return null;
@@ -4483,7 +4483,7 @@ fn combineQueryBuilderFilterQueries(
 
 fn buildQueryBuilderConstraintFilterQueryValue(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
 ) !?std.json.Value {
     var out = try queryBuilderConstraintBleveQuery(alloc, constraints, fields, "filter_query");
@@ -4502,7 +4502,7 @@ fn buildQueryBuilderConstraintFilterQueryValue(
 
 fn buildQueryBuilderConstraintExclusionQueryValue(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
 ) !?std.json.Value {
     var out = try queryBuilderConstraintBleveQuery(alloc, constraints, fields, "exclusion_query");
@@ -4521,13 +4521,12 @@ fn buildQueryBuilderConstraintExclusionQueryValue(
 
 fn queryBuilderConstraintBleveQuery(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     key: []const u8,
 ) !?std.json.Value {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const raw = value.object.get(key) orelse return null;
+    const raw = value.map.get(key) orelse return null;
     switch (raw) {
         .object => |object| {
             validateGeneratedQueryBuilderBleveObject(constraints, fields, object, 0) catch return null;
@@ -4543,13 +4542,12 @@ fn queryBuilderConstraintBleveQuery(
 
 fn buildQueryBuilderConstraintFieldFiltersValue(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     key: []const u8,
 ) !?std.json.Value {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const raw = value.object.get(key) orelse return null;
+    const raw = value.map.get(key) orelse return null;
     if (raw != .object) return null;
 
     var query_json = std.ArrayListUnmanaged(u8).empty;
@@ -4740,19 +4738,17 @@ fn queryBuilderGraphSearches(
     return try queryBuilderInferredGraphSearches(alloc, request, built, graph_indexes);
 }
 
-fn queryBuilderHasConstraintGraphSearches(constraints: ?std.json.Value) bool {
+fn queryBuilderHasConstraintGraphSearches(constraints: ?JsonObject) bool {
     const value = constraints orelse return false;
-    if (value != .object) return false;
-    return value.object.get("graph_queries") != null or value.object.get("graphs") != null;
+    return value.map.get("graph_queries") != null or value.map.get("graphs") != null;
 }
 
 fn queryBuilderConstraintGraphSearches(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
 ) !?std.json.ArrayHashMap(indexes_openapi.GraphQuery) {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const raw = value.object.get("graph_queries") orelse value.object.get("graphs") orelse return null;
+    const raw = value.map.get("graph_queries") orelse value.map.get("graphs") orelse return null;
     if (raw != .object) return null;
 
     const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(raw, .{})});
@@ -5374,14 +5370,13 @@ fn buildQueryBuilderTermQueryValue(
     return try std.json.parseFromSliceLeaky(std.json.Value, alloc, query_json, .{});
 }
 
-fn queryBuilderConstraintLimit(constraints: ?std.json.Value) ?i64 {
+fn queryBuilderConstraintLimit(constraints: ?JsonObject) ?i64 {
     return queryBuilderConstraintInteger(constraints, "limit");
 }
 
-fn queryBuilderConstraintInteger(constraints: ?std.json.Value, key: []const u8) ?i64 {
+fn queryBuilderConstraintInteger(constraints: ?JsonObject, key: []const u8) ?i64 {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const raw = value.object.get(key) orelse return null;
+    const raw = value.map.get(key) orelse return null;
     return queryBuilderIntegerValue(raw);
 }
 
@@ -5397,17 +5392,15 @@ fn queryBuilderIntegerValue(raw: std.json.Value) ?i64 {
     };
 }
 
-fn queryBuilderConstraintOptionalBool(constraints: ?std.json.Value, key: []const u8) ?bool {
+fn queryBuilderConstraintOptionalBool(constraints: ?JsonObject, key: []const u8) ?bool {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const raw = value.object.get(key) orelse return null;
+    const raw = value.map.get(key) orelse return null;
     return queryBuilderBoolValue(raw);
 }
 
-fn queryBuilderConstraintBool(constraints: ?std.json.Value, key: []const u8) bool {
+fn queryBuilderConstraintBool(constraints: ?JsonObject, key: []const u8) bool {
     const value = constraints orelse return false;
-    if (value != .object) return false;
-    const raw = value.object.get(key) orelse return false;
+    const raw = value.map.get(key) orelse return false;
     return queryBuilderBoolValue(raw) orelse false;
 }
 
@@ -5456,12 +5449,11 @@ fn validateRequiredExecutableQueryBuilderRequest(
 
 fn queryBuilderConstraintStringSlice(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     key: []const u8,
 ) ![]const []const u8 {
     const value = constraints orelse return &.{};
-    if (value != .object) return &.{};
-    const raw = value.object.get(key) orelse return &.{};
+    const raw = value.map.get(key) orelse return &.{};
 
     var out = std.ArrayListUnmanaged([]const u8).empty;
     defer out.deinit(alloc);
@@ -5486,12 +5478,11 @@ fn queryBuilderConstraintStringSlice(
 
 fn queryBuilderConstraintJsonValueSlice(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     key: []const u8,
 ) ![]const std.json.Value {
     const value = constraints orelse return &.{};
-    if (value != .object) return &.{};
-    const raw = value.object.get(key) orelse return &.{};
+    const raw = value.map.get(key) orelse return &.{};
 
     var out = std.ArrayListUnmanaged(std.json.Value).empty;
     errdefer {
@@ -5515,7 +5506,7 @@ fn queryBuilderConstraintJsonValueSlice(
 
 fn queryBuilderConstraintStringSliceOrNull(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     key: []const u8,
 ) !?[]const []const u8 {
     const values = try queryBuilderConstraintStringSlice(alloc, constraints, key);
@@ -5524,7 +5515,7 @@ fn queryBuilderConstraintStringSliceOrNull(
 
 fn queryBuilderConstraintFieldSlice(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     key: []const u8,
 ) !?[]const []const u8 {
@@ -5543,12 +5534,11 @@ fn queryBuilderConstraintFieldSlice(
 
 fn queryBuilderConstraintSortFields(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
 ) !?[]const metadata_openapi.SortField {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const raw = value.object.get("order_by") orelse return null;
+    const raw = value.map.get("order_by") orelse return null;
 
     var out = std.ArrayListUnmanaged(metadata_openapi.SortField).empty;
     defer out.deinit(alloc);
@@ -5573,7 +5563,7 @@ fn queryBuilderConstraintSortFields(
 
 fn queryBuilderSortField(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     value: std.json.Value,
 ) !?metadata_openapi.SortField {
@@ -5586,7 +5576,7 @@ fn queryBuilderSortField(
 
 fn queryBuilderSortFieldFromString(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     raw: []const u8,
 ) !?metadata_openapi.SortField {
@@ -5610,7 +5600,7 @@ fn queryBuilderSortFieldFromString(
 
 fn queryBuilderSortFieldFromObject(
     alloc: std.mem.Allocator,
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     object: std.json.ObjectMap,
 ) !?metadata_openapi.SortField {
@@ -5631,7 +5621,7 @@ fn queryBuilderSortFieldFromObject(
 }
 
 fn queryBuilderSortFieldAllowed(
-    constraints: ?std.json.Value,
+    constraints: ?JsonObject,
     fields: []const []const u8,
     field: []const u8,
 ) bool {
@@ -5647,10 +5637,9 @@ fn queryBuilderSortDirection(value: std.json.Value) ?bool {
     return null;
 }
 
-fn queryBuilderConstraintString(constraints: ?std.json.Value, key: []const u8) ?[]const u8 {
+fn queryBuilderConstraintString(constraints: ?JsonObject, key: []const u8) ?[]const u8 {
     const value = constraints orelse return null;
-    if (value != .object) return null;
-    const raw = value.object.get(key) orelse return null;
+    const raw = value.map.get(key) orelse return null;
     const string = queryBuilderStringValue(raw) orelse return null;
     return if (string.len > 0) string else null;
 }
@@ -5998,7 +5987,7 @@ fn buildQueryBuilderPlan(
     specialist: []const u8,
     built: BuiltQueryBuilderQuery,
     artifact: []const u8,
-) !std.json.Value {
+) !JsonObject {
     const query_kind = switch (built.query_kind) {
         .generic => "generic",
         .field_match => "field_match",
@@ -6019,7 +6008,7 @@ fn buildQueryBuilderPlan(
             std.json.fmt(artifact, .{}),
         },
     );
-    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, plan_json, .{});
+    return try std.json.parseFromSliceLeaky(JsonObject, alloc, plan_json, .{});
 }
 
 fn buildQueryBuilderExplanation(
@@ -6105,7 +6094,7 @@ fn buildQueryBuilderStepDetails(
     output: ?[]const u8,
     specialist: []const u8,
     preflight: ?*const QueryPreflightResult,
-) !std.json.Value {
+) !JsonObject {
     const preflight_details: ?QueryBuilderStepPreflightDetails = if (preflight) |summary|
         if (summary.diagnostics.len == 0 and summary.plan_summary == null and summary.estimate_summary == null)
             null
@@ -6128,7 +6117,11 @@ fn buildQueryBuilderStepDetails(
         .preflight = preflight_details,
     }, .{});
     defer alloc.free(encoded);
-    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{});
+    // The temporary encoding is released below, so the parsed object must own
+    // every key and string value rather than borrowing slices from `encoded`.
+    return try std.json.parseFromSliceLeaky(JsonObject, alloc, encoded, .{
+        .allocate = .alloc_always,
+    });
 }
 
 fn pickQueryBuilderTextField(fields: []const []const u8, preferred: ?[]const u8) ?[]const u8 {
@@ -6541,7 +6534,7 @@ pub fn testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided() !void
     }, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("full_text", result.specialist.?);
-    try std.testing.expect(result.query.object.get("match_phrase") != null);
+    try std.testing.expect(result.query.map.get("match_phrase") != null);
     try std.testing.expect(result.query_request != null);
     try std.testing.expect(result.query_request.?.full_text_search != null);
     try std.testing.expect(result.query_request.?.filter_query == null);
@@ -6549,7 +6542,7 @@ pub fn testQueryBuilderUsesGeneratedFullTextSpecialistWhenRunnerProvided() !void
     try std.testing.expectEqual(@as(f64, 0.91), result.confidence.?);
     try std.testing.expect(result.warnings != null);
     try std.testing.expectEqualStrings("checked schema fields", result.warnings.?[0]);
-    try std.testing.expect(result.plan.?.object.get("query_kind") != null);
+    try std.testing.expect(result.plan.?.map.get("query_kind") != null);
 }
 
 test "query builder uses generated full text specialist when runner is provided" {
@@ -6690,7 +6683,7 @@ test "query builder response step details include preflight summaries" {
     try std.testing.expectEqual(@as(usize, 1), result.steps.?.len);
     const details = result.steps.?[0].details;
     try std.testing.expect(details != null);
-    const preflight = details.?.object.get("preflight");
+    const preflight = details.?.map.get("preflight");
     try std.testing.expect(preflight != null);
     try std.testing.expectEqualStrings("estimate", preflight.?.object.get("mode").?.string);
     try std.testing.expectEqual(@as(usize, 0), preflight.?.object.get("diagnostics").?.array.items.len);
@@ -6705,7 +6698,7 @@ test "query builder response step details include preflight summaries" {
 }
 
 test "query builder generated semantic path does not prompt with sparse preferred index" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["sparse_idx"]}
     , .{});
     defer constraints_tree.deinit();
@@ -7533,7 +7526,7 @@ test "query builder preflight plan mode summarizes bound indexes and result refs
 }
 
 test "query builder collected context drives final validation" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_field":"status","require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -8045,7 +8038,7 @@ test "query builder preflight estimate mode reports structured count budget limi
 }
 
 test "query builder require executable rejects assembled full text outside index metadata" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_field":"status","require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -8108,8 +8101,8 @@ test "query builder rejects generated fields outside schema and falls back" {
     }, null, FakeGeneration.iface());
 
     try std.testing.expectEqualStrings("full_text", result.specialist.?);
-    try std.testing.expect(result.query.object.get("match") != null);
-    try std.testing.expectEqualStrings("body", result.query.object.get("field").?.string);
+    try std.testing.expect(result.query.map.get("match") != null);
+    try std.testing.expectEqualStrings("body", result.query.map.get("field").?.string);
     try std.testing.expect(result.warnings != null);
     try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed full-text query building failed") != null);
 }
@@ -8138,7 +8131,7 @@ test "query builder generated full text honors allowed fields constraint" {
         }
     };
 
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"allowed_fields":["body"]}
     , .{});
     defer constraints_tree.deinit();
@@ -8156,8 +8149,8 @@ test "query builder generated full text honors allowed fields constraint" {
         },
     }, null, FakeGeneration.iface());
 
-    try std.testing.expect(result.query.object.get("match") != null);
-    try std.testing.expectEqualStrings("body", result.query.object.get("field").?.string);
+    try std.testing.expect(result.query.map.get("match") != null);
+    try std.testing.expectEqualStrings("body", result.query.map.get("field").?.string);
     try std.testing.expect(result.warnings != null);
     try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed full-text query building failed") != null);
 }
@@ -8220,8 +8213,8 @@ test "query builder repairs invalid generated full text once" {
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqualStrings("full_text", result.specialist.?);
     try std.testing.expectEqualStrings("Repaired to use a schema field.", result.explanation.?);
-    try std.testing.expect(result.query.object.get("match_phrase") != null);
-    try std.testing.expectEqualStrings("body", result.query.object.get("field").?.string);
+    try std.testing.expect(result.query.map.get("match_phrase") != null);
+    try std.testing.expectEqualStrings("body", result.query.map.get("field").?.string);
     if (result.warnings) |warnings| {
         for (warnings) |warning| {
             try std.testing.expect(std.mem.indexOf(u8, warning, "Generator-backed full-text query building failed") == null);
@@ -8317,8 +8310,8 @@ test "query builder repairs generated full text from plan validator feedback" {
     try std.testing.expectEqual(@as(usize, 2), fake_validator.calls);
     try std.testing.expectEqualStrings("full_text", result.specialist.?);
     try std.testing.expectEqualStrings("Repaired from full-text validator feedback.", result.explanation.?);
-    try std.testing.expect(result.query.object.get("match_phrase") != null);
-    try std.testing.expectEqualStrings("body", result.query.object.get("field").?.string);
+    try std.testing.expect(result.query.map.get("match_phrase") != null);
+    try std.testing.expectEqualStrings("body", result.query.map.get("field").?.string);
     if (result.warnings) |warnings| {
         for (warnings) |warning| {
             try std.testing.expect(std.mem.indexOf(u8, warning, "Generator-backed full-text query building failed") == null);
@@ -8711,7 +8704,7 @@ test "query builder require executable rejects final plan validator feedback" {
         }
     };
 
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -8957,7 +8950,7 @@ test "query builder rejects generated graph malformed patterns" {
 }
 
 test "query builder assembles semantic query from preferred indexes" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["body_embedding"],"limit":4}
     , .{});
     defer constraints_tree.deinit();
@@ -9013,7 +9006,7 @@ test "query builder preserves legacy flat semantic indexes without structured me
 }
 
 test "query builder preferred indexes override table context" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["preferred_embedding"]}
     , .{});
     defer constraints_tree.deinit();
@@ -9034,7 +9027,7 @@ test "query builder preferred indexes override table context" {
 }
 
 test "query builder warns when preferred semantic index is sparse metadata" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["sparse_idx"]}
     , .{});
     defer constraints_tree.deinit();
@@ -9064,7 +9057,7 @@ test "query builder warns when preferred semantic index is sparse metadata" {
 }
 
 test "query builder require executable rejects sparse semantic index metadata" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["sparse_idx"],"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -9088,7 +9081,7 @@ test "query builder require executable rejects sparse semantic index metadata" {
 }
 
 test "query builder assembles hybrid query with semantic indexes and status filter" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["body_embedding"]}
     , .{});
     defer constraints_tree.deinit();
@@ -9182,7 +9175,7 @@ test "query builder converts status exclusions into must not filters" {
 }
 
 test "query builder maps structured constraint filters and exclusions" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"filter_prefix":"tenant:acme:","filters":{"tenant_id":"acme","category":["tech","ai"],"published_at":{"gte":"2024-01-01","lt":"2025-01-01"}},"exclude":{"status":"archived"}}
     , .{});
     defer constraints_tree.deinit();
@@ -9218,7 +9211,7 @@ test "query builder maps structured constraint filters and exclusions" {
 }
 
 test "query builder require executable rejects filters outside full text index metadata" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"filters":{"tenant_id":"acme"},"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -9244,7 +9237,7 @@ test "query builder require executable rejects filters outside full text index m
 }
 
 test "query builder filters structured constraints by allowed fields" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"filters":{"tenant_id":"acme","secret":"hidden"},"exclude":{"secret":"hidden"},"allowed_fields":["tenant_id"]}
     , .{});
     defer constraints_tree.deinit();
@@ -9409,12 +9402,12 @@ test "query builder uses text field decision answer" {
 
     try std.testing.expectEqual(AgentStatus.completed, result.status.?);
     try std.testing.expect(result.questions == null);
-    try std.testing.expectEqualStrings("title", result.query.object.get("field").?.string);
+    try std.testing.expectEqualStrings("title", result.query.map.get("field").?.string);
     try std.testing.expectEqualStrings("title", result.query_request.?.full_text_search.?.object.get("field").?.string);
 }
 
 test "query builder deterministic field selection honors allowed fields" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"allowed_fields":["title"],"prefer_field":"body"}
     , .{});
     defer constraints_tree.deinit();
@@ -9428,12 +9421,12 @@ test "query builder deterministic field selection honors allowed fields" {
         .constraints = constraints_tree.value,
     }, null);
 
-    try std.testing.expectEqualStrings("title", result.query.object.get("field").?.string);
+    try std.testing.expectEqualStrings("title", result.query.map.get("field").?.string);
     try std.testing.expectEqualStrings("title", result.query_request.?.full_text_search.?.object.get("field").?.string);
 }
 
 test "query builder applies projection sort and pagination constraints" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"fields":["title","status"],"order_by":["-published_at","title asc"],"offset":5,"limit":3,"count":true,"profile":"true"}
     , .{});
     defer constraints_tree.deinit();
@@ -9463,7 +9456,7 @@ test "query builder applies projection sort and pagination constraints" {
 }
 
 test "query builder applies sort constraints outside full text requests" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["body_embedding"],"order_by":["published_at desc"],"limit":4}
     , .{});
     defer constraints_tree.deinit();
@@ -9486,7 +9479,7 @@ test "query builder applies sort constraints outside full text requests" {
 }
 
 test "query builder preserves cursor-only pagination for implicit id sort" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"prefer_indexes":["body_embedding"],"search_after":["doc-9"],"offset":5}
     , .{});
     defer constraints_tree.deinit();
@@ -9509,7 +9502,7 @@ test "query builder preserves cursor-only pagination for implicit id sort" {
 }
 
 test "query builder require executable rejects sort outside full text index metadata" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"order_by":["published_at"],"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -9536,7 +9529,7 @@ test "query builder require executable rejects sort outside full text index meta
 }
 
 test "query builder filters projection and sort constraints by allowed fields" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"fields":["title","secret"],"order_by":[{"field":"secret","desc":true},{"field":"title","direction":"asc"}],"allowed_fields":["title"]}
     , .{});
     defer constraints_tree.deinit();
@@ -9559,7 +9552,7 @@ test "query builder filters projection and sort constraints by allowed fields" {
 }
 
 test "query builder preserves reserved sort fields outside allowed document fields" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"order_by":["_score desc","_id"],"allowed_fields":["body"]}
     , .{});
     defer constraints_tree.deinit();
@@ -9582,7 +9575,7 @@ test "query builder preserves reserved sort fields outside allowed document fiel
 }
 
 test "query builder applies search cursor only when sort is present" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"order_by":["published_at"],"offset":5,"search_after":["2025-01-01","doc-9"]}
     , .{});
     defer constraints_tree.deinit();
@@ -9605,7 +9598,7 @@ test "query builder applies search cursor only when sort is present" {
 }
 
 test "query builder maps canonical graph queries and ignores legacy expansion" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"graph_queries":{"related":{"index":"doc_graph","traverse":{"start":{"keys":["doc-1"]},"edge_types":["references"],"max_depth":1}}},"expand_strategy":"union"}
     , .{});
     defer constraints_tree.deinit();
@@ -9650,7 +9643,7 @@ test "query builder infers graph search from table context" {
 }
 
 test "query builder infers dense graph seed from semantic results" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"graph_index":"doc_graph"}
     , .{});
     defer constraints_tree.deinit();
@@ -9692,7 +9685,7 @@ test "query builder preserves legacy flat graph indexes without structured metad
 }
 
 test "query builder maps graph shorthand constraints" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"graph_index":"doc_graph","graph_start_nodes":"doc:a, doc:b","graph_edge_types":["references"],"graph_max_depth":1}
     , .{});
     defer constraints_tree.deinit();
@@ -9753,7 +9746,7 @@ test "query builder infers graph between nodes and dependency edge type" {
 }
 
 test "query builder infers graph multi hop pattern from intent" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"graph_target_nodes":"doc:z"}
     , .{});
     defer constraints_tree.deinit();
@@ -9785,7 +9778,7 @@ test "query builder infers graph multi hop pattern from intent" {
 }
 
 test "query builder maps tree search into retrieval query request" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"tree_search":{"index":"doc_hierarchy","start_nodes":"$roots","max_depth":2,"beam_width":4},"limit":5}
     , .{});
     defer constraints_tree.deinit();
@@ -9808,11 +9801,11 @@ test "query builder maps tree search into retrieval query request" {
     try std.testing.expectEqualStrings("$roots", result.retrieval_query_request.?.tree_search.?.start_nodes.?);
     try std.testing.expectEqual(@as(i64, 2), result.retrieval_query_request.?.tree_search.?.max_depth.?);
     try std.testing.expectEqual(@as(i64, 4), result.retrieval_query_request.?.tree_search.?.beam_width.?);
-    try std.testing.expectEqualStrings("retrieval_query_request", result.plan.?.object.get("artifact").?.string);
+    try std.testing.expectEqualStrings("retrieval_query_request", result.plan.?.map.get("artifact").?.string);
 }
 
 test "query builder maps tree shorthand constraints" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"tree_index":"doc_hierarchy","tree_start_nodes":"doc:a,doc:b","tree_max_depth":3}
     , .{});
     defer constraints_tree.deinit();
@@ -9850,7 +9843,7 @@ test "query builder infers tree index from table context" {
 }
 
 test "query builder require executable rejects tree search without tree topology metadata" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -9989,7 +9982,7 @@ test "query builder uses graph index decision answer" {
 }
 
 test "query builder require executable rejects missing semantic index without clarification" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -10006,7 +9999,7 @@ test "query builder require executable rejects missing semantic index without cl
 }
 
 test "query builder require executable rejects missing graph index without clarification" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -10023,7 +10016,7 @@ test "query builder require executable rejects missing graph index without clari
 }
 
 test "query builder require executable allows pending clarification" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -10046,7 +10039,7 @@ test "query builder require executable allows pending clarification" {
 }
 
 test "query builder require executable asks for missing table with field context" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -10068,7 +10061,7 @@ test "query builder require executable asks for missing table with field context
 }
 
 test "query builder uses table decision answer" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -10094,7 +10087,7 @@ test "query builder uses table decision answer" {
 }
 
 test "query builder require executable rejects missing table" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();
@@ -10109,7 +10102,7 @@ test "query builder require executable rejects missing table" {
 }
 
 test "query builder require executable rejects missing tree search" {
-    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+    var constraints_tree = try std.json.parseFromSlice(JsonObject, std.testing.allocator,
         \\{"require_executable":true}
     , .{});
     defer constraints_tree.deinit();

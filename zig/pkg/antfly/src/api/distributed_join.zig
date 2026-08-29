@@ -4197,11 +4197,11 @@ pub fn parseSupportedJoinRequestWithSecrets(
     };
 }
 
-pub fn parseSupportedJoinClauseValue(
+pub fn parseSupportedJoinClauseObject(
     alloc: std.mem.Allocator,
-    join_value: std.json.Value,
+    join_value: std.json.ArrayHashMap(std.json.Value),
 ) anyerror!SupportedJoinRequest {
-    const encoded = try stringifyJsonValueAlloc(alloc, join_value);
+    const encoded = try stringifyJsonValueAlloc(alloc, .{ .object = join_value.map });
     defer alloc.free(encoded);
     var parsed = std.json.parseFromSlice(metadata_openapi.JoinClause, alloc, encoded, .{
         .ignore_unknown_fields = true,
@@ -4243,7 +4243,7 @@ pub fn supportedJoinRequestFromOpenApi(
         const initialized_nested = blk: {
             const nested = try alloc.create(SupportedJoinRequest);
             errdefer alloc.destroy(nested);
-            nested.* = try parseSupportedJoinClauseValue(alloc, value);
+            nested.* = try parseSupportedJoinClauseObject(alloc, value);
             break :blk nested;
         };
         nested_join = initialized_nested;

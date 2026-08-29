@@ -7616,7 +7616,7 @@ export interface components {
             _distance?: number;
             /** @description Scores partitioned by index when using RRF search. */
             _index_scores?: {
-                [key: string]: unknown;
+                [key: string]: number;
             };
             _source?: {
                 [key: string]: unknown;

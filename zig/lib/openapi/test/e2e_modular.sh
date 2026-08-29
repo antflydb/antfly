@@ -146,8 +146,8 @@ echo "--- Testing OpenAPI 3.1 (petstore31.json) ---"
 
 assert_contains "$GEN_DIR/petstore31/types.zig" "pub const PetStatus = enum {" "3.1 enum generated"
 assert_contains "$GEN_DIR/petstore31/types.zig" "tag: OpenApiOptionalNullable([]const u8) = .absent," "3.1 optional nullable preserves wire presence"
-assert_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.Value," "3.1 required+nullable (no default)"
-assert_not_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.Value = null" "3.1 required+nullable has no = null"
+assert_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.ArrayHashMap(std.json.Value)," "3.1 required+nullable free-form object (no default)"
+assert_not_contains "$GEN_DIR/petstore31/types.zig" "details: ?std.json.ArrayHashMap(std.json.Value) = null" "3.1 required+nullable free-form object has no = null"
 assert_contains "$GEN_DIR/petstore31/types.zig" "/// Initial status (defaults to available)" "3.1 \$ref description sibling"
 assert_contains "$GEN_DIR/petstore31/types.zig" "/// Required but nullable error details" "3.1 nullable field description"
 assert_contains "$GEN_DIR/petstore31/types.zig" "pub const FlexibleValue = i64;" "component keeps preferred public name"
@@ -158,6 +158,7 @@ assert_contains "$GEN_DIR/petstore31/types.zig" "required_raw: NullableRaw," "re
 assert_contains "$GEN_DIR/petstore31/types.zig" "optional_raw: OpenApiOptionalNullable(NullableRaw) = .absent," "optional raw JSON field tracks absence separately"
 assert_contains "$GEN_DIR/petstore31/types.zig" "required_inline_raw: std.json.Value," "inline raw JSON override uses intrinsic null representation"
 assert_contains "$GEN_DIR/petstore31/types.zig" "optional_inline_raw: OpenApiOptionalNullable(std.json.Value) = .absent," "optional inline raw JSON tracks absence separately"
+assert_contains "$GEN_DIR/petstore31/types.zig" "metadata: ?std.json.ArrayHashMap(std.json.Value) = null," "free-form object retains its object-only wire kind"
 assert_contains "$GEN_DIR/petstore31/types.zig" "fn openApiParseObject(" "optional non-nullable fields use the schema-faithful streaming parser"
 assert_contains "$GEN_DIR/petstore31/server.zig" "ServerRouter" "3.1 server generated"
 

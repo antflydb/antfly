@@ -96,7 +96,7 @@ pub const AlgebraicIndexStats = struct {
     catch_up_phase: ?[]const u8 = null,
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
-    async_indexing: ?std.json.Value = null,
+    async_indexing: ?std.json.ArrayHashMap(std.json.Value) = null,
     healthy: ?bool = null,
     parse_error_count: ?i64 = null,
     schema_version: ?i64 = null,
@@ -148,13 +148,13 @@ pub const AlgebraicIndexStats = struct {
     missing_groups: ?i64 = null,
     unknown_remote_groups: ?i64 = null,
     /// Source artifact stream used to materialize graph edges.
-    source_artifact: ?std.json.Value = null,
+    source_artifact: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Graph resolver replay diagnostics.
-    resolver_replay: ?std.json.Value = null,
+    resolver_replay: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact resolution replay diagnostics.
-    resolution: ?std.json.Value = null,
+    resolution: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact promotion replay diagnostics.
-    promotion: ?std.json.Value = null,
+    promotion: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -2397,7 +2397,7 @@ pub const Edge = struct {
     /// When the edge was last updated
     updated_at: ?[]const u8 = null,
     /// Optional edge metadata
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -2771,9 +2771,9 @@ pub const EmbeddingsIndexStats = struct {
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
     enrichment_runtime: ?EnrichmentRuntimeStatus = null,
-    hbc_cache: ?std.json.Value = null,
-    hbc_posting: ?std.json.Value = null,
-    async_indexing: ?std.json.Value = null,
+    hbc_cache: ?std.json.ArrayHashMap(std.json.Value) = null,
+    hbc_posting: ?std.json.ArrayHashMap(std.json.Value) = null,
+    async_indexing: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
     projection_checkpoint_status: ?[]const u8 = null,
     /// Highest derived-log sequence covered by the durable projection checkpoint.
@@ -2800,9 +2800,9 @@ pub const EmbeddingsIndexStats = struct {
     missing_groups: ?i64 = null,
     unknown_remote_groups: ?i64 = null,
     /// Artifact resolution replay diagnostics.
-    resolution: ?std.json.Value = null,
+    resolution: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact promotion replay diagnostics.
-    promotion: ?std.json.Value = null,
+    promotion: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -3443,9 +3443,9 @@ pub const FullTextIndexStats = struct {
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
     /// Full-text merge runtime diagnostics.
-    text_merge: ?std.json.Value = null,
+    text_merge: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Asynchronous indexer runtime diagnostics.
-    async_indexing: ?std.json.Value = null,
+    async_indexing: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
     projection_checkpoint_status: ?[]const u8 = null,
     /// Highest derived-log sequence covered by the durable projection checkpoint.
@@ -3471,9 +3471,9 @@ pub const FullTextIndexStats = struct {
     missing_groups: ?i64 = null,
     unknown_remote_groups: ?i64 = null,
     /// Artifact resolution replay diagnostics.
-    resolution: ?std.json.Value = null,
+    resolution: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact promotion replay diagnostics.
-    promotion: ?std.json.Value = null,
+    promotion: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -3857,7 +3857,7 @@ pub const GraphArtifactEdgeMappingConfig = struct {
     type: ?GraphTemplateValue = null,
     weight: ?GraphTemplateValue = null,
     /// JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses.
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -3939,7 +3939,7 @@ pub const GraphArtifactProducerConfig = struct {
     content_type: ?[]const u8 = null,
     execution: ?ExecutionPolicy = null,
     /// Write-only producer configuration; it may contain credentials and is never returned.
-    producer_json: ?std.json.Value = null,
+    producer_json: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -4043,7 +4043,7 @@ pub const GraphBindingNode = struct {
     /// Owning table for a cross-table binding; omitted for the queried table.
     table: ?[]const u8 = null,
     /// Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted.
-    document: ?std.json.Value = null,
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -4532,11 +4532,11 @@ pub const GraphDocumentIdsFilter = struct {
 };
 
 pub const GraphDocumentMatchAllFilter = struct {
-    match_all: std.json.Value,
+    match_all: struct {},
 };
 
 pub const GraphDocumentMatchNoneFilter = struct {
-    match_none: std.json.Value,
+    match_none: struct {},
 };
 
 /// At least one of min or max is required and enforced by every Antfly execution boundary. When both are present, min must not exceed max.
@@ -4869,10 +4869,10 @@ pub const GraphIndexStats = struct {
     catch_up_applied_sequence: ?i64 = null,
     catch_up_target_sequence: ?i64 = null,
     /// Graph source artifact materialization status.
-    source_artifact: ?std.json.Value = null,
+    source_artifact: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Resolver replay diagnostics for graph materialization.
-    resolver_replay: ?std.json.Value = null,
-    async_indexing: ?std.json.Value = null,
+    resolver_replay: ?std.json.ArrayHashMap(std.json.Value) = null,
+    async_indexing: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Durable projection checkpoint status: clean, rebuilding, degraded, or repair_required.
     projection_checkpoint_status: ?[]const u8 = null,
     /// Highest derived-log sequence covered by the durable projection checkpoint.
@@ -4897,9 +4897,9 @@ pub const GraphIndexStats = struct {
     missing_groups: ?i64 = null,
     unknown_remote_groups: ?i64 = null,
     /// Artifact resolution replay diagnostics.
-    resolution: ?std.json.Value = null,
+    resolution: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Artifact promotion replay diagnostics.
-    promotion: ?std.json.Value = null,
+    promotion: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Algebraic graph execution health for bounded semiring traversal.
     algebraic_graph: ?std.json.Value = null,
 
@@ -5543,7 +5543,7 @@ pub const GraphPathEdge = struct {
     type: GraphEdgeType,
     /// Finite durable edge weight. max_weight_product paths further require values in [0,1].
     weight: f64,
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -5673,7 +5673,7 @@ pub const GraphPathObjective = enum {
 pub const GraphPathResult = struct {
     path: GraphPath,
     /// Stored terminal document when include_documents=true and the terminal identity exists at the pinned snapshot; otherwise omitted.
-    document: ?std.json.Value = null,
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -5795,7 +5795,7 @@ pub const GraphQueryParams = struct {
     k: ?i64 = null,
     node_filter: ?NodeFilter = null,
     algorithm: ?[]const u8 = null,
-    algorithm_params: ?std.json.Value = null,
+    algorithm_params: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -6134,7 +6134,7 @@ pub const GraphResultNode = struct {
     /// Hop count from the start node; when path is present this equals path length minus one
     depth: i64,
     /// Stored document when include_documents=true and the identity exists at the pinned snapshot; otherwise omitted.
-    document: ?std.json.Value = null,
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Exact ordered traversal identities from the start node, terminating at this node's fully qualified identity. Present only for traversal queries with include_paths=true.
     path: ?[]const GraphPathEndpoint = null,
     /// Ordered typed traversal edges from the start node. Present only with path for traversal queries.
@@ -6142,7 +6142,7 @@ pub const GraphResultNode = struct {
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
-    evidence: ?std.json.Value = null,
+    evidence: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -7128,7 +7128,7 @@ pub const IndexType = enum {
 };
 
 /// Deprecated free-form graph filter accepted by the v0.2 compatibility contract.
-pub const LegacyGraphDocumentQuery = std.json.Value;
+pub const LegacyGraphDocumentQuery = std.json.ArrayHashMap(std.json.Value);
 
 /// Deprecated v0.2 graph selector. Unqualified target keys match any reachable table.
 pub const LegacyGraphNodeSelector = struct {
@@ -7274,7 +7274,7 @@ pub const LegacyGraphResultNode = struct {
     /// Weighted distance
     distance: ?f64 = null,
     /// Full document (if include_documents=true)
-    document: ?std.json.Value = null,
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Deprecated unqualified keys in the path from the start node to this node
     path: ?[]const []const u8 = null,
     /// Edges in path from start to this node
@@ -7282,7 +7282,7 @@ pub const LegacyGraphResultNode = struct {
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
-    evidence: ?std.json.Value = null,
+    evidence: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Connected edges when supplied by the graph executor.
     edges: ?[]const Edge = null,
 
@@ -7580,7 +7580,7 @@ pub const PathEdge = struct {
     target: ?[]const u8 = null,
     type: ?[]const u8 = null,
     weight: ?f64 = null,
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -8118,7 +8118,7 @@ pub const TraversalResult = struct {
     /// Base64-encoded document key
     key: []const u8,
     /// Document data (if loaded)
-    document: ?std.json.Value = null,
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Distance from start node (0 = start node)
     depth: i64,
     /// Sequence of keys from start to this node (if include_paths=true)

@@ -39,6 +39,7 @@ const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const RetrievalQueryRequest = metadata_openapi.RetrievalQueryRequest;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
 const TreeSearchConfig = metadata_openapi.TreeSearchConfig;
+const JsonObject = std.json.ArrayHashMap(std.json.Value);
 
 const ToolPolicy = struct {
     global_tools: ?generating_api_openapi.ChatToolsConfig = null,
@@ -1204,7 +1205,7 @@ fn executeInternal(
                             previous_attempt_summary,
                             fallback_plan.candidate_scores,
                         );
-                        try clarification_details.object.put(alloc, "planner_decision", .{ .string = "clarify" });
+                        try clarification_details.map.put(alloc, "planner_decision", .{ .string = "clarify" });
                         try appendStep(arena, &steps_list, &live, .{
                             .kind = .planning,
                             .name = "evaluate",
@@ -1625,7 +1626,7 @@ fn buildClassificationStepDetails(
     request: RetrievalAgentRequest,
     cfg: ParsedClassificationConfig,
     selected_query_indices: ?[]const usize,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "agentic_mode", .{ .bool = (request.max_internal_iterations orelse 0) > 0 });
     if (cfg.force_strategy) |strategy| try obj.put(alloc, "force_strategy", .{ .string = @tagName(strategy) });
@@ -1636,14 +1637,14 @@ fn buildClassificationStepDetails(
         for (selected) |index| try values.append(.{ .integer = @intCast(index) });
         try obj.put(alloc, "selected_query_indices", .{ .array = values });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildAgenticSelectionDetails(
     alloc: std.mem.Allocator,
     request: RetrievalAgentRequest,
     selected_query_indices: ?[]const usize,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "agentic_mode", .{ .bool = true });
     try obj.put(alloc, "query_count", .{ .integer = @intCast(request.queries.len) });
@@ -1652,7 +1653,7 @@ fn buildAgenticSelectionDetails(
         for (selected) |index| try values.append(.{ .integer = @intCast(index) });
         try obj.put(alloc, "selected_query_indices", .{ .array = values });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildPipelineStepDetails(
@@ -1660,7 +1661,7 @@ fn buildPipelineStepDetails(
     retrieval_queries: []const RetrievalQueryRequest,
     selected_query_indices: ?[]const usize,
     broadened_from_decision: bool,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_count", .{ .integer = @intCast(retrieval_queries.len) });
     try obj.put(alloc, "broadened_from_decision", .{ .bool = broadened_from_decision });
@@ -1676,7 +1677,7 @@ fn buildPipelineStepDetails(
         for (selected) |index| try values.append(.{ .integer = @intCast(index) });
         try obj.put(alloc, "selected_query_indices", .{ .array = values });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildToolStepDetails(
@@ -1684,7 +1685,7 @@ fn buildToolStepDetails(
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
     strategy: RetrievalStrategy,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(strategy) });
@@ -1704,7 +1705,7 @@ fn buildToolStepDetails(
         if (tree_search.beam_width) |beam_width| try tree_obj.put(alloc, "beam_width", .{ .integer = beam_width });
         try obj.put(alloc, "tree_search", .{ .object = tree_obj });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildTreeExpansionStepDetails(
@@ -1712,7 +1713,7 @@ fn buildTreeExpansionStepDetails(
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
     plan: TreeBranchExpansionPlan,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -1724,7 +1725,7 @@ fn buildTreeExpansionStepDetails(
     try obj.put(alloc, "max_depth", .{ .integer = plan.max_depth });
     try obj.put(alloc, "query_relevance", .{ .float = plan.branch.query_relevance });
     try obj.put(alloc, "node_count", .{ .integer = @intCast(plan.branch.node_count) });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildSelectStrategyAction(
@@ -1753,7 +1754,7 @@ fn buildSelectStrategyStepDetails(
     source: AgenticSelectionSource,
     candidate_scores: []const AgenticCandidateScore,
     broadened_from_decision: bool,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "selected_strategy", .{ .string = @tagName(detectSelectedAgenticStrategy(retrieval_queries, selected_query_indices)) });
     try obj.put(alloc, "selected_query_count", .{ .integer = @intCast(selected_query_indices.len) });
@@ -1785,13 +1786,13 @@ fn buildSelectStrategyStepDetails(
         try scores.append(.{ .object = score_obj });
     }
     try obj.put(alloc, "candidate_scores", .{ .array = scores });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildClarificationSelectionDetails(
     alloc: std.mem.Allocator,
     candidate_scores: []const AgenticCandidateScore,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     var scores = std.json.Array.init(alloc);
     for (candidate_scores) |candidate| {
@@ -1805,14 +1806,14 @@ fn buildClarificationSelectionDetails(
         try scores.append(.{ .object = score_obj });
     }
     try obj.put(alloc, "candidate_scores", .{ .array = scores });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildRefineQueryStepDetails(
     alloc: std.mem.Allocator,
     retrieval_query: RetrievalQueryRequest,
     retrieval_query_index: usize,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -1820,7 +1821,7 @@ fn buildRefineQueryStepDetails(
     if (retrieval_query.table) |table_name| {
         try obj.put(alloc, "table", .{ .string = table_name });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationRefineQueryStepDetails(
@@ -1829,7 +1830,7 @@ fn buildEvaluationRefineQueryStepDetails(
     retrieval_query_index: usize,
     classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -1848,7 +1849,7 @@ fn buildEvaluationRefineQueryStepDetails(
     if (retrieval_query.table) |table_name| {
         try obj.put(alloc, "table", .{ .string = table_name });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationStepDetails(
@@ -1863,7 +1864,7 @@ fn buildEvaluationStepDetails(
     attempt_summary: AttemptEvaluationSummary,
     previous_attempt_summary: ?AttemptEvaluationSummary,
     candidate_scores: []const AgenticCandidateScore,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     const current_planner_score = attemptPlannerScore(attempt_summary, strategy);
     const best_fallback_score = bestRemainingCandidateScore(candidate_scores, attempted_query_indices);
@@ -1937,7 +1938,7 @@ fn buildEvaluationStepDetails(
         try scores.append(.{ .object = score_obj });
     }
     try obj.put(alloc, "candidate_scores", .{ .array = scores });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationRefinementStepDetails(
@@ -1948,7 +1949,7 @@ fn buildEvaluationRefinementStepDetails(
     trigger: AgenticEvaluationTrigger,
     attempt_summary: AttemptEvaluationSummary,
     best_fallback_score: ?f32,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     const current_planner_score = attemptPlannerScore(attempt_summary, detectStrategy(retrieval_query));
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
@@ -1971,7 +1972,7 @@ fn buildEvaluationRefinementStepDetails(
         try obj.put(alloc, "current_top_tree_branch_leaf_hits", .{ .integer = value });
         try obj.put(alloc, "current_tree_branch_thin", .{ .bool = value == 0 });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationAcceptStepDetails(
@@ -1983,7 +1984,7 @@ fn buildEvaluationAcceptStepDetails(
     current_score: f32,
     previous_score: ?f32,
     best_fallback_score: ?f32,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -2008,7 +2009,7 @@ fn buildEvaluationAcceptStepDetails(
         try obj.put(alloc, "current_top_tree_branch_leaf_hits", .{ .integer = value });
         try obj.put(alloc, "current_tree_branch_thin", .{ .bool = value == 0 });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn buildEvaluationTreeExpansionStepDetails(
@@ -2020,7 +2021,7 @@ fn buildEvaluationTreeExpansionStepDetails(
     attempt_summary: AttemptEvaluationSummary,
     best_fallback_score: ?f32,
     plan: TreeBranchExpansionPlan,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     const current_planner_score = attemptPlannerScore(attempt_summary, detectStrategy(retrieval_query));
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
@@ -2047,7 +2048,7 @@ fn buildEvaluationTreeExpansionStepDetails(
     try obj.put(alloc, "seed_key", .{ .string = plan.seed_key });
     try obj.put(alloc, "seed_depth", .{ .integer = @intCast(plan.seed_depth) });
     try obj.put(alloc, "max_depth", .{ .integer = plan.max_depth });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn summarizeAttemptEvaluation(
@@ -2143,7 +2144,7 @@ fn buildInitialRefineQueryStepDetails(
     retrieval_query_index: usize,
     classification: generating_api_openapi.ClassificationTransformationResult,
     refined_query: []const u8,
-) !std.json.Value {
+) !JsonObject {
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "query_index", .{ .integer = @intCast(retrieval_query_index) });
     try obj.put(alloc, "strategy", .{ .string = @tagName(detectStrategy(retrieval_query)) });
@@ -2162,7 +2163,7 @@ fn buildInitialRefineQueryStepDetails(
     if (retrieval_query.table) |table_name| {
         try obj.put(alloc, "table", .{ .string = table_name });
     }
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
 fn parseGenerationConfig(
@@ -2300,17 +2301,16 @@ fn hasGraphRetrievalFields(retrieval_query: RetrievalQueryRequest) bool {
 fn buildToolModeStepDetails(
     alloc: std.mem.Allocator,
     tool_policy: ToolPolicy,
-) !?std.json.Value {
+) !?JsonObject {
     const count = tool_policy.explicitToolCount() orelse return null;
     var obj = std.json.ObjectMap.empty;
     try obj.put(alloc, "tools_count", .{ .integer = @intCast(count) });
-    return .{ .object = obj };
+    return .{ .map = obj };
 }
 
-fn toolCountFromStepDetails(details: ?std.json.Value) ?i64 {
+fn toolCountFromStepDetails(details: ?JsonObject) ?i64 {
     const value = details orelse return null;
-    if (value != .object) return null;
-    const tools_count = value.object.get("tools_count") orelse return null;
+    const tools_count = value.map.get("tools_count") orelse return null;
     return switch (tools_count) {
         .integer => |count| count,
         else => null,
@@ -2710,8 +2710,7 @@ fn buildBranchGenerationSummaryWithLimit(
             if (seen_nodes >= limit) break;
         }
         const source = hit._source orelse continue;
-        if (source != .object) continue;
-        const title = switch (source.object.get("title") orelse continue) {
+        const title = switch (source.map.get("title") orelse continue) {
             .string => |value| value,
             else => continue,
         };
@@ -3005,8 +3004,7 @@ fn compareGenerationHitOrder(lhs: QueryHit, rhs: QueryHit) i32 {
 
 fn treeMetaString(hit: QueryHit, key: []const u8) ?[]const u8 {
     const source = hit._source orelse return null;
-    if (source != .object) return null;
-    const meta_value = source.object.get("_tree") orelse return null;
+    const meta_value = source.map.get("_tree") orelse return null;
     if (meta_value != .object) return null;
     const value = meta_value.object.get(key) orelse return null;
     return switch (value) {
@@ -3017,8 +3015,7 @@ fn treeMetaString(hit: QueryHit, key: []const u8) ?[]const u8 {
 
 fn treeMetaInteger(hit: QueryHit, key: []const u8) ?i64 {
     const source = hit._source orelse return null;
-    if (source != .object) return null;
-    const meta_value = source.object.get("_tree") orelse return null;
+    const meta_value = source.map.get("_tree") orelse return null;
     if (meta_value != .object) return null;
     const value = meta_value.object.get(key) orelse return null;
     return switch (value) {
@@ -3030,8 +3027,7 @@ fn treeMetaInteger(hit: QueryHit, key: []const u8) ?i64 {
 
 fn treeMetaBool(hit: QueryHit, key: []const u8) ?bool {
     const source = hit._source orelse return null;
-    if (source != .object) return null;
-    const meta_value = source.object.get("_tree") orelse return null;
+    const meta_value = source.map.get("_tree") orelse return null;
     if (meta_value != .object) return null;
     const value = meta_value.object.get(key) orelse return null;
     return switch (value) {
@@ -3053,8 +3049,7 @@ fn buildTreeGenerationContext(
     var tree_hit_count: usize = 0;
     for (hits) |hit| {
         const source = hit._source orelse continue;
-        if (source != .object) continue;
-        const meta_value = source.object.get("_tree") orelse continue;
+        const meta_value = source.map.get("_tree") orelse continue;
         if (meta_value != .object) continue;
         const meta = meta_value.object;
         saw_tree_hit = true;
@@ -3084,8 +3079,7 @@ fn buildTreeGenerationContext(
 
     for (hits) |hit| {
         const source = hit._source orelse continue;
-        if (source != .object) continue;
-        const meta_value = source.object.get("_tree") orelse continue;
+        const meta_value = source.map.get("_tree") orelse continue;
         if (meta_value != .object) continue;
         const meta = meta_value.object;
 
@@ -3148,20 +3142,20 @@ fn buildTreeGenerationContext(
             }
         }
 
-        if (source.object.get("title")) |title| {
+        if (source.map.get("title")) |title| {
             if (title == .string) {
                 try out.appendSlice(alloc, "  Title ");
                 try out.appendSlice(alloc, title.string);
                 try out.append(alloc, '\n');
             }
         }
-        if (source.object.get("body")) |body| {
+        if (source.map.get("body")) |body| {
             if (body == .string and body.string.len > 0) {
                 try out.appendSlice(alloc, "  Body ");
                 try out.appendSlice(alloc, body.string);
                 try out.append(alloc, '\n');
             }
-        } else if (source.object.get("content")) |content| {
+        } else if (source.map.get("content")) |content| {
             if (content == .string and content.string.len > 0) {
                 try out.appendSlice(alloc, "  Content ");
                 try out.appendSlice(alloc, content.string);
@@ -3380,15 +3374,7 @@ fn describeHitForGeneration(
     hit: QueryHit,
 ) ![]const u8 {
     const source = hit._source orelse return try alloc.dupe(u8, "null");
-    if (source != .object) {
-        // Use page_allocator to avoid @memcpy aliasing with arena-backed json strings.
-        var tmp: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
-        defer tmp.deinit();
-        try std.json.Stringify.value(source, .{}, &tmp.writer);
-        return try alloc.dupe(u8, tmp.written());
-    }
-
-    const object = source.object;
+    const object = source.map;
     const tree_meta = object.get("_tree");
     // Use page_allocator to avoid @memcpy aliasing with arena-backed json strings.
     const encoded_source = blk: {
@@ -5192,18 +5178,16 @@ fn encodeSse(
             }
         } else if (std.mem.eql(u8, step.name, "select_strategy")) {
             if (step.details) |details| {
-                if (details == .object) {
-                    if (details.object.get("selection_source")) |selection_source| {
-                        if (selection_source == .string and std.mem.eql(u8, selection_source.string, "probe")) {
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "probe",
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                if (details.map.get("selection_source")) |selection_source| {
+                    if (selection_source == .string and std.mem.eql(u8, selection_source.string, "probe")) {
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "probe",
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
                 }
             }
@@ -5237,46 +5221,44 @@ fn encodeSse(
                 .details = step.details,
             });
             if (step.details) |details| {
-                if (details == .object) {
-                    if (details.object.get("current_vs_fallback_ambiguous")) |ambiguous| {
-                        if (ambiguous == .bool and ambiguous.bool) {
-                            try appendSseTextChunks(
-                                alloc,
-                                &out,
-                                "reasoning",
-                                "evaluation found the current result and the best fallback to be effectively tied",
-                                step_id,
-                                step.name,
-                            );
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "current_vs_fallback_ambiguity",
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                if (details.map.get("current_vs_fallback_ambiguous")) |ambiguous| {
+                    if (ambiguous == .bool and ambiguous.bool) {
+                        try appendSseTextChunks(
+                            alloc,
+                            &out,
+                            "reasoning",
+                            "evaluation found the current result and the best fallback to be effectively tied",
+                            step_id,
+                            step.name,
+                        );
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "current_vs_fallback_ambiguity",
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
-                    if (details.object.get("fallback_consensus_ambiguous")) |ambiguous| {
-                        if (ambiguous == .bool and ambiguous.bool) {
-                            try appendSseTextChunks(
-                                alloc,
-                                &out,
-                                "reasoning",
-                                "evaluation found multiple stronger fallback strategies that remain effectively tied",
-                                step_id,
-                                step.name,
-                            );
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "fallback_consensus_ambiguity",
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                }
+                if (details.map.get("fallback_consensus_ambiguous")) |ambiguous| {
+                    if (ambiguous == .bool and ambiguous.bool) {
+                        try appendSseTextChunks(
+                            alloc,
+                            &out,
+                            "reasoning",
+                            "evaluation found multiple stronger fallback strategies that remain effectively tied",
+                            step_id,
+                            step.name,
+                        );
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "fallback_consensus_ambiguity",
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
                 }
             }
@@ -5294,24 +5276,22 @@ fn encodeSse(
             try appendSseTextChunks(alloc, &out, "reasoning", step.action, step_id, step.name);
         } else if (step.kind == .tool_call) {
             if (step.details) |details| {
-                if (details == .object) {
-                    if (details.object.get("strategy")) |strategy| {
-                        if (strategy == .string and std.mem.eql(u8, strategy.string, "tree")) {
-                            const tree_depth = maxTreeHitDepth(result.hits);
-                            try appendSseEventValue(alloc, &out, "step_progress", .{
-                                .id = step_id,
-                                .kind = step.kind,
-                                .name = step.name,
-                                .phase = "tree_search",
-                                .depth = tree_depth,
-                                .num_nodes = result.hits.len,
-                                .collected = result.hits.len,
-                                .complete = true,
-                                .sufficient = result.hits.len > 0,
-                                .action = step.action,
-                                .details = step.details,
-                            });
-                        }
+                if (details.map.get("strategy")) |strategy| {
+                    if (strategy == .string and std.mem.eql(u8, strategy.string, "tree")) {
+                        const tree_depth = maxTreeHitDepth(result.hits);
+                        try appendSseEventValue(alloc, &out, "step_progress", .{
+                            .id = step_id,
+                            .kind = step.kind,
+                            .name = step.name,
+                            .phase = "tree_search",
+                            .depth = tree_depth,
+                            .num_nodes = result.hits.len,
+                            .collected = result.hits.len,
+                            .complete = true,
+                            .sufficient = result.hits.len > 0,
+                            .action = step.action,
+                            .details = step.details,
+                        });
                     }
                 }
             }
@@ -5383,12 +5363,11 @@ fn hasTreeHits(hits: []const QueryHit) bool {
 }
 
 fn stepProgressPhase(
-    details: ?std.json.Value,
+    details: ?JsonObject,
     default_phase: []const u8,
 ) []const u8 {
     const value = details orelse return default_phase;
-    if (value != .object) return default_phase;
-    if (value.object.get("phase")) |phase| {
+    if (value.map.get("phase")) |phase| {
         if (phase == .string) return phase.string;
     }
     return default_phase;
@@ -6167,18 +6146,16 @@ fn treeHitBranchRank(
 
 fn annotateTreeDocument(
     alloc: std.mem.Allocator,
-    document: std.json.Value,
+    document: std.json.ArrayHashMap(std.json.Value),
     search_name: []const u8,
     node: indexes_openapi.GraphResultNode,
     graph_paths: []const GraphPath,
     fallback_root_key: ?[]const u8,
-) !std.json.Value {
-    if (document != .object) return try json_helpers.cloneJsonValue(alloc, document);
-
+) !std.json.ArrayHashMap(std.json.Value) {
     var object = std.json.ObjectMap.empty;
     errdefer object.deinit(alloc);
 
-    var it = document.object.iterator();
+    var it = document.map.iterator();
     while (it.next()) |entry| {
         try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try json_helpers.cloneJsonValue(alloc, entry.value_ptr.*));
     }
@@ -6212,7 +6189,7 @@ fn annotateTreeDocument(
     }
 
     try object.put(alloc, "_tree", .{ .object = tree_meta });
-    return .{ .object = object };
+    return .{ .map = object };
 }
 
 fn bestTreePathPrefixForNode(
@@ -7235,8 +7212,8 @@ test "generation ordering prefers tree ancestors before leaves" {
     try leaf_source.put(alloc, "_tree", .{ .object = leaf_tree });
 
     const ordered = try orderHitsForGeneration(alloc, &[_]QueryHit{
-        .{ ._id = "doc:leaf", ._score = 1.0, ._source = .{ .object = leaf_source } },
-        .{ ._id = "doc:root", ._score = 0.5, ._source = .{ .object = root_source } },
+        .{ ._id = "doc:leaf", ._score = 1.0, ._source = .{ .map = leaf_source } },
+        .{ ._id = "doc:root", ._score = 0.5, ._source = .{ .map = root_source } },
     });
     try std.testing.expectEqualStrings("doc:root", ordered[0]._id);
     try std.testing.expectEqualStrings("doc:leaf", ordered[1]._id);
@@ -7262,17 +7239,17 @@ test "annotate tree document prefers graph path branch metadata" {
     };
     const annotated = try annotateTreeDocument(
         alloc,
-        .{ .object = document },
+        .{ .map = document },
         "tree_search",
         .{
             .key = "doc:child",
             .depth = 1,
-            .document = .{ .object = document },
+            .document = .{ .map = document },
         },
         &paths,
         null,
     );
-    const meta = annotated.object.get("_tree").?.object;
+    const meta = annotated.map.get("_tree").?.object;
     try std.testing.expectEqualStrings("doc:root", meta.get("root").?.string);
     try std.testing.expectEqualStrings("doc:root", meta.get("parent").?.string);
     try std.testing.expectEqualStrings("doc:root > doc:child", meta.get("path_text").?.string);
@@ -8000,8 +7977,8 @@ test "retrieval agent agentic mode selects one best query" {
     try std.testing.expect(parsed.value.classification != null);
     const selection_step = findStepByName(parsed.value.steps.?, "select_strategy") orelse return error.TestUnexpectedResult;
     const selection_details = selection_step.details.?;
-    try std.testing.expect(std.mem.eql(u8, selection_details.object.get("selection_source").?.string, "heuristic"));
-    try std.testing.expect(selection_details.object.get("candidate_scores").?.array.items.len == 2);
+    try std.testing.expect(std.mem.eql(u8, selection_details.map.get("selection_source").?.string, "heuristic"));
+    try std.testing.expect(selection_details.map.get("candidate_scores").?.array.items.len == 2);
 }
 
 test "retrieval agent agentic mode can resolve ambiguity by probing candidates" {
@@ -8059,8 +8036,8 @@ test "retrieval agent agentic mode can resolve ambiguity by probing candidates" 
     try std.testing.expectEqual(RetrievalStrategy.hybrid, parsed.value.strategy_used.?);
     const selection_step = findStepByName(parsed.value.steps.?, "select_strategy") orelse return error.TestUnexpectedResult;
     const selection_details = selection_step.details.?;
-    try std.testing.expect(std.mem.eql(u8, selection_details.object.get("selection_source").?.string, "probe"));
-    const candidate_scores = selection_details.object.get("candidate_scores").?.array.items;
+    try std.testing.expect(std.mem.eql(u8, selection_details.map.get("selection_source").?.string, "probe"));
+    const candidate_scores = selection_details.map.get("candidate_scores").?.array.items;
     try std.testing.expect(candidate_scores.len == 2);
     try std.testing.expect(candidate_scores[0].object.get("probe_hits") != null);
     try std.testing.expect(candidate_scores[1].object.get("probe_hits") != null);
@@ -8124,7 +8101,7 @@ test "retrieval agent agentic mode evaluates misses and falls back to the next q
     try std.testing.expectEqual(@as(usize, 1), parsed.value.hits.len);
     try std.testing.expectEqualStrings("doc:a", parsed.value.hits[0]._id);
     const evaluation_details = parsed.value.steps.?[3].details.?;
-    const candidate_scores = evaluation_details.object.get("candidate_scores").?.array.items;
+    const candidate_scores = evaluation_details.map.get("candidate_scores").?.array.items;
     try std.testing.expect(candidate_scores.len == 2);
     try std.testing.expect(candidate_scores[1].object.get("probe_hits") != null);
 
@@ -8740,7 +8717,7 @@ test "retrieval agent refines step-back semantic queries before execution" {
     for (parsed.value.steps.?) |step| {
         if (!std.mem.eql(u8, step.name, "refine_query")) continue;
         const details = step.details orelse continue;
-        const phase = details.object.get("phase") orelse continue;
+        const phase = details.map.get("phase") orelse continue;
         if (phase == .string and std.mem.eql(u8, phase.string, "step_back_initial")) {
             found = true;
             break;

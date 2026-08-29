@@ -3541,7 +3541,7 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
         ._index_scores = try indexScoresJsonValue(alloc, hit.index_scores),
         ._sort = if (hit.sort_values.len > 0) hit.sort_values else null,
         ._source = if (hit.stored_data) |stored_data|
-            if (req.defer_hierarchy_child_hydration and req.hierarchy_group_level == .unit)
+            try takeOpenApiObjectMap(alloc, if (req.defer_hierarchy_child_hydration and req.hierarchy_group_level == .unit)
                 // Deferred unit grouping uses `_source` as a private shard-to-
                 // coordinator revision envelope. Projecting it by public unit
                 // fields would turn it into `{}` and defeat revision binding.
@@ -3552,11 +3552,25 @@ fn toOpenApiHit(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, hit: 
                     .include_all_fields = req.include_all_fields,
                 })
             else
-                try parseStoredSourceValue(alloc, stored_data)
+                try parseStoredSourceValue(alloc, stored_data))
         else
             null,
         .hierarchy = try searchHitHierarchyOpenApiValue(alloc, req, hit),
     };
+}
+
+/// Move an owned dynamic JSON object into the generated OpenAPI object-map
+/// representation without cloning its keys or values. Stored documents are
+/// contractually objects; fail closed if corrupted internal state violates
+/// that invariant instead of emitting a response outside the public schema.
+fn takeOpenApiObjectMap(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !std.json.ArrayHashMap(std.json.Value) {
+    if (value == .object) return .{ .map = value.object };
+    var invalid = value;
+    db_mod.types.deinitJsonValue(alloc, &invalid);
+    return error.InvalidRemoteResponse;
 }
 
 fn searchHitHierarchyOpenApiValue(
@@ -3988,14 +4002,17 @@ fn putJsonString(alloc: std.mem.Allocator, obj: *std.json.ObjectMap, key: []cons
     try obj.put(alloc, try alloc.dupe(u8, key), .{ .string = try alloc.dupe(u8, value) });
 }
 
-fn indexScoresJsonValue(alloc: std.mem.Allocator, scores: []const fusion_mod.IndexScore) !?std.json.Value {
+fn indexScoresJsonValue(
+    alloc: std.mem.Allocator,
+    scores: []const fusion_mod.IndexScore,
+) !?std.json.ArrayHashMap(f64) {
     if (scores.len == 0) return null;
-    var obj = std.json.ObjectMap.empty;
-    errdefer obj.deinit(alloc);
+    var out = std.json.ArrayHashMap(f64){};
+    errdefer out.deinit(alloc);
     for (scores) |score| {
-        try obj.put(alloc, score.index_name, .{ .float = score.score });
+        try out.map.put(alloc, score.index_name, score.score);
     }
-    return .{ .object = obj };
+    return out;
 }
 
 test "api query contract serializes fused index scores" {
@@ -4006,15 +4023,12 @@ test "api query contract serializes fused index scores" {
     };
 
     var value = (try indexScoresJsonValue(alloc, &scores)).?;
-    defer switch (value) {
-        .object => |*obj| obj.deinit(alloc),
-        else => {},
-    };
+    defer value.deinit(alloc);
 
-    const object = value.object;
+    const object = value.map;
     try std.testing.expectEqual(@as(usize, 2), object.count());
-    try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?.float);
-    try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?.float);
+    try std.testing.expectEqual(@as(f64, 0.75), object.get("text_idx").?);
+    try std.testing.expectEqual(@as(f64, 0.25), object.get("semantic_idx").?);
 }
 
 fn expectSortProfileDiagnosticsSerializationForTest() !void {
@@ -5483,7 +5497,7 @@ fn findGraphQuery(
 }
 
 const GraphDocumentLookup = struct {
-    const Entry = struct { document: ?std.json.Value };
+    const Entry = struct { document: ?std.json.ArrayHashMap(std.json.Value) };
 
     enabled: bool,
     remaining_bindings: usize = public_limits.max_graph_hydrated_bindings,
@@ -5505,7 +5519,7 @@ const GraphDocumentLookup = struct {
             };
             if (self.entries.contains(identity)) continue;
             const parsed_document = if (hit.stored_data) |stored_data|
-                ant_json.parseFromSliceLeaky(std.json.Value, alloc, stored_data, .{}) catch
+                ant_json.parseFromSliceLeaky(std.json.ArrayHashMap(std.json.Value), alloc, stored_data, .{}) catch
                     return error.InvalidRemoteResponse
             else
                 null;
@@ -5518,7 +5532,7 @@ const GraphDocumentLookup = struct {
         self: *GraphDocumentLookup,
         key: []const u8,
         table: ?[]const u8,
-    ) !?std.json.Value {
+    ) !?std.json.ArrayHashMap(std.json.Value) {
         if (!self.enabled) return null;
         if (self.remaining_bindings == 0) return error.QueryCandidateBudgetExceeded;
         self.remaining_bindings -= 1;
@@ -5717,7 +5731,7 @@ fn toOpenApiLegacyPatternMatches(
                 .path = binding.node.path,
                 .path_edges = try toOpenApiOptionalPathEdges(alloc, binding.node.path_edges),
                 .provenance = binding.node.provenance,
-                .evidence = try graphNodeEvidenceJsonValue(alloc, binding.node),
+                .evidence = try graphNodeEvidenceObjectMap(alloc, binding.node),
                 .edges = null,
             });
         }
@@ -6503,7 +6517,7 @@ fn toOpenApiGraphNodes(
             .path = if (include_paths) try toOpenApiGraphNodePath(alloc, node) else null,
             .path_edges = if (include_paths) try toOpenApiOptionalGraphPathEdges(alloc, node) else null,
             .provenance = node.provenance,
-            .evidence = try graphNodeEvidenceJsonValue(alloc, node),
+            .evidence = try graphNodeEvidenceObjectMap(alloc, node),
         };
     }
     return nodes;
@@ -6571,7 +6585,7 @@ fn toOpenApiLegacyGraphNodes(
             .path = node.path,
             .path_edges = try toOpenApiOptionalPathEdges(alloc, node.path_edges),
             .provenance = node.provenance,
-            .evidence = try graphNodeEvidenceJsonValue(alloc, node),
+            .evidence = try graphNodeEvidenceObjectMap(alloc, node),
             .edges = null,
         };
     }
@@ -6712,7 +6726,7 @@ fn toOpenApiPathEdges(
             .target = edge.target,
             .type = edge.edge_type,
             .weight = edge.weight,
-            .metadata = try pathEdgeMetadataJsonValue(alloc, edge.metadata),
+            .metadata = try pathEdgeMetadataObjectMap(alloc, edge.metadata),
         };
     }
     return out;
@@ -6765,7 +6779,7 @@ fn toOpenApiGraphPathEdges(
             .direction = direction,
             .type = edge.edge_type,
             .weight = edge.weight,
-            .metadata = try pathEdgeMetadataObjectJsonValue(alloc, edge.metadata),
+            .metadata = try pathEdgeMetadataObjectMap(alloc, edge.metadata),
         };
     }
     return out;
@@ -6859,10 +6873,13 @@ fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?s
 /// at ingestion, while old durable records may contain scalar or malformed
 /// payloads accepted by earlier releases. Omit only that optional metadata on
 /// canonical reads so legacy data cannot break generated response decoders.
-fn pathEdgeMetadataObjectJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
+fn pathEdgeMetadataObjectMap(
+    alloc: std.mem.Allocator,
+    metadata: []const u8,
+) !?std.json.ArrayHashMap(std.json.Value) {
     if (metadata.len == 0) return null;
     const value = ant_json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch return null;
-    return if (value == .object) value else null;
+    return if (value == .object) .{ .map = value.object } else null;
 }
 
 test "canonical graph path metadata safely reads legacy non-object records" {
@@ -6870,22 +6887,21 @@ test "canonical graph path metadata safely reads legacy non-object records" {
     defer arena_state.deinit();
     const alloc = arena_state.allocator();
 
-    const object = (try pathEdgeMetadataObjectJsonValue(alloc, "{\"kind\":\"citation\"}")) orelse
+    const object = (try pathEdgeMetadataObjectMap(alloc, "{\"kind\":\"citation\"}")) orelse
         return error.TestUnexpectedResult;
-    try std.testing.expect(object == .object);
-    try std.testing.expectEqualStrings("citation", object.object.get("kind").?.string);
-    try std.testing.expect((try pathEdgeMetadataObjectJsonValue(alloc, "\"legacy\"")) == null);
-    try std.testing.expect((try pathEdgeMetadataObjectJsonValue(alloc, "{")) == null);
+    try std.testing.expectEqualStrings("citation", object.map.get("kind").?.string);
+    try std.testing.expect((try pathEdgeMetadataObjectMap(alloc, "\"legacy\"")) == null);
+    try std.testing.expect((try pathEdgeMetadataObjectMap(alloc, "{")) == null);
 
     const legacy = (try pathEdgeMetadataJsonValue(alloc, "\"legacy\"")) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("legacy", legacy.string);
 }
 
-fn graphNodeEvidenceJsonValue(
+fn graphNodeEvidenceObjectMap(
     alloc: std.mem.Allocator,
     node: graph_query_mod.GraphResultNode,
-) !?std.json.Value {
+) !?std.json.ArrayHashMap(std.json.Value) {
     const has_provenance = if (node.provenance) |items| items.len > 0 else false;
     var has_edge_metadata = false;
     if (node.path_edges) |edges| {
@@ -6970,7 +6986,7 @@ fn graphNodeEvidenceJsonValue(
         }
     }
 
-    return .{ .object = evidence };
+    return .{ .map = evidence };
 }
 
 fn toOpenApiOptionalPathEdges(
@@ -7047,11 +7063,11 @@ test "api query contract preserves algebraic graph path provenance" {
     try std.testing.expectEqualStrings("entities", encoded[0].path_edges.?[0].to.table.?);
     try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type);
     try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight);
-    try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.object.get("mention_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.map.get("mention_count").?.integer);
     try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
     try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);
     try std.testing.expectEqualStrings("B\x1fe\x1fC", encoded[0].provenance.?[1]);
-    const evidence = encoded[0].evidence.?.object;
+    const evidence = encoded[0].evidence.?.map;
     try std.testing.expectEqual(@as(usize, 2), evidence.get("provenance").?.array.items.len);
     try std.testing.expectEqual(@as(usize, 1), evidence.get("path_edges").?.array.items.len);
     const edge_evidence = evidence.get("path_edges").?.array.items[0].object;
@@ -7091,13 +7107,13 @@ test "api query contract hydrates equal graph keys from their table namespace" {
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(
         "docs",
-        local.object.get("origin").?.string,
+        local.map.get("origin").?.string,
     );
     const external = (try document_lookup.document("shared", "entities")) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings(
         "entities",
-        external.object.get("origin").?.string,
+        external.map.get("origin").?.string,
     );
     try std.testing.expect(try document_lookup.document("shared", "missing") == null);
 }
@@ -7456,6 +7472,10 @@ fn normalizePublicQueryBucketsAlloc(
     errdefer deinitTextQueryArrayList(alloc, &exclusion_text_queries);
 
     if (request.query) |query| {
+        // QueryRequest.query intentionally uses std.json.Value so the planner
+        // can consume its AST without reparsing raw bytes. Preserve the
+        // OpenAPI object contract explicitly at this semantic boundary.
+        if (query != .object) return error.InvalidQueryRequest;
         try appendCanonicalPublicQueryAlloc(
             alloc,
             query,
@@ -10100,7 +10120,7 @@ fn parseLegacyPatternNodeFilter(
     errdefer freePatternNodeFilter(alloc, out);
     if (value.filter_prefix) |prefix| out.filter_prefix = try alloc.dupe(u8, prefix);
     if (value.filter_query) |filter_query| {
-        const parsed = try parseSupportedFullTextQuery(alloc, filter_query, 10);
+        const parsed = try parseSupportedFullTextQuery(alloc, .{ .object = filter_query.map }, 10);
         defer freeTextQuery(alloc, parsed);
         out.filter_query_json = try encodePatternFilterQuery(alloc, parsed);
     }
@@ -10548,6 +10568,12 @@ test "canonical graph document filter variants cross the public storage boundary
             return error.TestUnexpectedResult;
         try std.testing.expect(normalized.len > 0);
     }
+
+    // Closed empty-object predicates reject misspelled or future fields at
+    // the generated-schema boundary instead of silently weakening the filter.
+    try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs",
+        \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["a"]},"filter":{"match_all":{"unexpected":true}}}}}}
+    ));
 }
 
 test "canonical graph boolean field filter has one unambiguous root" {
@@ -10846,14 +10872,8 @@ fn lowerGraphDocumentFilter(
             try body.put(alloc, "value", .{ .bool = value.bool_field.value });
             break :blk try graphStoredWrappedPredicate(alloc, "bool_field", .{ .object = body });
         },
-        .graph_document_match_all_filter => |value| blk: {
-            try validateGraphEmptyObject(value.match_all);
-            break :blk try graphStoredEmptyPredicate(alloc, "match_all");
-        },
-        .graph_document_match_none_filter => |value| blk: {
-            try validateGraphEmptyObject(value.match_none);
-            break :blk try graphStoredEmptyPredicate(alloc, "match_none");
-        },
+        .graph_document_match_all_filter => try graphStoredEmptyPredicate(alloc, "match_all"),
+        .graph_document_match_none_filter => try graphStoredEmptyPredicate(alloc, "match_none"),
         .graph_document_filter_conjunction => |value| try lowerGraphConjunction(alloc, value.*, depth, budget),
         .graph_document_filter_disjunction => |value| try lowerGraphDisjunction(alloc, value.*, depth, budget),
         .graph_document_filter_boolean => |value| try lowerGraphBoolean(alloc, value.*, depth, budget),
@@ -10862,10 +10882,6 @@ fn lowerGraphDocumentFilter(
 
 fn validateGraphDocumentPath(path: []const u8) !void {
     if (!validGraphDocumentJsonPointer(path)) return error.InvalidQueryRequest;
-}
-
-fn validateGraphEmptyObject(value: std.json.Value) !void {
-    if (value != .object or value.object.count() != 0) return error.InvalidQueryRequest;
 }
 
 fn graphStoredWrappedPredicate(
@@ -14392,6 +14408,25 @@ test "api query contract treats canonical typed scalar term as structured filter
     try std.testing.expect(parsed.req.full_text.? == .match_all);
     try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/published\",\"value\":true}}", parsed.req.filter_query_json);
     try std.testing.expectEqualStrings("", parsed.req.exclusion_query_json);
+}
+
+test "api query contract preserves the canonical query object wire kind" {
+    const alloc = std.testing.allocator;
+    inline for (.{
+        \\{"query":[]}
+        ,
+        \\{"query":"match all"}
+        ,
+        \\{"query":true}
+        ,
+        \\{"query":42}
+        ,
+    }) |body| {
+        try std.testing.expectError(
+            error.InvalidQueryRequest,
+            parsePublicQueryRequest(alloc, null, "docs", body),
+        );
+    }
 }
 
 test "api query contract treats canonical string path term as structured filter" {

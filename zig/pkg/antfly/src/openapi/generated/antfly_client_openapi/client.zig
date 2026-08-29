@@ -737,7 +737,7 @@ pub const Client = struct {
 
     /// Invoke an Antfly-compatible inference connection
     /// POST /db/v1/connections/{connection_id}/inference/{operation}
-    pub fn invokeInferenceConnection(self: *@This(), connection_id: []const u8, operation: []const u8, body: std.json.Value) !RawResponse {
+    pub fn invokeInferenceConnection(self: *@This(), connection_id: []const u8, operation: []const u8, body: std.json.ArrayHashMap(std.json.Value)) !RawResponse {
         const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
         defer self.allocator.free(encoded_connection_id);
         const encoded_operation = try httpx.PercentEncoding.encode(self.allocator, operation);
@@ -982,7 +982,7 @@ pub const Client = struct {
 
     /// Register or replace an artifact enrichment
     /// PUT /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment
-    pub fn putArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.EnrichmentConfig) !ApiResponse(std.json.Value) {
+    pub fn putArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.EnrichmentConfig) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
@@ -992,12 +992,12 @@ pub const Client = struct {
         const json_body = try httpx.json.Json.stringifyRequest(self.allocator, body);
         defer self.allocator.free(json_body);
         var resp = try self.http.put(url, .{ .json = json_body, .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
     /// Delete an artifact enrichment
     /// DELETE /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment
-    pub fn deleteArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8) !ApiResponse(std.json.Value) {
+    pub fn deleteArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
@@ -1005,7 +1005,7 @@ pub const Client = struct {
         const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/enrichment", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
     /// Reprocess a derived asset across a table range
@@ -1145,7 +1145,7 @@ pub const Client = struct {
 
     /// Retrieve a document by key
     /// GET /db/v1/tables/{tableName}/documents/{key}
-    pub fn lookupKey(self: *@This(), table_name: []const u8, key: []const u8, params: LookupKeyParams) !ApiResponse(std.json.Value) {
+    pub fn lookupKey(self: *@This(), table_name: []const u8, key: []const u8, params: LookupKeyParams) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
         defer self.allocator.free(encoded_table_name);
         const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
@@ -1177,7 +1177,7 @@ pub const Client = struct {
             url = new_url;
         }
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
-        return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
     }
 
     /// List derived document artifact manifests

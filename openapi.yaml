@@ -14308,6 +14308,7 @@ components:
           example: wikipedia
         query:
           x-go-type: json.RawMessage
+          x-zig-type: std.json.Value
           type: object
           additionalProperties: true
           description: >
@@ -15937,7 +15938,9 @@ components:
             non-dense and fused results.
         _index_scores:
           type: object
-          additionalProperties: true
+          additionalProperties:
+            type: number
+            format: double
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
         _source:

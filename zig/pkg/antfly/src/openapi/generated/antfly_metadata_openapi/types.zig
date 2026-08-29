@@ -197,7 +197,7 @@ pub const AgentStep = struct {
     /// Server-side execution time in milliseconds
     duration_ms: ?i64 = null,
     /// Additional details about the step
-    details: ?std.json.Value = null,
+    details: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -1416,7 +1416,7 @@ pub const BackupRequest = struct {
 /// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
 pub const BatchRequest = struct {
     /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
-    inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
+    inserts: ?std.json.ArrayHashMap(std.json.ArrayHashMap(std.json.Value)) = null,
     /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
     deletes: ?[]const []const u8 = null,
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric and set-like operations ($inc, $min, $max, $addToSet, $pull) Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($set) - Add or remove array values ($addToSet, $pull) - Update nested fields without overwriting the entire document
@@ -4010,7 +4010,7 @@ pub const GraphWorkBudgetExceededError = struct {
 
 pub const HierarchyAncestor = struct {
     id: ?[]const u8 = null,
-    document: ?std.json.Value = null,
+    document: ?std.json.ArrayHashMap(std.json.Value) = null,
     key: ?[]const u8 = null,
     artifact_name: ?[]const u8 = null,
     source_field: ?[]const u8 = null,
@@ -4224,8 +4224,8 @@ pub const HierarchyEvidence = struct {
     resolution_artifact_key: ?[]const u8 = null,
     resolver: ?[]const u8 = null,
     resolver_table: ?[]const u8 = null,
-    mention: ?std.json.Value = null,
-    canonical: ?std.json.Value = null,
+    mention: ?std.json.ArrayHashMap(std.json.Value) = null,
+    canonical: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -4387,7 +4387,7 @@ pub const HierarchyMatchHit = struct {
     _score: f32,
     /// Raw vector distance when this hit came directly from a dense-vector search; lower values are better.
     _distance: ?f32 = null,
-    _source: ?std.json.Value = null,
+    _source: ?std.json.ArrayHashMap(std.json.Value) = null,
     hierarchy: ?HierarchyMatchContext = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -4656,7 +4656,7 @@ pub const JoinClause = struct {
     /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
     strategy_hint: ?JoinStrategy = null,
     /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
-    nested_join: OpenApiOptionalNullable(std.json.Value) = .absent,
+    nested_join: OpenApiOptionalNullable(std.json.ArrayHashMap(std.json.Value)) = .absent,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -5025,7 +5025,7 @@ pub const LinearMergePageStatus = enum {
 /// Linear merge operation for syncing sorted records from external sources. Use this to keep Antfly in sync with an external database or data source. Requests may be sent as plain JSON or gzip-compressed JSON (`Content-Encoding: gzip`). Request bodies are limited to 64 MiB after decompression. Requests that exceed this limit return HTTP 413. **How it works:** 1. Send sorted records from your external source 2. Server upserts records that exist in your batch 3. Server deletes Antfly records in the key range that are absent from your batch 4. If stopped at shard boundary, use next_cursor for next request **WARNING:** Not safe for concurrent operations with overlapping key ranges.
 pub const LinearMergeRequest = struct {
     /// Map of resource ID to resource object: {"resource_id_1": {...}, "resource_id_2": {...}} Requirements: - The server processes keys in lexicographic order - Use consistent key naming (e.g., all start with same prefix) This format avoids duplicate IDs and matches Antfly's batch write interface.
-    records: std.json.Value,
+    records: std.json.ArrayHashMap(std.json.Value),
     /// ID of last record from previous merge request. - First request: Use empty string "" - Subsequent requests: Use next_cursor from previous response - Defines lower bound of key range to process This enables pagination for large datasets.
     last_merged_id: ?[]const u8 = null,
     /// If true, returns what would be deleted without making changes. Use cases: - Validate sync behavior before committing - Check which records will be removed - Test key range boundaries Response includes deleted_ids array when dry_run=true.
@@ -5957,7 +5957,7 @@ pub const QueryBuilderRequest = struct {
     /// Force a user-facing decision after this many unresolved internal passes.
     require_decision_after: ?i64 = null,
     /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
-    example_documents: ?[]const std.json.Value = null,
+    example_documents: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Name of the table to build query for. If provided, uses table schema for field context.
     table: ?[]const u8 = null,
     /// Natural language description of the search intent
@@ -5969,7 +5969,7 @@ pub const QueryBuilderRequest = struct {
     /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
     output: ?[]const u8 = null,
     /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
-    constraints: ?std.json.Value = null,
+    constraints: ?std.json.ArrayHashMap(std.json.Value) = null,
     generator: ?antfly_generating_openapi.GeneratorConfig = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
@@ -6079,7 +6079,7 @@ pub const QueryBuilderResult = struct {
     /// Clarification questions exposed in the shared bounded-agent envelope.
     questions: ?[]const AgentQuestion = null,
     /// Generated search query in native Bleve format. Can be used directly in QueryRequest.full_text_search or filter_query.
-    query: std.json.Value,
+    query: std.json.ArrayHashMap(std.json.Value),
     /// Antfly query request assembled by the coordinator. New clients should prefer this field when they want an executable Antfly query object.
     query_request: ?QueryRequest = null,
     /// Antfly retrieval query assembled by the coordinator when the requested artifact needs retrieval-only features such as tree_search. This is additive to query_request for clients that execute through the retrieval agent pipeline.
@@ -6087,7 +6087,7 @@ pub const QueryBuilderResult = struct {
     /// Specialist or strategy used to build the query, such as `full_text`, `filter`, or `hybrid`.
     specialist: ?[]const u8 = null,
     /// Optional machine-readable coordination plan for observability.
-    plan: ?std.json.Value = null,
+    plan: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Human-readable explanation of what the query does and why it was structured this way
     explanation: ?[]const u8 = null,
     /// Model's confidence in the generated query (0.0-1.0)
@@ -6312,8 +6312,8 @@ pub const QueryHit = struct {
     /// Raw vector distance for direct dense-vector hits; lower values are better. For a source group ranked by dense descendants, this is the distance of the best matching descendant that supplied the group score. Omitted for non-dense and fused results.
     _distance: ?f32 = null,
     /// Scores partitioned by index when using RRF search.
-    _index_scores: ?std.json.Value = null,
-    _source: ?std.json.Value = null,
+    _index_scores: ?std.json.ArrayHashMap(f64) = null,
+    _source: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level group includes nested matches. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `matches`, and `ancestors` with response-local or requested DB-backed source/unit context when available. Legacy rollup requests continue to use `chunks` instead of `matches`.
     hierarchy: ?QueryHitHierarchy = null,
     /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Values preserve their JSON types. Present for ordered result pages, including cursor-only requests whose effective order is `_id` ascending.
@@ -11523,7 +11523,7 @@ pub const TransactionStageReadSnapshot = struct {
 pub const TransactionStageWriteRequest = struct {
     table: []const u8,
     key: []const u8,
-    document: std.json.Value,
+    document: std.json.ArrayHashMap(std.json.Value),
 };
 
 pub const TransactionStatusResponse = struct {

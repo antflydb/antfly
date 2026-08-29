@@ -27093,8 +27093,7 @@ test "api http server serves query builder response envelope" {
     try std.testing.expectEqual(@as(i64, 2), parsed.value.remaining_user_clarifications.?);
     try std.testing.expect(parsed.value.steps != null);
     try std.testing.expectEqualStrings("query_builder", parsed.value.steps.?[0].name);
-    try std.testing.expect(parsed.value.query == .object);
-    try std.testing.expect(parsed.value.query.object.get("conjuncts") != null);
+    try std.testing.expect(parsed.value.query.map.get("conjuncts") != null);
     try std.testing.expect(parsed.value.query_request != null);
     try std.testing.expectEqualStrings("docs", parsed.value.query_request.?.table.?);
     try std.testing.expect(parsed.value.query_request.?.full_text_search != null);

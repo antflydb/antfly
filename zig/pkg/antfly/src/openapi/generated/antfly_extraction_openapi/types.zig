@@ -203,7 +203,7 @@ pub const ExtractionInput = struct {
     id: ?[]const u8 = null,
     content: antfly_generating_openapi.ChatMessageContent,
     tokens: ?[]const ExtractionToken = null,
-    metadata: ?std.json.Value = null,
+    metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -246,7 +246,7 @@ pub const ExtractionObject = struct {
     entities: ?[]const ExtractionEntity = null,
     relations: ?[]const ExtractionRelation = null,
     classifications: ?[]const ExtractionClassification = null,
-    structures: ?std.json.Value = null,
+    structures: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{
@@ -632,7 +632,7 @@ pub const ExtractionResponse = struct {
     object: []const u8,
     model: []const u8,
     data: []const ExtractionObject,
-    usage: ?std.json.Value = null,
+    usage: ?std.json.ArrayHashMap(std.json.Value) = null,
 
     /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
     pub const antflyOpenApiFieldMetadata = .{

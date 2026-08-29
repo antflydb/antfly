@@ -4984,7 +4984,7 @@ pub const Node = struct {
             .object = "extraction",
             .model = model_name,
             .data = data,
-            .usage = .{ .object = usage },
+            .usage = .{ .map = usage },
         }, .{});
     }
 
@@ -6432,7 +6432,7 @@ pub const Node = struct {
                         .message = "response_format.json_schema.schema is required for type=json_schema",
                     });
                 };
-                config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, schema) catch |err| {
+                config.grammar = grammar_mod.buildJsonSchemaGrammar(ctx.allocator, .{ .object = schema.map }) catch |err| {
                     return ctx.status(400).json(.{
                         .@"error" = "INVALID_REQUEST",
                         .message = @errorName(err),
@@ -7698,7 +7698,7 @@ pub const Node = struct {
             } else if (std.mem.eql(u8, rf.type, "json_schema")) {
                 const schema_cfg = rf.json_schema orelse return error.MissingJsonSchema;
                 const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
-                owned_grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, schema);
+                owned_grammar = try grammar_mod.buildJsonSchemaGrammar(allocator, .{ .object = schema.map });
                 config.grammar = owned_grammar;
             } else if (!std.mem.eql(u8, rf.type, "text")) {
                 return error.UnsupportedResponseFormat;
@@ -10843,7 +10843,7 @@ pub const Node = struct {
             .object = "extraction",
             .model = body.model,
             .data = data,
-            .usage = .{ .object = usage },
+            .usage = .{ .map = usage },
         });
     }
 
@@ -11582,7 +11582,7 @@ fn entityExtractionResponseJsonAlloc(
         .object = "extraction",
         .data = data,
         .model = request.model,
-        .usage = .{ .object = usage },
+        .usage = .{ .map = usage },
     }, .{});
 }
 
@@ -11654,7 +11654,7 @@ fn extractionResponseJsonAlloc(
         }
         data[result_index] = .{
             .id = if (result_index < inputs.len) inputs[result_index].id else null,
-            .structures = .{ .object = structures_map },
+            .structures = .{ .map = structures_map },
         };
     }
 
@@ -19886,7 +19886,7 @@ fn validateGeneratedJsonSchema(
     const schema = schema_cfg.schema orelse return error.MissingJsonSchema;
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
     defer parsed.deinit();
-    try jsonschema.validateJsonSchemaValue(allocator, schema, parsed.value);
+    try jsonschema.validateJsonSchemaValue(allocator, .{ .object = schema.map }, parsed.value);
 }
 
 test "structured output validation fails closed instead of fabricating JSON" {
@@ -19909,7 +19909,7 @@ test "structured output validation fails closed instead of fabricating JSON" {
     );
 
     var parsed_schema = try std.json.parseFromSlice(
-        std.json.Value,
+        std.json.ArrayHashMap(std.json.Value),
         allocator,
         "{\"type\":\"object\",\"required\":[\"answer\"],\"properties\":{\"answer\":{\"type\":\"string\"}}}",
         .{},

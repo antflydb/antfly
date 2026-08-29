@@ -53,7 +53,7 @@ pub const ChunkerConfig = struct {
     /// Controls whether chunk data is persisted to storage. When false (default), chunks are generated in memory and only embeddings are stored. When true, both chunks and embeddings are stored.
     store_chunks: ?bool = null,
     /// Configuration for full-text indexing of chunks in Bleve. When present (even if empty), chunks will be stored with :cft: suffix and indexed in Bleve's _chunks field. When absent, chunks use :c: suffix and are only used for vector embeddings.
-    full_text_index: ?std.json.Value = null,
+    full_text_index: ?std.json.ArrayHashMap(std.json.Value) = null,
     max_chunks: ?i64 = null,
     threshold: ?f32 = null,
     text: ?antfly_chunking_api_openapi.TextChunkOptions = null,

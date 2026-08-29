@@ -267,7 +267,12 @@ pub const AntflyClient = struct {
         return openapi.ApiResponse(openapi.types.QueryResponses).fromResponse(self.allocator, &response);
     }
 
-    pub fn lookupKey(self: *AntflyClient, table_name: []const u8, key: []const u8, params: openapi.client.LookupKeyParams) !openapi.ApiResponse(std.json.Value) {
+    pub fn lookupKey(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        params: openapi.client.LookupKeyParams,
+    ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         var resp = try self.inner.lookupKey(table_name, key, params);
         if (resp.status_code >= 300) {
             defer resp.deinit();
@@ -309,7 +314,7 @@ pub const AntflyClient = struct {
         table_name: []const u8,
         artifact_name: []const u8,
         body: openapi.types.EnrichmentConfig,
-    ) !openapi.ApiResponse(std.json.Value) {
+    ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         return try self.inner.putArtifactEnrichment(table_name, artifact_name, body);
     }
 
@@ -317,7 +322,7 @@ pub const AntflyClient = struct {
         self: *AntflyClient,
         table_name: []const u8,
         artifact_name: []const u8,
-    ) !openapi.ApiResponse(std.json.Value) {
+    ) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
         return try self.inner.deleteArtifactEnrichment(table_name, artifact_name);
     }
 
