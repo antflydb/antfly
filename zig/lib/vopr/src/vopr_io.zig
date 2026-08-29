@@ -119,12 +119,18 @@ pub fn capabilityDigest(capabilities: CapabilitySet) u64 {
 /// surface, so toolchain and virtual-OS compatibility are replay inputs without
 /// coupling the stable trace schema to Zig's evolving public vtable layout.
 pub fn artifactBackendIds() [4]ids.StableId {
-    // See capabilityDigest: vopr-io strings are stable trace-v1 IDs.
+    return artifactBackendIdsWithInstrumentation(0);
+}
+
+fn artifactBackendIdsWithInstrumentation(instrumentation_map_digest: u64) [4]ids.StableId {
+    // See capabilityDigest: vopr-io strings are stable trace-v1 IDs. Construct
+    // the one canonical identity set directly; there is no baseline-ID
+    // substitution or artifact migration path.
     var result = [4]ids.StableId{
         ids.stable("vopr-io-zig", builtin.zig_version_string),
         capabilityDigest(supported_capabilities),
         ids.derive("vopr-io-model", ids.stable("vopr-io", "virtual-os"), model_version),
-        ids.derive("vopr-io-instrumentation", ids.stable("vopr-io", "safepoints"), 0),
+        ids.derive("vopr-io-instrumentation", ids.stable("vopr-io", "safepoints"), instrumentation_map_digest),
     };
     ids.sort(&result);
     return result;
@@ -403,19 +409,7 @@ pub const VoprIo = struct {
     }
 
     pub fn artifactIds(self: *const VoprIo) [4]ids.StableId {
-        var result = artifactBackendIds();
-        const old_instrumentation = ids.derive("vopr-io-instrumentation", ids.stable("vopr-io", "safepoints"), 0);
-        const new_instrumentation = ids.derive(
-            "vopr-io-instrumentation",
-            ids.stable("vopr-io", "safepoints"),
-            self.instrumentation.config.map_digest,
-        );
-        for (&result) |*value| if (value.* == old_instrumentation) {
-            value.* = new_instrumentation;
-            break;
-        };
-        ids.sort(&result);
-        return result;
+        return artifactBackendIdsWithInstrumentation(self.instrumentation.config.map_digest);
     }
 
     pub fn require(required: CapabilitySet) InitError!void {
@@ -1663,6 +1657,16 @@ test "VoprIo replay backend identities are canonical and compatibility checked" 
         error.IncompatibleVoprIoBackend,
         validateArtifactBackendIds(backend_ids[1..]),
     );
+}
+
+test "VoprIo constructs configured instrumentation identity directly" {
+    var sim = try VoprIo.init(.{ .instrumentation = .{ .enabled = true, .map_digest = 77 } });
+    defer sim.deinit();
+    const configured = sim.artifactIds();
+    const expected = artifactBackendIdsWithInstrumentation(77);
+    const baseline = artifactBackendIds();
+    try std.testing.expectEqualSlices(ids.StableId, &expected, &configured);
+    try std.testing.expect(!std.mem.eql(ids.StableId, &baseline, &configured));
 }
 
 test "VoprIo composes atomic executor work into its scheduler" {

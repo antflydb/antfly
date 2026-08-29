@@ -636,6 +636,9 @@ extension, or old backend-ID namespace. Only `.voprtrace` is accepted, and
 canonical transitions and backend IDs use `vopr-io.*`/`vopr-io-*`. Older
 randomized real-I/O suites use `workload`/`integration` terminology when
 renamed; they do not become VOPR suites merely by changing a label.
+Configured instrumentation backend identity is constructed directly from its
+canonical map digest; VOPR does not build a baseline identity and substitute
+an "old" entry or translate a retained artifact.
 
 This forward-only rule applies to every VOPR-native surface: APIs, saved event
 sets, traces, run/results JSON, corpus indexes, debugger artifacts, command
