@@ -1076,6 +1076,7 @@ const LocalStandaloneMetadata = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const antfly.public_api.backups.TableBackupManifest,
     ) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
@@ -1083,24 +1084,28 @@ const LocalStandaloneMetadata = struct {
         if (!std.mem.eql(u8, manifest.table_name, table_name)) return error.InvalidBackupRequest;
         var table = try antfly.public_api.backups.deriveRestoreTableRecord(alloc, table_name, location_uri, manifest);
         defer antfly.metadata.table_manager.freeTable(alloc, table);
-        const ranges = try antfly.public_api.backups.deriveRestoreRanges(
+        if (self.storage_engine == .lite and manifest.shards.len != 1) return error.InvalidBackupRequest;
+        table.desired_replica_count = 1;
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        const occupied_ranges = try self.manager.listRanges(alloc);
+        defer self.manager.freeRanges(alloc, occupied_ranges);
+        const ranges = try antfly.public_api.backups.deriveFreshRestoreRanges(
             alloc,
             table.table_id,
             location_uri,
             connection,
             artifact_backup_id,
+            restore_job_id,
+            occupied_ranges,
             manifest,
         );
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);
         }
-        if (self.storage_engine == .lite and ranges.len != 1) return error.InvalidBackupRequest;
-        table.desired_replica_count = 1;
-
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
         var mutation = try self.beginCatalogMutationLocked();
         defer mutation.deinit(self);
         try self.manager.upsertTable(table);
@@ -7502,6 +7507,85 @@ test "standalone metadata rolls back an undurable catalog mutation" {
     }
     try std.testing.expectEqual(@as(u64, 1), metadata.epoch);
     try std.testing.expect(metadata.findTableByNameLocked("docs") == null);
+}
+
+test "standalone metadata restore derives fresh identity from durable job" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+    var metadata = LocalStandaloneMetadata{
+        .alloc = alloc,
+        .manager = antfly.metadata.TableManager.init(alloc),
+        .extension_catalog = antfly.extensions.ExtensionCatalog.init(alloc),
+        .local_node_id = 1,
+        .store_id = 1,
+        .api_url = try alloc.dupe(u8, "http://127.0.0.1:8080"),
+        .replica_root_dir = try alloc.dupe(u8, "."),
+        .catalog_path = try alloc.dupe(u8, catalog_path),
+        .catalog_store = null,
+        .backend_runtime = backend_runtime.ptr(),
+    };
+    defer metadata.deinit();
+
+    const source_group_id: u64 = 7001;
+    const shards = [_]antfly.public_api.backups.ShardSnapshot{.{
+        .group_id = source_group_id,
+        .start_key = "",
+        .snapshot_path = "backup-a/groups/7001.afb",
+        .artifact_size_bytes = 1,
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    }};
+    const manifest: antfly.public_api.backups.TableBackupManifest = .{
+        .format = .portable,
+        .backup_id = "backup-a",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = &shards,
+    };
+    const source = metadata.statusSource();
+
+    try std.testing.expect(try source.restoreTable(
+        alloc,
+        "docs",
+        "file:///backup",
+        "local-backup",
+        "backup-a",
+        901,
+        &manifest,
+    ));
+    const first_ranges = try metadata.manager.listRanges(alloc);
+    defer metadata.manager.freeRanges(alloc, first_ranges);
+    try std.testing.expectEqual(@as(usize, 1), first_ranges.len);
+    try std.testing.expect(first_ranges[0].group_id != source_group_id);
+    try std.testing.expectEqual(first_ranges[0].group_id, first_ranges[0].range_id);
+    try std.testing.expectEqual(first_ranges[0].group_id, first_ranges[0].doc_identity_shard_id);
+    try std.testing.expectEqual(first_ranges[0].group_id, first_ranges[0].doc_identity_range_id);
+    const first_group_id = first_ranges[0].group_id;
+
+    try source.dropTable(alloc, "docs");
+    try std.testing.expect(try source.restoreTable(
+        alloc,
+        "docs",
+        "file:///backup",
+        "local-backup",
+        "backup-a",
+        902,
+        &manifest,
+    ));
+    const second_ranges = try metadata.manager.listRanges(alloc);
+    defer metadata.manager.freeRanges(alloc, second_ranges);
+    try std.testing.expectEqual(@as(usize, 1), second_ranges.len);
+    try std.testing.expect(second_ranges[0].group_id != source_group_id);
+    try std.testing.expect(second_ranges[0].group_id != first_group_id);
 }
 
 test "standalone metadata advertises a linearizable owned snapshot" {

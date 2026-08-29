@@ -4279,6 +4279,8 @@ const store_record_extension_legacy_version: u16 = 1;
 const store_record_extension_version: u16 = 2;
 const reallocation_request_extension_magic = "afrr1";
 const reallocation_request_extension_version: u16 = 1;
+const placement_restore_identity_extension_magic = "afri1";
+const placement_restore_identity_extension_version: u16 = 1;
 
 const MetadataIncarnationRecord = struct {
     incarnation: metadata_incarnation.MetadataClusterIncarnation,
@@ -6075,6 +6077,16 @@ fn appendPlacementIntent(
     try appendInt(alloc, out, u64, intent.relocation_disk_bytes_watermark);
     try appendInt(alloc, out, u64, intent.relocation_target_sequence);
     try appendInt(alloc, out, u64, intent.relocation_applied_sequence);
+    if (intent.record.backup_restore_bootstrap) |backup| {
+        if (backup.reassign_identity_namespace) {
+            try out.appendSlice(alloc, placement_restore_identity_extension_magic);
+            try appendInt(alloc, out, u16, placement_restore_identity_extension_version);
+            try appendInt(alloc, out, u64, backup.identity_table_id);
+            try appendInt(alloc, out, u64, backup.identity_shard_id);
+            try appendInt(alloc, out, u64, backup.identity_range_id);
+            try out.append(alloc, @intFromBool(backup.reassign_identity_namespace));
+        }
+    }
 }
 
 fn appendTableRecord(
@@ -7032,6 +7044,32 @@ fn readPlacementIntent(
         relocation_disk_bytes_watermark = try readInt(encoded, pos, u64);
         relocation_target_sequence = try readInt(encoded, pos, u64);
         relocation_applied_sequence = try readInt(encoded, pos, u64);
+    }
+    if (pos.* < encoded.len) {
+        if (backup_restore_bootstrap == null or
+            pos.* + placement_restore_identity_extension_magic.len > encoded.len or
+            !std.mem.eql(
+                u8,
+                encoded[pos.* .. pos.* + placement_restore_identity_extension_magic.len],
+                placement_restore_identity_extension_magic,
+            ))
+        {
+            return error.InvalidMetadataTransitionEncoding;
+        }
+        pos.* += placement_restore_identity_extension_magic.len;
+        const extension_version = try readInt(encoded, pos, u16);
+        if (extension_version != placement_restore_identity_extension_version)
+            return error.InvalidMetadataTransitionEncoding;
+        var backup = backup_restore_bootstrap.?;
+        backup.identity_table_id = try readInt(encoded, pos, u64);
+        backup.identity_shard_id = try readInt(encoded, pos, u64);
+        backup.identity_range_id = try readInt(encoded, pos, u64);
+        const reassign_identity_namespace = try readInt(encoded, pos, u8);
+        if (reassign_identity_namespace > 1 or pos.* != encoded.len)
+            return error.InvalidMetadataTransitionEncoding;
+        backup.reassign_identity_namespace = reassign_identity_namespace == 1;
+        backup.validate() catch return error.InvalidMetadataTransitionEncoding;
+        backup_restore_bootstrap = backup;
     }
     return .{
         .record = .{
@@ -10949,6 +10987,10 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
                         .connection = "backup-store",
                         .artifact_size_bytes = 4096,
                         .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                        .identity_table_id = 52,
+                        .identity_shard_id = 5201,
+                        .identity_range_id = 5201,
+                        .reassign_identity_namespace = true,
                     },
                 },
                 .store_id = 45,
@@ -10991,6 +11033,10 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             intents[0].record.backup_restore_bootstrap.?.artifact_sha256,
         );
+        try std.testing.expectEqual(@as(u64, 52), intents[0].record.backup_restore_bootstrap.?.identity_table_id);
+        try std.testing.expectEqual(@as(u64, 5201), intents[0].record.backup_restore_bootstrap.?.identity_shard_id);
+        try std.testing.expectEqual(@as(u64, 5201), intents[0].record.backup_restore_bootstrap.?.identity_range_id);
+        try std.testing.expect(intents[0].record.backup_restore_bootstrap.?.reassign_identity_namespace);
     }
 }
 

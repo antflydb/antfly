@@ -4005,17 +4005,25 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
         hashPlacementU64(hasher, 1);
         hashPlacementU64(hasher, snapshot.from_node_id);
         hashPlacementU64(hasher, snapshot.term);
-        hasher.update(snapshot.snapshot_id);
-        hasher.update(snapshot.uri);
+        hashPlacementBytes(hasher, snapshot.snapshot_id);
+        hashPlacementBytes(hasher, snapshot.uri);
     } else {
         hashPlacementU64(hasher, 0);
     }
 
     if (intent.record.backup_restore_bootstrap) |backup| {
         hashPlacementU64(hasher, 1);
-        hasher.update(backup.backup_id);
-        hasher.update(backup.location);
-        hasher.update(backup.snapshot_path);
+        hashPlacementBytes(hasher, backup.backup_id);
+        hashPlacementBytes(hasher, backup.artifact_backup_id);
+        hashPlacementBytes(hasher, backup.location);
+        hashPlacementBytes(hasher, backup.snapshot_path);
+        hashPlacementBytes(hasher, backup.connection);
+        hashPlacementU64(hasher, backup.artifact_size_bytes);
+        hashPlacementBytes(hasher, backup.artifact_sha256);
+        hashPlacementU64(hasher, backup.identity_table_id);
+        hashPlacementU64(hasher, backup.identity_shard_id);
+        hashPlacementU64(hasher, backup.identity_range_id);
+        hashPlacementU64(hasher, @intFromBool(backup.reassign_identity_namespace));
     } else {
         hashPlacementU64(hasher, 0);
     }
@@ -4024,6 +4032,11 @@ fn hashPlacementIntent(hasher: *std.hash.Wyhash, intent: raft_reconciler.Placeme
 fn hashPlacementU64(hasher: *std.hash.Wyhash, value: u64) void {
     var numeric = value;
     hasher.update(std.mem.asBytes(&numeric));
+}
+
+fn hashPlacementBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
+    hashPlacementU64(hasher, value.len);
+    hasher.update(value);
 }
 
 fn placementIntentEquals(
@@ -4047,8 +4060,16 @@ fn placementIntentEquals(
     if (left.record.backup_restore_bootstrap) |backup| {
         const other = right.record.backup_restore_bootstrap.?;
         if (!std.mem.eql(u8, backup.backup_id, other.backup_id)) return false;
+        if (!std.mem.eql(u8, backup.artifact_backup_id, other.artifact_backup_id)) return false;
         if (!std.mem.eql(u8, backup.location, other.location)) return false;
         if (!std.mem.eql(u8, backup.snapshot_path, other.snapshot_path)) return false;
+        if (!std.mem.eql(u8, backup.connection, other.connection)) return false;
+        if (backup.artifact_size_bytes != other.artifact_size_bytes) return false;
+        if (!std.mem.eql(u8, backup.artifact_sha256, other.artifact_sha256)) return false;
+        if (backup.identity_table_id != other.identity_table_id) return false;
+        if (backup.identity_shard_id != other.identity_shard_id) return false;
+        if (backup.identity_range_id != other.identity_range_id) return false;
+        if (backup.reassign_identity_namespace != other.reassign_identity_namespace) return false;
     }
     if (left.store_id != right.store_id) return false;
     if (left.serving_state != right.serving_state) return false;

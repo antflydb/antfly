@@ -136,8 +136,22 @@ pub const BackupRestoreBootstrapRecord = struct {
     connection: []const u8,
     artifact_size_bytes: u64,
     artifact_sha256: []const u8,
+    identity_table_id: u64 = 0,
+    identity_shard_id: u64 = 0,
+    identity_range_id: u64 = 0,
+    reassign_identity_namespace: bool = false,
 
     pub fn validate(self: BackupRestoreBootstrapRecord) !void {
+        if (self.reassign_identity_namespace and
+            (self.identity_table_id == 0 or self.identity_shard_id == 0 or self.identity_range_id == 0))
+        {
+            return error.InvalidBackupRestoreBootstrap;
+        }
+        if (!self.reassign_identity_namespace and
+            (self.identity_table_id != 0 or self.identity_shard_id != 0 or self.identity_range_id != 0))
+        {
+            return error.InvalidBackupRestoreBootstrap;
+        }
         if (self.backup_id.len == 0 or
             self.backup_id.len > 128 or
             self.artifact_backup_id.len == 0 or
@@ -196,6 +210,10 @@ pub const BackupRestoreBootstrapRecord = struct {
             .connection = "",
             .artifact_size_bytes = self.artifact_size_bytes,
             .artifact_sha256 = "",
+            .identity_table_id = self.identity_table_id,
+            .identity_shard_id = self.identity_shard_id,
+            .identity_range_id = self.identity_range_id,
+            .reassign_identity_namespace = self.reassign_identity_namespace,
         };
         cloned.backup_id = try alloc.dupe(u8, self.backup_id);
         errdefer alloc.free(cloned.backup_id);
@@ -294,6 +312,10 @@ pub fn eqlReplicaRecord(left: ReplicaRecord, right: ReplicaRecord) bool {
         if (!std.mem.eql(u8, backup.connection, other.connection)) return false;
         if (backup.artifact_size_bytes != other.artifact_size_bytes) return false;
         if (!std.mem.eql(u8, backup.artifact_sha256, other.artifact_sha256)) return false;
+        if (backup.identity_table_id != other.identity_table_id) return false;
+        if (backup.identity_shard_id != other.identity_shard_id) return false;
+        if (backup.identity_range_id != other.identity_range_id) return false;
+        if (backup.reassign_identity_namespace != other.reassign_identity_namespace) return false;
     }
     return true;
 }
@@ -1334,6 +1356,10 @@ test "file replica catalog persists backup restore bootstrap records across reop
                 .connection = "backup-store",
                 .artifact_size_bytes = 4096,
                 .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                .identity_table_id = 22,
+                .identity_shard_id = 2201,
+                .identity_range_id = 2201,
+                .reassign_identity_namespace = true,
             },
         });
     }
@@ -1354,6 +1380,10 @@ test "file replica catalog persists backup restore bootstrap records across reop
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             records[0].backup_restore_bootstrap.?.artifact_sha256,
         );
+        try std.testing.expectEqual(@as(u64, 22), records[0].backup_restore_bootstrap.?.identity_table_id);
+        try std.testing.expectEqual(@as(u64, 2201), records[0].backup_restore_bootstrap.?.identity_shard_id);
+        try std.testing.expectEqual(@as(u64, 2201), records[0].backup_restore_bootstrap.?.identity_range_id);
+        try std.testing.expect(records[0].backup_restore_bootstrap.?.reassign_identity_namespace);
     }
 }
 

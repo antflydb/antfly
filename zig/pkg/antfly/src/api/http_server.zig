@@ -1005,6 +1005,7 @@ pub const StatusSource = struct {
             location_uri: []const u8,
             connection: []const u8,
             artifact_backup_id: []const u8,
+            restore_job_id: u64,
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
@@ -1073,10 +1074,11 @@ pub const StatusSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
         const fn_ptr = self.vtable.restore_table orelse return false;
-        try BoundaryAbi.call("restore_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, manifest });
+        try BoundaryAbi.call("restore_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, restore_job_id, manifest });
         return true;
     }
 
@@ -1233,9 +1235,10 @@ pub const StatusSource = struct {
                 location_uri: []const u8,
                 connection: []const u8,
                 artifact_backup_id: []const u8,
+                restore_job_id: u64,
                 manifest: *const backups_api.TableBackupManifest,
             ) anyerror!void {
-                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+                return try persistRestoreTableIntent(cast(ptr), alloc, table_name, location_uri, connection, artifact_backup_id, restore_job_id, manifest);
             }
 
             fn dropTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void {
@@ -1394,6 +1397,8 @@ fn deriveRestoreMetadataSpec(
     location_uri: []const u8,
     connection: []const u8,
     artifact_backup_id: []const u8,
+    restore_job_id: u64,
+    occupied_ranges: []const metadata_table_manager.RangeRecord,
     manifest: *const backups_api.TableBackupManifest,
 ) !RestoreMetadataSpec {
     try backups_api.validateRestoreManifest(alloc, manifest, manifest.backup_id);
@@ -1405,7 +1410,16 @@ fn deriveRestoreMetadataSpec(
         else => return err,
     };
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const ranges = try backups_api.deriveRestoreRanges(alloc, table.table_id, location_uri, connection, artifact_backup_id, manifest);
+    const ranges = try backups_api.deriveFreshRestoreRanges(
+        alloc,
+        table.table_id,
+        location_uri,
+        connection,
+        artifact_backup_id,
+        restore_job_id,
+        occupied_ranges,
+        manifest,
+    );
     errdefer {
         for (ranges) |record| metadata_table_manager.freeRange(alloc, record);
         alloc.free(ranges);
@@ -1541,13 +1555,22 @@ fn persistRestoreTableIntent(
     location_uri: []const u8,
     connection: []const u8,
     artifact_backup_id: []const u8,
+    restore_job_id: u64,
     manifest: *const backups_api.TableBackupManifest,
 ) !void {
-    var spec = try deriveRestoreMetadataSpec(alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
-    defer spec.deinit(alloc);
-
     var snapshot = try service.adminSnapshot();
     defer service.freeAdminSnapshot(&snapshot);
+    var spec = try deriveRestoreMetadataSpec(
+        alloc,
+        table_name,
+        location_uri,
+        connection,
+        artifact_backup_id,
+        restore_job_id,
+        snapshot.ranges,
+        manifest,
+    );
+    defer spec.deinit(alloc);
     if (tables_api.findTableByName(&snapshot, table_name)) |existing| {
         if (!try metadata_table_manager.restoreIntentTopologyCompatible(alloc, existing.*, snapshot.ranges, spec.table, spec.ranges))
             return error.TableAlreadyExists;
@@ -7718,11 +7741,12 @@ pub const ApiHttpServer = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const backups_api.TableBackupManifest,
     ) !bool {
         var attempt: usize = 0;
         while (attempt < 3) : (attempt += 1) {
-            return self.source.restoreTable(alloc, table_name, location_uri, connection, artifact_backup_id, manifest) catch |err| {
+            return self.source.restoreTable(alloc, table_name, location_uri, connection, artifact_backup_id, restore_job_id, manifest) catch |err| {
                 if (metadata_authority.isRetryableError(err)) return err;
                 if (backups_api.isArtifactIntegrityError(err)) return err;
                 return switch (err) {
@@ -9690,7 +9714,7 @@ pub const ApiHttpServer = struct {
                 destination_authorizer,
             ) catch return error.InvalidBackupRequest;
 
-            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, connection, backup_id, &manifest) catch |err| switch (err) {
+            if (self.restoreMetadataTableWithRetry(self.alloc, table_name, location_uri, connection, backup_id, request.restore_job_id, &manifest) catch |err| switch (err) {
                 error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
                 error.UnsupportedOperation => false,
                 error.InvalidBackupRequest => {
@@ -11372,6 +11396,7 @@ pub const ApiHttpServer = struct {
                     req.location,
                     restore_connection,
                     artifact_backup_id,
+                    if (cancellation) |token| token.job_id else 0,
                     &table_manifest,
                 ) catch |err| switch (err) {
                     error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => return error.NotLeader,
@@ -13407,6 +13432,7 @@ pub const ApiHttpServer = struct {
                         .{
                             .destination_authorization_fingerprint = state.destination_authorization_fingerprint,
                             .destination_authorization_principal = state.destination_authorization_principal,
+                            .restore_job_id = state.job_id,
                         },
                     ) catch |err| switch (err) {
                         // The local owned-table path reports durable completion as
@@ -37990,6 +38016,7 @@ test "api http server retries interrupted metadata restore publication" {
         "file:///backup",
         "test-backups",
         "daily",
+        901,
         &manifest,
     ));
     try std.testing.expectEqual(@as(usize, 2), source.attempts);
@@ -38025,7 +38052,7 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
         &shards,
     );
     defer manifest.deinit(alloc);
-    var spec = try deriveRestoreMetadataSpec(alloc, "docs", location_uri, "production-backups", "snap1", &manifest);
+    var spec = try deriveRestoreMetadataSpec(alloc, "docs", location_uri, "production-backups", "snap1", 901, &.{}, &manifest);
     defer spec.deinit(alloc);
 
     try std.testing.expectEqualStrings("", spec.table.restore_backup_id);

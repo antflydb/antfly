@@ -6490,6 +6490,16 @@ pub fn build(b: *std.Build) void {
             "backup manifest validation rejects ambiguous or unbound artifacts",
             "cluster backup manifest rejects incomplete coverage",
             "restore source identities are bounded and canonical",
+            "fresh restore ranges are deterministic per durable job and never reuse source identity",
+            "metadata raft apply store projects backup restore bootstrap source in placement intents",
+            "file replica catalog persists backup restore bootstrap records across reopen",
+            "metadata service keeps restore intent until runtime repair completes",
+            "metadata service keeps restore intent until placement bootstrap is normalized",
+            "metadata reconciler keeps restore dark when the third replica is isolated",
+            "placement topology bootstraps dark restore placements as a new voter generation",
+            "placement topology retains voter authority after restore descriptors clear",
+            "table provisioner restore rejects mismatched doc identity namespace",
+            "portable restore reassigns source identity namespace before publication",
             "portable backup integrity rejects changed staged bytes",
             "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
             "db incomplete deferred restore import recovers before runtime repair",
@@ -7103,6 +7113,7 @@ pub fn build(b: *std.Build) void {
             "standalone Lite adoption preserves deterministic embedded document identity",
             "standalone validates effective Lite CLI and config settings",
             "standalone metadata rolls back an undurable catalog mutation",
+            "standalone metadata restore derives fresh identity from durable job",
             "standalone metadata advertises a linearizable owned snapshot",
             "standalone metadata rejects corrupt catalog without double-freeing owned paths",
             "standalone metadata finalizes schema migration from resident runtime evidence",
@@ -10340,7 +10351,7 @@ pub fn build(b: *std.Build) void {
                 // measured the smaller storage-only closure.
                 .distributed => @as(usize, if (target.result.os.tag == .macos) 18 else 8) * 1024 * 1024 * 1024,
                 // This is deliberately a separate non-PIC product unit. The
-                // Its cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
+                // cold aarch64-macOS ReleaseFast build peaks near 2 GiB;
                 // the 10 GiB reservation keeps it serialized with the macOS
                 // storage kernel until both release runners confirm that.
                 .serverless => 10 * 1024 * 1024 * 1024,

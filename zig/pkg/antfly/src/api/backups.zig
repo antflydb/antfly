@@ -28,6 +28,7 @@ const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
 const bedrock = @import("../inference/bedrock.zig");
 const httpx = @import("httpx");
+const objectstore = @import("objectstore");
 const extension_domain = @import("../extensions/mod.zig");
 const google_auth = @import("antfly_google").auth;
 const backup_contract = @import("backup_contract.zig");
@@ -10809,11 +10810,155 @@ pub fn deriveRestoreRanges(
             connection,
             manifest.backup_id,
             artifact_backup_id,
+            shard.group_id,
+            false,
             shard,
         );
         initialized += 1;
     }
     return ranges;
+}
+
+pub fn deriveFreshRestoreRanges(
+    alloc: std.mem.Allocator,
+    table_id: u64,
+    location_uri: []const u8,
+    connection: []const u8,
+    artifact_backup_id: []const u8,
+    restore_job_id: u64,
+    occupied_ranges: []const metadata_table_manager.RangeRecord,
+    manifest: *const TableBackupManifest,
+) ![]metadata_table_manager.RangeRecord {
+    if (restore_job_id == 0) return error.InvalidBackupRequest;
+    if (manifest.shards.len == 0) return error.UnsupportedBackupFormat;
+    if (connection.len == 0 or connection.len > 256) return error.InvalidBackupRequest;
+    try validateBackupId(artifact_backup_id);
+
+    const ranges = try alloc.alloc(metadata_table_manager.RangeRecord, manifest.shards.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (ranges[0..initialized]) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(ranges);
+    }
+    for (manifest.shards, 0..) |shard, i| {
+        if (!group_ids.isDataGroupId(shard.group_id)) return error.UnsupportedBackupFormat;
+        const target_group_id = deriveFreshRestoreGroupId(
+            table_id,
+            location_uri,
+            connection,
+            artifact_backup_id,
+            restore_job_id,
+            occupied_ranges,
+            ranges[0..initialized],
+            manifest.backup_id,
+            shard,
+        ) orelse return error.RestoreGroupIdExhausted;
+        ranges[i] = try deriveRestoreRange(
+            alloc,
+            table_id,
+            location_uri,
+            connection,
+            manifest.backup_id,
+            artifact_backup_id,
+            target_group_id,
+            true,
+            shard,
+        );
+        initialized += 1;
+    }
+    return ranges;
+}
+
+fn deriveFreshRestoreGroupId(
+    table_id: u64,
+    location_uri: []const u8,
+    connection: []const u8,
+    artifact_backup_id: []const u8,
+    restore_job_id: u64,
+    occupied_ranges: []const metadata_table_manager.RangeRecord,
+    planned_ranges: []const metadata_table_manager.RangeRecord,
+    backup_id: []const u8,
+    shard: ShardSnapshot,
+) ?u64 {
+    var attempt: u64 = 0;
+    while (attempt < 64) : (attempt += 1) {
+        var hasher = std.hash.Wyhash.init(0x7265_7374_6f72_6532);
+        hashRestoreIdU64(&hasher, restore_job_id);
+        hashRestoreIdU64(&hasher, table_id);
+        hashRestoreIdU64(&hasher, shard.group_id);
+        hashRestoreIdField(&hasher, backup_id);
+        hashRestoreIdField(&hasher, artifact_backup_id);
+        hashRestoreIdField(&hasher, shard.snapshot_path);
+        hashRestoreIdField(&hasher, shard.start_key);
+        if (shard.end_key) |end_key| {
+            hasher.update(&.{1});
+            hashRestoreIdField(&hasher, end_key);
+        } else {
+            hasher.update(&.{0});
+        }
+        hashRestoreIdU64(&hasher, attempt);
+        const candidate = group_ids.dataGroupIdFromHash(hasher.final());
+        if (candidate == shard.group_id or findRangeByGroupId(planned_ranges, candidate) != null) continue;
+        if (findRangeByGroupId(occupied_ranges, candidate)) |occupied| {
+            if (restoreRangeMatchesShard(
+                occupied,
+                table_id,
+                location_uri,
+                connection,
+                backup_id,
+                artifact_backup_id,
+                shard,
+            )) return candidate;
+            continue;
+        }
+        return candidate;
+    }
+    return null;
+}
+
+fn hashRestoreIdU64(hasher: *std.hash.Wyhash, value: u64) void {
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, value, .big);
+    hasher.update(&encoded);
+}
+
+fn hashRestoreIdField(hasher: *std.hash.Wyhash, value: []const u8) void {
+    hashRestoreIdU64(hasher, @intCast(value.len));
+    hasher.update(value);
+}
+
+fn findRangeByGroupId(
+    ranges: []const metadata_table_manager.RangeRecord,
+    group_id: u64,
+) ?metadata_table_manager.RangeRecord {
+    for (ranges) |range| if (range.group_id == group_id) return range;
+    return null;
+}
+
+fn restoreRangeMatchesShard(
+    range: metadata_table_manager.RangeRecord,
+    table_id: u64,
+    location_uri: []const u8,
+    connection: []const u8,
+    backup_id: []const u8,
+    artifact_backup_id: []const u8,
+    shard: ShardSnapshot,
+) bool {
+    return range.table_id == table_id and
+        std.mem.eql(u8, range.start_key, shard.start_key) and
+        optionalBytesEqual(range.end_key, shard.end_key) and
+        std.mem.eql(u8, range.restore_backup_id, backup_id) and
+        std.mem.eql(u8, range.restore_artifact_backup_id, artifact_backup_id) and
+        std.mem.eql(u8, range.restore_location, location_uri) and
+        std.mem.eql(u8, range.restore_snapshot_path, shard.snapshot_path) and
+        std.mem.eql(u8, range.restore_connection, connection) and
+        range.restore_artifact_size_bytes == shard.artifact_size_bytes and
+        std.mem.eql(u8, range.restore_artifact_sha256, shard.artifact_sha256);
+}
+
+fn optionalBytesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
 }
 
 fn deriveRestoreRange(
@@ -10823,6 +10968,8 @@ fn deriveRestoreRange(
     connection: []const u8,
     backup_id: []const u8,
     artifact_backup_id: []const u8,
+    target_group_id: u64,
+    fresh_identity: bool,
     shard: ShardSnapshot,
 ) !metadata_table_manager.RangeRecord {
     const start_key = try alloc.dupe(u8, shard.start_key);
@@ -10842,10 +10989,13 @@ fn deriveRestoreRange(
     const restore_artifact_sha256 = try alloc.dupe(u8, shard.artifact_sha256);
     errdefer alloc.free(restore_artifact_sha256);
     return .{
-        .group_id = shard.group_id,
+        .group_id = target_group_id,
+        .range_id = if (fresh_identity) target_group_id else 0,
         .table_id = table_id,
         .start_key = start_key,
         .end_key = end_key,
+        .doc_identity_shard_id = if (fresh_identity) target_group_id else 0,
+        .doc_identity_range_id = if (fresh_identity) target_group_id else 0,
         .restore_backup_id = owned_backup_id,
         .restore_artifact_backup_id = owned_artifact_backup_id,
         .restore_location = restore_location,
@@ -10854,6 +11004,163 @@ fn deriveRestoreRange(
         .restore_artifact_size_bytes = shard.artifact_size_bytes,
         .restore_artifact_sha256 = restore_artifact_sha256,
     };
+}
+
+test "fresh restore ranges are deterministic per durable job and never reuse source identity" {
+    const alloc = std.testing.allocator;
+    const sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const shards = [_]ShardSnapshot{
+        .{
+            .group_id = 7001,
+            .start_key = "",
+            .end_key = "m",
+            .snapshot_path = "backup-a/groups/7001.afb",
+            .artifact_size_bytes = 11,
+            .artifact_sha256 = sha256,
+        },
+        .{
+            .group_id = 7002,
+            .start_key = "m",
+            .end_key = null,
+            .snapshot_path = "backup-a/groups/7002.afb",
+            .artifact_size_bytes = 12,
+            .artifact_sha256 = sha256,
+        },
+    };
+    const manifest: TableBackupManifest = .{
+        .format = .portable,
+        .backup_id = "backup-a",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = &shards,
+    };
+
+    const first = try deriveFreshRestoreRanges(
+        alloc,
+        42,
+        "s3://backups/prod",
+        "prod-backups",
+        "artifact-a",
+        901,
+        &.{},
+        &manifest,
+    );
+    defer {
+        for (first) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(first);
+    }
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    for (first, shards) |record, source| {
+        try std.testing.expect(record.group_id != source.group_id);
+        try std.testing.expectEqual(record.group_id, record.range_id);
+        try std.testing.expectEqual(record.group_id, record.doc_identity_shard_id);
+        try std.testing.expectEqual(record.group_id, record.doc_identity_range_id);
+    }
+
+    const retry = try deriveFreshRestoreRanges(
+        alloc,
+        42,
+        "s3://backups/prod",
+        "prod-backups",
+        "artifact-a",
+        901,
+        first,
+        &manifest,
+    );
+    defer {
+        for (retry) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(retry);
+    }
+    try std.testing.expectEqual(first[0].group_id, retry[0].group_id);
+    try std.testing.expectEqual(first[1].group_id, retry[1].group_id);
+
+    const next_job = try deriveFreshRestoreRanges(
+        alloc,
+        42,
+        "s3://backups/prod",
+        "prod-backups",
+        "artifact-a",
+        902,
+        &.{},
+        &manifest,
+    );
+    defer {
+        for (next_job) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(next_job);
+    }
+    try std.testing.expect(first[0].group_id != next_job[0].group_id);
+    try std.testing.expect(first[1].group_id != next_job[1].group_id);
+
+    const reversed_shards = [_]ShardSnapshot{ shards[1], shards[0] };
+    var reversed_manifest = manifest;
+    reversed_manifest.shards = &reversed_shards;
+    const reversed = try deriveFreshRestoreRanges(
+        alloc,
+        42,
+        "s3://backups/prod",
+        "prod-backups",
+        "artifact-a",
+        901,
+        &.{},
+        &reversed_manifest,
+    );
+    defer {
+        for (reversed) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(reversed);
+    }
+    try std.testing.expectEqual(first[0].group_id, reversed[1].group_id);
+    try std.testing.expectEqual(first[1].group_id, reversed[0].group_id);
+
+    const occupied = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = first[0].group_id,
+        .table_id = 999,
+        .start_key = "",
+    }};
+    const collision = try deriveFreshRestoreRanges(
+        alloc,
+        42,
+        "s3://backups/prod",
+        "prod-backups",
+        "artifact-a",
+        901,
+        &occupied,
+        &manifest,
+    );
+    defer {
+        for (collision) |record| metadata_table_manager.freeRange(alloc, record);
+        alloc.free(collision);
+    }
+    try std.testing.expect(collision[0].group_id != occupied[0].group_id);
+
+    var seen = std.AutoHashMapUnmanaged(u64, void).empty;
+    defer seen.deinit(alloc);
+    var job_id: u64 = 1;
+    while (job_id <= 128) : (job_id += 1) {
+        const sample = try deriveFreshRestoreRanges(
+            alloc,
+            42,
+            "s3://backups/prod",
+            "prod-backups",
+            "artifact-a",
+            job_id,
+            &.{},
+            &manifest,
+        );
+        defer {
+            for (sample) |record| metadata_table_manager.freeRange(alloc, record);
+            alloc.free(sample);
+        }
+        for (sample, shards) |record, source| {
+            try std.testing.expect(group_ids.isDataGroupId(record.group_id));
+            try std.testing.expect(record.group_id != source.group_id);
+            const entry = try seen.getOrPut(alloc, record.group_id);
+            try std.testing.expect(!entry.found_existing);
+        }
+    }
 }
 
 pub fn findShardSnapshot(manifest: *const TableBackupManifest, group_id: u64) ?*const ShardSnapshot {
@@ -12845,6 +13152,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol" {
             _: ?[]const u8,
             _: ?[]const u8,
             max_response_size: ?usize,
+            _: ?objectstore.CancellationToken,
         ) !object_storage.S3.TransportResponse {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             const parsed = try std.Uri.parse(url);

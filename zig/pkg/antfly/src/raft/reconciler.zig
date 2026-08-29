@@ -680,16 +680,24 @@ fn hashIntent(intent: PlacementIntent) u64 {
         hashU64(&hasher, 1);
         hashU64(&hasher, snapshot.from_node_id);
         hashU64(&hasher, snapshot.term);
-        hasher.update(snapshot.snapshot_id);
-        hasher.update(snapshot.uri);
+        hashBytes(&hasher, snapshot.snapshot_id);
+        hashBytes(&hasher, snapshot.uri);
     } else {
         hashU64(&hasher, 0);
     }
     if (intent.record.backup_restore_bootstrap) |backup| {
         hashU64(&hasher, 1);
-        hasher.update(backup.backup_id);
-        hasher.update(backup.location);
-        hasher.update(backup.snapshot_path);
+        hashBytes(&hasher, backup.backup_id);
+        hashBytes(&hasher, backup.artifact_backup_id);
+        hashBytes(&hasher, backup.location);
+        hashBytes(&hasher, backup.snapshot_path);
+        hashBytes(&hasher, backup.connection);
+        hashU64(&hasher, backup.artifact_size_bytes);
+        hashBytes(&hasher, backup.artifact_sha256);
+        hashU64(&hasher, backup.identity_table_id);
+        hashU64(&hasher, backup.identity_shard_id);
+        hashU64(&hasher, backup.identity_range_id);
+        hashU64(&hasher, @intFromBool(backup.reassign_identity_namespace));
     } else {
         hashU64(&hasher, 0);
     }
@@ -699,6 +707,11 @@ fn hashIntent(intent: PlacementIntent) u64 {
 fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
     var numeric = value;
     hasher.update(std.mem.asBytes(&numeric));
+}
+
+fn hashBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
+    hashU64(hasher, value.len);
+    hasher.update(value);
 }
 
 fn cloneIntent(alloc: std.mem.Allocator, intent: PlacementIntent) !PlacementIntent {

@@ -7531,11 +7531,45 @@ fn rangeRestoreIntentComplete(
     placements: []const raft_reconciler.PlacementIntent,
     progress: []const metadata_table_manager.RestoreProgressRecord,
 ) bool {
-    var found_any_placement = false;
+    var reference_placement: ?raft_reconciler.PlacementIntent = null;
+    var placement_count: usize = 0;
     for (placements) |intent| {
         if (intent.record.group_id != range.group_id) continue;
-        found_any_placement = true;
-        const restored = findRestoreProgress(progress, table_id, intent.record.local_node_id, range.group_id) orelse return false;
+        placement_count += 1;
+        if (reference_placement) |reference| {
+            const reference_fingerprint = metadata_table_manager.voterSetFingerprint(
+                reference.peer_node_ids,
+                reference.record.local_node_id,
+            );
+            const intent_fingerprint = metadata_table_manager.voterSetFingerprint(
+                intent.peer_node_ids,
+                intent.record.local_node_id,
+            );
+            if (!std.mem.eql(u8, &reference_fingerprint, &intent_fingerprint)) return false;
+        } else {
+            reference_placement = intent;
+        }
+        if (intent.record.bootstrap_mode != .persisted or
+            intent.record.snapshot_bootstrap != null or
+            intent.record.backup_restore_bootstrap != null)
+        {
+            return false;
+        }
+        var local_placement_count: usize = 0;
+        for (placements) |candidate| {
+            if (candidate.record.group_id == range.group_id and
+                candidate.record.local_node_id == intent.record.local_node_id)
+            {
+                local_placement_count += 1;
+            }
+        }
+        if (local_placement_count != 1) return false;
+        const restored = metadata_table_manager.findRestoreProgress(
+            progress,
+            table_id,
+            intent.record.local_node_id,
+            range.group_id,
+        ) orelse return false;
         if (!std.mem.eql(u8, restored.backup_id, restore_backup_id)) return false;
         if (!std.mem.eql(u8, restored.artifact_backup_id, range.restore_artifact_backup_id)) return false;
         if (!std.mem.eql(u8, restored.location, restore_location)) return false;
@@ -7543,7 +7577,11 @@ fn rangeRestoreIntentComplete(
         if (!std.mem.eql(u8, restored.artifact_sha256, range.restore_artifact_sha256)) return false;
         if (!restored.primary_restored or !restored.runtime_repair_complete) return false;
     }
-    return found_any_placement;
+    const reference = reference_placement orelse return false;
+    return placement_count == metadata_table_manager.normalizedVoterCount(
+        reference.peer_node_ids,
+        reference.record.local_node_id,
+    );
 }
 
 fn collectProjectedSplitObservations(
@@ -13804,6 +13842,23 @@ test "metadata service keeps restore intent until runtime repair completes" {
         .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .primary_restored = true, .runtime_repair_complete = false, .phase = "runtime_repair" },
     };
 
+    const isolated_third_replica_placements = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2, 3 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2, 3 } },
+    };
+    const isolated_third_replica_progress = [_]metadata_table_manager.RestoreProgressRecord{
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "new-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "new-artifact", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+    };
+    try std.testing.expect(!rangeRestoreIntentComplete(7, .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_artifact_backup_id = "snap1-artifacts",
+        .restore_snapshot_path = "snap/groups/7001",
+        .restore_artifact_sha256 = "new-artifact",
+    }, "snap1", "file:///tmp/backups", &isolated_third_replica_placements, &isolated_third_replica_progress));
+
     try std.testing.expect(!rangeRestoreIntentComplete(7, .{
         .group_id = 7001,
         .table_id = 7,
@@ -13837,6 +13892,104 @@ test "metadata service keeps restore intent until runtime repair completes" {
         .restore_snapshot_path = "snap/groups/7001",
         .restore_artifact_sha256 = "new-artifact",
     }, "snap1", "file:///tmp/backups", &placements, &stale_namespace_progress));
+}
+
+test "metadata service keeps restore intent until placement bootstrap is normalized" {
+    const range: metadata_table_manager.RangeRecord = .{
+        .group_id = 7001,
+        .table_id = 7,
+        .start_key = "",
+        .restore_backup_id = "snap1",
+        .restore_artifact_backup_id = "snap1-artifacts",
+        .restore_location = "file:///tmp/backups",
+        .restore_snapshot_path = "snap/groups/7001",
+        .restore_connection = "backups",
+        .restore_artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    };
+    const progress = [_]metadata_table_manager.RestoreProgressRecord{
+        .{ .table_id = 7, .node_id = 1, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+        .{ .table_id = 7, .node_id = 2, .group_id = 7001, .backup_id = "snap1", .artifact_backup_id = "snap1-artifacts", .location = "file:///tmp/backups", .snapshot_path = "snap/groups/7001", .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", .primary_restored = true, .runtime_repair_complete = true, .phase = "complete" },
+    };
+    const pending_normalization = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
+        .{
+            .record = .{
+                .group_id = 7001,
+                .replica_id = 2,
+                .local_node_id = 2,
+                .bootstrap_mode = .fetch_snapshot,
+                .backup_restore_bootstrap = .{
+                    .backup_id = "snap1",
+                    .artifact_backup_id = "snap1-artifacts",
+                    .location = "file:///tmp/backups",
+                    .snapshot_path = "snap/groups/7001",
+                    .connection = "backups",
+                    .artifact_size_bytes = 1,
+                    .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                },
+            },
+            .store_id = 0,
+            .peer_node_ids = &.{ 1, 2 },
+        },
+    };
+    try std.testing.expect(!rangeRestoreIntentComplete(
+        7,
+        range,
+        range.restore_backup_id,
+        range.restore_location,
+        &pending_normalization,
+        &progress,
+    ));
+
+    var persisted_backup = pending_normalization;
+    persisted_backup[1].record.bootstrap_mode = .persisted;
+    try std.testing.expect(!rangeRestoreIntentComplete(
+        7,
+        range,
+        range.restore_backup_id,
+        range.restore_location,
+        &persisted_backup,
+        &progress,
+    ));
+
+    const persisted_snapshot = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
+        .{
+            .record = .{
+                .group_id = 7001,
+                .replica_id = 2,
+                .local_node_id = 2,
+                .bootstrap_mode = .persisted,
+                .snapshot_bootstrap = .{
+                    .from_node_id = 1,
+                    .snapshot_id = "stale-snapshot",
+                },
+            },
+            .store_id = 0,
+            .peer_node_ids = &.{ 1, 2 },
+        },
+    };
+    try std.testing.expect(!rangeRestoreIntentComplete(
+        7,
+        range,
+        range.restore_backup_id,
+        range.restore_location,
+        &persisted_snapshot,
+        &progress,
+    ));
+
+    const normalized = [_]raft_reconciler.PlacementIntent{
+        .{ .record = .{ .group_id = 7001, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
+        .{ .record = .{ .group_id = 7001, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .persisted }, .store_id = 0, .peer_node_ids = &.{ 1, 2 } },
+    };
+    try std.testing.expect(rangeRestoreIntentComplete(
+        7,
+        range,
+        range.restore_backup_id,
+        range.restore_location,
+        &normalized,
+        &progress,
+    ));
 }
 
 test "metadata http service catalog cache is independent from volatile projection traffic" {

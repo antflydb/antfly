@@ -434,6 +434,14 @@ const Manager = struct {
         return error.InvalidGenerationTransition;
     }
 
+    fn validateRead(self: *Manager, id: u64, path: []const u8) !void {
+        platform.sync.lockYielding(&self.mutex);
+        defer self.mutex.unlock();
+        const entry = self.active.get(id) orelse return error.InvalidGenerationTransition;
+        if (entry.kind == .read and std.mem.eql(u8, entry.path, path)) return;
+        return error.InvalidGenerationTransition;
+    }
+
     fn validateStaging(self: *Manager, id: u64, path: []const u8) !void {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
@@ -599,6 +607,11 @@ pub const ReadLease = struct {
     id: u64,
     publication_lock: ?std.Io.File = null,
     active: bool = true,
+
+    pub fn validate(self: *const ReadLease, path: []const u8) !void {
+        if (!self.active or !std.mem.eql(u8, self.path, path)) return error.InvalidGenerationTransition;
+        try self.manager.validateRead(self.id, path);
+    }
 
     pub fn deinit(self: *@This()) void {
         if (!self.active) return;

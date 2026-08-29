@@ -361,6 +361,8 @@ pub const OpenOptions = struct {
     hbc_cache: ?*hbc_mod.Cache = null,
     lsm_root_generation: u64 = 0,
     staged_generation: ?*const generation_lifecycle.StagedGeneration = null,
+    borrowed_generation_read: ?*const generation_lifecycle.ReadLease = null,
+    borrowed_exclusive_generation_transition: ?*const generation_lifecycle.ExclusiveTransition = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     /// Optional storage-backend capacity probe. BackendRuntime configurators
     /// may install this while composing a DB open; it is resource policy input,
@@ -3377,9 +3379,19 @@ pub const DB = struct {
                     try configurator.configure(path, &opts);
                 }
             }
+            const borrowed_generation_guards = @intFromBool(opts.staged_generation != null) +
+                @intFromBool(opts.borrowed_generation_read != null) +
+                @intFromBool(opts.borrowed_exclusive_generation_transition != null);
+            if (borrowed_generation_guards > 1) return error.InvalidGenerationTransition;
             var generation_read_lease = if (opts.staged_generation) |staged_generation| staged_blk: {
                 try staged_generation.validatePath(path);
                 break :staged_blk null;
+            } else if (opts.borrowed_generation_read) |generation_read| read_blk: {
+                try generation_read.validate(path);
+                break :read_blk null;
+            } else if (opts.borrowed_exclusive_generation_transition) |exclusive_transition| exclusive_blk: {
+                try exclusive_transition.validate(path);
+                break :exclusive_blk null;
             } else if (opts.physical_root_mode == .external_backend)
                 null
             else

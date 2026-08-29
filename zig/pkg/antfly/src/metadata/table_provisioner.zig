@@ -851,8 +851,27 @@ pub fn applyRestoreIntentIfNeededWithOptions(
     range: table_manager.RangeRecord,
     open_options: backups_api.OpenOptions,
 ) !void {
-    const restore = resolveRestoreIntent(range, table) orelse return;
-    try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, .{
+    const restore = restoreSourceFromRecords(range, table, open_options) orelse return;
+    try backup_restore.applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, restore, .{
+        .expected_table_name = table.name,
+        .expected_identity_namespace = doc_identity.Namespace{
+            .table_id = table.table_id,
+            .shard_id = table_manager.rangeDocIdentityShardId(range),
+            .range_id = table_manager.rangeDocIdentityRangeId(range),
+        },
+        .reassign_identity_namespace = range.range_id != 0 and
+            range.doc_identity_shard_id != 0 and
+            range.doc_identity_range_id != 0,
+    });
+}
+
+pub fn restoreSourceFromRecords(
+    range: table_manager.RangeRecord,
+    table: table_manager.TableRecord,
+    open_options: backups_api.OpenOptions,
+) ?backup_restore.RestoreSource {
+    const restore = resolveRestoreIntent(range, table) orelse return null;
+    return .{
         .backup_id = restore.backup_id,
         .artifact_backup_id = restore.artifact_backup_id,
         .location = restore.location,
@@ -861,14 +880,7 @@ pub fn applyRestoreIntentIfNeededWithOptions(
         .expected_artifact_size_bytes = restore.artifact_size_bytes,
         .expected_artifact_sha256 = restore.artifact_sha256,
         .open_options = open_options,
-    }, .{
-        .expected_table_name = table.name,
-        .expected_identity_namespace = doc_identity.Namespace{
-            .table_id = table.table_id,
-            .shard_id = table_manager.rangeDocIdentityShardId(range),
-            .range_id = table_manager.rangeDocIdentityRangeId(range),
-        },
-    });
+    };
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
@@ -3258,6 +3270,59 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             },
         },
     ));
+
+    const fresh_group_id: u64 = 3001;
+    _ = try reconcileReplicaRootWithOptions(
+        std.testing.allocator,
+        replica_root,
+        100,
+        &.{ 100, fresh_group_id },
+        &.{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = tables_api.default_indexes_json,
+            .restore_backup_id = "snap1",
+            .restore_location = restore_location,
+            .placement_role = "data",
+        }},
+        &.{.{
+            .group_id = fresh_group_id,
+            .range_id = fresh_group_id,
+            .table_id = 7,
+            .start_key = "doc:a",
+            .end_key = null,
+            .doc_identity_shard_id = fresh_group_id,
+            .doc_identity_range_id = fresh_group_id,
+            .restore_backup_id = "snap1",
+            .restore_artifact_backup_id = "snap1",
+            .restore_location = restore_location,
+            .restore_snapshot_path = "snap1/groups/2001",
+            .restore_connection = "test-backups",
+            .restore_artifact_size_bytes = artifact_integrity.size_bytes,
+            .restore_artifact_sha256 = artifact_integrity.sha256,
+        }},
+        .{
+            .restore_open_options = .{
+                .node_config = &node_config,
+                .io = io_impl.io(),
+            },
+        },
+    );
+    const fresh_db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, replica_root, fresh_group_id);
+    defer std.testing.allocator.free(fresh_db_path);
+    const target_namespace = doc_identity.Namespace{
+        .table_id = 7,
+        .shard_id = fresh_group_id,
+        .range_id = fresh_group_id,
+    };
+    var restored = try db_mod.DB.open(std.testing.allocator, fresh_db_path, .{
+        .identity_namespace = target_namespace,
+    });
+    defer restored.close();
+    const restored_doc = (try restored.get(std.testing.allocator, "doc:a")) orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(restored_doc);
+    try std.testing.expect(std.mem.indexOf(u8, restored_doc, "\"alpha\"") != null);
+    try std.testing.expect(restored.core.identity_namespace.eql(target_namespace));
 }
 
 test "table provisioner removes indexes missing from metadata" {

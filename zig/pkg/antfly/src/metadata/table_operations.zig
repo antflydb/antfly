@@ -12,6 +12,7 @@ const tables_api = @import("../api/tables.zig");
 const table_manager = @import("table_manager.zig");
 
 pub const RestoreRequest = struct {
+    restore_job_id: u64,
     backup_id: []const u8,
     artifact_backup_id: []const u8,
     location: []const u8,
@@ -83,6 +84,7 @@ pub const Operations = struct {
 
     pub fn restore(self: Operations, alloc: std.mem.Allocator, ctx: operation.RequestContext, table_name: []const u8, request: RestoreRequest) !void {
         try validateNameAndContext(ctx, table_name);
+        if (request.restore_job_id == 0) return error.InvalidBackupRequest;
         try backups_api.validateBackupId(request.backup_id);
         try backups_api.validateBackupId(request.artifact_backup_id);
         if (request.location.len == 0 or request.location.len > 4096) return error.InvalidBackupRequest;

@@ -3840,6 +3840,8 @@ fn isRetryableMetadataBootstrapError(err: anyerror) bool {
         error.ConnectionRefused,
         error.BrokenPipe,
         error.EndOfStream,
+        error.Timeout,
+        error.NoAddressReturned,
         error.UnexpectedHttpStatus,
         error.NotListening,
         error.NotLeader,
@@ -3904,6 +3906,7 @@ test "data runtime treats metadata leadership churn as retryable bootstrap failu
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ProposalDropped));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.LeaderTransferInProgress));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.ConnectionRefused));
+    try std.testing.expect(isRetryableMetadataBootstrapError(error.NoAddressReturned));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.StoreRegistrationNotVisible));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MetadataIncarnationUnavailable));
     try std.testing.expect(isRetryableMetadataBootstrapError(error.MissingAuthoritativeBootstrapVoters));
@@ -4716,6 +4719,122 @@ fn captureRaftBatchLeaderTimeoutDiagnostics(context: RaftBatchLeaderTimeoutCaptu
 
 fn structuralRaftAppliedIndex(durable: ?u64, process_local: ?u64) ?u64 {
     return durable orelse process_local;
+}
+
+fn restoreProgressNeedsPublication(
+    projected: []const antfly.metadata.table_manager.RestoreProgressRecord,
+    local: antfly.metadata.table_manager.RestoreProgressRecord,
+) bool {
+    const existing = antfly.metadata.table_manager.findRestoreProgress(
+        projected,
+        local.table_id,
+        local.node_id,
+        local.group_id,
+    ) orelse return true;
+    return !antfly.metadata.table_manager.restoreProgressEquivalent(existing, local);
+}
+
+fn restoreProgressNeedsLocalRepair(progress: antfly.metadata.table_manager.RestoreProgressRecord) bool {
+    return progress.primary_restored and !progress.runtime_repair_complete;
+}
+
+fn restoreProgressMatchesActiveLocalIntent(
+    local_node_id: u64,
+    local_group_ids: []const u64,
+    ranges: []const antfly.metadata.table_manager.RangeRecord,
+    progress: antfly.metadata.table_manager.RestoreProgressRecord,
+) bool {
+    if (progress.node_id != local_node_id or !containsU64(local_group_ids, progress.group_id)) return false;
+    const range = findRangeByGroupId(ranges, progress.group_id) orelse return false;
+    if (range.table_id != progress.table_id or
+        range.restore_backup_id.len == 0 or
+        range.restore_location.len == 0)
+    {
+        return false;
+    }
+    return std.mem.eql(u8, range.restore_backup_id, progress.backup_id) and
+        std.mem.eql(u8, range.restore_artifact_backup_id, progress.artifact_backup_id) and
+        std.mem.eql(u8, range.restore_location, progress.location) and
+        (range.restore_snapshot_path.len == 0 or
+            std.mem.eql(u8, range.restore_snapshot_path, progress.snapshot_path)) and
+        std.mem.eql(u8, range.restore_artifact_sha256, progress.artifact_sha256);
+}
+
+fn localRestoreProgressNeedsScan(
+    local_node_id: u64,
+    local_group_ids: []const u64,
+    ranges: []const antfly.metadata.table_manager.RangeRecord,
+    projected: []const antfly.metadata.table_manager.RestoreProgressRecord,
+) bool {
+    for (local_group_ids) |group_id| {
+        const range = findRangeByGroupId(ranges, group_id) orelse continue;
+        if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) continue;
+        const existing = antfly.metadata.table_manager.findRestoreProgress(
+            projected,
+            range.table_id,
+            local_node_id,
+            group_id,
+        ) orelse return true;
+        if (!restoreProgressMatchesActiveLocalIntent(local_node_id, local_group_ids, ranges, existing)) return true;
+        if (!existing.primary_restored or !existing.runtime_repair_complete) return true;
+    }
+    return false;
+}
+
+test "data restore progress publishes only absent or changed state" {
+    const complete: antfly.metadata.table_manager.RestoreProgressRecord = .{
+        .table_id = 7,
+        .node_id = 2,
+        .group_id = 70,
+        .backup_id = "backup-7",
+        .artifact_backup_id = "artifact-7",
+        .location = "s3://backups/antfly",
+        .snapshot_path = "artifact-7.afb",
+        .artifact_sha256 = "sha256",
+        .primary_restored = true,
+        .runtime_repair_complete = true,
+        .phase = "complete",
+    };
+    try std.testing.expect(!restoreProgressNeedsPublication(&.{complete}, complete));
+    try std.testing.expect(restoreProgressNeedsPublication(&.{}, complete));
+
+    var repairing = complete;
+    repairing.runtime_repair_complete = false;
+    repairing.phase = "repairing";
+    try std.testing.expect(restoreProgressNeedsPublication(&.{repairing}, complete));
+    try std.testing.expect(restoreProgressNeedsLocalRepair(repairing));
+
+    var primary_pending = repairing;
+    primary_pending.primary_restored = false;
+    try std.testing.expect(!restoreProgressNeedsLocalRepair(primary_pending));
+    try std.testing.expect(!restoreProgressNeedsLocalRepair(complete));
+
+    var retrying = repairing;
+    retrying.last_error = "transient";
+    try std.testing.expect(restoreProgressNeedsLocalRepair(retrying));
+
+    const local_group_ids = [_]u64{70};
+    const active_ranges = [_]antfly.metadata.table_manager.RangeRecord{.{
+        .group_id = 70,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+        .restore_backup_id = "backup-7",
+        .restore_artifact_backup_id = "artifact-7",
+        .restore_location = "s3://backups/antfly",
+        .restore_snapshot_path = "artifact-7.afb",
+        .restore_artifact_sha256 = "sha256",
+    }};
+    try std.testing.expect(!localRestoreProgressNeedsScan(2, &local_group_ids, &active_ranges, &.{complete}));
+    try std.testing.expect(localRestoreProgressNeedsScan(2, &local_group_ids, &active_ranges, &.{repairing}));
+    try std.testing.expect(localRestoreProgressNeedsScan(2, &local_group_ids, &active_ranges, &.{}));
+    try std.testing.expect(restoreProgressMatchesActiveLocalIntent(2, &local_group_ids, &active_ranges, complete));
+
+    var superseded = complete;
+    superseded.backup_id = "backup-6";
+    try std.testing.expect(localRestoreProgressNeedsScan(2, &local_group_ids, &active_ranges, &.{superseded}));
+    try std.testing.expect(!restoreProgressMatchesActiveLocalIntent(2, &local_group_ids, &active_ranges, superseded));
+    try std.testing.expect(!localRestoreProgressNeedsScan(2, &local_group_ids, &.{}, &.{complete}));
 }
 
 pub const DataServer = struct {
@@ -9162,13 +9281,9 @@ pub const DataServer = struct {
         for (group_ids) |group_id| {
             if (group_id == metadata_group_id) continue;
             const range = findRangeByGroupId(ranges, group_id) orelse continue;
-            const table = findTableById(tables, range.table_id) orelse continue;
+            _ = findTableById(tables, range.table_id) orelse continue;
 
             const group_result = reconcile: {
-                var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse
-                    break :reconcile error.WriterLocked;
-                defer activity.deinit();
-
                 var group_id_one = [_]u64{group_id};
                 break :reconcile refresh_write_source.reconcileReplicaRootTablesWithWriteCache(
                     self.alloc,
@@ -9191,9 +9306,9 @@ pub const DataServer = struct {
     }
 
     fn finishVisibleProvisionedMetadataReconcile(self: *DataServer, schedule_startup_catch_up: bool) void {
-        // This is an in-place catalog reconciliation, not a filesystem-root
-        // publication. Retain the writer generation and retire only readers
-        // and artifact caches that could have observed the previous catalog.
+        // Root-replacing restore is fenced and advances its group generation
+        // inside reconciliation. Retire remaining metadata readers and
+        // artifact caches here without advancing every hosted group again.
         self.provisioned_storage.invalidateInPlaceMetadataReconcileCaches();
         self.pruneStaleVisibleWriteCaches();
         // The data runtime owns its remote-head bookkeeping. Ask that owner to
@@ -11586,6 +11701,14 @@ pub const DataServer = struct {
             snapshot.tables,
             snapshot.ranges,
         );
+        try self.reportLocalRestoreProgress(
+            snapshot.status.metadata_group_id,
+            registration.node_id,
+            local_group_ids,
+            snapshot.tables,
+            snapshot.ranges,
+            snapshot.restore_progresses,
+        );
         try self.storeStatusHeartbeatCacheReplace(report);
         self.last_store_status_report_at_ms = @intCast(@divTrunc(platform_time.monotonicNs(), std.time.ns_per_ms));
         self.clearMetadataBootstrapRetry();
@@ -11859,11 +11982,8 @@ pub const DataServer = struct {
             if (findRangeByGroupId(snapshot.ranges, group_id) != null) continue;
             const range = findRangeByGroupId(provisioning_ranges, group_id) orelse
                 return error.MissingProvisioningRange;
-            const table = findTableById(snapshot.tables, range.table_id) orelse
+            _ = findTableById(snapshot.tables, range.table_id) orelse
                 return error.MissingProvisioningTable;
-            var activity = write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse
-                return error.TransitionDestinationProvisioningBusy;
-            defer activity.deinit();
 
             var group_ids = [_]u64{group_id};
             const result = write_source.reconcileReplicaRootTablesWithWriteCache(
@@ -11874,7 +11994,10 @@ pub const DataServer = struct {
                 provisioning_ranges,
                 backend_runtime,
             );
-            _ = try result;
+            _ = result catch |err| switch (err) {
+                error.WriterLocked => return error.TransitionDestinationProvisioningBusy,
+                else => return err,
+            };
             reconciled = true;
         }
 
@@ -14691,6 +14814,14 @@ pub const DataServer = struct {
                 );
             };
             if (self.last_provision_fingerprint == next_fingerprint) {
+                try self.reportLocalRestoreProgress(
+                    head.metadata_group_id,
+                    registration.node_id,
+                    local_group_ids,
+                    snapshot.tables,
+                    provisioning_ranges,
+                    snapshot.restore_progresses,
+                );
                 self.last_provision_metadata_epoch = head.metadata_epoch;
                 return;
             }
@@ -14699,34 +14830,41 @@ pub const DataServer = struct {
             for (local_group_ids) |group_id| {
                 if (group_id == head.metadata_group_id) continue;
                 const range = findRangeByGroupId(provisioning_ranges, group_id) orelse continue;
-                const table = findTableById(snapshot.tables, range.table_id) orelse continue;
+                _ = findTableById(snapshot.tables, range.table_id) orelse continue;
 
                 {
-                    var activity = refresh_write_source.tryBeginGroupRefreshActivity(table.name, group_id) orelse {
-                        self.last_provision_metadata_epoch = head.metadata_epoch;
-                        self.last_provision_fingerprint = null;
-                        self.provisioned_root_refresh_dirty.store(true, .release);
-                        return;
-                    };
-                    defer activity.deinit();
-
                     var group_ids_one = [_]u64{group_id};
-                    const summary = try refresh_write_source.reconcileReplicaRootTablesWithWriteCache(
+                    const summary = refresh_write_source.reconcileReplicaRootTablesWithWriteCache(
                         self.alloc,
                         head.metadata_group_id,
                         group_ids_one[0..],
                         snapshot.tables,
                         provisioning_ranges,
                         backend_runtime,
-                    );
+                    ) catch |err| switch (err) {
+                        error.WriterLocked => {
+                            self.last_provision_metadata_epoch = head.metadata_epoch;
+                            self.last_provision_fingerprint = null;
+                            self.provisioned_root_refresh_dirty.store(true, .release);
+                            return;
+                        },
+                        else => return err,
+                    };
                     indexes_pending += summary.indexes_pending;
                 }
             }
-            // Provisioning reconciles schema and index metadata into the live
-            // DB; it does not publish a replacement filesystem root. Keep the
-            // writer's root generation stable while forcing query/artifact
-            // owners to observe the reconciled metadata.
+            // Root-replacing restore is fenced and advances its group
+            // generation inside reconciliation. Retire the remaining
+            // metadata readers and artifacts without a second generation bump.
             self.provisioned_storage.invalidateInPlaceMetadataReconcileCaches();
+            try self.reportLocalRestoreProgress(
+                head.metadata_group_id,
+                registration.node_id,
+                local_group_ids,
+                snapshot.tables,
+                provisioning_ranges,
+                snapshot.restore_progresses,
+            );
             break :blk next_fingerprint;
         };
 
@@ -14785,6 +14923,60 @@ pub const DataServer = struct {
 
         for (local_progress) |record| {
             try remote_metadata.upsertSchemaProgress(record);
+        }
+    }
+
+    fn reportLocalRestoreProgress(
+        self: *DataServer,
+        metadata_group_id: u64,
+        local_node_id: u64,
+        local_group_ids: []const u64,
+        tables: []const antfly.metadata.table_manager.TableRecord,
+        ranges: []const antfly.metadata.table_manager.RangeRecord,
+        projected_progress: []const antfly.metadata.table_manager.RestoreProgressRecord,
+    ) !void {
+        const remote_metadata = self.remote_metadata orelse return;
+        if (!localRestoreProgressNeedsScan(local_node_id, local_group_ids, ranges, projected_progress)) {
+            for (projected_progress) |record| {
+                if (record.node_id != local_node_id) continue;
+                if (restoreProgressMatchesActiveLocalIntent(local_node_id, local_group_ids, ranges, record)) continue;
+                try remote_metadata.removeRestoreProgress(record.table_id, record.node_id, record.group_id);
+            }
+            return;
+        }
+        const local_progress = try antfly.metadata.table_provisioner.collectLocalRestoreProgressUsingIo(
+            self.alloc,
+            (try self.ensureBackendRuntime()).io(),
+            self.liveRuntimeWriteSource().replica_root_dir,
+            metadata_group_id,
+            local_node_id,
+            local_group_ids,
+            tables,
+            ranges,
+        );
+        defer {
+            for (local_progress) |record| antfly.metadata.table_manager.freeRestoreProgress(self.alloc, record);
+            self.alloc.free(local_progress);
+        }
+
+        for (local_progress) |record| {
+            if (restoreProgressNeedsLocalRepair(record)) {
+                if (findTableById(tables, record.table_id)) |table| {
+                    _ = self.liveRuntimeWriteSource().requestRestoreRepairCatchUp(table.name, record.group_id);
+                }
+            }
+            if (!restoreProgressNeedsPublication(projected_progress, record)) continue;
+            try remote_metadata.upsertRestoreProgress(record);
+        }
+        for (projected_progress) |record| {
+            if (record.node_id != local_node_id) continue;
+            if (antfly.metadata.table_manager.findRestoreProgress(
+                local_progress,
+                record.table_id,
+                record.node_id,
+                record.group_id,
+            ) != null) continue;
+            try remote_metadata.removeRestoreProgress(record.table_id, record.node_id, record.group_id);
         }
     }
 
@@ -15111,6 +15303,9 @@ const PlacementTopologyIndex = struct {
                 .planned, .bootstrapping, .replaying => try appendUniqueNodeId(alloc, &group.transition_learners, intent.record.local_node_id),
                 .retiring => {},
             }
+            if (intent.record.backup_restore_bootstrap != null) {
+                group.bootstrap_generation = true;
+            }
         }
         for (split_transitions) |transition| {
             if (self.groups.getPtr(transition.destination_group_id)) |group| {
@@ -15144,7 +15339,7 @@ const PlacementTopologyIndex = struct {
 
     fn initialVoters(self: *const @This(), group_id: u64) ?[]const u64 {
         const group = self.groups.get(group_id) orelse return null;
-        if (group.pristine or group.bootstrap_generation) return group.peers.items;
+        if (group.pristine or group.bootstrap_generation or completeDarkGeneration(group)) return group.peers.items;
         // Transition peer lists intentionally include non-voting targets. A
         // partially projected transition cannot prove the complete incumbent
         // voter set, so an empty replica must wait for every member row rather
@@ -15155,9 +15350,16 @@ const PlacementTopologyIndex = struct {
 
     fn learners(self: *const @This(), group_id: u64) ?[]const u64 {
         const group = self.groups.get(group_id) orelse return null;
-        if (group.pristine or group.bootstrap_generation) return &.{};
+        if (group.pristine or group.bootstrap_generation or completeDarkGeneration(group)) return &.{};
         if (group.member_rows.items.len != group.peers.items.len) return null;
         return group.transition_learners.items;
+    }
+
+    fn completeDarkGeneration(group: Group) bool {
+        return group.peers.items.len > 0 and
+            group.member_rows.items.len == group.peers.items.len and
+            group.transition_voters.items.len == 0 and
+            group.transition_learners.items.len == group.member_rows.items.len;
     }
 };
 
@@ -15177,6 +15379,49 @@ test "placement topology bootstraps active split destination as a new voter gene
     defer topology.deinit();
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(706).?);
     try std.testing.expectEqual(@as(usize, 0), topology.learners(706).?.len);
+}
+
+test "placement topology bootstraps dark restore placements as a new voter generation" {
+    const restore = @import("../raft/catalog.zig").BackupRestoreBootstrapRecord{
+        .backup_id = "backup-706",
+        .artifact_backup_id = "artifact-706",
+        .location = "s3://backups/prod",
+        .snapshot_path = "backup-706/groups/705.afb",
+        .connection = "prod-backups",
+        .artifact_size_bytes = 1,
+        .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    };
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 706, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .fetch_snapshot, .backup_restore_bootstrap = restore }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+        .{ .record = .{ .group_id = 706, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .fetch_snapshot, .backup_restore_bootstrap = restore }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+        .{ .record = .{ .group_id = 706, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .fetch_snapshot, .backup_restore_bootstrap = restore }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping },
+    };
+    var topology = try PlacementTopologyIndex.initForSnapshot(std.testing.allocator, &intents, &.{});
+    defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(706).?);
+    try std.testing.expectEqual(@as(usize, 0), topology.learners(706).?.len);
+}
+
+test "placement topology retains voter authority after restore descriptors clear" {
+    const intents = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 707, .replica_id = 1, .local_node_id = 1, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+        .{ .record = .{ .group_id = 707, .replica_id = 2, .local_node_id = 2, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+        .{ .record = .{ .group_id = 707, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+    };
+    var topology = try PlacementTopologyIndex.init(std.testing.allocator, &intents);
+    defer topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, topology.initialVoters(707).?);
+    try std.testing.expectEqual(@as(usize, 0), topology.learners(707).?.len);
+
+    const mixed_relocation = [_]antfly.raft.PlacementIntent{
+        .{ .record = .{ .group_id = 708, .replica_id = 1, .local_node_id = 1 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .serving },
+        .{ .record = .{ .group_id = 708, .replica_id = 2, .local_node_id = 2 }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .draining, .relocation_generation = 2 },
+        .{ .record = .{ .group_id = 708, .replica_id = 3, .local_node_id = 3, .bootstrap_mode = .fetch_snapshot }, .peer_node_ids = &.{ 1, 2, 3 }, .serving_state = .bootstrapping, .relocation_generation = 2 },
+    };
+    var mixed_topology = try PlacementTopologyIndex.init(std.testing.allocator, &mixed_relocation);
+    defer mixed_topology.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, mixed_topology.initialVoters(708).?);
+    try std.testing.expectEqualSlices(u64, &.{3}, mixed_topology.learners(708).?);
 }
 
 test "placement topology uses authoritative split peer set during partial projection" {
@@ -15224,6 +15469,16 @@ test "placement topology refuses partial transition bootstrap voters" {
     var topology = try PlacementTopologyIndex.init(std.testing.allocator, &partial);
     defer topology.deinit();
     try std.testing.expect(topology.initialVoters(704) == null);
+
+    const one_dark_row = [_]antfly.raft.PlacementIntent{.{
+        .record = .{ .group_id = 709, .replica_id = 4, .local_node_id = 4, .bootstrap_mode = .fetch_snapshot },
+        .peer_node_ids = &.{ 1, 2, 3, 4 },
+        .serving_state = .bootstrapping,
+        .relocation_generation = 9,
+    }};
+    var dark_topology = try PlacementTopologyIndex.init(std.testing.allocator, &one_dark_row);
+    defer dark_topology.deinit();
+    try std.testing.expect(dark_topology.initialVoters(709) == null);
 }
 
 fn appendOwnedPeerRouteUpsert(
@@ -16104,6 +16359,7 @@ const RemoteMetadataSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const antfly.public_api.backups.TableBackupManifest,
     ) !void {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
@@ -16112,6 +16368,7 @@ const RemoteMetadataSource = struct {
             .artifact_backup_id = artifact_backup_id,
             .location = location_uri,
             .connection = connection,
+            .restore_job_id = restore_job_id,
             .manifest = manifest.*,
         }, .{});
         defer alloc.free(body);
@@ -16391,6 +16648,31 @@ const RemoteMetadataSource = struct {
                 try client.upsertSchemaProgress(base_uri, ctx);
             }
         }.call, body);
+    }
+
+    fn upsertRestoreProgress(self: *RemoteMetadataSource, record: antfly.metadata.table_manager.RestoreProgressRecord) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const body = try stringifyJsonAlloc(scratch, record);
+        try self.withMetadataApiClient(void, struct {
+            fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, ctx: []const u8) !void {
+                try client.upsertRestoreProgress(base_uri, ctx);
+            }
+        }.call, body);
+    }
+
+    fn removeRestoreProgress(self: *RemoteMetadataSource, table_id: u64, node_id: u64, group_id: u64) !void {
+        try self.withMetadataApiClient(void, struct {
+            fn call(
+                _: *RemoteMetadataSource,
+                client: *antfly.metadata_http_client.MetadataHttpClient,
+                base_uri: []const u8,
+                ids: [3]u64,
+            ) !void {
+                try client.removeRestoreProgress(base_uri, ids[0], ids[1], ids[2]);
+            }
+        }.call, .{ table_id, node_id, group_id });
     }
 };
 
@@ -19738,7 +20020,6 @@ test "data raft replica retirement removes only retired group apply state" {
     try std.testing.expect(!apply_sm.apply_outcomes.contains(.{ .group_id = retired_group_id, .index = 9 }));
     try std.testing.expectEqual(@as(usize, 1), apply_sm.apply_outcomes.count());
     try std.testing.expectEqual(.pending, apply_sm.apply_outcomes.get(.{ .group_id = active_group_id, .index = 12 }).?.outcome);
-
     try host.addGroup(.{
         .group_id = retired_group_id,
         .local_node_id = 1,
@@ -25623,7 +25904,7 @@ test "data runtime keeps serving when store status metadata request is retryable
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-status-retry", .{tmp.sub_path});
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-status-timeout", .{tmp.sub_path});
     defer alloc.free(replica_root_dir);
 
     var backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{});
@@ -25631,7 +25912,7 @@ test "data runtime keeps serving when store status metadata request is retryable
     const remote_metadata = try alloc.create(RemoteMetadataSource);
     const metadata_api_urls = [_][]const u8{"http://metadata.test"};
     remote_metadata.* = try RemoteMetadataSource.init(alloc, &metadata_api_urls, backend_runtime.ptr().apiIoImpl().?);
-    remote_metadata.test_faults.fetch_head_error = error.NotLeader;
+    remote_metadata.test_faults.fetch_head_error = error.Timeout;
 
     var server: DataServer = .{
         .alloc = alloc,

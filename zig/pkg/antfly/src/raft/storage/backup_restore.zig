@@ -121,6 +121,7 @@ fn validateExpectedArtifactBinding(
 pub const RestoreOptions = struct {
     expected_table_name: ?[]const u8 = null,
     expected_identity_namespace: ?doc_identity.Namespace = null,
+    reassign_identity_namespace: bool = false,
 };
 
 pub fn groupDbPathFromReplicaRoot(alloc: std.mem.Allocator, replica_root_dir: []const u8, group_id: u64) ![]u8 {
@@ -294,6 +295,7 @@ fn publishedRestoreAlreadyApplied(
     path: []const u8,
     group_id: u64,
     restore: RestoreSource,
+    expected_identity_namespace: ?doc_identity.Namespace,
 ) !bool {
     var generation_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, path)) orelse
         return false;
@@ -302,7 +304,33 @@ fn publishedRestoreAlreadyApplied(
         error.RestoreIdentityMismatch => return false,
         else => return err,
     };
+    if (expected_identity_namespace) |expected| {
+        if (!try restoredIdentityNamespaceMatches(alloc, path, expected, &generation_read, null)) return false;
+    }
     return true;
+}
+
+fn restoredIdentityNamespaceMatches(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    expected: doc_identity.Namespace,
+    borrowed_generation_read: ?*const db_mod.generation_lifecycle.ReadLease,
+    borrowed_exclusive_transition: ?*const db_mod.generation_lifecycle.ExclusiveTransition,
+) !bool {
+    var db = db_mod.DB.open(alloc, path, .{
+        .open_mode = .query_readonly,
+        .identity_namespace = expected,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .start_optional_runtime_workers = false,
+        .borrowed_generation_read = borrowed_generation_read,
+        .borrowed_exclusive_generation_transition = borrowed_exclusive_transition,
+    }) catch |err| switch (err) {
+        error.IdentityNamespaceMismatch => return false,
+        else => return err,
+    };
+    defer db.close();
+    return db.core.identity_namespace.eql(expected);
 }
 
 pub fn validateImportedRestoreIdentity(
@@ -365,8 +393,23 @@ pub fn applyBackupRestoreFromRecordWithOptions(
         .expected_artifact_sha256 = restore.artifact_sha256,
         .open_options = open_options,
     };
-    if (try publishedRestoreAlreadyApplied(alloc, path, group_id, source)) return;
-    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, source, .{});
+    const reassign_identity_namespace = restore.reassign_identity_namespace;
+    const expected_identity_namespace: ?doc_identity.Namespace = if (reassign_identity_namespace) .{
+        .table_id = restore.identity_table_id,
+        .shard_id = restore.identity_shard_id,
+        .range_id = restore.identity_range_id,
+    } else null;
+    if (try publishedRestoreAlreadyApplied(
+        alloc,
+        path,
+        group_id,
+        source,
+        expected_identity_namespace,
+    )) return;
+    try applyRestoreSnapshotToPathWithOptions(alloc, path, group_id, source, .{
+        .expected_identity_namespace = expected_identity_namespace,
+        .reassign_identity_namespace = reassign_identity_namespace,
+    });
 }
 
 fn prepareRestoreSnapshotIfNeeded(
@@ -395,7 +438,20 @@ fn prepareRestoreSnapshotIfNeeded(
             // generation is sealed and atomically published. Its content hash
             // is therefore the idempotence proof; rescanning the external
             // artifact would be weaker, O(artifact size), and racy.
-            return null;
+            if (options.expected_identity_namespace) |expected| {
+                const exclusive_transition: ?*const db_mod.generation_lifecycle.ExclusiveTransition =
+                    if (comptime @TypeOf(transition.*) == db_mod.generation_lifecycle.ExclusiveTransition)
+                        transition
+                    else
+                        null;
+                if (try restoredIdentityNamespaceMatches(
+                    alloc,
+                    path,
+                    expected,
+                    null,
+                    exclusive_transition,
+                )) return null;
+            } else return null;
         }
     }
 
@@ -411,6 +467,8 @@ fn prepareRestoreSnapshot(
     restore: RestoreSource,
     options: RestoreOptions,
 ) !db_mod.generation_lifecycle.StagedGeneration {
+    if (options.reassign_identity_namespace and options.expected_identity_namespace == null)
+        return error.InvalidBackupRequest;
     var location = try openRestoreLocation(alloc, restore, io);
     defer location.deinit(alloc);
     var owned_manifest: ?backups_api.TableBackupManifest = null;
@@ -476,6 +534,7 @@ fn prepareRestoreSnapshot(
     std.log.info("native restore staged generation phase=materialization", .{});
     try db_mod.DB.restoreSnapshotToDeferredRuntimeRepairWithIo(&staged_generation, alloc, io, snapshot_root, staged_path, .{
         .identity_namespace = options.expected_identity_namespace,
+        .prefer_existing_identity_namespace = options.reassign_identity_namespace,
     }, .{
         .backup_id = restore.backup_id,
         .location = restoreIdentityLocation(restore),
@@ -483,6 +542,14 @@ fn prepareRestoreSnapshot(
         .snapshot_path = snapshot_path,
         .group_id = group_id,
     });
+    if (options.reassign_identity_namespace) {
+        try reassignStagedIdentityNamespace(
+            &staged_generation,
+            alloc,
+            staged_path,
+            options.expected_identity_namespace.?,
+        );
+    }
     std.log.info("native restore staged generation phase=prepared", .{});
     return staged_generation;
 }
@@ -527,6 +594,9 @@ fn applyPortableRestore(
         .import_derived_indexes = true,
         .embedding_source_fields = embedding_source_fields,
     });
+    if (options.reassign_identity_namespace) {
+        try db.reassignIdentityNamespaceForInternalTransition(options.expected_identity_namespace.?);
+    }
     // Go portable AFBs may contain portable logical artifacts (for example
     // embedding batches) as well as old on-disk index directories. Keep the
     // logical artifacts in the DocStore, but drop runtime index directories so
@@ -546,6 +616,22 @@ fn applyPortableRestore(
         shard.snapshot_path,
         group_id,
     );
+}
+
+fn reassignStagedIdentityNamespace(
+    staged_generation: *const db_mod.generation_lifecycle.StagedGeneration,
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    namespace: doc_identity.Namespace,
+) !void {
+    var db = try db_mod.DB.open(alloc, path, .{
+        .identity_namespace = namespace,
+        .prefer_existing_identity_namespace = true,
+        .start_index_workers = false,
+        .staged_generation = staged_generation,
+    });
+    defer db.close();
+    try db.reassignIdentityNamespaceForInternalTransition(namespace);
 }
 
 fn resolveRestoreShard(
@@ -861,4 +947,115 @@ test "backup restore bootstrap deduplicates exact content across source aliases 
         error.GenerationTransitionActive,
         applyBackupRestoreFromRecord(alloc, replica_root_dir, group_id, different),
     );
+}
+
+test "portable restore reassigns source identity namespace before publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-reassign-source", .{tmp.sub_path});
+    defer alloc.free(source_path);
+    const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-reassign-backup", .{tmp.sub_path});
+    defer alloc.free(backup_root);
+    const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-reassign-target", .{tmp.sub_path});
+    defer alloc.free(target_path);
+    defer destroyPathIfExists(source_path);
+    defer destroyPathIfExists(backup_root);
+    defer destroyPathIfExists(target_path);
+
+    const source_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 2001, .range_id = 97001 };
+    var portable = std.ArrayList(u8).empty;
+    defer portable.deinit(alloc);
+    {
+        var source = try db_mod.DB.open(alloc, source_path, .{ .identity_namespace = source_namespace });
+        defer source.close();
+        try source.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .timestamp_ns = 1,
+            .sync_level = .full_index,
+        });
+        try portable_backup.exportPortable(alloc, source.core.store, &portable);
+    }
+
+    const snapshot_path = "snap-portable/groups/2001.afb";
+    const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ backup_root, snapshot_path });
+    defer alloc.free(artifact_path);
+    try writeFile(artifact_path, portable.items);
+    var integrity = try backups_api.artifactIntegrityAlloc(alloc, io, .portable, artifact_path);
+    defer integrity.deinit(alloc);
+
+    const cwd = try std.process.currentPathAlloc(io, alloc);
+    defer alloc.free(cwd);
+    const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
+    defer alloc.free(backup_root_abs);
+    const location = try std.fmt.allocPrint(alloc, "file://{s}", .{backup_root_abs});
+    defer alloc.free(location);
+    const shards = [_]backups_api.ShardSnapshot{.{
+        .group_id = 2001,
+        .start_key = "",
+        .snapshot_path = snapshot_path,
+        .artifact_size_bytes = integrity.size_bytes,
+        .artifact_sha256 = integrity.sha256,
+    }};
+    const manifest: backups_api.TableBackupManifest = .{
+        .format = .portable,
+        .backup_id = "snap-portable",
+        .table_name = "docs",
+        .description = "",
+        .schema_json = "",
+        .read_schema_json = "",
+        .indexes_json = "{}",
+        .replication_sources_json = "[]",
+        .shards = @constCast(&shards),
+    };
+    const target_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 3001, .range_id = 3001 };
+    const restore_source: RestoreSource = .{
+        .backup_id = "snap-portable",
+        .artifact_backup_id = "snap-portable",
+        .location = location,
+        .identity_location = "s3://backups/snap-portable",
+        .snapshot_path = snapshot_path,
+        .authority = .staged_local,
+        .expected_artifact_size_bytes = integrity.size_bytes,
+        .expected_artifact_sha256 = integrity.sha256,
+        .manifest = &manifest,
+        .io = io,
+    };
+    const restore_options: RestoreOptions = .{
+        .expected_table_name = "docs",
+        .expected_identity_namespace = target_namespace,
+        .reassign_identity_namespace = true,
+    };
+    try applyRestoreSnapshotToPathWithOptions(alloc, target_path, 3001, restore_source, restore_options);
+    {
+        var generation_read = (try db_mod.generation_lifecycle.acquirePublishedGenerationRead(alloc, target_path)) orelse
+            return error.TestExpectedEqual;
+        defer generation_read.deinit();
+        try std.testing.expect(try restoredIdentityNamespaceMatches(
+            alloc,
+            target_path,
+            target_namespace,
+            &generation_read,
+            null,
+        ));
+        try std.testing.expect(!try restoredIdentityNamespaceMatches(
+            alloc,
+            target_path,
+            source_namespace,
+            &generation_read,
+            null,
+        ));
+    }
+    try applyRestoreSnapshotToPathWithOptions(alloc, target_path, 3001, restore_source, restore_options);
+
+    var restored = try db_mod.DB.open(alloc, target_path, .{ .identity_namespace = target_namespace });
+    defer restored.close();
+    try std.testing.expect(restored.core.identity_namespace.eql(target_namespace));
+    const restored_doc = (try restored.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(restored_doc);
+    try std.testing.expect(std.mem.indexOf(u8, restored_doc, "\"alpha\"") != null);
 }

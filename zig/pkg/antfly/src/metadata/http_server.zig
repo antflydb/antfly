@@ -96,6 +96,7 @@ pub const AdminSource = struct {
             location_uri: []const u8,
             connection: []const u8,
             artifact_backup_id: []const u8,
+            restore_job_id: u64,
             manifest: *const backups_api.TableBackupManifest,
         ) anyerror!void = null,
         drop_table: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) anyerror!void = null,
@@ -189,10 +190,11 @@ pub const AdminSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const backups_api.TableBackupManifest,
     ) !void {
         const fn_ptr = self.vtable.restore_table orelse return error.UnsupportedOperation;
-        return try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+        return try fn_ptr(self.ptr, alloc, table_name, location_uri, connection, artifact_backup_id, restore_job_id, manifest);
     }
 
     pub fn dropTable(self: AdminSource, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -527,10 +529,11 @@ pub const AdminSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const backups_api.TableBackupManifest,
     ) !void {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, restore_job_id, manifest);
         try flushMetadataServiceMutation(svc);
     }
 
@@ -873,10 +876,11 @@ pub const AdminSource = struct {
         location_uri: []const u8,
         connection: []const u8,
         artifact_backup_id: []const u8,
+        restore_job_id: u64,
         manifest: *const backups_api.TableBackupManifest,
     ) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, manifest);
+        try persistRestoreTableIntent(svc, alloc, table_name, location_uri, connection, artifact_backup_id, restore_job_id, manifest);
         try flushMetadataHttpServiceMutation(svc);
     }
 
@@ -1824,7 +1828,7 @@ pub const MetadataHttpServer = struct {
 
     fn restoreTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, request: table_operations.RestoreRequest) !void {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return self.source.restoreTable(alloc, table_name, request.location, request.connection, request.artifact_backup_id, &request.manifest);
+        return self.source.restoreTable(alloc, table_name, request.location, request.connection, request.artifact_backup_id, request.restore_job_id, &request.manifest);
     }
 
     fn dropTableOperation(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8) !void {
@@ -2130,6 +2134,7 @@ fn testInternalTableRestoreRequestBodyAlloc(
         }},
     };
     return try std.json.Stringify.valueAlloc(alloc, InternalTableRestoreRequest{
+        .restore_job_id = 901,
         .backup_id = backup_id,
         .artifact_backup_id = backup_id,
         .location = location,
@@ -2196,6 +2201,8 @@ fn loadRestoreMetadataSpec(
     location_uri: []const u8,
     connection: []const u8,
     artifact_backup_id: []const u8,
+    restore_job_id: u64,
+    occupied_ranges: []const metadata_table_manager.RangeRecord,
     manifest: *const backups_api.TableBackupManifest,
 ) !RestoreMetadataSpec {
     try backups_api.validateTableManifest(alloc, manifest, manifest.backup_id);
@@ -2206,12 +2213,14 @@ fn loadRestoreMetadataSpec(
         return error.InvalidBackupRequest;
     };
     errdefer metadata_table_manager.freeTable(alloc, table);
-    const ranges = try backups_api.deriveRestoreRanges(
+    const ranges = try backups_api.deriveFreshRestoreRanges(
         alloc,
         table.table_id,
         location_uri,
         connection,
         artifact_backup_id,
+        restore_job_id,
+        occupied_ranges,
         manifest,
     );
     errdefer {
@@ -2231,20 +2240,22 @@ fn persistRestoreTableIntent(
     location_uri: []const u8,
     connection: []const u8,
     artifact_backup_id: []const u8,
+    restore_job_id: u64,
     manifest: *const backups_api.TableBackupManifest,
 ) !void {
+    var snapshot = try service_impl.adminSnapshot();
+    defer service_impl.freeAdminSnapshot(&snapshot);
     var spec = try loadRestoreMetadataSpec(
         alloc,
         table_name,
         location_uri,
         connection,
         artifact_backup_id,
+        restore_job_id,
+        snapshot.ranges,
         manifest,
     );
     defer spec.deinit(alloc);
-
-    var snapshot = try service_impl.adminSnapshot();
-    defer service_impl.freeAdminSnapshot(&snapshot);
     if (findTableByName(&snapshot, table_name)) |existing| {
         if (!try metadata_table_manager.restoreIntentTopologyCompatible(alloc, existing.*, snapshot.ranges, spec.table, spec.ranges))
             return error.TableAlreadyExists;
@@ -4618,6 +4629,7 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             location_uri: []const u8,
             connection: []const u8,
             artifact_backup_id: []const u8,
+            restore_job_id: u64,
             manifest: *const backups_api.TableBackupManifest,
         ) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -4625,6 +4637,7 @@ test "metadata http server accepts internal reallocate and split merge routes" {
             try std.testing.expectEqualStrings("file:///tmp/out", location_uri);
             try std.testing.expectEqualStrings("test-backups", connection);
             try std.testing.expectEqualStrings("snap1", artifact_backup_id);
+            try std.testing.expectEqual(@as(u64, 901), restore_job_id);
             try std.testing.expectEqualStrings("snap1", manifest.backup_id);
             try std.testing.expectEqualStrings("docs", manifest.table_name);
             self.restore_count += 1;
@@ -5125,7 +5138,7 @@ test "metadata http server returns 400 for invalid internal restore backup locat
 
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-        fn restoreTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: *const backups_api.TableBackupManifest) !void {
+        fn restoreTable(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: []const u8, _: u64, _: *const backups_api.TableBackupManifest) !void {
             return error.MissingEndpoint;
         }
     };

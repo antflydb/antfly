@@ -77,6 +77,10 @@ pub const RequestContext = struct {
     /// Credential identity that authorized durable background destinations.
     /// Workers re-resolve this principal against the live user/key store.
     destination_authorization_principal: []const u8 = "",
+    /// Stable durable restore job identity. Retries keep this value while
+    /// attempt ids change, so distributed restore can derive one Raft
+    /// generation exactly once.
+    restore_job_id: u64 = 0,
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
         if (self.cancellation.isCancelled()) return error.Canceled;

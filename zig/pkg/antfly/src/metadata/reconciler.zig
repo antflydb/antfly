@@ -1288,7 +1288,11 @@ fn backupRestoreBootstrapEqual(
         std.mem.eql(u8, a.?.snapshot_path, b.?.snapshot_path) and
         std.mem.eql(u8, a.?.connection, b.?.connection) and
         a.?.artifact_size_bytes == b.?.artifact_size_bytes and
-        std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256);
+        std.mem.eql(u8, a.?.artifact_sha256, b.?.artifact_sha256) and
+        a.?.identity_table_id == b.?.identity_table_id and
+        a.?.identity_shard_id == b.?.identity_shard_id and
+        a.?.identity_range_id == b.?.identity_range_id and
+        a.?.reassign_identity_namespace == b.?.reassign_identity_namespace;
 }
 
 fn findPlacementIntent(intents: []const raft_reconciler.PlacementIntent, group_id: u64, local_node_id: u64) ?raft_reconciler.PlacementIntent {
@@ -1333,7 +1337,7 @@ fn normalizeRestoreBootstrapIntent(
         range.restore_snapshot_path,
         range.restore_artifact_sha256,
     )) |progress| {
-        if (!progress.primary_restored) return effective;
+        if (!progress.primary_restored or !progress.runtime_repair_complete) return effective;
         effective.record.bootstrap_mode = .persisted;
         effective.record.snapshot_bootstrap = null;
         effective.record.backup_restore_bootstrap = null;
@@ -1348,9 +1352,66 @@ fn normalizeRestoreBootstrapIntent(
             .connection = range.restore_connection,
             .artifact_size_bytes = range.restore_artifact_size_bytes,
             .artifact_sha256 = range.restore_artifact_sha256,
+            .identity_table_id = if (range.range_id != 0 and range.doc_identity_shard_id != 0 and range.doc_identity_range_id != 0) table.table_id else 0,
+            .identity_shard_id = if (range.range_id != 0 and range.doc_identity_shard_id != 0 and range.doc_identity_range_id != 0) table_manager.rangeDocIdentityShardId(range) else 0,
+            .identity_range_id = if (range.range_id != 0 and range.doc_identity_shard_id != 0 and range.doc_identity_range_id != 0) table_manager.rangeDocIdentityRangeId(range) else 0,
+            .reassign_identity_namespace = range.range_id != 0 and
+                range.doc_identity_shard_id != 0 and
+                range.doc_identity_range_id != 0,
         };
     }
     return effective;
+}
+
+fn restorePlacementServingBlocked(
+    current: CurrentMetadataState,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    intent: raft_reconciler.PlacementIntent,
+) bool {
+    const range = findRangeRecord(ranges, intent.record.group_id) orelse return false;
+    const table = findTableRecord(tables, range.table_id) orelse return false;
+    if (range.restore_backup_id.len == 0 or range.restore_location.len == 0) return false;
+
+    for (intent.peer_node_ids) |node_id| {
+        if (!restoreProgressCompleteForRange(current.restore_progresses, table.table_id, node_id, range)) return true;
+    }
+    if (!containsU64(intent.peer_node_ids, intent.record.local_node_id) and
+        !restoreProgressCompleteForRange(current.restore_progresses, table.table_id, intent.record.local_node_id, range))
+    {
+        return true;
+    }
+    return intent.peer_node_ids.len == 0 and
+        !restoreProgressCompleteForRange(current.restore_progresses, table.table_id, intent.record.local_node_id, range);
+}
+
+fn restoreProgressCompleteForRange(
+    records: []const table_manager.RestoreProgressRecord,
+    table_id: u64,
+    node_id: u64,
+    range: table_manager.RangeRecord,
+) bool {
+    for (records) |record| {
+        if (record.table_id != table_id or record.node_id != node_id or record.group_id != range.group_id) continue;
+        if (!std.mem.eql(u8, record.backup_id, range.restore_backup_id)) continue;
+        if (!std.mem.eql(u8, record.artifact_backup_id, range.restore_artifact_backup_id)) continue;
+        if (!std.mem.eql(u8, record.location, range.restore_location)) continue;
+        if (!std.mem.eql(u8, record.snapshot_path, range.restore_snapshot_path)) continue;
+        if (!std.mem.eql(u8, record.artifact_sha256, range.restore_artifact_sha256)) continue;
+        return record.primary_restored and record.runtime_repair_complete;
+    }
+    return false;
+}
+
+fn applyRestoreServingGate(
+    current: CurrentMetadataState,
+    tables: []const table_manager.TableRecord,
+    ranges: []const table_manager.RangeRecord,
+    intent: *raft_reconciler.PlacementIntent,
+) void {
+    if (restorePlacementServingBlocked(current, tables, ranges, intent.*)) {
+        intent.serving_state = .bootstrapping;
+    }
 }
 
 fn effectivePlacementIntent(
@@ -1365,6 +1426,7 @@ fn effectivePlacementIntent(
     const has_current_group = evidence.placementCount(effective.record.group_id) > 0;
     if (!has_current_group) {
         effective.serving_state = .serving;
+        applyRestoreServingGate(current, tables, ranges, &effective);
         return effective;
     }
 
@@ -1400,11 +1462,15 @@ fn effectivePlacementIntent(
             .cutover_ready => if (relocationTargetReady(evidence, effective)) .serving else .cutover_ready,
             .planned, .bootstrapping, .replaying, .retiring => relocationTargetServingState(evidence, effective),
         };
+        applyRestoreServingGate(current, tables, ranges, &effective);
         return effective;
     }
 
     effective.serving_state = relocationTargetServingState(evidence, effective);
-    if (effective.serving_state == .serving) return effective;
+    if (effective.serving_state == .serving) {
+        applyRestoreServingGate(current, tables, ranges, &effective);
+        return effective;
+    }
     if (effective.relocation_generation == 0) effective.relocation_generation = watermark.generation_hint;
     if (effective.relocation_source_node_id == 0) {
         if (evidence.relocationSource(effective.record.group_id)) |source| {
@@ -1412,6 +1478,7 @@ fn effectivePlacementIntent(
             effective.relocation_source_store_id = source.store_id;
         }
     }
+    applyRestoreServingGate(current, tables, ranges, &effective);
     return effective;
 }
 
@@ -9361,7 +9428,7 @@ test "metadata reconciler does not plan automatic split while restore is pending
     try std.testing.expectEqual(@as(usize, 0), plan.split_upserts.len);
 }
 
-test "metadata reconciler marks restore-active placements with fetch_snapshot until progress is reported" {
+test "metadata reconciler keeps restore dark when the third replica is isolated" {
     var manager = table_manager.TableManager.init(std.testing.allocator);
     defer manager.deinit();
 
@@ -9391,24 +9458,69 @@ test "metadata reconciler marks restore-active placements with fetch_snapshot un
             .snapshot_path = "snap1/groups/4901",
             .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             .primary_restored = true,
+            .runtime_repair_complete = true,
             .phase = "runtime_repair",
+        },
+        .{
+            .table_id = 490,
+            .node_id = 2,
+            .group_id = 4901,
+            .backup_id = "snap1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap1/groups/4901",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .primary_restored = true,
+            .runtime_repair_complete = true,
+            .phase = "complete",
         },
     };
 
     var reconciler = Reconciler.init(std.testing.allocator);
-    var plan = try reconciler.computePlan(&manager, &.{ 1, 2 }, &.{}, .{
+    var plan = try reconciler.computePlan(&manager, &.{ 1, 2, 3 }, &.{}, .{
         .restore_progresses = &progress,
     });
     defer plan.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), plan.placement_upserts.len);
+    try std.testing.expectEqual(@as(usize, 3), plan.placement_upserts.len);
     const first = findPlacementIntent(plan.placement_upserts, 4901, 1).?;
     const second = findPlacementIntent(plan.placement_upserts, 4901, 2).?;
+    const third = findPlacementIntent(plan.placement_upserts, 4901, 3).?;
     try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.persisted, first.record.bootstrap_mode);
-    try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.fetch_snapshot, second.record.bootstrap_mode);
-    try std.testing.expect(second.record.backup_restore_bootstrap != null);
-    try std.testing.expectEqualStrings("snap1", second.record.backup_restore_bootstrap.?.backup_id);
-    try std.testing.expectEqualStrings("file:///tmp/backups", second.record.backup_restore_bootstrap.?.location);
+    try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.persisted, second.record.bootstrap_mode);
+    try std.testing.expectEqual(@import("../raft/catalog.zig").ReplicaBootstrapMode.fetch_snapshot, third.record.bootstrap_mode);
+    try std.testing.expectEqual(.bootstrapping, first.serving_state);
+    try std.testing.expectEqual(.bootstrapping, second.serving_state);
+    try std.testing.expectEqual(.bootstrapping, third.serving_state);
+    try std.testing.expect(first.record.backup_restore_bootstrap == null);
+    try std.testing.expect(second.record.backup_restore_bootstrap == null);
+    try std.testing.expect(third.record.backup_restore_bootstrap != null);
+    try std.testing.expectEqualStrings("snap1", third.record.backup_restore_bootstrap.?.backup_id);
+    try std.testing.expectEqualStrings("file:///tmp/backups", third.record.backup_restore_bootstrap.?.location);
+
+    const complete_progress = [_]table_manager.RestoreProgressRecord{
+        progress[0],
+        progress[1],
+        .{
+            .table_id = 490,
+            .node_id = 3,
+            .group_id = 4901,
+            .backup_id = "snap1",
+            .location = "file:///tmp/backups",
+            .snapshot_path = "snap1/groups/4901",
+            .artifact_sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            .primary_restored = true,
+            .runtime_repair_complete = true,
+            .phase = "complete",
+        },
+    };
+    var complete_plan = try reconciler.computePlan(&manager, &.{ 1, 2, 3 }, &.{}, .{
+        .restore_progresses = &complete_progress,
+    });
+    defer complete_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), complete_plan.placement_upserts.len);
+    for (complete_plan.placement_upserts) |placement| {
+        try std.testing.expectEqual(.serving, placement.serving_state);
+    }
 }
 
 test "metadata reconciler prefers live median key lookup for automatic split" {
