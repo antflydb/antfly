@@ -6,6 +6,7 @@
 //! own public HTTP, data-Raft, storage, metadata polling, and status reporting.
 
 const std = @import("std");
+const casbin = @import("antfly_casbin");
 const vopr = @import("vopr");
 const data_runtime = @import("../data/runtime.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -32,6 +33,7 @@ const mem_backend = @import("../storage/mem_backend.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const http_disconnect = @import("http_disconnect.zig");
+const usermgr = @import("../usermgr/user_manager.zig");
 
 // The composed deployment uses the same service identity as the metadata
 // quorum fixture. Leaving this unset does not model an unauthenticated legacy
@@ -81,6 +83,38 @@ fn parseHttpBaseUriAddress(base_uri: []const u8) !std.Io.net.IpAddress {
         return error.InvalidProductionDataBaseUri;
     return std.Io.net.IpAddress.parse(host, port) catch error.InvalidProductionDataBaseUri;
 }
+
+/// Fixture-owned public credential adapter. The ordinary ApiHttpClient keeps
+/// constructing every production request; this boundary only supplies the
+/// same request-level credential that an external authenticated client would.
+const PublicAuthorizationExecutor = struct {
+    inner: common_http.RequestExecutor,
+    authorization: []const u8,
+
+    fn iface(self: *@This()) common_http.RequestExecutor {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .execute = execute },
+            .realtime_ns_fn = if (self.inner.realtime_ns_fn != null) realtimeNs else null,
+        };
+    }
+
+    fn execute(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        request: common_http.HttpRequest,
+    ) anyerror!common_http.HttpResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        var authenticated = request;
+        authenticated.authorization = self.authorization;
+        return try self.inner.execute(alloc, authenticated);
+    }
+
+    fn realtimeNs(ptr: *anyopaque) i128 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.inner.realtimeNs().?;
+    }
+};
 
 pub const Fixture = struct {
     pub const FaultMode = enum {
@@ -150,8 +184,14 @@ pub const Fixture = struct {
     const split_destination_group_id: u64 = 6_846;
     const split_key = "doc:g";
     const graph_index_name = "graph_idx";
+    const graph_authorization_username = "vopr-graph-reader";
+    const graph_authorization_password = "vopr-graph-secret";
+    const graph_authorization_header = "Basic dm9wci1ncmFwaC1yZWFkZXI6dm9wci1ncmFwaC1zZWNyZXQ=";
     const left_batch_body =
         \\{"inserts":{"doc:c":{"title":"production-left","_edges":{"graph_idx":{"links":[{"target":"doc:x"}]}}},"doc:k":{"title":"production-split"}},"sync_level":"full_index"}
+    ;
+    const graph_authorization_left_batch_body =
+        \\{"inserts":{"doc:a":{"title":"authorization-source","_edges":{"graph_idx":{"links":[{"target":"tenant:q","metadata":{"target_table":"tenant_b_docs"}}]}}},"doc:c":{"title":"production-left","_edges":{"graph_idx":{"links":[{"target":"doc:x"}]}}},"doc:k":{"title":"production-split"}},"sync_level":"full_index"}
     ;
     const right_batch_body =
         \\{"inserts":{"doc:x":{"title":"production-right","_edges":{"graph_idx":{"links":[{"target":"doc:k"}]}}}},"sync_level":"full_index"}
@@ -196,6 +236,7 @@ pub const Fixture = struct {
     raft_executor_live: bool = false,
     public_executor: io_http_executor.IoHttpExecutor = undefined,
     public_executor_live: bool = false,
+    public_authorization_executor: PublicAuthorizationExecutor = undefined,
     http_disconnect_probe: http_disconnect.Probe = undefined,
     transition_executor: io_http_executor.IoHttpExecutor = undefined,
     transition_executor_live: bool = false,
@@ -206,6 +247,12 @@ pub const Fixture = struct {
     join_job_backend_count: usize = 0,
     join_job_stores: [node_count]backend_erased.Store = undefined,
     join_job_store_count: usize = 0,
+    auth_store: usermgr.MemoryStore = undefined,
+    auth_store_live: bool = false,
+    auth_policy_store: casbin.MemoryAdapter = undefined,
+    auth_policy_store_live: bool = false,
+    auth_manager: usermgr.UserManager = undefined,
+    auth_manager_live: bool = false,
     data_roots: [node_count][]u8 = undefined,
     data_root_count: usize = 0,
     capacity_sources: [node_count]ModeledCapacitySource = undefined,
@@ -278,6 +325,13 @@ pub const Fixture = struct {
     graph_cancellation_observed: bool = false,
     graph_cancellation_recovered: bool = false,
     graph_cancellation_sound: bool = false,
+    graph_authorization_revoked: bool = false,
+    graph_authorization_denied_without_leak: bool = false,
+    graph_authorization_restored: bool = false,
+    graph_authorization_recovered: bool = false,
+    graph_authorization_denied_status: u16 = 0,
+    graph_authorization_recovered_status: u16 = 0,
+    graph_authorization_sound: bool = false,
     split_graph_inflight_started: bool = false,
     split_graph_inflight_complete: bool = false,
     split_graph_inflight_rejected: bool = false,
@@ -348,6 +402,7 @@ pub const Fixture = struct {
     graph_enabled: bool = false,
     graph_hydration_enabled: bool = false,
     graph_cancellation_enabled: bool = false,
+    graph_authorization_mutation_enabled: bool = false,
     join_enabled: bool = false,
     fault_mode: FaultMode = .clean,
     work_cost_ports: ?WorkCostPorts = null,
@@ -384,6 +439,11 @@ pub const Fixture = struct {
     pub fn setGraphCancellationEnabled(self: *Fixture, enabled: bool) void {
         std.debug.assert(self.phase == .created);
         self.graph_cancellation_enabled = enabled;
+    }
+
+    pub fn setGraphAuthorizationMutationEnabled(self: *Fixture, enabled: bool) void {
+        std.debug.assert(self.phase == .created);
+        self.graph_authorization_mutation_enabled = enabled;
     }
 
     pub fn setJoinEnabled(self: *Fixture, enabled: bool) void {
@@ -463,6 +523,8 @@ pub const Fixture = struct {
             return error.InvalidProductionClusterGraphHydrationMode;
         if (self.graph_cancellation_enabled and !self.graph_enabled)
             return error.InvalidProductionClusterGraphCancellationMode;
+        if (self.graph_authorization_mutation_enabled and !self.graph_enabled)
+            return error.InvalidProductionClusterGraphAuthorizationMode;
         switch (self.fault_mode) {
             .clean => {},
             .join_finalizer_ack_failure => if (!self.join_enabled or self.active_split_enabled)
@@ -523,6 +585,43 @@ pub const Fixture = struct {
             .pool_max_per_host = 8,
         });
         self.public_executor_live = true;
+        if (self.graph_authorization_mutation_enabled) {
+            self.auth_store = usermgr.MemoryStore.init(alloc);
+            self.auth_store_live = true;
+            self.auth_policy_store = casbin.MemoryAdapter.init(alloc);
+            self.auth_policy_store_live = true;
+            self.auth_manager = try usermgr.UserManager.initWithIo(
+                alloc,
+                self.sim.io(),
+                self.auth_store.iface(),
+                try usermgr.initDefaultEnforcer(alloc, self.auth_policy_store.iface()),
+            );
+            self.auth_manager_live = true;
+            var docs_read = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+            defer docs_read.deinit(alloc);
+            var docs_write = try usermgr.Permission.initOwned(alloc, .table, "docs", .write);
+            defer docs_write.deinit(alloc);
+            var tenant_read = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .read);
+            defer tenant_read.deinit(alloc);
+            var tenant_write = try usermgr.Permission.initOwned(alloc, .table, "tenant_b_docs", .write);
+            defer tenant_write.deinit(alloc);
+            const permissions = [_]usermgr.Permission{
+                docs_read,
+                docs_write,
+                tenant_read,
+                tenant_write,
+            };
+            var user = try self.auth_manager.createUser(
+                graph_authorization_username,
+                graph_authorization_password,
+                &permissions,
+            );
+            user.deinit(alloc);
+            self.public_authorization_executor = .{
+                .inner = self.public_executor.executor(),
+                .authorization = graph_authorization_header,
+            };
+        }
         // Hosted structural-operation polling is a control-plane protocol,
         // not the keep-alive subject of this deployment history. Give it a
         // dedicated non-pooled client so connection lifetime cannot couple
@@ -597,7 +696,13 @@ pub const Fixture = struct {
         try self.waitForInitialDataLeaders();
         self.phase = .leaders_ready;
         try self.installExternalTransitionRouting();
-        self.client = api_http_client.ApiHttpClient.init(alloc, self.public_executor.executor());
+        self.client = api_http_client.ApiHttpClient.init(
+            alloc,
+            if (self.graph_authorization_mutation_enabled)
+                self.public_authorization_executor.iface()
+            else
+                self.public_executor.executor(),
+        );
     }
 
     fn initializeDataServer(self: *Fixture, index: usize) !void {
@@ -626,6 +731,8 @@ pub const Fixture = struct {
             .backend_runtime = self.backend_runtimes[index].ptr(),
             .h1_disconnect_probe = self.http_disconnect_probe.iface(),
             .api_server_cfg = .{
+                .auth_enabled = self.graph_authorization_mutation_enabled,
+                .user_manager = if (self.graph_authorization_mutation_enabled) &self.auth_manager else null,
                 .internal_service_secret = internal_service_secret,
                 .internal_service_issuer = internal_service_issuer,
                 .distributed_join_lifecycle_hook = .{
@@ -1338,7 +1445,9 @@ pub const Fixture = struct {
     }
 
     fn runWorkloadInner(self: *Fixture) !void {
-        const left_body = if (self.graph_enabled)
+        const left_body = if (self.graph_authorization_mutation_enabled)
+            graph_authorization_left_batch_body
+        else if (self.graph_enabled)
             left_batch_body
         else if (self.join_enabled)
             join_left_batch_body
@@ -1473,6 +1582,10 @@ pub const Fixture = struct {
                 self.graph_cancellation_sound = try self.runGraphCancellationQuery();
                 if (!self.graph_cancellation_sound)
                     return error.ProductionDataGraphCancellationQueryFailed;
+            } else if (self.graph_authorization_mutation_enabled) {
+                self.graph_authorization_sound = try self.runGraphAuthorizationMutationQuery();
+                if (!self.graph_authorization_sound)
+                    return error.ProductionDataGraphAuthorizationMutationFailed;
             } else if (self.graph_hydration_enabled) {
                 self.graph_hydration_sound = try self.runGraphHydrationQuery();
                 if (!self.graph_hydration_sound)
@@ -1915,6 +2028,96 @@ pub const Fixture = struct {
         body: []const u8,
     ) !common_http.HttpResponse {
         return self.client.fetchQueryRaw(uri, "docs", body);
+    }
+
+    fn runGraphAuthorizationMutationQuery(self: *Fixture) !bool {
+        if (!self.auth_manager_live) return error.ProductionGraphAuthorizationManagerMissing;
+
+        const query_body = try test_contract_helpers.encodeGraphTraverseQueryWithDocumentsRequest(
+            self.alloc,
+            "walk",
+            graph_index_name,
+            &.{"doc:a"},
+            &.{"links"},
+            1,
+            10,
+        );
+        defer self.alloc.free(query_body);
+
+        try self.auth_manager.removePermissionFromUser(
+            graph_authorization_username,
+            "tenant_b_docs",
+            .table,
+        );
+        self.graph_authorization_revoked = true;
+
+        var denied = try self.client.fetchQueryRaw(
+            self.data_api_uris[self.graph_probe_route_index],
+            "docs",
+            query_body,
+        );
+        defer denied.deinit(self.alloc);
+        self.graph_authorization_denied_status = denied.status;
+        self.graph_authorization_denied_without_leak = denied.status == 200 and
+            try self.graphAuthorizationResponseSound(denied.body, false);
+        if (!self.graph_authorization_denied_without_leak) return false;
+
+        var restored_permission = try usermgr.Permission.initOwned(
+            self.alloc,
+            .table,
+            "tenant_b_docs",
+            .read,
+        );
+        defer restored_permission.deinit(self.alloc);
+        try self.auth_manager.addPermissionToUser(
+            graph_authorization_username,
+            restored_permission,
+        );
+        self.graph_authorization_restored = true;
+
+        var recovered = try self.client.fetchQueryRaw(
+            self.data_api_uris[self.graph_probe_route_index],
+            "docs",
+            query_body,
+        );
+        defer recovered.deinit(self.alloc);
+        self.graph_authorization_recovered_status = recovered.status;
+        self.graph_authorization_recovered = recovered.status == 200 and
+            try self.graphAuthorizationResponseSound(recovered.body, true);
+        return self.graph_authorization_recovered;
+    }
+
+    fn graphAuthorizationResponseSound(
+        self: *Fixture,
+        body: []const u8,
+        expect_visible: bool,
+    ) !bool {
+        var parsed = try std.json.parseFromSlice(
+            metadata_openapi.QueryResponses,
+            self.alloc,
+            body,
+            .{},
+        );
+        defer parsed.deinit();
+        const responses = parsed.value.responses orelse return false;
+        if (responses.len != 1) return false;
+        const graph_results = responses[0].graph_results orelse return false;
+        const walk = graph_results.map.get("walk") orelse return false;
+        const nodes = walk.nodes orelse return false;
+        if (!expect_visible) {
+            return walk.total == 0 and nodes.len == 0 and
+                std.mem.indexOf(u8, body, "tenant:q") == null and
+                std.mem.indexOf(u8, body, "production-tenant") == null;
+        }
+        if (walk.total != 1 or nodes.len != 1) return false;
+        const node = nodes[0];
+        if (!std.mem.eql(u8, node.key, "tenant:q") or
+            node.table == null or
+            !std.mem.eql(u8, node.table.?, "tenant_b_docs")) return false;
+        const document = node.document orelse return false;
+        if (document != .object) return false;
+        const title = document.object.get("title") orelse return false;
+        return title == .string and std.mem.eql(u8, title.string, "production-tenant");
     }
 
     fn runSplitGraphProbe(self: *Fixture) !bool {
@@ -2622,6 +2825,18 @@ pub const Fixture = struct {
             self.data_server_live[server_index] = false;
         }
         self.data_server_count = 0;
+        if (self.auth_manager_live) {
+            self.auth_manager.deinit();
+            self.auth_manager_live = false;
+        }
+        if (self.auth_policy_store_live) {
+            self.auth_policy_store.deinit();
+            self.auth_policy_store_live = false;
+        }
+        if (self.auth_store_live) {
+            self.auth_store.deinit();
+            self.auth_store_live = false;
+        }
         var join_store_index = self.join_job_store_count;
         while (join_store_index > 0) {
             join_store_index -= 1;
@@ -2833,6 +3048,13 @@ pub const Fixture = struct {
         graph_cancellation_observed: bool,
         graph_cancellation_recovered: bool,
         graph_cancellation_ok: bool,
+        graph_authorization_revoked: bool,
+        graph_authorization_denied_without_leak: bool,
+        graph_authorization_restored: bool,
+        graph_authorization_recovered: bool,
+        graph_authorization_denied_status: u16,
+        graph_authorization_recovered_status: u16,
+        graph_authorization_ok: bool,
         split_graph_inflight_started: bool,
         split_graph_inflight_complete: bool,
         split_graph_inflight_rejected: bool,
@@ -2880,6 +3102,7 @@ pub const Fixture = struct {
                 (!self.graph_enabled or self.graph_sound) and
                 (!self.graph_hydration_enabled or self.graph_hydration_sound) and
                 (!self.graph_cancellation_enabled or self.graph_cancellation_sound) and
+                (!self.graph_authorization_mutation_enabled or self.graph_authorization_sound) and
                 (!self.active_split_enabled or self.split_sound) and
                 self.failure == null,
             .topology_ok = self.topology_sound,
@@ -2898,6 +3121,13 @@ pub const Fixture = struct {
             .graph_cancellation_observed = self.graph_cancellation_observed,
             .graph_cancellation_recovered = self.graph_cancellation_recovered,
             .graph_cancellation_ok = self.graph_cancellation_sound,
+            .graph_authorization_revoked = self.graph_authorization_revoked,
+            .graph_authorization_denied_without_leak = self.graph_authorization_denied_without_leak,
+            .graph_authorization_restored = self.graph_authorization_restored,
+            .graph_authorization_recovered = self.graph_authorization_recovered,
+            .graph_authorization_denied_status = self.graph_authorization_denied_status,
+            .graph_authorization_recovered_status = self.graph_authorization_recovered_status,
+            .graph_authorization_ok = self.graph_authorization_sound,
             .split_graph_inflight_started = self.split_graph_inflight_started,
             .split_graph_inflight_complete = self.split_graph_inflight_complete,
             .split_graph_inflight_rejected = self.split_graph_inflight_rejected,
