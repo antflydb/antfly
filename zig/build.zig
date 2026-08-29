@@ -4444,6 +4444,7 @@ pub fn build(b: *std.Build) void {
         "raft batch protocol activation is reusable only in its accepted leader term",
         "raft batch protocol activation cleanup preserves in flight references",
         "data raft forwarding distinguishes safe retries from ambiguous outcomes",
+        "data raft preproposal admission errors are never reported as committed",
         "expired data raft deadline snapshots never wait and release before returning",
         "transaction pre-decision Raft wait consumes admission delay and preserves response time",
         "data raft batch forwarding bounds routing campaigns deadlines and deterministic fallback",

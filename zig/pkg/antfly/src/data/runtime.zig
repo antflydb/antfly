@@ -7999,6 +7999,16 @@ pub const DataServer = struct {
                 if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                 const admission_source = if (self.data_raft_apply) |apply_sm| &apply_sm.write_source else &self.write_source;
                 try admission_source.preflightDenseRepairWriteAdmission(group_id, table_name);
+                const admission_cancellation: antfly.db.types.CancellationToken = if (route.cancellation) |cancellation| cancellation.token() else .none;
+                admission_source.preflightReplicatedWriteAdmission(
+                    group_id,
+                    table_name,
+                    req,
+                    admission_cancellation,
+                    deadline_ns,
+                ) catch |err| return dataRaftPreproposalAdmissionError(err);
+                ensureDataRaftBatchRouteActive(route) catch |err| return dataRaftPreproposalAdmissionError(err);
+                if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
             }
 
             var target_index: ?u64 = null;
@@ -8021,6 +8031,8 @@ pub const DataServer = struct {
                         // proposing a batch that skipped pressure admission.
                         retry_for_leader_preflight = true;
                     } else {
+                        ensureDataRaftBatchRouteActive(route) catch |err| return dataRaftPreproposalAdmissionError(err);
+                        if (platform_time.monotonicNs() >= deadline_ns) return error.LeaderUnavailable;
                         const status = raft.host.http_host.host.raftStatus(group_id) orelse
                             return error.RaftBatchWriteOutcomeUnknown;
                         // Recheck the shared state while proposal ordering is
@@ -8497,6 +8509,17 @@ pub const DataServer = struct {
         if (route.cancellation) |cancellation| {
             if (cancellation.isCancelled()) return error.Cancelled;
         }
+    }
+
+    fn dataRaftPreproposalAdmissionError(err: anyerror) anyerror {
+        return switch (err) {
+            error.Cancelled,
+            error.EnrichmentWaitCanceled,
+            error.EnrichmentWaitTimeout,
+            error.AsyncWorkerFailed,
+            => error.LeaderUnavailable,
+            else => err,
+        };
     }
 
     fn dataRaftLocalCampaignGraceNs(leader_wait_ns: u64) u64 {
@@ -28276,6 +28299,18 @@ test "data server wires configured HA executors into API server" {
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_received_lsn{slot=\"standby-a\"} 0\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_slot_status_code{slot=\"standby-a\"} 2\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, metrics, "antfly_ha_primary_mirror_failures_total 0\n") != null);
+}
+
+test "data raft preproposal admission errors are never reported as committed" {
+    for ([_]anyerror{
+        error.Cancelled,
+        error.EnrichmentWaitCanceled,
+        error.EnrichmentWaitTimeout,
+        error.AsyncWorkerFailed,
+    }) |err| {
+        try std.testing.expect(DataServer.dataRaftPreproposalAdmissionError(err) == error.LeaderUnavailable);
+    }
+    try std.testing.expect(DataServer.dataRaftPreproposalAdmissionError(error.OutOfMemory) == error.OutOfMemory);
 }
 
 test "raft proposal materializes a default batch timestamp exactly once" {

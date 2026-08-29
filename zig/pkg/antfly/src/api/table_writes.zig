@@ -6825,6 +6825,50 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
+    pub fn preflightReplicatedWriteAdmission(
+        self: *ProvisionedTableWriteSource,
+        group_id: u64,
+        table_name: []const u8,
+        req: db_mod.types.BatchRequest,
+        cancellation: db_mod.types.CancellationToken,
+        deadline_ns: ?u64,
+    ) !void {
+        if (self.local_write_owner) |owner| {
+            return owner.preflightReplicatedWriteAdmission(
+                group_id,
+                table_name,
+                req,
+                cancellation,
+                deadline_ns,
+            );
+        }
+        if (!replicatedBatchRequiresDerivedAdmission(req)) return;
+
+        lockAtomic(&self.local_db_mutex);
+        var resident: ?ProvisionedTableWriteCache.CachedDb = null;
+        var foreground_blocked = false;
+        if (self.write_cache) |cache| {
+            resident = cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, true);
+            foreground_blocked = resident == null and cache.hasForegroundStateForGroupTableLocked(group_id, table_name);
+        }
+        if (resident == null and !foreground_blocked) {
+            if (self.startup_write_cache) |cache| {
+                if (self.write_cache == null or self.write_cache.? != cache) {
+                    resident = cache.leaseLiveEntryForLocalMutationLocked(group_id, table_name, true);
+                    foreground_blocked = resident == null and cache.hasForegroundStateForGroupTableLocked(group_id, table_name);
+                }
+            }
+        }
+        self.local_db_mutex.unlock();
+
+        if (resident) |*cached| {
+            defer cached.deinit(std.heap.page_allocator);
+            try cached.db.preflightReplicatedWriteAdmission(req.sync_level, cancellation, deadline_ns);
+            return;
+        }
+        if (foreground_blocked) return error.LsmRootWriterAlreadyOpen;
+    }
+
     fn droppedTableDeleteOwnerId(self: *ProvisionedTableWriteSource, runtime: *db_mod.background_runtime.BackendRuntime) !u64 {
         if (self.dropped_table_delete_owner_id == 0) {
             self.dropped_table_delete_owner_id = try runtime.allocOwnerId();
@@ -19724,6 +19768,68 @@ fn applyReplicatedTransactionMutation(
     req: db_mod.types.BatchRequest,
 ) !void {
     try applyReplicatedTransactionMutationInternal(alloc, db, table_name, group_id, req, .none, null);
+}
+
+fn replicatedBatchRequiresDerivedAdmission(req: db_mod.types.BatchRequest) bool {
+    const mutation = req.transaction orelse return req.writes.len != 0 or
+        req.deletes.len != 0 or
+        req.transforms.len != 0 or
+        req.graph_writes.len != 0 or
+        req.graph_deletes.len != 0;
+    return switch (mutation) {
+        .resolve => |resolve| resolve.status == .committed,
+        .begin, .prepare, .acknowledge, .cleanup => false,
+    };
+}
+
+test "replicated write admission classifies every mutation family" {
+    const txn_id: db_mod.types.TxnId = .{0x11} ** 16;
+    const participant = [_][]const u8{"docs:7001"};
+    const cases = [_]struct {
+        req: db_mod.types.BatchRequest,
+        expected: bool,
+    }{
+        .{ .req = .{}, .expected = false },
+        .{ .req = .{ .writes = &.{.{ .key = "doc:a", .value = "{}" }} }, .expected = true },
+        .{ .req = .{ .deletes = &.{"doc:a"} }, .expected = true },
+        .{ .req = .{ .transforms = &.{.{ .key = "doc:a", .operations = &.{} }} }, .expected = true },
+        .{ .req = .{ .graph_writes = &.{.{ .index_name = "graph", .source = "a", .target = "b", .edge_type = "related" }} }, .expected = true },
+        .{ .req = .{ .graph_deletes = &.{.{ .index_name = "graph", .source = "a", .target = "b", .edge_type = "related" }} }, .expected = true },
+        .{ .req = .{ .transaction = .{ .begin = .{
+            .txn_id = txn_id,
+            .begin_timestamp = 1,
+            .created_at_ns = 1,
+            .topology_epoch = 1,
+            .participants = &participant,
+        } } }, .expected = false },
+        .{ .req = .{
+            .writes = &.{.{ .key = "doc:a", .value = "{}" }},
+            .transaction = .{ .prepare = .{ .txn_id = txn_id, .topology_epoch = 1 } },
+        }, .expected = false },
+        .{ .req = .{ .transaction = .{ .resolve = .{
+            .txn_id = txn_id,
+            .status = .committed,
+            .commit_version = 2,
+        } } }, .expected = true },
+        .{ .req = .{ .transaction = .{ .resolve = .{
+            .txn_id = txn_id,
+            .status = .aborted,
+            .commit_version = 2,
+        } } }, .expected = false },
+        .{ .req = .{ .transaction = .{ .acknowledge = .{
+            .txn_id = txn_id,
+            .participant = "docs:7001",
+        } } }, .expected = false },
+        .{ .req = .{ .transaction = .{ .cleanup = .{
+            .txn_id = txn_id,
+            .cutoff_timestamp = 3,
+            .retained_cutoff_timestamp = 2,
+        } } }, .expected = false },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, replicatedBatchRequiresDerivedAdmission(case.req));
+    }
 }
 
 fn applyReplicatedTransactionMutationWithCancellation(
@@ -46803,6 +46909,83 @@ test "provisioned leader admission rejects uncommitted writes under dense repair
     try source.preflightDenseRepairWriteAdmission(7002, "docs");
     entry.db.async_context.index_repair_replay_pinned.store(false, .release);
     try source.preflightDenseRepairWriteAdmission(7001, "docs");
+}
+
+test "provisioned leader admission drains replicated derived backlog before proposal" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-backlog-leader-admission", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"config\":{}}}",
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var resources = resource_manager_mod.ResourceManager.init(.{
+        .derived_backlog_high_sequences = 1,
+        .derived_backlog_resume_sequences = 0,
+        .derived_backlog_throttle_window_sequences = 1,
+    });
+    defer resources.deinit(alloc);
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+    write_cache.resource_manager = &resources;
+    var source = ProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+
+    var cached = try write_cache.getOrOpenLockedMode(path, Catalog.iface(), 7001, 1, "docs", .startup_catch_up);
+    defer cached.deinit(alloc);
+    try cached.db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+    });
+    try cached.db.batchReplicatedApply(.{
+        .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+    });
+    try std.testing.expectEqual(@as(u64, 0), try cached.db.core.loadAppliedSequence(alloc, "search_idx"));
+
+    try source.preflightReplicatedWriteAdmission(7001, "docs", .{
+        .writes = &.{.{ .key = "doc:c", .value = "{\"title\":\"gamma\"}" }},
+        .sync_level = .write,
+    }, .none, null);
+    try std.testing.expectEqual(@as(u64, 2), try cached.db.core.loadAppliedSequence(alloc, "search_idx"));
 }
 
 test "median key lookup reuses startup writer instead of reopening its root" {
