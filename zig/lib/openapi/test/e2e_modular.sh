@@ -165,7 +165,12 @@ assert_contains "$GEN_DIR/petstore31/server.zig" "ServerRouter" "3.1 server gene
 # assertions catch API shape regressions; compilation catches invalid defaults
 # and helper-name collisions that otherwise survive source inspection.
 "$ZIG" test "$GEN_DIR/petstore31/types.zig"
-"$ZIG" test --dep types -Mroot="$PROJECT_DIR/test/optional_nullable_runtime.zig" -Mtypes="$GEN_DIR/petstore31/types.zig"
+"$ZIG" test \
+  --dep types \
+  --dep antfly-json \
+  -Mroot="$PROJECT_DIR/test/optional_nullable_runtime.zig" \
+  -Mtypes="$GEN_DIR/petstore31/types.zig" \
+  -Mantfly-json="$PROJECT_DIR/../json/src/mod.zig"
 
 echo ""
 echo "=== All E2E tests passed ==="

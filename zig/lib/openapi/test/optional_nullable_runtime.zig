@@ -13,6 +13,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const antfly_json = @import("antfly-json");
 const types = @import("types");
 
 test "optional nullable properties round-trip all three wire states" {
@@ -157,6 +158,45 @@ test "required nullable presence remains distinct from optional non-nullable omi
     ,
         .{},
     ));
+}
+
+test "required nullable fields require wire presence on every parser backend" {
+    const alloc = std.testing.allocator;
+    const missing =
+        \\{"error":"boom","message":"failed"}
+    ;
+
+    try std.testing.expectError(
+        error.MissingField,
+        std.json.parseFromSlice(types.Error, alloc, missing, .{}),
+    );
+    try std.testing.expectError(
+        error.MissingField,
+        antfly_json.parseFromSliceWithConfig(
+            types.Error,
+            alloc,
+            missing,
+            .{},
+            .{ .preferred_backend = .simd, .simd_min_input_len = 0 },
+        ),
+    );
+
+    const automatic_input = missing ++ (" " ** 256);
+    try std.testing.expectError(
+        error.MissingField,
+        antfly_json.parseFromSlice(types.Error, alloc, automatic_input, .{}),
+    );
+
+    var explicit_null = try antfly_json.parseFromSliceWithConfig(
+        types.Error,
+        alloc,
+        \\{"error":"boom","message":"failed","details":null}
+    ,
+        .{},
+        .{ .preferred_backend = .simd, .simd_min_input_len = 0 },
+    );
+    defer explicit_null.deinit();
+    try std.testing.expect(explicit_null.value.details == null);
 }
 
 test "OpenAPI wire names remain distinct from ergonomic Zig field names" {

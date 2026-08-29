@@ -23304,6 +23304,45 @@ pub const RunObject = struct {
     parallel_tool_calls: ParallelToolCalls,
     response_format: AssistantsApiResponseFormatOption,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "id", "id", false },
+        .{ "object", "object", false },
+        .{ "created_at", "created_at", false },
+        .{ "thread_id", "thread_id", false },
+        .{ "assistant_id", "assistant_id", false },
+        .{ "status", "status", false },
+        .{ "required_action", "required_action", false },
+        .{ "last_error", "last_error", false },
+        .{ "expires_at", "expires_at", false },
+        .{ "started_at", "started_at", false },
+        .{ "cancelled_at", "cancelled_at", false },
+        .{ "failed_at", "failed_at", false },
+        .{ "completed_at", "completed_at", false },
+        .{ "incomplete_details", "incomplete_details", false },
+        .{ "model", "model", false },
+        .{ "instructions", "instructions", false },
+        .{ "tools", "tools", false },
+        .{ "metadata", "metadata", false },
+        .{ "usage", "usage", false },
+        .{ "temperature", "temperature", false },
+        .{ "top_p", "top_p", false },
+        .{ "max_prompt_tokens", "max_prompt_tokens", false },
+        .{ "max_completion_tokens", "max_completion_tokens", false },
+        .{ "truncation_strategy", "truncation_strategy", false },
+        .{ "tool_choice", "tool_choice", false },
+        .{ "parallel_tool_calls", "parallel_tool_calls", false },
+        .{ "response_format", "response_format", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("id");

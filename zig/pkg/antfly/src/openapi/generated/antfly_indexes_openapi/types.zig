@@ -2254,6 +2254,35 @@ pub const DerivedCoverageStatus = struct {
     /// Whether all sources are settled but coverage remains unhealthy under the configured policy, including terminal failures or policy-rejected skips.
     degraded: bool,
 
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "policy", "policy", false },
+        .{ "observation_complete", "observation_complete", false },
+        .{ "observation_incomplete_reasons", "observation_incomplete_reasons", false },
+        .{ "config_fingerprint", "config_fingerprint", false },
+        .{ "summary_ready", "summary_ready", false },
+        .{ "config_mismatch_group_count", "config_mismatch_group_count", false },
+        .{ "source_total", "source_total", false },
+        .{ "produced", "produced", false },
+        .{ "skipped", "skipped", false },
+        .{ "terminal_failed", "terminal_failed", false },
+        .{ "covered", "covered", false },
+        .{ "settled", "settled", false },
+        .{ "uncovered", "uncovered", false },
+        .{ "pending", "pending", false },
+        .{ "complete", "complete", false },
+        .{ "healthy", "healthy", false },
+        .{ "degraded", "degraded", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
+
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
         try jw.objectField("policy");
@@ -3774,6 +3803,19 @@ pub const GraphAliasCountAggregate = struct {
 
 pub const GraphAliasOperand = struct {
     alias: antfly_graph_identifier_openapi.GraphIdentifier,
+
+    /// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.
+    pub const antflyOpenApiFieldMetadata = .{
+        .{ "alias", "alias", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), antflyOpenApiFieldMetadata, allocator, source, options);
+    }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();

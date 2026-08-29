@@ -39,7 +39,7 @@ pub const TypeGenerator = struct {
     auxiliary_type_names: std.StringHashMapUnmanaged([]const u8) = .empty,
     optional_nullable_type_name: ?[]const u8 = null,
     uses_optional_nullable: bool = false,
-    uses_strict_optional_object: bool = false,
+    uses_presence_aware_object: bool = false,
     type_names_initialized: bool = false,
 
     pub fn init(arena: Allocator, w: *SourceWriter, resolver: *Resolver) TypeGenerator {
@@ -83,8 +83,8 @@ pub const TypeGenerator = struct {
             try self.emitOptionalNullableType(optional_nullable_type_name);
             try self.w.blank();
         }
-        if (self.uses_strict_optional_object) {
-            try self.emitStrictOptionalObjectHelpers();
+        if (self.uses_presence_aware_object) {
+            try self.emitPresenceAwareObjectHelpers();
             try self.w.blank();
         }
     }
@@ -158,7 +158,7 @@ pub const TypeGenerator = struct {
         try self.w.line("}}", .{});
     }
 
-    fn emitStrictOptionalObjectHelpers(self: *TypeGenerator) !void {
+    fn emitPresenceAwareObjectHelpers(self: *TypeGenerator) !void {
         try self.w.line("/// Parse an OpenAPI object without materializing a second JSON tree while", .{});
         try self.w.line("/// rejecting explicit null for optional properties whose schemas are non-nullable.", .{});
         try self.w.line("fn openApiParseObject(", .{});
@@ -600,7 +600,11 @@ pub const TypeGenerator = struct {
 
         var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
         try self.collectNonNullableOptionalFields(schema, &required_set, true, &strict_optional_fields);
-        try self.emitStrictOptionalObjectParsers(schema.properties.keys(), &strict_optional_fields);
+        try self.emitPresenceAwareObjectParsers(
+            schema.properties.keys(),
+            &strict_optional_fields,
+            self.schemaNeedsRequiredFieldPresence(schema, &required_set, true),
+        );
 
         // Request serialization normally omits null optional fields. Generate a
         // required-aware serializer when a required field permits null or its
@@ -768,7 +772,11 @@ pub const TypeGenerator = struct {
 
         var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
         try self.collectNonNullableOptionalFields(schema, &all_required, true, &strict_optional_fields);
-        try self.emitStrictOptionalObjectParsers(emitted_props.keys(), &strict_optional_fields);
+        try self.emitPresenceAwareObjectParsers(
+            emitted_props.keys(),
+            &strict_optional_fields,
+            self.schemaNeedsRequiredFieldPresence(schema, &all_required, true),
+        );
 
         if (strict_optional_fields.count() > 0 or
             self.schemaNeedsRequiredFieldSerializer(schema, &all_required, true))
@@ -809,7 +817,11 @@ pub const TypeGenerator = struct {
 
         var strict_optional_fields = std.StringArrayHashMapUnmanaged(void){};
         try self.collectNonNullableOptionalFields(schema, &all_required, true, &strict_optional_fields);
-        try self.emitStrictOptionalObjectParsers(emitted_props.keys(), &strict_optional_fields);
+        try self.emitPresenceAwareObjectParsers(
+            emitted_props.keys(),
+            &strict_optional_fields,
+            self.schemaNeedsRequiredFieldPresence(schema, &all_required, true),
+        );
 
         try self.w.blank();
         try self.w.line("pub fn jsonStringify(self: @This(), jw: anytype) !void {{", .{});
@@ -852,13 +864,14 @@ pub const TypeGenerator = struct {
         }
     }
 
-    fn emitStrictOptionalObjectParsers(
+    fn emitPresenceAwareObjectParsers(
         self: *TypeGenerator,
         property_names: []const []const u8,
         strict_optional_fields: *const std.StringArrayHashMapUnmanaged(void),
+        has_required_presence_fields: bool,
     ) !void {
-        if (strict_optional_fields.count() == 0) return;
-        self.uses_strict_optional_object = true;
+        if (strict_optional_fields.count() == 0 and !has_required_presence_fields) return;
+        self.uses_presence_aware_object = true;
 
         try self.w.blank();
         try self.w.line("/// OpenAPI wire names and nullability consumed directly by antfly-json's typed parser.", .{});
@@ -1028,6 +1041,34 @@ pub const TypeGenerator = struct {
         for (schema.all_of) |member| {
             const resolved = self.resolver.resolveSchema(member) catch continue;
             if (self.schemaNeedsRequiredFieldSerializer(resolved, required_fields, allow_required)) return true;
+        }
+        return false;
+    }
+
+    /// Whether parsing must distinguish an omitted required property from an
+    /// explicit JSON null. Ordinary Zig fields already reject omission unless
+    /// their representation is optional; nullable and unresolved external
+    /// schemas can carry such a representation and therefore require OpenAPI
+    /// field metadata on the SIMD path.
+    fn schemaNeedsRequiredFieldPresence(
+        self: *TypeGenerator,
+        schema: types.Schema,
+        required_fields: *const std.StringArrayHashMapUnmanaged(void),
+        allow_required: bool,
+    ) bool {
+        if (allow_required) {
+            for (schema.properties.keys(), schema.properties.values()) |prop_name, prop_sor| {
+                if (required_fields.contains(prop_name) and
+                    self.schemaOrRefRepresentation(prop_sor).nullability != .non_nullable)
+                {
+                    return true;
+                }
+            }
+        }
+
+        for (schema.all_of) |member| {
+            const resolved = self.resolver.resolveSchema(member) catch continue;
+            if (self.schemaNeedsRequiredFieldPresence(resolved, required_fields, allow_required)) return true;
         }
         return false;
     }
