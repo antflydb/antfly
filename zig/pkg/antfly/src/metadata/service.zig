@@ -6651,7 +6651,7 @@ pub const MetadataHttpService = struct {
     fn refreshProbeReady(self: *MetadataHttpService) void {
         const ready = switch (self.raft.host.status(self.metadata_group_id)) {
             .active, .quiesced => true,
-            .absent, .starting, .snapshotting, .failed => false,
+            .absent, .starting, .quarantined, .snapshotting, .failed => false,
         };
         self.probe_ready.store(ready, .release);
     }

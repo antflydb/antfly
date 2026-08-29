@@ -6314,6 +6314,7 @@ pub fn build(b: *std.Build) void {
             "malformed recovery intent is durably removed from the active queue and counted",
             "transient recovery intent read failure retains active work and retries successfully",
             "dropped table recovery drains a wake coalesced during the active scan",
+            "dropped table recovery watchdog repairs a failed durable enqueue",
             "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart",
             "provisioned table drop retains repair intent until catalog ownership clears",
             "replica retirement journal distinguishes active retained and committed removal",

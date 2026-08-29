@@ -249,6 +249,7 @@ pub const HealthSource = struct {
         }
 
         try append(writer, "antfly_raft_hosted_groups", "gauge", "Number of raft groups hosted on this node", @intCast(host_metrics.hosted_groups));
+        try append(writer, "antfly_raft_quarantined_groups", "gauge", "Number of raft groups stopped by a hard Ready safety invariant and awaiting explicit recovery", @intCast(host_metrics.quarantined_groups));
         try append(writer, "antfly_raft_reconcile_rounds_total", "counter", "Total number of reconcile rounds", @intCast(host_metrics.reconcile_rounds));
         try append(writer, "antfly_raft_ensure_replica_calls_total", "counter", "Total ensure_replica calls", @intCast(host_metrics.ensure_replica_calls));
         try append(writer, "antfly_raft_remove_replica_calls_total", "counter", "Total remove_replica calls", @intCast(host_metrics.remove_replica_calls));

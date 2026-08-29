@@ -130,6 +130,7 @@ pub const HostedReplicaStatus = enum {
     starting,
     active,
     quiesced,
+    quarantined,
     snapshotting,
     failed,
 };
@@ -169,6 +170,7 @@ pub const BootstrapStatus = struct {
 
 pub const HostMetrics = struct {
     hosted_groups: usize = 0,
+    quarantined_groups: usize = 0,
     reconcile_rounds: usize = 0,
     ensure_replica_calls: usize = 0,
     remove_replica_calls: usize = 0,
@@ -591,12 +593,25 @@ pub const Host = struct {
             return switch (bootstrap_status.phase) {
                 .preparing, .durability_pending => .starting,
                 .failed => .failed,
-                .succeeded => if (self.runtime_host.group(group_id) == null) .absent else if (self.runtime_host.isGroupQuiesced(group_id)) .quiesced else .active,
+                .succeeded => self.runtimeReplicaStatus(group_id),
             };
         }
+        return self.runtimeReplicaStatus(group_id);
+    }
+
+    fn runtimeReplicaStatus(self: *Host, group_id: u64) HostedReplicaStatus {
         if (self.runtime_host.group(group_id) == null) return .absent;
+        if (self.runtime_host.groupQuarantine(group_id) != null) return .quarantined;
         if (self.runtime_host.isGroupQuiesced(group_id)) return .quiesced;
         return .active;
+    }
+
+    pub fn quarantineStatus(self: *const Host, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.runtime_host.groupQuarantine(group_id);
+    }
+
+    pub fn resumeQuarantinedGroup(self: *Host, group_id: u64) !void {
+        try self.runtime_host.resumeQuarantinedGroup(group_id);
     }
 
     pub fn bootstrapStatus(self: *const Host, group_id: u64) ?BootstrapStatus {
@@ -649,6 +664,7 @@ pub const Host = struct {
         const runtime_metrics = self.runtime_host.metricsSnapshot();
         var snapshot = self.metrics;
         snapshot.hosted_groups = runtime_metrics.group_count;
+        snapshot.quarantined_groups = runtime_metrics.quarantined_group_count;
         snapshot.runtime_rounds = runtime_metrics.rounds;
         snapshot.runtime_ticked_groups = runtime_metrics.ticked_groups;
         snapshot.runtime_processed_groups = runtime_metrics.processed_groups;
@@ -1233,6 +1249,14 @@ pub const HttpHost = struct {
 
     pub fn status(self: *HttpHost, group_id: u64) HostedReplicaStatus {
         return self.host.status(group_id);
+    }
+
+    pub fn quarantineStatus(self: *const HttpHost, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.host.quarantineStatus(group_id);
+    }
+
+    pub fn resumeQuarantinedGroup(self: *HttpHost, group_id: u64) !void {
+        try self.host.resumeQuarantinedGroup(group_id);
     }
 
     pub fn bootstrapStatus(self: *const HttpHost, group_id: u64) ?BootstrapStatus {

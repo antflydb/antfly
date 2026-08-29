@@ -1779,6 +1779,7 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_executor_control_acquisitions_total", "counter", "Successful control executor lease acquisitions", lanes.control_acquisitions_total);
             try health_metrics.appendPromMetric(writer, "antfly_executor_control_rejections_total", "counter", "Control executor lease acquisitions rejected during shutdown", lanes.control_rejections_total);
         }
+        try health_metrics.appendPromMetric(writer, "antfly_raft_quarantined_groups", "gauge", "Raft groups stopped by a hard Ready safety invariant and awaiting explicit recovery", raft_metrics.quarantined_groups);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_completions_total", "counter", "Raft snapshot compactions published", raft_metrics.runtime_snapshot_compaction_completions);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_failures_total", "counter", "Raft snapshot compaction build or publication failures", raft_metrics.runtime_snapshot_compaction_failures);
         try health_metrics.appendPromMetric(writer, "antfly_raft_snapshot_compaction_candidates", "gauge", "Raft groups currently queued for snapshot compaction", raft_metrics.runtime_snapshot_compaction_candidates);
@@ -1966,6 +1967,12 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_read_cache_misses_total", "counter", "Provisioned read-cache opens that had to open a local table DB", read_cache_stats.miss_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_hits_total", "counter", "Provisioned write-cache hits served from already-open local table DBs", write_cache_stats.hit_count);
         try health_metrics.appendPromMetric(writer, "antfly_data_provisioned_write_cache_misses_total", "counter", "Provisioned write-cache opens that had to open a local table DB", write_cache_stats.miss_count);
+        const dropped_table_recovery = live_write_source.droppedTableRecoveryStatus();
+        try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_pending_epochs", "gauge", "Durable dropped-table cleanup wake epochs not yet completed", dropped_table_recovery.pending_epochs);
+        try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_worker_scheduled", "gauge", "Whether a dropped-table recovery worker currently owns the cleanup lane", if (dropped_table_recovery.worker_scheduled) 1 else 0);
+        try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_retry_scheduled", "gauge", "Whether dropped-table recovery is waiting in its bounded retry backoff", if (dropped_table_recovery.retry_scheduled) 1 else 0);
+        try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_consecutive_enqueue_failures", "gauge", "Consecutive dropped-table recovery worker allocations or durable queue submissions that failed", dropped_table_recovery.consecutive_enqueue_failures);
+        try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_enqueue_failures_total", "counter", "Dropped-table recovery worker allocations or durable queue submissions that failed and were retained for watchdog retry", dropped_table_recovery.enqueue_failures);
         try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
         try writeLsmCacheMetrics(writer, self.data_server.provisioned_storage.lsm_cache.snapshotStats());
         try writeLsmNativeStorageMetrics(writer, live_write_source.lsmNativeStorageStatsBestEffort());
@@ -6738,6 +6745,9 @@ pub const DataServer = struct {
     /// Callers must concurrently drive `runRaftRoundOnly` at the configured
     /// tick cadence.
     pub fn runControlRoundOnly(self: *DataServer) !void {
+        // Durable cleanup epochs survive transient allocation/queue failures;
+        // the control loop is their allocation-free watchdog.
+        self.write_source.maintainDroppedTableRecovery();
         const now_ns = platform_time.monotonicNs();
         if (self.haStandbyReplicationRetryDue(now_ns)) {
             if (self.runHAStandbyReplicationRound()) |_| {

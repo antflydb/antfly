@@ -2319,7 +2319,11 @@ test "multi raft drainReady quarantines an impossible outbound Ready hard ceilin
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().pending_outbound_bytes);
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().transport_queue_denials);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
+    try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().quarantined_group_count);
     try std.testing.expect(host.isGroupQuiesced(258));
+    const quarantine = host.groupQuarantine(258).?;
+    try std.testing.expectEqual(runtime.QuarantineReason.outbound_ready_too_large, quarantine.reason);
+    try std.testing.expect(quarantine.observed_bytes > quarantine.configured_limit);
     try std.testing.expect(host.group(258).?.hasReady());
     // A quarantined group is not reconsidered every round, avoiding warning
     // and counter storms while preserving its Ready for operator recovery.
@@ -2328,6 +2332,8 @@ test "multi raft drainReady quarantines an impossible outbound Ready hard ceilin
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_outbound_ready_rejections);
     try host.resumeGroup(258);
     try std.testing.expect(!host.isGroupQuiesced(258));
+    try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().quarantined_group_count);
+    try std.testing.expectEqual(@as(?runtime.GroupQuarantine, null), host.groupQuarantine(258));
 }
 
 test "multi raft drainReady quarantines an impossible apply Ready hard ceiling" {
@@ -2355,6 +2361,10 @@ test "multi raft drainReady quarantines an impossible apply Ready hard ceiling" 
     try std.testing.expectEqual(@as(usize, 0), host.metricsSnapshot().apply_queue_denials);
     try std.testing.expectEqual(@as(usize, 1), host.metricsSnapshot().oversized_apply_ready_rejections);
     try std.testing.expect(host.isGroupQuiesced(259));
+    try std.testing.expectEqual(
+        runtime.QuarantineReason.apply_ready_too_large,
+        host.groupQuarantine(259).?.reason,
+    );
     try std.testing.expect(host.group(259).?.hasReady());
 }
 

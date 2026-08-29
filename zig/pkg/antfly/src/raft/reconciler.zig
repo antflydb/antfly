@@ -419,8 +419,16 @@ pub const Reconciler = struct {
             const intent_hash = hashIntent(intent);
             const hosted_status = self.host.status(intent.record.group_id);
             const stored_hash = self.last_intent_hashes.get(intent.record.group_id);
+            // Quarantine is a stable operator-owned state, not an incomplete
+            // ensure. Reapply only a genuinely changed intent; otherwise a
+            // reconciliation loop would rewrite the catalog every round while
+            // traffic correctly remains unable to auto-resume the group.
+            const lifecycle_incomplete = switch (hosted_status) {
+                .active, .quarantined => false,
+                .absent, .starting, .quiesced, .snapshotting, .failed => true,
+            };
             const should_apply =
-                hosted_status != .active or
+                lifecycle_incomplete or
                 stored_hash == null or
                 stored_hash.? != intent_hash;
 

@@ -291,6 +291,14 @@ pub const ManagedHost = struct {
         return self.host.status(group_id);
     }
 
+    pub fn quarantineStatus(self: *const ManagedHost, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.host.quarantineStatus(group_id);
+    }
+
+    pub fn resumeQuarantinedGroup(self: *ManagedHost, group_id: u64) !void {
+        try self.host.resumeQuarantinedGroup(group_id);
+    }
+
     pub fn bootstrapStatus(self: *const ManagedHost, group_id: u64) ?host_mod.BootstrapStatus {
         return self.host.bootstrapStatus(group_id);
     }
@@ -571,6 +579,14 @@ pub const ManagedHttpHost = struct {
 
     pub fn status(self: *ManagedHttpHost, group_id: u64) host_mod.HostedReplicaStatus {
         return self.http_host.status(group_id);
+    }
+
+    pub fn quarantineStatus(self: *const ManagedHttpHost, group_id: u64) ?raft_engine.runtime.GroupQuarantine {
+        return self.http_host.quarantineStatus(group_id);
+    }
+
+    pub fn resumeQuarantinedGroup(self: *ManagedHttpHost, group_id: u64) !void {
+        try self.http_host.resumeQuarantinedGroup(group_id);
     }
 
     pub fn bootstrapStatus(self: *const ManagedHttpHost, group_id: u64) ?host_mod.BootstrapStatus {

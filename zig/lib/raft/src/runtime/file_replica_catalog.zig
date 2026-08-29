@@ -53,6 +53,7 @@ pub const FileReplicaCatalog = struct {
 
     fn upsertReplica(ptr: *anyopaque, record: replica.ReplicaRecord) !void {
         const self: *FileReplicaCatalog = @ptrCast(@alignCast(ptr));
+        try validateWritableRecord(record);
         var records = try self.loadRecords(self.alloc);
         defer self.freeRecords(self.alloc, records);
 
@@ -172,6 +173,7 @@ pub const FileReplicaCatalog = struct {
 };
 
 fn encodeRecord(alloc: std.mem.Allocator, buffer: *std.ArrayList(u8), record: replica.ReplicaRecord) !void {
+    try validateWritableRecord(record);
     try appendInt(alloc, buffer, u64, record.group_id);
     try appendInt(alloc, buffer, u64, record.local_node_id);
     try appendInt(alloc, buffer, u32, @intCast(record.raft.peers.len));
@@ -203,6 +205,19 @@ fn encodeRecord(alloc: std.mem.Allocator, buffer: *std.ArrayList(u8), record: re
             try writeBytes(alloc, buffer, snapshot.locator.snapshot_id);
             try writeBytes(alloc, buffer, snapshot.locator.uri);
         },
+    }
+}
+
+fn validateWritableRecord(record: replica.ReplicaRecord) !void {
+    // Decoder-first rollout keeps the on-disk file readable by the predecessor
+    // release. Its shape has no format field, and this generic catalog has no
+    // transport contract from which it can reconstruct one. Reject semantic
+    // loss explicitly until the versioned writer is activated.
+    switch (record.bootstrap) {
+        .fetch_snapshot => |snapshot| if (snapshot.locator.format != .unknown) {
+            return error.SnapshotFormatRequiresVersionedCatalogWriter;
+        },
+        .empty, .persisted => {},
     }
 }
 
@@ -349,10 +364,10 @@ test "versioned snapshot bootstrap frees partial locator on invalid format" {
     );
 }
 
-test "file replica catalog persists and reloads replica records" {
+test "file replica catalog rejects format loss and round trips predecessor records" {
     const path = "/tmp/antflydb-raft-file-replica-catalog.bin";
     var peers = [_]core.types.NodeId{ 1, 2, 3 };
-    const record: replica.ReplicaRecord = .{
+    var record: replica.ReplicaRecord = .{
         .group_id = 201,
         .local_node_id = 2,
         .raft = .{
@@ -374,10 +389,25 @@ test "file replica catalog persists and reloads replica records" {
         },
     };
 
-    // The writer remains predecessor-readable even when the in-memory locator
-    // has an explicit decoder format.
+    // Decoder-only deployment must not silently erase the caller's explicit
+    // decoder selection merely to remain predecessor-readable.
     var encoded: std.ArrayList(u8) = .empty;
     defer encoded.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.SnapshotFormatRequiresVersionedCatalogWriter,
+        encodeRecord(std.testing.allocator, &encoded, record),
+    );
+    try std.testing.expectEqual(@as(usize, 0), encoded.items.len);
+    {
+        var catalog = try FileReplicaCatalog.init(std.testing.allocator, path);
+        defer catalog.deinit();
+        try std.testing.expectError(
+            error.SnapshotFormatRequiresVersionedCatalogWriter,
+            catalog.catalog().upsertReplica(record),
+        );
+    }
+
+    record.bootstrap.fetch_snapshot.locator.format = .unknown;
     try encodeRecord(std.testing.allocator, &encoded, record);
     var reader: std.Io.Reader = .fixed(encoded.items);
     _ = try reader.takeInt(u64, .little);

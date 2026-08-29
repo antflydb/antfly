@@ -141,6 +141,7 @@ pub const DrainReadyDiagnostics = struct {
 pub const HostMetrics = struct {
     group_count: usize = 0,
     quiesced_group_count: usize = 0,
+    quarantined_group_count: usize = 0,
     rounds: usize = 0,
     virtual_round: u64 = 0,
     virtual_time_ms: u64 = 0,
@@ -405,6 +406,16 @@ const snapshot_retry_base_ns: u64 = 10 * std.time.ns_per_ms;
 const snapshot_retry_max_ns: u64 = 5 * std.time.ns_per_s;
 const snapshot_publish_inline_retry_limit: u8 = 5;
 
+pub const QuarantineReason = scheduler_mod.QuarantineReason;
+pub const GroupQuarantine = scheduler_mod.GroupQuarantine;
+
+const OversizedReadyGroup = struct {
+    group_id: core.types.GroupId,
+    reason: QuarantineReason,
+    observed_bytes: usize,
+    configured_limit: usize,
+};
+
 fn snapshotRetryDelayNs(attempt: u8) u64 {
     const shift: u6 = @intCast(@min(attempt -| 1, 9));
     return @min(snapshot_retry_base_ns << shift, snapshot_retry_max_ns);
@@ -425,7 +436,7 @@ pub const MultiRaft = struct {
     // Reused by every bounded Ready drain. Capacity is reserved when groups
     // are admitted so the consensus hot path never allocates merely to record
     // hard-limit quarantines.
-    oversized_ready_scratch: std.ArrayListUnmanaged(core.types.GroupId) = .empty,
+    oversized_ready_scratch: std.ArrayListUnmanaged(OversizedReadyGroup) = .empty,
     snapshot_candidates: std.AutoHashMapUnmanaged(core.types.GroupId, SnapshotCandidate) = .empty,
     next_snapshot_candidate_sequence: u64 = 1,
     snapshot_worker: ?*SnapshotBuildWorker = null,
@@ -611,8 +622,21 @@ pub const MultiRaft = struct {
         self.refreshMetricsTopology();
     }
 
+    /// Explicitly acknowledge and retry a quarantined group after an operator
+    /// has corrected the configured limit or offending workload.
+    pub fn resumeQuarantinedGroup(self: *MultiRaft, group_id: core.types.GroupId) !void {
+        if (!self.groups.contains(group_id)) return error.UnknownGroup;
+        if (self.scheduler.groupQuarantine(group_id) == null) return error.GroupNotQuarantined;
+        _ = self.scheduler.resumeGroup(group_id);
+        self.refreshMetricsTopology();
+    }
+
     pub fn isGroupQuiesced(self: *const MultiRaft, group_id: core.types.GroupId) bool {
         return self.scheduler.isQuiesced(group_id);
+    }
+
+    pub fn groupQuarantine(self: *const MultiRaft, group_id: core.types.GroupId) ?GroupQuarantine {
+        return self.scheduler.groupQuarantine(group_id);
     }
 
     pub fn addPeer(self: *MultiRaft, group_id: core.types.GroupId, peer: transport_iface.PeerDescriptor) !void {
@@ -933,8 +957,8 @@ pub const MultiRaft = struct {
         // The single-group path must remain allocation-free until Ready passes
         // admission (backpressure tests deliberately install a failing
         // allocator). Back this one-element quarantine sink with stack memory.
-        var oversized_ready_group_buf: [1]core.types.GroupId = undefined;
-        var oversized_ready_groups = std.ArrayListUnmanaged(core.types.GroupId){
+        var oversized_ready_group_buf: [1]OversizedReadyGroup = undefined;
+        var oversized_ready_groups = std.ArrayListUnmanaged(OversizedReadyGroup){
             .items = oversized_ready_group_buf[0..0],
             .capacity = oversized_ready_group_buf.len,
         };
@@ -1066,18 +1090,23 @@ pub const MultiRaft = struct {
 
     fn quiesceOversizedReadyGroups(
         self: *MultiRaft,
-        group_ids: []const core.types.GroupId,
+        groups: []const OversizedReadyGroup,
         cursor: *usize,
     ) void {
         var changed = false;
-        while (cursor.* < group_ids.len) : (cursor.* += 1) {
-            const group_id = group_ids[cursor.*];
-            self.scheduler.quarantineGroup(group_id) catch |err| {
+        while (cursor.* < groups.len) : (cursor.* += 1) {
+            const oversized = groups[cursor.*];
+            self.scheduler.quarantineGroup(
+                oversized.group_id,
+                oversized.reason,
+                oversized.observed_bytes,
+                oversized.configured_limit,
+            ) catch |err| {
                 std.log.err(
-                    "failed to quiesce oversized Ready group_id={d} err={s}",
-                    .{ group_id, @errorName(err) },
+                    "failed to quarantine oversized Ready group_id={d} err={s}",
+                    .{ oversized.group_id, @errorName(err) },
                 );
-                self.scheduler.deferReady(group_id);
+                self.scheduler.deferReady(oversized.group_id);
                 continue;
             };
             changed = true;
@@ -1091,7 +1120,7 @@ pub const MultiRaft = struct {
         outbox: *TransportOutbox,
         persist_batch: ?storage_iface.PersistBatch,
         diagnostics: ?*DrainReadyDiagnostics,
-        oversized_ready_groups: *std.ArrayListUnmanaged(core.types.GroupId),
+        oversized_ready_groups: *std.ArrayListUnmanaged(OversizedReadyGroup),
     ) !bool {
         if (diagnostics) |diag| {
             var ready_diag = ReadyGroupDiagnostics{ .group_id = group_id };
@@ -1131,7 +1160,7 @@ pub const MultiRaft = struct {
         flush_transport: bool,
         flush_apply_queue: bool,
         diagnostics: ?*ReadyGroupDiagnostics,
-        oversized_ready_groups: *std.ArrayListUnmanaged(core.types.GroupId),
+        oversized_ready_groups: *std.ArrayListUnmanaged(OversizedReadyGroup),
     ) !bool {
         const grp = self.group(group_id) orelse return error.UnknownGroup;
         if (!grp.hasReady()) {
@@ -1198,7 +1227,7 @@ pub const MultiRaft = struct {
             }
             self.metrics.oversized_outbound_ready_rejections += 1;
             std.log.warn(
-                "raft Ready exceeds hard outbound ceiling; quiescing group group_id={d} message_bytes={d} max_bytes={d}",
+                "raft Ready exceeds hard outbound ceiling; quarantining group group_id={d} message_bytes={d} max_bytes={d}",
                 .{ group_id, ready_pressure.message_bytes, self.cfg.max_single_outbound_ready_bytes },
             );
             // This is a group-local invariant violation. Returning from the
@@ -1207,7 +1236,12 @@ pub const MultiRaft = struct {
             // pass. Quarantine only the offending group and let the batch
             // flush normally; metrics and quiesced status retain the operator
             // signal without starving healthy groups or log-spinning.
-            oversized_ready_groups.appendAssumeCapacity(group_id);
+            oversized_ready_groups.appendAssumeCapacity(.{
+                .group_id = group_id,
+                .reason = .outbound_ready_too_large,
+                .observed_bytes = ready_pressure.message_bytes,
+                .configured_limit = self.cfg.max_single_outbound_ready_bytes,
+            });
             return false;
         }
         if (!outbound_capacity_available and !outbound_single_ready_progress) {
@@ -1234,10 +1268,15 @@ pub const MultiRaft = struct {
             }
             self.metrics.oversized_apply_ready_rejections += 1;
             std.log.warn(
-                "raft Ready exceeds hard apply ceiling; quiescing group group_id={d} apply_bytes={d} max_bytes={d} snapshot_bytes={d}",
+                "raft Ready exceeds hard apply ceiling; quarantining group group_id={d} apply_bytes={d} max_bytes={d} snapshot_bytes={d}",
                 .{ group_id, apply_ready_bytes, self.cfg.max_single_apply_ready_bytes, ready_pressure.snapshot_bytes },
             );
-            oversized_ready_groups.appendAssumeCapacity(group_id);
+            oversized_ready_groups.appendAssumeCapacity(.{
+                .group_id = group_id,
+                .reason = .apply_ready_too_large,
+                .observed_bytes = apply_ready_bytes,
+                .configured_limit = self.cfg.max_single_apply_ready_bytes,
+            });
             return false;
         }
         if (!apply_capacity_available and !apply_single_ready_progress) {
@@ -1826,6 +1865,7 @@ pub const MultiRaft = struct {
     fn refreshMetricsTopology(self: *MultiRaft) void {
         self.metrics.group_count = self.groups.count();
         self.metrics.quiesced_group_count = self.groups.count() - self.scheduler.activeGroupCount();
+        self.metrics.quarantined_group_count = self.scheduler.quarantinedGroupCount();
     }
 
     fn refreshQueueMetrics(self: *MultiRaft) void {

@@ -876,6 +876,25 @@ var test_before_startup_catch_up_replay_hook: ?TestStartupCatchUpReplayPassHook 
 var test_after_startup_catch_up_replay_pass_hook: ?TestStartupCatchUpReplayPassHook = null;
 var test_writer_open_persistent_descriptor_failures_remaining: std.atomic.Value(u32) = .init(0);
 var test_recovery_intent_read_failures_remaining: std.atomic.Value(u32) = .init(0);
+var test_dropped_table_job_submit_failures_remaining: std.atomic.Value(u32) = .init(0);
+
+fn consumeTestDroppedTableJobSubmitFailure() bool {
+    if (!builtin.is_test) return false;
+    var remaining = test_dropped_table_job_submit_failures_remaining.load(.acquire);
+    while (remaining != 0) {
+        if (test_dropped_table_job_submit_failures_remaining.cmpxchgWeak(
+            remaining,
+            remaining - 1,
+            .acq_rel,
+            .acquire,
+        )) |observed| {
+            remaining = observed;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
 
 fn consumeTestRecoveryIntentReadFailure() bool {
     if (!builtin.is_test) return false;
@@ -6803,6 +6822,15 @@ pub const BoundTableWriteSource = struct {
 };
 
 pub const ProvisionedTableWriteSource = struct {
+    pub const DroppedTableRecoveryStatus = struct {
+        pending_epochs: u64,
+        worker_scheduled: bool,
+        retry_scheduled: bool,
+        consecutive_recovery_failures: u32,
+        consecutive_enqueue_failures: u32,
+        enqueue_failures: u64,
+    };
+
     pub const StartupCatchUpResult = struct {
         had_debt: bool = false,
         cleared_debt: bool = false,
@@ -7101,8 +7129,11 @@ pub const ProvisionedTableWriteSource = struct {
     // only after observing the same epoch before and after clearing the
     // scheduled bit, closing the classic coalesced-work lost-wakeup race.
     dropped_table_recovery_requested: std.atomic.Value(u64) = .init(0),
+    dropped_table_recovery_completed: std.atomic.Value(u64) = .init(0),
     dropped_table_recovery_retry_scheduled: std.atomic.Value(bool) = .init(false),
     dropped_table_recovery_retry_failures: std.atomic.Value(u32) = .init(0),
+    dropped_table_recovery_enqueue_failures: std.atomic.Value(u64) = .init(0),
+    dropped_table_recovery_enqueue_failure_streak: std.atomic.Value(u32) = .init(0),
     quarantined_recovery_intents: std.atomic.Value(u64) = .init(0),
     replica_retirement_ownership_mutex: std.atomic.Mutex = .unlocked,
     replica_retirement_ownership: ?ReplicaRetirementOwnership = null,
@@ -8063,6 +8094,7 @@ pub const ProvisionedTableWriteSource = struct {
         lockAtomic(&self.dropped_table_job_owner_mutex);
         defer self.dropped_table_job_owner_mutex.unlock();
         if (self.lifecycle.load(.acquire) != .open) return error.Canceled;
+        if (consumeTestDroppedTableJobSubmitFailure()) return error.TestDroppedTableJobSubmitFailure;
         const owner_id = try self.droppedTableDeleteOwnerIdLocked(runtime);
         var job = input_job;
         job.owner_id = owner_id;
@@ -8485,6 +8517,52 @@ pub const ProvisionedTableWriteSource = struct {
         if (self.local_write_owner) |owner| return owner.startDroppedTableRecovery();
         if (!self.dropped_table_recovery_started.swap(true, .acq_rel)) {
             self.scheduleDroppedTableRecovery();
+            return;
+        }
+        self.maintainDroppedTableRecovery();
+    }
+
+    /// Re-establishes the worker invariant for durable cleanup debt. This is
+    /// safe to call from a periodic control loop and performs no allocation
+    /// when there is no pending epoch or another worker owns the lane.
+    pub fn maintainDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
+        if (self.local_write_owner) |owner| return owner.maintainDroppedTableRecovery();
+        if (!self.isOpen()) return;
+        const requested = self.dropped_table_recovery_requested.load(.acquire);
+        const completed = self.dropped_table_recovery_completed.load(.acquire);
+        if (requested == completed) return;
+        if (self.dropped_table_recovery_retry_scheduled.load(.acquire)) return;
+        self.ensureDroppedTableRecoveryScheduled();
+    }
+
+    pub fn droppedTableRecoveryStatus(self: *const ProvisionedTableWriteSource) DroppedTableRecoveryStatus {
+        const requested = self.dropped_table_recovery_requested.load(.acquire);
+        const completed = self.dropped_table_recovery_completed.load(.acquire);
+        return .{
+            .pending_epochs = requested -| completed,
+            .worker_scheduled = self.dropped_table_recovery_scheduled.load(.acquire),
+            .retry_scheduled = self.dropped_table_recovery_retry_scheduled.load(.acquire),
+            .consecutive_recovery_failures = self.dropped_table_recovery_retry_failures.load(.acquire),
+            .consecutive_enqueue_failures = self.dropped_table_recovery_enqueue_failure_streak.load(.acquire),
+            .enqueue_failures = self.dropped_table_recovery_enqueue_failures.load(.acquire),
+        };
+    }
+
+    fn recordDroppedTableRecoveryEnqueueFailure(
+        self: *ProvisionedTableWriteSource,
+        operation: []const u8,
+        err: ?anyerror,
+    ) void {
+        _ = self.dropped_table_recovery_enqueue_failures.fetchAdd(1, .monotonic);
+        const streak = self.dropped_table_recovery_enqueue_failure_streak.fetchAdd(1, .monotonic) +| 1;
+        // The control-loop watchdog deliberately retries persistent resource
+        // failures. Log the first and powers of two so operators retain a
+        // useful signal without a 100 ms failure turning into a log storm.
+        if (streak != 1 and (streak & (streak - 1)) != 0) return;
+        if (err) |cause| {
+            std.log.warn("dropped-table recovery {s} deferred root={s} consecutive_failures={d} err={s}", .{ operation, self.replica_root_dir, streak, @errorName(cause) });
+        } else {
+            std.log.warn("dropped-table recovery {s} deferred root={s} consecutive_failures={d}", .{ operation, self.replica_root_dir, streak });
         }
     }
 
@@ -8521,6 +8599,12 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.dropped_table_recovery_requested.load(.acquire) != observed_epoch)
                 continue;
 
+            // Publish completion while this worker still owns the scheduled
+            // bit. A successor can then only advance this monotonic watermark;
+            // an older worker can never overwrite newer completion.
+            if (!retry_required) {
+                self.dropped_table_recovery_completed.store(observed_epoch, .release);
+            }
             self.dropped_table_recovery_scheduled.store(false, .release);
             if (self.dropped_table_recovery_requested.load(.acquire) == observed_epoch) {
                 if (retry_required) {
@@ -8565,7 +8649,7 @@ pub const ProvisionedTableWriteSource = struct {
                 defer io_impl.deinit();
                 io_impl.io().sleep(.fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
                 work.source.dropped_table_recovery_retry_scheduled.store(false, .release);
-                work.source.scheduleDroppedTableRecovery();
+                work.source.maintainDroppedTableRecovery();
             }
 
             fn deinit(ptr: *anyopaque) void {
@@ -8575,24 +8659,39 @@ pub const ProvisionedTableWriteSource = struct {
         };
         const work = std.heap.page_allocator.create(RetryWork) catch {
             self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("retry allocation", null);
             return;
         };
         work.* = .{ .source = self };
+        const enqueue_streak = self.dropped_table_recovery_enqueue_failure_streak.load(.acquire);
         self.submitDroppedTableJob(runtime, .{
             .owner_id = 0,
             .class = .cleanup,
             .ptr = work,
             .run = RetryWork.run,
             .deinit = RetryWork.deinit,
-        }) catch {
+        }) catch |err| {
             std.heap.page_allocator.destroy(work);
             self.dropped_table_recovery_retry_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("retry enqueue", err);
+            return;
         };
+        _ = self.dropped_table_recovery_enqueue_failure_streak.cmpxchgStrong(
+            enqueue_streak,
+            0,
+            .release,
+            .monotonic,
+        );
     }
 
     fn scheduleDroppedTableRecovery(self: *ProvisionedTableWriteSource) void {
         if (!self.isOpen()) return;
         _ = self.dropped_table_recovery_requested.fetchAdd(1, .release);
+        self.ensureDroppedTableRecoveryScheduled();
+    }
+
+    fn ensureDroppedTableRecoveryScheduled(self: *ProvisionedTableWriteSource) void {
+        if (!self.isOpen()) return;
         if (self.dropped_table_recovery_scheduled.swap(true, .acq_rel)) return;
         const runtime = self.backend_runtime orelse {
             self.drainDroppedTableRecoveryRequests();
@@ -8613,19 +8712,29 @@ pub const ProvisionedTableWriteSource = struct {
         };
         const work = std.heap.page_allocator.create(Work) catch {
             self.dropped_table_recovery_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("allocation", null);
             return;
         };
         work.* = .{ .source = self };
+        const enqueue_streak = self.dropped_table_recovery_enqueue_failure_streak.load(.acquire);
         self.submitDroppedTableJob(runtime, .{
             .owner_id = 0,
             .class = .cleanup,
             .ptr = work,
             .run = Work.run,
             .deinit = Work.deinit,
-        }) catch {
+        }) catch |err| {
             std.heap.page_allocator.destroy(work);
             self.dropped_table_recovery_scheduled.store(false, .release);
+            self.recordDroppedTableRecoveryEnqueueFailure("enqueue", err);
+            return;
         };
+        _ = self.dropped_table_recovery_enqueue_failure_streak.cmpxchgStrong(
+            enqueue_streak,
+            0,
+            .release,
+            .monotonic,
+        );
     }
 
     fn scheduleDroppedGroupDelete(self: *ProvisionedTableWriteSource, path: []const u8) !bool {
@@ -46188,6 +46297,44 @@ test "dropped table recovery drains a wake coalesced during the active scan" {
     try std.testing.expectEqual(@as(usize, 2), probe.passes);
     try std.testing.expectEqual(@as(u64, 2), source.dropped_table_recovery_requested.load(.acquire));
     try std.testing.expect(!source.dropped_table_recovery_scheduled.load(.acquire));
+}
+
+test "dropped table recovery watchdog repairs a failed durable enqueue" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        ".zig-cache/tmp/{s}/drop-recovery-enqueue-failure",
+        .{tmp.sub_path},
+    );
+    defer std.testing.allocator.free(replica_root_dir);
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(
+        std.testing.allocator,
+        .{ .backend = .manual },
+    );
+    defer runtime.deinit();
+    var source = ProvisionedTableWriteSource.init(
+        replica_root_dir,
+        table_catalog.emptyCatalogSource(),
+    );
+    defer source.deinit();
+    source.backend_runtime = runtime.ptr();
+
+    test_dropped_table_job_submit_failures_remaining.store(1, .release);
+    defer test_dropped_table_job_submit_failures_remaining.store(0, .release);
+    source.startDroppedTableRecovery();
+
+    var status = source.droppedTableRecoveryStatus();
+    try std.testing.expectEqual(@as(u64, 1), status.pending_epochs);
+    try std.testing.expectEqual(@as(u64, 1), status.enqueue_failures);
+    try std.testing.expectEqual(@as(u32, 1), status.consecutive_enqueue_failures);
+    try std.testing.expect(!status.worker_scheduled);
+
+    source.maintainDroppedTableRecovery();
+    status = source.droppedTableRecoveryStatus();
+    try std.testing.expectEqual(@as(u64, 0), status.pending_epochs);
+    try std.testing.expectEqual(@as(u32, 0), status.consecutive_enqueue_failures);
+    try std.testing.expect(!status.worker_scheduled);
 }
 
 test "provisioned source quiesce closes cleanup admission and drains accepted owner jobs" {
