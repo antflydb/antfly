@@ -3034,9 +3034,9 @@ pub const MetadataService = struct {
             return &(self.catalog_validation_cache.snapshot orelse unreachable);
         }
 
-        // The apply store captures the two projected lists under its apply
-        // mutex. The listener epoch stabilizes cache publication and
-        // invalidation without requiring the outer Raft runtime lock.
+        // The apply store captures both projected lists from one point-in-time
+        // storage transaction. The listener epoch stabilizes cache publication
+        // and invalidation without either apply or outer Raft runtime locks.
         var attempts: usize = 0;
         while (attempts < 4) : (attempts += 1) {
             const before = self.catalog_epoch.load(.acquire);
@@ -5942,10 +5942,10 @@ pub const MetadataHttpService = struct {
         return snapshot;
     }
 
-    /// The apply store captures one committed table/range pair under its apply
-    /// mutex, and this catalog mutex publishes that immutable pair. The
-    /// listener epoch stabilizes cache publication and invalidation without
-    /// requiring the outer Raft runtime lock.
+    /// The apply store captures one committed table/range pair from a
+    /// point-in-time storage transaction, and this catalog mutex publishes that
+    /// immutable pair. The listener epoch stabilizes cache publication and
+    /// invalidation without either apply or outer Raft runtime locks.
     fn catalogValidationSnapshotLocked(self: *MetadataHttpService) !*const CatalogValidationSnapshot {
         return try self.catalogValidationSnapshotLockedUntil(null);
     }

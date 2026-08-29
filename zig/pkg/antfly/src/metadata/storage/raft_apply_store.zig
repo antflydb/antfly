@@ -31,7 +31,6 @@ const raft_reconciler = @import("../../raft/reconciler.zig");
 const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
-const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 
 pub const AppliedMetadataBatch = struct {
@@ -1582,16 +1581,21 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return try self.listTablesTxn(alloc, &txn, group_id);
+    }
+
+    fn listTablesTxn(
+        _: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+    ) ![]metadata.TableRecord {
         var prefix_buf: [128]u8 = undefined;
         const prefix = try tablePrefixForGroup(&prefix_buf, group_id);
-        const kvs = try self.store.scanPrefix(alloc, prefix);
-        defer {
-            for (kvs) |kv| {
-                alloc.free(kv.key);
-                alloc.free(kv.value);
-            }
-            alloc.free(kvs);
-        }
+        const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
+        defer freeKvs(alloc, kvs);
         const out = try alloc.alloc(metadata.TableRecord, kvs.len);
         var filled: usize = 0;
         errdefer {
@@ -1607,30 +1611,33 @@ pub const RaftApplyStore = struct {
         return out;
     }
 
-    /// Capture the table and range namespaces from one committed apply-store
-    /// revision without acquiring the outer Raft runtime lock.
+    /// Capture the table and range namespaces from one committed storage
+    /// revision without acquiring either the apply or outer Raft runtime lock.
     pub fn captureCatalogProjection(
         self: *RaftApplyStore,
         alloc: std.mem.Allocator,
         group_id: u64,
         deadline_ns: ?u64,
     ) !CatalogProjectionSnapshot {
-        const io = self.io_impl.io();
         if (deadline_ns) |deadline| {
-            while (!self.apply_mutex.tryLock()) {
-                if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
-                platform_clock.Clock.real().sleepMs(1);
-            }
-        } else {
-            self.apply_mutex.lockUncancelable(io);
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
         }
-        defer self.apply_mutex.unlock(io);
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
 
-        const tables = try self.listTables(alloc, group_id);
+        const tables = try self.listTablesTxn(alloc, &txn, group_id);
         errdefer self.freeTables(alloc, tables);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
+        const ranges = try self.listRangesTxn(alloc, &txn, group_id);
+        errdefer self.freeRanges(alloc, ranges);
+        if (deadline_ns) |deadline| {
+            if (platform_time.monotonicNs() >= deadline) return error.CatalogRoutingSnapshotTimeout;
+        }
         return .{
             .tables = tables,
-            .ranges = try self.listRanges(alloc, group_id),
+            .ranges = ranges,
         };
     }
 
@@ -1898,22 +1905,31 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn listRanges(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.RangeRecord {
+        var txn = try self.store.beginReadTxn();
+        defer txn.abort();
+        return try self.listRangesTxn(alloc, &txn, group_id);
+    }
+
+    fn listRangesTxn(
+        _: *RaftApplyStore,
+        alloc: std.mem.Allocator,
+        txn: *docstore.DocStore.Txn,
+        group_id: u64,
+    ) ![]metadata.RangeRecord {
         var prefix_buf: [128]u8 = undefined;
         const prefix = try rangePrefixForGroup(&prefix_buf, group_id);
-        const kvs = try self.store.scanPrefix(alloc, prefix);
-        defer {
-            for (kvs) |kv| {
-                alloc.free(kv.key);
-                alloc.free(kv.value);
-            }
-            alloc.free(kvs);
-        }
+        const kvs = try docstore.DocStore.scanPrefixTxn(alloc, txn, prefix);
+        defer freeKvs(alloc, kvs);
         const out = try alloc.alloc(metadata.RangeRecord, kvs.len);
+        var filled: usize = 0;
         errdefer {
-            for (out[0..kvs.len]) |record| metadata_table_manager.freeRange(alloc, record);
+            for (out[0..filled]) |record| metadata_table_manager.freeRange(alloc, record);
             alloc.free(out);
         }
-        for (kvs, 0..) |kv, i| out[i] = try decodeRangeRecord(alloc, kv.value);
+        for (kvs, 0..) |kv, i| {
+            out[i] = try decodeRangeRecord(alloc, kv.value);
+            filled = i + 1;
+        }
         return out;
     }
 
@@ -8381,7 +8397,7 @@ test "metadata raft apply store publishes listeners only after commit" {
     try std.testing.expectEqual(@as(usize, 0), tables.len);
 }
 
-test "metadata raft apply store catalog projection honors apply deadline" {
+test "metadata raft apply store catalog projection uses storage snapshot independently from apply mutex" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -8391,25 +8407,92 @@ test "metadata raft apply store catalog projection honors apply deadline" {
     var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
     defer store.deinit();
 
+    const table = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = testTransitionTableRecord(),
+    });
+    defer std.testing.allocator.free(table);
+    const range = try encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_range = testTransitionRangeRecord(
+            101,
+            test_transition_table_contract.source_identity,
+            "",
+            null,
+        ),
+    });
+    defer std.testing.allocator.free(range);
+    const entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = range },
+    });
+    defer std.testing.allocator.free(entries);
+    var outcome = try store.applyCommittedBatch(41, 2, entries);
+    defer outcome.deinit();
+
+    // Keep one storage snapshot open across a later apply and prove the two
+    // namespace scans cannot straddle that commit.
+    {
+        var txn = try store.store.beginReadTxn();
+        defer txn.abort();
+        const before_tables = try store.listTablesTxn(std.testing.allocator, &txn, 41);
+        defer store.freeTables(std.testing.allocator, before_tables);
+
+        var updated_table = testTransitionTableRecord();
+        updated_table.schema_json = "{\"title\":{\"type\":\"text\"}}";
+        const table_update = try encodeTransitionCommand(std.testing.allocator, .{
+            .upsert_table = updated_table,
+        });
+        defer std.testing.allocator.free(table_update);
+        const range_update = try encodeTransitionCommand(std.testing.allocator, .{
+            .upsert_range = testTransitionRangeRecord(
+                101,
+                test_transition_table_contract.source_identity,
+                "m",
+                null,
+            ),
+        });
+        defer std.testing.allocator.free(range_update);
+        const update_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = table_update },
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = range_update },
+        });
+        defer std.testing.allocator.free(update_entries);
+        var update_outcome = try store.applyCommittedBatch(41, 4, update_entries);
+        defer update_outcome.deinit();
+
+        const before_ranges = try store.listRangesTxn(std.testing.allocator, &txn, 41);
+        defer store.freeRanges(std.testing.allocator, before_ranges);
+        try std.testing.expectEqual(@as(usize, 1), before_tables.len);
+        try std.testing.expectEqual(@as(usize, 1), before_ranges.len);
+        try std.testing.expectEqualStrings(test_transition_table_contract.schema_json, before_tables[0].schema_json);
+        try std.testing.expectEqualStrings("", before_ranges[0].start_key);
+    }
+
+    try std.testing.expectError(
+        error.CatalogRoutingSnapshotTimeout,
+        store.captureCatalogProjection(
+            std.testing.allocator,
+            41,
+            platform_time.monotonicNs() -| 1,
+        ),
+    );
+
     const io = store.io_impl.io();
     store.apply_mutex.lockUncancelable(io);
     {
         defer store.apply_mutex.unlock(io);
-        try std.testing.expectError(
-            error.CatalogRoutingSnapshotTimeout,
-            store.captureCatalogProjection(
-                std.testing.allocator,
-                41,
-                platform_time.monotonicNs() + std.time.ns_per_ms,
-            ),
+        const snapshot = try store.captureCatalogProjection(
+            std.testing.allocator,
+            41,
+            platform_time.monotonicNs() + std.time.ns_per_s,
         );
+        defer store.freeTables(std.testing.allocator, snapshot.tables);
+        defer store.freeRanges(std.testing.allocator, snapshot.ranges);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.tables.len);
+        try std.testing.expectEqual(@as(usize, 1), snapshot.ranges.len);
+        try std.testing.expectEqual(snapshot.tables[0].table_id, snapshot.ranges[0].table_id);
+        try std.testing.expectEqualStrings("{\"title\":{\"type\":\"text\"}}", snapshot.tables[0].schema_json);
+        try std.testing.expectEqualStrings("m", snapshot.ranges[0].start_key);
     }
-
-    const snapshot = try store.captureCatalogProjection(std.testing.allocator, 41, null);
-    defer store.freeTables(std.testing.allocator, snapshot.tables);
-    defer store.freeRanges(std.testing.allocator, snapshot.ranges);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.tables.len);
-    try std.testing.expectEqual(@as(usize, 0), snapshot.ranges.len);
 }
 
 test "metadata raft apply store resolves stale store drain intent at apply time" {
